@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightfee-py"
+version = "0.1.0"
+description = "Python LightFee: funding-rate arbitrage execution engine"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "LightFee Team"},
+]
+dependencies = [
+    "pydantic>=2.0",
+    "tomli>=2.0; python_version < '3.11'",
+    "httpx>=0.25",
+    "websockets>=12.0",
+    "aiosqlite>=0.19",
+    "orjson>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+lightfee-live = "lightfee.apps.live:main"
+lightfee-sidecar = "lightfee.apps.sidecar:main"
+lightfee-scheduler = "lightfee.apps.scheduler:main"
+lightfee-ops = "lightfee.apps.ops:main"
+lightfee-report = "lightfee.apps.report:main"
+lightfee-replay = "lightfee.apps.replay:main"
+lightfee-evolution = "lightfee.apps.evolution:main"
+lightfee-probe = "lightfee.apps.probe:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
