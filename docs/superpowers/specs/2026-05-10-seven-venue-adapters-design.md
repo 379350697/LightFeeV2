@@ -32,9 +32,13 @@ Out of scope for this spec:
 - risk-triggered execution
 - offline replay, evolution, and reporting
 
-## Current State
+## Current State (historical — see Completion / Closure)
 
-The code already has the right anchors:
+This section describes the codebase before the seven-venue adapter batch landed. The
+implementation is now complete. All seven venues are live-capable adapters with a
+shared transport, EIP-712 signing for Hyperliquid, and 236 passing acceptance tests.
+
+The code already had the right anchors:
 
 - `lightfee/venues/base.py` defines capability metadata.
 - `lightfee/venues/registry.py` enumerates the seven venues.
@@ -42,7 +46,9 @@ The code already has the right anchors:
 - `lightfee/apps/live.py` and `lightfee/engine/runtime.py` already expect a live runtime boundary.
 - `tests/test_runtime_smoke.py` already asserts all seven venues exist in the registry.
 
-The missing part is the transport and codec layer that makes those adapters actually useful.
+The missing part — the transport, codec, and signing layer — has been delivered.
+See **Completion / Closure** at the end of this document for the authoritative
+per-venue capability matrix, fixed deviation list, and acceptance results.
 
 ## Design Overview
 
@@ -193,7 +199,7 @@ This spec is complete when all of the following are true:
 
 ## Completion / Closure
 
-**Status:** 完整闭环 — 7/7 venues live-capable, all 8 mandatory deviations fixed, 432 tests passing.
+**Status:** 完整闭环 — 7/7 venues live-capable, all 8 mandatory deviations fixed, 236 tests passing.
 
 ### Per-Venue Capability Matrix
 
@@ -244,7 +250,7 @@ This spec is complete when all of the following are true:
 ```bash
 $ pytest tests/test_venues_transport.py tests/test_venues_contract.py \
         tests/test_venues_base.py tests/test_runtime_smoke.py -v
-432 passed
+236 passed
 
 $ python3 -m compileall lightfee
 Listing 'lightfee'...  # all modules compile cleanly

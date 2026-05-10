@@ -1,6 +1,6 @@
 # Seven Venue Adapters Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Do **not** implement the seven venues one by one in isolation. Finish the shared transport first, then run the venue batches in parallel.
+> **This is a historical plan.** The implementation is complete. The **Completion / Closure** section at the end of this document is the authoritative record of what was actually delivered, including the per-venue capability matrix, the 8 fixed deviations, final acceptance results (236 passed), and explicit unsupported capability boundaries. The task breakdown below is preserved as the original execution roadmap; if any detail conflicts, the Closure section takes precedence.
 
 **Goal:** Replace the seven V2 venue stubs with real, shared, live-capable adapters that can fetch market snapshots, normalize quantities, fetch positions, and submit orders for Binance, OKX, Bybit, Bitget, Gate, Aster, and Hyperliquid.
 
@@ -453,7 +453,7 @@ This plan is complete when:
 
 ## Completion / Closure
 
-**Status:** 完整闭环 — All 7 venues have live-capable adapters; all 8 closure deviations fixed; 432 tests passing.
+**Status:** 完整闭环 — All 7 venues have live-capable adapters; all 8 closure deviations fixed; 236 tests passing.
 
 ### Per-Venue Capability Matrix
 
@@ -505,7 +505,7 @@ This plan is complete when:
 # Full test suite
 $ pytest tests/test_venues_transport.py tests/test_venues_contract.py \
       tests/test_venues_base.py tests/test_runtime_smoke.py -v
-432 passed
+236 passed
 
 # Targeted deviation tests
 $ pytest tests/test_venues_transport.py -k "okx or bybit or private or short or ack" -v
