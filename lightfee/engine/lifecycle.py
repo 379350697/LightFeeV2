@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 from lightfee.engine.state import EngineState
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+
+class LiveStartupPhase(Enum):
+    """Ordered adapter startup phases (Rust: LiveStartupPhase)."""
+
+    PRIVATE_STREAMS = "private_streams"
+    MARKET_STREAMS = "market_streams"
+    LOCAL_L2 = "local_l2"
 
 
 def set_lifecycle(state: EngineState, lifecycle: EngineLifecycle) -> None:
@@ -25,3 +35,14 @@ def is_running(state: EngineState) -> bool:
 
 def can_enter_new_positions(state: EngineState) -> bool:
     return is_running(state)
+
+
+def transition_to_reconciling(state: EngineState) -> None:
+    """Transition to RECONCILING from BOOTING."""
+    set_lifecycle(state, EngineLifecycle.RECONCILING)
+
+
+def transition_to_running(state: EngineState) -> None:
+    """Transition to RUNNING after successful reconciliation."""
+    set_lifecycle(state, EngineLifecycle.RUNNING)
+    set_global_risk_mode(state, GlobalRiskMode.RUNNING)

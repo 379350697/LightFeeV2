@@ -37,6 +37,7 @@ lightfee-report = "lightfee.apps.report:main"
 lightfee-replay = "lightfee.apps.replay:main"
 lightfee-evolution = "lightfee.apps.evolution:main"
 lightfee-probe = "lightfee.apps.probe:main"
+lightfee-explain = "lightfee.apps.explain:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,150 @@
+"""Daily universe: symbol filtering, ranking, and persistence matching Rust universe.rs."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
+
+
+@dataclass
+class PersistedDailyUniverse:
+    """Serializable daily universe snapshot persisted to JSON."""
+
+    trading_date: str  # YYYY-MM-DD
+    generated_at_ms: int
+    selector_version: int = 1
+    source_symbol_count: int = 0
+    selected_symbol_count: int = 0
+    selected_symbols: list[str] = field(default_factory=list)
+
+    def validate(self) -> list[str]:
+        """Return list of validation error messages. Empty = valid."""
+        errors: list[str] = []
+        if self.generated_at_ms < 0:
+            errors.append("generated_at_ms must be >= 0")
+        if self.selector_version < 1:
+            errors.append("selector_version must be >= 1")
+        if self.selected_symbol_count != len(self.selected_symbols):
+            errors.append(
+                f"selected_symbol_count {self.selected_symbol_count} != "
+                f"len(selected_symbols) {len(self.selected_symbols)}"
+            )
+        if self.selected_symbol_count > self.source_symbol_count:
+            errors.append(
+                f"selected_symbol_count {self.selected_symbol_count} > "
+                f"source_symbol_count {self.source_symbol_count}"
+            )
+        # Duplicate check
+        seen = set()
+        for s in self.selected_symbols:
+            norm = _normalize_symbol(s)
+            if norm in seen:
+                errors.append(f"duplicate symbol: {s}")
+            seen.add(norm)
+        return errors
+
+    def save(self, path: str) -> None:
+        """Atomically write JSON to path."""
+        errors = self.validate()
+        if errors:
+            raise ValueError(f"invalid PersistedDailyUniverse: {errors}")
+        dirname = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=dirname, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._asdict(), f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def load(cls, path: str) -> Optional[PersistedDailyUniverse]:
+        """Load from JSON file. Returns None if file absent."""
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        inst = cls(
+            trading_date=data.get("trading_date", ""),
+            generated_at_ms=data.get("generated_at_ms", 0),
+            selector_version=data.get("selector_version", 1),
+            source_symbol_count=data.get("source_symbol_count", 0),
+            selected_symbol_count=data.get("selected_symbol_count", 0),
+            selected_symbols=data.get("selected_symbols", []),
+        )
+        errors = inst.validate()
+        if errors:
+            raise ValueError(f"invalid PersistedDailyUniverse in {path}: {errors}")
+        return inst
+
+    def _asdict(self) -> dict:
+        return {
+            "trading_date": self.trading_date,
+            "generated_at_ms": self.generated_at_ms,
+            "selector_version": self.selector_version,
+            "source_symbol_count": self.source_symbol_count,
+            "selected_symbol_count": self.selected_symbol_count,
+            "selected_symbols": self.selected_symbols,
+        }
+
+
+@dataclass
+class RuntimeSymbolResolutionSummary:
+    """Returned by prepare_runtime_symbols with resolution stats."""
+
+    daily_universe_enabled: bool = False
+    global_symbol_count: int = 0
+    resolved_symbol_count: int = 0
+    selector_adapter_count: int = 0
+
+
+def _normalize_symbol(raw: str) -> str:
+    """Uppercase and strip separators/dashes/spaces."""
+    s = raw.upper().replace("-", "").replace("_", "").replace("/", "").replace(" ", "")
+    if not s:
+        raise ValueError(f"blank symbol after normalization: {raw!r}")
+    return s
+
+
+def today_trading_date(tz: timezone | None = None) -> str:
+    """Return today's date as YYYY-MM-DD in Shanghai time (UTC+8) by default."""
+    if tz is None:
+        tz = timezone(timedelta(hours=8))  # UTC+8 (Shanghai)
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
+async def resolve_runtime_symbols(
+    config, adapters, universe_path: str | None = None
+) -> RuntimeSymbolResolutionSummary:
+    """Resolve which symbols to trade today.
+
+    If daily universe is enabled and a persisted JSON exists for today,
+    returns its symbol list. Otherwise falls back to config.symbols.
+    """
+    symbols = list(getattr(config, "symbols", []))
+    summary = RuntimeSymbolResolutionSummary(
+        daily_universe_enabled=getattr(config, "daily_universe_enabled", False),
+        global_symbol_count=len(symbols),
+    )
+
+    # Try loading persisted daily universe
+    if universe_path and os.path.exists(universe_path):
+        persisted = PersistedDailyUniverse.load(universe_path)
+        if persisted is not None and persisted.trading_date == today_trading_date():
+            summary.resolved_symbol_count = persisted.selected_symbol_count
+            summary.selector_adapter_count = 1
+            return summary
+
+    # Fallback: use config symbols as-is
+    summary.resolved_symbol_count = len(symbols)
+    if adapters and hasattr(adapters, "__len__"):
+        summary.selector_adapter_count = len(adapters)
+    return summary

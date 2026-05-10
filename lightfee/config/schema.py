@@ -35,6 +35,9 @@ class RuntimeConfig:
     ws_unhealthy_after_failures: int = 5
     journal_async_queue_capacity: int = 4096
     auto_trade_enabled: bool = True
+    live_startup_phase_timeout_ms: int = 15000
+    maker_event_lane_enabled: bool = False
+    shutdown_grace_period_ms: int = 3000
 
 
 @dataclass
