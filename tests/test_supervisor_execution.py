@@ -247,7 +247,8 @@ class TestSupervisePosition:
 
 
 class TestExecuteRiskPlan:
-    def test_execute_delever_increments_step_count(self):
+    @pytest.mark.asyncio
+    async def test_execute_delever_increments_step_count(self):
         config = _make_config()
         state = EngineState()
         journal = _make_journal()
@@ -260,13 +261,14 @@ class TestExecuteRiskPlan:
             requested_quantity=0.002,
             adjusted_quantity=0.002,
         )
-        supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
+        await supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
 
         assert pos.risk_delever_step_count == 1
         assert pos.last_risk_action_at_ms == 5000
         assert pos.last_risk_reason == "risk_delever"
 
-    def test_execute_delever_logs_triggered(self):
+    @pytest.mark.asyncio
+    async def test_execute_delever_logs_triggered(self):
         config = _make_config()
         state = EngineState()
         journal = _make_journal()
@@ -279,13 +281,14 @@ class TestExecuteRiskPlan:
             requested_quantity=0.002,
             adjusted_quantity=0.002,
         )
-        supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
+        await supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
 
         entries = journal.read_all()
         triggered = [e for e in entries if e.get("kind") == "risk.delever_triggered"]
         assert len(triggered) == 1
 
-    def test_execute_delever_reaches_limit_logs(self):
+    @pytest.mark.asyncio
+    async def test_execute_delever_reaches_limit_logs(self):
         config = _make_config(max_partial_delever_steps=2)
         state = EngineState()
         journal = _make_journal()
@@ -298,7 +301,7 @@ class TestExecuteRiskPlan:
             requested_quantity=0.002,
             adjusted_quantity=0.002,
         )
-        supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
+        await supervisor._execute_delever(pos, plan, 5000, 0.0, 0.0)
 
         entries = journal.read_all()
         limit = [e for e in entries if e.get("kind") == "risk.delever_limit_reached"]

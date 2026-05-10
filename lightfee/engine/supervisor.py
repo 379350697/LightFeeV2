@@ -202,7 +202,7 @@ class Supervisor:
         elif plan.kind == RiskExecutionPlanKind.FAIL_CLOSED:
             self._execute_fail_closed(position, plan, now_ms)
 
-    def _execute_delever(
+    async def _execute_delever(
         self,
         position: OpenPosition,
         plan: RiskExecutionPlan,
@@ -230,7 +230,7 @@ class Supervisor:
             },
         )
 
-        # If we have a close executor, use it. Otherwise log that it would be called.
+        # If we have a close executor, use it to execute the delever close
         if self.close_executor and plan.adjusted_quantity > 0:
             self.journal.append(
                 "risk.delever_close_initiated",
@@ -239,11 +239,13 @@ class Supervisor:
                     "quantity": plan.adjusted_quantity,
                 },
             )
-            # In full runtime, this would call:
-            # await self.close_executor.execute_close(
-            #     position, plan.reason, now_ms,
-            #     long_price_hint, short_price_hint, plan.adjusted_quantity,
-            # )
+            await self.close_executor.execute_close(
+                position, plan.reason, now_ms,
+                long_price_hint=long_price_hint,
+                short_price_hint=short_price_hint,
+                total_quantity=plan.adjusted_quantity,
+                state=self.state,
+            )
 
         # Update position tracking
         position.last_risk_action_at_ms = now_ms
@@ -369,3 +371,5 @@ class Supervisor:
                 "risk.warning_line_triggered",
                 {"min_health_ratio": health.min_health_ratio, "ts_ms": now_ms},
             )
+
+

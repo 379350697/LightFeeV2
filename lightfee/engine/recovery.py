@@ -208,100 +208,187 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
     }
 
 
+def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
+    """Restore EngineState fields from a snapshot dict (without journal replay)."""
+    state = EngineState()
+
+    lifecycle_str = snap.get("lifecycle", "booting")
+    try:
+        state.lifecycle = EngineLifecycle(lifecycle_str)
+    except ValueError:
+        state.lifecycle = EngineLifecycle.BOOTING
+
+    risk_str = snap.get("risk_mode", "running")
+    try:
+        state.risk_mode = GlobalRiskMode(risk_str)
+    except ValueError:
+        state.risk_mode = GlobalRiskMode.RUNNING
+
+    state.run_id = snap.get("run_id", "")
+    state.started_at_ms = snap.get("started_at_ms", 0)
+    state.last_tick_ms = snap.get("last_tick_ms", 0)
+    state.tick_count = snap.get("tick_count", 0)
+    state.venue_health = snap.get("venue_health", {})
+
+    # Restore operator control state
+    op = snap.get("operator", {})
+    if isinstance(op, dict):
+        if op.get("requested_mode"):
+            try:
+                state.operator.requested_mode = GlobalRiskMode(str(op["requested_mode"]))
+            except ValueError:
+                pass
+        state.operator.pending_reconcile = bool(op.get("pending_reconcile", False))
+
+    # Restore open positions
+    pos_dict = snap.get("open_positions", {})
+    if isinstance(pos_dict, dict):
+        for pid, pdata in pos_dict.items():
+            if isinstance(pdata, dict):
+                state.open_positions[pid] = _deserialize_open_position(pdata)
+
+    # Restore pending entries
+    pend_dict = snap.get("pending_entries", {})
+    if isinstance(pend_dict, dict):
+        for pend_id, pdata in pend_dict.items():
+            if isinstance(pdata, dict):
+                from lightfee.core.domain import Side as DomainSide
+
+                long_venue_str = str(pdata.get("long_venue", "binance"))
+                short_venue_str = str(pdata.get("short_venue", "okx"))
+                try:
+                    long_venue = Venue.from_str(long_venue_str)
+                except (ValueError, AttributeError):
+                    long_venue = Venue.BINANCE
+                try:
+                    short_venue = Venue.from_str(short_venue_str)
+                except (ValueError, AttributeError):
+                    short_venue = Venue.OKX
+
+                long_side_str = pdata.get("long_side", "buy")
+                short_side_str = pdata.get("short_side", "sell")
+                try:
+                    long_side = DomainSide(long_side_str)
+                except ValueError:
+                    long_side = DomainSide.BUY
+                try:
+                    short_side = DomainSide(short_side_str)
+                except ValueError:
+                    short_side = DomainSide.SELL
+
+                state.pending_entries[pend_id] = PendingEntry(
+                    pending_id=pdata.get("pending_id", pend_id),
+                    symbol=pdata.get("symbol", ""),
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                    target_quantity=float(pdata.get("target_quantity", 0)),
+                    long_side=long_side,
+                    short_side=short_side,
+                    created_at_ms=int(pdata.get("created_at_ms", 0)),
+                    maker_order_id=str(pdata.get("maker_order_id", "")),
+                    hedge_order_id=str(pdata.get("hedge_order_id", "")),
+                    maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
+                    hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
+                    uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
+                )
+
+    # Restore pending closes
+    close_dict = snap.get("pending_closes", {})
+    if isinstance(close_dict, dict):
+        for cid, cdata in close_dict.items():
+            if isinstance(cdata, dict):
+                state.pending_closes[cid] = PendingClose(
+                    close_id=cdata.get("close_id", cid),
+                    position_id=cdata.get("position_id", ""),
+                    reason=cdata.get("reason", ""),
+                    created_at_ms=int(cdata.get("created_at_ms", 0)),
+                    long_order_id=str(cdata.get("long_order_id", "")),
+                    short_order_id=str(cdata.get("short_order_id", "")),
+                    long_closed=float(cdata.get("long_closed", 0)),
+                    short_closed=float(cdata.get("short_closed", 0)),
+                    long_uncertain=bool(cdata.get("long_uncertain", False)),
+                    short_uncertain=bool(cdata.get("short_uncertain", False)),
+                )
+
+    return state
+
+
+def _apply_journal_replay_to_state(
+    state: EngineState,
+    records: list[dict[str, Any]],
+) -> None:
+    """Replay journal records against an already-restored EngineState.
+
+    Processes events that happened AFTER the snapshot was written:
+    - entry.opened / recovery.live_detected → add position
+    - exit.closed / recovery.flat → remove position
+    - exit.partial_closed → reduce matched_quantity
+    - runtime.lifecycle_changed / risk_mode_changed → update modes
+    """
+    for record in records:
+        kind = record.get("kind", "")
+        payload = record.get("payload", {})
+
+        if kind in ("entry.opened", "recovery.live_detected"):
+            pid = payload.get("position_id", "")
+            if pid and pid not in state.open_positions:
+                state.open_positions[pid] = _deserialize_open_position(payload)
+
+        elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
+            pid = payload.get("position_id", "")
+            if pid:
+                state.open_positions.pop(pid, None)
+                state.pending_closes.pop(pid, None)
+
+        elif kind == "exit.partial_closed":
+            pid = payload.get("position_id", "")
+            if pid and pid in state.open_positions:
+                pos = state.open_positions[pid]
+                matched_closed = float(payload.get("matched_closed", 0))
+                if matched_closed > 0:
+                    remaining = max(pos.matched_quantity - matched_closed, 0)
+                    pos.long_quantity = max(pos.long_quantity - matched_closed, 0)
+                    pos.short_quantity = max(pos.short_quantity - matched_closed, 0)
+                    pos.matched_quantity = remaining
+
+        elif kind == "runtime.lifecycle_changed":
+            to_val = payload.get("to")
+            if to_val:
+                try:
+                    state.lifecycle = EngineLifecycle(str(to_val))
+                except ValueError:
+                    pass
+
+        elif kind == "runtime.risk_mode_changed":
+            to_val = payload.get("to")
+            if to_val:
+                try:
+                    state.risk_mode = GlobalRiskMode(str(to_val))
+                except ValueError:
+                    pass
+
+
 def recover_from_snapshot(
     snapshot_store: SnapshotStore,
     journal: Journal,
 ) -> EngineState:
-    """Load persisted state and replay journal to recover engine state.
+    """Load persisted state, replay journal, and reconstruct engine state.
 
     Rust V1: Engine startup loads FileStateStore snapshot, replays journal,
     and enters RECONCILING if any recovery work exists.
+
+    Flow:
+    1. Load snapshot dict → restore base EngineState
+    2. Read journal records → replay events that happened after snapshot
+    3. Assess recovery needs → set lifecycle/risk_mode
     """
-    state = EngineState()
-
     snap = snapshot_store.read()
-    if snap:
-        lifecycle_str = snap.get("lifecycle", "booting")
-        try:
-            state.lifecycle = EngineLifecycle(lifecycle_str)
-        except ValueError:
-            state.lifecycle = EngineLifecycle.BOOTING
+    state = _restore_state_from_snapshot_dict(snap) if snap else EngineState()
 
-        risk_str = snap.get("risk_mode", "running")
-        try:
-            state.risk_mode = GlobalRiskMode(risk_str)
-        except ValueError:
-            state.risk_mode = GlobalRiskMode.RUNNING
-
-        state.run_id = snap.get("run_id", "")
-        state.started_at_ms = snap.get("started_at_ms", 0)
-        state.last_tick_ms = snap.get("last_tick_ms", 0)
-        state.tick_count = snap.get("tick_count", 0)
-        state.venue_health = snap.get("venue_health", {})
-
-        # Restore open positions
-        pos_dict = snap.get("open_positions", {})
-        if isinstance(pos_dict, dict):
-            for pid, pdata in pos_dict.items():
-                if isinstance(pdata, dict):
-                    state.open_positions[pid] = _deserialize_open_position(pdata)
-
-        # Restore pending entries
-        pend_dict = snap.get("pending_entries", {})
-        if isinstance(pend_dict, dict):
-            for pend_id, pdata in pend_dict.items():
-                if isinstance(pdata, dict):
-                    from lightfee.core.domain import Side as DomainSide
-                    long_side_str = pdata.get("long_side", "buy")
-                    short_side_str = pdata.get("short_side", "sell")
-                    try:
-                        long_side = DomainSide(long_side_str)
-                    except ValueError:
-                        long_side = DomainSide.BUY
-                    try:
-                        short_side = DomainSide(short_side_str)
-                    except ValueError:
-                        short_side = DomainSide.SELL
-
-                    state.pending_entries[pend_id] = PendingEntry(
-                        pending_id=pdata.get("pending_id", pend_id),
-                        symbol=pdata.get("symbol", ""),
-                        long_venue=state.open_positions.get(pend_id, OpenPosition(
-                            position_id="", symbol="", long_venue=Venue.BINANCE,
-                            short_venue=Venue.OKX, long_quantity=0, short_quantity=0,
-                            long_entry_price=0, short_entry_price=0, opened_at_ms=0,
-                        )).long_venue,
-                        short_venue=state.open_positions.get(pend_id, OpenPosition(
-                            position_id="", symbol="", long_venue=Venue.BINANCE,
-                            short_venue=Venue.OKX, long_quantity=0, short_quantity=0,
-                            long_entry_price=0, short_entry_price=0, opened_at_ms=0,
-                        )).short_venue,
-                        target_quantity=float(pdata.get("target_quantity", 0)),
-                        long_side=long_side,
-                        short_side=short_side,
-                        created_at_ms=int(pdata.get("created_at_ms", 0)),
-                        maker_order_id=str(pdata.get("maker_order_id", "")),
-                        hedge_order_id=str(pdata.get("hedge_order_id", "")),
-                        maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
-                        hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
-                        uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
-                    )
-
-        # Restore pending closes
-        close_dict = snap.get("pending_closes", {})
-        if isinstance(close_dict, dict):
-            for cid, cdata in close_dict.items():
-                if isinstance(cdata, dict):
-                    state.pending_closes[cid] = PendingClose(
-                        close_id=cdata.get("close_id", cid),
-                        position_id=cdata.get("position_id", ""),
-                        reason=cdata.get("reason", ""),
-                        created_at_ms=int(cdata.get("created_at_ms", 0)),
-                        long_order_id=str(cdata.get("long_order_id", "")),
-                        short_order_id=str(cdata.get("short_order_id", "")),
-                        long_uncertain=bool(cdata.get("long_uncertain", False)),
-                        short_uncertain=bool(cdata.get("short_uncertain", False)),
-                    )
+    # Replay journal records to catch events after last snapshot
+    journal_records = journal.read_all()
+    if journal_records:
+        _apply_journal_replay_to_state(state, journal_records)
 
     # Assess recovery needs
     recovery = build_recovery_snapshot(state)

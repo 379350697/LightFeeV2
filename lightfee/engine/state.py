@@ -144,4 +144,63 @@ class EngineState:
             "open_position_count": len(self.open_positions),
             "pending_entry_count": len(self.pending_entries),
             "pending_close_count": len(self.pending_closes),
+            "open_positions": {
+                pid: {
+                    "position_id": pos.position_id,
+                    "symbol": pos.symbol,
+                    "long_venue": pos.long_venue.value,
+                    "short_venue": pos.short_venue.value,
+                    "long_quantity": pos.long_quantity,
+                    "short_quantity": pos.short_quantity,
+                    "long_entry_price": pos.long_entry_price,
+                    "short_entry_price": pos.short_entry_price,
+                    "opened_at_ms": pos.opened_at_ms,
+                    "matched_quantity": pos.matched_quantity,
+                    "captured_funding_quote": pos.captured_funding_quote,
+                    "funding_captured": pos.funding_captured,
+                    "peak_net_quote": pos.peak_net_quote,
+                    "current_net_quote": pos.current_net_quote,
+                    "realized_price_pnl_quote": pos.realized_price_pnl_quote,
+                    "realized_exit_fee_quote": pos.realized_exit_fee_quote,
+                    "long_entry_fee_quote": pos.long_entry_fee_quote,
+                    "short_entry_fee_quote": pos.short_entry_fee_quote,
+                    "risk_delever_step_count": pos.risk_delever_step_count,
+                    "last_risk_reason": pos.last_risk_reason,
+                    "single_side_protection_triggered": pos.single_side_protection_triggered,
+                }
+                for pid, pos in self.open_positions.items()
+            },
+            "pending_entries": {
+                pid: {
+                    "pending_id": p.pending_id,
+                    "symbol": p.symbol,
+                    "long_venue": p.long_venue.value,
+                    "short_venue": p.short_venue.value,
+                    "target_quantity": p.target_quantity,
+                    "long_side": p.long_side.value,
+                    "short_side": p.short_side.value,
+                    "created_at_ms": p.created_at_ms,
+                    "maker_order_id": p.maker_order_id,
+                    "hedge_order_id": p.hedge_order_id,
+                    "maker_leg_filled": p.maker_leg_filled,
+                    "hedge_leg_filled": p.hedge_leg_filled,
+                    "uncertain_outcome": p.uncertain_outcome,
+                }
+                for pid, p in self.pending_entries.items()
+            },
+            "pending_closes": {
+                cid: {
+                    "close_id": c.close_id,
+                    "position_id": c.position_id,
+                    "reason": c.reason,
+                    "created_at_ms": c.created_at_ms,
+                    "long_order_id": c.long_order_id,
+                    "short_order_id": c.short_order_id,
+                    "long_closed": c.long_closed,
+                    "short_closed": c.short_closed,
+                    "long_uncertain": c.long_uncertain,
+                    "short_uncertain": c.short_uncertain,
+                }
+                for cid, c in self.pending_closes.items()
+            },
         }

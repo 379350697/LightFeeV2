@@ -296,11 +296,13 @@ class CloseExecutor:
         long_price_hint: float = 0.0,
         short_price_hint: float = 0.0,
         total_quantity: float | None = None,
+        state: Any | None = None,
     ) -> CloseExecution:
         """Execute a full close for an open position.
 
         Submits both legs (short=buy, long=sell) as reduce-only taker orders.
-        On partial fill, submits compensating orders.
+        When *state* is provided, writes back PnL attribution, matched quantity
+        updates, and manages PendingClose lifecycle for uncertain outcomes.
         """
         from lightfee.engine.exit import CloseExecution as CE
 
@@ -325,6 +327,8 @@ class CloseExecutor:
         # Submit short close first
         short_legs: list[CloseExecutionLeg] = []
         long_legs: list[CloseExecutionLeg] = []
+        short_uncertain = False
+        long_uncertain = False
 
         short_result = await self._submit_close_leg(
             short_req, position.position_id, "short", now_ms,
@@ -335,11 +339,12 @@ class CloseExecutor:
                 submit_started_at_ms=now_ms,
             ))
         elif short_result["outcome"] == "rejected":
-            # Short rejected — still try long to avoid leaving exposure
             self.journal.append(
                 "exit.short_rejected",
                 {"position_id": position.position_id, "reason": short_result.get("reason", "")},
             )
+        elif short_result["outcome"] == "uncertain":
+            short_uncertain = True
 
         long_result = await self._submit_close_leg(
             long_req, position.position_id, "long", now_ms,
@@ -349,6 +354,8 @@ class CloseExecutor:
                 fill=long_result["fill"],
                 submit_started_at_ms=now_ms,
             ))
+        elif long_result["outcome"] == "uncertain":
+            long_uncertain = True
 
         close = build_close_execution_from_legs(
             position, 1, short_legs, long_legs,
@@ -372,6 +379,13 @@ class CloseExecutor:
                 },
             )
 
+        # Write back to EngineState when available
+        if state is not None:
+            self._writeback_to_state(
+                state, position, close, long_closed, short_closed,
+                long_uncertain, short_uncertain, now_ms, reason,
+            )
+
         self.journal.append(
             "exit.completed",
             {
@@ -379,12 +393,79 @@ class CloseExecutor:
                 "reason": reason,
                 "long_closed_qty": long_closed,
                 "short_closed_qty": short_closed,
+                "long_uncertain": long_uncertain,
+                "short_uncertain": short_uncertain,
                 "price_pnl": close.realized_price_pnl_quote,
                 "net_quote": close.net_quote,
             },
         )
 
         return close
+
+    def _writeback_to_state(
+        self,
+        state: Any,
+        position: OpenPosition,
+        close: CloseExecution,
+        long_closed: float,
+        short_closed: float,
+        long_uncertain: bool,
+        short_uncertain: bool,
+        now_ms: int,
+        reason: str,
+    ) -> None:
+        """Write close execution results back into EngineState.
+
+        - Updates position PnL / quantity tracking
+        - Creates PendingClose for uncertain legs
+        - Removes fully-closed positions from open_positions
+        """
+        # Track partial close: update quantities
+        matched_closed = min(long_closed, short_closed)
+        position.matched_quantity = max(position.matched_quantity - matched_closed, 0.0)
+        position.long_quantity = max(position.long_quantity - long_closed, 0.0)
+        position.short_quantity = max(position.short_quantity - short_closed, 0.0)
+        position.realized_price_pnl_quote += close.realized_price_pnl_quote
+        position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+        position.current_net_quote += close.net_quote
+
+        # If any leg is uncertain, register a PendingClose for reconciliation
+        if long_uncertain or short_uncertain:
+            close_id = f"pending-close-{position.position_id}-{now_ms}"
+            state.pending_closes[close_id] = PendingClose(
+                close_id=close_id,
+                position_id=position.position_id,
+                reason=reason,
+                created_at_ms=now_ms,
+                long_order_id="",
+                short_order_id="",
+                long_closed=long_closed,
+                short_closed=short_closed,
+                long_uncertain=long_uncertain,
+                short_uncertain=short_uncertain,
+            )
+            self.journal.append(
+                "exit.pending_close_registered",
+                {
+                    "close_id": close_id,
+                    "position_id": position.position_id,
+                    "long_uncertain": long_uncertain,
+                    "short_uncertain": short_uncertain,
+                },
+            )
+
+        # Fully closed → remove from open positions
+        if position.matched_quantity < 1e-12:
+            state.open_positions.pop(position.position_id, None)
+            self.journal.append(
+                "exit.closed",
+                {
+                    "position_id": position.position_id,
+                    "reason": reason,
+                    "price_pnl": close.realized_price_pnl_quote,
+                    "net_quote": close.net_quote,
+                },
+            )
 
     async def _submit_close_leg(
         self,

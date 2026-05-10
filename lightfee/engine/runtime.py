@@ -186,6 +186,11 @@ class LiveRuntime:
             )
             return
 
+        # --- Build price lookup from snapshot quotes ---
+        price_hints: dict[str, float] = {}
+        for quote in snapshot.quotes:
+            price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0 if quote.bid > 0 and quote.ask > 0 else 0.0
+
         # --- Discover tradeable candidates ---
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
             tradeable = discover_tradeable_candidates(
@@ -197,10 +202,16 @@ class LiveRuntime:
                     {"count": len(tradeable), "ts_ms": now_ms},
                 )
                 # Dispatch first tradeable candidate to entry executor
-                await self._dispatch_entry(tradeable[0], now_ms)
+                # (V1 policy: one new entry per tick to avoid correlated fills)
+                mid_price = price_hints.get(tradeable[0].symbol, 0.0)
+                await self._dispatch_entry(tradeable[0], now_ms, price_hint=mid_price)
 
     async def tick_active_positions(self) -> None:
-        """Fast tick lane: active position monitoring (lighter than full tick)."""
+        """Fast tick lane: active position monitoring with risk supervision.
+
+        Evaluates risk for every open position and executes delever / protection
+        plans when conditions are met. This is the primary close-driving path.
+        """
         now_ms = wall_clock_now_ms()
         self.state.last_tick_ms = now_ms
         self.state.tick_count += 1
@@ -212,6 +223,24 @@ class LiveRuntime:
             "runtime.active_position_tick",
             {"position_count": len(self.state.open_positions), "ts_ms": now_ms},
         )
+
+        # --- Per-position risk supervision ---
+        for position in list(self.state.open_positions.values()):
+            plan = self.supervisor.supervise_position(
+                position, now_ms,
+                long_supports_risk_health=False,
+                short_supports_risk_health=False,
+            )
+            if plan is not None:
+                self.journal.append(
+                    "runtime.risk_plan_generated",
+                    {
+                        "position_id": position.position_id,
+                        "kind": plan.kind.value,
+                        "reason": plan.reason,
+                    },
+                )
+                await self.supervisor.execute_risk_plan(position, plan, now_ms)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -288,7 +317,7 @@ class LiveRuntime:
     # Entry dispatch
     # ------------------------------------------------------------------
 
-    async def _dispatch_entry(self, candidate, now_ms: int) -> None:
+    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> None:
         """Transform a tradeable candidate into an entry context and execute via entry_executor."""
         from lightfee.core.domain import Side, Venue
         from lightfee.engine.entry import EntryContext, EntryType
@@ -296,9 +325,9 @@ class LiveRuntime:
         # Resolve venue enums from candidate string fields
         long_venue = Venue.from_str(candidate.long_venue)
         short_venue = Venue.from_str(candidate.short_venue)
-        # Derive base quantity from notional and a default price assumption
-        default_price = 1.0  # will be refined by adapter; safe planning floor
-        quantity = max(candidate.entry_notional_quote / default_price, 0.0)
+        # Derive base quantity from notional and price; use price_hint from snapshot if available
+        effective_price = price_hint if price_hint > 0 else 1.0
+        quantity = candidate.entry_notional_quote / effective_price if candidate.entry_notional_quote > 0 else 0.0
 
         ctx = EntryContext(
             entry_id=f"entry-{now_ms}-{candidate.symbol}",
@@ -307,8 +336,8 @@ class LiveRuntime:
             short_venue=short_venue,
             long_quantity=quantity,
             short_quantity=quantity,
-            long_price_hint=0.0,
-            short_price_hint=0.0,
+            long_price_hint=effective_price,
+            short_price_hint=effective_price,
             maker_leg=Side.BUY,
             entry_type=EntryType.STANDARD_DUAL_TAKER,
             created_at_ms=now_ms,
