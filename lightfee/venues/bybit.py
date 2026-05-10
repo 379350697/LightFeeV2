@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
+from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
     OrderRequest,
@@ -9,18 +12,36 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.specs import bybit_spec
+from lightfee.venues.transport import LiveCredential, VenueTransport
 
 
-class BybitAdapter:
+class BybitAdapter(VenueAdapter):
+    """Bybit V5 unified account adapter."""
+
+    def __init__(
+        self,
+        mode: str = "paper",
+        credential: Optional[LiveCredential] = None,
+    ) -> None:
+        spec = bybit_spec()
+        self._transport = VenueTransport(spec=spec, mode=mode, credential=credential)
+
     @property
     def venue(self) -> Venue:
         return Venue.BYBIT
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
-        return VenueMarketSnapshot(venue=Venue.BYBIT, observed_at_ms=0)
+        return await self._transport.fetch_market_snapshot(symbols)
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
-        raise NotImplementedError("Bybit order placement requires live credentials")
+        return await self._transport.place_order(request)
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
-        raise NotImplementedError("Bybit position fetch requires live credentials")
+        return await self._transport.fetch_position(symbol)
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        return await self._transport.normalize_quantity(symbol, quantity)
+
+    async def shutdown(self) -> None:
+        await self._transport.close()

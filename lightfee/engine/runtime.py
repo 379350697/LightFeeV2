@@ -6,6 +6,8 @@ import asyncio
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
+from lightfee.core.contracts import VenueAdapter
+from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
     active_position_poll_interval_ms,
@@ -39,7 +41,7 @@ from lightfee.strategy.discovery import discover_tradeable_candidates
 class LiveRuntime:
     """Live trading runtime with multi-lane ticks and control-plane exports."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, venue_adapters: Optional[dict[Venue, VenueAdapter]] = None) -> None:
         self.config = config
         self.state = EngineState()
         self.journal = Journal(config.persistence.event_log_path)
@@ -47,10 +49,17 @@ class LiveRuntime:
         self.supervisor = Supervisor(config, self.state, self.journal)
         self._running = False
         self._export_state = ExportState()
+        self._venue_adapters = venue_adapters or {}
 
         # Tick-failure backoff deadlines (ms since epoch). None = no backoff active.
         self._tick_backoff_until_ms: Optional[int] = None
         self._active_tick_backoff_until_ms: Optional[int] = None
+
+    def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
+        return self._venue_adapters.get(venue)
+
+    def get_venue_adapters(self) -> dict[Venue, VenueAdapter]:
+        return dict(self._venue_adapters)
 
     # ------------------------------------------------------------------
     # Lifecycle

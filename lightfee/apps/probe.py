@@ -6,7 +6,7 @@ import argparse
 
 from lightfee.config.loader import load_config
 from lightfee.venues.base import VenueCapabilities
-from lightfee.venues.registry import all_live_perp_venues
+from lightfee.venues.registry import all_live_perp_venues, build_adapter_map
 
 
 def main() -> None:
@@ -25,4 +25,7 @@ def main() -> None:
 
     config = load_config(args.config)
     execute = args.execute
-    print(f"Probe {'exec' if execute else 'dry-run'} mode with {len(config.venues)} venues")
+    adapters = build_adapter_map(config)
+    print(f"Probe {'exec' if execute else 'dry-run'} mode: {len(adapters)} adapters from {len(config.venues)} config venues")
+    for venue, adapter in adapters.items():
+        print(f"  {venue.value}: adapter={type(adapter).__name__}")

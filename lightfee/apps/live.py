@@ -9,6 +9,7 @@ import signal
 
 from lightfee.config.loader import load_config
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.venues.registry import build_adapter_map
 
 logger = logging.getLogger("lightfee.live")
 
@@ -21,7 +22,13 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    runtime = LiveRuntime(config)
+    venue_adapters = build_adapter_map(config)
+    logger.info(
+        "built %d venue adapters: %s",
+        len(venue_adapters),
+        ",".join(v.value for v in venue_adapters),
+    )
+    runtime = LiveRuntime(config, venue_adapters=venue_adapters)
     loop = asyncio.new_event_loop()
 
     shutdown_requested = False

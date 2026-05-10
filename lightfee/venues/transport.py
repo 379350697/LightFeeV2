@@ -1,0 +1,759 @@
+"""Shared venue transport: HTTP client, auth signing, error classification."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import datetime
+import time
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Optional
+
+import httpx
+
+from lightfee.core.domain import (
+    OrderFill,
+    OrderRequest,
+    PositionSnapshot,
+    Side,
+    Venue,
+    VenueMarketQuote,
+    VenueMarketSnapshot,
+)
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.venues.common import normalize_venue_quantity
+from lightfee.venues.specs import AuthScheme, VenueSpec
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LiveCredential:
+    api_key: str = ""
+    api_secret: str = ""
+    api_passphrase: str = ""
+    wallet_private_key: str = ""
+    account_address: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+
+class TransportErrorCategory(Enum):
+    TRANSPORT_FAILURE = "transport_failure"
+    AUTH_FAILURE = "auth_failure"
+    AUTHORIZATION_FAILURE = "authorization_failure"
+    UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    REQUEST_REJECTED = "request_rejected"
+    ORDER_STATE_UNCERTAIN = "order_state_uncertain"
+    NORMALIZATION_FAILURE = "normalization_failure"
+
+
+class TransportError(Exception):
+    def __init__(self, category: TransportErrorCategory, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+def classify_transport_error(
+    status_code: int, body: str
+) -> Optional[TransportErrorCategory]:
+    if 200 <= status_code < 300:
+        return None
+    if status_code == 401:
+        return TransportErrorCategory.AUTH_FAILURE
+    if status_code == 403:
+        return TransportErrorCategory.AUTHORIZATION_FAILURE
+    if status_code == 400:
+        return TransportErrorCategory.REQUEST_REJECTED
+    if status_code in (429, 502, 503, 504):
+        return TransportErrorCategory.TRANSPORT_FAILURE
+    if status_code >= 500:
+        return TransportErrorCategory.TRANSPORT_FAILURE
+    return TransportErrorCategory.TRANSPORT_FAILURE
+
+
+def _map_to_submit_error(
+    category: TransportErrorCategory, message: str
+) -> OrderSubmitError:
+    if category in (
+        TransportErrorCategory.AUTH_FAILURE,
+        TransportErrorCategory.AUTHORIZATION_FAILURE,
+        TransportErrorCategory.REQUEST_REJECTED,
+        TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+        TransportErrorCategory.NORMALIZATION_FAILURE,
+    ):
+        return OrderSubmitError(SubmitFailureClass.REJECTED, message)
+    return OrderSubmitError(SubmitFailureClass.UNCERTAIN, message)
+
+
+# ---------------------------------------------------------------------------
+# Signing helpers
+# ---------------------------------------------------------------------------
+
+
+def build_hmac_sha256_hex(secret: str, payload: str) -> str:
+    mac = hmac.new(secret.encode(), payload.encode(), hashlib.sha256)
+    return mac.hexdigest()
+
+
+def build_hmac_sha256_base64(secret: str, payload: str) -> str:
+    mac = hmac.new(secret.encode(), payload.encode(), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
+
+
+def _iso8601_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
+        str(datetime.datetime.now(datetime.timezone.utc).microsecond // 1000).zfill(3)
+    ) + "Z"
+
+
+def build_hmac_sha512_hex(secret: str, payload: str) -> str:
+    mac = hmac.new(secret.encode(), payload.encode(), hashlib.sha512)
+    return mac.hexdigest()
+
+
+def _sign_payload(scheme: AuthScheme, secret: str, payload: str) -> str:
+    if scheme == AuthScheme.HMAC_SHA256_HEX:
+        return build_hmac_sha256_hex(secret, payload)
+    if scheme == AuthScheme.HMAC_SHA256_BASE64:
+        return build_hmac_sha256_base64(secret, payload)
+    if scheme == AuthScheme.HMAC_SHA512_HEX:
+        return build_hmac_sha512_hex(secret, payload)
+    raise ValueError(f"unsupported auth scheme: {scheme}")
+
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
+
+class VenueTransport:
+    """Shared async transport that owns HTTP lifecycle, auth, and error mapping."""
+
+    def __init__(
+        self,
+        spec: VenueSpec,
+        mode: str = "paper",
+        credential: Optional[LiveCredential] = None,
+    ) -> None:
+        self._spec = spec
+        self.mode = mode
+        self._credential = credential
+        self._client: Optional[httpx.AsyncClient] = None
+
+        if mode == "live":
+            self._validate_live_credentials(credential)
+
+    @property
+    def venue(self) -> Venue:
+        return self._spec.venue_id
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0),
+                limits=httpx.Limits(max_keepalive_connections=4),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    # ------------------------------------------------------------------
+    # Credential validation
+    # ------------------------------------------------------------------
+
+    def _validate_live_credentials(self, credential: Optional[LiveCredential]) -> None:
+        if credential is None:
+            raise ValueError(
+                f"live mode requires credentials for {self._spec.venue_id.value}"
+            )
+        if not credential.api_key:
+            raise ValueError(
+                f"live mode requires api_key for {self._spec.venue_id.value}"
+            )
+        if not credential.api_secret:
+            raise ValueError(
+                f"live mode requires api_secret for {self._spec.venue_id.value}"
+            )
+        if self._spec.requires_passphrase and not credential.api_passphrase:
+            raise ValueError(
+                f"live mode requires passphrase for {self._spec.venue_id.value}"
+            )
+        if self._spec.requires_wallet_key and not credential.wallet_private_key:
+            raise ValueError(
+                f"live mode requires wallet_private_key for {self._spec.venue_id.value}"
+            )
+
+    # ------------------------------------------------------------------
+    # Auth header construction
+    # ------------------------------------------------------------------
+
+    def _build_auth_headers(
+        self,
+        method: str,
+        path: str,
+        query_string: str = "",
+        body: str = "",
+    ) -> dict[str, str]:
+        spec = self._spec
+        cred = self._credential
+
+        if cred is None:
+            return {}
+
+        headers: dict[str, str] = {}
+
+        # --- EIP712 (Hyperliquid) ---
+        if spec.auth_scheme == AuthScheme.EIP712:
+            headers["Content-Type"] = "application/json"
+            return headers
+
+        # --- Binance / Aster: query-string signature ---
+        if spec.signature_param:
+            ts = str(int(time.time() * 1000))
+            payload = query_string.lstrip("?") if query_string else ""
+            if spec.timestamp_param and spec.timestamp_param not in (payload or ""):
+                ts_param = f"{spec.timestamp_param}={ts}"
+                payload = f"{ts_param}&{payload}" if payload else ts_param
+            headers[spec.api_key_header] = cred.api_key
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, payload)
+            # signature is added to query params in _build_signed_request
+            return headers
+
+        # --- Gate: HMAC-SHA512 with body hash, seconds timestamp, newline payload ---
+        if spec.auth_scheme == AuthScheme.HMAC_SHA512_HEX:
+            import hashlib as _hashlib
+            ts = str(int(time.time()))
+            body_hash = _hashlib.sha512((body or "").encode()).hexdigest()
+            sign_payload = f"{method.upper()}\n{path}\n{query_string.lstrip('?')}\n{body_hash}\n{ts}"
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers["KEY"] = cred.api_key
+            headers["Timestamp"] = ts
+            headers["SIGN"] = sig
+            headers["Content-Type"] = "application/json"
+            headers["X-Gate-Size-Decimal"] = "1"
+            return headers
+
+        # --- Bitget: timestamp + METHOD + request_path + body ---
+        if spec.auth_scheme == AuthScheme.HMAC_SHA256_BASE64 and spec.requires_passphrase:
+            ts = str(int(time.time() * 1000))
+            request_path = f"{path}?{query_string.lstrip('?')}" if query_string else path
+            sign_payload = ts + method.upper() + request_path + (body or "")
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers["ACCESS-KEY"] = cred.api_key
+            headers["ACCESS-SIGN"] = sig
+            headers["ACCESS-TIMESTAMP"] = ts
+            headers["ACCESS-PASSPHRASE"] = cred.api_passphrase
+            headers["Content-Type"] = "application/json"
+            headers["locale"] = "en-US"
+            return headers
+
+        # --- Header-based signature (OKX, Bybit) ---
+        if spec.signature_header:
+            if spec.use_iso8601_timestamp:
+                ts = _iso8601_now()
+            else:
+                ts = str(int(time.time() * 1000))
+
+            headers[spec.api_key_header] = cred.api_key
+            headers[spec.timestamp_header] = ts
+
+            if spec.requires_passphrase and spec.passphrase_header:
+                headers[spec.passphrase_header] = cred.api_passphrase
+
+            if spec.recv_window_header:
+                headers[spec.recv_window_header] = "5000"
+
+            # OKX style: ts + method + path + body
+            if spec.use_iso8601_timestamp:
+                sign_payload = ts + method.upper() + path + (body or "")
+            else:
+                # Bybit style: ts + api_key + recv_window + body
+                recv = headers.get(spec.recv_window_header, "5000")
+                sign_payload = ts + cred.api_key + recv + (body or "")
+
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers[spec.signature_header] = sig
+
+        return headers
+
+    def _build_signed_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, dict[str, str], Optional[str]]:
+        spec = self._spec
+        query_string = ""
+        req_body: Optional[str] = None
+
+        if params:
+            # For Binance/Aster style, timestamp + signature go into query params
+            if spec.signature_param:
+                ts = str(int(time.time() * 1000))
+                if spec.timestamp_param:
+                    params[spec.timestamp_param] = ts
+                if self._credential:
+                    encoded = "&".join(
+                        f"{k}={v}" for k, v in sorted(params.items())
+                    )
+                    sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
+                    params[spec.signature_param] = sig
+                query_string = "?" + "&".join(
+                    f"{k}={v}" for k, v in sorted(params.items())
+                )
+            else:
+                query_parts = []
+                for k, v in sorted((params or {}).items()):
+                    query_parts.append(f"{k}={v}")
+                if query_parts:
+                    query_string = "?" + "&".join(query_parts)
+
+        if body is not None:
+            req_body = json.dumps(body)
+
+        headers = self._build_auth_headers(method, path, query_string, req_body or "")
+        if req_body and "Content-Type" not in headers:
+            headers["Content-Type"] = "application/json"
+
+        return query_string, headers, req_body
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        client = await self._get_client()
+        base_url = (
+            self._spec.private_base_url
+            if method.upper() == "POST"
+            else self._spec.public_base_url
+        )
+        qs, headers, req_body = self._build_signed_request(method, path, params, body)
+        url = base_url + path + qs
+
+        try:
+            if method.upper() == "GET":
+                resp = await client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                resp = await client.post(url, headers=headers, content=req_body)
+            elif method.upper() == "DELETE":
+                resp = await client.delete(url, headers=headers)
+            else:
+                raise ValueError(f"unsupported HTTP method: {method}")
+
+            if resp.status_code >= 400:
+                cat = classify_transport_error(resp.status_code, resp.text)
+                if cat:
+                    raise TransportError(cat, f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+            if not resp.text:
+                return {}
+            return resp.json()
+        except httpx.TimeoutException:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"timeout: {method} {path}",
+            )
+        except httpx.NetworkError as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"network error: {method} {path}: {e}",
+            )
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"unexpected error: {method} {path}: {e}",
+            )
+
+    # ------------------------------------------------------------------
+    # Market snapshot
+    # ------------------------------------------------------------------
+
+    async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
+        spec = self._spec
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            quotes = tuple(
+                VenueMarketQuote(
+                    symbol=self._venue_symbol(sym),
+                    bid=0.0,
+                    ask=0.0,
+                )
+                for sym in symbols
+            )
+            return VenueMarketSnapshot(
+                venue=spec.venue_id,
+                observed_at_ms=now_ms,
+                quotes=quotes,
+            )
+
+        # Live path: call the venue market endpoint
+        try:
+            raw = await self._request("GET", spec.market_snapshot_path)
+            return self._parse_market_snapshot(raw, symbols, now_ms)
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"market snapshot failed: {e}",
+            )
+
+    def _parse_market_snapshot(
+        self, raw: dict[str, Any], symbols: list[str], now_ms: int
+    ) -> VenueMarketSnapshot:
+        spec = self._spec
+        quotes: list[VenueMarketQuote] = []
+
+        if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+            # Response is a list or single dict of {symbol, bidPrice, askPrice, ...}
+            items = raw if isinstance(raw, list) else [raw]
+            for item in items:
+                sym = item.get("symbol", "")
+                if sym:
+                    quotes.append(
+                        VenueMarketQuote(
+                            symbol=sym,
+                            bid=float(item.get("bidPrice", 0)),
+                            ask=float(item.get("askPrice", 0)),
+                            bid_size=float(item.get("bidQty", 0)),
+                            ask_size=float(item.get("askQty", 0)),
+                        )
+                    )
+        elif spec.venue_id in (Venue.OKX, Venue.BYBIT):
+            data = raw.get("data", raw)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                sym = item.get("instId", item.get("symbol", ""))
+                if sym:
+                    quotes.append(
+                        VenueMarketQuote(
+                            symbol=sym,
+                            bid=float(item.get("bidPx", item.get("bid1Price", 0))),
+                            ask=float(item.get("askPx", item.get("ask1Price", 0))),
+                            bid_size=float(item.get("bidSz", item.get("bid1Size", 0))),
+                            ask_size=float(item.get("askSz", item.get("ask1Size", 0))),
+                        )
+                    )
+        elif spec.venue_id == Venue.BITGET:
+            data = raw.get("data", raw)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                sym = item.get("symbol", "")
+                if sym:
+                    quotes.append(
+                        VenueMarketQuote(
+                            symbol=sym,
+                            bid=float(item.get("bestBid", 0)),
+                            ask=float(item.get("bestAsk", 0)),
+                        )
+                    )
+        elif spec.venue_id == Venue.GATE:
+            items = raw if isinstance(raw, list) else [raw]
+            for item in items:
+                sym = item.get("contract", "")
+                if sym:
+                    quotes.append(
+                        VenueMarketQuote(
+                            symbol=sym,
+                            bid=float(item.get("mark_price", 0)),
+                            ask=float(item.get("mark_price", 0)),
+                        )
+                    )
+        elif spec.venue_id == Venue.HYPERLIQUID:
+            # Info API returns differently structured data
+            if isinstance(raw, list):
+                for item in raw:
+                    quotes.append(
+                        VenueMarketQuote(
+                            symbol=item.get("name", item.get("coin", "")),
+                            bid=float(item.get("markPx", 0)),
+                            ask=float(item.get("markPx", 0)),
+                        )
+                    )
+
+        return VenueMarketSnapshot(
+            venue=spec.venue_id,
+            observed_at_ms=now_ms,
+            quotes=tuple(quotes),
+        )
+
+    # ------------------------------------------------------------------
+    # Position fetch
+    # ------------------------------------------------------------------
+
+    async def fetch_position(self, symbol: str) -> PositionSnapshot:
+        spec = self._spec
+        venue_sym = self._venue_symbol(symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            return PositionSnapshot(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=now_ms,
+            )
+
+        try:
+            params: dict[str, Any] = {}
+            if spec.venue_id == Venue.BITGET:
+                params["symbol"] = venue_sym
+                params["marginCoin"] = "USDT"
+            elif spec.venue_id == Venue.BYBIT:
+                params["category"] = "linear"
+                params["symbol"] = venue_sym
+            elif spec.venue_id == Venue.OKX:
+                params["instId"] = venue_sym
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                body = {"type": "clearinghouseState", "user": self._credential.account_address if self._credential else ""}
+                raw = await self._request("POST", spec.position_path, body=body)
+                return self._parse_position(raw, venue_sym, now_ms)
+
+            raw = await self._request("GET", spec.position_path, params=params)
+            return self._parse_position(raw, venue_sym, now_ms)
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"position fetch failed: {e}",
+            )
+
+    def _parse_position(
+        self, raw: dict[str, Any], symbol: str, now_ms: int
+    ) -> PositionSnapshot:
+        spec = self._spec
+        data = raw
+
+        if isinstance(raw, dict):
+            if "data" in raw and isinstance(raw["data"], dict):
+                data = raw["data"]
+            elif "data" in raw and isinstance(raw["data"], list) and raw["data"]:
+                data = raw["data"][0]
+            elif "result" in raw and isinstance(raw["result"], list) and raw["result"]:
+                data = raw["result"][0]
+
+        if spec.venue_id == Venue.HYPERLIQUID:
+            # Parse from clearinghouse state
+            positions = data.get("assetPositions", [])
+            for p in positions:
+                pos_sym = p.get("position", {}).get("coin", "")
+                if pos_sym == symbol or not symbol:
+                    return PositionSnapshot(
+                        venue=spec.venue_id,
+                        symbol=pos_sym or symbol,
+                        side=Side.BUY if float(p.get("position", {}).get("szi", 0)) > 0 else Side.SELL,
+                        quantity=abs(float(p.get("position", {}).get("szi", 0))),
+                        entry_price=float(p.get("position", {}).get("entryPx", 0)),
+                        observed_at_ms=now_ms,
+                    )
+            return PositionSnapshot(
+                venue=spec.venue_id,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=now_ms,
+            )
+
+        # Generic position parsing
+        pos_side_str = str(data.get("positionSide", data.get("posSide", "LONG"))).upper()
+        if "SHORT" in pos_side_str:
+            side = Side.SELL
+        else:
+            side = Side.BUY
+
+        qty_raw = data.get("positionAmt", data.get("pos", data.get("size", data.get("volume", "0"))))
+        qty = abs(float(qty_raw)) if qty_raw else 0.0
+
+        entry_price = float(data.get("entryPrice", data.get("avgPx", data.get("openPriceAvg", 0))))
+
+        return PositionSnapshot(
+            venue=spec.venue_id,
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            entry_price=entry_price,
+            observed_at_ms=now_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Order placement
+    # ------------------------------------------------------------------
+
+    async def place_order(self, request: OrderRequest) -> OrderFill:
+        spec = self._spec
+        venue_sym = self._venue_symbol(request.symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            order_id = str(uuid.uuid4()).replace("-", "")[:20]
+            return OrderFill(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=request.side,
+                quantity=request.quantity,
+                price=request.price or 0.0,
+                order_id=order_id,
+                client_order_id=request.client_order_id,
+                filled_at_ms=now_ms,
+            )
+
+        try:
+            body: dict[str, Any] = {
+                "symbol": venue_sym,
+                "side": request.side.value.upper(),
+                "quantity": str(request.quantity),
+            }
+
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                body["type"] = "MARKET"
+                if request.reduce_only:
+                    body["reduceOnly"] = "true"
+                if request.price is not None:
+                    body["type"] = "LIMIT"
+                    body["price"] = str(request.price)
+                    body["timeInForce"] = "GTC"
+            elif spec.venue_id == Venue.OKX:
+                body["instId"] = venue_sym
+                body["tdMode"] = "cross"
+                body["ordType"] = "market"
+                if request.reduce_only:
+                    body["reduceOnly"] = "true"
+            elif spec.venue_id == Venue.BYBIT:
+                body["category"] = "linear"
+                body["orderType"] = "Market"
+                if request.reduce_only:
+                    body["reduceOnly"] = "true"
+            elif spec.venue_id == Venue.BITGET:
+                body["marginCoin"] = "USDT"
+                body["orderType"] = "market"
+                if request.reduce_only:
+                    body["reduceOnly"] = "true"
+            elif spec.venue_id == Venue.GATE:
+                body["contract"] = venue_sym
+                body["size"] = int(request.quantity)
+                if request.reduce_only:
+                    body["reduce_only"] = True
+                if request.price is not None:
+                    body["price"] = str(request.price)
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                is_buy = request.side == Side.BUY
+                body = {
+                    "action": {
+                        "type": "order",
+                        "orders": [{
+                            "asset": venue_sym,
+                            "isBuy": is_buy,
+                            "reduceOnly": request.reduce_only,
+                            "limitPx": str(request.price) if request.price else "0",
+                            "orderType": {"limit": {"tif": "Gtc"}} if request.price else {"market": {}},
+                            "sz": str(request.quantity),
+                        }],
+                    },
+                    "type": "order",
+                }
+                if self._credential and self._credential.account_address:
+                    body["action"]["grouping"] = "na"
+                    body["vaultAddress"] = self._credential.account_address
+
+            raw = await self._request("POST", spec.order_path, body=body)
+            return self._parse_order_fill(raw, request, venue_sym, now_ms)
+
+        except TransportError as e:
+            if e.category == TransportErrorCategory.REQUEST_REJECTED:
+                raise _map_to_submit_error(e.category, str(e))
+            raise _map_to_submit_error(e.category, str(e))
+        except OrderSubmitError:
+            raise
+        except Exception as e:
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
+
+    def _parse_order_fill(
+        self,
+        raw: dict[str, Any],
+        request: OrderRequest,
+        venue_sym: str,
+        now_ms: int,
+    ) -> OrderFill:
+        spec = self._spec
+        data = raw.get("data", raw)
+
+        if isinstance(data, dict):
+            pass
+        elif isinstance(data, list) and data:
+            data = data[0]
+
+        if isinstance(data, dict):
+            order_id = str(data.get("orderId", data.get("ordId", data.get("order_id", ""))))
+            exec_qty = float(data.get("executedQty", data.get("cumQty", data.get("filledQty", data.get("filled_size", request.quantity)))))
+            exec_price = float(data.get("avgPrice", data.get("fillPx", data.get("price", request.price or 0.0))))
+        else:
+            order_id = str(uuid.uuid4()).replace("-", "")[:20]
+            exec_qty = request.quantity
+            exec_price = request.price or 0.0
+
+        return OrderFill(
+            venue=spec.venue_id,
+            symbol=venue_sym,
+            side=request.side,
+            quantity=exec_qty,
+            price=exec_price,
+            order_id=order_id,
+            client_order_id=request.client_order_id,
+            filled_at_ms=now_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Quantity normalization
+    # ------------------------------------------------------------------
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        spec = self._spec
+        return normalize_venue_quantity(
+            quantity=quantity,
+            step_size=spec.quantity_step,
+            contract_size=spec.contract_size,
+            min_quantity=spec.min_quantity,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _venue_symbol(self, symbol: str) -> str:
+        spec = self._spec
+        if spec.symbol_to_venue is not None:
+            return spec.symbol_to_venue(symbol)
+        return symbol
