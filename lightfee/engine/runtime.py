@@ -55,6 +55,13 @@ class LiveRuntime:
         self._tick_backoff_until_ms: Optional[int] = None
         self._active_tick_backoff_until_ms: Optional[int] = None
 
+        # V1 entry executor — set after construction or defaults to None
+        self.entry_executor: Optional[object] = None
+        # V1 close executor — set after construction or defaults to None
+        self.close_executor: Optional[object] = None
+        # V1 reconciliation service — set after construction or defaults to None
+        self.reconciler: Optional[object] = None
+
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._venue_adapters.get(venue)
 
@@ -89,17 +96,41 @@ class LiveRuntime:
         if self.state.started_at_ms == 0:
             self.state.started_at_ms = wall_clock_now_ms()
 
-        # Phase 4 – RECONCILING → RUNNING
-        if self.state.lifecycle in (EngineLifecycle.BOOTING, EngineLifecycle.RECONCILING):
+        # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
+        from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
+
+        recovery_class = classify_startup_recovery_state(self.state)
+
+        if recovery_class == "clean":
+            # No recovery work → safe to run immediately
+            set_lifecycle(self.state, EngineLifecycle.RUNNING)
+            self.journal.append(
+                "runtime.running",
+                {"reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms()},
+            )
+        elif recovery_class == "recovery_needed":
+            # Has open positions or pending work → stay in RECONCILING
             transition_to_reconciling(self.state)
             self.journal.append(
                 "runtime.reconciling",
-                {"reason": "startup_recovery", "ts_ms": wall_clock_now_ms()},
+                {
+                    "reason": "startup_recovery_required",
+                    "open_positions": len(self.state.open_positions),
+                    "pending_entries": len(self.state.pending_entries),
+                    "pending_closes": len(self.state.pending_closes),
+                    "ts_ms": wall_clock_now_ms(),
+                },
             )
-            transition_to_running(self.state)
+        else:
+            # fail_closed — preserve the recovered state
             self.journal.append(
-                "runtime.running",
-                {"ts_ms": wall_clock_now_ms()},
+                "runtime.recovery_blocked",
+                {
+                    "reason": "startup_fail_closed",
+                    "lifecycle": self.state.lifecycle.value,
+                    "risk_mode": self.state.risk_mode.value,
+                    "ts_ms": wall_clock_now_ms(),
+                },
             )
 
         self.journal.append(
@@ -156,7 +187,7 @@ class LiveRuntime:
             return
 
         # --- Discover tradeable candidates ---
-        if can_enter_new_positions(self.state):
+        if can_enter_new_positions(self.state) and self.entry_executor is not None:
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
             )
@@ -165,6 +196,8 @@ class LiveRuntime:
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
                 )
+                # Dispatch first tradeable candidate to entry executor
+                await self._dispatch_entry(tradeable[0], now_ms)
 
     async def tick_active_positions(self) -> None:
         """Fast tick lane: active position monitoring (lighter than full tick)."""
@@ -250,6 +283,59 @@ class LiveRuntime:
     # ------------------------------------------------------------------
     # Backoff
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Entry dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch_entry(self, candidate, now_ms: int) -> None:
+        """Transform a tradeable candidate into an entry context and execute via entry_executor."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.entry import EntryContext, EntryType
+
+        # Resolve venue enums from candidate string fields
+        long_venue = Venue.from_str(candidate.long_venue)
+        short_venue = Venue.from_str(candidate.short_venue)
+        # Derive base quantity from notional and a default price assumption
+        default_price = 1.0  # will be refined by adapter; safe planning floor
+        quantity = max(candidate.entry_notional_quote / default_price, 0.0)
+
+        ctx = EntryContext(
+            entry_id=f"entry-{now_ms}-{candidate.symbol}",
+            symbol=candidate.symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            long_quantity=quantity,
+            short_quantity=quantity,
+            long_price_hint=0.0,
+            short_price_hint=0.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            created_at_ms=now_ms,
+        )
+
+        try:
+            result = await self.entry_executor.execute(ctx)
+            self.journal.append(
+                "runtime.entry_dispatched",
+                {
+                    "entry_id": ctx.entry_id,
+                    "symbol": candidate.symbol,
+                    "route": result.route.value,
+                    "state": result.state.value,
+                },
+            )
+            if result.open_position is not None:
+                self.state.open_positions[result.open_position.position_id] = result.open_position
+                self.journal.append(
+                    "runtime.position_opened",
+                    {"position_id": result.open_position.position_id},
+                )
+        except Exception as e:
+            self.journal.append(
+                "runtime.entry_dispatch_error",
+                {"entry_id": ctx.entry_id, "error": str(e)},
+            )
 
     def _apply_tick_backoff(self, is_active: bool) -> None:
         """Apply incremental tick-failure backoff from config floors / caps."""

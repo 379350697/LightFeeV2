@@ -66,7 +66,8 @@ class TestLifecycle:
 
 
 class TestRecovery:
-    def test_empty_snapshot_starts_reconciling(self):
+    def test_empty_snapshot_starts_running(self):
+        """Rust V1: clean startup with no snapshot and no positions → RUNNING."""
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "events.jsonl"
             snap_path = Path(td) / "state.json"
@@ -77,7 +78,7 @@ class TestRecovery:
 
             snap = SnapshotStore(snap_path)
             state = recover_from_snapshot(snap, journal)
-            assert state.lifecycle == EngineLifecycle.RECONCILING
+            assert state.lifecycle == EngineLifecycle.RUNNING
 
     def test_recovery_snapshot_no_positions(self):
         state = EngineState()

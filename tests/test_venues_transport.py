@@ -26,6 +26,7 @@ from lightfee.venues.common import (
     normalize_order_quantity,
     venue_reduce_only_close_exempts_min_notional,
 )
+from lightfee.venues.base import VenueAccountContract
 from lightfee.venues.specs import (
     AuthScheme,
     VenueSpec,
@@ -1006,6 +1007,355 @@ class TestPositionSideParsing:
 # ---------------------------------------------------------------------------
 # Ack-only order response MUST NOT return fake fill (Fix 6)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# OKX / Bybit GET signing with query string (Fix 1 + Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestOkxGetSigningWithQueryString:
+    """OKX GET must include query string in signature payload.
+
+    Rust V1 source: src/live/okx.rs::signed_request()
+    sign_payload = timestamp + method + request_path(including ?query) + body
+    """
+
+    def test_okx_get_fetch_position_sign_payload_contains_query(self):
+        from lightfee.venues.transport import _sign_payload
+        spec = okx_spec()
+        cred = LiveCredential(api_key="okx-k", api_secret="okx-s",
+                              api_passphrase="okx-p")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        qs, headers, body = transport._build_signed_request(
+            "GET", "/api/v5/account/positions",
+            params={"instId": "BTC-USDT-SWAP"},
+        )
+        # Verify query string is in the URL
+        assert "instId=BTC-USDT-SWAP" in qs
+        # Verify signature header exists
+        assert headers.get("OK-ACCESS-SIGN")
+        # Recompute signature to verify payload includes query
+        sign = headers["OK-ACCESS-SIGN"]
+        ts = headers["OK-ACCESS-TIMESTAMP"]
+        expected_payload = ts + "GET" + "/api/v5/account/positions" + qs
+        expected_sig = _sign_payload(spec.auth_scheme, "okx-s", expected_payload)
+        assert sign == expected_sig, (
+            f"OKX GET signature mismatch.\n"
+            f"  Payload: {expected_payload!r}\n"
+            f"  Expected: {expected_sig}\n"
+            f"  Got: {sign}"
+        )
+
+    def test_okx_get_without_query_string_still_signs_correctly(self):
+        from lightfee.venues.transport import _sign_payload
+        spec = okx_spec()
+        cred = LiveCredential(api_key="okx-k", api_secret="okx-s",
+                              api_passphrase="okx-p")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        qs, headers, body = transport._build_signed_request(
+            "GET", "/api/v5/account/config",
+        )
+        sign = headers["OK-ACCESS-SIGN"]
+        ts = headers["OK-ACCESS-TIMESTAMP"]
+        expected_payload = ts + "GET" + "/api/v5/account/config"
+        expected_sig = _sign_payload(spec.auth_scheme, "okx-s", expected_payload)
+        assert sign == expected_sig
+
+    def test_okx_post_sign_payload_uses_body_not_query(self):
+        from lightfee.venues.transport import _sign_payload
+        spec = okx_spec()
+        cred = LiveCredential(api_key="okx-k", api_secret="okx-s",
+                              api_passphrase="okx-p")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        qs, headers, body = transport._build_signed_request(
+            "POST", "/api/v5/trade/order",
+            body={"instId": "BTC-USDT-SWAP", "tdMode": "cross",
+                  "side": "buy", "ordType": "market", "sz": "1"},
+        )
+        sign = headers["OK-ACCESS-SIGN"]
+        ts = headers["OK-ACCESS-TIMESTAMP"]
+        expected_payload = ts + "POST" + "/api/v5/trade/order" + (body or "")
+        expected_sig = _sign_payload(spec.auth_scheme, "okx-s", expected_payload)
+        assert sign == expected_sig
+
+
+class TestBybitGetSigningWithQueryString:
+    """Bybit V5 GET must sign query_string (without leading '?') as payload.
+
+    Rust V1 source: src/live/bybit.rs::signed_request()
+    sign_payload = timestamp + api_key + recv_window + query_or_body
+    """
+
+    def test_bybit_get_fetch_position_sign_payload_contains_query(self):
+        from lightfee.venues.transport import _sign_payload
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        qs, headers, body = transport._build_signed_request(
+            "GET", "/v5/position/list",
+            params={"category": "linear", "symbol": "BTCUSDT"},
+        )
+        assert headers.get("X-BAPI-SIGN")
+        sign = headers["X-BAPI-SIGN"]
+        ts = headers["X-BAPI-TIMESTAMP"]
+        recv = headers.get("X-BAPI-RECV-WINDOW", "5000")
+        # Bybit signs: timestamp + api_key + recv_window + query_without_question_mark
+        expected_payload = ts + "bybit-k" + recv + qs.lstrip("?")
+        expected_sig = _sign_payload(spec.auth_scheme, "bybit-s", expected_payload)
+        assert sign == expected_sig, (
+            f"Bybit GET signature mismatch.\n"
+            f"  Payload: {expected_payload!r}\n"
+            f"  Expected: {expected_sig}\n"
+            f"  Got: {sign}"
+        )
+
+    def test_bybit_post_sign_payload_uses_body(self):
+        from lightfee.venues.transport import _sign_payload
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        qs, headers, body = transport._build_signed_request(
+            "POST", "/v5/order/create",
+            body={"category": "linear", "symbol": "BTCUSDT",
+                  "side": "Buy", "orderType": "Market", "qty": "0.01"},
+        )
+        sign = headers["X-BAPI-SIGN"]
+        ts = headers["X-BAPI-TIMESTAMP"]
+        recv = headers.get("X-BAPI-RECV-WINDOW", "5000")
+        expected_payload = ts + "bybit-k" + recv + (body or "")
+        expected_sig = _sign_payload(spec.auth_scheme, "bybit-s", expected_payload)
+        assert sign == expected_sig
+
+    def test_bybit_get_query_params_sorted_consistently(self):
+        """Query params must be sorted alphabetically for signature consistency."""
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport1 = VenueTransport(spec=spec, mode="live", credential=cred)
+        transport2 = VenueTransport(spec=spec, mode="live", credential=cred)
+        # Same params in different order should produce same signature
+        _qh1, h1, _b1 = transport1._build_signed_request(
+            "GET", "/v5/position/list",
+            params={"symbol": "BTCUSDT", "category": "linear"},
+        )
+        _qh2, h2, _b2 = transport2._build_signed_request(
+            "GET", "/v5/position/list",
+            params={"category": "linear", "symbol": "BTCUSDT"},
+        )
+        assert h1["X-BAPI-SIGN"] == h2["X-BAPI-SIGN"], (
+            "Bybit signature should be invariant to param dict order"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Private GET base_url selection (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateGetBaseUrl:
+    """Private GET endpoints (position fetch, profile probe) must use private_base_url."""
+
+    def test_private_get_uses_private_base_url(self):
+        """When private=True, private_base_url is used regardless of HTTP method."""
+        spec = VenueSpec(
+            venue_id=Venue.ASTER,
+            public_base_url="https://public.example.com",
+            private_base_url="https://private.example.com",
+            auth_scheme=AuthScheme.HMAC_SHA256_HEX,
+            account_contract=VenueAccountContract.SINGLE_OR_MULTI_ASSET,
+            api_key_header="X-MBX-APIKEY",
+            signature_param="signature",
+            timestamp_param="timestamp",
+            market_snapshot_path="/public/tickers",
+            position_path="/private/position",
+            order_path="/private/order",
+        )
+        cred = LiveCredential(api_key="k", api_secret="s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+
+        qs_p, headers_p, body_p = transport._build_signed_request(
+            "GET", "/private/position",
+            params={"symbol": "BTCUSDT"},
+        )
+        assert spec.private_base_url == "https://private.example.com"
+        assert spec.public_base_url == "https://public.example.com"
+        assert spec.private_base_url != spec.public_base_url, (
+            "private_base_url differs from public_base_url for this test"
+        )
+
+    def test_public_get_uses_public_base_url(self):
+        """Market data GET (without private flag) uses public_base_url."""
+        spec = VenueSpec(
+            venue_id=Venue.ASTER,
+            public_base_url="https://public.example.com",
+            private_base_url="https://private.example.com",
+            auth_scheme=AuthScheme.HMAC_SHA256_HEX,
+            account_contract=VenueAccountContract.SINGLE_OR_MULTI_ASSET,
+            api_key_header="X-MBX-APIKEY",
+            signature_param="signature",
+            timestamp_param="timestamp",
+            market_snapshot_path="/public/tickers",
+            position_path="/private/position",
+            order_path="/private/order",
+        )
+        cred = LiveCredential(api_key="k", api_secret="s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+
+        assert spec.public_base_url == "https://public.example.com"
+        assert spec.private_base_url == "https://private.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Position side parsing — short/sell/long/buy across venues (Fix 5)
+# ---------------------------------------------------------------------------
+
+
+class TestPositionSideParsing:
+    """Position side must recognize SHORT, SELL, short, sell, SHORT_SIDE,
+    LONG, BUY, long, buy, and negative quantity fields."""
+
+    SELL_CASES = [
+        ("SHORT", "okx_short"),
+        ("SELL", "binance_sell"),
+        ("short", "okx_lowercase_short"),
+        ("sell", "lowercase_sell"),
+        ("SHORT_SIDE", "short_side_indicator"),
+        ("Short", "mixed_case_short"),
+        ("Sell", "mixed_case_sell"),
+        ("ShOrT", "weird_case_short"),
+    ]
+
+    BUY_CASES = [
+        ("LONG", "okx_long"),
+        ("BUY", "binance_buy"),
+        ("long", "lowercase_long"),
+        ("buy", "lowercase_buy"),
+    ]
+
+    @pytest.mark.parametrize("side_str,label", SELL_CASES)
+    def test_parse_position_side_sell_variants(self, side_str, label):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"positionSide": side_str, "positionAmt": "0.01",
+               "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL, (
+            f"side_str={side_str!r} ({label}) should parse as SELL, got {pos.side}"
+        )
+        assert pos.quantity == 0.01
+
+    @pytest.mark.parametrize("side_str,label", BUY_CASES)
+    def test_parse_position_side_buy_variants(self, side_str, label):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"positionSide": side_str, "positionAmt": "0.01",
+               "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.BUY, (
+            f"side_str={side_str!r} ({label}) should parse as BUY, got {pos.side}"
+        )
+        assert pos.quantity == 0.01
+
+    def test_negative_quantity_implies_sell(self):
+        """If positionAmt is negative, side must be SELL even without side field."""
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "positionAmt": "-0.01",
+               "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01  # absolute value
+
+    def test_negative_pos_field_implies_sell(self):
+        """If 'pos' field is negative, side must be SELL."""
+        spec = okx_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"instId": "BTC-USDT-SWAP", "pos": "-1", "avgPx": "50000"}
+        pos = transport._parse_position(raw, "BTC-USDT-SWAP", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 1.0
+
+    def test_negative_size_field_implies_sell(self):
+        """If 'size' field is negative, side must be SELL."""
+        spec = bitget_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "size": "-0.01", "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01
+
+    def test_positive_quantity_no_side_default_buy(self):
+        """If no explicit side field and quantity is positive, default to BUY."""
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "positionAmt": "0.01",
+               "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.BUY
+        assert pos.quantity == 0.01
+
+    def test_zero_quantity_zero_side_default_buy(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.BUY
+        assert pos.quantity == 0.0
+
+    # Per-venue short/sell fixture or inline raw coverage
+    def test_binance_short_position(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "positionSide": "SHORT",
+               "positionAmt": "0.01", "entryPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01
+
+    def test_okx_short_position(self):
+        spec = okx_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"instId": "BTC-USDT-SWAP", "posSide": "short",
+               "pos": "1", "avgPx": "50000"}
+        pos = transport._parse_position(raw, "BTC-USDT-SWAP", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 1.0
+
+    def test_bybit_sell_position(self):
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "side": "Sell",
+               "size": "0.01", "avgPrice": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01
+
+    def test_bitget_short_position(self):
+        spec = bitget_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"symbol": "BTCUSDT", "holdSide": "short",
+               "total": "0.01", "openPriceAvg": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01
+
+    def test_gate_short_position(self):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"contract": "BTCUSDT", "size": "-1",
+               "entry_price": "50000.0"}
+        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 1.0
+
+    def test_hyperliquid_short_position(self):
+        spec = hyperliquid_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {"assetPositions": [{"position": {"coin": "BTC",
+               "szi": "-1.0", "entryPx": "50000.0"}}]}
+        pos = transport._parse_position(raw, "BTC", 1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 1.0
 
 
 class TestOrderAckNotFill:

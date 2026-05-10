@@ -1,0 +1,369 @@
+"""Task 3: Synchronized entry executor contract tests.
+
+Rust references:
+- src/execution_core/entry_sync.rs: execute_incremental_entry (line 3173)
+- src/execution_core/entry_sync.rs: submit_pending_entry_passive_cycle (line 2486)
+- src/execution_core/entry_sync.rs: reconcile_inflight_entry_hedge (line 4568)
+- src/engine/entry.rs: execute_order_leg (line 3854)
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.engine.entry import (
+    EntryContext,
+    EntryState,
+    EntryType,
+    advance_entry_state,
+    build_entry_orders,
+    build_open_position,
+)
+from lightfee.engine.entry_sync import (
+    EntryExecutionResult,
+    EntrySyncExecutor,
+    execute_entry,
+)
+from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.residual import (
+    ResidualExposureTask,
+    ResidualOrigin,
+    detect_residual,
+)
+from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.persistence.journal import Journal
+
+from lightfee.core.contracts import VenueAdapter
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.core.domain import PositionSnapshot
+
+
+# Inline test helpers (avoid cross-file import issues during pytest collection)
+from dataclasses import dataclass, field
+from typing import Optional as _Optional
+
+
+@dataclass
+class _FakeAdapter(VenueAdapter):
+    _venue: Venue
+    _min_notional_quote: float = 0.0
+    place_order_outcomes: list = field(default_factory=list)
+    position_snapshots: list = field(default_factory=list)
+    default_fill_price: float = 0.0
+    last_request: _Optional[OrderRequest] = None
+    place_order_call_count: int = 0
+
+    @property
+    def venue(self) -> Venue:
+        return self._venue
+
+    async def place_order(self, request):
+        self.place_order_call_count += 1
+        self.last_request = request
+        if self.place_order_outcomes:
+            outcome = self.place_order_outcomes.pop(0)
+            if isinstance(outcome, (OrderSubmitError,)):
+                raise outcome
+            return outcome
+        price = self.default_fill_price if self.default_fill_price > 0 else request.price or 1.0
+        return OrderFill(venue=self._venue, symbol=request.symbol, side=request.side,
+                         quantity=request.quantity, price=price,
+                         order_id=f"fake-{self._venue.value}-{self.place_order_call_count}",
+                         filled_at_ms=1000)
+
+    async def fetch_position(self, symbol):
+        return PositionSnapshot(venue=self._venue, symbol=symbol, side=Side.BUY,
+                                quantity=0.0, entry_price=0.0, observed_at_ms=1000)
+
+    async def normalize_quantity(self, symbol, quantity):
+        return quantity
+def _make_rejected(reason: str = "order rejected") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.REJECTED, reason)
+
+
+def _make_uncertain(reason: str = "order timeout") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.UNCERTAIN, reason)
+
+
+def _fake_fill(
+    venue, symbol, side, quantity, price=50000.0,
+    order_id="fill-001", fee_quote=2.5, filled_at_ms=1000,
+):
+    from lightfee.core.domain import OrderFill as OF
+    return OF(venue=venue, symbol=symbol, side=side, quantity=quantity,
+              price=price, order_id=order_id, fee_quote=fee_quote,
+              filled_at_ms=filled_at_ms)
+
+
+@pytest.fixture
+def journal(tmp_path):
+    j = Journal(str(tmp_path / "test.jsonl"))
+    j.open()
+    yield j
+    j.close()
+
+
+@pytest.fixture
+def binance():
+    return _FakeAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+
+
+@pytest.fixture
+def okx():
+    return _FakeAdapter(Venue.OKX, _min_notional_quote=10.0)
+
+
+@pytest.fixture
+def adapters(binance, okx):
+    return {Venue.BINANCE: binance, Venue.OKX: okx}
+
+
+@pytest.fixture
+def btc_context():
+    return EntryContext(
+        entry_id="e001",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        long_quantity=0.01,
+        short_quantity=0.01,
+        long_price_hint=50000.0,
+        short_price_hint=50000.0,
+        maker_leg=Side.BUY,
+        entry_type=EntryType.PASSIVE_INCREMENTAL,
+        created_at_ms=1000,
+    )
+
+
+# ---------------------------------------------------------------------------
+# EntrySyncExecutor construction
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncExecutorConstruction:
+    def test_creates_executor_with_adapters_and_journal(self, adapters, journal):
+        executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+            state={},
+            config_overrides={"deadline_ms": 30_000},
+        )
+        assert executor.adapters is adapters
+        assert executor.journal is journal
+
+    def test_default_config_overrides(self, adapters, journal):
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        assert executor.deadline_ms == 30_000
+        assert executor.min_matched_ratio == 0.95
+
+
+# ---------------------------------------------------------------------------
+# Standard dual-taker: maker reject fails entry
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncMakerReject:
+    @pytest.mark.asyncio
+    async def test_maker_reject_fails_entry_without_hedge_submit(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [_make_rejected("insufficient margin")]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        result = await executor.execute(btc_context)
+
+        assert result.route == ExecutionRoute.REJECTED
+        assert result.state == EntryState.FAILED
+        assert result.open_position is None
+        assert result.residual_task is None
+        # Hedge venue must NOT have been called
+        assert okx_ada.place_order_call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_maker_uncertain_marks_pending(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        binance_ada.place_order_outcomes = [_make_uncertain("timeout")]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        result = await executor.execute(btc_context)
+
+        assert result.state in (EntryState.FAILED, EntryState.FAILED_WITH_RESIDUAL)
+        assert result.has_uncertainty is True
+
+
+# ---------------------------------------------------------------------------
+# Hedged rejection after maker fill → residual
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncHedgeRejectAfterMakerFill:
+    @pytest.mark.asyncio
+    async def test_hedge_reject_after_maker_fill_creates_residual(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+
+        maker_fill = _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001")
+        binance_ada.place_order_outcomes = [maker_fill]
+        okx_ada.place_order_outcomes = [_make_rejected("hedge rejected")]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        result = await executor.execute(btc_context)
+
+        assert result.state == EntryState.FAILED_WITH_RESIDUAL
+        assert result.residual_task is not None
+        assert result.residual_task.exposure_quantity == pytest.approx(0.01)
+        assert result.residual_task.exposure_venue == Venue.BINANCE
+
+
+# ---------------------------------------------------------------------------
+# Full dual-taker: both legs fill → OpenPosition
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncDualTakerSuccess:
+    @pytest.mark.asyncio
+    async def test_both_legs_fill_opens_matched_position(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+
+        maker_fill = _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001", fee_quote=2.5)
+        hedge_fill = _fake_fill(Venue.OKX, "BTCUSDT", Side.SELL, 0.01, 49990.0, "h001", fee_quote=2.5)
+        binance_ada.place_order_outcomes = [maker_fill]
+        okx_ada.place_order_outcomes = [hedge_fill]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        result = await executor.execute(btc_context)
+
+        assert result.state == EntryState.COMPLETED
+        assert result.open_position is not None
+        pos = result.open_position
+        assert pos.position_id == "e001"
+        assert pos.long_quantity == 0.01
+        assert pos.short_quantity == 0.01
+        assert pos.matched_quantity == 0.01
+        assert pos.long_entry_price == 50000.0
+        assert pos.short_entry_price == 49990.0
+        assert result.residual_task is None
+
+    @pytest.mark.asyncio
+    async def test_journal_entries_on_completion(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001"),
+        ]
+        okx_ada.place_order_outcomes = [
+            _fake_fill(Venue.OKX, "BTCUSDT", Side.SELL, 0.01, 50000.0, "h001"),
+        ]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        await executor.execute(btc_context)
+
+        records = journal.read_all()
+        kinds = [r["kind"] for r in records]
+        assert "entry.maker_submitted" in kinds
+        assert "entry.maker_filled" in kinds
+        assert "entry.hedge_submitted" in kinds
+        assert "entry.hedge_filled" in kinds
+        assert "entry.completed" in kinds
+
+
+# ---------------------------------------------------------------------------
+# Partial fill behavior
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncPartialFills:
+    @pytest.mark.asyncio
+    async def test_partial_maker_below_threshold_no_position(self, adapters, journal, btc_context):
+        """Maker fill below min threshold: entry fails, no position opened."""
+        binance_ada = adapters[Venue.BINANCE]
+        # Fill only 10% of requested
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.001, 50000.0, "m001"),
+        ]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal, config_overrides={
+            "min_matched_ratio": 0.5,
+        })
+        result = await executor.execute(btc_context)
+
+        assert result.open_position is None
+        assert result.state == EntryState.FAILED_WITH_RESIDUAL
+
+    @pytest.mark.asyncio
+    async def test_partial_hedge_creates_residual(self, adapters, journal, btc_context):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001"),
+        ]
+        # Hedge only partially filled (0.005 vs 0.01)
+        okx_ada.place_order_outcomes = [
+            _fake_fill(Venue.OKX, "BTCUSDT", Side.SELL, 0.005, 50000.0, "h001"),
+        ]
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+        result = await executor.execute(btc_context)
+
+        assert result.residual_task is not None
+        assert result.residual_task.exposure_quantity == pytest.approx(0.005)
+
+
+# ---------------------------------------------------------------------------
+# execute_entry convenience wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteEntryConvenience:
+    @pytest.mark.asyncio
+    async def test_standard_dual_taker_both_fill(self, adapters, journal):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m-001"),
+        ]
+        okx_ada.place_order_outcomes = [
+            _fake_fill(Venue.OKX, "BTCUSDT", Side.SELL, 0.01, 49990.0, "h-001"),
+        ]
+
+        result = await execute_entry(
+            entry_id="ee1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            quantity=0.01,
+            long_price_hint=50000.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            adapters=adapters,
+            journal=journal,
+        )
+
+        assert result.open_position is not None
+        assert result.open_position.long_venue == Venue.BINANCE
+        assert result.open_position.short_venue == Venue.OKX
+
+    @pytest.mark.asyncio
+    async def test_standard_dual_taker_maker_rejected(self, adapters, journal):
+        binance_ada = adapters[Venue.BINANCE]
+        binance_ada.place_order_outcomes = [_make_rejected("rejected")]
+
+        result = await execute_entry(
+            entry_id="ee2",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            quantity=0.01,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.BUY,
+            adapters=adapters,
+            journal=journal,
+        )
+
+        assert result.open_position is None
+        assert result.route == ExecutionRoute.REJECTED

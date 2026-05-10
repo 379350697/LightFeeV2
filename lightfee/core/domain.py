@@ -126,6 +126,10 @@ class OrderRequest:
     reduce_only: bool = False
     client_order_id: Optional[str] = None
     post_only: bool = False
+    # --- Rust V1 live-path fields for execution quality and timing ---
+    price_hint: Optional[float] = None
+    mark_price_hint: Optional[float] = None
+    observed_at_ms: Optional[int] = None
 
 
 @dataclass(frozen=True, slots=True)

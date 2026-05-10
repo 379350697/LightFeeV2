@@ -22,6 +22,14 @@ class L2PoolAssignment(Enum):
     DROPPED = "dropped"
 
 
+class ExecutionLiquiditySource(Enum):
+    """V1: where execution liquidity came from for a given venue+symbol."""
+    TRUE_L2 = "true_l2"
+    TOP_BOOK = "top_book"
+    CACHED = "cached"
+    NONE = "none"
+
+
 @dataclass
 class PriceLevel:
     price: float
@@ -40,6 +48,9 @@ class LocalL2Book:
     bootstrap_started_ms: int = 0
     degrade_count: int = 0
     last_error: str = ""
+    # --- V1 degrade/suspend thresholds ---
+    max_consecutive_degradations: int = 3  # repeated degradation → suspended
+    stall_timeout_ms: int = 60_000  # no update within window → stalled
 
     # -- State machine transitions ---------------------------------------
 
@@ -51,12 +62,14 @@ class LocalL2Book:
     def transition_to_hot(self) -> None:
         if self.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
             self.status = L2BookStatus.HOT
-            self.degrade_count = 0
+            # degrade_count is cumulative across recoveries for suspend gating
 
     def transition_to_degraded(self, error: str = "") -> None:
         self.status = L2BookStatus.DEGRADED
         self.degrade_count += 1
         self.last_error = error
+        if self.degrade_count >= self.max_consecutive_degradations:
+            self.status = L2BookStatus.SUSPENDED
 
     def transition_to_rebuilding(self) -> None:
         if self.status == L2BookStatus.DEGRADED:
@@ -64,6 +77,12 @@ class LocalL2Book:
 
     def transition_to_suspended(self) -> None:
         self.status = L2BookStatus.SUSPENDED
+
+    def check_stall(self, now_ms: int) -> bool:
+        """True if book has not been updated within stall_timeout_ms."""
+        if self.observed_at_ms == 0:
+            return False
+        return (now_ms - self.observed_at_ms) > self.stall_timeout_ms
 
     def is_healthy(self) -> bool:
         return self.status in (L2BookStatus.HOT, L2BookStatus.BOOTSTRAPPING)

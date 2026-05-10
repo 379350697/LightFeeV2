@@ -79,6 +79,8 @@ class StrategyConfig:
     net_stop_loss_quote: float = 20.0
     mark_price_delta_hard_stop_quote: float = 20.0
     trailing_drawdown_quote: float = 10.0
+    settlement_remainder_close_delay_secs: int = 300
+    settlement_force_close_delay_secs: int = 1200
     risk_monitor_enabled: bool = False
     unsupported_risk_snapshot_behavior: str = "death_line"
     warning_line_enabled: bool = True

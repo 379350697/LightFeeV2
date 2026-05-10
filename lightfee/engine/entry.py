@@ -1,12 +1,18 @@
-"""Entry execution state machine matching Rust entry flow."""
+"""Entry execution state machine matching Rust V1 entry flow.
+
+Rust references:
+- src/execution_core/entry_sync.rs: PendingEntryHedge, state transitions
+- src/engine/entry.rs: EntryAttemptOutcome, execute_entry_order_leg
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional
 
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
+from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.state import OpenPosition
 
 
@@ -18,6 +24,13 @@ class EntryState(Enum):
     HEDGE_PENDING = "hedge_pending"
     COMPLETED = "completed"
     FAILED = "failed"
+    # --- V1 passive fallback and residual states ---
+    PASSIVE_FALLBACK = "passive_fallback"
+    FAILED_WITH_RESIDUAL = "failed_with_residual"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (EntryState.COMPLETED, EntryState.FAILED, EntryState.FAILED_WITH_RESIDUAL)
 
 
 class EntryType(Enum):
@@ -42,6 +55,22 @@ class EntryContext:
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
     created_at_ms: int = 0
+    # --- V1 planner output ---
+    planned_route: ExecutionRoute = ExecutionRoute.PASSIVE_INCREMENTAL
+
+
+def advance_entry_state(ctx: EntryContext, next_state: EntryState) -> EntryContext:
+    """Advance EntryContext to next_state, enforcing valid transitions.
+
+    V1 transition rules:
+    - COMPLETED, FAILED, FAILED_WITH_RESIDUAL are terminal
+    - All other states valid for forward progress
+    """
+    if ctx.state.is_terminal:
+        raise ValueError(
+            f"Cannot advance from terminal state {ctx.state.value} to {next_state.value}"
+        )
+    return replace(ctx, state=next_state)
 
 
 def build_entry_orders(
@@ -90,17 +119,32 @@ def build_open_position(
     now_ms: int,
 ) -> OpenPosition:
     """Build an OpenPosition from completed entry fills."""
+    maker_is_long = ctx.maker_leg == Side.BUY
     matched_qty = min(maker_fill.quantity, hedge_fill.quantity)
+
+    if maker_is_long:
+        long_fill, short_fill = maker_fill, hedge_fill
+        long_qty = matched_qty
+        short_qty = matched_qty
+        long_entry_price = maker_fill.price
+        short_entry_price = hedge_fill.price
+    else:
+        long_fill, short_fill = hedge_fill, maker_fill
+        long_qty = matched_qty
+        short_qty = matched_qty
+        long_entry_price = hedge_fill.price
+        short_entry_price = maker_fill.price
+
     return OpenPosition(
         position_id=ctx.entry_id,
         symbol=ctx.symbol,
         long_venue=ctx.long_venue,
         short_venue=ctx.short_venue,
-        long_quantity=matched_qty if ctx.maker_leg == Side.BUY else matched_qty,
-        short_quantity=matched_qty if ctx.maker_leg == Side.SELL else matched_qty,
-        long_entry_price=maker_fill.price if ctx.maker_leg == Side.BUY else hedge_fill.price,
-        short_entry_price=hedge_fill.price if ctx.maker_leg == Side.BUY else maker_fill.price,
+        long_quantity=long_qty,
+        short_quantity=short_qty,
+        long_entry_price=long_entry_price,
+        short_entry_price=short_entry_price,
         opened_at_ms=now_ms,
-        long_fill=maker_fill if ctx.maker_leg == Side.BUY else hedge_fill,
-        short_fill=hedge_fill if ctx.maker_leg == Side.BUY else maker_fill,
+        long_fill=long_fill,
+        short_fill=short_fill,
     )

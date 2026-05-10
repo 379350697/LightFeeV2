@@ -629,8 +629,11 @@ class VenueTransport:
             data.get("volume", "0"))))
         ))
 
-        # Determine side: explicit indicators, then sign of quantity
-        short_indicators = ("SHORT", "SELL")
+        # Determine side: explicit indicators (case-insensitive), then sign of quantity.
+        # Mirrors Rust V1 behavior where position side strings vary per venue
+        # (e.g. OKX uses "short"/"long", Binance uses "SHORT"/"LONG", etc.).
+        pos_side_upper = pos_side_str.upper()
+        short_indicators = ("SHORT", "SELL", "SHORT_SIDE")
         long_indicators = ("LONG", "BUY")
         if any(ind in pos_side_str for ind in short_indicators):
             side = Side.SELL

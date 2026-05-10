@@ -1,0 +1,126 @@
+"""Fake venue adapters for testing entry sync, residual, and execution flows.
+
+Provides controllable adapters that can simulate:
+- Full fills, partial fills, rejected submits, uncertain submits
+- Delayed reconciliation responses
+- Position queries
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from lightfee.core.contracts import VenueAdapter
+from lightfee.core.domain import (
+    OrderFill,
+    OrderRequest,
+    PositionSnapshot,
+    Side,
+    Venue,
+)
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+
+@dataclass
+class FakeVenueAdapter(VenueAdapter):
+    """Programmable fake adapter for testing.
+
+    Configure outcomes via the *_outcome attributes before calling methods.
+    Each outcome is consumed once (FIFO queue), then falls back to defaults.
+    """
+
+    _venue: Venue
+    _min_notional_quote: float = 0.0
+
+    # --- Programmable outcomes (consumed FIFO) ---
+    place_order_outcomes: list[OrderFill | OrderSubmitError] = field(default_factory=list)
+    position_snapshots: list[PositionSnapshot] = field(default_factory=list)
+
+    # --- Default outcomes (used when queue is empty) ---
+    default_fill_price: float = 0.0
+    default_position_side: Side = Side.BUY
+    default_position_qty: float = 0.0
+
+    # --- Spy fields ---
+    last_request: Optional[OrderRequest] = None
+    place_order_call_count: int = 0
+    fetch_position_call_count: int = 0
+
+    @property
+    def venue(self) -> Venue:
+        return self._venue
+
+    async def place_order(self, request: OrderRequest) -> OrderFill:
+        self.place_order_call_count += 1
+        self.last_request = request
+
+        if self.place_order_outcomes:
+            outcome = self.place_order_outcomes.pop(0)
+            if isinstance(outcome, OrderSubmitError):
+                raise outcome
+            return outcome
+
+        # Default: instant fill at default_fill_price or request price
+        price = self.default_fill_price if self.default_fill_price > 0 else request.price or 1.0
+        return OrderFill(
+            venue=self._venue,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            price=price,
+            order_id=f"fake-{self._venue.value}-{self.place_order_call_count}",
+            filled_at_ms=1000,
+        )
+
+    async def fetch_position(self, symbol: str) -> PositionSnapshot:
+        self.fetch_position_call_count += 1
+        if self.position_snapshots:
+            return self.position_snapshots.pop(0)
+        return PositionSnapshot(
+            venue=self._venue,
+            symbol=symbol,
+            side=self.default_position_side,
+            quantity=self.default_position_qty,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+
+    async def fetch_order_fill_reconciliation(
+        self, symbol: str, order_id: str, client_order_id: Optional[str] = None
+    ) -> Optional[OrderFill]:
+        # Default: order was filled at the request quantity
+        return None  # signal "unknown" - caller should handle
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        return quantity
+
+
+def make_rejected_error(reason: str = "order rejected") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.REJECTED, reason)
+
+
+def make_uncertain_error(reason: str = "order timeout") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.UNCERTAIN, reason)
+
+
+def make_fake_fill(
+    venue: Venue,
+    symbol: str,
+    side: Side,
+    quantity: float,
+    price: float = 50000.0,
+    order_id: str = "fill-001",
+    fee_quote: float = 2.5,
+    filled_at_ms: int = 1000,
+) -> OrderFill:
+    return OrderFill(
+        venue=venue,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        price=price,
+        order_id=order_id,
+        fee_quote=fee_quote,
+        filled_at_ms=filled_at_ms,
+    )

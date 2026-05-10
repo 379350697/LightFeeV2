@@ -9,7 +9,7 @@ class TestExecutionPlanner:
     def test_rejects_zero_quantity(self):
         route, clip, reason = plan_entry_execution(0, 100, 10, 0.01, 0.01)
         assert route == ExecutionRoute.REJECTED
-        assert "zero_target" in reason
+        assert "target_quantity_not_positive" in reason
 
     def test_falls_back_when_maker_min_too_large(self):
         # maker_min_clip > max_initial_clip (0.8 * target)
