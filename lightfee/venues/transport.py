@@ -251,8 +251,8 @@ class VenueTransport:
             headers["X-Gate-Size-Decimal"] = "1"
             return headers
 
-        # --- Bitget: timestamp + METHOD + request_path + body ---
-        if spec.auth_scheme == AuthScheme.HMAC_SHA256_BASE64 and spec.requires_passphrase:
+        # --- Bitget: specific ACCESS-* headers + signing (not OKX) ---
+        if spec.venue_id == Venue.BITGET:
             ts = str(int(time.time() * 1000))
             request_path = f"{path}?{query_string.lstrip('?')}" if query_string else path
             sign_payload = ts + method.upper() + request_path + (body or "")
@@ -305,27 +305,26 @@ class VenueTransport:
         query_string = ""
         req_body: Optional[str] = None
 
-        if params:
-            # For Binance/Aster style, timestamp + signature go into query params
-            if spec.signature_param:
-                ts = str(int(time.time() * 1000))
-                if spec.timestamp_param:
-                    params[spec.timestamp_param] = ts
-                if self._credential:
-                    encoded = "&".join(
-                        f"{k}={v}" for k, v in sorted(params.items())
-                    )
-                    sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
-                    params[spec.signature_param] = sig
-                query_string = "?" + "&".join(
-                    f"{k}={v}" for k, v in sorted(params.items())
-                )
-            else:
-                query_parts = []
-                for k, v in sorted((params or {}).items()):
-                    query_parts.append(f"{k}={v}")
-                if query_parts:
-                    query_string = "?" + "&".join(query_parts)
+        # Binance / Aster always require timestamp + signature in the query
+        # string, even for POST requests with a JSON body.
+        if spec.signature_param:
+            qp: dict[str, Any] = dict(params) if params else {}
+            ts = str(int(time.time() * 1000))
+            if spec.timestamp_param:
+                qp[spec.timestamp_param] = ts
+            if self._credential:
+                encoded = "&".join(f"{k}={v}" for k, v in sorted(qp.items()))
+                sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
+                qp[spec.signature_param] = sig
+            query_string = "?" + "&".join(
+                f"{k}={v}" for k, v in sorted(qp.items())
+            )
+        elif params:
+            query_parts = []
+            for k, v in sorted(params.items()):
+                query_parts.append(f"{k}={v}")
+            if query_parts:
+                query_string = "?" + "&".join(query_parts)
 
         if body is not None:
             req_body = json.dumps(body)
@@ -449,8 +448,16 @@ class VenueTransport:
                         )
                     )
         elif spec.venue_id in (Venue.OKX, Venue.BYBIT):
-            data = raw.get("data", raw)
-            items = data if isinstance(data, list) else [data]
+            # Bybit V5 wraps tickers in result.list; OKX uses data[]
+            if spec.venue_id == Venue.BYBIT:
+                result = raw.get("result", raw)
+                if isinstance(result, dict):
+                    items = result.get("list", [])
+                else:
+                    items = result if isinstance(result, list) else [result]
+            else:
+                data = raw.get("data", raw)
+                items = data if isinstance(data, list) else [data]
             for item in items:
                 sym = item.get("instId", item.get("symbol", ""))
                 if sym:
@@ -561,6 +568,9 @@ class VenueTransport:
                 data = raw["data"]
             elif "data" in raw and isinstance(raw["data"], list) and raw["data"]:
                 data = raw["data"][0]
+            elif "result" in raw and isinstance(raw["result"], dict) and raw["result"].get("list"):
+                # Bybit V5: {"result": {"list": [...]}}
+                data = raw["result"]["list"][0]
             elif "result" in raw and isinstance(raw["result"], list) and raw["result"]:
                 data = raw["result"][0]
 
@@ -587,17 +597,34 @@ class VenueTransport:
                 observed_at_ms=now_ms,
             )
 
-        # Generic position parsing
-        pos_side_str = str(data.get("positionSide", data.get("posSide", "LONG"))).upper()
+        # Generic position parsing — wide fallback chains for per-venue field names
+        pos_side_str = str(data.get(
+            "positionSide",
+            data.get("posSide",
+            data.get("holdSide",
+            data.get("side", "LONG")))
+        )).upper()
         if "SHORT" in pos_side_str:
             side = Side.SELL
         else:
             side = Side.BUY
 
-        qty_raw = data.get("positionAmt", data.get("pos", data.get("size", data.get("volume", "0"))))
+        qty_raw = str(data.get(
+            "positionAmt",
+            data.get("pos",
+            data.get("size",
+            data.get("total",
+            data.get("volume", "0"))))
+        ))
         qty = abs(float(qty_raw)) if qty_raw else 0.0
 
-        entry_price = float(data.get("entryPrice", data.get("avgPx", data.get("openPriceAvg", 0))))
+        entry_price = float(data.get(
+            "entryPrice",
+            data.get("avgPrice",
+            data.get("avgPx",
+            data.get("openPriceAvg",
+            data.get("entry_price", 0))))
+        ))
 
         return PositionSnapshot(
             venue=spec.venue_id,
@@ -669,6 +696,16 @@ class VenueTransport:
                 if request.price is not None:
                     body["price"] = str(request.price)
             elif spec.venue_id == Venue.HYPERLIQUID:
+                # Live Hyperliquid orders require EIP-712 signing with a wallet
+                # private key. Full exchange-action signing (L1Action encode +
+                # sign + connection_id + nonce + vault_address) is not yet wired.
+                # Paper mode still produces a deterministic fill.
+                if self.mode == "live":
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Hyperliquid live order submission not yet implemented: "
+                        "EIP-712 exchange-action signing requires wallet integration",
+                    )
                 is_buy = request.side == Side.BUY
                 body = {
                     "action": {
@@ -710,15 +747,38 @@ class VenueTransport:
         spec = self._spec
         data = raw.get("data", raw)
 
+        # Bybit V5 nests the order under "result"
+        if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
+            if data["result"].get("orderId") or data["result"].get("orderLinkId"):
+                data = data["result"]
+        elif isinstance(data, dict) and "result" in data and isinstance(data["result"], list) and data["result"]:
+            data = data["result"][0]
+
         if isinstance(data, dict):
             pass
         elif isinstance(data, list) and data:
             data = data[0]
 
         if isinstance(data, dict):
-            order_id = str(data.get("orderId", data.get("ordId", data.get("order_id", ""))))
-            exec_qty = float(data.get("executedQty", data.get("cumQty", data.get("filledQty", data.get("filled_size", request.quantity)))))
-            exec_price = float(data.get("avgPrice", data.get("fillPx", data.get("price", request.price or 0.0))))
+            order_id = str(data.get(
+                "orderId",
+                data.get("ordId",
+                data.get("id",
+                data.get("order_id", "")))
+            ))
+            exec_qty = float(data.get(
+                "executedQty",
+                data.get("cumQty",
+                data.get("filledQty",
+                data.get("size",
+                data.get("filled_size", request.quantity))))
+            ))
+            exec_price = float(data.get(
+                "avgPrice",
+                data.get("fillPx",
+                data.get("fill_price",
+                data.get("price", request.price or 0.0)))
+            ))
         else:
             order_id = str(uuid.uuid4()).replace("-", "")[:20]
             exec_qty = request.quantity
