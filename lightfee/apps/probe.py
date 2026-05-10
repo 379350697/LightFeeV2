@@ -19,8 +19,10 @@ def main() -> None:
     if args.list_capabilities:
         for venue in all_live_perp_venues():
             caps = VenueCapabilities.for_venue(venue)
+            order_status = "supported" if caps.live_order_supported else "unsupported"
             print(f"{venue.value}: l2={caps.execution_liquidity.value}, "
-                  f"risk={caps.risk_health.value}, reconcile={caps.reconcile_quality.value}")
+                  f"risk={caps.risk_health.value}, reconcile={caps.reconcile_quality.value}, "
+                  f"live_order={order_status}")
         return
 
     config = load_config(args.config)

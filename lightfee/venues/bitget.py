@@ -91,6 +91,10 @@ class BitgetAdapter(VenueAdapter):
         """Detect account profile (UTA vs Classic) via a lightweight probe.
 
         Caches the result so subsequent calls are free.
+
+        Only falls back to CLASSIC when the exchange explicitly indicates a
+        classic/UTA mismatch. Auth failures (401/403), rate limits (429),
+        network errors, and other transport failures propagate immediately.
         """
         if self._profile is not None:
             return self._profile
@@ -106,18 +110,44 @@ class BitgetAdapter(VenueAdapter):
                 "GET",
                 "/api/v3/position/current-position",
                 params={"productType": "USDT-FUTURES"},
+                private=True,
             )
             if _payload_indicates_classic(raw):
                 self._profile = BitgetAccountProfile.CLASSIC
             else:
                 self._profile = BitgetAccountProfile.UTA
-        except Exception as e:
-            # If UTA endpoint is unreachable or reports classic, try classic
-            if hasattr(e, "category"):
+        except TransportError as e:
+            # Only fall back to CLASSIC on explicit classic-mode errors
+            status_code = getattr(e, "status_code", 0)
+            body_str = getattr(e, "body", "")
+            body_dict: dict = {}
+            if body_str:
+                try:
+                    import json as _json
+                    body_dict = _json.loads(body_str)
+                except Exception:
+                    body_dict = {}
+            if _is_classic_mode_error(status_code, body_dict):
                 self._profile = BitgetAccountProfile.CLASSIC
+            elif e.category in (
+                TransportErrorCategory.AUTH_FAILURE,
+                TransportErrorCategory.AUTHORIZATION_FAILURE,
+            ):
+                raise TransportError(
+                    TransportErrorCategory.AUTH_FAILURE,
+                    f"Bitget profile detection failed: auth error (HTTP {status_code})",
+                    status_code=status_code,
+                    body=body_str,
+                ) from e
+            elif e.category == TransportErrorCategory.TRANSPORT_FAILURE:
+                raise TransportError(
+                    TransportErrorCategory.TRANSPORT_FAILURE,
+                    f"Bitget profile detection failed: transport error (HTTP {status_code})",
+                    status_code=status_code,
+                    body=body_str,
+                ) from e
             else:
-                self._profile = BitgetAccountProfile.CLASSIC
-            logger.debug("bitget profile detection fell back to classic: %s", e)
+                raise
 
         return self._profile
 
@@ -139,7 +169,7 @@ class BitgetAdapter(VenueAdapter):
                 "marginCoin": "USDT",
             }
             raw = await self._transport._request(
-                "GET", "/api/v2/mix/position/single-position", params=params
+                "GET", "/api/v2/mix/position/single-position", params=params, private=True
             )
         else:
             params = {
@@ -147,7 +177,7 @@ class BitgetAdapter(VenueAdapter):
                 "productType": "USDT-FUTURES",
             }
             raw = await self._transport._request(
-                "GET", "/api/v3/position/current-position", params=params
+                "GET", "/api/v3/position/current-position", params=params, private=True
             )
 
         now_ms = int(__import__("time").time() * 1000)
@@ -174,11 +204,11 @@ class BitgetAdapter(VenueAdapter):
 
             if profile == BitgetAccountProfile.CLASSIC:
                 raw = await self._transport._request(
-                    "POST", "/api/v2/mix/order/placeOrder", body=body
+                    "POST", "/api/v2/mix/order/placeOrder", body=body, private=True
                 )
             else:
                 raw = await self._transport._request(
-                    "POST", "/api/v3/order/placeOrder", body=body
+                    "POST", "/api/v3/order/placeOrder", body=body, private=True
                 )
 
             return self._transport._parse_order_fill(raw, request, venue_sym, now_ms)

@@ -83,6 +83,7 @@ class VenueCapabilities:
     market_api_contract: VenueMarketApiContract
     private_api_contract: VenuePrivateApiContract
     account_contract: VenueAccountContract
+    live_order_supported: bool = True
 
     def supports_risk_health(self) -> bool:
         return self.risk_health.is_supported()
@@ -147,6 +148,7 @@ class VenueCapabilities:
                 market_api_contract=VenueMarketApiContract.HYPERLIQUID_INFO_API,
                 private_api_contract=VenuePrivateApiContract.HYPERLIQUID_EXCHANGE_API,
                 account_contract=VenueAccountContract.NATIVE_PERP_ACCOUNT,
+                live_order_supported=True,
             ),
             Venue.BITGET: cls(
                 venue=Venue.BITGET,

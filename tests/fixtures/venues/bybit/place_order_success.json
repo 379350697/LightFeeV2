@@ -1,1 +1,1 @@
-{"retCode": 0, "result": {"orderId": "xyz789", "orderLinkId": "client_1"}}
+{"retCode": 0, "result": {"orderId": "xyz789", "orderLinkId": "client_1", "cumExecQty": "0.01", "avgPrice": "50000.0"}}

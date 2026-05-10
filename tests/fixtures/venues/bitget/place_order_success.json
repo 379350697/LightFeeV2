@@ -1,1 +1,1 @@
-{"code": "00000", "data": {"orderId": "bg123", "clientOrderId": "client_1"}}
+{"code": "00000", "data": {"orderId": "bg123", "clientOrderId": "client_1", "filledQty": "0.01", "price": "50000.0"}}

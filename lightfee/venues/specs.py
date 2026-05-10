@@ -40,6 +40,8 @@ class VenueSpec:
     requires_wallet_key: bool = False
     # Paper mode can simulate order placement
     paper_order_supported: bool = True
+    # Live mode can submit orders (False = unsupported despite valid spec)
+    live_order_supported: bool = True
 
     # Headers / query param naming
     api_key_header: str = ""
@@ -201,6 +203,7 @@ def hyperliquid_spec() -> VenueSpec:
         position_path="/info",
         order_path="/exchange",
         requires_wallet_key=True,
+        live_order_supported=True,
     )
 
 

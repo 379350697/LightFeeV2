@@ -1,1 +1,1 @@
-{"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+{"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 123, "totalSz": "1.0", "avgPx": "50000.0"}}]}}}

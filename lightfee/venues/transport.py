@@ -59,9 +59,12 @@ class TransportErrorCategory(Enum):
 
 
 class TransportError(Exception):
-    def __init__(self, category: TransportErrorCategory, message: str) -> None:
+    def __init__(self, category: TransportErrorCategory, message: str,
+                 status_code: int = 0, body: str = "") -> None:
         super().__init__(message)
         self.category = category
+        self.status_code = status_code
+        self.body = body
 
 
 def classify_transport_error(
@@ -150,6 +153,7 @@ class VenueTransport:
         self.mode = mode
         self._credential = credential
         self._client: Optional[httpx.AsyncClient] = None
+        self._hl_meta_cache: dict[str, int] = {}
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -281,13 +285,21 @@ class VenueTransport:
             if spec.recv_window_header:
                 headers[spec.recv_window_header] = "5000"
 
-            # OKX style: ts + method + path + body
+            # OKX style: ts + method + path (+ query_string for GET/DELETE, body for POST)
             if spec.use_iso8601_timestamp:
-                sign_payload = ts + method.upper() + path + (body or "")
+                if query_string and method.upper() in ("GET", "DELETE"):
+                    sign_payload = ts + method.upper() + path + query_string
+                else:
+                    sign_payload = ts + method.upper() + path + (body or "")
             else:
-                # Bybit style: ts + api_key + recv_window + body
+                # Bybit V5 style: ts + api_key + recv_window
+                #   GET/DELETE: + query_string_without_question_mark
+                #   POST:       + JSON body
                 recv = headers.get(spec.recv_window_header, "5000")
-                sign_payload = ts + cred.api_key + recv + (body or "")
+                if query_string and method.upper() in ("GET", "DELETE"):
+                    sign_payload = ts + cred.api_key + recv + query_string.lstrip("?")
+                else:
+                    sign_payload = ts + cred.api_key + recv + (body or "")
 
             sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
             headers[spec.signature_header] = sig
@@ -345,11 +357,12 @@ class VenueTransport:
         path: str,
         params: Optional[dict[str, Any]] = None,
         body: Optional[dict[str, Any]] = None,
+        private: bool = False,
     ) -> dict[str, Any]:
         client = await self._get_client()
         base_url = (
             self._spec.private_base_url
-            if method.upper() == "POST"
+            if private or method.upper() == "POST"
             else self._spec.public_base_url
         )
         qs, headers, req_body = self._build_signed_request(method, path, params, body)
@@ -368,7 +381,10 @@ class VenueTransport:
             if resp.status_code >= 400:
                 cat = classify_transport_error(resp.status_code, resp.text)
                 if cat:
-                    raise TransportError(cat, f"HTTP {resp.status_code}: {resp.text[:200]}")
+                    raise TransportError(
+                        cat, f"HTTP {resp.status_code}: {resp.text[:200]}",
+                        status_code=resp.status_code, body=resp.text,
+                    )
 
             if not resp.text:
                 return {}
@@ -544,10 +560,10 @@ class VenueTransport:
                 params["instId"] = venue_sym
             elif spec.venue_id == Venue.HYPERLIQUID:
                 body = {"type": "clearinghouseState", "user": self._credential.account_address if self._credential else ""}
-                raw = await self._request("POST", spec.position_path, body=body)
+                raw = await self._request("POST", spec.position_path, body=body, private=True)
                 return self._parse_position(raw, venue_sym, now_ms)
 
-            raw = await self._request("GET", spec.position_path, params=params)
+            raw = await self._request("GET", spec.position_path, params=params, private=True)
             return self._parse_position(raw, venue_sym, now_ms)
         except TransportError:
             raise
@@ -602,12 +618,8 @@ class VenueTransport:
             "positionSide",
             data.get("posSide",
             data.get("holdSide",
-            data.get("side", "LONG")))
+            data.get("side", "")))
         )).upper()
-        if "SHORT" in pos_side_str:
-            side = Side.SELL
-        else:
-            side = Side.BUY
 
         qty_raw = str(data.get(
             "positionAmt",
@@ -616,6 +628,25 @@ class VenueTransport:
             data.get("total",
             data.get("volume", "0"))))
         ))
+
+        # Determine side: explicit indicators, then sign of quantity
+        short_indicators = ("SHORT", "SELL")
+        long_indicators = ("LONG", "BUY")
+        if any(ind in pos_side_str for ind in short_indicators):
+            side = Side.SELL
+        elif any(ind in pos_side_str for ind in long_indicators):
+            side = Side.BUY
+        elif qty_raw:
+            try:
+                if float(qty_raw) < 0:
+                    side = Side.SELL
+                else:
+                    side = Side.BUY
+            except ValueError:
+                side = Side.BUY
+        else:
+            side = Side.BUY
+
         qty = abs(float(qty_raw)) if qty_raw else 0.0
 
         entry_price = float(data.get(
@@ -696,36 +727,58 @@ class VenueTransport:
                 if request.price is not None:
                     body["price"] = str(request.price)
             elif spec.venue_id == Venue.HYPERLIQUID:
-                # Live Hyperliquid orders require EIP-712 signing with a wallet
-                # private key. Full exchange-action signing (L1Action encode +
-                # sign + connection_id + nonce + vault_address) is not yet wired.
-                # Paper mode still produces a deterministic fill.
-                if self.mode == "live":
-                    raise OrderSubmitError(
-                        SubmitFailureClass.REJECTED,
-                        "Hyperliquid live order submission not yet implemented: "
-                        "EIP-712 exchange-action signing requires wallet integration",
-                    )
                 is_buy = request.side == Side.BUY
-                body = {
-                    "action": {
-                        "type": "order",
-                        "orders": [{
-                            "asset": venue_sym,
-                            "isBuy": is_buy,
-                            "reduceOnly": request.reduce_only,
-                            "limitPx": str(request.price) if request.price else "0",
-                            "orderType": {"limit": {"tif": "Gtc"}} if request.price else {"market": {}},
-                            "sz": str(request.quantity),
-                        }],
-                    },
-                    "type": "order",
-                }
-                if self._credential and self._credential.account_address:
-                    body["action"]["grouping"] = "na"
-                    body["vaultAddress"] = self._credential.account_address
+                tif = "Gtc" if request.price else "Ioc"
+                limit_px = str(request.price) if request.price else "0"
 
-            raw = await self._request("POST", spec.order_path, body=body)
+                if self.mode == "live":
+                    from lightfee.venues.hyperliquid_signing import (
+                        build_hyperliquid_exchange_payload,
+                        build_hyperliquid_order_action,
+                    )
+
+                    asset_index = await self._hl_resolve_asset_index(venue_sym)
+                    action = build_hyperliquid_order_action(
+                        symbol=venue_sym,
+                        is_buy=is_buy,
+                        quantity=request.quantity,
+                        price=float(limit_px),
+                        reduce_only=request.reduce_only,
+                        tif=tif,
+                    )
+                    # Override the placeholder asset index with the resolved one
+                    action["orders"][0]["a"] = asset_index
+
+                    vault_addr = None
+                    if self._credential and self._credential.account_address:
+                        vault_addr = self._credential.account_address
+
+                    body = build_hyperliquid_exchange_payload(
+                        action=action,
+                        private_key_hex=self._credential.api_secret if self._credential else "",
+                        vault_address=vault_addr,
+                        is_mainnet=True,
+                    )
+                else:
+                    body = {
+                        "action": {
+                            "type": "order",
+                            "orders": [{
+                                "a": 0,  # asset index — placeholder for paper
+                                "b": is_buy,
+                                "p": limit_px,
+                                "s": str(request.quantity),
+                                "r": request.reduce_only,
+                                "t": {"limit": {"tif": tif}},
+                            }],
+                            "grouping": "na",
+                        },
+                        "type": "order",
+                    }
+                    if self._credential and self._credential.account_address:
+                        body["vaultAddress"] = self._credential.account_address
+
+            raw = await self._request("POST", spec.order_path, body=body, private=True)
             return self._parse_order_fill(raw, request, venue_sym, now_ms)
 
         except TransportError as e:
@@ -745,6 +798,54 @@ class VenueTransport:
         now_ms: int,
     ) -> OrderFill:
         spec = self._spec
+
+        # Hyperliquid exchange response: {"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}
+        if spec.venue_id == Venue.HYPERLIQUID:
+            resp_status = str(raw.get("status", "")).lower()
+            if resp_status == "err":
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    str(raw.get("response", "Hyperliquid exchange error")),
+                )
+            response = raw.get("response", {})
+            if isinstance(response, dict):
+                inner_data = response.get("data", response)
+                statuses = inner_data.get("statuses", []) if isinstance(inner_data, dict) else []
+            else:
+                statuses = []
+
+            if not statuses:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "Hyperliquid order response contains no statuses",
+                )
+
+            status_entry = statuses[0]
+            if "filled" in status_entry:
+                filled = status_entry["filled"]
+                return OrderFill(
+                    venue=spec.venue_id,
+                    symbol=venue_sym,
+                    side=request.side,
+                    quantity=abs(float(filled.get("totalSz", 0))),
+                    price=float(filled.get("avgPx", request.price or 0)),
+                    order_id=str(filled.get("oid", "")),
+                    client_order_id=request.client_order_id,
+                    filled_at_ms=now_ms,
+                )
+            elif "resting" in status_entry:
+                resting = status_entry["resting"]
+                oid = str(resting.get("oid", ""))
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"Hyperliquid order resting (oid={oid}) — fill not confirmed",
+                )
+            else:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"Hyperliquid unknown order status: {list(status_entry.keys())}",
+                )
+
         data = raw.get("data", raw)
 
         # Bybit V5 nests the order under "result"
@@ -759,30 +860,55 @@ class VenueTransport:
         elif isinstance(data, list) and data:
             data = data[0]
 
-        if isinstance(data, dict):
-            order_id = str(data.get(
-                "orderId",
-                data.get("ordId",
-                data.get("id",
-                data.get("order_id", "")))
-            ))
-            exec_qty = float(data.get(
-                "executedQty",
-                data.get("cumQty",
-                data.get("filledQty",
-                data.get("size",
-                data.get("filled_size", request.quantity))))
-            ))
-            exec_price = float(data.get(
-                "avgPrice",
-                data.get("fillPx",
-                data.get("fill_price",
-                data.get("price", request.price or 0.0)))
-            ))
+        if not isinstance(data, dict):
+            raise OrderSubmitError(
+                SubmitFailureClass.UNCERTAIN,
+                "unexpected order response shape — cannot parse fill",
+            )
+
+        order_id = str(data.get(
+            "orderId",
+            data.get("ordId",
+            data.get("id",
+            data.get("order_id", "")))
+        ))
+
+        # Explicit fill quantity fields — do NOT fall back to request.quantity
+        exec_qty_raw = data.get(
+            "executedQty",
+            data.get("cumExecQty",
+            data.get("cumQty",
+            data.get("fillSz",
+            data.get("filledQty",
+            data.get("filled_size", None)))))
+        )
+
+        exec_price_raw = data.get(
+            "avgPrice",
+            data.get("fillPx",
+            data.get("fill_price", None))
+        )
+
+        status_str = str(data.get("status", "")).upper()
+        has_fill_status = status_str in ("FILLED", "FINISHED", "CLOSED")
+
+        if exec_qty_raw is not None:
+            exec_qty = abs(float(exec_qty_raw))
+            exec_price = float(exec_price_raw) if exec_price_raw is not None else float(data.get("price", 0))
+        elif has_fill_status:
+            exec_qty = abs(float(data.get("size", data.get("quantity", 0))))
+            exec_price = float(data.get("price", data.get("avgPrice", 0)))
+        elif order_id:
+            raise OrderSubmitError(
+                SubmitFailureClass.UNCERTAIN,
+                f"order accepted (id={order_id}) but fill not confirmed — "
+                "no executedQty/cumQty/fillSz in response",
+            )
         else:
-            order_id = str(uuid.uuid4()).replace("-", "")[:20]
-            exec_qty = request.quantity
-            exec_price = request.price or 0.0
+            raise OrderSubmitError(
+                SubmitFailureClass.UNCERTAIN,
+                "order response contains no order id and no fill data",
+            )
 
         return OrderFill(
             venue=spec.venue_id,
@@ -817,3 +943,37 @@ class VenueTransport:
         if spec.symbol_to_venue is not None:
             return spec.symbol_to_venue(symbol)
         return symbol
+
+    # ------------------------------------------------------------------
+    # Hyperliquid asset index resolution
+    # ------------------------------------------------------------------
+
+    async def _hl_resolve_asset_index(self, asset_name: str) -> int:
+        """Return the Hyperliquid asset index for *asset_name*.
+
+        Fetches ``POST /info {"type": "meta"}`` once and caches the
+        name→index mapping.  The index is the 0-based position in the
+        ``universe`` array — matching the Rust implementation.
+        """
+        if asset_name in self._hl_meta_cache:
+            return self._hl_meta_cache[asset_name]
+
+        raw = await self._request(
+            "POST", "/info",
+            body={"type": "meta"},
+            private=False,
+        )
+        universe = raw.get("universe", []) if isinstance(raw, list) else raw.get("universe", [])
+        if isinstance(raw, list) and len(raw) > 0 and "universe" not in raw:
+            universe = raw[0].get("universe", raw) if isinstance(raw[0], dict) else []
+
+        for idx, entry in enumerate(universe):
+            name = entry.get("name", "") if isinstance(entry, dict) else ""
+            if name:
+                self._hl_meta_cache[name] = idx
+
+        if asset_name not in self._hl_meta_cache:
+            raise ValueError(
+                f"Hyperliquid asset '{asset_name}' not found in metadata universe"
+            )
+        return self._hl_meta_cache[asset_name]

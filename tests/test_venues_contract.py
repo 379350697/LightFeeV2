@@ -30,7 +30,7 @@ from lightfee.venues.bitget import BitgetAdapter
 from lightfee.venues.gate import GateAdapter
 from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.hyperliquid import HyperliquidAdapter
-from lightfee.venues.transport import LiveCredential
+from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory
 
 ADAPTERS = [
     (Venue.BINANCE, BinanceAdapter),
@@ -253,10 +253,7 @@ class TestFixtureDrivenPosition:
             await transport.close()
 
 
-@pytest.mark.parametrize("fixture_name,venue_id,adapter_cls,symbol", [
-    # Hyperliquid live orders are explicitly unsupported — test separately
-    (n, v, a, s) for n, v, a, s in VENUE_FIXTURE_TABLE if n != "hyperliquid"
-])
+@pytest.mark.parametrize("fixture_name,venue_id,adapter_cls,symbol", VENUE_FIXTURE_TABLE)
 class TestFixtureDrivenOrderSuccess:
     """Feed each venue's place_order_success.json via mock and verify fill."""
 
@@ -267,17 +264,26 @@ class TestFixtureDrivenOrderSuccess:
         fixture = _load_fixture(fixture_name, "place_order_success")
         mock = _build_mock_transport(fixture)
 
-        cred = LiveCredential(api_key="k", api_secret="s",
-                              api_passphrase="p",
-                              wallet_private_key="0xdead",
-                              account_address="0xbeef")
+        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(
+            api_key="k",
+            api_secret=hl_privkey if venue_id == Venue.HYPERLIQUID else "s",
+            api_passphrase="p",
+            wallet_private_key="0xdead",
+            account_address="0xbeef",
+        )
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
 
+        # Hyperliquid needs the asset index pre-populated so the mock
+        # transport (single-response) doesn't need to serve metadata.
+        if venue_id == Venue.HYPERLIQUID:
+            transport._hl_meta_cache[symbol] = 0
+
         try:
             req = OrderRequest(
-                venue=venue_id, symbol=symbol, side=Side.BUY, quantity=0.01,
+                venue=venue_id, symbol=symbol, side=Side.BUY, quantity=1.0 if venue_id == Venue.HYPERLIQUID else 0.01,
             )
             fill = await adapter.place_order(req)
             assert isinstance(fill, OrderFill)
@@ -288,9 +294,7 @@ class TestFixtureDrivenOrderSuccess:
             await transport.close()
 
 
-@pytest.mark.parametrize("fixture_name,venue_id,adapter_cls,symbol", [
-    (n, v, a, s) for n, v, a, s in VENUE_FIXTURE_TABLE if n != "hyperliquid"
-])
+@pytest.mark.parametrize("fixture_name,venue_id,adapter_cls,symbol", VENUE_FIXTURE_TABLE)
 class TestFixtureDrivenOrderReject:
     """Feed each venue's place_order_reject.json and verify rejection handling."""
 
@@ -310,9 +314,14 @@ class TestFixtureDrivenOrderReject:
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
 
+        # Pre-populate Hyperliquid asset index so mock only handles the order
+        if venue_id == Venue.HYPERLIQUID:
+            transport._hl_meta_cache[symbol] = 0
+
         try:
             req = OrderRequest(
-                venue=venue_id, symbol=symbol, side=Side.BUY, quantity=0.01,
+                venue=venue_id, symbol=symbol, side=Side.BUY,
+                quantity=1.0 if venue_id == Venue.HYPERLIQUID else 0.01,
             )
             with pytest.raises(OrderSubmitError):
                 await adapter.place_order(req)
@@ -385,27 +394,32 @@ class TestAsterOrderRequestShape:
             await transport.close()
 
 
-class TestHyperliquidLiveOrderUnsupported:
-    """Hyperliquid live order must explicitly report unsupported."""
+class TestHyperliquidLiveOrderNowSupported:
+    """Hyperliquid live order now works with EIP-712 signing."""
 
     @pytest.mark.asyncio
-    async def test_live_order_raises_with_not_implemented_message(self):
+    async def test_live_order_succeeds_with_fill_fixture(self):
         fixture = _load_fixture("hyperliquid", "place_order_success")
         mock = _build_mock_transport(fixture)
 
-        cred = LiveCredential(api_key="k", api_secret="s",
+        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(api_key="k", api_secret=hl_privkey,
                               wallet_private_key="0xdead",
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        # Pre-populate asset index cache to avoid mock needing metadata response
+        transport._hl_meta_cache["BTC"] = 0
 
         try:
             req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
                               side=Side.BUY, quantity=1.0)
-            with pytest.raises(OrderSubmitError) as exc_info:
-                await adapter.place_order(req)
-            assert "not yet implemented" in str(exc_info.value).lower()
+            fill = await adapter.place_order(req)
+            assert fill.venue == Venue.HYPERLIQUID
+            assert fill.order_id == "123"
+            assert fill.quantity == 1.0
+            assert fill.price == 50000.0
         finally:
             await transport.close()
 
@@ -509,5 +523,263 @@ class TestLiveModeNoSilentFakeData:
             # These must come from the fixture, not be zeros
             assert q.bid == 50000.0, f"Expected fixture bid 50000, got {q.bid}"
             assert q.ask == 50001.0, f"Expected fixture ask 50001, got {q.ask}"
+        finally:
+            await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Bitget profile detection integration — full fetch_position flow (Fix 4)
+# ---------------------------------------------------------------------------
+
+
+class TestBitgetProfileDetectionFullFlow:
+    """Bitget profile detection must handle errors correctly and cache results."""
+
+    @pytest.mark.asyncio
+    async def test_classic_fallback_completes_fetch_position(self):
+        """When UTA probe returns classic-mode error, adapter falls back to classic
+        and successfully fetches position via classic endpoint."""
+        from lightfee.venues.bitget import BitgetAccountProfile
+
+        # Response 1: UTA probe returns classic-mode error
+        # Response 2: Classic position endpoint returns success
+        classic_error = {"code": "40034", "msg": "classic account not supported"}
+        classic_position = {
+            "code": "00000",
+            "data": {"symbol": "BTCUSDT", "holdSide": "long",
+                     "total": "0.02", "openPriceAvg": "51000.0"},
+        }
+        mock = _build_multi_response_transport([
+            (400, classic_error),
+            (200, classic_position),
+        ])
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            pos = await adapter.fetch_position("BTCUSDT")
+            assert pos.quantity == 0.02
+            assert pos.entry_price == 51000.0
+            assert adapter.account_profile == BitgetAccountProfile.CLASSIC
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_auth_401_does_not_fallback(self):
+        """401 Unauthorized must NOT be treated as classic-mode; must propagate."""
+        mock = _build_mock_transport({"code": "40100", "msg": "invalid api key"}, status=401)
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            with pytest.raises(TransportError) as exc_info:
+                await adapter.detect_profile()
+            assert exc_info.value.category == TransportErrorCategory.AUTH_FAILURE
+            # Profile must NOT be cached as CLASSIC
+            assert adapter.account_profile is None
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_429_does_not_fallback(self):
+        """429 Rate limit must NOT be treated as classic-mode; must propagate."""
+        mock = _build_mock_transport(
+            {"code": "42900", "msg": "rate limited"}, status=429
+        )
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            with pytest.raises(TransportError) as exc_info:
+                await adapter.detect_profile()
+            assert exc_info.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+            assert adapter.account_profile is None
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_network_error_does_not_fallback(self):
+        """Network timeout must NOT be treated as classic-mode; must propagate."""
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        # Use a non-routable address to force network error
+        transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: (_ for _ in ()).throw(httpx.ConnectError("connection refused"))
+            )
+        )
+
+        try:
+            with pytest.raises(TransportError) as exc_info:
+                await adapter.detect_profile()
+            assert exc_info.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+            assert adapter.account_profile is None
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_profile_cached_after_first_detection(self):
+        """Profile is cached; second detect_profile does not probe again."""
+        uta_position = {
+            "code": "00000",
+            "data": [{"symbol": "BTCUSDT", "posSide": "long",
+                       "total": "0.01", "openPriceAvg": "50000.0"}],
+        }
+        mock = _build_mock_transport(uta_position)
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            from lightfee.venues.bitget import BitgetAccountProfile
+            profile1 = await adapter.detect_profile()
+            assert profile1 == BitgetAccountProfile.UTA
+            # Second call is cached — returns immediately without new HTTP request
+            profile2 = await adapter.detect_profile()
+            assert profile2 == BitgetAccountProfile.UTA
+            assert adapter.account_profile == BitgetAccountProfile.UTA
+        finally:
+            await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Hyperliquid capability declaration consistency (Fix 7)
+# ---------------------------------------------------------------------------
+
+
+class TestHyperliquidCapabilityConsistency:
+    """Hyperliquid live order is now supported with EIP-712 signing."""
+
+    def test_hyperliquid_spec_has_live_order_supported(self):
+        from lightfee.venues.specs import hyperliquid_spec
+        spec = hyperliquid_spec()
+        assert spec.live_order_supported is True, (
+            "Hyperliquid spec must declare live_order_supported=True"
+        )
+        assert spec.paper_order_supported is True, (
+            "Hyperliquid paper order must still work"
+        )
+
+    def test_hyperliquid_capabilities_live_order_supported(self):
+        from lightfee.venues.base import VenueCapabilities
+        caps = VenueCapabilities.for_venue(Venue.HYPERLIQUID)
+        assert caps.live_order_supported is True, (
+            "Hyperliquid capabilities must show live_order_supported=True"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_order_now_works_with_signing(self):
+        """Hyperliquid live order with mock exchange returns valid fill."""
+        fixture = _load_fixture("hyperliquid", "place_order_success")
+        mock = _build_mock_transport(fixture)
+
+        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(api_key="k", api_secret=hl_privkey,
+                              wallet_private_key="0xdead",
+                              account_address="0xbeef")
+        adapter = HyperliquidAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+        transport._hl_meta_cache["BTC"] = 0
+
+        try:
+            req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
+                              side=Side.BUY, quantity=1.0)
+            fill = await adapter.place_order(req)
+            assert fill.venue == Venue.HYPERLIQUID
+            assert fill.order_id == "123"
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_market_snapshot_still_works(self):
+        """Hyperliquid market data path must remain functional."""
+        fixture = _load_fixture("hyperliquid", "market_snapshot")
+        mock = _build_mock_transport(fixture)
+        cred = LiveCredential(api_key="k", api_secret="s",
+                              wallet_private_key="0xdead",
+                              account_address="0xbeef")
+        adapter = HyperliquidAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            snap = await adapter.fetch_market_snapshot(["BTC"])
+            assert len(snap.quotes) > 0
+            assert snap.quotes[0].bid > 0
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_position_still_works(self):
+        """Hyperliquid position fetch must remain functional."""
+        fixture = _load_fixture("hyperliquid", "position_snapshot")
+        mock = _build_mock_transport(fixture)
+        cred = LiveCredential(api_key="k", api_secret="s",
+                              wallet_private_key="0xdead",
+                              account_address="0xbeef")
+        adapter = HyperliquidAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            pos = await adapter.fetch_position("BTC")
+            assert pos.quantity > 0
+            assert pos.entry_price > 0
+        finally:
+            await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Ack-only order integration test (Fix 6 integration)
+# ---------------------------------------------------------------------------
+
+
+class TestAckOnlyOrderIntegration:
+    """Integration test: ack-only order response through adapter must raise UNCERTAIN."""
+
+    @pytest.mark.asyncio
+    async def test_bybit_ack_only_through_adapter_raises_uncertain(self):
+        """Bybit place_order with ack-only response must raise UNCERTAIN."""
+        ack_response = {"retCode": 0, "result": {"orderId": "xyz789", "orderLinkId": "client_1"}}
+        mock = _build_mock_transport(ack_response)
+        cred = LiveCredential(api_key="k", api_secret="s")
+        adapter = BybitAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            req = OrderRequest(venue=Venue.BYBIT, symbol="BTCUSDT",
+                              side=Side.BUY, quantity=0.01)
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await adapter.place_order(req)
+            assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_bitget_ack_only_through_adapter_raises_uncertain(self):
+        """Bitget place_order with ack-only response must raise UNCERTAIN."""
+        ack_response = {"code": "00000", "data": {"orderId": "bg123", "clientOrderId": "client_1"}}
+        mock = _build_mock_transport(ack_response)
+        cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+        adapter = BitgetAdapter(mode="live", credential=cred)
+        transport = adapter._transport
+        transport._client = httpx.AsyncClient(transport=mock)
+
+        try:
+            req = OrderRequest(venue=Venue.BITGET, symbol="BTCUSDT",
+                              side=Side.BUY, quantity=0.01)
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await adapter.place_order(req)
+            assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
         finally:
             await transport.close()
