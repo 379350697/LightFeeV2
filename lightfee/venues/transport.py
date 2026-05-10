@@ -635,9 +635,9 @@ class VenueTransport:
         pos_side_upper = pos_side_str.upper()
         short_indicators = ("SHORT", "SELL", "SHORT_SIDE")
         long_indicators = ("LONG", "BUY")
-        if any(ind in pos_side_str for ind in short_indicators):
+        if any(ind in pos_side_upper for ind in short_indicators):
             side = Side.SELL
-        elif any(ind in pos_side_str for ind in long_indicators):
+        elif any(ind in pos_side_upper for ind in long_indicators):
             side = Side.BUY
         elif qty_raw:
             try:

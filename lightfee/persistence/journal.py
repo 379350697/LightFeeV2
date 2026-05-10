@@ -32,6 +32,12 @@ class Journal:
             self._file.close()
             self._file = None
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def append(
         self,
         kind: str,

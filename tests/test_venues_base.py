@@ -52,8 +52,9 @@ class TestReduceOnlyExemptions:
         assert venue_reduce_only_close_exempts_min_notional(Venue.ASTER)
         assert venue_reduce_only_close_exempts_min_notional(Venue.BINANCE)
 
-    def test_gate_is_not_exempt(self):
-        assert not venue_reduce_only_close_exempts_min_notional(Venue.GATE)
+    def test_gate_is_exempt(self):
+        """Gate is exempt per V1 live/gate.rs: reduce-only empty position is terminal success."""
+        assert venue_reduce_only_close_exempts_min_notional(Venue.GATE)
 
     def test_others_not_exempt(self):
         for v in (Venue.OKX, Venue.BYBIT, Venue.BITGET, Venue.HYPERLIQUID):

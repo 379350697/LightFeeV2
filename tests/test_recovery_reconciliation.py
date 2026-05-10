@@ -687,7 +687,7 @@ class TestReconciliationService:
         long_adapter = FakeVenueAdapter(Venue.BINANCE)
         short_adapter = FakeVenueAdapter(Venue.OKX)
 
-        reconciler = OrderReconciler(long_adapter, short_adapter)
+        reconciler = OrderReconciler(adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter})
         result = await reconciler.reconcile_position(
             position_id="pos-1",
             symbol="BTCUSDT",
@@ -704,7 +704,7 @@ class TestReconciliationService:
         long_adapter = FakeVenueAdapter(Venue.BINANCE)
         short_adapter = FakeVenueAdapter(Venue.OKX)
 
-        reconciler = OrderReconciler(long_adapter, short_adapter)
+        reconciler = OrderReconciler(adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter})
         result = await reconciler.reconcile_position(
             position_id="pos-u",
             symbol="ETHUSDT",

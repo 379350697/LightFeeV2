@@ -194,10 +194,13 @@ class Supervisor:
         V1: engine/risk.rs lines 1794-1905.
         """
         if plan.kind == RiskExecutionPlanKind.DELEVER:
-            self._execute_delever(position, plan, now_ms, long_price_hint, short_price_hint)
+            await self._execute_delever(position, plan, now_ms, long_price_hint, short_price_hint)
 
         elif plan.kind == RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION:
-            self._execute_single_side_protection(position, plan, now_ms)
+            await self._execute_single_side_protection(
+                position, plan, now_ms,
+                long_price_hint=long_price_hint, short_price_hint=short_price_hint,
+            )
 
         elif plan.kind == RiskExecutionPlanKind.FAIL_CLOSED:
             self._execute_fail_closed(position, plan, now_ms)
@@ -263,15 +266,19 @@ class Supervisor:
                 },
             )
 
-    def _execute_single_side_protection(
+    async def _execute_single_side_protection(
         self,
         position: OpenPosition,
         plan: RiskExecutionPlan,
         now_ms: int,
+        long_price_hint: float = 0.0,
+        short_price_hint: float = 0.0,
     ) -> None:
         """Execute single-side protection then enter fail-closed.
 
         V1: engine/risk.rs lines 1883-1891 (try_single_side_protection).
+        Submits a protective reduce-only close when a CloseExecutor is available
+        before entering fail-closed lifecycle.
         """
         self.journal.append(
             "risk.death_triggered",
@@ -282,6 +289,24 @@ class Supervisor:
                 "action": "single_side_protection",
             },
         )
+
+        # V1: Submit protective close order on the healthier leg
+        if self.close_executor and position.matched_quantity > 0:
+            total_quantity = min(position.matched_quantity, plan.adjusted_quantity if plan.adjusted_quantity > 0 else position.matched_quantity)
+            self.journal.append(
+                "risk.death_protection_close_initiated",
+                {
+                    "position_id": position.position_id,
+                    "quantity": total_quantity,
+                },
+            )
+            await self.close_executor.execute_close(
+                position, f"death_protection:{plan.reason}", now_ms,
+                long_price_hint=long_price_hint,
+                short_price_hint=short_price_hint,
+                total_quantity=total_quantity,
+                state=self.state,
+            )
 
         position.last_risk_action_at_ms = now_ms
         position.last_risk_reason = plan.reason

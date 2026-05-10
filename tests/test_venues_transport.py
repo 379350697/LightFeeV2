@@ -338,7 +338,7 @@ class TestQuantityNormalization:
     def test_reduce_only_close_exemptions(self):
         assert venue_reduce_only_close_exempts_min_notional(Venue.ASTER)
         assert venue_reduce_only_close_exempts_min_notional(Venue.BINANCE)
-        assert not venue_reduce_only_close_exempts_min_notional(Venue.GATE)
+        assert venue_reduce_only_close_exempts_min_notional(Venue.GATE)  # V1: Gate exempt
 
     def test_floor_to_step_alias(self):
         assert floor_to_step(1.7, 1.0) == 1.0

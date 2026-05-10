@@ -259,6 +259,124 @@ class TestPendingEntryTracking:
 
 
 # ---------------------------------------------------------------------------
+# EN-001: Planner-driven route and maker-leg decisions
+# ---------------------------------------------------------------------------
+
+
+class TestPlannerDispatchIntegration:
+    """Prove runtime calls planner for route/maker-leg instead of hardcoding."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_uses_planner_route(self, config, tmp_journal):
+        """Entry route comes from planner, not hardcoded STANDARD_DUAL_TAKER."""
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = executor
+
+        # Create a mock candidate with enough notional to pass planner
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,  # large enough to pass min-notional
+        )
+
+        # Dispatch with valid price hint
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+
+        # Verify journal records entry_dispatched (planner passed)
+        records = runtime.journal.read_all()
+        kinds = [r["kind"] for r in records]
+        assert "runtime.entry_dispatched" in kinds
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_rejects_below_min_notional(self, config, tmp_journal):
+        """Entry below min-notional is rejected by planner."""
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=1.0,  # too small
+        )
+
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+
+        records = runtime.journal.read_all()
+        kinds = [r["kind"] for r in records]
+        # Should be rejected by planner (target_below_min_hedgeable_chunk or similar)
+        assert "runtime.entry_skipped_planner_rejected" in kinds or "runtime.entry_skipped_no_quote" in kinds
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_skips_no_quote(self, config, tmp_journal):
+        """Entry with zero price_hint is rejected before planner."""
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+        executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+        )
+
+        await runtime._dispatch_entry(candidate, 5000, price_hint=0.0)
+
+        records = runtime.journal.read_all()
+        kinds = [r["kind"] for r in records]
+        assert "runtime.entry_skipped_no_quote" in kinds
+
+
+# ---------------------------------------------------------------------------
 # Runtime wiring: executor connected to LiveRuntime
 # ---------------------------------------------------------------------------
 

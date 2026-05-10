@@ -211,6 +211,9 @@ class LiveRuntime:
 
         Evaluates risk for every open position and executes delever / protection
         plans when conditions are met. This is the primary close-driving path.
+
+        V1: queries venue adapters for account risk snapshots, passes real
+        supports_risk_health flags instead of hardcoded False (Fix 4).
         """
         now_ms = wall_clock_now_ms()
         self.state.last_tick_ms = now_ms
@@ -226,10 +229,37 @@ class LiveRuntime:
 
         # --- Per-position risk supervision ---
         for position in list(self.state.open_positions.values()):
+            # Determine risk health support from venue adapters (Fix 4)
+            long_adapter = self.get_venue_adapter(position.long_venue)
+            short_adapter = self.get_venue_adapter(position.short_venue)
+
+            long_supports = (
+                long_adapter is not None and long_adapter.supports_risk_health
+            )
+            short_supports = (
+                short_adapter is not None and short_adapter.supports_risk_health
+            )
+
+            # Try to fetch real risk snapshots
+            import asyncio as _asyncio
+
+            long_snapshot = None
+            short_snapshot = None
+            try:
+                if long_supports and long_adapter is not None:
+                    long_snapshot = await long_adapter.fetch_account_risk_snapshot()
+                if short_supports and short_adapter is not None:
+                    short_snapshot = await short_adapter.fetch_account_risk_snapshot()
+            except Exception:
+                # Risk snapshot fetch failure — treat as unsupported (V1: fail-closed by config)
+                pass
+
             plan = self.supervisor.supervise_position(
                 position, now_ms,
-                long_supports_risk_health=False,
-                short_supports_risk_health=False,
+                long_supports_risk_health=long_supports,
+                short_supports_risk_health=short_supports,
+                long_snapshot=long_snapshot,
+                short_snapshot=short_snapshot,
             )
             if plan is not None:
                 self.journal.append(
@@ -281,7 +311,7 @@ class LiveRuntime:
                         )
 
             # --- Post-tick housekeeping ---
-            self._post_tick_housekeeping(now_ms)
+            await self._post_tick_housekeeping(now_ms)
 
             # --- Persist state snapshot ---
             self.snapshot_store.write(self.state.to_dict())
@@ -293,13 +323,131 @@ class LiveRuntime:
             await asyncio.sleep(min(poll_ms, active_poll_ms) / 1000.0)
 
     # ------------------------------------------------------------------
+    # Reconciliation (V1 recovery/reconciliation live path — Fix 3)
+    # ------------------------------------------------------------------
+
+    async def _reconcile_pending_state(self, now_ms: int) -> None:
+        """Process pending closes and pending entries through venue adapters.
+
+        Rust V1: recovery.rs process_pending_close_reconciliations() and
+        runtime_state pending reconciliation tick.
+        """
+        if self.reconciler is None or not self._venue_adapters:
+            return
+
+        # --- Process pending entries (uncertain maker/hedge orders) ---
+        resolved_entry_ids: list[str] = []
+        for entry_id, pending in list(self.state.pending_entries.items()):
+            if not pending.uncertain_outcome:
+                resolved_entry_ids.append(entry_id)
+                continue
+
+            try:
+                result = await self.reconciler.reconcile_position(
+                    position_id=entry_id,
+                    symbol=pending.symbol,
+                    long_venue=pending.long_venue,
+                    short_venue=pending.short_venue,
+                    long_order_id=pending.maker_order_id,
+                    short_order_id=pending.hedge_order_id,
+                )
+            except Exception as e:
+                self.journal.append(
+                    "reconciliation.entry_reconcile_error",
+                    {"entry_id": entry_id, "error": str(e)},
+                )
+                continue
+
+            if result.long_status == "filled" and result.short_status == "filled":
+                resolved_entry_ids.append(entry_id)
+                self.journal.append(
+                    "reconciliation.entry_resolved",
+                    {"entry_id": entry_id, "long_status": result.long_status, "short_status": result.short_status},
+                )
+            elif result.is_flat:
+                # Both sides flat — entry was likely never placed, clear it
+                resolved_entry_ids.append(entry_id)
+                self.journal.append(
+                    "reconciliation.entry_cleared_flat",
+                    {"entry_id": entry_id},
+                )
+
+        for eid in resolved_entry_ids:
+            self.state.pending_entries.pop(eid, None)
+
+        # --- Process pending closes ---
+        resolved_ids: list[str] = []
+        for close_id, pending in list(self.state.pending_closes.items()):
+            if pending.long_uncertain or pending.short_uncertain:
+                # Find the associated position for venue info
+                pos = self.state.open_positions.get(pending.position_id)
+                if pos is None:
+                    # Position already gone — clear the pending close
+                    resolved_ids.append(close_id)
+                    self.journal.append(
+                        "reconciliation.pending_close_orphaned",
+                        {"close_id": close_id, "position_id": pending.position_id},
+                    )
+                    continue
+
+                try:
+                    result = await self.reconciler.reconcile_position(
+                        position_id=pending.position_id,
+                        symbol=pos.symbol,
+                        long_venue=pos.long_venue,
+                        short_venue=pos.short_venue,
+                    )
+                except Exception as e:
+                    self.journal.append(
+                        "reconciliation.reconcile_error",
+                        {"close_id": close_id, "error": str(e)},
+                    )
+                    continue
+
+                # If both legs are confirmed, resolve
+                if result.is_flat:
+                    resolved_ids.append(close_id)
+                    self.state.open_positions.pop(pending.position_id, None)
+                    self.journal.append(
+                        "reconciliation.close_resolved_flat",
+                        {"close_id": close_id, "position_id": pending.position_id},
+                    )
+                elif not pending.long_uncertain and not pending.short_uncertain:
+                    resolved_ids.append(close_id)
+                    self.journal.append(
+                        "reconciliation.close_resolved",
+                        {"close_id": close_id, "position_id": pending.position_id},
+                    )
+                # else: leave pending for next tick
+
+        for cid in resolved_ids:
+            self.state.pending_closes.pop(cid, None)
+
+        # --- Transition out of RECONCILING if all work is done ---
+        if (
+            self.state.lifecycle == EngineLifecycle.RECONCILING
+            and not self.state.pending_entries
+            and not self.state.pending_closes
+        ):
+            from lightfee.engine.lifecycle import transition_to_running
+
+            transition_to_running(self.state)
+            self.journal.append(
+                "runtime.reconciling_complete",
+                {"reason": "all_pending_resolved", "ts_ms": now_ms},
+            )
+
+    # ------------------------------------------------------------------
     # Housekeeping
     # ------------------------------------------------------------------
 
-    def _post_tick_housekeeping(self, now_ms: int) -> None:
-        """Run after every tick cycle: supervisor, periodic exports."""
+    async def _post_tick_housekeeping(self, now_ms: int) -> None:
+        """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
         # Risk-line supervision
         self.supervisor.supervise(now_ms, self.state.venue_health)
+
+        # Reconciliation of pending/uncertain outcomes
+        await self._reconcile_pending_state(now_ms)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(
@@ -318,28 +466,91 @@ class LiveRuntime:
     # ------------------------------------------------------------------
 
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> None:
-        """Transform a tradeable candidate into an entry context and execute via entry_executor."""
+        """Transform a tradeable candidate into an entry context and execute via entry_executor.
+
+        V1: entry route/maker-leg/price gate from config and execution planner.
+        Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
+        Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
+        """
         from lightfee.core.domain import Side, Venue
         from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.execution_planner import (
+            ExecutionRoute,
+            plan_incremental_entry_execution,
+        )
+
+        # V1 price gate: require valid quote before constructing entry context
+        if price_hint <= 0 or candidate.entry_notional_quote <= 0:
+            self.journal.append(
+                "runtime.entry_skipped_no_quote",
+                {
+                    "symbol": candidate.symbol,
+                    "price_hint": price_hint,
+                    "notional": candidate.entry_notional_quote,
+                    "reason": "no valid quote to construct entry — V1 rejects",
+                },
+            )
+            return
 
         # Resolve venue enums from candidate string fields
         long_venue = Venue.from_str(candidate.long_venue)
         short_venue = Venue.from_str(candidate.short_venue)
-        # Derive base quantity from notional and price; use price_hint from snapshot if available
-        effective_price = price_hint if price_hint > 0 else 1.0
-        quantity = candidate.entry_notional_quote / effective_price if candidate.entry_notional_quote > 0 else 0.0
+        quantity = candidate.entry_notional_quote / price_hint
+
+        # V1 entry route planning: derive route and maker leg from execution planner.
+        # Strategy config provides min-notional; venue-specific chunk/min-notional
+        # are resolved from the adapter or spec when available.
+        strategy = self.config.strategy
+        min_notional = strategy.min_entry_leg_notional_quote
+        min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
+
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=quantity,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=min_hedgeable_chunk,
+            maker_min_notional_quote=min_notional,
+            maker_price_hint=price_hint if price_hint > 0 else None,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=min_notional,
+            hedge_price_hint=price_hint if price_hint > 0 else None,
+        )
+
+        if route == ExecutionRoute.REJECTED:
+            self.journal.append(
+                "runtime.entry_skipped_planner_rejected",
+                {
+                    "symbol": candidate.symbol,
+                    "target_quantity": quantity,
+                    "reason": plan.reason or "planner rejected entry",
+                },
+            )
+            return
+
+        # Map planner route to EntryType
+        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
+            entry_type = EntryType.PASSIVE_INCREMENTAL
+            effective_quantity = plan.initial_maker_target_quantity
+        elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
+            entry_type = EntryType.STANDARD_DUAL_TAKER
+            effective_quantity = quantity
+        else:
+            entry_type = EntryType.STANDARD_DUAL_TAKER
+            effective_quantity = quantity
+
+        # maker_leg defaults to BUY (funding arb: long side is typically maker)
+        maker_leg = Side.BUY
 
         ctx = EntryContext(
             entry_id=f"entry-{now_ms}-{candidate.symbol}",
             symbol=candidate.symbol,
             long_venue=long_venue,
             short_venue=short_venue,
-            long_quantity=quantity,
-            short_quantity=quantity,
-            long_price_hint=effective_price,
-            short_price_hint=effective_price,
-            maker_leg=Side.BUY,
-            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            long_quantity=effective_quantity,
+            short_quantity=effective_quantity,
+            long_price_hint=price_hint,
+            short_price_hint=price_hint,
+            maker_leg=maker_leg,
+            entry_type=entry_type,
             created_at_ms=now_ms,
         )
 

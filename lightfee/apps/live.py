@@ -29,6 +29,21 @@ def main() -> None:
         ",".join(v.value for v in venue_adapters),
     )
     runtime = LiveRuntime(config, venue_adapters=venue_adapters)
+
+    # Wire production executors (V1 live closure — Fix 2)
+    from lightfee.engine.close_executor import CloseExecutor
+    from lightfee.engine.entry_sync import EntrySyncExecutor
+    from lightfee.engine.reconciliation import OrderReconciler
+
+    runtime.entry_executor = EntrySyncExecutor(
+        adapters=venue_adapters, journal=runtime.journal,
+    )
+    runtime.close_executor = CloseExecutor(
+        adapters=venue_adapters, journal=runtime.journal,
+    )
+    runtime.supervisor.close_executor = runtime.close_executor
+    runtime.reconciler = OrderReconciler(adapters=venue_adapters)
+
     loop = asyncio.new_event_loop()
 
     shutdown_requested = False

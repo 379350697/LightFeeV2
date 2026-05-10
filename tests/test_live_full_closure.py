@@ -239,9 +239,10 @@ class TestLiveFullClosure:
             await runtime.start()
 
             # Trigger housekeeping
-            runtime._post_tick_housekeeping(5000)
+            await runtime._post_tick_housekeeping(5000)
 
             # Should not crash (metrics export is gated by env var)
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
 
 
 # ---------------------------------------------------------------------------

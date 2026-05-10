@@ -246,7 +246,48 @@ class TestSupervisePosition:
 # ---------------------------------------------------------------------------
 
 
+class _FakeCloseExecutor:
+    """Fake close executor that records calls for testing supervisor execution."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def execute_close(self, position, reason, now_ms, **kwargs) -> None:
+        self.calls.append({
+            "position_id": position.position_id,
+            "reason": reason,
+            "now_ms": now_ms,
+            "kwargs": kwargs,
+        })
+
+
 class TestExecuteRiskPlan:
+    @pytest.mark.asyncio
+    async def test_execute_risk_plan_delever_awaits_close_executor(self):
+        """Fix 1: DELEVER plan via execute_risk_plan must call close_executor.execute_close."""
+        config = _make_config()
+        state = EngineState()
+        journal = _make_journal()
+        fake_close = _FakeCloseExecutor()
+        supervisor = Supervisor(config, state, journal, close_executor=fake_close)
+
+        pos = _make_position(matched_quantity=0.01)
+        plan = RiskExecutionPlan(
+            kind=RiskExecutionPlanKind.DELEVER,
+            reason="risk_delever",
+            requested_quantity=0.002,
+            adjusted_quantity=0.002,
+        )
+        await supervisor.execute_risk_plan(pos, plan, 5000, long_price_hint=50000.0, short_price_hint=50000.0)
+
+        # The close executor MUST have been called
+        assert len(fake_close.calls) == 1, f"expected 1 close executor call, got {len(fake_close.calls)}"
+        assert fake_close.calls[0]["position_id"] == "p001"
+        assert fake_close.calls[0]["reason"] == "risk_delever"
+        # Position state must be updated
+        assert pos.risk_delever_step_count == 1
+        assert pos.last_risk_action_at_ms == 5000
+
     @pytest.mark.asyncio
     async def test_execute_delever_increments_step_count(self):
         config = _make_config()
@@ -307,7 +348,8 @@ class TestExecuteRiskPlan:
         limit = [e for e in entries if e.get("kind") == "risk.delever_limit_reached"]
         assert len(limit) == 1
 
-    def test_execute_single_side_protection_enters_fail_closed(self):
+    @pytest.mark.asyncio
+    async def test_execute_single_side_protection_enters_fail_closed(self):
         config = _make_config()
         state = EngineState()
         journal = _make_journal()
@@ -318,7 +360,7 @@ class TestExecuteRiskPlan:
             kind=RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION,
             reason="test_death",
         )
-        supervisor._execute_single_side_protection(pos, plan, 5000)
+        await supervisor._execute_single_side_protection(pos, plan, 5000)
 
         assert pos.single_side_protection_triggered
         assert pos.last_risk_reason == "test_death"

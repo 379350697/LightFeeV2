@@ -83,5 +83,22 @@ class VenueAdapter(ABC):
     async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
         pass
 
+    @property
+    def supports_risk_health(self) -> bool:
+        """Whether this venue adapter can provide account risk health snapshots.
+
+        V1: Risk health requires equity/margin data to compute health ratios.
+        Default is False — overridden by adapters that support it.
+        """
+        return False
+
+    async def fetch_account_risk_snapshot(self) -> Optional[AccountRiskSnapshot]:
+        """Fetch an account risk snapshot for risk health evaluation.
+
+        Returns None if not supported. V1 equivalent: account risk polling
+        that feeds evaluate_position_risk().
+        """
+        return None
+
     async def shutdown(self) -> None:
         pass

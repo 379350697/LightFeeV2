@@ -59,20 +59,27 @@ class OrderReconciler:
     Rust V1 equivalent: engine queries venue adapters for order fills and
     position state during recovery. This service encapsulates the async
     adapter queries needed to resolve uncertainty.
+
+    Constructor accepts only a dict[Venue, VenueAdapter] map. Both legs
+    must be queried through the adapter map — single-adapter shortcuts
+    are not permitted (V1 requires both-leg reconciliation).
     """
 
     def __init__(
         self,
-        long_adapter: Optional[VenueAdapter] = None,
-        short_adapter: Optional[VenueAdapter] = None,
+        adapters: dict[Venue, VenueAdapter],
     ) -> None:
-        self._long_adapter = long_adapter
-        self._short_adapter = short_adapter
+        self._adapters = dict(adapters)
+
+    def _adapter_for(self, venue: Venue) -> Optional[VenueAdapter]:
+        return self._adapters.get(venue)
 
     async def reconcile_position(
         self,
         position_id: str,
         symbol: str,
+        long_venue: Optional[Venue] = None,
+        short_venue: Optional[Venue] = None,
         long_order_id: str = "",
         short_order_id: str = "",
     ) -> PositionReconciliationResult:
@@ -82,9 +89,12 @@ class OrderReconciler:
             symbol=symbol,
         )
 
-        if self._long_adapter is not None:
+        long_adapter = self._adapter_for(long_venue) if long_venue else None
+        short_adapter = self._adapter_for(short_venue) if short_venue else None
+
+        if long_adapter is not None:
             if long_order_id:
-                fill = await self._long_adapter.fetch_order_fill_reconciliation(
+                fill = await long_adapter.fetch_order_fill_reconciliation(
                     symbol, long_order_id
                 )
                 if fill is not None:
@@ -92,12 +102,12 @@ class OrderReconciler:
                     result.long_fill = fill
                 else:
                     result.long_status = "uncertain"
-            pos = await self._long_adapter.fetch_position(symbol)
+            pos = await long_adapter.fetch_position(symbol)
             result.long_position = pos
 
-        if self._short_adapter is not None:
+        if short_adapter is not None:
             if short_order_id:
-                fill = await self._short_adapter.fetch_order_fill_reconciliation(
+                fill = await short_adapter.fetch_order_fill_reconciliation(
                     symbol, short_order_id
                 )
                 if fill is not None:
@@ -105,7 +115,7 @@ class OrderReconciler:
                     result.short_fill = fill
                 else:
                     result.short_status = "uncertain"
-            pos = await self._short_adapter.fetch_position(symbol)
+            pos = await short_adapter.fetch_position(symbol)
             result.short_position = pos
 
         # Determine if flat

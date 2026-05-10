@@ -9,8 +9,14 @@ from lightfee.core.money import floor_to_step, normalize_order_quantity
 
 
 def venue_reduce_only_close_exempts_min_notional(venue: Venue) -> bool:
-    """Aster and Binance reduce-only closes are exempt from min notional checks."""
-    return venue in (Venue.ASTER, Venue.BINANCE)
+    """Aster, Binance, and Gate reduce-only closes are exempt from min notional checks.
+
+    V1: exit.rs:1948-1949 — venue_reduce_only_close_exempts_min_notional
+    allows these venues to bypass min-notional on reduce-only close because
+    the exchange itself rejects the order before it reaches the order book
+    when the position is already flat or too small.
+    """
+    return venue in (Venue.ASTER, Venue.BINANCE, Venue.GATE)
 
 
 def floor_quantity_to_step(quantity: float, step_size: float) -> float:
