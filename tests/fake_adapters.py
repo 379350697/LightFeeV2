@@ -73,6 +73,25 @@ class FakeVenueAdapter(VenueAdapter):
             filled_at_ms=1000,
         )
 
+    async def amend_order(self, request: OrderRequest) -> OrderFill:
+        """Amend existing order — same as place_order for fake testing."""
+        self.last_request = request
+        price = self.default_fill_price if self.default_fill_price > 0 else request.price or 1.0
+        return OrderFill(
+            venue=self._venue,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            price=price,
+            order_id=request.order_id or f"fake-amend-{self._venue.value}",
+            filled_at_ms=1000,
+        )
+
+    async def cancel_order(self, request: OrderRequest) -> None:
+        """Cancel existing order — no-op for fake testing."""
+        self.last_request = request
+        return None
+
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         self.fetch_position_call_count += 1
         if self.position_snapshots:
@@ -94,6 +113,22 @@ class FakeVenueAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
+
+    async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> "LocalL2Update":
+        """Return a fake L2 snapshot for testing."""
+        from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
+
+        now_ms = 1000
+        return LocalL2Update(
+            venue=self._venue.value,
+            symbol=symbol,
+            bids=[PriceLevel(price=49900.0, quantity=1.0), PriceLevel(price=49800.0, quantity=2.0)],
+            asks=[PriceLevel(price=50100.0, quantity=1.0), PriceLevel(price=50200.0, quantity=2.0)],
+            sequence=1,
+            event_time_ms=now_ms,
+            received_at_ms=now_ms,
+            update_kind=LocalL2UpdateKind.SNAPSHOT,
+        )
 
 
 def make_rejected_error(reason: str = "order rejected") -> OrderSubmitError:

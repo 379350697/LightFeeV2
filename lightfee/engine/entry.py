@@ -55,6 +55,9 @@ class EntryContext:
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
     created_at_ms: int = 0
+    # --- V1 maker-event lane repricing ---
+    parent_entry_id: Optional[str] = None
+    reprice_action: str = ""
     # --- V1 planner output ---
     planned_route: ExecutionRoute = ExecutionRoute.PASSIVE_INCREMENTAL
 

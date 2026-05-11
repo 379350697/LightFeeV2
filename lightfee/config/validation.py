@@ -26,11 +26,35 @@ def validate_config(config: AppConfig) -> list[str]:
             f"{sorted(VALID_OPPORTUNITY_INPUT_MODES)}, got: {config.runtime.opportunity_input_mode}"
         )
 
+    if config.runtime.maker_event_lane_enabled and config.runtime.maker_event_lane_min_wake_interval_ms <= 0:
+        issues.append(
+            f"runtime.maker_event_lane_min_wake_interval_ms must be > 0 when maker_event_lane_enabled, "
+            f"got: {config.runtime.maker_event_lane_min_wake_interval_ms}"
+        )
+
     if config.strategy.max_concurrent_positions < 0:
         issues.append("strategy.max_concurrent_positions must be >= 0")
 
     if config.strategy.entry_notional_cap_quote <= 0:
         issues.append("strategy.entry_notional_cap_quote must be > 0")
+
+    # V1 entry planner constraints (Rust: entry_execution_planner.rs:38,108)
+    sr = config.strategy.maker_initial_slice_ratio
+    if not (0.0 < sr <= 1.0):
+        issues.append(
+            f"strategy.maker_initial_slice_ratio must be within (0.0, 1.0], got: {sr}"
+        )
+
+    cr = config.strategy.entry_max_initial_clip_ratio
+    if not (cr > 0.0 and cr == cr):
+        issues.append(
+            f"strategy.entry_max_initial_clip_ratio must be finite and > 0, got: {cr}"
+        )
+
+    if config.strategy.maker_leg_default not in ("buy", "sell"):
+        issues.append(
+            f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
+        )
 
     for vc in config.venues:
         try:

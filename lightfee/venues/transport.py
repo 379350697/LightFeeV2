@@ -361,8 +361,7 @@ class VenueTransport:
     ) -> dict[str, Any]:
         client = await self._get_client()
         base_url = (
-            self._spec.private_base_url
-            if private or method.upper() == "POST"
+            self._spec.private_base_url if private
             else self._spec.public_base_url
         )
         qs, headers, req_body = self._build_signed_request(method, path, params, body)
@@ -530,6 +529,85 @@ class VenueTransport:
         )
 
     # ------------------------------------------------------------------
+    # Local-L2 snapshot — REST order book depth bootstrap
+    # ------------------------------------------------------------------
+
+    async def fetch_l2_snapshot(
+        self, symbol: str, depth: int = 50,
+    ) -> "LocalL2Update":
+        """Fetch full order book depth snapshot for local-L2 bootstrap.
+
+        Returns a canonical LocalL2Update that can be fed directly into
+        LocalL2Runtime.record_update().
+
+        Uses the venue's public REST depth endpoint — no authentication needed.
+        Hyperliquid uses POST to /info API with l2Book type.
+        """
+        from lightfee.marketdata.local_l2_venues import parse_l2_update
+
+        spec = self._spec
+        venue_sym = self._venue_symbol(symbol)
+        now_ms = int(time.time() * 1000)
+
+        if not spec.l2_snapshot_path:
+            raise TransportError(
+                TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                f"L2 snapshot not supported for {spec.venue_id.value}",
+            )
+
+        if self.mode == "paper":
+            from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind
+            return LocalL2Update(
+                venue=spec.venue_id.value,
+                symbol=venue_sym,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+                received_at_ms=now_ms,
+            )
+
+        try:
+            if spec.venue_id == Venue.HYPERLIQUID:
+                # Hyperliquid: POST /info {"type": "l2Book", "coin": "BTC"}
+                body = {"type": "l2Book", "coin": venue_sym}
+                raw = await self._request("POST", spec.l2_snapshot_path, body=body)
+            else:
+                params: dict[str, Any] = {}
+                if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                    params["symbol"] = venue_sym
+                    params["limit"] = str(depth)
+                elif spec.venue_id == Venue.OKX:
+                    params["instId"] = venue_sym
+                    params["sz"] = str(depth)
+                elif spec.venue_id == Venue.BYBIT:
+                    params["category"] = "linear"
+                    params["symbol"] = venue_sym
+                    params["limit"] = str(depth)
+                elif spec.venue_id == Venue.BITGET:
+                    params["symbol"] = venue_sym
+                    params["limit"] = str(depth)
+                elif spec.venue_id == Venue.GATE:
+                    params["contract"] = venue_sym  # Already converted via _venue_symbol
+                    params["limit"] = str(depth)
+
+                raw = await self._request("GET", spec.l2_snapshot_path, params=params)
+
+            result = parse_l2_update(
+                spec.venue_id.value, payload=raw,
+                symbol=venue_sym, now_ms=now_ms,
+            )
+            # Ensure canonical symbol is returned, not the venue wire symbol.
+            # The caller passes the canonical symbol in `symbol` — the result
+            # must use that key so it lands in the correct runtime book.
+            result.symbol = symbol
+            return result
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"L2 snapshot failed for {spec.venue_id.value}:{symbol}: {e}",
+            )
+
+    # ------------------------------------------------------------------
     # Position fetch
     # ------------------------------------------------------------------
 
@@ -668,6 +746,194 @@ class VenueTransport:
             entry_price=entry_price,
             observed_at_ms=now_ms,
         )
+
+    # ------------------------------------------------------------------
+    # Account risk snapshot (V1: per-venue account risk polling)
+    # ------------------------------------------------------------------
+
+    async def fetch_account_risk_snapshot(self) -> Optional[Any]:
+        """Fetch an account risk snapshot for risk health evaluation.
+
+        V1: Each venue adapter calls its specific private REST endpoint
+        and converts the response into an AccountRiskSnapshot.
+        Supported: Binance, OKX, Bybit, Aster, Bitget, Gate.
+        Unsupported: Hyperliquid (no account risk endpoint).
+        """
+        from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
+
+        spec = self._spec
+        if self.mode != "live":
+            return None
+        if not spec.account_risk_path:
+            return None
+
+        now_ms = int(time.time() * 1000)
+
+        try:
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                raw = await self._request("GET", spec.account_risk_path, private=True)
+                equity = float(raw.get("totalMarginBalance", 0))
+                maint_margin_val = raw.get("totalMaintMargin")
+                if maint_margin_val is None or str(maint_margin_val).strip() == "":
+                    return None
+                maint = float(maint_margin_val)
+                if maint <= 0.0:
+                    return None
+                snapshot = ARS(
+                    venue=spec.venue_id,
+                    equity_quote=equity,
+                    maintenance_margin_quote=maint,
+                    health_ratio=equity / maint,
+                    observed_at_ms=now_ms,
+                    source="fapi_account",
+                )
+                snapshot.available_balance_quote = float(raw.get("availableBalance", 0))
+                return snapshot
+
+            elif spec.venue_id == Venue.OKX:
+                raw = await self._request("GET", spec.account_risk_path, private=True)
+                data_list = raw.get("data", [])
+                if not data_list:
+                    return None
+                row = data_list[0] if isinstance(data_list, list) else data_list
+                equity = float(row.get("totalEq", 0))
+                mmr = row.get("mmr")
+                if mmr is None:
+                    return None
+                maint = float(mmr)
+                if maint <= 0.0:
+                    return None
+                snapshot = ARS(
+                    venue=spec.venue_id,
+                    equity_quote=equity,
+                    maintenance_margin_quote=maint,
+                    health_ratio=equity / maint,
+                    observed_at_ms=now_ms,
+                    source="okx_account_balance",
+                )
+                snapshot.available_balance_quote = float(row.get("availEq", 0)) if row.get("availEq") else None
+                return snapshot
+
+            elif spec.venue_id == Venue.BYBIT:
+                raw = await self._request(
+                    "GET", spec.account_risk_path,
+                    params={"accountType": "UNIFIED"}, private=True,
+                )
+                result = raw.get("result", {})
+                acct_list = result.get("list", []) if isinstance(result, dict) else []
+                if not acct_list:
+                    return None
+                row = acct_list[0]
+                equity = float(row.get("totalEquity", 0))
+                maint_margin_val = row.get("totalMaintenanceMargin")
+                if maint_margin_val is None:
+                    return None
+                maint = float(maint_margin_val)
+                if maint <= 0.0:
+                    return None
+                snapshot = ARS(
+                    venue=spec.venue_id,
+                    equity_quote=equity,
+                    maintenance_margin_quote=maint,
+                    health_ratio=equity / maint,
+                    observed_at_ms=now_ms,
+                    source="bybit_wallet_balance",
+                )
+                snapshot.available_balance_quote = float(row.get("totalAvailableBalance", 0)) if row.get("totalAvailableBalance") else None
+                return snapshot
+
+            elif spec.venue_id == Venue.BITGET:
+                raw = await self._request("GET", spec.account_risk_path, private=True)
+                data = raw.get("data", raw)
+                # V1: bitget_account_asset_row — find USDT margin row
+                row = None
+                if isinstance(data, dict):
+                    row = data
+                elif isinstance(data, list):
+                    row = next(
+                        (r for r in data if isinstance(r, dict) and
+                         str(r.get("marginCoin", "")).upper() == "USDT"),
+                        data[0] if data else None,
+                    )
+                if not row or not isinstance(row, dict):
+                    return None
+                maint = None
+                for key in ("maintenanceMargin", "maintMargin", "maintainMargin", "maintenance_margin"):
+                    if key in row:
+                        val = row[key]
+                        if val is not None and str(val).strip():
+                            maint = float(val)
+                            break
+                if maint is None or maint <= 0.0:
+                    return None
+                equity = None
+                for key in ("usdtEquity", "equity", "accountEquity"):
+                    if key in row:
+                        equity = float(row[key])
+                        break
+                if equity is None:
+                    return None
+                snapshot = ARS(
+                    venue=spec.venue_id,
+                    equity_quote=equity,
+                    maintenance_margin_quote=maint,
+                    health_ratio=equity / maint,
+                    observed_at_ms=now_ms,
+                    source="bitget_account_risk",
+                )
+                avail = None
+                for key in ("available", "availableBalance", "crossedMaxAvailable"):
+                    if key in row:
+                        avail = float(row[key])
+                        break
+                snapshot.available_balance_quote = avail
+                return snapshot
+
+            elif spec.venue_id == Venue.GATE:
+                raw = await self._request("GET", spec.account_risk_path, private=True)
+                # V1: gate_account_risk_snapshot_from_wallet_row
+                # Response is a single dict with account fields
+                maint = None
+                for key in ("maintenance_margin", "maintenanceMargin", "maint_margin", "maintMargin"):
+                    if key in raw:
+                        val = raw[key]
+                        if val is not None and str(val).strip():
+                            maint = float(val)
+                            break
+                if maint is None or maint <= 0.0:
+                    return None
+                equity = None
+                for key in ("total", "equity", "total_balance"):
+                    if key in raw:
+                        equity = float(raw[key])
+                        break
+                if equity is None:
+                    return None
+                snapshot = ARS(
+                    venue=spec.venue_id,
+                    equity_quote=equity,
+                    maintenance_margin_quote=maint,
+                    health_ratio=equity / maint,
+                    observed_at_ms=now_ms,
+                    source="gate_account_risk",
+                )
+                avail = None
+                for key in ("available", "available_balance"):
+                    if key in raw:
+                        avail = float(raw[key])
+                        break
+                snapshot.available_balance_quote = avail
+                return snapshot
+
+            else:
+                return None
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"account risk snapshot failed: {e}",
+            )
 
     # ------------------------------------------------------------------
     # Order placement

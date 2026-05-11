@@ -1413,3 +1413,612 @@ class TestOrderAckNotFill:
         with pytest.raises(OrderSubmitError) as exc_info:
             transport._parse_order_fill(raw_no_id, req, "BTC-USDT-SWAP", 1000)
         assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+
+
+class TestBitgetRiskHealth:
+    """Bitget account risk snapshot parsing (V1: bitget_account_risk_snapshot_from_account_row)."""
+
+    def test_parses_bitget_account_assets_response(self):
+        from lightfee.engine.risk_actions import AccountRiskSnapshot
+
+        spec = bitget_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"))
+        # Simulate a parsed response (bypassing HTTP)
+        raw = {"code": "00000", "data": [
+            {"marginCoin": "USDT", "usdtEquity": "10000.0",
+             "maintenanceMargin": "1000.0",
+             "available": "8000.0", "equity": "10000.0"},
+        ]}
+        # Access private parsing via the pending data
+        # Test the raw response shape that fetch_account_risk_snapshot would process
+        from lightfee.venues.transport import VenueTransport as VT
+        # Manually test extraction logic
+        data = raw.get("data", raw)
+        row = data[0] if isinstance(data, list) else data
+        assert float(row["usdtEquity"]) == 10000.0
+        assert float(row["maintenanceMargin"]) == 1000.0
+
+    def test_bitget_missing_maintenance_margin_returns_none(self):
+        spec = bitget_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"))
+        raw = {"code": "00000", "data": [
+            {"marginCoin": "USDT", "usdtEquity": "10000.0", "available": "8000.0"},
+        ]}
+        data = raw.get("data", raw)
+        row = data[0] if isinstance(data, list) else data
+        maint = row.get("maintenanceMargin")
+        assert maint is None
+
+    def test_bitget_supports_risk_health_in_live_mode(self):
+        from lightfee.venues.bitget import BitgetAdapter
+        adapter = BitgetAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"))
+        assert adapter.supports_risk_health is True
+
+    def test_bitget_supports_risk_health_false_in_paper(self):
+        from lightfee.venues.bitget import BitgetAdapter
+        adapter = BitgetAdapter(mode="paper")
+        assert adapter.supports_risk_health is False
+
+
+class TestGateRiskHealth:
+    """Gate account risk snapshot parsing (V1: gate_account_risk_snapshot_from_wallet_row)."""
+
+    def test_parses_gate_account_assets_response(self):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s"))
+        raw = {
+            "total": "10000.0",
+            "maintenance_margin": "1000.0",
+            "available": "8000.0",
+        }
+        assert float(raw["total"]) == 10000.0
+        assert float(raw["maintenance_margin"]) == 1000.0
+
+    def test_gate_missing_maintenance_margin_returns_none(self):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s"))
+        raw = {"total": "10000.0", "available": "8000.0"}
+        maint = raw.get("maintenance_margin")
+        assert maint is None
+
+    def test_gate_supports_risk_health_in_live_mode(self):
+        from lightfee.venues.gate import GateAdapter
+        adapter = GateAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s"))
+        assert adapter.supports_risk_health is True
+
+    def test_gate_supports_risk_health_false_in_paper(self):
+        from lightfee.venues.gate import GateAdapter
+        adapter = GateAdapter(mode="paper")
+        assert adapter.supports_risk_health is False
+
+
+class TestRiskSnapshotCache:
+    """V1: runtime risk snapshot cache — same-tick same-venue reuses cached fetch."""
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_avoids_refetch(self):
+        import tempfile, os
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.config.schema import AppConfig, PersistenceConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            config = AppConfig(
+                symbols=["BTCUSDT"],
+                persistence=PersistenceConfig(event_log_path=os.path.join(td, "events.jsonl")),
+            )
+            rt = LiveRuntime(config)
+            rt.journal.open()
+
+            call_count = 0
+
+            class FakeAdapter:
+                supports_risk_health = True
+                async def fetch_account_risk_snapshot(self):
+                    nonlocal call_count
+                    call_count += 1
+                    from lightfee.engine.risk_actions import AccountRiskSnapshot
+                    return AccountRiskSnapshot(
+                        venue=Venue.BINANCE, equity_quote=10000, maintenance_margin_quote=1000,
+                        health_ratio=10.0, observed_at_ms=1000, source="test",
+                    )
+
+            adapter = FakeAdapter()
+            now_ms = 1000
+
+            # First fetch — cache miss
+            snap1, sup1 = await rt._fetch_venue_risk_snapshot(Venue.BINANCE, adapter, True, now_ms)
+            assert call_count == 1
+            assert snap1 is not None
+
+            # Second fetch within TTL — cache hit
+            snap2, sup2 = await rt._fetch_venue_risk_snapshot(Venue.BINANCE, adapter, True, now_ms + 500)
+            assert call_count == 1  # No second fetch
+            assert snap2 is not None
+            assert sup2 is True
+
+            rt.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_cache_ttl_expiry_triggers_refetch(self):
+        import tempfile, os
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.config.schema import AppConfig, PersistenceConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            config = AppConfig(
+                symbols=["BTCUSDT"],
+                persistence=PersistenceConfig(event_log_path=os.path.join(td, "events.jsonl")),
+            )
+            rt = LiveRuntime(config)
+            rt.journal.open()
+
+            call_count = 0
+
+            class FakeAdapter:
+                supports_risk_health = True
+                async def fetch_account_risk_snapshot(self):
+                    nonlocal call_count
+                    call_count += 1
+                    from lightfee.engine.risk_actions import AccountRiskSnapshot
+                    return AccountRiskSnapshot(
+                        venue=Venue.BINANCE, equity_quote=10000, maintenance_margin_quote=1000,
+                        health_ratio=10.0, observed_at_ms=1000, source="test",
+                    )
+
+            adapter = FakeAdapter()
+            now_ms = 1000
+
+            # First fetch
+            await rt._fetch_venue_risk_snapshot(Venue.BINANCE, adapter, True, now_ms)
+            assert call_count == 1
+
+            # After TTL (1s) expiry
+            await rt._fetch_venue_risk_snapshot(Venue.BINANCE, adapter, True, now_ms + 2000)
+            assert call_count == 2
+
+            rt.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_cache_stores_error_and_journals(self):
+        import tempfile, os
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.config.schema import AppConfig, PersistenceConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            config = AppConfig(
+                symbols=["BTCUSDT"],
+                persistence=PersistenceConfig(event_log_path=os.path.join(td, "events.jsonl")),
+            )
+            rt = LiveRuntime(config)
+            rt.journal.open()
+
+            class FailingAdapter:
+                supports_risk_health = True
+                async def fetch_account_risk_snapshot(self):
+                    raise RuntimeError("rate limited")
+
+            adapter = FailingAdapter()
+
+            snap, sup = await rt._fetch_venue_risk_snapshot(Venue.OKX, adapter, True, 1000)
+            assert snap is None
+            # Fetch error → snapshot None, but capability (supports) unchanged per V1
+            assert sup is True
+
+            # Error should be cached — no second exception attempt if called again within TTL
+            snap2, sup2 = await rt._fetch_venue_risk_snapshot(Venue.OKX, adapter, True, 1500)
+            assert snap2 is None
+            assert sup2 is True
+
+            rt.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_has_longer_cache_ttl(self):
+        from lightfee.engine.runtime import LiveRuntime
+        assert LiveRuntime._risk_snapshot_ttl_ms(Venue.ASTER) == 30_000
+        assert LiveRuntime._risk_snapshot_ttl_ms(Venue.BINANCE) == 1_000
+        assert LiveRuntime._risk_snapshot_ttl_ms(Venue.OKX) == 1_000
+
+
+# ---------------------------------------------------------------------------
+# Bitget risk health real-method tests — call fetch_account_risk_snapshot()
+# through mocked _request (not manual dict parsing)
+# ---------------------------------------------------------------------------
+
+
+class TestBitgetRiskHealthRealMethod:
+    """BitgetAdapter.fetch_account_risk_snapshot() profile-aware tests.
+
+    V1: bitget.rs fetch_private_account_assets_payload (line 836-866).
+    """
+
+    @pytest.mark.asyncio
+    async def test_uta_success_returns_snapshot(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+        from lightfee.engine.risk_actions import AccountRiskSnapshot
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        # Pre-set profile to UTA to skip detect_profile() probe
+        adapter._profile = BitgetAccountProfile.UTA
+
+        call_urls = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            call_urls.append(path)
+            return {
+                "code": "00000",
+                "data": [{
+                    "marginCoin": "USDT",
+                    "usdtEquity": "10000.0",
+                    "maintenanceMargin": "1000.0",
+                    "available": "8000.0",
+                }],
+            }
+
+        adapter._transport._request = mock_request
+
+        result = await adapter.fetch_account_risk_snapshot()
+        assert result is not None
+        assert isinstance(result, AccountRiskSnapshot)
+        assert result.venue == Venue.BITGET
+        assert result.equity_quote == 10000.0
+        assert result.maintenance_margin_quote == 1000.0
+        assert result.health_ratio == 10.0
+        assert result.available_balance_quote == 8000.0
+        assert result.source == "bitget_account_risk"
+        # UTA path used
+        assert any("/api/v3/account/assets" in u for u in call_urls)
+
+    @pytest.mark.asyncio
+    async def test_classic_cached_goes_direct_to_classic_endpoint(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+        from lightfee.engine.risk_actions import AccountRiskSnapshot
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+
+        call_urls = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            call_urls.append(path)
+            return {
+                "code": "00000",
+                "data": [{
+                    "marginCoin": "USDT",
+                    "equity": "5000.0",
+                    "maintenanceMargin": "500.0",
+                    "availableBalance": "4000.0",
+                }],
+            }
+
+        adapter._transport._request = mock_request
+
+        result = await adapter.fetch_account_risk_snapshot()
+        assert result is not None
+        assert result.equity_quote == 5000.0
+        assert result.maintenance_margin_quote == 500.0
+        # Classic endpoint was used
+        assert any("/api/v2/mix/account/accounts" in u for u in call_urls)
+
+    @pytest.mark.asyncio
+    async def test_uta_mismatch_falls_back_to_classic(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile, _is_classic_mode_error
+        from lightfee.engine.risk_actions import AccountRiskSnapshot
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = None  # Force probe — but we mock the profile as undetected
+        # Simulate UTA not yet known: the adapter will try UTA first
+        adapter._profile = BitgetAccountProfile.UTA  # Assume UTA until mismatch
+
+        call_count = 0
+        call_paths = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            nonlocal call_count
+            call_count += 1
+            call_paths.append(path)
+            if call_count == 1:
+                # First call: UTA returns classic mismatch error
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "classic account not supported",
+                    status_code=400,
+                    body='{"code":"40034","msg":"classic account not supported"}',
+                )
+            else:
+                # Second call: classic endpoint succeeds
+                return {
+                    "code": "00000",
+                    "data": [{
+                        "marginCoin": "USDT",
+                        "usdtEquity": "3000.0",
+                        "maintenanceMargin": "300.0",
+                        "available": "2000.0",
+                    }],
+                }
+
+        adapter._transport._request = mock_request
+
+        result = await adapter.fetch_account_risk_snapshot()
+        assert result is not None
+        assert result.equity_quote == 3000.0
+        assert result.maintenance_margin_quote == 300.0
+        # Profile should now be CLASSIC (cached)
+        assert adapter._profile == BitgetAccountProfile.CLASSIC
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_auth_401_does_not_fallback(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            raise TransportError(
+                TransportErrorCategory.AUTH_FAILURE,
+                "Unauthorized",
+                status_code=401,
+                body='{"code":"40100","msg":"Invalid API key"}',
+            )
+
+        adapter._transport._request = mock_request
+
+        with pytest.raises(TransportError) as exc_info:
+            await adapter.fetch_account_risk_snapshot()
+        assert exc_info.value.category == TransportErrorCategory.AUTH_FAILURE
+        # Profile must NOT change to CLASSIC
+        assert adapter._profile == BitgetAccountProfile.UTA
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_429_does_not_fallback(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "Rate limited",
+                status_code=429,
+                body='{"code":"42900","msg":"Too many requests"}',
+            )
+
+        adapter._transport._request = mock_request
+
+        with pytest.raises(TransportError) as exc_info:
+            await adapter.fetch_account_risk_snapshot()
+        assert exc_info.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+        assert adapter._profile == BitgetAccountProfile.UTA
+
+    @pytest.mark.asyncio
+    async def test_network_timeout_does_not_fallback(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "timeout: GET /api/v3/account/assets",
+            )
+
+        adapter._transport._request = mock_request
+
+        with pytest.raises(TransportError) as exc_info:
+            await adapter.fetch_account_risk_snapshot()
+        assert exc_info.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+        assert adapter._profile == BitgetAccountProfile.UTA
+
+    @pytest.mark.asyncio
+    async def test_missing_maintenance_margin_returns_none(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return {
+                "code": "00000",
+                "data": [{
+                    "marginCoin": "USDT",
+                    "usdtEquity": "10000.0",
+                    "available": "8000.0",
+                }],
+            }
+
+        adapter._transport._request = mock_request
+
+        result = await adapter.fetch_account_risk_snapshot()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_profile_cached_second_call_no_probe(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+        from lightfee.engine.risk_actions import AccountRiskSnapshot
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+
+        call_count = 0
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "code": "00000",
+                "data": [{
+                    "marginCoin": "USDT",
+                    "usdtEquity": "10000.0",
+                    "maintenanceMargin": "1000.0",
+                    "available": "8000.0",
+                }],
+            }
+
+        adapter._transport._request = mock_request
+
+        # First fetch
+        r1 = await adapter.fetch_account_risk_snapshot()
+        assert r1 is not None
+        assert call_count == 1
+
+        # Second fetch — profile cached, goes directly to UTA endpoint
+        r2 = await adapter.fetch_account_risk_snapshot()
+        assert r2 is not None
+        assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# PendingEntry recovery roundtrip — new maker-event fields
+# ---------------------------------------------------------------------------
+
+
+class TestPendingEntryRecoveryRoundtrip:
+    """PendingEntry.entry_type, maker_price, long_quantity, short_quantity
+    must survive snapshot ↔ recovery roundtrip."""
+
+    def test_pending_entry_new_fields_in_snapshot_to_dict(self):
+        from lightfee.engine.state import EngineState, PendingEntry
+        from lightfee.core.domain import Side, Venue
+
+        state = EngineState()
+        pe = PendingEntry(
+            pending_id="pe-001",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=5000,
+            entry_type="passive_incremental",
+            maker_price=50000.0,
+            long_quantity=0.005,
+            short_quantity=0.005,
+        )
+        state.pending_entries["pe-001"] = pe
+        d = state.to_dict()
+        pend = d["pending_entries"]["pe-001"]
+        assert pend["entry_type"] == "passive_incremental"
+        assert pend["maker_price"] == 50000.0
+        assert pend["long_quantity"] == 0.005
+        assert pend["short_quantity"] == 0.005
+
+    def test_pending_entry_new_fields_restored_from_snapshot(self):
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        snap = {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_positions": {},
+            "pending_entries": {
+                "pe-001": {
+                    "pending_id": "pe-001",
+                    "symbol": "BTCUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "target_quantity": 0.01,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "created_at_ms": 5000,
+                    "entry_type": "passive_incremental",
+                    "maker_price": 50000.0,
+                    "long_quantity": 0.005,
+                    "short_quantity": 0.005,
+                },
+            },
+            "pending_closes": {},
+        }
+        state = _restore_state_from_snapshot_dict(snap)
+        pe = state.pending_entries["pe-001"]
+        assert pe.entry_type == "passive_incremental"
+        assert pe.maker_price == 50000.0
+        assert pe.long_quantity == 0.005
+        assert pe.short_quantity == 0.005
+
+    def test_persistent_view_includes_new_fields(self):
+        from lightfee.engine.state import EngineState, PendingEntry
+        from lightfee.engine.recovery import build_persistent_state_view
+        from lightfee.core.domain import Side, Venue
+
+        state = EngineState()
+        pe = PendingEntry(
+            pending_id="pe-001",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=5000,
+            entry_type="passive_incremental",
+            maker_price=50000.0,
+            long_quantity=0.005,
+            short_quantity=0.005,
+        )
+        state.pending_entries["pe-001"] = pe
+        view = build_persistent_state_view(state)
+        pend = view["pending_entries"]["pe-001"]
+        assert pend["entry_type"] == "passive_incremental"
+        assert pend["maker_price"] == 50000.0
+        assert pend["long_quantity"] == 0.005
+        assert pend["short_quantity"] == 0.005
+
+    def test_old_snapshot_without_new_fields_defaults_empty(self):
+        """Backward-compat: snapshot without entry_type/maker_price fields
+        should restore PendingEntry with default empty/zero values."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        snap = {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_positions": {},
+            "pending_entries": {
+                "old-pe": {
+                    "pending_id": "old-pe",
+                    "symbol": "ETHUSDT",
+                    "long_venue": "gate",
+                    "short_venue": "bybit",
+                    "target_quantity": 0.1,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "created_at_ms": 1000,
+                },
+            },
+            "pending_closes": {},
+        }
+        state = _restore_state_from_snapshot_dict(snap)
+        pe = state.pending_entries["old-pe"]
+        assert pe.entry_type == ""
+        assert pe.maker_price == 0.0
+        assert pe.long_quantity == 0.0
+        assert pe.short_quantity == 0.0

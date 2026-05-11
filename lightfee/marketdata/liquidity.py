@@ -1,8 +1,21 @@
-"""Execution liquidity: multi-level VWAP, slippage, and capacity estimation."""
+"""Execution liquidity: multi-level VWAP, slippage, capacity estimation.
+
+Rust V1 parity: converts LocalL2Book → ExecutionLiquiditySnapshot for entry/delever/close.
+
+V1 enforces that in parity mode, execution liquidity MUST come from local-L2
+when local-L2 is enabled and the book is ready.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
+
+from lightfee.marketdata.l2 import (
+    ExecutionLiquiditySource,
+    LocalL2Book,
+    PriceLevel,
+)
 
 
 @dataclass
@@ -22,7 +35,9 @@ class ExecutionLiquiditySnapshot:
     bids: list[LiquidityLevel] = field(default_factory=list)
     asks: list[LiquidityLevel] = field(default_factory=list)
     observed_at_ms: int = 0
-    source: str = "top_book"  # "true_l2" or "top_book"
+    source: str = "top_book"  # "true_l2", "top_book", "cached", "none"
+    fallback_reason: str = ""
+    book_ready: bool = True
 
     def estimate_vwap_buy(self, target_quote: float) -> tuple[float, float]:
         """Estimate VWAP and avg price for buying target_quote notional."""
@@ -102,3 +117,65 @@ def chunked_l2_close_capacity(
         return min(target_quantity, snapshot.max_fillable_buy(max_slippage_bps))
     else:
         return min(target_quantity, snapshot.max_fillable_sell(max_slippage_bps))
+
+
+# ---------------------------------------------------------------------------
+# LocalL2Book → ExecutionLiquiditySnapshot conversion (Rust V1 parity)
+# ---------------------------------------------------------------------------
+
+
+def execution_liquidity_from_local_l2(
+    book: LocalL2Book,
+    max_depth: int = 0,
+    max_age_ms: int = 5000,
+    now_ms: int = 0,
+    require_ready: bool = True,
+) -> ExecutionLiquiditySnapshot:
+    """Convert a LocalL2Book to an ExecutionLiquiditySnapshot.
+
+    In parity mode, requires the book to be HOT and fresh.
+    Returns NONE source if the book is not ready.
+    """
+    depth = max_depth or book.max_depth or 50
+
+    # Check readiness
+    if require_ready:
+        if not book.is_ready(max_age_ms, now_ms):
+            return ExecutionLiquiditySnapshot(
+                symbol=book.symbol,
+                venue=book.venue,
+                observed_at_ms=book.observed_at_ms,
+                source=ExecutionLiquiditySource.NONE.value,
+                fallback_reason=f"book_not_ready status={book.status.value} age={book.age_ms(now_ms)}ms",
+                book_ready=False,
+            )
+
+    bids = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in book.bids[:depth]]
+    asks = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in book.asks[:depth]]
+
+    return ExecutionLiquiditySnapshot(
+        symbol=book.symbol,
+        venue=book.venue,
+        bids=bids,
+        asks=asks,
+        observed_at_ms=book.observed_at_ms,
+        source=ExecutionLiquiditySource.TRUE_L2.value,
+        book_ready=True,
+    )
+
+
+def execution_liquidity_fallback(
+    symbol: str,
+    venue: str,
+    reason: str,
+    source: ExecutionLiquiditySource = ExecutionLiquiditySource.TOP_BOOK,
+) -> ExecutionLiquiditySnapshot:
+    """Create a fallback liquidity snapshot with explicit reason."""
+    return ExecutionLiquiditySnapshot(
+        symbol=symbol,
+        venue=venue,
+        source=source.value,
+        fallback_reason=reason,
+        book_ready=False,
+    )
+

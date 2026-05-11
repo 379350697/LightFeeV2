@@ -55,6 +55,67 @@ def _payload_indicates_classic(payload: dict) -> bool:
     return False
 
 
+def _parse_bitget_risk_from_rowlike(raw: dict, now_ms: int):
+    """Parse an AccountRiskSnapshot from a Bitget account assets response.
+
+    V1: bitget_account_asset_row + bitget_account_risk_snapshot_from_account_row
+    Uses multi-field-name fallback chains per Rust V1 (bitget.rs:5740-5777).
+    Returns None when maintenance_margin is missing or <= 0.
+    """
+    from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
+
+    data = raw.get("data", raw)
+    # Find USDT margin row
+    row = None
+    if isinstance(data, dict):
+        row = data
+    elif isinstance(data, list):
+        row = next(
+            (r for r in data if isinstance(r, dict)
+             and str(r.get("marginCoin", "")).upper() == "USDT"),
+            data[0] if data else None,
+        )
+    if not row or not isinstance(row, dict):
+        return None
+
+    # Maintenance margin: multi-key fallback
+    maint = None
+    for key in ("maintenanceMargin", "maintMargin", "maintainMargin", "maintenance_margin"):
+        if key in row:
+            val = row[key]
+            if val is not None and str(val).strip():
+                maint = float(val)
+                break
+    if maint is None or maint <= 0.0:
+        return None
+
+    # Equity: multi-key fallback
+    equity = None
+    for key in ("usdtEquity", "equity", "accountEquity"):
+        if key in row:
+            equity = float(row[key])
+            break
+    if equity is None:
+        return None
+
+    snapshot = ARS(
+        venue=Venue.BITGET,
+        equity_quote=equity,
+        maintenance_margin_quote=maint,
+        health_ratio=equity / maint,
+        observed_at_ms=now_ms,
+        source="bitget_account_risk",
+    )
+    # Available balance: multi-key fallback
+    avail = None
+    for key in ("available", "availableBalance", "crossedMaxAvailable"):
+        if key in row:
+            avail = float(row[key])
+            break
+    snapshot.available_balance_quote = avail
+    return snapshot
+
+
 class BitgetAdapter(VenueAdapter):
     """Bitget Mix V2 adapter with classic-vs-UTA detection.
 
@@ -78,6 +139,10 @@ class BitgetAdapter(VenueAdapter):
     @property
     def venue(self) -> Venue:
         return Venue.BITGET
+
+    @property
+    def supports_risk_health(self) -> bool:
+        return self._mode == "live"
 
     # ------------------------------------------------------------------
     # Profile detection
@@ -223,6 +288,88 @@ class BitgetAdapter(VenueAdapter):
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
+
+    # ------------------------------------------------------------------
+    # Risk snapshot with profile-aware classic fallback (V1: bitget.rs:836-866, 2896-2902)
+    # ------------------------------------------------------------------
+
+    _BITGET_CLASSIC_ACCOUNT_PATH = "/api/v2/mix/account/accounts"
+    _BITGET_CLASSIC_PRODUCT_TYPE = "USDT-FUTURES"
+
+    async def fetch_account_risk_snapshot(self):
+        """Fetch account risk snapshot with profile-aware routing.
+
+        Rust V1 flow:
+        1. If profile is already CLASSIC → go directly to classic endpoint.
+        2. Try UTA endpoint /api/v3/account/assets.
+        3. If classic/UTA mismatch error → cache CLASSIC, retry classic endpoint.
+        4. If payload indicates classic mode → cache CLASSIC, retry classic endpoint.
+        5. Auth/rate-limit/network errors propagate — never fall back.
+        """
+        from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
+        import time as _time
+
+        if self._mode != "live":
+            return None
+
+        now_ms = int(_time.time() * 1000)
+
+        # If profile is already CLASSIC, go directly to classic endpoint
+        if self._profile == BitgetAccountProfile.CLASSIC:
+            return await self._fetch_classic_risk_snapshot(now_ms)
+
+        # Try UTA endpoint
+        try:
+            raw = await self._transport._request(
+                "GET", self._transport._spec.account_risk_path, private=True
+            )
+            # Check if successful payload indicates classic mode
+            if _payload_indicates_classic(raw):
+                self._profile = BitgetAccountProfile.CLASSIC
+                return await self._fetch_classic_risk_snapshot(now_ms)
+
+            return _parse_bitget_risk_from_rowlike(raw, now_ms)
+
+        except TransportError as e:
+            status_code = getattr(e, "status_code", 0)
+            body_str = getattr(e, "body", "")
+            body_dict: dict = {}
+            if body_str:
+                try:
+                    import json as _json
+                    body_dict = _json.loads(body_str)
+                except Exception:
+                    body_dict = {}
+
+            # Only classic/UTA mismatch triggers fallback
+            if _is_classic_mode_error(status_code, body_dict):
+                self._profile = BitgetAccountProfile.CLASSIC
+                return await self._fetch_classic_risk_snapshot(now_ms)
+
+            # Auth/rate-limit/network → propagate, never fall back
+            if e.category in (
+                TransportErrorCategory.AUTH_FAILURE,
+                TransportErrorCategory.AUTHORIZATION_FAILURE,
+                TransportErrorCategory.TRANSPORT_FAILURE,
+            ):
+                raise
+
+            raise
+
+    async def _fetch_classic_risk_snapshot(self, now_ms: int):
+        """Fetch risk snapshot from Bitget classic account endpoint.
+
+        V1: GET /api/v2/mix/account/accounts?productType=USDT-FUTURES
+        """
+        from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
+
+        raw = await self._transport._request(
+            "GET",
+            self._BITGET_CLASSIC_ACCOUNT_PATH,
+            params={"productType": self._BITGET_CLASSIC_PRODUCT_TYPE},
+            private=True,
+        )
+        return _parse_bitget_risk_from_rowlike(raw, now_ms)
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)

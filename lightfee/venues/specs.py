@@ -33,6 +33,8 @@ class VenueSpec:
     market_snapshot_path: str = ""
     position_path: str = ""
     order_path: str = ""
+    account_risk_path: str = ""
+    l2_snapshot_path: str = ""  # REST order book depth endpoint for local-L2 bootstrap
 
     # Whether the venue requires a passphrase for auth
     requires_passphrase: bool = False
@@ -74,6 +76,8 @@ def binance_spec() -> VenueSpec:
         market_snapshot_path="/fapi/v1/ticker/bookTicker",
         position_path="/fapi/v2/positionRisk",
         order_path="/fapi/v1/order",
+        account_risk_path="/fapi/v3/account",
+        l2_snapshot_path="/fapi/v1/depth",
         api_key_header="X-MBX-APIKEY",
         signature_param="signature",
         timestamp_param="timestamp",
@@ -94,6 +98,8 @@ def okx_spec() -> VenueSpec:
         market_snapshot_path="/api/v5/market/tickers",
         position_path="/api/v5/account/positions",
         order_path="/api/v5/trade/order",
+        account_risk_path="/api/v5/account/balance",
+        l2_snapshot_path="/api/v5/market/books",
         requires_passphrase=True,
         api_key_header="OK-ACCESS-KEY",
         signature_header="OK-ACCESS-SIGN",
@@ -119,6 +125,8 @@ def bybit_spec() -> VenueSpec:
         market_snapshot_path="/v5/market/tickers",
         position_path="/v5/position/list",
         order_path="/v5/order/create",
+        account_risk_path="/v5/account/wallet-balance",
+        l2_snapshot_path="/v5/market/orderbook",
         api_key_header="X-BAPI-API-KEY",
         signature_header="X-BAPI-SIGN",
         timestamp_header="X-BAPI-TIMESTAMP",
@@ -140,6 +148,8 @@ def bitget_spec() -> VenueSpec:
         market_snapshot_path="/api/mix/v1/market/tickers",
         position_path="/api/mix/v1/position/singlePosition",
         order_path="/api/mix/v1/order/placeOrder",
+        account_risk_path="/api/v3/account/assets",
+        l2_snapshot_path="/api/mix/v1/market/depth",
         requires_passphrase=True,
         api_key_header="ACCESS-KEY",
         signature_header="ACCESS-SIGN",
@@ -162,9 +172,13 @@ def gate_spec() -> VenueSpec:
         market_snapshot_path="/api/v4/futures/usdt/tickers",
         position_path="/api/v4/futures/usdt/positions",
         order_path="/api/v4/futures/usdt/orders",
+        account_risk_path="/api/v4/futures/usdt/accounts",
+        l2_snapshot_path="/api/v4/futures/usdt/order_book",
         api_key_header="KEY",
         signature_header="SIGN",
         timestamp_header="Timestamp",
+        symbol_to_venue=lambda s: s.replace("USDT", "_USDT") if "_" not in s else s,
+        symbol_from_venue=lambda s: s.replace("_USDT", "USDT").replace("_", ""),
     )
 
 
@@ -182,6 +196,8 @@ def aster_spec() -> VenueSpec:
         market_snapshot_path="/fapi/v1/ticker/bookTicker",
         position_path="/fapi/v1/positionRisk",
         order_path="/fapi/v1/order",
+        account_risk_path="/fapi/v4/account",
+        l2_snapshot_path="/fapi/v1/depth",
         api_key_header="X-MBX-APIKEY",
         signature_param="signature",
         timestamp_param="timestamp",
@@ -202,8 +218,11 @@ def hyperliquid_spec() -> VenueSpec:
         market_snapshot_path="/info",
         position_path="/info",
         order_path="/exchange",
+        l2_snapshot_path="/info",  # POST {"type": "l2Book", "coin": "BTC"}
         requires_wallet_key=True,
         live_order_supported=True,
+        symbol_to_venue=lambda s: s.replace("USDT", "").replace("usdt", ""),
+        symbol_from_venue=lambda s: s + "USDT" if "USDT" not in s.upper() else s,
     )
 
 

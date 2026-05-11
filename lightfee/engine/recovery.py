@@ -252,7 +252,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     if isinstance(pend_dict, dict):
         for pend_id, pdata in pend_dict.items():
             if isinstance(pdata, dict):
-                from lightfee.core.domain import Side as DomainSide
+                from lightfee.core.domain import Side as DomainSide, Venue
 
                 long_venue_str = str(pdata.get("long_venue", "binance"))
                 short_venue_str = str(pdata.get("short_venue", "okx"))
@@ -290,6 +290,10 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
                     hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
                     uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
+                    entry_type=str(pdata.get("entry_type", "")),
+                    maker_price=float(pdata.get("maker_price", 0)),
+                    long_quantity=float(pdata.get("long_quantity", 0)),
+                    short_quantity=float(pdata.get("short_quantity", 0)),
                 )
 
     # Restore pending closes
@@ -309,6 +313,19 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     long_uncertain=bool(cdata.get("long_uncertain", False)),
                     short_uncertain=bool(cdata.get("short_uncertain", False)),
                 )
+
+    # Restore local-L2 state (V1 parity)
+    retained = snap.get("retained_local_l2_books", [])
+    if isinstance(retained, list):
+        state.retained_local_l2_books = retained
+
+    books_snap = snap.get("local_l2_books_snapshot", [])
+    if isinstance(books_snap, list):
+        state.local_l2_books_snapshot = books_snap
+
+    session_snap = snap.get("local_l2_session_snapshot", [])
+    if isinstance(session_snap, list):
+        state.local_l2_session_snapshot = session_snap
 
     return state
 
@@ -450,6 +467,10 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "maker_leg_filled": p.maker_leg_filled,
             "hedge_leg_filled": p.hedge_leg_filled,
             "uncertain_outcome": p.uncertain_outcome,
+            "entry_type": p.entry_type,
+            "maker_price": p.maker_price,
+            "long_quantity": p.long_quantity,
+            "short_quantity": p.short_quantity,
         }
         for pid, p in state.pending_entries.items()
     }

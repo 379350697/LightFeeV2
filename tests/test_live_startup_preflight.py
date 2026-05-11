@@ -141,6 +141,45 @@ class TestRuntimePreflight:
             assert runtime.journal._file is None
 
     @pytest.mark.asyncio
+    async def test_shutdown_calls_per_adapter_shutdown(self):
+        """V1 parity: LiveRuntime.stop() calls shutdown() on each venue adapter."""
+        shutdown_calls: list[str] = []
+
+        class ShutdownTrackingAdapter(FakeVenueAdapter):
+            async def shutdown(self) -> None:
+                shutdown_calls.append(self._venue.value)
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            adapters = {
+                Venue.BINANCE: ShutdownTrackingAdapter(Venue.BINANCE),
+                Venue.OKX: ShutdownTrackingAdapter(Venue.OKX),
+                Venue.HYPERLIQUID: ShutdownTrackingAdapter(Venue.HYPERLIQUID),
+            }
+            runtime = LiveRuntime(config, venue_adapters=adapters)
+            await runtime.start()
+            await runtime.stop()
+
+            assert sorted(shutdown_calls) == ["binance", "hyperliquid", "okx"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_adapter_error_does_not_block(self):
+        """V1 parity: adapter shutdown errors are journaled, not re-raised."""
+        class FailingShutdownAdapter(FakeVenueAdapter):
+            async def shutdown(self) -> None:
+                raise RuntimeError("adapter shutdown failure")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            adapters = {Venue.BINANCE: FailingShutdownAdapter(Venue.BINANCE)}
+            runtime = LiveRuntime(config, venue_adapters=adapters)
+            await runtime.start()
+            # Must not raise — error is journaled
+            await runtime.stop()
+
+            assert runtime.journal._file is None
+
+    @pytest.mark.asyncio
     async def test_venue_adapters_accessible(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
@@ -162,3 +201,37 @@ class TestRuntimePreflight:
 
             adapter = runtime.get_venue_adapter(Venue.HYPERLIQUID)
             assert adapter is None
+
+
+class TestRateLimitConfigManagerStartup:
+    """Verify live startup constructs RateLimitConfigManager with correct parameter name."""
+
+    def test_rate_limit_config_manager_accepts_config_path_param(self):
+        from lightfee.rate_limit.config import RateLimitConfigManager
+        import tempfile, os
+
+        with tempfile.TemporaryDirectory() as td:
+            rl_path = os.path.join(td, "rate_limits.toml")
+            with open(rl_path, "w") as f:
+                f.write("[global]\ndefault_margin = 0.95\n")
+
+            mgr = RateLimitConfigManager(config_path=rl_path)
+            assert mgr.config.default_margin == 0.95
+            outcome = mgr.refresh()
+            assert outcome in ("reloaded", "unchanged")
+
+    def test_rate_limit_config_manager_path_is_stored(self):
+        from lightfee.rate_limit.config import RateLimitConfigManager
+
+        mgr = RateLimitConfigManager(config_path="/tmp/test_limits.toml")
+        assert mgr.path == "/tmp/test_limits.toml"
+
+    def test_rate_limit_config_manager_no_path_uses_defaults(self):
+        from lightfee.rate_limit.config import RateLimitConfigManager
+
+        mgr = RateLimitConfigManager()
+        assert mgr.path is None
+        assert mgr.config.default_margin == 0.95
+        # Refresh should be a no-op without path
+        outcome = mgr.refresh()
+        assert outcome == "unchanged"

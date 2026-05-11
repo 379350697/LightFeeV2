@@ -99,7 +99,7 @@ def config(tmp_path):
             event_log_path=str(tmp_path / "events.jsonl"),
             snapshot_path=str(tmp_path / "snapshot.json"),
         ),
-        strategy=StrategyConfig(),
+        strategy=StrategyConfig(local_l2_enabled=False),
     )
 
 

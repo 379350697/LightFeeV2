@@ -44,6 +44,22 @@ def main() -> None:
     runtime.supervisor.close_executor = runtime.close_executor
     runtime.reconciler = OrderReconciler(adapters=venue_adapters)
 
+    # Initialize global rate-limit runtime for SIGHUP and periodic reload
+    from lightfee.rate_limit.engine import (
+        RateLimitRuntime,
+        install_global_rate_limit_runtime,
+    )
+    from lightfee.rate_limit.config import RateLimitConfigManager
+    from lightfee.engine.bootstrap import rate_limit_config_path
+
+    rate_limit_config_mgr = RateLimitConfigManager(
+        config_path=rate_limit_config_path(args.config)
+    )
+    rate_limit_rt = RateLimitRuntime(config_manager=rate_limit_config_mgr)
+    install_global_rate_limit_runtime(rate_limit_rt)
+    # Wire rate-limit runtime to LiveRuntime for periodic reload
+    runtime._rate_limit_runtime = rate_limit_rt
+
     loop = asyncio.new_event_loop()
 
     shutdown_requested = False
@@ -67,8 +83,15 @@ def main() -> None:
         asyncio.ensure_future(_graceful_shutdown(), loop=loop)
 
     def _on_sighup() -> None:
-        """Reload rate-limit config (placeholder for Task 22)."""
-        logger.info("SIGHUP received — rate-limit reload placeholder")
+        """V1: reload rate-limit config on SIGHUP."""
+        from lightfee.rate_limit.engine import global_rate_limit_runtime
+
+        logger.info("SIGHUP received — reloading rate-limit config")
+        try:
+            rt = global_rate_limit_runtime()
+            asyncio.ensure_future(rt.refresh(), loop=loop)
+        except Exception as e:
+            logger.error("SIGHUP rate-limit reload failed: %s", e)
 
     # Register signal handlers
     for sig, handler in (

@@ -31,6 +31,10 @@ class BinanceAdapter(VenueAdapter):
     def venue(self) -> Venue:
         return Venue.BINANCE
 
+    @property
+    def supports_risk_health(self) -> bool:
+        return self._transport.mode == "live"
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
@@ -39,6 +43,9 @@ class BinanceAdapter(VenueAdapter):
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         return await self._transport.fetch_position(symbol)
+
+    async def fetch_account_risk_snapshot(self):
+        return await self._transport.fetch_account_risk_snapshot()
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)

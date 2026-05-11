@@ -37,9 +37,33 @@ class VenueAdapter(ABC):
     async def place_order(self, request: OrderRequest) -> OrderFill:
         ...
 
+    async def amend_order(self, request: OrderRequest) -> OrderFill:
+        """Amend an existing order (modify price/quantity). Default: not implemented."""
+        raise NotImplementedError(f"amend_order not implemented for {self.venue.value}")
+
+    async def cancel_order(self, request: OrderRequest) -> None:
+        """Cancel an existing order. Default: not implemented."""
+        raise NotImplementedError(f"cancel_order not implemented for {self.venue.value}")
+
     @abstractmethod
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         ...
+
+    async def fetch_l2_snapshot(
+        self, symbol: str, depth: int = 50,
+    ) -> "LocalL2Update":
+        """Fetch a full order book depth snapshot for local-L2 bootstrap.
+
+        Returns a canonical LocalL2Update that can be fed into
+        LocalL2Runtime.record_update(). Default delegates to transport if available.
+        Raises NotImplementedError if the adapter has no L2 snapshot capability.
+        """
+        transport = getattr(self, '_transport', None)
+        if transport is not None:
+            return await transport.fetch_l2_snapshot(symbol=symbol, depth=depth)
+        raise NotImplementedError(
+            f"fetch_l2_snapshot not implemented for {self.venue.value}"
+        )
 
     async def fetch_all_positions(self) -> Optional[list[PositionSnapshot]]:
         return None
@@ -99,6 +123,14 @@ class VenueAdapter(ABC):
         that feeds evaluate_position_risk().
         """
         return None
+
+    def ws_worker_categories(self) -> list[dict]:
+        """Return worker category diagnostics (V1: WsWorkerCategoryStatus).
+
+        Each entry: {category, active_count, expected_max, risk_relevant}.
+        Default empty — adapters that own workers override this.
+        """
+        return []
 
     async def shutdown(self) -> None:
         pass

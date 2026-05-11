@@ -37,6 +37,7 @@ class RuntimeConfig:
     auto_trade_enabled: bool = True
     live_startup_phase_timeout_ms: int = 15000
     maker_event_lane_enabled: bool = False
+    maker_event_lane_min_wake_interval_ms: int = 15000
     shutdown_grace_period_ms: int = 3000
 
 
@@ -149,7 +150,10 @@ class StrategyConfig:
     maker_try_window_ms: int = 1500
     maker_min_fill_ratio: float = 0.25
     maker_initial_slice_ratio: float = 0.5
+    entry_max_initial_clip_ratio: float = 0.8
+    maker_leg_default: str = "buy"
     local_l2_enabled: bool = True
+    local_l2_ws_enabled: bool = True  # WS L2 delta streaming
     bybit_local_l2_depth: int = 50
     local_l2_short_prewarm_enabled: bool = True
     local_l2_short_prewarm_window_secs: int = 900

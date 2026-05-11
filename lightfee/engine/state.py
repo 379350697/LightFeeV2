@@ -80,6 +80,14 @@ class PendingEntry:
     fallback_route: str = ""
     # --- Uncertainty flag for reconciliation (Rust V1 uncertain entry outcomes) ---
     uncertain_outcome: bool = False
+    # --- Reconciliation retry tracking (Rust V1 exponential backoff) ---
+    reconcile_attempt: int = 0
+    reconcile_next_attempt_ms: int = 0
+    # --- V1 maker-event lane repricing ---
+    entry_type: str = ""
+    maker_price: float = 0.0
+    long_quantity: float = 0.0
+    short_quantity: float = 0.0
 
 
 @dataclass
@@ -102,6 +110,9 @@ class PendingClose:
     # --- Uncertainty flags per leg (Rust V1 uncertain close outcomes) ---
     long_uncertain: bool = False
     short_uncertain: bool = False
+    # --- Reconciliation retry tracking (Rust V1 exponential backoff) ---
+    reconcile_attempt: int = 0
+    reconcile_next_attempt_ms: int = 0
 
 
 @dataclass
@@ -132,6 +143,10 @@ class EngineState:
     last_tick_ms: int = 0
     tick_count: int = 0
     venue_health: dict[str, str] = field(default_factory=dict)
+    # --- Local-L2 state for persistence/recovery (V1 parity) ---
+    retained_local_l2_books: list[dict] = field(default_factory=list)
+    local_l2_books_snapshot: list[dict] = field(default_factory=list)
+    local_l2_session_snapshot: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -144,6 +159,9 @@ class EngineState:
             "open_position_count": len(self.open_positions),
             "pending_entry_count": len(self.pending_entries),
             "pending_close_count": len(self.pending_closes),
+            "retained_local_l2_books": self.retained_local_l2_books,
+            "local_l2_books_snapshot": self.local_l2_books_snapshot,
+            "local_l2_session_snapshot": self.local_l2_session_snapshot,
             "open_positions": {
                 pid: {
                     "position_id": pos.position_id,
@@ -185,6 +203,10 @@ class EngineState:
                     "maker_leg_filled": p.maker_leg_filled,
                     "hedge_leg_filled": p.hedge_leg_filled,
                     "uncertain_outcome": p.uncertain_outcome,
+                    "entry_type": p.entry_type,
+                    "maker_price": p.maker_price,
+                    "long_quantity": p.long_quantity,
+                    "short_quantity": p.short_quantity,
                 }
                 for pid, p in self.pending_entries.items()
             },

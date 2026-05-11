@@ -361,3 +361,171 @@ async def execute_entry(
         config_overrides=kwargs,
     )
     return await executor.execute(ctx)
+
+
+# ---------------------------------------------------------------------------
+# V1 pending entry hedge in-situ driver
+# ---------------------------------------------------------------------------
+# Rust reference: src/execution_core/entry_sync.rs:5459+ drive_pending_entry_hedge()
+#
+# This is the V1-equivalent hedge driver. Unlike execute() which creates a full
+# maker→hedge flow, drive_pending_entry_hedge() amends or cancel-replaces the
+# EXISTING maker order within a pending entry. It does NOT create a new entry
+# flow, a new entry_id, or submit a new hedge.
+#
+# Valid actions:
+#   "reprice"       → amend the maker order price
+#   "cancel_replace" → cancel + re-submit the maker order at new price
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HedgeDriveResult:
+    """Outcome of a pending hedge drive operation."""
+    action: str  # "reprice", "cancel_replace", "noop"
+    outcome: str  # "applied", "rejected", "uncertain", "noop"
+    detail: str = ""
+    order_id: str = ""
+    new_price: float = 0.0
+
+
+async def drive_pending_entry_hedge(
+    entry_id: str,
+    pending,
+    new_price: float,
+    old_price: float,
+    action: str,
+    now_ms: int,
+    adapters: dict[Venue, VenueAdapter],
+    journal: Journal,
+    maker_leg: Side,
+    symbol: str,
+    long_venue: Venue,
+    short_venue: Venue,
+    quantity: float = 0.0,
+) -> HedgeDriveResult:
+    """Drive a pending entry hedge in-situ: amend or cancel-replace the maker order.
+
+    V1 semantics:
+    - "reprice": amend the existing maker order to new_price
+    - "cancel_replace": cancel existing maker + submit new maker at new_price
+    - Does NOT create a new entry flow or submit a hedge
+    - Does NOT change the entry_id
+    - Returns HedgeDriveResult with outcome classification
+
+    This is called by the maker-event lane when local-L2 events trigger
+    repricing of a pending passive maker order.
+    """
+    from lightfee.core.domain import OrderRequest
+
+    if action == "noop":
+        return HedgeDriveResult(action="noop", outcome="noop")
+
+    maker_venue = long_venue if maker_leg == Side.BUY else short_venue
+    adapter = adapters.get(maker_venue)
+    if adapter is None:
+        journal.append(
+            "entry.hedge_drive_no_adapter",
+            {"entry_id": entry_id, "venue": maker_venue.value, "action": action},
+        )
+        return HedgeDriveResult(action=action, outcome="rejected",
+                               detail=f"no adapter for {maker_venue.value}")
+
+    qty = quantity if quantity > 0 else getattr(pending, 'long_quantity', 0) or getattr(pending, 'target_quantity', 0)
+    if qty <= 0:
+        return HedgeDriveResult(action=action, outcome="rejected",
+                               detail="zero quantity")
+
+    # Build an amend or cancel-replace request for the existing maker order
+    maker_order_id = getattr(pending, 'maker_order_id', '')
+    post_only = True  # V1: passive maker orders are always post-only
+
+    if action == "reprice" and maker_order_id:
+        # Amend existing maker order price
+        amend_req = OrderRequest(
+            venue=maker_venue,
+            symbol=symbol,
+            side=maker_leg,
+            quantity=qty,
+            price=new_price,
+            post_only=post_only,
+            order_id=maker_order_id,
+            reduce_only=False,
+        )
+        try:
+            fill = await adapter.amend_order(amend_req)
+            if fill.quantity > 0:
+                journal.append(
+                    "entry.hedge_drive_reprice",
+                    {"entry_id": entry_id, "action": "reprice",
+                     "old_price": old_price, "new_price": new_price,
+                     "order_id": fill.order_id},
+                )
+                return HedgeDriveResult(action="reprice", outcome="applied",
+                                       order_id=fill.order_id, new_price=new_price)
+            else:
+                return HedgeDriveResult(action="reprice", outcome="uncertain",
+                                       detail="amend ack-only, fill not confirmed")
+        except OrderSubmitError as e:
+            if e.is_rejected:
+                return HedgeDriveResult(action="reprice", outcome="rejected",
+                                       detail=str(e))
+            return HedgeDriveResult(action="reprice", outcome="uncertain",
+                                   detail=str(e))
+        except Exception as e:
+            return HedgeDriveResult(action="reprice", outcome="uncertain",
+                                   detail=str(e))
+
+    elif action == "cancel_replace":
+        # Cancel existing + submit new maker at new_price
+        cancel_req = OrderRequest(
+            venue=maker_venue,
+            symbol=symbol,
+            side=maker_leg,
+            quantity=0.0,  # cancel
+            price=0.0,
+            post_only=False,
+            order_id=maker_order_id,
+            reduce_only=False,
+        )
+        try:
+            await adapter.cancel_order(cancel_req)
+        except Exception:
+            pass  # Best-effort cancel; proceed to re-submit
+
+        new_req = OrderRequest(
+            venue=maker_venue,
+            symbol=symbol,
+            side=maker_leg,
+            quantity=qty,
+            price=new_price,
+            post_only=post_only,
+            reduce_only=False,
+        )
+        try:
+            fill = await adapter.place_order(new_req)
+            if fill.quantity > 0:
+                journal.append(
+                    "entry.hedge_drive_cancel_replace",
+                    {"entry_id": entry_id, "action": "cancel_replace",
+                     "old_price": old_price, "new_price": new_price,
+                     "order_id": fill.order_id},
+                )
+                return HedgeDriveResult(action="cancel_replace", outcome="applied",
+                                       order_id=fill.order_id, new_price=new_price)
+            else:
+                return HedgeDriveResult(action="cancel_replace", outcome="uncertain",
+                                       detail="new order ack-only after cancel")
+        except OrderSubmitError as e:
+            if e.is_rejected:
+                return HedgeDriveResult(action="cancel_replace", outcome="rejected",
+                                       detail=str(e))
+            return HedgeDriveResult(action="cancel_replace", outcome="uncertain",
+                                   detail=str(e))
+        except Exception as e:
+            return HedgeDriveResult(action="cancel_replace", outcome="uncertain",
+                                   detail=str(e))
+
+    else:
+        return HedgeDriveResult(action=action, outcome="noop",
+                               detail=f"unknown action: {action}")

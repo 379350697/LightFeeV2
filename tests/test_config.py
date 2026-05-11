@@ -83,3 +83,60 @@ class TestConfigValidation:
         config = AppConfig(symbols=["BTCUSDT"], venues=[VenueConfig(venue="unknown_x")])
         issues = validate_config(config)
         assert any("unknown venue" in i.lower() for i in issues)
+
+    def test_rejects_invalid_maker_initial_slice_ratio(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+
+        # 0.0 — invalid (must be > 0.0)
+        config.strategy.maker_initial_slice_ratio = 0.0
+        issues = validate_config(config)
+        assert any("maker_initial_slice_ratio" in i for i in issues)
+
+        # negative — invalid
+        config.strategy.maker_initial_slice_ratio = -0.5
+        issues = validate_config(config)
+        assert any("maker_initial_slice_ratio" in i for i in issues)
+
+        # > 1.0 — invalid
+        config.strategy.maker_initial_slice_ratio = 1.5
+        issues = validate_config(config)
+        assert any("maker_initial_slice_ratio" in i for i in issues)
+
+    def test_accepts_maker_initial_slice_ratio_eq_one(self):
+        """Rust V1 allows maker_initial_slice_ratio = 1.0 (constraint: (0.0, 1.0])."""
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.maker_initial_slice_ratio = 1.0
+        issues = validate_config(config)
+        assert len(issues) == 0
+
+    def test_rejects_invalid_entry_max_initial_clip_ratio(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_max_initial_clip_ratio = 0.0
+        issues = validate_config(config)
+        assert any("entry_max_initial_clip_ratio" in i for i in issues)
+
+        config.strategy.entry_max_initial_clip_ratio = float("nan")
+        issues = validate_config(config)
+        assert any("entry_max_initial_clip_ratio" in i for i in issues)
+
+    def test_rejects_invalid_maker_leg_default(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.maker_leg_default = "SELL"
+        issues = validate_config(config)
+        assert any("maker_leg_default" in i for i in issues)
+
+        config.strategy.maker_leg_default = "both"
+        issues = validate_config(config)
+        assert any("maker_leg_default" in i for i in issues)
+
+    def test_accepts_valid_new_fields(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.maker_initial_slice_ratio = 0.5
+        config.strategy.entry_max_initial_clip_ratio = 0.8
+        config.strategy.maker_leg_default = "buy"
+        issues = validate_config(config)
+        assert len(issues) == 0
+
+        config.strategy.maker_leg_default = "sell"
+        issues = validate_config(config)
+        assert len(issues) == 0

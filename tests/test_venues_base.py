@@ -26,12 +26,18 @@ class TestVenueCapabilities:
         assert caps.supports_risk_health()
         assert caps.supports_private_health()
 
-    def test_hyperliquid_bitget_gate_risk_unsupported(self):
-        for v in (Venue.HYPERLIQUID, Venue.BITGET, Venue.GATE):
+    def test_hyperliquid_risk_unsupported(self):
+        """Only Hyperliquid has no account risk endpoint."""
+        caps = VenueCapabilities.for_venue(Venue.HYPERLIQUID)
+        assert caps.risk_health == CapabilitySupport.UNSUPPORTED
+        assert not caps.supports_risk_health()
+
+    def test_bitget_gate_risk_now_supported(self):
+        """Bitget and Gate risk health is now implemented (live REST endpoints)."""
+        for v in (Venue.BITGET, Venue.GATE):
             caps = VenueCapabilities.for_venue(v)
-            assert caps.risk_health == CapabilitySupport.UNSUPPORTED
-            assert caps.reconcile_quality == ReconcileQuality.UNSUPPORTED
-            assert not caps.supports_risk_health()
+            assert caps.risk_health == CapabilitySupport.SUPPORTED
+            assert caps.supports_risk_health()
 
     def test_okx_bybit_have_unified_account(self):
         for v in (Venue.OKX, Venue.BYBIT):
