@@ -65,6 +65,8 @@ class LiveRuntime:
         self.entry_executor: Optional[object] = None
         # V1 close executor — set after construction or defaults to None
         self.close_executor: Optional[object] = None
+        # V1 passive close executor — set after construction or defaults to None
+        self.passive_close_executor: Optional[object] = None
         # V1 reconciliation service — set after construction or defaults to None
         self.reconciler: Optional[object] = None
         # V1 rate-limit runtime for periodic reload
@@ -185,6 +187,22 @@ class LiveRuntime:
 
         # Phase 6 – Recover retained local-L2 state
         await self._restore_local_l2_state()
+
+        # Phase 7 – Instantiate passive close executor
+        if self._venue_adapters:
+            from lightfee.engine.passive_close import PassiveCloseExecutor
+            self.passive_close_executor = PassiveCloseExecutor(
+                adapters=self._venue_adapters,
+                journal=self.journal,
+            )
+            # Inject the L2 mid resolver so repricing has live book data
+            self.passive_close_executor.set_l2_mid_resolver(self._resolve_local_l2_mid)
+            # Inject close executor for DUAL_TAKER fallback
+            if self.close_executor is not None:
+                self.passive_close_executor.set_close_executor(self.close_executor)
+
+        # Phase 8 – Recover pending passive closes
+        await self._recover_passive_closes()
 
         self.journal.append(
             "runtime.started",
@@ -1090,11 +1108,17 @@ class LiveRuntime:
             # --- Rate-limit periodic reload (V1: rate_limit_reload_interval) ---
             await self._maybe_reload_rate_limits(now_ms)
 
-            # --- Maker-event lane (V1: maker_event_interval, optional) ---
-            await self._maybe_tick_maker_event(now_ms)
-
             # --- Local-L2 snapshot refresh (periodic REST bootstrap for books) ---
             await self._sync_local_l2_data(now_ms)
+
+            # --- Passive close lane (V1: process_pending_passive_closes) ---
+            await self._maybe_tick_passive_close(now_ms)
+
+            # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
+            await self._maybe_process_normal_exits(now_ms)
+
+            # --- Maker-event lane (V1: maker_event_interval, optional) ---
+            await self._maybe_tick_maker_event(now_ms)
 
             # --- Post-tick housekeeping ---
             await self._post_tick_housekeeping(now_ms)
@@ -1563,6 +1587,148 @@ class LiveRuntime:
                 "runtime.entry_dispatch_error",
                 {"entry_id": ctx.entry_id, "error": str(e)},
             )
+
+        # ------------------------------------------------------------------
+    # Passive close recovery (V1: recovery after restart)
+    # ------------------------------------------------------------------
+
+    async def _recover_passive_closes(self) -> None:
+        """Probe and recover pending passive closes after restart.
+
+        V1: On recovery, restored PendingPassiveClose records are probed
+        for live flatness. Flat positions are cleared; still-open positions
+        resume passive maintenance.
+        """
+        if self.passive_close_executor is None:
+            return
+        if not self.state.pending_passive_closes:
+            return
+
+        for position_id in list(self.state.pending_passive_closes.keys()):
+            result = await self.passive_close_executor.recover_passive_close(
+                self.state,
+                position_id,
+                self._venue_adapters,
+            )
+            self.journal.append(
+                "runtime.passive_close_recovery_result",
+                {
+                    "position_id": position_id,
+                    "result": result,
+                },
+            )
+
+    # ------------------------------------------------------------------
+    # Passive close lane (V1: process_pending_passive_closes)
+    # ------------------------------------------------------------------
+
+    async def _maybe_tick_passive_close(self, now_ms: int) -> None:
+        """Drive pending passive closes each tick.
+
+        V1: process_pending_passive_closes() in exit.rs line 2987.
+        Runs after local-L2 sync so repricing has fresh book state.
+        """
+        if self.passive_close_executor is None:
+            return
+        if not self.state.pending_passive_closes:
+            return
+
+        try:
+            await self.passive_close_executor.process_pending_passive_closes(
+                self.state, now_ms,
+            )
+        except Exception as e:
+            self.journal.append(
+                "runtime.passive_close_tick_error",
+                {"error": str(e), "ts_ms": now_ms},
+            )
+
+    # ------------------------------------------------------------------
+    # Normal exit lane (V1: standard_close_reason → passive/aggressive)
+    # ------------------------------------------------------------------
+
+    async def _maybe_process_normal_exits(self, now_ms: int) -> None:
+        """Evaluate normal exit reasons for open positions and route to close path.
+
+        V1: standard_close_reason() identifies which positions should close.
+        normal_close_reason_uses_passive_maker_taker() determines the close path:
+        - passive close: funding_capture, trailing_exit, first_stage_capture,
+          second_stage_capture, settlement_half_close, settlement_force_close
+        - aggressive close: hard_stop, risk_delever, protection
+
+        This method CONSUMES the predicate that was previously only unit-tested.
+        """
+        from lightfee.engine.exit_decision import (
+            normal_close_reason_uses_passive_maker_taker,
+            standard_close_reason,
+        )
+
+        if not self.state.open_positions:
+            return
+
+        for position in list(self.state.open_positions.values()):
+            # Skip positions already in passive close
+            if position.position_id in self.state.pending_passive_closes:
+                continue
+
+            reason = standard_close_reason(position, self.config.strategy, now_ms)
+            if reason is None:
+                continue
+
+            reason_str = reason.value if hasattr(reason, 'value') else str(reason)
+
+            if normal_close_reason_uses_passive_maker_taker(reason_str):
+                # Route to passive close
+                if self.passive_close_executor is not None:
+                    self.journal.append(
+                        "runtime.normal_close_routing_passive",
+                        {
+                            "position_id": position.position_id,
+                            "reason": reason_str,
+                            "matched_quantity": position.matched_quantity,
+                        },
+                    )
+                    pending = await self.passive_close_executor.start_pending_passive_close(
+                        self.state,
+                        position,
+                        reason_str,
+                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
+                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                    )
+                    if pending is not None:
+                        # Immediately drive one cycle
+                        await self.passive_close_executor.drive_pending_passive_close(
+                            self.state, position.position_id, wait_until_terminal=False,
+                        )
+            else:
+                # Route to aggressive close (hard_stop, risk, etc.)
+                if self.close_executor is not None:
+                    self.journal.append(
+                        "runtime.normal_close_routing_aggressive",
+                        {
+                            "position_id": position.position_id,
+                            "reason": reason_str,
+                            "matched_quantity": position.matched_quantity,
+                        },
+                    )
+                    await self.close_executor.execute_close(
+                        position, reason_str, now_ms,
+                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
+                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                        state=self.state,
+                    )
+
+    def _resolve_local_l2_mid(self, venue, symbol: str) -> float:
+        """Get mid price from local L2 book or sidecar for the given venue+symbol."""
+        try:
+            book = self.local_l2_runtime.get_book(venue.value if hasattr(venue, 'value') else str(venue), symbol)
+            if book is not None and book.status.value == "hot":
+                mid = book.mid_price()
+                if mid and mid > 0:
+                    return mid
+        except Exception:
+            pass
+        return 0.0
 
     def _apply_tick_backoff(self, is_active: bool) -> None:
         """Apply incremental tick-failure backoff from config floors / caps."""

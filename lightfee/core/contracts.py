@@ -11,6 +11,9 @@ from lightfee.core.domain import (
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
+    PassiveOrderAck,
+    PassiveOrderAmendRequest,
+    PassiveOrderProgress,
     PerpLiquiditySnapshot,
     PositionSnapshot,
     Venue,
@@ -134,3 +137,77 @@ class VenueAdapter(ABC):
 
     async def shutdown(self) -> None:
         pass
+
+    # --- Passive order contract (V1 resting-order semantics) ---
+
+    async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
+        """Submit a reduce-only GTC post-only maker order. Returns ack, not fill."""
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'submit_passive_order'):
+            return await transport.submit_passive_order(request)
+        raise NotImplementedError(
+            f"submit_passive_order not implemented for {self.venue.value}"
+        )
+
+    async def query_passive_order_progress(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> Optional[PassiveOrderProgress]:
+        """Query cumulative progress for a resting passive order."""
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'query_passive_order_progress'):
+            return await transport.query_passive_order_progress(
+                symbol=symbol, order_id=order_id, client_order_id=client_order_id,
+            )
+        raise NotImplementedError(
+            f"query_passive_order_progress not implemented for {self.venue.value}"
+        )
+
+    async def amend_passive_order(
+        self, request: PassiveOrderAmendRequest
+    ) -> PassiveOrderAck:
+        """Amend a resting passive order (price/quantity)."""
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'amend_passive_order'):
+            return await transport.amend_passive_order(request)
+        raise NotImplementedError(
+            f"amend_passive_order not implemented for {self.venue.value}"
+        )
+
+    async def cancel_passive_order(
+        self, symbol: str, order_id: str, client_order_id: Optional[str] = None
+    ) -> PassiveOrderAck:
+        """Cancel a resting passive order."""
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'cancel_passive_order'):
+            return await transport.cancel_passive_order(
+                symbol=symbol, order_id=order_id, client_order_id=client_order_id,
+            )
+        raise NotImplementedError(
+            f"cancel_passive_order not implemented for {self.venue.value}"
+        )
+
+    def price_tick_size(self, symbol: str) -> Optional[float]:
+        """Return the canonical price tick size for a symbol on this venue.
+
+        V1: passive_order_tick_size() in entry.rs line 2957.
+        Must be the venue's price tick, NOT the quantity step.
+
+        Default: reads from VenueSpec.price_tick via get_spec().
+        """
+        try:
+            from lightfee.venues.specs import get_spec
+            spec = get_spec(self.venue)
+            if spec.price_tick > 0:
+                return spec.price_tick
+        except Exception:
+            pass
+        return None
+
+    def min_entry_notional_quote_hint(
+        self, symbol: str, price_hint: Optional[float] = None
+    ) -> Optional[float]:
+        """Return the venue's min notional quote for a symbol."""
+        return None

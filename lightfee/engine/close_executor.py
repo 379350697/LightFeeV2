@@ -12,6 +12,8 @@ Rust references:
 
 from __future__ import annotations
 
+import asyncio
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -254,6 +256,86 @@ def close_position_exchange_min_notional_violation(
 
 
 # ---------------------------------------------------------------------------
+# Close chunk planning (V1 semantic activation)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChunkPlan:
+    chunk_quantities: list[float]
+    total_chunks: int
+
+
+def compute_close_chunks(
+    total_quantity: float,
+    long_price_hint: float,
+    short_price_hint: float,
+    max_notional_quote: float,
+    min_long_notional: float = 0.0,
+    min_short_notional: float = 0.0,
+    venue_long: Venue | None = None,
+    venue_short: Venue | None = None,
+) -> list[float]:
+    """V1 close chunk planning: split a large close into notional-capped chunks.
+
+    Rust V1 reference: close_execution_chunks (risk.rs line 826) splits based
+    on L2 liquidity depth. Python V2 uses a simpler notional-cap approach that
+    achieves the same effect: no single chunk exceeds max_notional_quote on
+    either leg.
+
+    Returns empty list if total_quantity <= 0.
+    Returns single-element list if max_notional_quote <= 0 or total notional
+    is already below the cap.
+    """
+    if total_quantity <= 0.0:
+        return []
+
+    if max_notional_quote <= 0.0:
+        return [total_quantity]
+
+    # Use the more expensive leg to determine chunk count
+    price_per_unit = max(long_price_hint, short_price_hint)
+    if price_per_unit <= 0.0:
+        return [total_quantity]
+
+    total_notional = total_quantity * price_per_unit
+    if total_notional <= max_notional_quote:
+        return [total_quantity]
+
+    # How many equal-sized chunks to stay under the cap
+    num_chunks = int(math.ceil(total_notional / max_notional_quote))
+    base_qty = total_quantity / num_chunks
+
+    # Validate min notional if venue info provided
+    if venue_long is not None and venue_short is not None:
+        min_allowed = 0.0
+        if min_long_notional > 0 and not venue_reduce_only_close_exempts_min_notional(venue_long):
+            min_allowed = max(min_allowed, min_long_notional / long_price_hint if long_price_hint > 0 else 0.0)
+        if min_short_notional > 0 and not venue_reduce_only_close_exempts_min_notional(venue_short):
+            min_allowed = max(min_allowed, min_short_notional / short_price_hint if short_price_hint > 0 else 0.0)
+        if min_allowed > 0 and base_qty < min_allowed:
+            # Chunks would be too small — fall back to fewer, larger chunks
+            max_chunk_qty = total_notional / max_notional_quote
+            num_chunks = max(1, int(math.floor(total_quantity / min_allowed)))
+            # But each chunk must still respect the notional cap
+            max_qty_per_chunk = max_notional_quote / price_per_unit
+            if num_chunks * max_qty_per_chunk < total_quantity:
+                num_chunks = int(math.ceil(total_quantity / max_qty_per_chunk))
+            base_qty = total_quantity / num_chunks
+
+    chunks = []
+    remaining = total_quantity
+    for i in range(num_chunks):
+        if i == num_chunks - 1:
+            chunks.append(remaining)
+        else:
+            chunks.append(base_qty)
+            remaining -= base_qty
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # Close executor
 # ---------------------------------------------------------------------------
 
@@ -263,11 +345,10 @@ class CloseExecConfig:
     deadline_ms: int = 30_000
     max_close_retries: int = 3
     post_funding_hold_ms: int = 30_000
-    # V1 semantic alignment: large-close chunking (config-ready, not yet activated).
-    # Rust V1 splits closes above a notional threshold into multiple chunks to
-    # reduce market impact. Python V2 currently submits the full matched quantity
-    # as a single chunk (chunk_count=1). When activated, each chunk is submitted
-    # as an independent close leg pair.
+    # V1 semantic alignment: large-close chunking (activated).
+    # Splits closes above close_chunk_max_notional_quote into multiple chunks to
+    # reduce market impact. Each chunk is submitted as an independent close leg
+    # pair with its own clientOrderId and journal entries. Set to 0 to disable.
     close_chunk_max_notional_quote: float = 0.0  # 0 = no chunking
     close_chunk_min_interval_ms: int = 1_000
 
@@ -329,66 +410,112 @@ class CloseExecutor:
                       long_close_qty=0.0, short_close_qty=0.0)
 
         close_id = f"close-{position.position_id}-{now_ms}"
-        short_cid = f"{close_id}-short"
-        long_cid = f"{close_id}-long"
 
-        short_req = OrderRequest(
-            venue=position.short_venue, symbol=position.symbol,
-            side=Side.BUY, quantity=total_quantity, reduce_only=True,
-            price=short_price_hint or None,
-            time_in_force=TimeInForce.IOC,
-            client_order_id=short_cid,
+        # V1 close chunk planning: split large closes by notional cap
+        chunk_quantities = compute_close_chunks(
+            total_quantity=total_quantity,
+            long_price_hint=long_price_hint,
+            short_price_hint=short_price_hint,
+            max_notional_quote=self.config.close_chunk_max_notional_quote,
+            min_long_notional=0.0,
+            min_short_notional=0.0,
+            venue_long=position.long_venue,
+            venue_short=position.short_venue,
         )
-        long_req = OrderRequest(
-            venue=position.long_venue, symbol=position.symbol,
-            side=Side.SELL, quantity=total_quantity, reduce_only=True,
-            price=long_price_hint or None,
-            time_in_force=TimeInForce.IOC,
-            client_order_id=long_cid,
-        )
+        total_chunks = len(chunk_quantities)
+        if total_chunks == 0:
+            return CE(position_id=position.position_id, reason=reason,
+                      long_close_price=0.0, short_close_price=0.0,
+                      long_close_qty=0.0, short_close_qty=0.0)
 
-        # Submit short close first (V1: short leg first)
         short_legs: list[CloseExecutionLeg] = []
         long_legs: list[CloseExecutionLeg] = []
-        short_uncertain = False
-        long_uncertain = False
-        short_order_id = ""
-        long_order_id = ""
+        chunk_short_cids: list[str] = []
+        chunk_long_cids: list[str] = []
+        chunk_short_order_ids: list[str] = []
+        chunk_long_order_ids: list[str] = []
+        any_short_uncertain = False
+        any_long_uncertain = False
 
-        short_result = await self._submit_close_leg_with_retry(
-            short_req, position.position_id, "short", now_ms,
-        )
-        if short_result["outcome"] == "filled":
-            short_legs.append(CloseExecutionLeg(
-                fill=short_result["fill"],
+        for chunk_idx, chunk_qty in enumerate(chunk_quantities):
+            chunk_suffix = f"_chunk_{chunk_idx + 1}" if total_chunks > 1 else ""
+            chunk_start_ms = now_ms
+
+            short_cid = f"{close_id}-short{chunk_suffix}"
+            long_cid = f"{close_id}-long{chunk_suffix}"
+
+            # Submit short close first (V1: short leg first per chunk)
+            short_req = OrderRequest(
+                venue=position.short_venue, symbol=position.symbol,
+                side=Side.BUY, quantity=chunk_qty, reduce_only=True,
+                price=short_price_hint or None,
+                time_in_force=TimeInForce.IOC,
                 client_order_id=short_cid,
-                submit_started_at_ms=now_ms,
-            ))
-            short_order_id = short_result["fill"].order_id
-        elif short_result["outcome"] == "uncertain":
-            short_uncertain = True
-            short_order_id = short_result.get("order_id", "")
+            )
+            short_result = await self._submit_close_leg_with_retry(
+                short_req, position.position_id, "short", now_ms,
+            )
+            if short_result["outcome"] == "filled":
+                short_legs.append(CloseExecutionLeg(
+                    fill=short_result["fill"],
+                    client_order_id=short_cid,
+                    submit_started_at_ms=chunk_start_ms,
+                ))
+                chunk_short_order_ids.append(short_result["fill"].order_id)
+            elif short_result["outcome"] == "uncertain":
+                any_short_uncertain = True
+                chunk_short_order_ids.append(short_result.get("order_id", ""))
 
-        long_result = await self._submit_close_leg_with_retry(
-            long_req, position.position_id, "long", now_ms,
-        )
-        if long_result["outcome"] == "filled":
-            long_legs.append(CloseExecutionLeg(
-                fill=long_result["fill"],
+            long_req = OrderRequest(
+                venue=position.long_venue, symbol=position.symbol,
+                side=Side.SELL, quantity=chunk_qty, reduce_only=True,
+                price=long_price_hint or None,
+                time_in_force=TimeInForce.IOC,
                 client_order_id=long_cid,
-                submit_started_at_ms=now_ms,
-            ))
-            long_order_id = long_result["fill"].order_id
-        elif long_result["outcome"] == "uncertain":
-            long_uncertain = True
-            long_order_id = long_result.get("order_id", "")
+            )
+            long_result = await self._submit_close_leg_with_retry(
+                long_req, position.position_id, "long", now_ms,
+            )
+            if long_result["outcome"] == "filled":
+                long_legs.append(CloseExecutionLeg(
+                    fill=long_result["fill"],
+                    client_order_id=long_cid,
+                    submit_started_at_ms=chunk_start_ms,
+                ))
+                chunk_long_order_ids.append(long_result["fill"].order_id)
+            elif long_result["outcome"] == "uncertain":
+                any_long_uncertain = True
+                chunk_long_order_ids.append(long_result.get("order_id", ""))
 
+            chunk_short_cids.append(short_cid)
+            chunk_long_cids.append(long_cid)
+
+            self.journal.append(
+                "exit.close_chunk_submitted",
+                {
+                    "position_id": position.position_id,
+                    "chunk_index": chunk_idx,
+                    "total_chunks": total_chunks,
+                    "chunk_quantity": chunk_qty,
+                    "short_client_order_id": short_cid,
+                    "long_client_order_id": long_cid,
+                    "short_outcome": short_result["outcome"],
+                    "long_outcome": long_result["outcome"],
+                },
+            )
+
+            # Inter-chunk delay (skip after last chunk)
+            if chunk_idx < total_chunks - 1 and self.config.close_chunk_min_interval_ms > 0:
+                delay_s = self.config.close_chunk_min_interval_ms / 1000.0
+                await asyncio.sleep(delay_s)
+
+        # Aggregate PnL across all chunks
         close = build_close_execution_from_legs(
-            position, 1, short_legs, long_legs,
+            position, total_chunks, short_legs, long_legs,
         )
         close.reason = reason
 
-        # Detect residual
+        # Detect residual from total closed quantities
         long_closed = sum(leg.fill.quantity for leg in long_legs)
         short_closed = sum(leg.fill.quantity for leg in short_legs)
         residual = split_close_fill_residual(
@@ -403,6 +530,7 @@ class CloseExecutor:
                     "exposure_quantity": residual.exposure_quantity,
                     "exposure_venue": residual.exposure_venue.value,
                     "close_id": close_id,
+                    "chunk_count": total_chunks,
                 },
             )
 
@@ -410,12 +538,13 @@ class CloseExecutor:
         if state is not None:
             self._writeback_to_state(
                 state, position, close, long_closed, short_closed,
-                long_uncertain, short_uncertain, now_ms, reason,
+                any_long_uncertain, any_short_uncertain, now_ms, reason,
                 close_id=close_id,
-                short_order_id=short_order_id,
-                long_order_id=long_order_id,
-                short_client_order_id=short_cid,
-                long_client_order_id=long_cid,
+                short_order_id=", ".join(chunk_short_order_ids),
+                long_order_id=", ".join(chunk_long_order_ids),
+                short_client_order_id=", ".join(chunk_short_cids),
+                long_client_order_id=", ".join(chunk_long_cids),
+                chunk_count=total_chunks,
             )
 
         pnl_attr = build_exit_pnl_attribution(position, close)
@@ -427,16 +556,17 @@ class CloseExecutor:
                 "reason": reason,
                 "long_closed_qty": long_closed,
                 "short_closed_qty": short_closed,
-                "long_uncertain": long_uncertain,
-                "short_uncertain": short_uncertain,
+                "long_uncertain": any_long_uncertain,
+                "short_uncertain": any_short_uncertain,
                 "price_pnl": pnl_attr["price_pnl_quote"],
                 "funding_pnl_quote": pnl_attr["funding_quote"],
                 "entry_fee_quote": pnl_attr["entry_fee_quote"],
                 "exit_fee_quote": pnl_attr["exit_fee_quote"],
                 "net_quote": pnl_attr["net_quote"],
                 "close_id": close_id,
-                "long_client_order_id": long_cid,
-                "short_client_order_id": short_cid,
+                "chunk_count": total_chunks,
+                "long_client_order_id": ", ".join(chunk_long_cids),
+                "short_client_order_id": ", ".join(chunk_short_cids),
             },
         )
 
@@ -458,12 +588,14 @@ class CloseExecutor:
         long_order_id: str = "",
         short_client_order_id: str = "",
         long_client_order_id: str = "",
+        chunk_count: int = 1,
     ) -> None:
         """Write close execution results back into EngineState.
 
         - Updates position PnL / quantity tracking
         - Creates PendingClose for uncertain legs with clientOrderId for idempotency
         - Removes fully-closed positions from open_positions
+        - Tracks chunk_index / total_chunks for multi-chunk closes
         """
         # Track partial close: update quantities
         matched_closed = min(long_closed, short_closed)
@@ -491,6 +623,8 @@ class CloseExecutor:
                 short_closed=short_closed,
                 long_uncertain=long_uncertain,
                 short_uncertain=short_uncertain,
+                chunk_index=0,
+                total_chunks=chunk_count,
             )
             self.journal.append(
                 "exit.pending_close_registered",
@@ -501,6 +635,7 @@ class CloseExecutor:
                     "short_uncertain": short_uncertain,
                     "long_client_order_id": long_client_order_id,
                     "short_client_order_id": short_client_order_id,
+                    "chunk_count": chunk_count,
                 },
             )
 
@@ -678,7 +813,6 @@ class CloseExecutor:
                         "client_order_id": request.client_order_id,
                     },
                 )
-                import asyncio
                 await asyncio.sleep(backoff_ms / 1000.0)
 
         return {"outcome": "uncertain", "fill": None, "order_id": ""}

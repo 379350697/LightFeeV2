@@ -230,3 +230,61 @@ class AssetTransferStatus:
     to_venue: Venue
     available: float
     observed_at_ms: int
+
+
+# ---------------------------------------------------------------------------
+# Passive order domain types (V1 parity: resting-order lifecycle)
+# ---------------------------------------------------------------------------
+
+
+class PassiveOrderState(Enum):
+    """V1 PassiveOrderState: lifecycle of a resting passive order."""
+    CREATED = "created"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class PassiveOrderAck:
+    """V1 acknowledgement of a passive order submission (not a terminal fill)."""
+    venue: Venue
+    symbol: str
+    side: Side
+    order_id: str
+    client_order_id: str
+    price: float
+    quantity: float
+    accepted_at_ms: int
+    state: PassiveOrderState = PassiveOrderState.CREATED
+
+
+@dataclass(frozen=True, slots=True)
+class PassiveOrderProgress:
+    """V1 cumulative progress for a resting passive order."""
+    venue: Venue
+    symbol: str
+    side: Side
+    order_id: str
+    client_order_id: str
+    cumulative_quantity: float
+    average_price: float
+    fee_quote: float
+    last_fill_time_ms: int
+    state: PassiveOrderState
+    observed_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class PassiveOrderAmendRequest:
+    """V1 request to amend a resting passive order."""
+    symbol: str
+    side: Side
+    order_id: str
+    client_order_id: Optional[str] = None
+    new_client_order_id: Optional[str] = None
+    new_price_hint: Optional[float] = None
+    new_quantity: Optional[float] = None

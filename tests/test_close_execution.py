@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.close_executor import (
     CloseBalance,
     CloseExecutionLeg,
@@ -66,6 +67,10 @@ def _fake_fill(
         order_id=order_id, fee_quote=fee_quote,
         filled_at_ms=1000,
     )
+
+
+def _make_uncertain_error(reason: str = "order timeout") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.UNCERTAIN, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -435,3 +440,379 @@ class TestClosePnlAttribution:
         assert attr["exit_fee_quote"] == 5.0  # 2.5 + 2.5
         # net = 2.0 + 15.0 - 5.0 - 5.0 = 7.0
         assert attr["net_quote"] == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Close chunking (V1 semantic activation)
+# ---------------------------------------------------------------------------
+
+
+from lightfee.engine.close_executor import compute_close_chunks
+
+
+class TestComputeCloseChunks:
+    """Test close chunk planning: splitting large positions by notional cap."""
+
+    def test_single_chunk_when_below_max_notional(self):
+        """Small position: chunking disabled or notional below threshold → single chunk."""
+        # 0.01 BTC * $50000 = $500 notional per leg, max_notional = 10000 → single chunk
+        chunks = compute_close_chunks(
+            total_quantity=0.01,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            max_notional_quote=10000.0,
+        )
+        assert len(chunks) == 1
+        assert chunks[0] == pytest.approx(0.01)
+
+    def test_single_chunk_when_max_notional_zero(self):
+        """max_notional_quote=0 means chunking disabled → single chunk."""
+        chunks = compute_close_chunks(
+            total_quantity=5.0,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            max_notional_quote=0.0,
+        )
+        assert len(chunks) == 1
+        assert chunks[0] == pytest.approx(5.0)
+
+    def test_single_chunk_when_quantity_zero(self):
+        """Zero quantity → empty chunk list."""
+        chunks = compute_close_chunks(
+            total_quantity=0.0,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            max_notional_quote=5000.0,
+        )
+        assert len(chunks) == 0
+
+    def test_splits_when_above_max_notional(self):
+        """Large position: 5 BTC * $50000 = $250000 notional, cap $50000 → 5 chunks."""
+        chunks = compute_close_chunks(
+            total_quantity=5.0,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            max_notional_quote=50_000.0,
+        )
+        assert len(chunks) == 5
+        # Each chunk ≈ 1.0 BTC = $50000 notional
+        for c in chunks:
+            assert c == pytest.approx(1.0)
+        assert sum(chunks) == pytest.approx(5.0)
+
+    def test_chunks_respect_min_notional_per_leg(self):
+        """Each chunk must be >= min_notional on every leg. Last chunk absorbs remainder."""
+        # 0.03 BTC * $50000 = $1500, cap $600 → needs 3 chunks
+        # Each BTC=0.012 notional=$600, last absorbs rounding
+        chunks = compute_close_chunks(
+            total_quantity=0.03,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            max_notional_quote=600.0,
+            min_long_notional=5.0,
+            min_short_notional=5.0,
+            venue_long=Venue.OKX,
+            venue_short=Venue.OKX,
+        )
+        assert len(chunks) >= 2
+        # Sum of all chunks should equal total
+        assert sum(chunks) == pytest.approx(0.03)
+        # Each chunk notional should not exceed max
+        for c in chunks:
+            assert c * 50000.0 <= 600.0 + 1.0  # allow epsilon
+
+    def test_heterogeneous_price_hints(self):
+        """Long price higher → chunk size bounded by the more expensive leg."""
+        chunks = compute_close_chunks(
+            total_quantity=2.0,
+            long_price_hint=52000.0,  # long leg notional = 2 * 52000 = 104000
+            short_price_hint=50000.0,  # short leg notional = 2 * 50000 = 100000
+            max_notional_quote=50_000.0,
+        )
+        # Chunk capped by max of the two notionals: max(52000, 50000) = 52000 per unit
+        # Each chunk must fit within $50000 notional on BOTH legs
+        # chunk_notional_on_long = c * 52000 <= 50000 → c <= 0.9615
+        for c in chunks:
+            assert c * 52000.0 <= 50_000.0 + 1.0
+            assert c * 50000.0 <= 50_000.0 + 1.0
+        assert sum(chunks) == pytest.approx(2.0)
+
+
+class TestCloseChunkExecutor:
+    """Integration tests: CloseExecutor chunked execution with fake adapters."""
+
+    @pytest.mark.asyncio
+    async def test_small_position_not_chunked(self):
+        """Small position (single chunk) still works correctly through executor."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE, default_fill_price=50100.0)
+        short_adapter = FakeVenueAdapter(Venue.OKX, default_fill_price=49900.0)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"close_chunk_max_notional_quote": 10000.0},
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        close = await executor.execute_close(
+            pos, "profit_take", 2000,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            total_quantity=0.01, state=state,
+        )
+
+        # 0.01 BTC * $50000 = $500 < $10000 cap → single chunk
+        assert close.long_close_qty == pytest.approx(0.01)
+        assert close.short_close_qty == pytest.approx(0.01)
+        # Each adapter called exactly once (one chunk)
+        assert long_adapter.place_order_call_count == 1
+        assert short_adapter.place_order_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_large_position_is_chunked(self):
+        """Large position exceeds notional cap → multiple chunks."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE, default_fill_price=50100.0)
+        short_adapter = FakeVenueAdapter(Venue.OKX, default_fill_price=49900.0)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={
+                "close_chunk_max_notional_quote": 5000.0,  # low cap to force chunks
+            },
+        )
+
+        # 0.1 BTC * $50000 = $5000 notional per leg → chunked
+        # each chunk max notional = $5000 → about 1 chunk of 0.1
+        # Let's make it bigger: 0.5 BTC * $50000 = $25000 → 5 chunks of 0.1
+        pos = _make_position(long_quantity=0.5, short_quantity=0.5, matched_quantity=0.5)
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        close = await executor.execute_close(
+            pos, "profit_take", 2000,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            total_quantity=0.5, state=state,
+        )
+
+        # Should have called each adapter multiple times
+        assert long_adapter.place_order_call_count >= 2
+        assert short_adapter.place_order_call_count >= 2
+        # Total quantity should match
+        assert close.long_close_qty == pytest.approx(0.5)
+        assert close.short_close_qty == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_chunks_have_distinct_client_order_ids(self):
+        """Each chunk gets unique clientOrderId with _chunk_N suffix."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE, default_fill_price=50100.0)
+        short_adapter = FakeVenueAdapter(Venue.OKX, default_fill_price=49900.0)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"close_chunk_max_notional_quote": 1000.0},
+        )
+
+        # 0.5 BTC * $50000 = $25000, cap $1000 → ~25 chunks
+        pos = _make_position(long_quantity=0.5, short_quantity=0.5, matched_quantity=0.5)
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        await executor.execute_close(
+            pos, "profit_take", 2000,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            total_quantity=0.5, state=state,
+        )
+
+        # Check that chunked clientOrderIds were generated
+        all_short_cids = set()
+        all_long_cids = set()
+        # Replay journal to find the client_order_ids from order.filled entries
+        for record in executor.journal.read_all():
+            if record["kind"] == "order.filled":
+                cid = record["payload"].get("client_order_id", "")
+                leg = record["payload"].get("leg", "")
+                if leg == "short":
+                    all_short_cids.add(cid)
+                elif leg == "long":
+                    all_long_cids.add(cid)
+
+        # Each chunk should have a distinct clientOrderId
+        assert len(all_short_cids) >= 2
+        assert len(all_long_cids) >= 2
+        # All IDs should contain "_chunk_"
+        for cid in all_short_cids:
+            assert "_chunk_" in cid
+
+    @pytest.mark.asyncio
+    async def test_chunk_uncertain_creates_pending_close_with_chunk_info(self):
+        """When a chunk is uncertain, PendingClose tracks chunk_index and total_chunks."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE, default_fill_price=50100.0)
+        # Short adapter: all attempts uncertain (exhaust retries)
+        short_adapter = FakeVenueAdapter(Venue.OKX, default_fill_price=49900.0)
+        short_adapter.place_order_outcomes = [
+            _make_uncertain_error("timeout"),
+            _make_uncertain_error("timeout"),
+            _make_uncertain_error("timeout"),
+        ]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={
+                "close_chunk_max_notional_quote": 5000.0,
+                "max_close_retries": 1,  # don't retry on uncertain — register immediately
+            },
+        )
+
+        # Large enough to trigger chunking but almost all chunks will be uncertain on short side
+        pos = _make_position(long_quantity=0.5, short_quantity=0.5, matched_quantity=0.5)
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        await executor.execute_close(
+            pos, "profit_take", 2000,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            total_quantity=0.5, state=state,
+        )
+
+        # Should have registered at least one PendingClose with chunk tracking
+        assert len(state.pending_closes) >= 1
+        for close_id, pc in state.pending_closes.items():
+            # PendingClose should carry chunk info when chunked
+            assert pc.total_chunks >= 1
+            # Should reference clientOrderIds
+            if pc.short_uncertain:
+                assert pc.short_client_order_id != ""
+
+    @pytest.mark.asyncio
+    async def test_multichunk_pnl_aggregation_correct(self):
+        """PnL across multiple chunks sums correctly via build_close_execution_from_legs."""
+        # 2 chunks manually built and aggregated
+        pos = _make_position(
+            long_quantity=0.02, short_quantity=0.02, matched_quantity=0.02,
+            long_entry_price=50000.0, short_entry_price=50000.0,
+        )
+        # Chunk 1: short fills at 49900, long fills at 50100, 0.01 each
+        short_leg_1 = CloseExecutionLeg(fill=_fake_fill(
+            Venue.OKX, "BTCUSDT", Side.BUY, 0.01, 49900.0, "s1", fee_quote=2.0,
+        ))
+        long_leg_1 = CloseExecutionLeg(fill=_fake_fill(
+            Venue.BINANCE, "BTCUSDT", Side.SELL, 0.01, 50100.0, "l1", fee_quote=2.0,
+        ))
+        # Chunk 2: short fills at 49850, long fills at 50150, 0.01 each
+        short_leg_2 = CloseExecutionLeg(fill=_fake_fill(
+            Venue.OKX, "BTCUSDT", Side.BUY, 0.01, 49850.0, "s2", fee_quote=1.5,
+        ))
+        long_leg_2 = CloseExecutionLeg(fill=_fake_fill(
+            Venue.BINANCE, "BTCUSDT", Side.SELL, 0.01, 50150.0, "l2", fee_quote=1.5,
+        ))
+
+        close = build_close_execution_from_legs(
+            pos, 2,
+            [short_leg_1, short_leg_2],
+            [long_leg_1, long_leg_2],
+        )
+
+        # Chunk 1 PnL: long (50100-50000)*0.01=1.0, short (50000-49900)*0.01=1.0 → 2.0
+        # Chunk 2 PnL: long (50150-50000)*0.01=1.5, short (50000-49850)*0.01=1.5 → 3.0
+        # Total price PnL = 5.0
+        assert close.realized_price_pnl_quote == pytest.approx(5.0)
+        assert close.long_close_qty == 0.02
+        assert close.short_close_qty == 0.02
+        # Fees: 2.0 + 1.5 = 3.5 each side
+        assert close.long_fee_quote == pytest.approx(3.5)
+        assert close.short_fee_quote == pytest.approx(3.5)
+        # Average prices
+        # long avg = (50100*0.01 + 50150*0.01) / 0.02 = 50125.0
+        assert close.long_close_price == pytest.approx(50125.0)
+        # short avg = (49900*0.01 + 49850*0.01) / 0.02 = 49875.0
+        assert close.short_close_price == pytest.approx(49875.0)
+
+
+# ---------------------------------------------------------------------------
+# Fake adapter for integration tests
+# ---------------------------------------------------------------------------
+
+
+class FakeVenueAdapter:
+    """Minimal inline fake for chunking tests."""
+
+    def __init__(self, venue: Venue, default_fill_price: float = 50000.0):
+        self._venue = venue
+        self.default_fill_price = default_fill_price
+        self.place_order_outcomes: list = []
+        self.last_request = None
+        self.place_order_call_count = 0
+        self.fetch_position_call_count = 0
+
+    @property
+    def venue(self) -> Venue:
+        return self._venue
+
+    async def place_order(self, request):
+        self.place_order_call_count += 1
+        self.last_request = request
+
+        if self.place_order_outcomes:
+            outcome = self.place_order_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        price = self.default_fill_price
+        return OrderFill(
+            venue=self._venue,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            price=price,
+            order_id=f"fake-{self._venue.value}-{self.place_order_call_count}",
+            filled_at_ms=1000,
+        )
+
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_call_count += 1
+        return PositionSnapshot(
+            venue=self._venue, symbol=symbol, side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=1000,
+        )
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+        return None
+
+    async def normalize_quantity(self, symbol, quantity):
+        return quantity
+
+    async def amend_order(self, request):
+        return await self.place_order(request)
+
+    async def cancel_order(self, request):
+        self.last_request = request
+        return None
+
+
+from lightfee.core.domain import PositionSnapshot

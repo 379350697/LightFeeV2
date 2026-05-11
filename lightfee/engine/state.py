@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
 
 from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -98,6 +100,124 @@ class PendingEntry:
     outcome: str = ""  # "filled", "rejected", "uncertain", "partial"
 
 
+# ---------------------------------------------------------------------------
+# Passive close state (V1 PendingPassiveClose parity)
+# ---------------------------------------------------------------------------
+
+
+class PassiveExecutionPhase(Enum):
+    """V1 PassiveExecutionPhase: maker slippage phase for passive close."""
+    HIGH_SLIPPAGE_MAKER = "high_slippage_maker"
+    LOW_SLIPPAGE_MAKER = "low_slippage_maker"
+    DUAL_TAKER = "dual_taker"  # fallback to aggressive
+
+
+class ActiveMakerLeg(Enum):
+    """Which leg is the passive maker."""
+    LONG = "long"
+    SHORT = "short"
+
+    def label(self) -> str:
+        return self.value
+
+
+@dataclass
+class PassivePhaseState:
+    """V1 PassivePhaseState: tracks the current passive execution phase and cycles."""
+    phase: PassiveExecutionPhase = PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+    preferred_maker_leg: ActiveMakerLeg = ActiveMakerLeg.LONG
+    active_maker_leg: ActiveMakerLeg = ActiveMakerLeg.LONG
+    phase_started_at_ms: int = 0
+    cycle_attempt: int = 1
+    cycle_started_at_ms: int = 0
+    zero_fill_cycles_in_phase: int = 0
+    maker_order_id: str = ""
+    maker_client_order_id: str = ""
+    maker_resting_limit_price: Optional[float] = None
+    maker_resting_since_ms: int = 0
+
+
+@dataclass
+class PendingPassiveLegFill:
+    """V1 PendingEntryLegFill: cumulative fill tracking for a passive close leg."""
+    quantity: float = 0.0
+    average_price: float = 0.0
+    fee_quote: float = 0.0
+    last_fill_time_ms: int = 0
+    order_id: str = ""
+    client_order_id: str = ""
+
+
+@dataclass
+class PersistedCloseExecutionLeg:
+    """V1 PersistedCloseExecutionLeg: serializable close leg for passive close."""
+    fill: Optional[OrderFill] = None
+    client_order_id: str = ""
+    submit_started_at_ms: int = 0
+    latency_ms: int = 0
+
+
+@dataclass
+class PassiveOrderManagerRuntime:
+    """V1 PassiveOrderManagerRuntime: per-venue passive order management state."""
+    cooldown_until_ms: Optional[int] = None
+    consecutive_failures: int = 0
+    last_success_ms: int = 0
+    last_attempt_ms: int = 0
+    ops_budget_remaining: int = 0
+    ops_budget_reset_ms: int = 0
+    last_operation_ms: int = 0
+
+
+@dataclass
+class PendingPassiveClose:
+    """V1 PendingPassiveClose: passive close pending state for recovery and maintenance.
+
+    Tracks a per-position passive close lifecycle: chunked maker+taker close
+    where the maker leg is GTC post-only and the hedge leg is IOC reduce-only.
+    """
+    position_id: str
+    reason: str
+    position_snapshot: Optional[OpenPosition] = None
+    short_stage: str = ""
+    long_stage: str = ""
+    target_quantity: float = 0.0
+    max_slippage_bps: Optional[float] = None
+    chunk_quantities: list[float] = field(default_factory=list)
+    active_chunk_index: int = 0
+    phase_state: PassivePhaseState = field(default_factory=PassivePhaseState)
+    maker_fill: PendingPassiveLegFill = field(default_factory=PendingPassiveLegFill)
+    hedge_fill: PendingPassiveLegFill = field(default_factory=PendingPassiveLegFill)
+    long_legs: list[PersistedCloseExecutionLeg] = field(default_factory=list)
+    short_legs: list[PersistedCloseExecutionLeg] = field(default_factory=list)
+    passive_manager_runtimes: dict[str, PassiveOrderManagerRuntime] = field(default_factory=dict)
+    small_fill_min_notional_attempts: int = 0
+    last_small_fill_missing_quantity: float = 0.0
+    small_fill_buffer_started_at_ms: Optional[int] = None
+    next_retry_at_ms: int = 0
+    multi_phase_started_at_ms: int = 0
+    created_cycle: int = 0
+
+    def current_chunk_quantity(self) -> float:
+        if self.active_chunk_index < len(self.chunk_quantities):
+            return self.chunk_quantities[self.active_chunk_index]
+        return 0.0
+
+    def remaining_chunk_quantity(self) -> float:
+        return max(self.current_chunk_quantity() - self.maker_fill.quantity, 0.0)
+
+    def current_chunk_suffix(self) -> str:
+        if len(self.chunk_quantities) > 1:
+            return f"_chunk_{self.active_chunk_index + 1}"
+        return ""
+
+    def chunk_count(self) -> int:
+        return len(self.chunk_quantities)
+
+    def completed(self) -> bool:
+        return self.active_chunk_index >= len(self.chunk_quantities)
+
+
 @dataclass
 class PendingClose:
     close_id: str
@@ -142,6 +262,7 @@ class RecoveryWorkSnapshot:
     has_open_positions: bool = False
     has_pending_entries: bool = False
     has_pending_closes: bool = False
+    has_pending_passive_closes: bool = False
     ambiguous_state: bool = False
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
 
@@ -154,6 +275,7 @@ class EngineState:
     open_positions: dict[str, OpenPosition] = field(default_factory=dict)
     pending_entries: dict[str, PendingEntry] = field(default_factory=dict)
     pending_closes: dict[str, PendingClose] = field(default_factory=dict)
+    pending_passive_closes: dict[str, PendingPassiveClose] = field(default_factory=dict)
     run_id: str = ""
     started_at_ms: int = 0
     last_tick_ms: int = 0
@@ -175,6 +297,7 @@ class EngineState:
             "open_position_count": len(self.open_positions),
             "pending_entry_count": len(self.pending_entries),
             "pending_close_count": len(self.pending_closes),
+            "pending_passive_close_count": len(self.pending_passive_closes),
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,
@@ -240,5 +363,50 @@ class EngineState:
                     "short_uncertain": c.short_uncertain,
                 }
                 for cid, c in self.pending_closes.items()
+            },
+            "pending_passive_closes": {
+                pid: {
+                    "position_id": ppc.position_id,
+                    "reason": ppc.reason,
+                    "short_stage": ppc.short_stage,
+                    "long_stage": ppc.long_stage,
+                    "target_quantity": ppc.target_quantity,
+                    "max_slippage_bps": ppc.max_slippage_bps,
+                    "chunk_quantities": ppc.chunk_quantities,
+                    "active_chunk_index": ppc.active_chunk_index,
+                    "phase_state": {
+                        "phase": ppc.phase_state.phase.value,
+                        "preferred_maker_leg": ppc.phase_state.preferred_maker_leg.value,
+                        "active_maker_leg": ppc.phase_state.active_maker_leg.value,
+                        "phase_started_at_ms": ppc.phase_state.phase_started_at_ms,
+                        "cycle_attempt": ppc.phase_state.cycle_attempt,
+                        "cycle_started_at_ms": ppc.phase_state.cycle_started_at_ms,
+                        "zero_fill_cycles_in_phase": ppc.phase_state.zero_fill_cycles_in_phase,
+                        "maker_order_id": ppc.phase_state.maker_order_id,
+                        "maker_client_order_id": ppc.phase_state.maker_client_order_id,
+                        "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,
+                        "maker_resting_since_ms": ppc.phase_state.maker_resting_since_ms,
+                    },
+                    "maker_fill": {
+                        "quantity": ppc.maker_fill.quantity,
+                        "average_price": ppc.maker_fill.average_price,
+                        "fee_quote": ppc.maker_fill.fee_quote,
+                        "last_fill_time_ms": ppc.maker_fill.last_fill_time_ms,
+                        "order_id": ppc.maker_fill.order_id,
+                        "client_order_id": ppc.maker_fill.client_order_id,
+                    },
+                    "hedge_fill": {
+                        "quantity": ppc.hedge_fill.quantity,
+                        "average_price": ppc.hedge_fill.average_price,
+                        "fee_quote": ppc.hedge_fill.fee_quote,
+                        "last_fill_time_ms": ppc.hedge_fill.last_fill_time_ms,
+                        "order_id": ppc.hedge_fill.order_id,
+                        "client_order_id": ppc.hedge_fill.client_order_id,
+                    },
+                    "next_retry_at_ms": ppc.next_retry_at_ms,
+                    "multi_phase_started_at_ms": ppc.multi_phase_started_at_ms,
+                    "created_cycle": ppc.created_cycle,
+                }
+                for pid, ppc in self.pending_passive_closes.items()
             },
         }

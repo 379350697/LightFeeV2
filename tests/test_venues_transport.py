@@ -1128,22 +1128,21 @@ class TestBybitGetSigningWithQueryString:
         assert sign == expected_sig
 
     def test_bybit_get_query_params_sorted_consistently(self):
-        """Query params must be sorted alphabetically for signature consistency."""
+        """Query params sorted alphabetically → identical query_string regardless of input order."""
         spec = bybit_spec()
         cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
-        transport1 = VenueTransport(spec=spec, mode="live", credential=cred)
-        transport2 = VenueTransport(spec=spec, mode="live", credential=cred)
-        # Same params in different order should produce same signature
-        _qh1, h1, _b1 = transport1._build_signed_request(
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        # Same params in different dict order should produce identical query_string
+        qs1, _, _ = transport._build_signed_request(
             "GET", "/v5/position/list",
             params={"symbol": "BTCUSDT", "category": "linear"},
         )
-        _qh2, h2, _b2 = transport2._build_signed_request(
+        qs2, _, _ = transport._build_signed_request(
             "GET", "/v5/position/list",
             params={"category": "linear", "symbol": "BTCUSDT"},
         )
-        assert h1["X-BAPI-SIGN"] == h2["X-BAPI-SIGN"], (
-            "Bybit signature should be invariant to param dict order"
+        assert qs1 == qs2, (
+            f"Bybit query_string must be invariant to param order: {qs1!r} != {qs2!r}"
         )
 
 

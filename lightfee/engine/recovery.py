@@ -15,11 +15,16 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from lightfee.engine.state import (
+    ActiveMakerLeg,
     EngineState,
     OpenPosition,
     OperatorControlState,
+    PassiveExecutionPhase,
+    PassivePhaseState,
     PendingClose,
     PendingEntry,
+    PendingPassiveClose,
+    PendingPassiveLegFill,
     RecoveryWorkSnapshot,
 )
 from lightfee.persistence.journal import Journal
@@ -131,6 +136,7 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
     has_opens = len(state.open_positions) > 0
     has_pending = len(state.pending_entries) > 0
     has_closes = len(state.pending_closes) > 0
+    has_passive_closes = len(state.pending_passive_closes) > 0
 
     ambiguous = has_opens and state.lifecycle == EngineLifecycle.BOOTING
 
@@ -138,6 +144,7 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
         has_open_positions=has_opens,
         has_pending_entries=has_pending,
         has_pending_closes=has_closes,
+        has_pending_passive_closes=has_passive_closes,
         ambiguous_state=ambiguous,
         lifecycle=state.lifecycle,
     )
@@ -312,6 +319,60 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     short_closed=float(cdata.get("short_closed", 0)),
                     long_uncertain=bool(cdata.get("long_uncertain", False)),
                     short_uncertain=bool(cdata.get("short_uncertain", False)),
+                )
+
+    # Restore pending passive closes
+    ppc_dict = snap.get("pending_passive_closes", {})
+    if isinstance(ppc_dict, dict):
+        for pid, pdata in ppc_dict.items():
+            if isinstance(pdata, dict):
+                ps_data = pdata.get("phase_state", {})
+                phase_state = PassivePhaseState(
+                    phase=PassiveExecutionPhase(ps_data.get("phase", "high_slippage_maker")),
+                    preferred_maker_leg=ActiveMakerLeg(ps_data.get("preferred_maker_leg", "long")),
+                    active_maker_leg=ActiveMakerLeg(ps_data.get("active_maker_leg", "long")),
+                    phase_started_at_ms=int(ps_data.get("phase_started_at_ms", 0)),
+                    cycle_attempt=int(ps_data.get("cycle_attempt", 1)),
+                    cycle_started_at_ms=int(ps_data.get("cycle_started_at_ms", 0)),
+                    zero_fill_cycles_in_phase=int(ps_data.get("zero_fill_cycles_in_phase", 0)),
+                    maker_order_id=str(ps_data.get("maker_order_id", "")),
+                    maker_client_order_id=str(ps_data.get("maker_client_order_id", "")),
+                    maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
+                    maker_resting_since_ms=int(ps_data.get("maker_resting_since_ms", 0)),
+                )
+                mf = pdata.get("maker_fill", {})
+                maker_fill = PendingPassiveLegFill(
+                    quantity=float(mf.get("quantity", 0)),
+                    average_price=float(mf.get("average_price", 0)),
+                    fee_quote=float(mf.get("fee_quote", 0)),
+                    last_fill_time_ms=int(mf.get("last_fill_time_ms", 0)),
+                    order_id=str(mf.get("order_id", "")),
+                    client_order_id=str(mf.get("client_order_id", "")),
+                )
+                hf = pdata.get("hedge_fill", {})
+                hedge_fill = PendingPassiveLegFill(
+                    quantity=float(hf.get("quantity", 0)),
+                    average_price=float(hf.get("average_price", 0)),
+                    fee_quote=float(hf.get("fee_quote", 0)),
+                    last_fill_time_ms=int(hf.get("last_fill_time_ms", 0)),
+                    order_id=str(hf.get("order_id", "")),
+                    client_order_id=str(hf.get("client_order_id", "")),
+                )
+                state.pending_passive_closes[pid] = PendingPassiveClose(
+                    position_id=pdata.get("position_id", pid),
+                    reason=pdata.get("reason", ""),
+                    short_stage=pdata.get("short_stage", ""),
+                    long_stage=pdata.get("long_stage", ""),
+                    target_quantity=float(pdata.get("target_quantity", 0)),
+                    max_slippage_bps=pdata.get("max_slippage_bps"),
+                    chunk_quantities=[float(x) for x in pdata.get("chunk_quantities", [])],
+                    active_chunk_index=int(pdata.get("active_chunk_index", 0)),
+                    phase_state=phase_state,
+                    maker_fill=maker_fill,
+                    hedge_fill=hedge_fill,
+                    next_retry_at_ms=int(pdata.get("next_retry_at_ms", 0)),
+                    multi_phase_started_at_ms=int(pdata.get("multi_phase_started_at_ms", 0)),
+                    created_cycle=int(pdata.get("created_cycle", 0)),
                 )
 
     # Restore local-L2 state (V1 parity)
@@ -522,6 +583,53 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
         for cid, c in state.pending_closes.items()
     }
 
+    # V1 parity: include pending passive closes
+    view["pending_passive_closes"] = {
+        pid: {
+            "position_id": ppc.position_id,
+            "reason": ppc.reason,
+            "short_stage": ppc.short_stage,
+            "long_stage": ppc.long_stage,
+            "target_quantity": ppc.target_quantity,
+            "max_slippage_bps": ppc.max_slippage_bps,
+            "chunk_quantities": ppc.chunk_quantities,
+            "active_chunk_index": ppc.active_chunk_index,
+            "phase_state": {
+                "phase": ppc.phase_state.phase.value,
+                "preferred_maker_leg": ppc.phase_state.preferred_maker_leg.value,
+                "active_maker_leg": ppc.phase_state.active_maker_leg.value,
+                "phase_started_at_ms": ppc.phase_state.phase_started_at_ms,
+                "cycle_attempt": ppc.phase_state.cycle_attempt,
+                "cycle_started_at_ms": ppc.phase_state.cycle_started_at_ms,
+                "zero_fill_cycles_in_phase": ppc.phase_state.zero_fill_cycles_in_phase,
+                "maker_order_id": ppc.phase_state.maker_order_id,
+                "maker_client_order_id": ppc.phase_state.maker_client_order_id,
+                "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,
+                "maker_resting_since_ms": ppc.phase_state.maker_resting_since_ms,
+            },
+            "maker_fill": {
+                "quantity": ppc.maker_fill.quantity,
+                "average_price": ppc.maker_fill.average_price,
+                "fee_quote": ppc.maker_fill.fee_quote,
+                "last_fill_time_ms": ppc.maker_fill.last_fill_time_ms,
+                "order_id": ppc.maker_fill.order_id,
+                "client_order_id": ppc.maker_fill.client_order_id,
+            },
+            "hedge_fill": {
+                "quantity": ppc.hedge_fill.quantity,
+                "average_price": ppc.hedge_fill.average_price,
+                "fee_quote": ppc.hedge_fill.fee_quote,
+                "last_fill_time_ms": ppc.hedge_fill.last_fill_time_ms,
+                "order_id": ppc.hedge_fill.order_id,
+                "client_order_id": ppc.hedge_fill.client_order_id,
+            },
+            "next_retry_at_ms": ppc.next_retry_at_ms,
+            "multi_phase_started_at_ms": ppc.multi_phase_started_at_ms,
+            "created_cycle": ppc.created_cycle,
+        }
+        for pid, ppc in state.pending_passive_closes.items()
+    }
+
     # V1 parity: include local-L2 state fields in snapshot
     view["retained_local_l2_books"] = [
         dict(b) if hasattr(b, '__iter__') and not isinstance(b, dict) else b
@@ -556,7 +664,7 @@ def classify_startup_recovery_state(state: EngineState) -> str:
     """
     snap = build_recovery_snapshot(state)
 
-    if not snap.has_open_positions and not snap.has_pending_entries and not snap.has_pending_closes:
+    if not snap.has_open_positions and not snap.has_pending_entries and not snap.has_pending_closes and not snap.has_pending_passive_closes:
         return "clean"
 
     if snap.ambiguous_state:
@@ -565,7 +673,7 @@ def classify_startup_recovery_state(state: EngineState) -> str:
     if snap.has_open_positions:
         return "recovery_needed"
 
-    if snap.has_pending_entries or snap.has_pending_closes:
+    if snap.has_pending_entries or snap.has_pending_closes or snap.has_pending_passive_closes:
         return "recovery_needed"
 
     return "clean"
@@ -577,7 +685,7 @@ def needs_reconciliation(state: EngineState) -> bool:
     Rust V1: state_has_recovery_work() — checks all pending/recovery vectors.
     """
     snap = build_recovery_snapshot(state)
-    return snap.has_open_positions or snap.has_pending_entries or snap.has_pending_closes
+    return snap.has_open_positions or snap.has_pending_entries or snap.has_pending_closes or snap.has_pending_passive_closes
 
 
 def is_safe_to_resume(state: EngineState) -> bool:
@@ -613,7 +721,7 @@ def has_lifecycle_blocking_work(state: EngineState) -> bool:
     Rust V1: EngineRecoveryWorkSnapshot.has_lifecycle_blocking_work()
     """
     snap = build_recovery_snapshot(state)
-    return snap.has_open_positions or snap.has_pending_entries
+    return snap.has_open_positions or snap.has_pending_entries or snap.has_pending_passive_closes
 
 
 def normalize_engine_state(state: EngineState) -> None:
@@ -663,6 +771,14 @@ def build_recovery_dedup_index(state: EngineState) -> dict[str, str]:
             index[pc.long_client_order_id] = close_id
         if pc.short_client_order_id:
             index[pc.short_client_order_id] = close_id
+
+    for pid, ppc in state.pending_passive_closes.items():
+        if ppc.phase_state.maker_client_order_id:
+            index[ppc.phase_state.maker_client_order_id] = pid
+        if ppc.maker_fill.client_order_id:
+            index[ppc.maker_fill.client_order_id] = pid
+        if ppc.hedge_fill.client_order_id:
+            index[ppc.hedge_fill.client_order_id] = pid
 
     return index
 

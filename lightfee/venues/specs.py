@@ -28,6 +28,8 @@ class VenueSpec:
     contract_size: float = 1.0
     min_quantity: float = 0.001
     min_notional: float = 5.0
+    # V1: canonical price tick for passive repricing (NOT quantity step)
+    price_tick: float = 0.0
 
     # Endpoint path builders
     market_snapshot_path: str = ""
@@ -73,6 +75,7 @@ def binance_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=0.001,
         min_notional=5.0,
+        price_tick=0.01,
         market_snapshot_path="/fapi/v1/ticker/bookTicker",
         position_path="/fapi/v2/positionRisk",
         order_path="/fapi/v1/order",
@@ -95,6 +98,7 @@ def okx_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=0.01,
         min_notional=1.0,
+        price_tick=0.01,
         market_snapshot_path="/api/v5/market/tickers",
         position_path="/api/v5/account/positions",
         order_path="/api/v5/trade/order",
@@ -122,6 +126,7 @@ def bybit_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=0.001,
         min_notional=1.0,
+        price_tick=0.01,
         market_snapshot_path="/v5/market/tickers",
         position_path="/v5/position/list",
         order_path="/v5/order/create",
@@ -145,6 +150,7 @@ def bitget_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=0.001,
         min_notional=5.0,
+        price_tick=0.01,
         market_snapshot_path="/api/mix/v1/market/tickers",
         position_path="/api/mix/v1/position/singlePosition",
         order_path="/api/mix/v1/order/placeOrder",
@@ -169,6 +175,7 @@ def gate_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=1.0,
         min_notional=1.0,
+        price_tick=0.01,
         market_snapshot_path="/api/v4/futures/usdt/tickers",
         position_path="/api/v4/futures/usdt/positions",
         order_path="/api/v4/futures/usdt/orders",
@@ -193,6 +200,7 @@ def aster_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=0.001,
         min_notional=5.0,
+        price_tick=0.01,
         market_snapshot_path="/fapi/v1/ticker/bookTicker",
         position_path="/fapi/v1/positionRisk",
         order_path="/fapi/v1/order",
@@ -215,6 +223,7 @@ def hyperliquid_spec() -> VenueSpec:
         contract_size=1.0,
         min_quantity=1.0,
         min_notional=10.0,
+        price_tick=0.01,
         market_snapshot_path="/info",
         position_path="/info",
         order_path="/exchange",

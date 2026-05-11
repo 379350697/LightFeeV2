@@ -63,6 +63,52 @@ def normalize_venue_quantity(
     return result
 
 
+# ---------------------------------------------------------------------------
+# V1 passive price tick alignment (entry.rs:4646 align_passive_price_to_tick)
+# ---------------------------------------------------------------------------
+
+
+def align_passive_price_to_tick(price: float, tick_size: float, side: "Side") -> float:
+    """V1 align_passive_price_to_tick (entry.rs line 4646).
+
+    Buy:  floor(price / tick) * tick  (don't overpay)
+    Sell: ceil(price / tick) * tick   (don't undersell)
+    """
+    from lightfee.core.domain import Side as _Side
+
+    if not math.isfinite(price) or not math.isfinite(tick_size) or tick_size <= 0.0:
+        return price
+    if isinstance(side, str):
+        side = _Side(side)
+    if side == _Side.BUY:
+        return math.floor(price / tick_size) * tick_size
+    else:
+        return math.ceil(price / tick_size) * tick_size
+
+
+def resolve_price_tick(
+    venue_spec: Optional["VenueSpec"] = None,
+    adapter: Optional[object] = None,
+    symbol: str = "",
+) -> float:
+    """Resolve canonical price tick for passive repricing.
+
+    Precedence:
+    1. Adapter's price_tick_size(symbol) if available
+    2. VenueSpec.price_tick if > 0
+    3. 0.0 (caller must not proceed with passive repricing)
+
+    V1: passive_order_tick_size() in entry.rs line 2957.
+    """
+    if adapter is not None:
+        tick = getattr(adapter, 'price_tick_size', lambda s: None)(symbol)
+        if tick and tick > 0.0 and math.isfinite(tick):
+            return tick
+    if venue_spec is not None and venue_spec.price_tick > 0.0:
+        return venue_spec.price_tick
+    return 0.0
+
+
 __all__ = [
     "floor_to_step",
     "normalize_order_quantity",

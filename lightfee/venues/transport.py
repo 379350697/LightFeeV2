@@ -1191,6 +1191,433 @@ class VenueTransport:
         )
 
     # ------------------------------------------------------------------
+    # Passive order contract (V1: GTC post-only maker order lifecycle)
+    # ------------------------------------------------------------------
+
+    async def submit_passive_order(self, request: OrderRequest) -> "PassiveOrderAck":
+        """Submit a GTC post-only reduce-only maker order. Returns ack, not fill."""
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
+
+        spec = self._spec
+        venue_sym = self._venue_symbol(request.symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            order_id = str(uuid.uuid4()).replace("-", "")[:20]
+            cid = request.client_order_id or ""
+            return PassiveOrderAck(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=request.side,
+                order_id=order_id,
+                client_order_id=cid,
+                price=request.price or 0.0,
+                quantity=request.quantity,
+                accepted_at_ms=now_ms,
+                state=PassiveOrderState.OPEN,
+            )
+
+        try:
+            body: dict[str, Any] = {
+                "symbol": venue_sym,
+                "side": request.side.value.upper(),
+                "quantity": str(request.quantity),
+                "reduceOnly": "true",
+            }
+
+            if request.client_order_id:
+                body["newClientOrderId"] = request.client_order_id
+
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                body["type"] = "LIMIT"
+                body["timeInForce"] = "GTX"  # post-only
+                if request.price is not None and request.price > 0:
+                    body["price"] = str(request.price)
+            elif spec.venue_id == Venue.OKX:
+                body["instId"] = venue_sym
+                body["tdMode"] = "cross"
+                body["ordType"] = "post_only"
+                if request.price is not None and request.price > 0:
+                    body["px"] = str(request.price)
+            elif spec.venue_id == Venue.BYBIT:
+                body["category"] = "linear"
+                body["orderType"] = "Limit"
+                body["timeInForce"] = "PostOnly"
+                if request.price is not None and request.price > 0:
+                    body["price"] = str(request.price)
+            elif spec.venue_id == Venue.BITGET:
+                body["marginCoin"] = "USDT"
+                body["orderType"] = "limit"
+                body["timeInForceValue"] = "post_only"
+                if request.price is not None and request.price > 0:
+                    body["price"] = str(request.price)
+            elif spec.venue_id == Venue.GATE:
+                body["contract"] = venue_sym
+                body["size"] = int(request.quantity)
+                body["price"] = str(request.price) if request.price else "0"
+                body["tif"] = "gtc"
+                body["reduce_only"] = True
+                body["post_only"] = True
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                if request.price is not None and request.price > 0:
+                    body["price"] = str(request.price)
+                body["timeInForce"] = "Gtc"
+                body["postOnly"] = True
+
+            raw = await self._request("POST", spec.order_path, body=body, private=True)
+            return self._parse_passive_order_ack(raw, request, venue_sym, now_ms)
+
+        except TransportError as e:
+            raise _map_to_submit_error(e.category, str(e))
+        except OrderSubmitError:
+            raise
+        except Exception as e:
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
+
+    def _parse_passive_order_ack(
+        self, raw: dict[str, Any], request: OrderRequest, venue_sym: str, now_ms: int,
+    ) -> "PassiveOrderAck":
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
+
+        spec = self._spec
+        data = raw.get("data", raw)
+
+        if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
+            if data["result"].get("orderId") or data["result"].get("orderLinkId"):
+                data = data["result"]
+        elif isinstance(data, dict) and "result" in data and isinstance(data["result"], list) and data["result"]:
+            data = data["result"][0]
+        elif isinstance(data, list) and data:
+            data = data[0]
+
+        if not isinstance(data, dict):
+            data = {}
+
+        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
+        client_order_id = str(data.get("clientOrderId", data.get("clOrdId",
+                              request.client_order_id or "")))
+        price = float(data.get("price", data.get("px", request.price or 0)))
+        qty = float(data.get("origQty", data.get("sz", data.get("size", request.quantity))))
+
+        state = PassiveOrderState.OPEN
+        status_str = str(data.get("status", data.get("state", data.get("ordStatus", "")))).upper()
+        if status_str in ("NEW", "OPEN", "UNTRI", "ACTIVE", "UNTRIGGERED"):
+            state = PassiveOrderState.OPEN
+        elif status_str in ("PARTIALLY_FILLED", "PARTIAL"):
+            state = PassiveOrderState.PARTIALLY_FILLED
+        elif status_str in ("FILLED", "CLOSED", "FINISHED"):
+            state = PassiveOrderState.FILLED
+        elif status_str in ("CANCELED", "CANCELLED"):
+            state = PassiveOrderState.CANCELED
+        elif status_str in ("REJECTED", "EXPIRED"):
+            state = PassiveOrderState.REJECTED
+
+        return PassiveOrderAck(
+            venue=spec.venue_id,
+            symbol=venue_sym,
+            side=request.side,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            price=price,
+            quantity=qty,
+            accepted_at_ms=now_ms,
+            state=state,
+        )
+
+    async def query_passive_order_progress(
+        self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
+    ) -> Optional["PassiveOrderProgress"]:
+        """Query cumulative progress for a resting passive order."""
+        from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
+
+        spec = self._spec
+        venue_sym = self._venue_symbol(symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            return None
+
+        try:
+            params: dict[str, Any] = {}
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["origClientOrderId"] = client_order_id
+            elif spec.venue_id == Venue.OKX:
+                params["instId"] = venue_sym
+                if order_id:
+                    params["ordId"] = order_id
+                elif client_order_id:
+                    params["clOrdId"] = client_order_id
+            elif spec.venue_id == Venue.BYBIT:
+                params["category"] = "linear"
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["orderLinkId"] = client_order_id
+            elif spec.venue_id == Venue.BITGET:
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["clientOid"] = client_order_id
+            elif spec.venue_id == Venue.GATE:
+                if order_id:
+                    params["order_id"] = order_id
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                # Hyperliquid doesn't have an order query; return None
+                return None
+
+            raw = await self._request("GET", spec.order_path, params=params, private=True)
+            return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
+
+        except TransportError:
+            return None
+        except Exception:
+            return None
+
+    def _parse_passive_order_progress(
+        self, raw: dict[str, Any], spec: "VenueSpec", venue_sym: str, now_ms: int,
+    ) -> Optional["PassiveOrderProgress"]:
+        from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side
+
+        data = raw.get("data", raw)
+        if isinstance(data, dict) and "result" in data:
+            r = data["result"]
+            if isinstance(r, dict) and (r.get("orderId") or r.get("orderLinkId")):
+                data = r
+            elif isinstance(r, list) and r:
+                data = r[0]
+        elif isinstance(data, list) and data:
+            data = data[0]
+
+        if not isinstance(data, dict):
+            return None
+
+        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
+        client_order_id = str(data.get("clientOrderId", data.get("clOrdId", data.get("orderLinkId", ""))))
+        side_raw = str(data.get("side", "buy")).upper()
+        side = Side.BUY if side_raw in ("BUY", "LONG") else Side.SELL
+
+        cum_qty = float(data.get("cumQty", data.get("executedQty",
+                      data.get("filledSize", data.get("filledQty",
+                      data.get("filled_total", data.get("accFillSz", data.get("cumExecQty", 0))))))))
+        avg_price = float(data.get("avgPrice", data.get("avgPx", data.get("price", 0))))
+
+        fee_quote = float(data.get("commission", data.get("fee", 0)))
+        last_fill_time = int(data.get("updateTime", data.get("updatedTime",
+                               data.get("updateTimestamp", data.get("cTime", now_ms)))))
+
+        status_str = str(data.get("status", data.get("state", data.get("ordStatus", "")))).upper()
+        if status_str in ("NEW", "OPEN", "UNTRI", "ACTIVE", "UNTRIGGERED"):
+            state = PassiveOrderState.OPEN
+        elif status_str in ("PARTIALLY_FILLED", "PARTIAL"):
+            state = PassiveOrderState.PARTIALLY_FILLED
+        elif status_str in ("FILLED", "CLOSED", "FINISHED"):
+            state = PassiveOrderState.FILLED
+        elif status_str in ("CANCELED", "CANCELLED"):
+            state = PassiveOrderState.CANCELED
+        elif status_str in ("REJECTED"):
+            state = PassiveOrderState.REJECTED
+        elif status_str in ("EXPIRED"):
+            state = PassiveOrderState.EXPIRED
+        else:
+            return None
+
+        return PassiveOrderProgress(
+            venue=spec.venue_id,
+            symbol=venue_sym,
+            side=side,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            cumulative_quantity=cum_qty,
+            average_price=avg_price,
+            fee_quote=fee_quote,
+            last_fill_time_ms=last_fill_time,
+            state=state,
+            observed_at_ms=now_ms,
+        )
+
+    async def amend_passive_order(
+        self, request: "PassiveOrderAmendRequest",
+    ) -> "PassiveOrderAck":
+        """Amend a resting passive order (price/quantity). Falls back to cancel+replace."""
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState, Side
+
+        spec = self._spec
+        venue_sym = self._venue_symbol(request.symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            return PassiveOrderAck(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=request.side,
+                order_id=request.order_id,
+                client_order_id=request.client_order_id or "",
+                price=request.new_price_hint or 0.0,
+                quantity=request.new_quantity or 0.0,
+                accepted_at_ms=now_ms,
+                state=PassiveOrderState.OPEN,
+            )
+
+        try:
+            body: dict[str, Any] = {"symbol": venue_sym}
+
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                body["orderId"] = request.order_id
+                body["side"] = request.side.value.upper()
+                if request.new_price_hint is not None and request.new_price_hint > 0:
+                    body["price"] = str(request.new_price_hint)
+                if request.new_quantity is not None and request.new_quantity > 0:
+                    body["quantity"] = str(request.new_quantity)
+            elif spec.venue_id == Venue.OKX:
+                body["instId"] = venue_sym
+                if request.order_id:
+                    body["ordId"] = request.order_id
+                elif request.client_order_id:
+                    body["clOrdId"] = request.client_order_id
+                if request.new_client_order_id:
+                    body["newClOrdId"] = request.new_client_order_id
+                if request.new_price_hint is not None and request.new_price_hint > 0:
+                    body["newPx"] = str(request.new_price_hint)
+                if request.new_quantity is not None and request.new_quantity > 0:
+                    body["newSz"] = str(request.new_quantity)
+            elif spec.venue_id == Venue.BYBIT:
+                body["category"] = "linear"
+                body["orderId"] = request.order_id
+                if request.new_price_hint is not None and request.new_price_hint > 0:
+                    body["price"] = str(request.new_price_hint)
+                if request.new_quantity is not None and request.new_quantity > 0:
+                    body["qty"] = str(request.new_quantity)
+            elif spec.venue_id == Venue.BITGET:
+                body["orderId"] = request.order_id
+                if request.new_price_hint is not None and request.new_price_hint > 0:
+                    body["price"] = str(request.new_price_hint)
+                if request.new_quantity is not None and request.new_quantity > 0:
+                    body["size"] = str(request.new_quantity)
+            elif spec.venue_id == Venue.GATE:
+                body["order_id"] = request.order_id
+                if request.new_price_hint is not None and request.new_price_hint > 0:
+                    body["price"] = str(request.new_price_hint)
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                # Hyperliquid amend via cancel+replace only
+                raise NotImplementedError("Hyperliquid amend not supported")
+
+            raw = await self._request("PUT", spec.order_path, body=body, private=True)
+            return self._parse_passive_order_ack(
+                raw,
+                OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=request.side,
+                             quantity=request.new_quantity or 0.0,
+                             price=request.new_price_hint,
+                             client_order_id=request.new_client_order_id or request.client_order_id),
+                venue_sym, now_ms,
+            )
+
+        except NotImplementedError:
+            raise
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"amend passive order failed: {e}",
+            )
+
+    async def cancel_passive_order(
+        self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
+    ) -> "PassiveOrderAck":
+        """Cancel a resting passive order."""
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState, Side
+
+        spec = self._spec
+        venue_sym = self._venue_symbol(symbol)
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            return PassiveOrderAck(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=Side.BUY,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                price=0.0,
+                quantity=0.0,
+                accepted_at_ms=now_ms,
+                state=PassiveOrderState.CANCELED,
+            )
+
+        try:
+            params: dict[str, Any] = {}
+            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["origClientOrderId"] = client_order_id
+            elif spec.venue_id == Venue.OKX:
+                params["instId"] = venue_sym
+                if order_id:
+                    params["ordId"] = order_id
+                elif client_order_id:
+                    params["clOrdId"] = client_order_id
+            elif spec.venue_id == Venue.BYBIT:
+                params["category"] = "linear"
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["orderLinkId"] = client_order_id
+            elif spec.venue_id == Venue.BITGET:
+                params["symbol"] = venue_sym
+                if order_id:
+                    params["orderId"] = order_id
+                elif client_order_id:
+                    params["clientOid"] = client_order_id
+            elif spec.venue_id == Venue.GATE:
+                if order_id:
+                    params["order_id"] = order_id
+            elif spec.venue_id == Venue.HYPERLIQUID:
+                body = {
+                    "type": "cancel",
+                    "cancel": {
+                        "coin": venue_sym,
+                        "oid": int(order_id) if order_id else 0,
+                    },
+                }
+                raw = await self._request("POST", spec.order_path, body=body, private=True)
+                return PassiveOrderAck(
+                    venue=spec.venue_id,
+                    symbol=venue_sym,
+                    side=Side.BUY,
+                    order_id=order_id,
+                    client_order_id=client_order_id or "",
+                    price=0.0,
+                    quantity=0.0,
+                    accepted_at_ms=now_ms,
+                    state=PassiveOrderState.CANCELED,
+                )
+
+            raw = await self._request("DELETE", spec.order_path, params=params, private=True)
+            return self._parse_passive_order_ack(
+                raw,
+                OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=Side.BUY,
+                             quantity=0.0, client_order_id=client_order_id),
+                venue_sym, now_ms,
+            )
+
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"cancel passive order failed: {e}",
+            )
+
+    # ------------------------------------------------------------------
     # Quantity normalization
     # ------------------------------------------------------------------
 
