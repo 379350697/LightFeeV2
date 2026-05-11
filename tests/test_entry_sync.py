@@ -262,10 +262,8 @@ class TestEntrySyncDualTakerSuccess:
 
         records = journal.read_all()
         kinds = [r["kind"] for r in records]
-        assert "entry.maker_submitted" in kinds
-        assert "entry.maker_filled" in kinds
-        assert "entry.hedge_submitted" in kinds
-        assert "entry.hedge_filled" in kinds
+        assert "order.submitted" in kinds
+        assert "order.filled" in kinds
         assert "entry.opened" in kinds
 
 

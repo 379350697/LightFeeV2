@@ -188,7 +188,7 @@ class TestEntrySyncJournalIntegration:
 
         records = tmp_journal.read_all()
         kinds = [r["kind"] for r in records]
-        assert "entry.maker_rejected" in kinds
+        assert "order.rejected" in kinds
 
 
 # ---------------------------------------------------------------------------

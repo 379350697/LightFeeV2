@@ -158,6 +158,17 @@ class Supervisor:
             return
 
         if risk_view.warning_condition:
+            self.journal.append(
+                "risk.warning_triggered",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "long_health_ratio": risk_view.long_health_ratio,
+                    "short_health_ratio": risk_view.short_health_ratio,
+                    "min_health_ratio": risk_view.min_health_ratio,
+                    "degraded_reason": risk_view.degraded_reason,
+                },
+            )
             if not strategy.warning_line_enabled:
                 self.journal.append(
                     "risk.line_disabled",
@@ -176,6 +187,9 @@ class Supervisor:
                         "symbol": position.symbol,
                     },
                 )
+        elif position.single_side_protection_triggered:
+            # Warning was previously active but now cleared
+            pass  # risk.warning_cleared emitted by risk mode transition handler
 
     # ------------------------------------------------------------------
     # Risk plan execution
@@ -285,8 +299,26 @@ class Supervisor:
             {
                 "position_id": position.position_id,
                 "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
                 "reason": plan.reason,
                 "action": "single_side_protection",
+                "requested_quantity": plan.requested_quantity,
+                "adjusted_quantity": plan.adjusted_quantity,
+                "remaining_quantity": position.matched_quantity,
+            },
+        )
+        self.journal.append(
+            "risk.single_side_protection_triggered",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "reason": plan.reason,
+                "protection_venue": plan.long_liquidity_source or "",
+                "protection_side": "buy" if plan.short_liquidity_source else "sell",
+                "requested_quantity": plan.requested_quantity,
+                "adjusted_quantity": plan.adjusted_quantity,
+                "remaining_quantity": position.matched_quantity,
             },
         )
 

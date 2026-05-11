@@ -15,12 +15,16 @@ from typing import Any
 
 
 class Journal:
-    """Append-only JSONL journal for event persistence."""
+    """Append-only JSONL journal for event persistence.
+
+    V1 type parity: Python int is arbitrary-precision and covers all V1 integer
+    domains (u64 seq, i64 ts_ms, u64/Decimal quantities) without range loss.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._seq = 0
-        self._run_id = str(int(time.time() * 1000))
+        self._run_id = f"lightfee-{int(time.time() * 1000)}-{os.getpid()}"
         self._file = None
 
     def open(self) -> None:

@@ -109,6 +109,23 @@ class EntrySyncExecutor:
                 maker_order_id="",
                 hedge_order_id="",
             )
+            self.journal.append(
+                "entry.aborted",
+                {
+                    "position_id": ctx.entry_id,
+                    "reason": maker_result.get("reason", "maker rejected"),
+                    "maker_client_order_id": maker_req.client_order_id,
+                    "hedge_client_order_id": hedge_req.client_order_id,
+                },
+            )
+            self.journal.append(
+                "entry.aborted_failed_pending_retained",
+                {
+                    "position_id": ctx.entry_id,
+                    "pending_entry_id": ctx.entry_id,
+                    "outcome": "rejected",
+                },
+            )
             return result
 
         if maker_result["outcome"] == "uncertain":
@@ -361,72 +378,87 @@ class EntrySyncExecutor:
     ) -> dict[str, Any]:
         """Submit maker order and classify outcome."""
         self.journal.append(
-            "entry.maker_submitted",
+            "order.submitted",
             {
                 "position_id": ctx.entry_id,
+                "leg": "maker",
                 "symbol": request.symbol,
                 "venue": request.venue.value,
                 "side": request.side.value,
                 "quantity": request.quantity,
                 "price": request.price,
                 "post_only": request.post_only,
+                "is_maker": True,
                 "client_order_id": request.client_order_id,
                 "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
-        return await self._submit_order(request, ctx.entry_id, "maker")
+        return await self._submit_order(request, ctx.entry_id, "maker", now_ms)
 
     async def _submit_hedge(
         self, ctx: EntryContext, request: OrderRequest, now_ms: int
     ) -> dict[str, Any]:
         """Submit hedge order and classify outcome."""
         self.journal.append(
-            "entry.hedge_submitted",
+            "order.submitted",
             {
                 "position_id": ctx.entry_id,
+                "leg": "hedge",
                 "symbol": request.symbol,
                 "venue": request.venue.value,
                 "side": request.side.value,
                 "quantity": request.quantity,
                 "price": request.price,
                 "reduce_only": request.reduce_only,
+                "is_maker": False,
                 "client_order_id": request.client_order_id,
                 "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
-        return await self._submit_order(request, ctx.entry_id, "hedge")
+        return await self._submit_order(request, ctx.entry_id, "hedge", now_ms)
 
     async def _submit_order(
-        self, request: OrderRequest, position_id: str, leg: str
+        self, request: OrderRequest, position_id: str, leg: str,
+        submit_started_at_ms: int = 0,
     ) -> dict[str, Any]:
         """Submit an order through the venue adapter and classify outcome.
 
         Returns dict with outcome, fill, order_id, and client_order_id.
         """
+        import time as _time
         adapter = self.adapters.get(request.venue)
+        is_maker = (leg == "maker")
         if adapter is None:
             self.journal.append(
-                f"entry.{leg}_rejected",
+                "order.rejected",
                 {
                     "position_id": position_id,
+                    "leg": leg,
                     "reason": f"no adapter for {request.venue.value}",
                     "client_order_id": request.client_order_id,
+                    "is_maker": is_maker,
                 },
             )
             return {"outcome": "rejected", "fill": None, "order_id": ""}
 
         try:
             fill = await adapter.place_order(request)
+            latency_ms = 0
+            if submit_started_at_ms > 0 and fill.filled_at_ms > 0:
+                latency_ms = fill.filled_at_ms - submit_started_at_ms
             if fill.quantity > 0:
                 self.journal.append(
-                    f"entry.{leg}_filled",
+                    "order.filled",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "order_id": fill.order_id,
                         "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
                         "price": fill.price,
                         "fee_quote": fill.fee_quote,
+                        "latency_ms": latency_ms,
+                        "is_maker": is_maker,
                     },
                 )
                 return {
@@ -436,13 +468,15 @@ class EntrySyncExecutor:
                     "journal": [],
                 }
             else:
-                # Ack-only or zero-fill
                 self.journal.append(
-                    f"entry.{leg}_uncertain",
+                    "order.uncertain",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": "zero fill quantity",
                         "client_order_id": request.client_order_id,
+                        "is_maker": is_maker,
+                        "latency_ms": latency_ms,
                     },
                 )
                 return {
@@ -454,32 +488,38 @@ class EntrySyncExecutor:
         except OrderSubmitError as e:
             if e.is_rejected:
                 self.journal.append(
-                    f"entry.{leg}_rejected",
+                    "order.rejected",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
+                        "is_maker": is_maker,
                     },
                 )
                 return {"outcome": "rejected", "fill": None, "order_id": ""}
             else:
                 self.journal.append(
-                    f"entry.{leg}_uncertain",
+                    "order.uncertain",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
+                        "is_maker": is_maker,
                     },
                 )
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
             self.journal.append(
-                f"entry.{leg}_uncertain",
+                "order.uncertain",
                 {
                     "position_id": position_id,
+                    "leg": leg,
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
+                    "is_maker": is_maker,
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}

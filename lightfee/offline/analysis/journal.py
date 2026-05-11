@@ -61,7 +61,12 @@ def analyze_journal_records(
             stats.max_latency_ms = max(stats.max_latency_ms, latency)
             stats.min_latency_ms = min(stats.min_latency_ms, latency)
 
-        elif kind == "order.failed":
+        elif kind == "order.rejected":
+            venue = payload.get("venue", "unknown")
+            stats = venue_stats.setdefault(venue, VenueOrderStats(venue=venue))
+            stats.failure_count += 1
+
+        elif kind == "order.uncertain":
             venue = payload.get("venue", "unknown")
             stats = venue_stats.setdefault(venue, VenueOrderStats(venue=venue))
             stats.failure_count += 1

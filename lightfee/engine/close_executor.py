@@ -365,15 +365,6 @@ class CloseExecutor:
                 submit_started_at_ms=now_ms,
             ))
             short_order_id = short_result["fill"].order_id
-        elif short_result["outcome"] == "rejected":
-            self.journal.append(
-                "exit.short_rejected",
-                {
-                    "position_id": position.position_id,
-                    "reason": short_result.get("reason", ""),
-                    "client_order_id": short_cid,
-                },
-            )
         elif short_result["outcome"] == "uncertain":
             short_uncertain = True
             short_order_id = short_result.get("order_id", "")
@@ -513,6 +504,26 @@ class CloseExecutor:
                 },
             )
 
+        # Emit partial close when position remains open
+        if position.matched_quantity > 1e-12:
+            self.journal.append(
+                "exit.partial_closed",
+                {
+                    "position_id": position.position_id,
+                    "quantity": position.matched_quantity,
+                    "long_quantity": position.long_quantity,
+                    "short_quantity": position.short_quantity,
+                    "current_net_quote": position.current_net_quote,
+                    "peak_net_quote": position.peak_net_quote,
+                    "funding_captured": position.funding_captured,
+                    "second_stage_funding_captured": position.second_stage_funding_captured,
+                    "long_closed_qty": long_closed,
+                    "short_closed_qty": short_closed,
+                    "close_id": close_id,
+                    "reason": reason,
+                },
+            )
+
         # Fully closed → remove from open positions
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(position.position_id, None)
@@ -537,9 +548,10 @@ class CloseExecutor:
         adapter = self.adapters.get(request.venue)
         if adapter is None:
             self.journal.append(
-                f"exit.{leg}_rejected",
+                "order.rejected",
                 {
                     "position_id": position_id,
+                    "leg": leg,
                     "reason": f"no adapter for {request.venue.value}",
                     "client_order_id": request.client_order_id,
                 },
@@ -550,9 +562,10 @@ class CloseExecutor:
             fill = await adapter.place_order(request)
             if fill.quantity > 0:
                 self.journal.append(
-                    f"exit.{leg}_filled",
+                    "order.filled",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "order_id": fill.order_id,
                         "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
@@ -563,9 +576,10 @@ class CloseExecutor:
                 return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
             else:
                 self.journal.append(
-                    f"exit.{leg}_uncertain",
+                    "order.uncertain",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": "zero fill",
                         "client_order_id": request.client_order_id,
                     },
@@ -575,9 +589,10 @@ class CloseExecutor:
         except OrderSubmitError as e:
             if e.is_rejected:
                 self.journal.append(
-                    f"exit.{leg}_rejected",
+                    "order.rejected",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                     },
@@ -585,9 +600,10 @@ class CloseExecutor:
                 return {"outcome": "rejected", "fill": None, "reason": str(e), "order_id": ""}
             else:
                 self.journal.append(
-                    f"exit.{leg}_uncertain",
+                    "order.uncertain",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                     },
@@ -596,9 +612,10 @@ class CloseExecutor:
 
         except Exception as e:
             self.journal.append(
-                f"exit.{leg}_uncertain",
+                "order.uncertain",
                 {
                     "position_id": position_id,
+                    "leg": leg,
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                 },
@@ -632,9 +649,11 @@ class CloseExecutor:
                 reason = result.get("reason", "")
                 if "position closed" in reason.lower() or "empty position" in reason.lower():
                     self.journal.append(
-                        f"exit.{leg}_terminal_reduce_only_success",
+                        "order.filled",
                         {
                             "position_id": position_id,
+                            "leg": leg,
+                            "reason": "terminal_reduce_only",
                             "client_order_id": request.client_order_id,
                             "attempt": attempt,
                         },
@@ -650,9 +669,10 @@ class CloseExecutor:
             if attempt < self.config.max_close_retries:
                 backoff_ms = min(retry_base_ms * (2 ** (attempt - 1)), retry_max_ms)
                 self.journal.append(
-                    f"exit.{leg}_retry_wait",
+                    "exit.retry_wait",
                     {
                         "position_id": position_id,
+                        "leg": leg,
                         "attempt": attempt,
                         "backoff_ms": backoff_ms,
                         "client_order_id": request.client_order_id,

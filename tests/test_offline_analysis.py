@@ -14,7 +14,7 @@ class TestJournalAnalysis:
             {"kind": "exit.closed", "payload": {"net_quote": 50.0, "exit_fee_quote": 3.0}},
             {"kind": "order.submitted", "payload": {"venue": "binance"}},
             {"kind": "order.filled", "payload": {"venue": "binance", "latency_ms": 150}},
-            {"kind": "order.failed", "payload": {"venue": "binance"}},
+            {"kind": "order.rejected", "payload": {"venue": "binance"}},
         ]
         venue_stats, daily = analyze_journal_records(records)
         assert daily.entry_count == 1

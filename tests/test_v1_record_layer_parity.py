@@ -288,7 +288,7 @@ class TestV1ClientOrderIdIdempotency:
         await executor.execute(btc_context)
 
         records = journal.read_all()
-        maker_submitted = [r for r in records if r["kind"] == "entry.maker_submitted"]
+        maker_submitted = [r for r in records if r["kind"] == "order.submitted" and r["payload"].get("leg") == "maker"]
         assert len(maker_submitted) == 1
         assert maker_submitted[0]["payload"]["client_order_id"] == f"{btc_context.entry_id}-maker"
 
@@ -317,8 +317,8 @@ class TestV1OrderConfirmation:
         assert result.state == EntryState.FAILED
         records = journal.read_all()
         kinds = [r["kind"] for r in records]
-        assert "entry.maker_submitted" in kinds
-        assert "entry.maker_rejected" in kinds
+        assert "order.submitted" in kinds
+        assert "order.rejected" in kinds
 
     @pytest.mark.asyncio
     async def test_maker_uncertain_produces_pending_entry(self, adapters, journal, btc_context):
@@ -352,10 +352,8 @@ class TestV1OrderConfirmation:
         assert result.open_position is not None
         records = journal.read_all()
         kinds = [r["kind"] for r in records]
-        assert "entry.maker_submitted" in kinds
-        assert "entry.maker_filled" in kinds
-        assert "entry.hedge_submitted" in kinds
-        assert "entry.hedge_filled" in kinds
+        assert "order.submitted" in kinds
+        assert "order.filled" in kinds
         assert "entry.opened" in kinds
 
 

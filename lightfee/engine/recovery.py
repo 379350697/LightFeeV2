@@ -402,10 +402,35 @@ def recover_from_snapshot(
     snap = snapshot_store.read()
     state = _restore_state_from_snapshot_dict(snap) if snap else EngineState()
 
+    # Emit recovery.live_detected for each position restored from snapshot
+    # (V1: recovery.live_detected is recorded when live positions are detected at startup)
+    snapshot_position_ids = set(state.open_positions.keys())
+
     # Replay journal records to catch events after last snapshot
     journal_records = journal.read_all()
     if journal_records:
         _apply_journal_replay_to_state(state, journal_records)
+
+    for pid in snapshot_position_ids:
+        if pid in state.open_positions:
+            pos = state.open_positions[pid]
+            _try_emit_recovery(journal, "recovery.live_detected", {
+                "position_id": pid,
+                "symbol": pos.symbol,
+                "long_venue": pos.long_venue.value if hasattr(pos.long_venue, 'value') else str(pos.long_venue),
+                "short_venue": pos.short_venue.value if hasattr(pos.short_venue, 'value') else str(pos.short_venue),
+                "quantity": pos.matched_quantity,
+                "long_quantity": pos.long_quantity,
+                "short_quantity": pos.short_quantity,
+            })
+
+    # Remove positions that became flat after journal replay (were in snapshot but closed in journal)
+    for pid in snapshot_position_ids:
+        if pid not in state.open_positions:
+            _try_emit_recovery(journal, "recovery.flat", {
+                "position_id": pid,
+                "reason": "closed_in_journal_since_snapshot",
+            })
 
     # Assess recovery needs
     recovery = build_recovery_snapshot(state)
@@ -414,6 +439,10 @@ def recover_from_snapshot(
         if recovery.ambiguous_state:
             state.lifecycle = EngineLifecycle.RECONCILING
             state.risk_mode = state.risk_mode.max(GlobalRiskMode.REDUCE_ONLY)
+            _try_emit_recovery(journal, "recovery.blocked", {
+                "reason": "ambiguous_live_truth",
+                "open_position_count": len(state.open_positions),
+            })
         else:
             state.lifecycle = EngineLifecycle.RECONCILING
 
@@ -424,6 +453,9 @@ def recover_from_snapshot(
     if not recovery.has_open_positions and not recovery.has_pending_entries and not recovery.has_pending_closes:
         if state.lifecycle == EngineLifecycle.RECONCILING:
             state.lifecycle = EngineLifecycle.RUNNING
+            _try_emit_recovery(journal, "runtime.running", {
+                "reason": "startup_no_recovery_work",
+            })
 
     return state
 
@@ -490,6 +522,20 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
         for cid, c in state.pending_closes.items()
     }
 
+    # V1 parity: include local-L2 state fields in snapshot
+    view["retained_local_l2_books"] = [
+        dict(b) if hasattr(b, '__iter__') and not isinstance(b, dict) else b
+        for b in getattr(state, 'retained_local_l2_books', [])
+    ]
+    view["local_l2_books_snapshot"] = [
+        dict(b) if hasattr(b, '__iter__') and not isinstance(b, dict) else b
+        for b in getattr(state, 'local_l2_books_snapshot', [])
+    ]
+    view["local_l2_session_snapshot"] = [
+        dict(s) if hasattr(s, '__iter__') and not isinstance(s, dict) else s
+        for s in getattr(state, 'local_l2_session_snapshot', [])
+    ]
+
     return view
 
 
@@ -546,6 +592,19 @@ def is_safe_to_resume(state: EngineState) -> bool:
         if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
             return False
     return not needs_reconciliation(state)
+
+
+def _try_emit_recovery(journal: Journal, kind: str, payload: dict[str, Any]) -> None:
+    """Emit a recovery diagnostic event through the journal if it is open.
+
+    Journal may not be open for writing during recovery — this helper
+    silently skips emission when the journal is not writeable.
+    """
+    import time as _time
+    try:
+        journal.append(kind, payload, ts_ms=int(_time.time() * 1000))
+    except RuntimeError:
+        pass  # Journal not open for writing, no recovery diagnostic emitted
 
 
 def has_lifecycle_blocking_work(state: EngineState) -> bool:
