@@ -124,6 +124,25 @@ class PassiveCloseConfig:
 
 
 # ---------------------------------------------------------------------------
+# Hedge delta result (V1 structured hedge outcome)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HedgeDeltaResult:
+    """Structured result from a delta hedge submission.
+
+    V1: hedge_result in drive_pending_passive_close (exit.rs line 2471-2591).
+    """
+    requested: float
+    filled: float
+    residual: float
+    success: bool
+    error: Optional[str] = None
+    order_id: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Passive close executor
 # ---------------------------------------------------------------------------
 
@@ -221,8 +240,8 @@ class PassiveCloseExecutor:
             return None
 
         first_chunk = chunk_quantities[0]
-        # Choose preferred maker leg based on venue liquidity
-        preferred_leg = ActiveMakerLeg.LONG
+        # Choose preferred maker leg based on venue liquidity (V1: select_exit_maker_leg)
+        preferred_leg = self._select_preferred_maker_leg(position)
         phase_state = PassivePhaseState(
             phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
             preferred_maker_leg=preferred_leg,
@@ -360,35 +379,84 @@ class PassiveCloseExecutor:
                 if progress.state in (PassiveOrderState.FILLED, PassiveOrderState.CANCELED,
                                        PassiveOrderState.EXPIRED, PassiveOrderState.REJECTED):
                     if progress.state == PassiveOrderState.FILLED:
-                        # Maker fully filled — hedge delta before advancing chunk
+                        # Maker fully filled — hedge all outstanding quantity
+                        # V1: hedges outstanding_hedge_quantity = maker_fill - hedged_close_quantity,
+                        # not just the cycle delta. On retry, if maker hasn't changed but hedge
+                        # is still behind, we submit a hedge for the remaining gap.
                         maker_fill_delta = pending.maker_fill.quantity - cycle_fill_before
-                        if maker_fill_delta > 1e-9:
-                            await self._submit_hedge_for_delta(state, pending, position, maker_fill_delta)
+                        unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
+                        if unhedged_gap > 1e-9:
+                            result = await self._submit_hedge_for_delta(state, pending, position, unhedged_gap)
+                        elif maker_fill_delta > 1e-9:
+                            result = await self._submit_hedge_for_delta(state, pending, position, maker_fill_delta)
+                        else:
+                            result = HedgeDeltaResult(requested=0.0, filled=0.0, residual=0.0, success=True)
                         # Re-read pending after hedge
                         pending = state.pending_passive_closes.get(position_id)
                         if pending is None:
                             return True
-                        await self._advance_chunk(state, pending)
-                        continue
+                        # Chunk advance invariant: hedge must have caught up to maker fill
+                        if pending.hedge_fill.quantity + 1e-9 >= pending.maker_fill.quantity:
+                            if await self._advance_chunk(state, pending):
+                                continue
+                            # advance blocked — will retry
+                            return False
+                        # Hedge not caught up — record unhedged residual, retry
+                        unhedged = pending.maker_fill.quantity - pending.hedge_fill.quantity
+                        self._journal.append(
+                            "exit.passive_close_unhedged_residual",
+                            {
+                                "position_id": position_id,
+                                "maker_quantity": pending.maker_fill.quantity,
+                                "hedge_quantity": pending.hedge_fill.quantity,
+                                "unhedged_residual": unhedged,
+                                "chunk_index": pending.active_chunk_index,
+                            },
+                        )
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                        return False
                     else:
-                        # Maker order died → restart maintenance cycle
+                        # Maker order died — restart maintenance cycle
                         continue
 
-            # --- Delta hedge: hedge newly filled maker quantity ---
+            # --- Delta hedge: hedge outstanding gap between maker and hedge ---
+            # V1: hedges unhedged_gap, not just maker_fill_delta, so that
+            # partial hedge fills from prior cycles are retried even when
+            # maker_fill_delta == 0 this cycle.
             pending = state.pending_passive_closes.get(position_id)
             if pending is None:
                 return True
 
-            maker_fill_delta = pending.maker_fill.quantity - cycle_fill_before
-            if maker_fill_delta > 1e-9:
-                await self._submit_hedge_for_delta(state, pending, position, maker_fill_delta)
+            unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
+            if unhedged_gap > 1e-9:
+                result = await self._submit_hedge_for_delta(state, pending, position, unhedged_gap)
+                if not result.success:
+                    pending = state.pending_passive_closes.get(position_id)
+                    if pending is None:
+                        return True
+                    self._journal.append(
+                        "exit.passive_close_hedge_incomplete",
+                        {
+                            "position_id": position_id,
+                            "requested": result.requested,
+                            "filled": result.filled,
+                            "residual": result.residual,
+                            "maker_quantity": pending.maker_fill.quantity,
+                            "hedge_quantity": pending.hedge_fill.quantity,
+                            "chunk_index": pending.active_chunk_index,
+                        },
+                    )
+                    pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                    return False
 
-            # --- Check chunk complete ---
+            # --- Check chunk complete (must satisfy double cumulative invariant) ---
             pending = state.pending_passive_closes.get(position_id)
             if pending is None:
                 return True
 
-            if pending.maker_fill.quantity + 1e-9 >= chunk_quantity:
+            maker_full = pending.maker_fill.quantity + 1e-9 >= chunk_quantity
+            hedge_caught_up = pending.hedge_fill.quantity + 1e-9 >= pending.maker_fill.quantity
+            if maker_full and hedge_caught_up:
                 self._journal.append(
                     "exit.passive_close_chunk_filled",
                     {
@@ -398,8 +466,10 @@ class PassiveCloseExecutor:
                         "hedge_quantity": pending.hedge_fill.quantity,
                     },
                 )
-                await self._advance_chunk(state, pending)
-                continue
+                if await self._advance_chunk(state, pending):
+                    continue
+                # advance blocked — retry next tick
+                return False
 
             # --- Maintain maker order ---
             pending = state.pending_passive_closes.get(position_id)
@@ -527,9 +597,43 @@ class PassiveCloseExecutor:
         price_hint: float,
         chunk_quantity: float,
     ) -> bool:
-        """Submit the initial GTC post-only reduce-only maker order."""
+        """Submit the initial GTC post-only reduce-only maker order.
+
+        Fails closed when L2 mid or tick size is unavailable — a GTC post-only
+        maker order must have a valid limit price (V1: price_hint required).
+        """
         tick_size = self._get_tick_size(maker_venue, position.symbol)
-        aligned_price = align_passive_price_to_tick(price_hint, tick_size, maker_side) if tick_size > 0 else price_hint
+        if tick_size <= 0.0 or price_hint <= 0.0:
+            self._journal.append(
+                "exit.passive_close_missing_l2_or_tick",
+                {
+                    "position_id": position.position_id,
+                    "maker_venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "price_hint": price_hint,
+                    "tick_size": tick_size,
+                    "reason": "cannot submit post-only maker without valid L2 mid and tick size",
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            return False
+
+        aligned_price = align_passive_price_to_tick(price_hint, tick_size, maker_side)
+        if aligned_price <= 0.0:
+            self._journal.append(
+                "exit.passive_close_invalid_aligned_price",
+                {
+                    "position_id": position.position_id,
+                    "maker_venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "price_hint": price_hint,
+                    "tick_size": tick_size,
+                    "aligned_price": aligned_price,
+                    "reason": "aligned price <= 0 after tick alignment",
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            return False
 
         adapter = self._adapter(maker_venue)
         if adapter is None:
@@ -543,7 +647,7 @@ class PassiveCloseExecutor:
             symbol=position.symbol,
             side=maker_side,
             quantity=chunk_quantity,
-            price=aligned_price if aligned_price > 0 else None,
+            price=aligned_price,
             reduce_only=True,
             post_only=True,
             time_in_force=TimeInForce.GTC,
@@ -578,7 +682,7 @@ class PassiveCloseExecutor:
 
         pending.phase_state.maker_order_id = ack.order_id
         pending.phase_state.maker_client_order_id = ack.client_order_id
-        pending.phase_state.maker_resting_limit_price = aligned_price if aligned_price > 0 else price_hint
+        pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
 
         self._journal.append(
@@ -685,11 +789,15 @@ class PassiveCloseExecutor:
         pending: PendingPassiveClose,
         position: OpenPosition,
         delta: float,
-    ) -> None:
+    ) -> HedgeDeltaResult:
         """Submit IOC reduce-only taker hedge for maker fill delta.
 
         V1: hedges only the newly filled quantity, not the entire chunk.
+        Returns a HedgeDeltaResult so callers can decide retry/fallback.
         """
+        if delta <= 1e-12:
+            return HedgeDeltaResult(requested=delta, filled=0.0, residual=0.0, success=True)
+
         maker_leg = pending.phase_state.active_maker_leg
         if maker_leg == ActiveMakerLeg.LONG:
             hedge_venue = position.short_venue
@@ -705,7 +813,10 @@ class PassiveCloseExecutor:
         hedge_price = price_hint if price_hint > 0 else None
         adapter = self._adapter(hedge_venue)
         if adapter is None:
-            return
+            return HedgeDeltaResult(
+                requested=delta, filled=0.0, residual=delta, success=False,
+                error=f"no adapter for {hedge_venue.value}",
+            )
 
         close_id = f"pclose-{position.position_id}-{self._now_ms()}"
         hedge_cid = f"{close_id}-hedge{pending.current_chunk_suffix()}"
@@ -734,7 +845,14 @@ class PassiveCloseExecutor:
                     "error": str(e),
                 },
             )
-            return
+            return HedgeDeltaResult(
+                requested=delta, filled=0.0, residual=delta, success=False,
+                error=str(e),
+            )
+
+        filled_qty = fill.quantity if fill.quantity > 0 else 0.0
+        residual = max(delta - filled_qty, 0.0)
+        success = residual < 1e-12
 
         if fill.quantity > 0:
             pending.hedge_fill.quantity += fill.quantity
@@ -773,6 +891,25 @@ class PassiveCloseExecutor:
                 },
             )
 
+        if not success and filled_qty > 0:
+            self._journal.append(
+                "exit.passive_close_hedge_partial",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg_label,
+                    "requested": delta,
+                    "filled": filled_qty,
+                    "residual": residual,
+                    "chunk_index": pending.active_chunk_index,
+                },
+            )
+
+        return HedgeDeltaResult(
+            requested=delta, filled=filled_qty, residual=residual,
+            success=success, error=None if success else "partial_fill" if filled_qty > 0 else "zero_fill",
+        )
+
     # ------------------------------------------------------------------
     # Maintain maker order (hold / amend / cancel-replace)
     # ------------------------------------------------------------------
@@ -797,24 +934,66 @@ class PassiveCloseExecutor:
         if remaining <= 1e-9:
             return
 
+        now_ms = self._now_ms()
+        pid = position.position_id
+
         tick_size = self._get_tick_size(maker_venue, position.symbol)
         if tick_size <= 0.0:
-            # Cannot reprice without tick size
             self._journal.append(
-                "exit.passive_close_no_tick_size",
+                "exit.passive_close_maintain_no_tick_size",
                 {
-                    "position_id": position.position_id,
+                    "position_id": pid,
                     "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
                     "reason": "cannot reprice — no tick size available",
                 },
             )
+            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            return
+
+        if price_hint <= 0.0:
+            self._journal.append(
+                "exit.passive_close_maintain_no_price_hint",
+                {
+                    "position_id": pid,
+                    "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "reason": "cannot reprice — L2 mid unavailable",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
             return
 
         reference_mid = self._resolve_local_l2_mid(maker_venue, position.symbol)
         current_price = pending.phase_state.maker_resting_limit_price
         target_price = align_passive_price_to_tick(price_hint, tick_size, maker_side) if price_hint > 0 else None
 
-        if current_price is None or target_price is None:
+        if current_price is None:
+            self._journal.append(
+                "exit.passive_close_maintain_no_resting_price",
+                {
+                    "position_id": pid,
+                    "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "reason": "no resting limit price — maker may not be submitted yet",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            return
+
+        if target_price is None:
+            self._journal.append(
+                "exit.passive_close_maintain_no_target_price",
+                {
+                    "position_id": pid,
+                    "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "price_hint": price_hint,
+                    "tick_size": tick_size,
+                    "reason": "aligned target price is None",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
             return
 
         # Close enough — hold
@@ -901,13 +1080,16 @@ class PassiveCloseExecutor:
                 maker_leg_label, target_price, remaining_quantity, tick_size, reference_mid,
             )
         except Exception as e:
+            # Transport/auth/rate-limit failure — journal, set retry, let drive loop escalate
             self._journal.append(
                 "exit.passive_close_amend_failed",
                 {
                     "position_id": position.position_id,
                     "error": str(e),
+                    "reason": "non-unsupported failure — will retry or escalate via zero_fill budget",
                 },
             )
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
 
     async def _cancel_replace_maker_order(
         self,
@@ -944,18 +1126,42 @@ class PassiveCloseExecutor:
         )
 
         # Cancel old order
+        cancel_ok = False
         try:
             await adapter.cancel_passive_order(
                 symbol=position.symbol,
                 order_id=old_order_id,
                 client_order_id=old_client_id,
             )
-        except (NotImplementedError, Exception) as e:
+            cancel_ok = True
+        except NotImplementedError:
+            self._journal.append(
+                "exit.passive_close_cancel_not_supported",
+                {"position_id": position.position_id, "order_id": old_order_id},
+            )
+        except Exception as e:
             self._journal.append(
                 "exit.passive_close_cancel_error",
                 {"position_id": position.position_id, "error": str(e)},
             )
-            # Continue with new order even if cancel fails
+
+        if not cancel_ok:
+            # Cancel failed — query old order status to avoid double-order risk.
+            # Only submit the new order if old order is confirmed dead.
+            old_dead = await self._probe_order_dead(
+                adapter, position.symbol, old_order_id, old_client_id,
+            )
+            if not old_dead:
+                self._journal.append(
+                    "exit.passive_close_cancel_replace_blocked_double_order_risk",
+                    {
+                        "position_id": position.position_id,
+                        "old_order_id": old_order_id,
+                        "reason": "cancel failed and old order may still be alive — refusing to submit new",
+                    },
+                )
+                pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                return
 
         # Submit new maker order
         await self._submit_maker_order(
@@ -981,22 +1187,65 @@ class PassiveCloseExecutor:
         self,
         state: EngineState,
         pending: PendingPassiveClose,
-    ) -> None:
+    ) -> bool:
         """V1 advance_pending_passive_close_chunk (exit.rs line 1648).
 
-        Move to the next chunk or finalize the close.
+        Move to the next chunk or finalize the close. Returns True if the
+        chunk was advanced (or finalized), False if advance was blocked.
+
+        ROOT INVARIANT (non-negotiable):
+          hedge_fill.quantity + eps >= maker_fill.quantity
+          AND
+          maker_fill.quantity + eps >= chunk_quantity
+
+        If either fails, this method REFUSES to advance: no chunk_index bump,
+        no fill reset, no finalize. The caller must retry or escalate.
         """
+        chunk_quantity = pending.current_chunk_quantity()
+        eps = 1e-9
+
+        maker_ok = pending.maker_fill.quantity + eps >= chunk_quantity
+        hedge_ok = pending.hedge_fill.quantity + eps >= pending.maker_fill.quantity
+
+        if not maker_ok:
+            self._journal.append(
+                "exit.passive_close_advance_blocked_maker_under_chunk",
+                {
+                    "position_id": pending.position_id,
+                    "maker_quantity": pending.maker_fill.quantity,
+                    "chunk_quantity": chunk_quantity,
+                    "deficit": chunk_quantity - pending.maker_fill.quantity,
+                    "chunk_index": pending.active_chunk_index,
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return False
+
+        if not hedge_ok:
+            unhedged = pending.maker_fill.quantity - pending.hedge_fill.quantity
+            self._journal.append(
+                "exit.passive_close_advance_blocked_unhedged",
+                {
+                    "position_id": pending.position_id,
+                    "maker_quantity": pending.maker_fill.quantity,
+                    "hedge_quantity": pending.hedge_fill.quantity,
+                    "unhedged_residual": unhedged,
+                    "chunk_index": pending.active_chunk_index,
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return False
+
         pending.active_chunk_index += 1
 
         if pending.completed():
             await self._finalize_passive_close(state, pending)
-            return
+            return True
 
         # Reset for next chunk
-        chunk_quantity = pending.current_chunk_quantity()
         position = pending.position_snapshot
         if position is None:
-            return
+            return True
 
         pending.phase_state = PassivePhaseState(
             phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
@@ -1023,6 +1272,7 @@ class PassiveCloseExecutor:
                 "total_chunks": pending.chunk_count(),
             },
         )
+        return True
 
     # ------------------------------------------------------------------
     # Finalize
@@ -1138,9 +1388,22 @@ class PassiveCloseExecutor:
         pending: PendingPassiveClose,
         position: OpenPosition,
     ) -> bool:
-        """Hand the remaining quantity to the aggressive CloseExecutor."""
-        remaining = pending.remaining_chunk_quantity()
-        if remaining <= 1e-9:
+        """Hand the remaining quantity to the aggressive CloseExecutor.
+
+        V1 fallback semantics (dual taker):
+        1. First, catch up unhedged residual (maker_fill - hedge_fill)
+           by submitting a hedge for the single-sided deficit.
+        2. Only then, close the paired residual (chunk_quantity - maker_fill)
+           via aggressive close with total_quantity=paired_residual.
+        3. Never flatten the entire position — only the current chunk residual.
+        """
+        maker_qty = pending.maker_fill.quantity
+        hedge_qty = pending.hedge_fill.quantity
+        unhedged_residual = max(maker_qty - hedge_qty, 0.0)
+        paired_residual = max(pending.current_chunk_quantity() - maker_qty, 0.0)
+
+        total_remaining = unhedged_residual + paired_residual
+        if total_remaining <= 1e-9:
             return True
 
         if self._close_executor is None:
@@ -1149,7 +1412,8 @@ class PassiveCloseExecutor:
                 {
                     "position_id": pending.position_id,
                     "reason": "no close_executor injected",
-                    "remaining_quantity": remaining,
+                    "unhedged_residual": unhedged_residual,
+                    "paired_residual": paired_residual,
                 },
             )
             pending.next_retry_at_ms = self._now_ms() + 10_000
@@ -1159,7 +1423,11 @@ class PassiveCloseExecutor:
             "exit.passive_close_fallback_aggressive",
             {
                 "position_id": pending.position_id,
-                "remaining_quantity": remaining,
+                "maker_quantity": maker_qty,
+                "hedge_quantity": hedge_qty,
+                "unhedged_residual": unhedged_residual,
+                "paired_residual": paired_residual,
+                "chunk_index": pending.active_chunk_index,
                 "reason": pending.reason,
             },
         )
@@ -1170,19 +1438,70 @@ class PassiveCloseExecutor:
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
 
-        success = await self._close_executor.execute_close(
-            position=position,
-            reason=pending.reason,
-            now_ms=self._now_ms(),
-            long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
-            short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
-            state=state,
-        )
-        if not success:
-            pending.next_retry_at_ms = self._now_ms() + 5_000
-            return False
+        # Step 1: Catch up unhedged residual (single-sided hedge for maker-fill deficit)
+        if unhedged_residual > 1e-9:
+            result = await self._submit_hedge_for_delta(
+                state, pending, position, unhedged_residual,
+            )
+            pending = state.pending_passive_closes.get(pending.position_id)
+            if pending is None:
+                return True
+            if not result.success:
+                self._journal.append(
+                    "exit.passive_close_fallback_unhedged_failed",
+                    {
+                        "position_id": pending.position_id,
+                        "unhedged_residual": unhedged_residual,
+                        "hedge_result_error": result.error,
+                    },
+                )
+                pending.next_retry_at_ms = self._now_ms() + 5_000
+                return False
+            # Recompute paired residual after hedge catch-up
+            paired_residual = max(pending.current_chunk_quantity() - pending.maker_fill.quantity, 0.0)
 
-        # After aggressive close, clean up passive pending
+        # Step 2: Close paired residual via aggressive close
+        if paired_residual > 1e-9:
+            close_result = await self._close_executor.execute_close(
+                position=position,
+                reason=pending.reason,
+                now_ms=self._now_ms(),
+                long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
+                short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                total_quantity=paired_residual,
+                state=state,
+            )
+            # Check if aggressive close actually executed
+            if close_result is None:
+                self._journal.append(
+                    "exit.passive_close_fallback_aggressive_null_result",
+                    {"position_id": pending.position_id},
+                )
+                pending.next_retry_at_ms = self._now_ms() + 5_000
+                return False
+
+            long_closed = close_result.long_close_qty if hasattr(close_result, 'long_close_qty') else 0.0
+            short_closed = close_result.short_close_qty if hasattr(close_result, 'short_close_qty') else 0.0
+
+            if long_closed < 1e-12 and short_closed < 1e-12:
+                # Zero fill — check if a PendingClose was registered for tracking
+                has_pending_close = any(
+                    pc.position_id == pending.position_id
+                    for pc in state.pending_closes.values()
+                )
+                if not has_pending_close:
+                    self._journal.append(
+                        "exit.passive_close_fallback_zero_fill_no_pending",
+                        {
+                            "position_id": pending.position_id,
+                            "paired_residual": paired_residual,
+                            "reason": "aggressive close returned zero fill with no pending close registered",
+                        },
+                    )
+                    pending.next_retry_at_ms = self._now_ms() + 5_000
+                    return False
+
+        # After fallback close, clean up passive pending
         state.pending_passive_closes.pop(pending.position_id, None)
         self._journal.append(
             "exit.passive_close_fallback_complete",
@@ -1233,6 +1552,40 @@ class PassiveCloseExecutor:
             return "resumed"
 
         return "ambiguous"
+
+    async def _probe_order_dead(
+        self,
+        adapter: VenueAdapter,
+        symbol: str,
+        order_id: str,
+        client_order_id: str,
+    ) -> bool:
+        """Check whether a passive order is confirmed dead (canceled/filled/expired/rejected).
+
+        Returns True if the order is dead or cannot be queried (conservative: a
+        failed query should not permanently block progress). Returns False if the
+        order is still OPEN or PARTIALLY_FILLED.
+        """
+        try:
+            progress = await adapter.query_passive_order_progress(
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+        except Exception:
+            # Cannot query — fail-closed: treat as alive to avoid double-order risk
+            return False
+
+        if progress is None:
+            return True  # no progress = order not found = dead
+
+        dead_states = {
+            PassiveOrderState.FILLED,
+            PassiveOrderState.CANCELED,
+            PassiveOrderState.EXPIRED,
+            PassiveOrderState.REJECTED,
+        }
+        return progress.state in dead_states
 
     async def _probe_live_flatness(
         self,
@@ -1356,3 +1709,131 @@ class PassiveCloseExecutor:
         delays = self._config.maker_cycle_retry_delays_ms
         idx = min(zero_fill_cycles, len(delays) - 1)
         return delays[idx] if idx >= 0 else delays[-1]
+
+    def _select_preferred_maker_leg(self, position: OpenPosition) -> ActiveMakerLeg:
+        """V1 select_exit_maker_leg (discovery.rs line 65).
+
+        Selects which leg to use as the passive (post-only) maker based on
+        estimated slippage/bps on each venue. The leg with higher estimated
+        taker cost should be the maker leg to save on fees/slippage.
+
+        Uses runtime-injected local L2 data as the primary signal (mid + spread).
+        Falls back to adapter snapshot, then to venue taker fee comparison.
+        If L2 data is missing for either venue, journals the gap and uses a
+        deterministic fallback chain. Tie-break defaults to LONG (V1 behavior).
+        """
+        symbol = position.symbol
+        pid = position.position_id
+
+        # Resolve local L2 mid for both venues via injected resolver
+        long_mid = self._resolve_local_l2_mid(position.long_venue, symbol)
+        short_mid = self._resolve_local_l2_mid(position.short_venue, symbol)
+
+        # Compute L2-based cost estimates
+        long_cost_bps = self._estimate_venue_taker_cost_bps(
+            position.long_venue, symbol, l2_mid=long_mid,
+        )
+        short_cost_bps = self._estimate_venue_taker_cost_bps(
+            position.short_venue, symbol, l2_mid=short_mid,
+        )
+
+        # Track data quality for journal
+        long_has_l2 = long_mid > 0.0
+        short_has_l2 = short_mid > 0.0
+
+        if not long_has_l2 or not short_has_l2:
+            self._journal.append(
+                "exit.passive_close_maker_leg_l2_missing",
+                {
+                    "position_id": pid,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "long_mid_available": long_has_l2,
+                    "short_mid_available": short_has_l2,
+                    "long_cost_bps": long_cost_bps,
+                    "short_cost_bps": short_cost_bps,
+                },
+            )
+
+        if long_cost_bps > short_cost_bps + 1e-9:
+            self._journal.append(
+                "exit.passive_close_maker_leg_selected",
+                {
+                    "position_id": pid,
+                    "selected_leg": "long",
+                    "long_taker_cost_bps": long_cost_bps,
+                    "short_taker_cost_bps": short_cost_bps,
+                    "long_l2_available": long_has_l2,
+                    "short_l2_available": short_has_l2,
+                    "reason": "long_taker_cost_higher",
+                },
+            )
+            return ActiveMakerLeg.LONG
+        elif short_cost_bps > long_cost_bps + 1e-9:
+            self._journal.append(
+                "exit.passive_close_maker_leg_selected",
+                {
+                    "position_id": pid,
+                    "selected_leg": "short",
+                    "long_taker_cost_bps": long_cost_bps,
+                    "short_taker_cost_bps": short_cost_bps,
+                    "long_l2_available": long_has_l2,
+                    "short_l2_available": short_has_l2,
+                    "reason": "short_taker_cost_higher",
+                },
+            )
+            return ActiveMakerLeg.SHORT
+        else:
+            self._journal.append(
+                "exit.passive_close_maker_leg_selected",
+                {
+                    "position_id": pid,
+                    "selected_leg": "long",
+                    "long_taker_cost_bps": long_cost_bps,
+                    "short_taker_cost_bps": short_cost_bps,
+                    "long_l2_available": long_has_l2,
+                    "short_l2_available": short_has_l2,
+                    "reason": "tie_or_equal_cost_default_long",
+                },
+            )
+            return ActiveMakerLeg.LONG
+
+    def _estimate_venue_taker_cost_bps(
+        self, venue: Venue, symbol: str, l2_mid: float = 0.0,
+    ) -> float:
+        """Estimate the effective taker cost in bps for a venue.
+
+        Uses local L2 spread (bid-ask width as bps of mid) + venue taker fee.
+        Primary: runtime-injected L2 resolver for mid, adapter snapshot for spread.
+        Fallback: taker fee only if L2 is unavailable.
+        """
+        cost_bps = 0.0
+
+        # Add spread-based slippage estimate from L2
+        adapter = self._adapter(venue)
+        if adapter is not None:
+            try:
+                snapshot = adapter.fetch_market_snapshot([symbol])
+                import asyncio
+                if not asyncio.iscoroutine(snapshot) and snapshot is not None:
+                    for quote in getattr(snapshot, 'quotes', []):
+                        if getattr(quote, 'symbol', '') == symbol:
+                            bid = getattr(quote, 'bid', 0)
+                            ask = getattr(quote, 'ask', 0)
+                            if bid > 0 and ask > 0:
+                                mid = (bid + ask) / 2.0
+                                spread_bps = (ask - bid) / mid * 10_000
+                                cost_bps += spread_bps
+                            break
+            except Exception:
+                pass
+
+        # Add venue taker fee from spec
+        try:
+            spec = get_spec(venue)
+            taker_fee = getattr(spec, 'taker_fee_bps', 0.0) or 0.0
+            cost_bps += taker_fee
+        except Exception:
+            pass
+
+        return max(cost_bps, 0.0)
