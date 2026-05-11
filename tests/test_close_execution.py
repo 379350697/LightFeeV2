@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import pytest
 
+import tempfile
+from pathlib import Path
+
 from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.engine.close_executor import (
     CloseBalance,
@@ -23,10 +26,12 @@ from lightfee.engine.close_executor import (
     close_position_exchange_min_notional_violation,
     build_close_execution_from_legs,
     split_close_fill_residual,
+    build_exit_pnl_attribution,
 )
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.residual import ResidualOrigin
 from lightfee.engine.state import OpenPosition
+from lightfee.persistence.journal import Journal
 
 
 # ---------------------------------------------------------------------------
@@ -292,3 +297,141 @@ class TestSplitCloseFillResidual:
         pos = _make_position()
         residual = split_close_fill_residual(pos, 0.005, 0.005, 1000, 31000)
         assert residual is None
+
+
+# ---------------------------------------------------------------------------
+# Journal emission fidelity tests
+# ---------------------------------------------------------------------------
+
+
+class TestExitJournalPayload:
+    """Verify exit.closed journal payload matches Rust V1 full PnL attribution shape."""
+
+    _required_exit_closed_keys = frozenset({
+        "position_id", "reason",
+        "long_closed_qty", "short_closed_qty",
+        "price_pnl", "funding_pnl_quote", "entry_fee_quote", "exit_fee_quote",
+        "net_quote", "long_uncertain", "short_uncertain",
+    })
+
+    def test_exit_closed_emits_full_pnl_payload(self):
+        """V1 rule: exit.closed must include funding_pnl_quote and entry_fee_quote."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "exit.jsonl"
+            j = Journal(path)
+            j.open()
+
+            full_exit = {
+                "position_id": "pos-exit-test",
+                "reason": "profit_take",
+                "long_closed_qty": 0.1,
+                "short_closed_qty": 0.1,
+                "price_pnl": 60.0,
+                "funding_pnl_quote": 15.0,
+                "entry_fee_quote": 5.0,
+                "exit_fee_quote": 3.0,
+                "net_quote": 67.0,
+                "long_uncertain": False,
+                "short_uncertain": False,
+            }
+            j.append("exit.closed", full_exit, flush=True)
+            j.close()
+
+            records = j.read_all()
+            assert len(records) == 1
+            emitted = records[0]["payload"]
+            for key in self._required_exit_closed_keys:
+                assert key in emitted, f"Missing key '{key}' in exit.closed payload"
+
+
+class TestScanJournalPayload:
+    """Verify scan.completed journal payload includes full candidate/filter list."""
+
+    _required_scan_keys = frozenset({
+        "candidate_count", "blocked_count", "accepted_count",
+        "blocked_reasons", "no_entry_reason",
+    })
+
+    def test_scan_completed_emits_full_candidate_list_not_boolean(self):
+        """V1 rule: scan.completed must emit full candidate list with blocked
+        reasons per candidate, not a boolean blocked flag."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scan.jsonl"
+            j = Journal(path)
+            j.open()
+
+            scan_payload = {
+                "candidate_count": 5,
+                "blocked_count": 2,
+                "accepted_count": 3,
+                "blocked_reasons": {
+                    "btcusdt:binance->okx": ["stale_market_data:binance"],
+                    "ethusdt:binance->bybit": ["low_liquidity:bybit", "budget_exhausted"],
+                },
+                "accepted_candidates": [
+                    {"pair_id": "solusdt:binance->okx", "edge_bps": 15.0},
+                    {"pair_id": "avaxusdt:okx->binance", "edge_bps": 12.0},
+                    {"pair_id": "linkusdt:bybit->okx", "edge_bps": 8.0},
+                ],
+                "no_entry_reason": "",
+            }
+            j.append("scan.completed", scan_payload, flush=True)
+            j.close()
+
+            records = j.read_all()
+            assert len(records) == 1
+            emitted = records[0]["payload"]
+            assert emitted["candidate_count"] == 5
+            assert emitted["blocked_count"] == 2
+            assert emitted["accepted_count"] == 3
+            # blocked_reasons must be a dict of candidate → reasons, not a boolean
+            assert isinstance(emitted["blocked_reasons"], dict)
+            assert len(emitted["blocked_reasons"]) == 2
+            # accepted candidates list must be present
+            accepted = emitted.get("accepted_candidates", [])
+            assert len(accepted) == 3
+
+    def test_scan_no_entry_diagnostics_emitted(self):
+        """V1 rule: scan.no_entry_diagnostics with reason."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scan_no_entry.jsonl"
+            j = Journal(path)
+            j.open()
+
+            j.append("scan.no_entry_diagnostics", {
+                "reason": "all_candidates_blocked",
+                "market_status": "degraded",
+                "candidate_count": 3,
+                "blocked_count": 3,
+            }, flush=True)
+            j.close()
+
+            records = j.read_all()
+            assert len(records) == 1
+            assert records[0]["kind"] == "scan.no_entry_diagnostics"
+            assert records[0]["payload"]["reason"] == "all_candidates_blocked"
+
+
+class TestClosePnlAttribution:
+    """Verify build_exit_pnl_attribution separates all PnL components."""
+
+    def test_pnl_attribution_separates_components(self):
+        pos = _make_position(
+            captured_funding_quote=10.0, second_stage_funding_quote=5.0,
+            long_entry_fee_quote=2.5, short_entry_fee_quote=2.5,
+        )
+        close = CloseExecution(
+            position_id="p001", reason="profit_take",
+            long_close_price=50100.0, short_close_price=49900.0,
+            long_close_qty=0.01, short_close_qty=0.01,
+            long_fee_quote=2.5, short_fee_quote=2.5,
+            realized_price_pnl_quote=2.0,
+            net_quote=10.0,
+        )
+        attr = build_exit_pnl_attribution(pos, close)
+        assert attr["funding_quote"] == 15.0  # 10 + 5
+        assert attr["price_pnl_quote"] == 2.0
+        assert attr["entry_fee_quote"] == 5.0  # 2.5 + 2.5
+        assert attr["exit_fee_quote"] == 5.0  # 2.5 + 2.5
+        # net = 2.0 + 15.0 - 5.0 - 5.0 = 7.0
+        assert attr["net_quote"] == 7.0

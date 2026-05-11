@@ -79,7 +79,18 @@ def advance_entry_state(ctx: EntryContext, next_state: EntryState) -> EntryConte
 def build_entry_orders(
     ctx: EntryContext,
 ) -> tuple[OrderRequest, OrderRequest]:
-    """Build maker and hedge order requests."""
+    """Build maker and hedge order requests with V1 TIF/reduce-only/clientOrderId.
+
+    V1 semantics:
+    - Maker: GTC post-only with deterministic clientOrderId
+    - Hedge: IOC reduce-only=False (hedge is opening, not closing)
+    - Both legs carry clientOrderId for idempotency and reconciliation
+    """
+    from lightfee.core.domain import TimeInForce
+
+    maker_cid = f"{ctx.entry_id}-maker"
+    hedge_cid = f"{ctx.entry_id}-hedge"
+
     if ctx.maker_leg == Side.BUY:
         maker_req = OrderRequest(
             venue=ctx.long_venue,
@@ -88,6 +99,8 @@ def build_entry_orders(
             quantity=ctx.long_quantity,
             price=ctx.long_price_hint,
             post_only=True,
+            time_in_force=TimeInForce.GTC,
+            client_order_id=maker_cid,
         )
         hedge_req = OrderRequest(
             venue=ctx.short_venue,
@@ -95,6 +108,9 @@ def build_entry_orders(
             side=Side.SELL,
             quantity=ctx.short_quantity,
             price=ctx.short_price_hint,
+            reduce_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=hedge_cid,
         )
     else:
         maker_req = OrderRequest(
@@ -104,6 +120,8 @@ def build_entry_orders(
             quantity=ctx.short_quantity,
             price=ctx.short_price_hint,
             post_only=True,
+            time_in_force=TimeInForce.GTC,
+            client_order_id=maker_cid,
         )
         hedge_req = OrderRequest(
             venue=ctx.long_venue,
@@ -111,6 +129,9 @@ def build_entry_orders(
             side=Side.BUY,
             quantity=ctx.long_quantity,
             price=ctx.long_price_hint,
+            reduce_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=hedge_cid,
         )
     return maker_req, hedge_req
 

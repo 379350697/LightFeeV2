@@ -79,14 +79,20 @@ class EntrySyncExecutor:
     # ------------------------------------------------------------------
 
     async def execute(self, ctx: EntryContext) -> EntryExecutionResult:
-        """Execute a full entry flow: maker → hedge, with outcome handling."""
+        """Execute a full entry flow: maker → hedge, with outcome handling.
+
+        V1 parity additions:
+        - Creates PendingEntry on uncertain outcomes for reconciliation
+        - Tracks clientOrderId in all journal events
+        - Propagates TIF/reduce-only through order requests
+        """
         now_ms = int(time.time() * 1000)
         result = EntryExecutionResult(
             route=ExecutionRoute.REJECTED,
             state=EntryState.IDLE,
         )
 
-        # Build order requests
+        # Build order requests with clientOrderId, TIF, reduce_only
         maker_req, hedge_req = build_entry_orders(ctx)
 
         # --- Phase 1: Submit maker ---
@@ -97,11 +103,23 @@ class EntrySyncExecutor:
         if maker_result["outcome"] == "rejected":
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="rejected",
+                maker_order_id="",
+                hedge_order_id="",
+            )
             return result
 
         if maker_result["outcome"] == "uncertain":
             result.state = EntryState.FAILED_WITH_RESIDUAL
             result.has_uncertainty = True
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="uncertain",
+                maker_order_id=maker_result.get("order_id", ""),
+                hedge_order_id="",
+            )
             return result
 
         # Maker filled — advance to hedge
@@ -151,11 +169,35 @@ class EntrySyncExecutor:
 
             result.state = EntryState.FAILED_WITH_RESIDUAL
             result.residual_task = residual
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="hedge_rejected",
+                maker_order_id=maker_fill.order_id,
+                hedge_order_id="",
+                maker_filled=maker_fill.quantity,
+            )
+            self.journal.append(
+                "entry.hedge_rejected_residual",
+                {
+                    "position_id": ctx.entry_id,
+                    "maker_filled": maker_fill.quantity,
+                    "maker_client_order_id": maker_req.client_order_id,
+                    "hedge_client_order_id": hedge_req.client_order_id,
+                    "residual_quantity": residual.exposure_quantity if residual else 0,
+                },
+            )
             return result
 
         if hedge_result["outcome"] == "uncertain":
             result.state = EntryState.FAILED_WITH_RESIDUAL
             result.has_uncertainty = True
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="hedge_uncertain",
+                maker_order_id=maker_fill.order_id,
+                hedge_order_id=hedge_result.get("order_id", ""),
+                maker_filled=maker_fill.quantity,
+            )
             return result
 
         # Both filled — check symmetry
@@ -178,12 +220,22 @@ class EntrySyncExecutor:
         if residual is not None:
             result.state = EntryState.FAILED_WITH_RESIDUAL
             result.residual_task = residual
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="partial_fill_residual",
+                maker_order_id=maker_fill.order_id,
+                hedge_order_id=hedge_fill.order_id,
+                maker_filled=maker_fill.quantity,
+                hedge_filled=hedge_fill.quantity,
+            )
             self.journal.append(
                 "entry.residual_detected",
                 {
                     "position_id": ctx.entry_id,
                     "exposure_quantity": residual.exposure_quantity,
                     "exposure_venue": residual.exposure_venue.value,
+                    "maker_client_order_id": maker_req.client_order_id,
+                    "hedge_client_order_id": hedge_req.client_order_id,
                 },
             )
             return result
@@ -205,6 +257,14 @@ class EntrySyncExecutor:
                 now_ms=now_ms,
                 deadline_ms=now_ms + self.deadline_ms,
             )
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="below_min_matched_ratio",
+                maker_order_id=maker_fill.order_id,
+                hedge_order_id=hedge_fill.order_id,
+                maker_filled=maker_fill.quantity,
+                hedge_filled=hedge_fill.quantity,
+            )
             return result
 
         # Success — build OpenPosition
@@ -216,16 +276,81 @@ class EntrySyncExecutor:
         result.hedge_fill = hedge_fill
 
         self.journal.append(
-            "entry.completed",
+            "entry.opened",
             {
-                "position_id": ctx.entry_id,
-                "symbol": ctx.symbol,
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "quantity": position.matched_quantity,
                 "long_quantity": position.long_quantity,
                 "short_quantity": position.short_quantity,
+                "long_entry_price": position.long_entry_price,
+                "short_entry_price": position.short_entry_price,
+                "opened_at_ms": position.opened_at_ms,
                 "matched_quantity": position.matched_quantity,
+                "current_net_quote": position.current_net_quote,
+                "peak_net_quote": position.peak_net_quote,
+                "captured_funding_quote": position.captured_funding_quote,
+                "second_stage_funding_quote": position.second_stage_funding_quote,
+                "long_entry_fee_quote": position.long_entry_fee_quote,
+                "short_entry_fee_quote": position.short_entry_fee_quote,
+                "funding_captured": position.funding_captured,
+                "second_stage_funding_captured": position.second_stage_funding_captured,
+                "maker_order_id": maker_fill.order_id,
+                "hedge_order_id": hedge_fill.order_id,
+                "maker_client_order_id": maker_req.client_order_id,
+                "hedge_client_order_id": hedge_req.client_order_id,
             },
         )
         return result
+
+    # ------------------------------------------------------------------
+    # PendingEntry factory (V1: creates reconcilable pending state)
+    # ------------------------------------------------------------------
+
+    def _make_pending_entry(
+        self,
+        ctx: EntryContext,
+        maker_req: OrderRequest,
+        hedge_req: OrderRequest,
+        now_ms: int,
+        outcome: str = "uncertain",
+        maker_order_id: str = "",
+        hedge_order_id: str = "",
+        maker_filled: float = 0.0,
+        hedge_filled: float = 0.0,
+    ) -> PendingEntry:
+        """Create a PendingEntry for reconciliation after uncertain outcomes.
+
+        V1: after any non-terminal entry outcome, a PendingEntry is created
+        so the reconciliation loop can resolve it via venue queries.
+        """
+        maker_is_long = ctx.maker_leg == Side.BUY
+        return PendingEntry(
+            pending_id=ctx.entry_id,
+            symbol=ctx.symbol,
+            long_venue=ctx.long_venue,
+            short_venue=ctx.short_venue,
+            target_quantity=ctx.long_quantity,
+            long_side=Side.BUY if maker_is_long else Side.SELL,
+            short_side=Side.SELL if maker_is_long else Side.BUY,
+            created_at_ms=now_ms,
+            maker_order_id=maker_order_id,
+            hedge_order_id=hedge_order_id,
+            maker_client_order_id=maker_req.client_order_id or "",
+            hedge_client_order_id=hedge_req.client_order_id or "",
+            maker_leg_filled=maker_filled,
+            hedge_leg_filled=hedge_filled,
+            uncertain_outcome=(outcome != "filled"),
+            entry_type=ctx.entry_type.value,
+            maker_price=maker_req.price or 0.0,
+            long_quantity=ctx.long_quantity,
+            short_quantity=ctx.short_quantity,
+            deadline_ms=now_ms + self.deadline_ms,
+            entry_route=ctx.planned_route.value,
+            outcome=outcome,
+        )
 
     # ------------------------------------------------------------------
     # Order submission helpers
@@ -245,6 +370,8 @@ class EntrySyncExecutor:
                 "quantity": request.quantity,
                 "price": request.price,
                 "post_only": request.post_only,
+                "client_order_id": request.client_order_id,
+                "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
         return await self._submit_order(request, ctx.entry_id, "maker")
@@ -262,6 +389,9 @@ class EntrySyncExecutor:
                 "side": request.side.value,
                 "quantity": request.quantity,
                 "price": request.price,
+                "reduce_only": request.reduce_only,
+                "client_order_id": request.client_order_id,
+                "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
         return await self._submit_order(request, ctx.entry_id, "hedge")
@@ -269,14 +399,21 @@ class EntrySyncExecutor:
     async def _submit_order(
         self, request: OrderRequest, position_id: str, leg: str
     ) -> dict[str, Any]:
-        """Submit an order through the venue adapter and classify outcome."""
+        """Submit an order through the venue adapter and classify outcome.
+
+        Returns dict with outcome, fill, order_id, and client_order_id.
+        """
         adapter = self.adapters.get(request.venue)
         if adapter is None:
             self.journal.append(
                 f"entry.{leg}_rejected",
-                {"position_id": position_id, "reason": f"no adapter for {request.venue.value}"},
+                {
+                    "position_id": position_id,
+                    "reason": f"no adapter for {request.venue.value}",
+                    "client_order_id": request.client_order_id,
+                },
             )
-            return {"outcome": "rejected", "fill": None}
+            return {"outcome": "rejected", "fill": None, "order_id": ""}
 
         try:
             fill = await adapter.place_order(request)
@@ -286,40 +423,66 @@ class EntrySyncExecutor:
                     {
                         "position_id": position_id,
                         "order_id": fill.order_id,
+                        "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
                         "price": fill.price,
                         "fee_quote": fill.fee_quote,
                     },
                 )
-                return {"outcome": "filled", "fill": fill, "journal": []}
+                return {
+                    "outcome": "filled",
+                    "fill": fill,
+                    "order_id": fill.order_id,
+                    "journal": [],
+                }
             else:
                 # Ack-only or zero-fill
                 self.journal.append(
                     f"entry.{leg}_uncertain",
-                    {"position_id": position_id, "reason": "zero fill quantity"},
+                    {
+                        "position_id": position_id,
+                        "reason": "zero fill quantity",
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "uncertain", "fill": None}
+                return {
+                    "outcome": "uncertain",
+                    "fill": None,
+                    "order_id": getattr(fill, "order_id", ""),
+                }
 
         except OrderSubmitError as e:
             if e.is_rejected:
                 self.journal.append(
                     f"entry.{leg}_rejected",
-                    {"position_id": position_id, "reason": str(e)},
+                    {
+                        "position_id": position_id,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "rejected", "fill": None}
+                return {"outcome": "rejected", "fill": None, "order_id": ""}
             else:
                 self.journal.append(
                     f"entry.{leg}_uncertain",
-                    {"position_id": position_id, "reason": str(e)},
+                    {
+                        "position_id": position_id,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "uncertain", "fill": None}
+                return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
             self.journal.append(
                 f"entry.{leg}_uncertain",
-                {"position_id": position_id, "reason": str(e)},
+                {
+                    "position_id": position_id,
+                    "reason": str(e),
+                    "client_order_id": request.client_order_id,
+                },
             )
-            return {"outcome": "uncertain", "fill": None}
+            return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
 
 # ---------------------------------------------------------------------------

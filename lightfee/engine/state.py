@@ -71,6 +71,9 @@ class PendingEntry:
     # --- Order IDs for reconciliation (Rust V1 maker/hedge order tracking) ---
     maker_order_id: str = ""
     hedge_order_id: str = ""
+    # --- Client order IDs for idempotency (Rust V1 clientOrderId dedup) ---
+    maker_client_order_id: str = ""
+    hedge_client_order_id: str = ""
     # --- Fill quantities per leg ---
     maker_leg_filled: float = 0.0
     hedge_leg_filled: float = 0.0
@@ -88,6 +91,11 @@ class PendingEntry:
     maker_price: float = 0.0
     long_quantity: float = 0.0
     short_quantity: float = 0.0
+    # --- V1 recovery dedup: run_id that created this entry ---
+    run_id: str = ""
+    # --- V1 entry route and outcome tracking ---
+    entry_route: str = ""
+    outcome: str = ""  # "filled", "rejected", "uncertain", "partial"
 
 
 @dataclass
@@ -99,6 +107,9 @@ class PendingClose:
     # --- Order IDs per leg (Rust V1 close order tracking) ---
     long_order_id: str = ""
     short_order_id: str = ""
+    # --- Client order IDs for idempotency (Rust V1 clientOrderId dedup) ---
+    long_client_order_id: str = ""
+    short_client_order_id: str = ""
     # --- Target close quantities per leg ---
     long_target_close_qty: float = 0.0
     short_target_close_qty: float = 0.0
@@ -113,6 +124,11 @@ class PendingClose:
     # --- Reconciliation retry tracking (Rust V1 exponential backoff) ---
     reconcile_attempt: int = 0
     reconcile_next_attempt_ms: int = 0
+    # --- V1 recovery dedup: run_id that created this close ---
+    run_id: str = ""
+    # --- V1 chunk tracking for large closes ---
+    chunk_index: int = 0
+    total_chunks: int = 1
 
 
 @dataclass

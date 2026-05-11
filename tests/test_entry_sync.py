@@ -266,7 +266,7 @@ class TestEntrySyncDualTakerSuccess:
         assert "entry.maker_filled" in kinds
         assert "entry.hedge_submitted" in kinds
         assert "entry.hedge_filled" in kinds
-        assert "entry.completed" in kinds
+        assert "entry.opened" in kinds
 
 
 # ---------------------------------------------------------------------------

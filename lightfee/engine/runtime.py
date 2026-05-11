@@ -27,7 +27,12 @@ from lightfee.engine.loop_control import (
     maybe_export_current_state_snapshot,
     maybe_export_runtime_metrics,
 )
-from lightfee.engine.recovery import recover_from_snapshot
+from lightfee.engine.recovery import (
+    recover_from_snapshot,
+    build_recovery_dedup_index,
+    is_client_order_id_duplicate,
+    has_pending_entry_for_symbol,
+)
 from lightfee.engine.state import EngineState
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
@@ -91,6 +96,9 @@ class LiveRuntime:
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
 
+        # V1 recovery dedup index: prevents duplicate orders after restart
+        self._recovery_dedup_index: dict[str, str] = {}
+
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
@@ -134,6 +142,9 @@ class LiveRuntime:
         self.state.run_id = self.journal.run_id
         if self.state.started_at_ms == 0:
             self.state.started_at_ms = wall_clock_now_ms()
+
+        # Build recovery dedup index from recovered pending state
+        self._recovery_dedup_index = build_recovery_dedup_index(self.state)
 
         # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
@@ -1147,6 +1158,8 @@ class LiveRuntime:
                     short_venue=pending.short_venue,
                     long_order_id=pending.maker_order_id,
                     short_order_id=pending.hedge_order_id,
+                    long_client_order_id=pending.maker_client_order_id,
+                    short_client_order_id=pending.hedge_client_order_id,
                 )
             except Exception as e:
                 self.journal.append(
@@ -1454,8 +1467,52 @@ class LiveRuntime:
         # V1: maker leg from strategy config (funding arb: long side is typically maker)
         maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
 
+        entry_id = f"entry-{now_ms}-{candidate.symbol}"
+
+        # --- V1 recovery dedup: check for duplicate entries after restart ---
+        maker_cid = f"{entry_id}-maker"
+        hedge_cid = f"{entry_id}-hedge"
+
+        if is_client_order_id_duplicate(maker_cid, self._recovery_dedup_index):
+            self.journal.append(
+                "runtime.entry_skipped_duplicate_client_order_id",
+                {
+                    "entry_id": entry_id,
+                    "client_order_id": maker_cid,
+                    "reason": "duplicate maker clientOrderId in recovery dedup index",
+                },
+            )
+            return
+
+        if is_client_order_id_duplicate(hedge_cid, self._recovery_dedup_index):
+            self.journal.append(
+                "runtime.entry_skipped_duplicate_client_order_id",
+                {
+                    "entry_id": entry_id,
+                    "client_order_id": hedge_cid,
+                    "reason": "duplicate hedge clientOrderId in recovery dedup index",
+                },
+            )
+            return
+
+        # Check for existing pending entry on same symbol pair
+        if has_pending_entry_for_symbol(
+            self.state, candidate.symbol,
+            long_venue.value, short_venue.value,
+        ):
+            self.journal.append(
+                "runtime.entry_skipped_existing_pending",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "reason": "pending entry already exists for this symbol pair",
+                },
+            )
+            return
+
         ctx = EntryContext(
-            entry_id=f"entry-{now_ms}-{candidate.symbol}",
+            entry_id=entry_id,
             symbol=candidate.symbol,
             long_venue=long_venue,
             short_venue=short_venue,
@@ -1477,6 +1534,7 @@ class LiveRuntime:
                     "symbol": candidate.symbol,
                     "route": result.route.value,
                     "state": result.state.value,
+                    "has_uncertainty": result.has_uncertainty,
                 },
             )
             if result.open_position is not None:
@@ -1484,6 +1542,21 @@ class LiveRuntime:
                 self.journal.append(
                     "runtime.position_opened",
                     {"position_id": result.open_position.position_id},
+                )
+            if result.pending_entry is not None:
+                # Track pending entry for reconciliation
+                self.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
+                self._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
+                self._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
+                self.journal.append(
+                    "runtime.pending_entry_registered",
+                    {
+                        "pending_id": result.pending_entry.pending_id,
+                        "symbol": result.pending_entry.symbol,
+                        "outcome": result.pending_entry.outcome,
+                        "maker_client_order_id": result.pending_entry.maker_client_order_id,
+                        "hedge_client_order_id": result.pending_entry.hedge_client_order_id,
+                    },
                 )
         except Exception as e:
             self.journal.append(

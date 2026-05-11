@@ -55,6 +55,18 @@ def _make_data_plane() -> tuple[LocalL2DataPlane, LocalL2Runtime, Journal]:
     return dp, rt, journal
 
 
+def _close_data_plane(dp: LocalL2DataPlane, journal: Journal) -> None:
+    """Best-effort cleanup for helper-created local-L2 test resources."""
+    try:
+        asyncio.run(dp.stop_ws_streams())
+    except Exception:
+        pass
+    try:
+        journal.close()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # WS client message parsing
 # ---------------------------------------------------------------------------
@@ -90,6 +102,7 @@ class TestBinanceL2WsClientParsing:
         assert len(update.asks) == 2
         assert update.asks[0].price == 50100.0
         assert update.asks[0].quantity == 0.5
+        _close_data_plane(dp, _)
 
     def test_ignores_non_depth_messages(self):
         dp, rt, _ = _make_data_plane()
@@ -99,6 +112,7 @@ class TestBinanceL2WsClientParsing:
         # Trade event, not depth
         raw = {"e": "trade", "s": "BTCUSDT", "p": "50000.00"}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
     def test_handles_empty_books(self):
         dp, rt, _ = _make_data_plane()
@@ -118,6 +132,7 @@ class TestBinanceL2WsClientParsing:
         assert update is not None
         assert len(update.bids) == 0
         assert len(update.asks) == 0
+        _close_data_plane(dp, _)
 
 
 class TestOkxL2WsClientParsing:
@@ -145,6 +160,7 @@ class TestOkxL2WsClientParsing:
         assert len(update.bids) == 2
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 0.5
+        _close_data_plane(dp, _)
 
     def test_parses_delta(self):
         dp, rt, _ = _make_data_plane()
@@ -169,6 +185,7 @@ class TestOkxL2WsClientParsing:
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.sequence == 99
         assert update.checksum == 12345
+        _close_data_plane(dp, _)
 
     def test_ignores_non_books_channel(self):
         dp, rt, _ = _make_data_plane()
@@ -177,6 +194,7 @@ class TestOkxL2WsClientParsing:
         )
         raw = {"arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"}, "data": []}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
 
 class TestBybitL2WsClientParsing:
@@ -205,6 +223,7 @@ class TestBybitL2WsClientParsing:
         assert update.update_kind == LocalL2UpdateKind.SNAPSHOT
         assert update.sequence == 200
         assert len(update.bids) == 2
+        _close_data_plane(dp, _)
 
     def test_parses_delta(self):
         dp, rt, _ = _make_data_plane()
@@ -229,6 +248,7 @@ class TestBybitL2WsClientParsing:
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert len(update.asks) == 1
         assert update.asks[0].quantity == 0  # deletion
+        _close_data_plane(dp, _)
 
 
 class TestBitgetL2WsClientParsing:
@@ -292,6 +312,7 @@ class TestBitgetL2WsClientParsing:
         )
         raw = {"action": "update", "arg": {"channel": "tickers", "instId": "BTCUSDT"}, "data": []}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
     def test_ignores_non_action_messages(self):
         dp, rt, _ = _make_data_plane()
@@ -300,6 +321,7 @@ class TestBitgetL2WsClientParsing:
         )
         raw = {"event": "subscribe", "arg": {"channel": "books"}}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
 
 class TestGateL2WsClientParsing:
@@ -332,6 +354,7 @@ class TestGateL2WsClientParsing:
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 2.0
         assert len(update.asks) == 2
+        _close_data_plane(dp, _)
 
     def test_parses_delta_update_event(self):
         dp, rt, _ = _make_data_plane()
@@ -358,6 +381,7 @@ class TestGateL2WsClientParsing:
         assert update.sequence == 123457
         assert len(update.asks) == 1
         assert update.asks[0].quantity == 0  # deletion
+        _close_data_plane(dp, _)
 
     def test_ignores_non_orderbook_channels(self):
         dp, rt, _ = _make_data_plane()
@@ -366,6 +390,7 @@ class TestGateL2WsClientParsing:
         )
         raw = {"time": 1715000000, "channel": "futures.trades", "event": "update", "result": {}}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
     def test_ignores_non_data_events(self):
         dp, rt, _ = _make_data_plane()
@@ -374,6 +399,7 @@ class TestGateL2WsClientParsing:
         )
         raw = {"time": 1715000000, "channel": "futures.order_book", "event": "subscribe"}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
     def test_gate_symbol_conversion(self):
         dp, rt, _ = _make_data_plane()
@@ -384,6 +410,7 @@ class TestGateL2WsClientParsing:
         )
         assert client.gate_symbol() == "BTC_USDT"
         assert client.wire_symbol == "BTC_USDT"
+        _close_data_plane(dp, _)
 
     def test_gate_wire_symbol_defaults_to_canonical(self):
         dp, rt, _ = _make_data_plane()
@@ -392,6 +419,7 @@ class TestGateL2WsClientParsing:
         )
         # Without venue_symbol, wire_symbol falls back to canonical symbol
         assert client.wire_symbol == "BTCUSDT"
+        _close_data_plane(dp, _)
 
 
 class TestAsterL2WsClientParsing:
@@ -422,6 +450,7 @@ class TestAsterL2WsClientParsing:
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 1.5
         assert len(update.asks) == 2
+        _close_data_plane(dp, _)
 
     def test_ignores_non_depth_messages(self):
         dp, rt, _ = _make_data_plane()
@@ -430,6 +459,7 @@ class TestAsterL2WsClientParsing:
         )
         raw = {"e": "trade", "s": "BTCUSDT", "p": "50000.00"}
         assert client.parse_depth_message(raw) is None
+        _close_data_plane(dp, _)
 
     def test_handles_empty_books(self):
         dp, rt, _ = _make_data_plane()
@@ -449,6 +479,7 @@ class TestAsterL2WsClientParsing:
         assert update is not None
         assert len(update.bids) == 0
         assert len(update.asks) == 0
+        _close_data_plane(dp, _)
 
 
 class TestHyperliquidL2Poller:
@@ -459,6 +490,7 @@ class TestHyperliquidL2Poller:
             venue_symbol="BTC",
         )
         assert isinstance(poller, LocalL2WsClient)
+        _close_data_plane(dp, _)
 
     def test_websocket_url_is_empty(self):
         dp, rt, _ = _make_data_plane()
@@ -467,6 +499,7 @@ class TestHyperliquidL2Poller:
             venue_symbol="BTC",
         )
         assert poller.websocket_url() == ""
+        _close_data_plane(dp, _)
 
     def test_parse_depth_message_returns_none(self):
         dp, rt, _ = _make_data_plane()
@@ -476,6 +509,7 @@ class TestHyperliquidL2Poller:
         )
         # HL poller doesn't use parse_depth_message — REST polling is in _run_loop
         assert poller.parse_depth_message({}) is None
+        _close_data_plane(dp, _)
 
     def test_set_adapter_stores_reference(self):
         dp, rt, _ = _make_data_plane()
@@ -486,6 +520,7 @@ class TestHyperliquidL2Poller:
         adapter = object()
         poller.set_adapter(adapter)
         assert poller._adapter is adapter
+        _close_data_plane(dp, _)
 
 
 # ---------------------------------------------------------------------------

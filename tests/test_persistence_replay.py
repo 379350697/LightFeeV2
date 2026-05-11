@@ -297,3 +297,234 @@ class TestJournalCompaction:
             assert len(records) == 101
             # Baseline record preserved
             assert records[0]["kind"] == "recovery.live_detected"
+
+
+class TestReplayReconstruction:
+    """Test that replay reconstructs full timeline, not just summary counts."""
+
+    def test_replay_reconstructs_position_fields_losslessly(self):
+        """V1 rule: replay preserves all position fields from recorded evidence."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "pos-full",
+                    "symbol": "BTCUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "quantity": 0.1,
+                    "long_quantity": 0.1,
+                    "short_quantity": 0.1,
+                    "long_entry_price": 68750.0,
+                    "short_entry_price": 68755.0,
+                    "opened_at_ms": 1000,
+                    "matched_quantity": 0.1,
+                    "current_net_quote": 1.5,
+                    "peak_net_quote": 2.0,
+                    "captured_funding_quote": 0.05,
+                    "funding_captured": False,
+                    "long_entry_fee_quote": 0.01,
+                    "short_entry_fee_quote": 0.01,
+                },
+            }
+        ]
+        result = replay_journal_records(records)
+        assert result["open_position_count"] == 1
+        pos = result["positions"].get("pos-full", {})
+        assert pos.get("long_entry_price") == 68750.0
+        assert pos.get("short_entry_price") == 68755.0
+        assert pos.get("current_net_quote") == 1.5
+        assert pos.get("peak_net_quote") == 2.0
+        assert pos.get("long_entry_fee_quote") == 0.01
+
+    def test_replay_tracks_pending_entry_from_journal(self):
+        """V1 rule: pending_entry_count must come from journal events, not hardcoded 0."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "entry.pending_registered",
+                "payload": {"pending_id": "pend-1", "symbol": "ETHUSDT"},
+            },
+        ]
+        result = replay_journal_records(records)
+        # Should track pending entries, not hardcode 0
+        assert result["pending_entry_count"] == 1
+
+    def test_replay_tracks_pending_close_from_journal(self):
+        """V1 rule: pending_close_count must come from journal events, not hardcoded 0."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "exit.pending_close_registered",
+                "payload": {"close_id": "close-1", "position_id": "pos-1"},
+            },
+        ]
+        result = replay_journal_records(records)
+        assert result["pending_close_count"] == 1
+
+    def test_replay_preserves_candidate_filter_list_evidence(self):
+        """V1 rule: replay must preserve candidate list and blocked reasons, not boolean only."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "scan.completed",
+                "payload": {
+                    "candidate_count": 3,
+                    "blocked_count": 1,
+                    "accepted_count": 2,
+                    "blocked_reasons": {
+                        "btcusdt:binance->okx": ["stale_market_data:binance"],
+                    },
+                    "accepted_candidates": [
+                        {"pair_id": "ethusdt:binance->okx", "edge_bps": 15.0},
+                        {"pair_id": "solusdt:binance->bybit", "edge_bps": 12.0},
+                    ],
+                    "no_entry_reason": "",
+                },
+            }
+        ]
+        result = replay_journal_records(records)
+        assert result["scan_stats"] is not None
+        assert result["scan_stats"]["candidate_count"] == 3
+        assert result["scan_stats"]["blocked_count"] == 1
+        assert result["scan_stats"]["accepted_count"] == 2
+        assert "btcusdt:binance->okx" in result["scan_stats"]["blocked_reasons"]
+
+    def test_replay_preserves_recovery_diagnostic_records(self):
+        """V1 rule: recovery diagnostics (blocked, mismatch, flat) must be tracked."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "recovery.blocked",
+                "payload": {"reason": "venue_unavailable", "venue": "binance"},
+            },
+        ]
+        result = replay_journal_records(records)
+        assert len(result.get("recovery_events", [])) == 1
+        assert result["recovery_events"][0]["kind"] == "recovery.blocked"
+
+    def test_replay_preserves_risk_trigger_evidence(self):
+        """V1 rule: risk trigger payloads must include health ratios and adjusted quantities."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "risk.death_triggered",
+                "payload": {
+                    "position_id": "pos-risk",
+                    "reason": "health_drop",
+                    "long_health_ratio": 0.45,
+                    "short_health_ratio": 0.38,
+                    "min_health_ratio": 0.38,
+                    "requested_quantity": 0.1,
+                    "adjusted_quantity": 0.08,
+                    "blocked_reason": "",
+                },
+            }
+        ]
+        result = replay_journal_records(records)
+        assert len(result.get("risk_events", [])) == 1
+        risk = result["risk_events"][0]
+        assert risk["payload"]["long_health_ratio"] == 0.45
+        assert risk["payload"]["short_health_ratio"] == 0.38
+        assert risk["payload"]["adjusted_quantity"] == 0.08
+
+    def test_replay_reconstructs_lifecycle_timeline(self):
+        """V1 rule: replay must reconstruct per-event timeline, not just final state."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "runtime.lifecycle_changed",
+                "payload": {"from": "booting", "to": "reconciling", "reason": "startup"},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 5000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "pos-timeline", "symbol": "BTCUSDT"},
+            },
+            {
+                "seq": 3, "run_id": "r1", "ts_ms": 10000,
+                "kind": "runtime.lifecycle_changed",
+                "payload": {"from": "reconciling", "to": "running", "reason": "recovery_complete"},
+            },
+            {
+                "seq": 4, "run_id": "r1", "ts_ms": 20000,
+                "kind": "runtime.risk_mode_changed",
+                "payload": {"from": "running", "to": "reduce_only", "reason": "health_drop"},
+            },
+            {
+                "seq": 5, "run_id": "r1", "ts_ms": 30000,
+                "kind": "exit.closed",
+                "payload": {"position_id": "pos-timeline", "reason": "risk_close"},
+            },
+        ]
+        result = replay_journal_records(records)
+        assert result["final_lifecycle"] == "running"
+        assert result["final_risk_mode"] == "reduce_only"
+        # Must have timeline events
+        timeline = result.get("timeline", [])
+        assert len(timeline) >= 5
+        kinds = [e["kind"] for e in timeline]
+        assert "runtime.lifecycle_changed" in kinds
+        assert "entry.opened" in kinds
+        assert "exit.closed" in kinds
+
+    def test_replay_seed_state_propagates_fields(self):
+        """V1 rule: seed state fields propagate through replay without loss."""
+        seed = {
+            "lifecycle": "reconciling",
+            "risk_mode": "reduce_only",
+            "open_positions": {
+                "pos-seed": {
+                    "position_id": "pos-seed",
+                    "symbol": "BTCUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "quantity": 0.05,
+                    "long_entry_price": 68000.0,
+                    "short_entry_price": 68005.0,
+                    "opened_at_ms": 500,
+                    "matched_quantity": 0.05,
+                    "current_net_quote": 0.5,
+                    "peak_net_quote": 1.0,
+                    "captured_funding_quote": 0.0,
+                    "funding_captured": False,
+                    "long_entry_fee_quote": 0.005,
+                    "short_entry_fee_quote": 0.005,
+                },
+            },
+        }
+        result = replay_journal_records([], seed_state=seed)
+        assert result["open_position_count"] == 1
+        assert "pos-seed" in result["open_position_ids"]
+        pos = result["positions"].get("pos-seed", {})
+        assert pos.get("long_entry_price") == 68000.0
+        assert pos.get("peak_net_quote") == 1.0
+
+    def test_replay_returns_fixed_position_schema(self):
+        """V1 rule: replay output must use fixed ReplayPositionSnapshot schema, not ad-hoc dict."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "pos-schema",
+                    "symbol": "ETHUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "quantity": 10.0,
+                },
+            }
+        ]
+        result = replay_journal_records(records)
+        pos = result["positions"].get("pos-schema", {})
+        # Every key from ReplayPositionSnapshot must exist (defaulted if missing)
+        required_keys = {"position_id", "symbol", "long_venue", "short_venue",
+                         "quantity", "long_quantity", "short_quantity",
+                         "long_entry_price", "short_entry_price", "opened_at_ms",
+                         "matched_quantity", "current_net_quote", "peak_net_quote",
+                         "captured_funding_quote", "second_stage_funding_quote",
+                         "long_entry_fee_quote", "short_entry_fee_quote",
+                         "funding_captured", "second_stage_funding_captured"}
+        for key in required_keys:
+            assert key in pos, f"Missing key '{key}' in replay position snapshot"

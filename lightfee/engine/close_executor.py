@@ -263,6 +263,13 @@ class CloseExecConfig:
     deadline_ms: int = 30_000
     max_close_retries: int = 3
     post_funding_hold_ms: int = 30_000
+    # V1 semantic alignment: large-close chunking (config-ready, not yet activated).
+    # Rust V1 splits closes above a notional threshold into multiple chunks to
+    # reduce market impact. Python V2 currently submits the full matched quantity
+    # as a single chunk (chunk_count=1). When activated, each chunk is submitted
+    # as an independent close leg pair.
+    close_chunk_max_notional_quote: float = 0.0  # 0 = no chunking
+    close_chunk_min_interval_ms: int = 1_000
 
 
 class CloseExecutor:
@@ -286,6 +293,8 @@ class CloseExecutor:
             deadline_ms=overrides.get("deadline_ms", 30_000),
             max_close_retries=overrides.get("max_close_retries", 3),
             post_funding_hold_ms=overrides.get("post_funding_hold_ms", 30_000),
+            close_chunk_max_notional_quote=overrides.get("close_chunk_max_notional_quote", 0.0),
+            close_chunk_min_interval_ms=overrides.get("close_chunk_min_interval_ms", 1_000),
         )
 
     async def execute_close(
@@ -300,10 +309,16 @@ class CloseExecutor:
     ) -> CloseExecution:
         """Execute a full close for an open position.
 
-        Submits both legs (short=buy, long=sell) as reduce-only taker orders.
+        Submits both legs (short=buy, long=sell) as reduce-only IOC taker orders.
         When *state* is provided, writes back PnL attribution, matched quantity
         updates, and manages PendingClose lifecycle for uncertain outcomes.
+
+        V1 parity additions:
+        - IOC time_in_force for close orders
+        - Deterministic clientOrderId for idempotency
+        - Retry throttling with exponential backoff on each leg
         """
+        from lightfee.core.domain import TimeInForce
         from lightfee.engine.exit import CloseExecution as CE
 
         if total_quantity is None:
@@ -313,49 +328,69 @@ class CloseExecutor:
                       long_close_price=0.0, short_close_price=0.0,
                       long_close_qty=0.0, short_close_qty=0.0)
 
+        close_id = f"close-{position.position_id}-{now_ms}"
+        short_cid = f"{close_id}-short"
+        long_cid = f"{close_id}-long"
+
         short_req = OrderRequest(
             venue=position.short_venue, symbol=position.symbol,
             side=Side.BUY, quantity=total_quantity, reduce_only=True,
             price=short_price_hint or None,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=short_cid,
         )
         long_req = OrderRequest(
             venue=position.long_venue, symbol=position.symbol,
             side=Side.SELL, quantity=total_quantity, reduce_only=True,
             price=long_price_hint or None,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=long_cid,
         )
 
-        # Submit short close first
+        # Submit short close first (V1: short leg first)
         short_legs: list[CloseExecutionLeg] = []
         long_legs: list[CloseExecutionLeg] = []
         short_uncertain = False
         long_uncertain = False
+        short_order_id = ""
+        long_order_id = ""
 
-        short_result = await self._submit_close_leg(
+        short_result = await self._submit_close_leg_with_retry(
             short_req, position.position_id, "short", now_ms,
         )
         if short_result["outcome"] == "filled":
             short_legs.append(CloseExecutionLeg(
                 fill=short_result["fill"],
+                client_order_id=short_cid,
                 submit_started_at_ms=now_ms,
             ))
+            short_order_id = short_result["fill"].order_id
         elif short_result["outcome"] == "rejected":
             self.journal.append(
                 "exit.short_rejected",
-                {"position_id": position.position_id, "reason": short_result.get("reason", "")},
+                {
+                    "position_id": position.position_id,
+                    "reason": short_result.get("reason", ""),
+                    "client_order_id": short_cid,
+                },
             )
         elif short_result["outcome"] == "uncertain":
             short_uncertain = True
+            short_order_id = short_result.get("order_id", "")
 
-        long_result = await self._submit_close_leg(
+        long_result = await self._submit_close_leg_with_retry(
             long_req, position.position_id, "long", now_ms,
         )
         if long_result["outcome"] == "filled":
             long_legs.append(CloseExecutionLeg(
                 fill=long_result["fill"],
+                client_order_id=long_cid,
                 submit_started_at_ms=now_ms,
             ))
+            long_order_id = long_result["fill"].order_id
         elif long_result["outcome"] == "uncertain":
             long_uncertain = True
+            long_order_id = long_result.get("order_id", "")
 
         close = build_close_execution_from_legs(
             position, 1, short_legs, long_legs,
@@ -376,6 +411,7 @@ class CloseExecutor:
                     "position_id": position.position_id,
                     "exposure_quantity": residual.exposure_quantity,
                     "exposure_venue": residual.exposure_venue.value,
+                    "close_id": close_id,
                 },
             )
 
@@ -384,10 +420,17 @@ class CloseExecutor:
             self._writeback_to_state(
                 state, position, close, long_closed, short_closed,
                 long_uncertain, short_uncertain, now_ms, reason,
+                close_id=close_id,
+                short_order_id=short_order_id,
+                long_order_id=long_order_id,
+                short_client_order_id=short_cid,
+                long_client_order_id=long_cid,
             )
 
+        pnl_attr = build_exit_pnl_attribution(position, close)
+
         self.journal.append(
-            "exit.completed",
+            "exit.closed",
             {
                 "position_id": position.position_id,
                 "reason": reason,
@@ -395,8 +438,14 @@ class CloseExecutor:
                 "short_closed_qty": short_closed,
                 "long_uncertain": long_uncertain,
                 "short_uncertain": short_uncertain,
-                "price_pnl": close.realized_price_pnl_quote,
-                "net_quote": close.net_quote,
+                "price_pnl": pnl_attr["price_pnl_quote"],
+                "funding_pnl_quote": pnl_attr["funding_quote"],
+                "entry_fee_quote": pnl_attr["entry_fee_quote"],
+                "exit_fee_quote": pnl_attr["exit_fee_quote"],
+                "net_quote": pnl_attr["net_quote"],
+                "close_id": close_id,
+                "long_client_order_id": long_cid,
+                "short_client_order_id": short_cid,
             },
         )
 
@@ -413,11 +462,16 @@ class CloseExecutor:
         short_uncertain: bool,
         now_ms: int,
         reason: str,
+        close_id: str = "",
+        short_order_id: str = "",
+        long_order_id: str = "",
+        short_client_order_id: str = "",
+        long_client_order_id: str = "",
     ) -> None:
         """Write close execution results back into EngineState.
 
         - Updates position PnL / quantity tracking
-        - Creates PendingClose for uncertain legs
+        - Creates PendingClose for uncertain legs with clientOrderId for idempotency
         - Removes fully-closed positions from open_positions
         """
         # Track partial close: update quantities
@@ -431,14 +485,17 @@ class CloseExecutor:
 
         # If any leg is uncertain, register a PendingClose for reconciliation
         if long_uncertain or short_uncertain:
-            close_id = f"pending-close-{position.position_id}-{now_ms}"
+            if not close_id:
+                close_id = f"pending-close-{position.position_id}-{now_ms}"
             state.pending_closes[close_id] = PendingClose(
                 close_id=close_id,
                 position_id=position.position_id,
                 reason=reason,
                 created_at_ms=now_ms,
-                long_order_id="",
-                short_order_id="",
+                long_order_id=long_order_id,
+                short_order_id=short_order_id,
+                long_client_order_id=long_client_order_id,
+                short_client_order_id=short_client_order_id,
                 long_closed=long_closed,
                 short_closed=short_closed,
                 long_uncertain=long_uncertain,
@@ -451,6 +508,8 @@ class CloseExecutor:
                     "position_id": position.position_id,
                     "long_uncertain": long_uncertain,
                     "short_uncertain": short_uncertain,
+                    "long_client_order_id": long_client_order_id,
+                    "short_client_order_id": short_client_order_id,
                 },
             )
 
@@ -479,9 +538,13 @@ class CloseExecutor:
         if adapter is None:
             self.journal.append(
                 f"exit.{leg}_rejected",
-                {"position_id": position_id, "reason": f"no adapter for {request.venue.value}"},
+                {
+                    "position_id": position_id,
+                    "reason": f"no adapter for {request.venue.value}",
+                    "client_order_id": request.client_order_id,
+                },
             )
-            return {"outcome": "rejected", "fill": None, "reason": "no adapter"}
+            return {"outcome": "rejected", "fill": None, "reason": "no adapter", "order_id": ""}
 
         try:
             fill = await adapter.place_order(request)
@@ -491,39 +554,114 @@ class CloseExecutor:
                     {
                         "position_id": position_id,
                         "order_id": fill.order_id,
+                        "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
                         "price": fill.price,
                         "fee_quote": fill.fee_quote,
                     },
                 )
-                return {"outcome": "filled", "fill": fill}
+                return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
             else:
                 self.journal.append(
                     f"exit.{leg}_uncertain",
-                    {"position_id": position_id, "reason": "zero fill"},
+                    {
+                        "position_id": position_id,
+                        "reason": "zero fill",
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "uncertain", "fill": None}
+                return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except OrderSubmitError as e:
             if e.is_rejected:
                 self.journal.append(
                     f"exit.{leg}_rejected",
-                    {"position_id": position_id, "reason": str(e)},
+                    {
+                        "position_id": position_id,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "rejected", "fill": None, "reason": str(e)}
+                return {"outcome": "rejected", "fill": None, "reason": str(e), "order_id": ""}
             else:
                 self.journal.append(
                     f"exit.{leg}_uncertain",
-                    {"position_id": position_id, "reason": str(e)},
+                    {
+                        "position_id": position_id,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                    },
                 )
-                return {"outcome": "uncertain", "fill": None}
+                return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
             self.journal.append(
                 f"exit.{leg}_uncertain",
-                {"position_id": position_id, "reason": str(e)},
+                {
+                    "position_id": position_id,
+                    "reason": str(e),
+                    "client_order_id": request.client_order_id,
+                },
             )
-            return {"outcome": "uncertain", "fill": None}
+            return {"outcome": "uncertain", "fill": None, "order_id": ""}
+
+    async def _submit_close_leg_with_retry(
+        self,
+        request: OrderRequest,
+        position_id: str,
+        leg: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Submit a close leg with V1 retry throttling.
+
+        On UNCERTAIN outcomes, retries up to max_close_retries with
+        exponential backoff. On REJECTED, returns immediately.
+        Terminal success on empty-position reduce-only (venue-reported flat).
+        """
+        retry_base_ms = 1000
+        retry_max_ms = 10_000
+
+        for attempt in range(1, self.config.max_close_retries + 1):
+            result = await self._submit_close_leg(request, position_id, leg, now_ms)
+
+            if result["outcome"] == "filled":
+                return result
+
+            if result["outcome"] == "rejected":
+                # Check for terminal reduce-only success (venue flat)
+                reason = result.get("reason", "")
+                if "position closed" in reason.lower() or "empty position" in reason.lower():
+                    self.journal.append(
+                        f"exit.{leg}_terminal_reduce_only_success",
+                        {
+                            "position_id": position_id,
+                            "client_order_id": request.client_order_id,
+                            "attempt": attempt,
+                        },
+                    )
+                    return {"outcome": "filled", "fill": OrderFill(
+                        venue=request.venue, symbol=request.symbol,
+                        side=request.side, quantity=0.0, price=0.0,
+                        order_id="terminal-flat",
+                    ), "order_id": "terminal-flat"}
+                return result
+
+            # Uncertain — retry with backoff if attempts remain
+            if attempt < self.config.max_close_retries:
+                backoff_ms = min(retry_base_ms * (2 ** (attempt - 1)), retry_max_ms)
+                self.journal.append(
+                    f"exit.{leg}_retry_wait",
+                    {
+                        "position_id": position_id,
+                        "attempt": attempt,
+                        "backoff_ms": backoff_ms,
+                        "client_order_id": request.client_order_id,
+                    },
+                )
+                import asyncio
+                await asyncio.sleep(backoff_ms / 1000.0)
+
+        return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
 
 # ---------------------------------------------------------------------------

@@ -317,10 +317,22 @@ class LocalL2DataPlane:
                 connected += 1
         return connected
 
-    async def stop_ws_streams(self) -> None:
-        """Stop all WebSocket L2 streams."""
+    async def stop_ws_streams(self, *, per_client_timeout_s: float = 5.0) -> None:
+        """Stop all WebSocket L2 streams with per-client timeout guard.
+
+        Cancelled WS tasks may leave DNS resolution threads in the default
+        executor that survive task cancellation.  A per-client timeout prevents
+        a stuck client from blocking the entire shutdown sequence.
+        """
         for client in list(self._ws_clients.values()):
-            await client.stop()
+            try:
+                await asyncio.wait_for(client.stop(), timeout=per_client_timeout_s)
+            except asyncio.TimeoutError:
+                # Hard-abort: cancel the task and tear down the transport
+                if client._task is not None and not client._task.done():
+                    client._task.cancel()
+                client._state = "closed"
+                client._ws = None
         self._ws_clients.clear()
 
     @property

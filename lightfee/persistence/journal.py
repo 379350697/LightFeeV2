@@ -103,63 +103,142 @@ class Journal:
 # Journal replay (Rust V1: replay_bridge.rs)
 # ---------------------------------------------------------------------------
 
+def _normalize_position_snapshot(pdata: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a position dict to the fixed schema with all V1-visible fields.
+
+    Includes both ReplayPositionSnapshot fields and OpenPosition fields
+    needed for full PnL and state reconstruction.
+    """
+    return {
+        "position_id": pdata.get("position_id", ""),
+        "symbol": pdata.get("symbol", ""),
+        "long_venue": pdata.get("long_venue", ""),
+        "short_venue": pdata.get("short_venue", ""),
+        "quantity": float(pdata.get("quantity", 0)),
+        "long_quantity": float(pdata.get("long_quantity", 0)),
+        "short_quantity": float(pdata.get("short_quantity", 0)),
+        "long_entry_price": float(pdata.get("long_entry_price", 0)),
+        "short_entry_price": float(pdata.get("short_entry_price", 0)),
+        "opened_at_ms": int(pdata.get("opened_at_ms", 0)),
+        "matched_quantity": float(pdata.get("matched_quantity", 0)),
+        "current_net_quote": float(pdata.get("current_net_quote", 0)),
+        "peak_net_quote": float(pdata.get("peak_net_quote", 0)),
+        "captured_funding_quote": float(pdata.get("captured_funding_quote", 0)),
+        "second_stage_funding_quote": float(pdata.get("second_stage_funding_quote", 0)),
+        "long_entry_fee_quote": float(pdata.get("long_entry_fee_quote", 0)),
+        "short_entry_fee_quote": float(pdata.get("short_entry_fee_quote", 0)),
+        "realized_price_pnl_quote": float(pdata.get("realized_price_pnl_quote", 0)),
+        "realized_exit_fee_quote": float(pdata.get("realized_exit_fee_quote", 0)),
+        "funding_captured": bool(pdata.get("funding_captured", False)),
+        "second_stage_funding_captured": bool(
+            pdata.get("second_stage_funding_captured", False)
+        ),
+    }
+
+
 def replay_journal_records(
     records: list[dict[str, Any]],
     seed_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay journal records to reconstruct engine state.
 
-    Rust V1: replay_journal_records() in observability_ops/replay_bridge.rs
-    processes each journal record and tracks:
-    - Open positions (entry.opened → add, exit.closed/recovery.flat → remove)
-    - Partial closes (exit.partial_closed → reduce quantity)
-    - Lifecycle transitions (runtime.lifecycle_changed)
-    - Risk mode transitions (runtime.risk_mode_changed)
+    Rust V1: replay_journal_records() in observability_ops/replay_bridge.rs.
+    Tracks open positions, partial closes, lifecycle/risk transitions, pending
+    entries/closes, scan statistics, recovery and risk events, and full timeline.
 
-    Returns a dict with:
-    - open_position_count, open_position_ids
-    - pending_entry_count, pending_close_count
-    - final_lifecycle, final_risk_mode
-    - positions (detail dict)
+    Returns a dict with open_position_count, open_position_ids,
+    pending_entry_count, pending_close_count, final_lifecycle, final_risk_mode,
+    positions (fixed-schema dicts), scan_stats, recovery_events, risk_events,
+    and timeline.
     """
     positions: dict[str, dict[str, Any]] = {}
     lifecycle = "booting"
     risk_mode = "running"
     open_ids: set[str] = set()
+    pending_entry_ids: set[str] = set()
+    pending_close_ids: set[str] = set()
 
-    # Apply seed state if provided
+    scan_stats: dict[str, Any] | None = None
+    recovery_events: list[dict[str, Any]] = []
+    risk_events: list[dict[str, Any]] = []
+    timeline: list[dict[str, Any]] = []
+
+    _timeline_interesting = frozenset({
+        "entry.opened", "entry.pending_registered",
+        "exit.closed", "exit.partial_closed", "exit.reconciled",
+        "exit.pending_close_registered",
+        "recovery.live_detected", "recovery.flat", "recovery.blocked",
+        "recovery.mismatch_detected", "recovery.mismatch_flattened",
+        "recovery.resumed",
+        "runtime.lifecycle_changed", "runtime.risk_mode_changed",
+        "risk.warning_triggered", "risk.death_triggered",
+        "risk.single_side_protection_triggered",
+        "risk.single_side_protection_failed",
+        "risk.single_side_protection_unavailable",
+        "scan.completed", "scan.no_entry_diagnostics",
+        "scan.runtime_gate_blocked",
+    })
+
     if seed_state:
         lifecycle = seed_state.get("lifecycle", lifecycle)
         risk_mode = seed_state.get("risk_mode", risk_mode)
         seed_positions = seed_state.get("open_positions", {})
         if isinstance(seed_positions, dict):
             for pid, pdata in seed_positions.items():
-                positions[pid] = dict(pdata) if isinstance(pdata, dict) else {}
-                open_ids.add(pid)
+                if isinstance(pdata, dict):
+                    positions[pid] = _normalize_position_snapshot(pdata)
+                    open_ids.add(pid)
 
     for record in records:
         kind = record.get("kind", "")
         payload = record.get("payload", {})
 
+        if kind in _timeline_interesting:
+            timeline.append({
+                "seq": record.get("seq"),
+                "ts_ms": record.get("ts_ms"),
+                "kind": kind,
+            })
+
         if kind in ("entry.opened", "recovery.live_detected"):
             pid = payload.get("position_id", "")
             if pid:
-                positions[pid] = dict(payload)
+                positions[pid] = _normalize_position_snapshot(payload)
                 open_ids.add(pid)
+                pending_entry_ids.discard(pid)
 
         elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
             pid = payload.get("position_id", "")
             if pid and pid in positions:
                 del positions[pid]
                 open_ids.discard(pid)
+            pending_close_ids.discard(pid)
 
         elif kind == "exit.partial_closed":
             pid = payload.get("position_id", "")
             if pid and pid in positions:
+                pos = positions[pid]
                 if "quantity" in payload:
-                    positions[pid]["quantity"] = payload["quantity"]
+                    pos["quantity"] = float(payload["quantity"])
                 if "current_net_quote" in payload:
-                    positions[pid]["current_net_quote"] = payload["current_net_quote"]
+                    pos["current_net_quote"] = float(payload["current_net_quote"])
+                if "peak_net_quote" in payload:
+                    pos["peak_net_quote"] = float(payload["peak_net_quote"])
+                if "funding_captured" in payload:
+                    pos["funding_captured"] = bool(payload["funding_captured"])
+                if "second_stage_funding_captured" in payload:
+                    pos["second_stage_funding_captured"] = bool(
+                        payload["second_stage_funding_captured"])
+
+        elif kind == "entry.pending_registered":
+            pid = payload.get("pending_id", "")
+            if pid:
+                pending_entry_ids.add(pid)
+
+        elif kind == "exit.pending_close_registered":
+            cid = payload.get("close_id", "")
+            if cid:
+                pending_close_ids.add(cid)
 
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")
@@ -171,12 +250,37 @@ def replay_journal_records(
             if to_val:
                 risk_mode = str(to_val)
 
+        elif kind == "scan.completed":
+            scan_stats = {
+                "candidate_count": int(payload.get("candidate_count", 0)),
+                "blocked_count": int(payload.get("blocked_count", 0)),
+                "accepted_count": int(payload.get("accepted_count", 0)),
+                "blocked_reasons": payload.get("blocked_reasons", {}),
+                "no_entry_reason": payload.get("no_entry_reason", ""),
+            }
+
+        elif kind.startswith("recovery."):
+            recovery_events.append({
+                "kind": kind, "payload": dict(payload),
+                "seq": record.get("seq"),
+            })
+
+        elif kind.startswith("risk."):
+            risk_events.append({
+                "kind": kind, "payload": dict(payload),
+                "seq": record.get("seq"),
+            })
+
     return {
         "open_position_count": len(open_ids),
         "open_position_ids": sorted(open_ids),
-        "pending_entry_count": 0,  # journal alone can't distinguish
-        "pending_close_count": 0,
+        "pending_entry_count": len(pending_entry_ids),
+        "pending_close_count": len(pending_close_ids),
         "final_lifecycle": lifecycle,
         "final_risk_mode": risk_mode,
         "positions": positions,
+        "scan_stats": scan_stats,
+        "recovery_events": recovery_events,
+        "risk_events": risk_events,
+        "timeline": timeline,
     }

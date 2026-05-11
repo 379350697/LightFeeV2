@@ -98,7 +98,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "transfer_bias_bps": c.transfer_bias_bps,
                 "opportunity_type": c.opportunity_type,
                 "blocked": c.blocked,
-                "blocked_reason": c.blocked_reason,
+                "blocked_reasons": c.blocked_reasons,
             }
             for c in s.candidates
         ],

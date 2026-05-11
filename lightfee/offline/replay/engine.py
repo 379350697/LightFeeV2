@@ -27,8 +27,13 @@ def replay_dataset(dataset: ReplayDataset) -> ReplayResult:
             payload = record.get("payload", {})
             if payload.get("blocked"):
                 result.rejected += 1
-                reason = payload.get("blocked_reason", "unknown")
-                result.rejected_reasons[reason] = result.rejected_reasons.get(reason, 0) + 1
+                reasons = payload.get("blocked_reasons", ["unknown"])
+                if isinstance(reasons, list):
+                    for reason in reasons:
+                        result.rejected_reasons[reason] = result.rejected_reasons.get(reason, 0) + 1
+                else:
+                    reason = str(reasons)
+                    result.rejected_reasons[reason] = result.rejected_reasons.get(reason, 0) + 1
             else:
                 result.accepted += 1
     return result

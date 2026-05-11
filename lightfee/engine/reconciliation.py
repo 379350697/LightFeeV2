@@ -82,8 +82,14 @@ class OrderReconciler:
         short_venue: Optional[Venue] = None,
         long_order_id: str = "",
         short_order_id: str = "",
+        long_client_order_id: str = "",
+        short_client_order_id: str = "",
     ) -> PositionReconciliationResult:
-        """Query both venue adapters for fill and position state."""
+        """Query both venue adapters for fill and position state.
+
+        V1: prefers clientOrderId lookup when order_id is empty or unfound.
+        Falls back to order_id lookup, then position-only check.
+        """
         result = PositionReconciliationResult(
             position_id=position_id,
             symbol=symbol,
@@ -95,7 +101,17 @@ class OrderReconciler:
         if long_adapter is not None:
             if long_order_id:
                 fill = await long_adapter.fetch_order_fill_reconciliation(
-                    symbol, long_order_id
+                    symbol, long_order_id, long_client_order_id
+                )
+                if fill is not None:
+                    result.long_status = "filled"
+                    result.long_fill = fill
+                else:
+                    result.long_status = "uncertain"
+            elif long_client_order_id:
+                # Try clientOrderId lookup when exchange order_id is not available
+                fill = await long_adapter.fetch_order_fill_reconciliation(
+                    symbol, "", long_client_order_id
                 )
                 if fill is not None:
                     result.long_status = "filled"
@@ -108,7 +124,16 @@ class OrderReconciler:
         if short_adapter is not None:
             if short_order_id:
                 fill = await short_adapter.fetch_order_fill_reconciliation(
-                    symbol, short_order_id
+                    symbol, short_order_id, short_client_order_id
+                )
+                if fill is not None:
+                    result.short_status = "filled"
+                    result.short_fill = fill
+                else:
+                    result.short_status = "uncertain"
+            elif short_client_order_id:
+                fill = await short_adapter.fetch_order_fill_reconciliation(
+                    symbol, "", short_client_order_id
                 )
                 if fill is not None:
                     result.short_status = "filled"

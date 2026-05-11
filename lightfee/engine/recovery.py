@@ -575,3 +575,69 @@ def normalize_engine_state(state: EngineState) -> None:
     for pos in state.open_positions.values():
         if pos.matched_quantity == 0.0:
             pos.matched_quantity = min(pos.long_quantity, pos.short_quantity)
+
+
+# ---------------------------------------------------------------------------
+# Recovery dedup: prevent duplicate orders after restart (V1 clientOrderId)
+# ---------------------------------------------------------------------------
+
+
+def build_recovery_dedup_index(state: EngineState) -> dict[str, str]:
+    """Build a dedup index from recovered pending entries and closes.
+
+    Returns dict mapping client_order_id → pending_id or close_id.
+    Used to prevent re-submitting orders that were already sent before restart.
+
+    V1: before dispatching any entry or close, check if the same
+    clientOrderId already exists in recovered pending state.
+    """
+    index: dict[str, str] = {}
+
+    for pend_id, pe in state.pending_entries.items():
+        if pe.maker_client_order_id:
+            index[pe.maker_client_order_id] = pend_id
+        if pe.hedge_client_order_id:
+            index[pe.hedge_client_order_id] = pend_id
+
+    for close_id, pc in state.pending_closes.items():
+        if pc.long_client_order_id:
+            index[pc.long_client_order_id] = close_id
+        if pc.short_client_order_id:
+            index[pc.short_client_order_id] = close_id
+
+    return index
+
+
+def is_client_order_id_duplicate(
+    client_order_id: str,
+    dedup_index: dict[str, str],
+) -> bool:
+    """Check if a clientOrderId already exists in recovered pending state.
+
+    V1: prevents duplicate order submission after restart by checking
+    the dedup index built from pending entries and closes.
+
+    Returns True if the clientOrderId would create a duplicate.
+    """
+    return bool(client_order_id and client_order_id in dedup_index)
+
+
+def has_pending_entry_for_symbol(
+    state: EngineState,
+    symbol: str,
+    long_venue: str,
+    short_venue: str,
+) -> bool:
+    """Check if there's already a pending entry for the same symbol and venues.
+
+    V1: prevents opening duplicate positions on the same pair while
+    a pending entry already exists.
+    """
+    for pe in state.pending_entries.values():
+        if pe.symbol != symbol:
+            continue
+        pe_long = pe.long_venue.value if hasattr(pe.long_venue, 'value') else str(pe.long_venue)
+        pe_short = pe.short_venue.value if hasattr(pe.short_venue, 'value') else str(pe.short_venue)
+        if pe_long == long_venue and pe_short == short_venue:
+            return True
+    return False

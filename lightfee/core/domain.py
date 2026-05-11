@@ -74,6 +74,15 @@ class Side(Enum):
         return quantity if self == Side.BUY else -quantity
 
 
+class TimeInForce(Enum):
+    """Order time-in-force. V1 parity: GTC for maker, IOC for hedge/close."""
+
+    GTC = "gtc"
+    IOC = "ioc"
+    FOK = "fok"
+    POST_ONLY = "post_only"  # GTX on some venues
+
+
 class FundingOpportunityType(Enum):
     """Classification of funding-rate arbitrage opportunity timing."""
 
@@ -126,10 +135,12 @@ class OrderRequest:
     reduce_only: bool = False
     client_order_id: Optional[str] = None
     post_only: bool = False
+    time_in_force: Optional[TimeInForce] = None
     # --- Rust V1 live-path fields for execution quality and timing ---
     price_hint: Optional[float] = None
     mark_price_hint: Optional[float] = None
     observed_at_ms: Optional[int] = None
+    order_id: str = ""  # exchange-assigned order ID for amend/cancel
 
 
 @dataclass(frozen=True, slots=True)

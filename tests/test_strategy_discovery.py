@@ -120,7 +120,7 @@ class TestDiscovery:
                 long_venue="a", short_venue="b", symbol="X",
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
-                blocked=True, blocked_reason="test",
+                blocked=True, blocked_reasons=["test"],
             )
         ]
         result = discover_tradeable_candidates(candidates, config, 0)

@@ -76,7 +76,7 @@ class CandidateInput:
     transfer_bias_bps: float = 0.0
     opportunity_type: str = "aligned"
     blocked: bool = False
-    blocked_reason: str = ""
+    blocked_reasons: list[str] = field(default_factory=list)
     long_venue_index: int = 0
     short_venue_index: int = 0
     entry_notional_quote: float = 0.0

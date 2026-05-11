@@ -40,6 +40,8 @@ def make_test_config(temp_dir: str) -> AppConfig:
         strategy=StrategyConfig(
             risk_monitor_enabled=False,
             max_concurrent_positions=2,
+            local_l2_enabled=False,
+            local_l2_ws_enabled=False,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(Path(temp_dir) / "events.jsonl"),
