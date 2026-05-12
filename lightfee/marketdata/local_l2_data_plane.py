@@ -27,6 +27,7 @@ from lightfee.marketdata.l2 import (
     L2PoolAssignment,
     LocalL2BookKey,
     LocalL2Update,
+    LocalL2UpdateKind,
 )
 from lightfee.marketdata.local_l2_runtime import LocalL2Runtime, RuntimeFaultKind
 from lightfee.venues.transport import TransportError, TransportErrorCategory
@@ -38,6 +39,23 @@ if TYPE_CHECKING:
 
 # Pre-snapshot buffer capacity per symbol (V1: BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP)
 _PRE_SNAPSHOT_BUFFER_CAP = 512
+
+
+# ---------------------------------------------------------------------------
+# Buffered WS update wrapper (V1: BufferedBinanceLocalL2DepthUpdate)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BufferedUpdate:
+    """Wrapper tagging a WS delta with stream generation for stale-filtering.
+
+    V1: BufferedBinanceLocalL2DepthUpdate { generation, observed_at_ms, update }
+    """
+
+    generation: int
+    observed_at_ms: int
+    update: LocalL2Update
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +111,14 @@ class LocalL2DataPlane:
         self._snap_states: dict[LocalL2BookKey, _BookSnapshotState] = {}
         self._ws_clients: dict[LocalL2BookKey, "LocalL2WsClient"] = {}
 
-        # Pre-snapshot buffers: keyed by "venue:symbol" → buffered WS updates
-        # V1: binance_local_l2_pre_snapshot_buffers() — buffers deltas during bootstrap gap
-        self._pre_snapshot_buffers: dict[str, deque[LocalL2Update]] = {}
+        # Pre-snapshot buffers: keyed by "venue:symbol" → deque of _BufferedUpdate
+        # V1: binance_local_l2_pre_snapshot_buffers()
+        self._pre_snapshot_buffers: dict[str, deque[_BufferedUpdate]] = {}
+
+        # Stream generations: keyed by "venue:symbol" → generation counter (starts at 1)
+        # V1: binance_local_l2_stream_generations() — advanced on WS reconnect and
+        # bootstrap start to invalidate buffered updates from old streams.
+        self._stream_generations: dict[str, int] = {}
 
         # Background bootstrap worker tasks: keyed by "venue"
         self._bootstrap_tasks: dict[str, asyncio.Task] = {}
@@ -194,28 +217,91 @@ class LocalL2DataPlane:
         finally:
             ss.snapshot_in_flight = False
 
+    # ------------------------------------------------------------------
+    # Stream generation (V1: binance_local_l2_stream_generations)
+    # ------------------------------------------------------------------
+
+    def _current_stream_generation(self, venue: str, symbol: str) -> int:
+        """Return current generation for a venue/symbol stream, initialising if needed.
+
+        V1: current_binance_local_l2_stream_generation()
+        """
+        key = f"{venue}:{symbol}"
+        gen = self._stream_generations.get(key)
+        if gen is None:
+            gen = 1
+            self._stream_generations[key] = gen
+        return gen
+
+    def _advance_stream_generation(self, venue: str, symbol: str) -> int:
+        """Advance and return the stream generation for a venue/symbol.
+
+        V1: advance_binance_local_l2_stream_generation()
+        """
+        key = f"{venue}:{symbol}"
+        gen = self._stream_generations.get(key, 0) + 1
+        self._stream_generations[key] = gen
+        return gen
+
+    def reset_stream_state(self, venue: str, symbols: list[str]) -> None:
+        """Reset stream state for bootstrapping/rebuilding books.
+
+        V1: reset_binance_local_l2_bootstrap_stream_state_for_instance()
+        Called on WS reconnect and bootstrap start to invalidate buffered
+        updates from old streams and reset sequence tracking.
+
+        For each symbol that is BOOTSTRAPPING or REBUILDING:
+          - Advance stream generation (old buffered updates filtered out on replay)
+          - Clear pre-snapshot buffer
+          - Reset book sequence so a fresh snapshot isn't rejected as stale
+        """
+        for symbol in symbols:
+            key = f"{venue}:{symbol}"
+            self._advance_stream_generation(venue, symbol)
+
+            book = self._runtime.get_book(venue, symbol)
+            if book is None:
+                continue
+            if book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+                continue
+
+            # Clear buffered updates from old stream (V1: clear_..._for_instance)
+            self._pre_snapshot_buffers.pop(key, None)
+
+            # Reset sequence so snapshot isn't treated as stale (V1: set_last_sequence(None))
+            book.sequence = 0
+            book.last_update_id = 0
+
+    # ------------------------------------------------------------------
+    # Ingest: WS/REST update entry point
+    # ------------------------------------------------------------------
+
     def ingest_external_update(
         self, update: LocalL2Update, now_ms: int,
     ) -> list:
         """Ingest a LocalL2Update from any external data source (WS, relay, REST).
 
         V1 parity: when the target book is BOOTSTRAPPING or REBUILDING, buffer
-        the delta update instead of applying it to an incomplete book. Buffered
-        updates are replayed after the REST snapshot completes (see bootstrap_book).
+        delta updates tagged with the current stream generation. Buffered updates
+        are replayed after the REST snapshot completes (see bootstrap_book).
 
         Single entry point for all data sources to feed into the runtime.
         """
         key = f"{update.venue}:{update.symbol}"
         book = self._runtime.get_book(update.venue, update.symbol)
 
-        # Buffer delta updates during bootstrap/rebuild gap (V1: handle_binance_local_l2_ws_message)
+        # Buffer delta updates during bootstrap/rebuild gap
+        # V1: handle_binance_local_l2_ws_message_for_instance lines 4423-4435
         if book is not None and book.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
             buf = self._pre_snapshot_buffers.get(key)
             if buf is None:
                 buf = deque()
                 self._pre_snapshot_buffers[key] = buf
             if len(buf) >= _PRE_SNAPSHOT_BUFFER_CAP:
+                # Overflow → rebuild required (V1: mark_status(Rebuilding), set_last_sequence(None))
                 buf.clear()
+                book.sequence = 0
+                book.last_update_id = 0
                 book.transition_to_rebuilding(now_ms)
                 self._runtime.handle_runtime_failure(
                     update.venue, update.symbol,
@@ -223,11 +309,12 @@ class LocalL2DataPlane:
                     "pre_snapshot_buffer_overflow", now_ms,
                 )
                 return []
-            buf.append(update)
+            gen = self._current_stream_generation(update.venue, update.symbol)
+            buf.append(_BufferedUpdate(generation=gen, observed_at_ms=now_ms, update=update))
             return []
 
-        # If there are leftover buffered updates (shouldn't normally happen),
-        # replay them first before applying the current update.
+        # If there are leftover buffered updates (edge case: book became HOT while
+        # buffered updates were still pending), replay them first.
         if book is not None and self._pre_snapshot_buffers.get(key):
             self._replay_buffered_updates(update.venue, update.symbol)
 
@@ -237,20 +324,101 @@ class LocalL2DataPlane:
         """Replay buffered WS updates accumulated during bootstrap gap.
 
         V1: replay_binance_buffered_local_l2_depth_updates_for_instance()
-        Returns the number of updates replayed.
+        - Filters out updates from old stream generations
+        - Skips updates already covered by the snapshot (sequence <= book.sequence)
+        - Detects sequence gaps that require a rebuild
+        - Returns number of updates replayed (0 if buffer empty or all filtered)
         """
         key = f"{venue}:{symbol}"
         buf = self._pre_snapshot_buffers.pop(key, None)
         if not buf:
             return 0
+
+        book = self._runtime.get_book(venue, symbol)
+        if book is None:
+            return 0
+
+        current_gen = self._current_stream_generation(venue, symbol)
+        previous_sequence = book.sequence  # snapshot's sequence
+
+        # Filter: keep only current-generation updates (V1: retain by generation)
+        # Convert to list for indexed access
+        filtered: list[_BufferedUpdate] = [
+            b for b in buf if b.generation == current_gen
+        ]
+        if not filtered:
+            return 0
+
+        # Drop updates already covered by the snapshot (V1: final_update_id <= previous_sequence)
+        while filtered and filtered[0].update.sequence <= previous_sequence:
+            filtered.pop(0)
+        if not filtered:
+            return 0
+
+        # Find first update that bridges snapshot to live stream
+        # V1: first_update_id <= expected <= final_update_id
+        expected = previous_sequence + 1
+        start_index = None
+        for i, bu in enumerate(filtered):
+            first_id = bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0 else bu.update.sequence
+            if first_id <= expected <= bu.update.sequence:
+                start_index = i
+                break
+
+        if start_index is None:
+            # No overlap — gap between snapshot and buffered updates
+            book.sequence = 0
+            book.last_update_id = 0
+            book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+            self._runtime.handle_runtime_failure(
+                venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                "buffered_replay_snapshot_boundary: no overlapping update", 0,
+            )
+            return 0
+
+        # Replay from overlap point with continuity check
+        # V1: buffered_updates.into_iter().skip(start_index).enumerate()
         replayed = 0
-        while buf:
-            update = buf.popleft()
+        for i, bu in enumerate(filtered[start_index:], start=start_index):
+            if bu.update.sequence <= previous_sequence:
+                continue
+
+            if i > start_index:
+                # Check continuity between consecutive buffered updates
+                if bu.update.previous_sequence > 0 and bu.update.previous_sequence != previous_sequence:
+                    book.sequence = 0
+                    book.last_update_id = 0
+                    book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                    self._runtime.handle_runtime_failure(
+                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                        f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}", 0,
+                    )
+                    return replayed
+            elif bu.update.previous_sequence > 0 and expected < bu.update.previous_sequence + 1:
+                # First replay: gap between snapshot and first buffered
+                book.sequence = 0
+                book.last_update_id = 0
+                book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                self._runtime.handle_runtime_failure(
+                    venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                    f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}", 0,
+                )
+                return replayed
+
             try:
-                self._runtime.record_update(update, update.received_at_ms)
+                self._runtime.record_update(bu.update, bu.observed_at_ms)
+                previous_sequence = bu.update.sequence
                 replayed += 1
             except Exception:
-                pass
+                book.sequence = 0
+                book.last_update_id = 0
+                book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                self._runtime.handle_runtime_failure(
+                    venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                    f"buffered_replay_apply_failed at index {i}", 0,
+                )
+                return replayed
+
         return replayed
 
     # ------------------------------------------------------------------
@@ -340,6 +508,12 @@ class LocalL2DataPlane:
         """
         # Cancel any existing bootstrap task for this venue
         self.cancel_background_bootstrap(venue)
+
+        # Reset stream state: advance generation, clear old buffers, reset sequences
+        # V1: start_local_l2_bootstrap_at → reset_binance_local_l2_bootstrap_stream_state_for_instance
+        # A rebuild bootstrap must drop any previous snapshot sequence so a fresh
+        # depth snapshot with the same exchange sequence is not treated as stale.
+        self.reset_stream_state(venue, symbols)
 
         async def _bootstrap_worker() -> None:
             import random

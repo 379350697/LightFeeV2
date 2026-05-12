@@ -213,7 +213,12 @@ class LocalL2WsClient(ABC):
             )
 
     async def _connect_and_read(self) -> None:
-        """Establish WS connection, subscribe, and read messages."""
+        """Establish WS connection, subscribe, and read messages.
+
+        On each (re)connect, notifies the data plane to advance the stream
+        generation and reset sequence state for any bootstrapping book.
+        V1: reset_binance_local_l2_bootstrap_stream_state_for_instance in on_connect closure.
+        """
         url = self.websocket_url()
         self._state = WsClientState.CONNECTING
 
@@ -232,6 +237,10 @@ class LocalL2WsClient(ABC):
             sub_msg = self.build_subscribe_message()
             if sub_msg is not None:
                 await ws.send(json.dumps(sub_msg))
+
+            # Notify data plane: new WS stream → advance generation, clear old buffers
+            # V1: on_connect closure calling reset_binance_local_l2_bootstrap_stream_state_for_instance
+            self.data_plane.reset_stream_state(self.venue, [self.symbol])
 
             # Read loop
             async for raw_msg in ws:
