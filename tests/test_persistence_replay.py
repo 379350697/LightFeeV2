@@ -254,6 +254,194 @@ class TestJournalWithSnapshotRecovery:
             assert replay_result["open_position_count"] == 1
 
 
+class TestCounterfactualSafety:
+    """Test that counterfactual analysis never synthesizes missing evidence."""
+
+    def test_counterfactual_never_synthesizes_positions_or_pnl(self):
+        """Rust V1: counterfactual must NOT synthesize positions, PnL, or fake records."""
+        from lightfee.offline.replay.counterfactual import CounterfactualSpec, run_counterfactual
+        from lightfee.offline.replay.dataset import ReplayDataset
+
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "scan.completed",
+                "payload": {
+                    "candidate_count": 2,
+                    "blocked_count": 0,
+                    "accepted_count": 2,
+                    "blocked_reasons": {},
+                    "no_entry_reason": "",
+                },
+            },
+        ]
+        dataset = ReplayDataset(records=records, date_from="", date_to="")
+        spec = CounterfactualSpec(
+            review_id="cf-1",
+            config_overrides={"min_edge_bps": 15.0},
+        )
+        result = run_counterfactual(dataset, spec)
+        # Counterfactual must NOT synthesize positions, PnL, or extra records
+        assert result.simulated_positions == 0
+        assert result.estimated_pnl_quote == 0.0
+        # The total_candidates comes from recorded scan.completed events (config override applied)
+        # — this is V1 semantics: override config on recorded evidence, not synthesize new data
+
+    def test_counterfactual_without_overrides_equals_replay(self):
+        """Rust V1: counterfactual without config overrides returns same result as replay."""
+        from lightfee.offline.replay.counterfactual import CounterfactualSpec, run_counterfactual
+        from lightfee.offline.replay.dataset import ReplayDataset
+        from lightfee.offline.replay.engine import replay_dataset
+
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "sidecar.candidate_published",
+                "payload": {"pair_id": "btcusdt:binance->okx", "blocked": False},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 2000,
+                "kind": "sidecar.candidate_published",
+                "payload": {"pair_id": "ethusdt:binance->bybit", "blocked": True,
+                           "blocked_reasons": ["low_liquidity"]},
+            },
+        ]
+        dataset = ReplayDataset(records=records, date_from="", date_to="")
+        spec = CounterfactualSpec(review_id="cf-default")
+        cf_result = run_counterfactual(dataset, spec)
+        replay_result = replay_dataset(dataset)
+        assert cf_result.total_candidates == replay_result.total_candidates
+        assert cf_result.accepted == replay_result.accepted
+        assert cf_result.rejected == replay_result.rejected
+
+
+class TestWalkForwardDateArithmetic:
+    """Test that walk-forward uses real datetime arithmetic."""
+
+    def test_walk_forward_uses_real_date_window(self):
+        """Rust V1: walk-forward must use real calendar date arithmetic, not mock dates."""
+        from lightfee.offline.replay.walk_forward import generate_walk_forward_windows
+
+        windows = generate_walk_forward_windows(
+            start_date="20260101",
+            end_date="20260110",
+            train_days=4,
+            test_days=2,
+        )
+        assert len(windows) > 0
+
+        # Each window must have non-overlapping test periods, rolling forward
+        for i in range(1, len(windows)):
+            # Previous test_to == next test_from (deterministic roll)
+            prev = windows[i - 1]
+            curr = windows[i]
+            assert prev.test_to == curr.test_from, (
+                f"Window {i}: test periods should be contiguous "
+                f"({prev.test_to} != {curr.test_from})"
+            )
+
+        # Check first window structure
+        w0 = windows[0]
+        assert w0.train_from == "20260101"
+        assert w0.train_to == "20260105"  # +4 days
+        assert w0.test_from == "20260105"  # train_to
+        assert w0.test_to == "20260107"    # +2 days
+
+    def test_walk_forward_date_arithmetic_not_broken_by_string_comparison(self):
+        """Rust V1: date comparisons must use datetime, not string lexicographic ordering."""
+        from datetime import datetime, timedelta
+
+        # Prove that string comparison would give wrong answer for cross-year dates
+        assert "20260101" < "20270101"  # string comparison works for YYYYMMDD format
+        # But the implementation must actually use datetime math, not string slicing
+        from lightfee.offline.replay.walk_forward import generate_walk_forward_windows
+
+        windows = generate_walk_forward_windows(
+            start_date="20261228",
+            end_date="20270105",
+            train_days=3,
+            test_days=2,
+        )
+        assert len(windows) > 0
+        # Verify cross-year boundary is handled correctly
+        last = windows[-1]
+        assert last.test_to == "20270104" or last.test_to == "20270105"
+
+
+class TestReplayTimelineCompleteness:
+    """Test that replay timeline captures all state-transition events."""
+
+    def test_replay_timeline_includes_risk_death_triggered(self):
+        """Rust V1: risk.death_triggered events must appear in replay timeline."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "pos-risk", "symbol": "BTCUSDT"},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 5000,
+                "kind": "risk.death_triggered",
+                "payload": {
+                    "position_id": "pos-risk",
+                    "reason": "health_drop",
+                    "long_health_ratio": 0.35,
+                    "short_health_ratio": 0.30,
+                },
+            },
+        ]
+        result = replay_journal_records(records)
+        timeline_kinds = [e["kind"] for e in result.get("timeline", [])]
+        assert "risk.death_triggered" in timeline_kinds
+
+    def test_replay_timeline_includes_recovery_events(self):
+        """Rust V1: recovery events must appear in timeline for audit trace."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "recovery.live_detected",
+                "payload": {"position_id": "pos-rec", "symbol": "ETHUSDT"},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 5000,
+                "kind": "recovery.blocked",
+                "payload": {"reason": "venue_unavailable"},
+            },
+            {
+                "seq": 3, "run_id": "r1", "ts_ms": 10000,
+                "kind": "recovery.mismatch_detected",
+                "payload": {"position_id": "pos-rec", "expected": 1.0, "actual": 0.8},
+            },
+        ]
+        result = replay_journal_records(records)
+        timeline_kinds = [e["kind"] for e in result.get("timeline", [])]
+        assert "recovery.live_detected" in timeline_kinds
+        assert "recovery.blocked" in timeline_kinds
+        assert "recovery.mismatch_detected" in timeline_kinds
+
+    def test_replay_pending_counts_from_evidence_not_hardcoded(self):
+        """Rust V1: pending_entry_count and pending_close_count must be zero when no such events exist."""
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1000,
+                "kind": "scan.completed",
+                "payload": {"candidate_count": 5},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 2000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "pos-e", "symbol": "BTCUSDT"},
+            },
+        ]
+        result = replay_journal_records(records)
+        # No pending_entry_registered events → pending_entry_count == 0
+        assert result["pending_entry_count"] == 0
+        # No pending_close_registered events → pending_close_count == 0
+        assert result["pending_close_count"] == 0
+        # But we DO have 1 open position from entry.opened
+        assert result["open_position_count"] == 1
+
+
 class TestJournalCompaction:
     """Test journal compaction behavior (Rust V1: maybe_compact_persisted_journal)."""
 

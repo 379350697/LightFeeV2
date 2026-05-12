@@ -35,6 +35,58 @@ class TestJournal:
             assert j.run_id
             assert len(j.run_id) > 0
 
+    def test_run_id_matches_v1_shape(self):
+        """Rust V1: run_id = lightfee-{timestamp_ms}-{pid}."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "test.jsonl"
+            j = Journal(path)
+            parts = j.run_id.split("-")
+            # lightfee-{ts_ms}-{pid}
+            assert len(parts) >= 3, f"run_id '{j.run_id}' should be lightfee-{{ts_ms}}-{{pid}}"
+            assert parts[0] == "lightfee"
+            assert parts[1].isdigit(), f"timestamp part of run_id should be digits, got '{parts[1]}'"
+            assert parts[2].isdigit(), f"pid part of run_id should be digits, got '{parts[2]}'"
+
+    def test_seq_starts_at_1(self):
+        """Rust V1: next_seq starts at 1 (AtomicU64::new(1))."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "test.jsonl"
+            j = Journal(path)
+            j.open()
+            seq = j.append("test", {"x": 1}, flush=True)
+            assert seq == 1
+            j.close()
+            records = j.read_all()
+            assert records[0]["seq"] == 1
+
+    def test_scan_records_matching_kinds(self):
+        """Rust V1: scan_records_matching_kinds filters by kind during read."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scan_filter.jsonl"
+            j = Journal(path)
+            j.open()
+            j.append("scan.completed", {"cycle": 1}, flush=True)
+            j.append("entry.opened", {"position_id": "pos-1"}, flush=True)
+            j.append("scan.completed", {"cycle": 2}, flush=True)
+            j.append("exit.closed", {"position_id": "pos-1"}, flush=True)
+            j.close()
+
+            # Only scan.completed records
+            records = j.scan_records_matching_kinds(["scan.completed"])
+            kinds = [r["kind"] for r in records]
+            assert kinds == ["scan.completed", "scan.completed"]
+
+            # Multiple kinds
+            records = j.scan_records_matching_kinds(["entry.opened", "exit.closed"])
+            kinds = [r["kind"] for r in records]
+            assert "entry.opened" in kinds
+            assert "exit.closed" in kinds
+            assert "scan.completed" not in kinds
+
+            # No match
+            records = j.scan_records_matching_kinds(["nonexistent"])
+            assert records == []
+
     def test_read_all_handles_missing_file(self):
         j = Journal("/tmp/nonexistent/test_journal.jsonl")
         assert j.read_all() == []
@@ -171,6 +223,34 @@ class TestMetrics:
         assert m.venue_health_pause_entry_count == 2
         assert m.venue_health_reduce_only_count == 3
         assert m.venue_health_fail_closed_count == 4
+
+    def test_flush_requests_property_matches_v1(self):
+        """Rust V1: JournalRuntimeMetricsSnapshot exposes flush_requests."""
+        m = PersistenceMetrics()
+        m.record_journal_flush()
+        m.record_journal_flush()
+        m.record_journal_flush()
+        assert m.flush_requests == 3
+        # flush_requests and journal_flushes must be semantically equivalent
+        assert m.flush_requests == m.journal_flushes
+
+    def test_all_v1_runtime_counters_are_present(self):
+        """Rust V1: all 19 JournalRuntimeMetrics counters must exist."""
+        m = PersistenceMetrics()
+        v1_counter_fields = {
+            "async_appends", "critical_appends", "sync_fallback_appends",
+            "dropped_async_appends", "flush_requests", "writer_flushes",
+            "writer_failures", "queue_disconnects",
+            "open_position_count", "net_exposure_milli_quote",
+            "venue_health_normal_count", "venue_health_pause_entry_count",
+            "venue_health_reduce_only_count", "venue_health_fail_closed_count",
+            "risk_warning_trigger_count", "risk_delever_trigger_count",
+            "risk_death_trigger_count", "order_timeout_count",
+            "ws_disconnect_count", "rest_failure_count",
+            "reconcile_drift_count",
+        }
+        for field in v1_counter_fields:
+            assert hasattr(m, field), f"Missing V1 counter: {field}"
 
 
 class TestJournalPayloadPreservation:

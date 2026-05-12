@@ -86,6 +86,10 @@ class PersistenceMetrics:
     def record_journal_flush(self) -> None:
         self.journal_flushes += 1
 
+    @property
+    def flush_requests(self) -> int:
+        return self.journal_flushes
+
     def record_writer_flush(self) -> None:
         self.writer_flushes += 1
 

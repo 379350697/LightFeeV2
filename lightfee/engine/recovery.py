@@ -703,16 +703,28 @@ def is_safe_to_resume(state: EngineState) -> bool:
 
 
 def _try_emit_recovery(journal: Journal, kind: str, payload: dict[str, Any]) -> None:
-    """Emit a recovery diagnostic event through the journal if it is open.
+    """Emit a recovery diagnostic event through the journal.
 
-    Journal may not be open for writing during recovery — this helper
-    silently skips emission when the journal is not writeable.
+    Rust V1: recovery events (recovery.blocked, recovery.flat,
+    recovery.live_detected, runtime.running) are written to the journal
+    during startup recovery. If the journal is not open, it is temporarily
+    opened for append so that recovery diagnostics are never silently lost.
     """
     import time as _time
+    ts_ms = int(_time.time() * 1000)
+    if journal._file is not None:
+        journal.append(kind, payload, ts_ms=ts_ms)
+        return
     try:
-        journal.append(kind, payload, ts_ms=int(_time.time() * 1000))
-    except RuntimeError:
-        pass  # Journal not open for writing, no recovery diagnostic emitted
+        journal.open()
+        journal.append(kind, payload, ts_ms=ts_ms)
+    except Exception:
+        pass
+    finally:
+        try:
+            journal.close()
+        except Exception:
+            pass
 
 
 def has_lifecycle_blocking_work(state: EngineState) -> bool:

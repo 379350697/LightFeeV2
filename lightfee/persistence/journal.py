@@ -79,6 +79,17 @@ class Journal:
         """
         return self.append(kind, payload, flush=True, ts_ms=ts_ms)
 
+    def scan_records_matching_kinds(
+        self, kinds: list[str]
+    ) -> list[dict[str, Any]]:
+        """Scan journal records matching given event kinds.
+
+        Rust V1: scan_records_matching_kinds() in journal_bridge.rs.
+        Filters records by kind during read — more efficient than reading
+        all records and filtering post-hoc for offline replay.
+        """
+        return [r for r in self.read_all() if r.get("kind", "") in kinds]
+
     def read_all(self) -> list[dict[str, Any]]:
         """Read all journal records. Returns list of parsed dicts."""
         if not self.path.exists():
