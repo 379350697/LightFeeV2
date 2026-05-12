@@ -1,7 +1,7 @@
-"""Tests for offline analysis: journal stats, PnL summary, incident reports, diagnostics."""
+"""Tests for offline analysis: journal stats, PnL summary, incident reports, diagnostics,
+projection writer, and structured store read paths."""
 
-import pytest
-
+import json
 import tempfile
 from pathlib import Path
 
@@ -9,12 +9,21 @@ import pytest
 
 from lightfee.offline.analysis.journal import (
     JournalAnalysisReport,
+    analyze_from_store,
+    analyze_journal_or_store,
     analyze_journal_records,
 )
 from lightfee.offline.analysis.incident import build_incident_report
 from lightfee.offline.reports.daily import generate_daily_snapshot
 from lightfee.offline.reports.render import render_json, render_text
 from lightfee.persistence.journal import Journal
+from lightfee.persistence.metrics import PersistenceMetrics
+from lightfee.persistence.projection_writer import (
+    ProjectionWriter,
+    is_projected_kind,
+    is_journal_only_kind,
+)
+from lightfee.persistence.sqlite_store import SqliteStore
 
 
 class TestJournalAnalysis:
@@ -301,3 +310,412 @@ class TestReportRendering:
         result = render_text(data)
         assert "key" in result
         assert "value" in result
+
+
+# ---------------------------------------------------------------------------
+# Projection writer tests
+# ---------------------------------------------------------------------------
+
+def _make_record(seq: int, kind: str, ts_ms: int = 1000, **payload):
+    return {"seq": seq, "kind": kind, "ts_ms": ts_ms, "payload": payload}
+
+
+class TestProjectionWriter:
+    """Tests for idempotent journal-to-structured-store projection."""
+
+    @staticmethod
+    def _open_store():
+        td = tempfile.mkdtemp()
+        store = SqliteStore(Path(td) / "test.sqlite")
+        conn = store.open()
+        return td, store, conn
+
+    def test_projects_order_facts(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "order.submitted", venue="binance", symbol="BTCUSDT"),
+            _make_record(2, "order.filled", venue="binance", symbol="BTCUSDT", latency_ms=150, fee_quote=0.5),
+            _make_record(3, "order.rejected", venue="bybit", symbol="ETHUSDT"),
+            _make_record(4, "order.uncertain", venue="bybit", symbol="ETHUSDT"),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 4
+        assert result["skipped"] == 0
+        assert result["failed"] == 0
+
+        rows = store.query_order_facts(conn)
+        assert len(rows) == 4
+        kinds = {r["kind"] for r in rows}
+        assert kinds == {"order.submitted", "order.filled", "order.rejected", "order.uncertain"}
+
+        # Verify filled row
+        filled = [r for r in rows if r["kind"] == "order.filled"][0]
+        assert filled["filled"] == 1
+        assert filled["latency_ms"] == 150
+        assert filled["fee_quote"] == 0.5
+
+    def test_projects_entry_exit_facts(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "entry.opened", symbol="BTCUSDT", entry_fee_quote=5.0),
+            _make_record(2, "exit.closed", symbol="BTCUSDT", net_quote=50.0, exit_fee_quote=3.0),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 2
+
+        rows = store.query_entry_exit_facts(conn)
+        assert len(rows) == 2
+        entry = [r for r in rows if r["kind"] == "entry.opened"][0]
+        assert entry["entry_fee_quote"] == 5.0
+        exit_ = [r for r in rows if r["kind"] == "exit.closed"][0]
+        assert exit_["net_quote"] == 50.0
+
+    def test_projects_risk_counter_facts(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "risk.warning_triggered", health_ratio=0.3),
+            _make_record(2, "risk.warning_cleared"),
+            _make_record(3, "risk.death_triggered", reason="equity_drawdown"),
+            _make_record(4, "risk.single_side_protection_triggered", venue="binance"),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 4
+
+        rows = store.query_risk_counter_facts(conn)
+        assert len(rows) == 4
+        kinds = {r["kind"] for r in rows}
+        assert "risk.warning_triggered" in kinds
+        assert "risk.death_triggered" in kinds
+
+    def test_projects_local_l2_health_facts(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "runtime.local_l2_sequence_gap", continuity_reason="ws_disconnect", gap_ms=5000),
+            _make_record(2, "runtime.local_l2_sync_failed", failure_category="timeout", venue="binance"),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 2
+
+        rows = store.query_local_l2_health_facts(conn)
+        assert len(rows) == 2
+        gap = [r for r in rows if r["kind"] == "runtime.local_l2_sequence_gap"][0]
+        assert gap["reason"] == "ws_disconnect"
+        assert gap["category"] == "sequence_gap"
+        fail = [r for r in rows if r["kind"] == "runtime.local_l2_sync_failed"][0]
+        assert fail["reason"] == "timeout"
+        assert fail["category"] == "sync_failed"
+        assert fail["venue"] == "binance"
+
+    def test_projects_diagnostic_facts(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "scan.no_entry_diagnostics", reason="no_candidates"),
+            _make_record(2, "scan.runtime_gate_blocked", reason="risk_only"),
+            _make_record(3, "execution.entry_liquidity_blocked", reason="spread_too_wide", eligibility_class="class_a"),
+            _make_record(4, "runtime.fail_closed", reason="venue_disconnect"),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 4
+
+        rows = store.query_diagnostic_facts(conn)
+        assert len(rows) == 4
+        kinds = {r["kind"] for r in rows}
+        assert "scan.no_entry_diagnostics" in kinds
+        assert "runtime.fail_closed" in kinds
+
+        exec_row = [r for r in rows if r["kind"] == "execution.entry_liquidity_blocked"][0]
+        assert exec_row["reason"] == "spread_too_wide"
+        assert exec_row["classification"] == "class_a"
+
+    def test_idempotent_reprojection(self):
+        """Reprojecting the same records must not duplicate facts."""
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "order.submitted", venue="binance"),
+            _make_record(2, "entry.opened", entry_fee_quote=5.0),
+            _make_record(3, "risk.warning_triggered"),
+        ]
+        writer = ProjectionWriter(store)
+
+        r1 = writer.project_records(conn, records)
+        assert r1["appended"] == 3
+
+        r2 = writer.project_records(conn, records)
+        assert r2["appended"] == 0
+        assert r2["skipped"] == 3
+
+        assert len(store.query_order_facts(conn)) == 1
+        assert len(store.query_entry_exit_facts(conn)) == 1
+        assert len(store.query_risk_counter_facts(conn)) == 1
+
+    def test_skips_journal_only_kinds(self):
+        """Recovery and lifecycle records must stay in journal, never projected."""
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "recovery.live_detected", position_id="p1"),
+            _make_record(2, "runtime.lifecycle_changed", to="running"),
+            _make_record(3, "runtime.risk_mode_changed", to="risk_only"),
+            _make_record(4, "recovery.resumed", position_id="p2"),
+            _make_record(5, "runtime.booting"),
+            _make_record(6, "runtime.stopped"),
+        ]
+        writer = ProjectionWriter(store)
+        result = writer.project_records(conn, records)
+        assert result["appended"] == 0
+        assert result["skipped"] == 0
+        assert result["failed"] == 0
+
+        assert not store.has_projection_data(conn)
+
+    def test_cursor_tracks_projection_progress(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0),
+            _make_record(2, "exit.closed", net_quote=100.0),
+        ]
+        writer = ProjectionWriter(store)
+        writer.project_records(conn, records)
+
+        cursor = store.get_projection_cursor(conn)
+        assert cursor["last_projected_seq"] == 2
+        assert cursor["total_facts_written"] == 2
+        assert cursor["total_failures"] == 0
+
+    def test_metrics_tracked_during_projection(self):
+        _td, store, conn = self._open_store()
+        metrics = PersistenceMetrics()
+        records = [
+            _make_record(1, "order.submitted", venue="binance"),
+            _make_record(2, "order.filled", venue="binance", latency_ms=100),
+        ]
+        writer = ProjectionWriter(store, metrics=metrics)
+        writer.project_records(conn, records)
+
+        assert metrics.projection_appends == 2
+        assert metrics.projection_skips == 0
+        assert metrics.projection_failures == 0
+        assert metrics.last_projection_seq == 2
+
+
+class TestStoreBackedAnalysis:
+    """Tests for structured-store-backed analysis with journal fallback."""
+
+    @staticmethod
+    def _setup_store_with_data(records: list[dict]):
+        td = tempfile.mkdtemp()
+        store = SqliteStore(Path(td) / "test.sqlite")
+        conn = store.open()
+        writer = ProjectionWriter(store)
+        writer.project_records(conn, records)
+        return td, store, conn
+
+    def test_analyze_from_store_matches_journal_scan(self):
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0, symbol="BTCUSDT"),
+            _make_record(2, "exit.closed", net_quote=50.0, exit_fee_quote=3.0),
+            _make_record(3, "order.submitted", venue="binance"),
+            _make_record(4, "order.filled", venue="binance", latency_ms=150, fee_quote=0.5),
+            _make_record(5, "order.rejected", venue="bybit"),
+            _make_record(6, "risk.warning_triggered", health_ratio=0.3),
+            _make_record(7, "scan.no_entry_diagnostics", reason="no_candidates"),
+            _make_record(8, "runtime.local_l2_sequence_gap", continuity_reason="ws"),
+            _make_record(9, "runtime.local_l2_sync_failed", failure_category="timeout"),
+            _make_record(10, "execution.entry_liquidity_blocked", reason="spread", eligibility_class="A"),
+        ]
+        _td, store, conn = self._setup_store_with_data(records)
+
+        store_report = analyze_from_store(conn)
+        journal_report = analyze_journal_records(records)
+
+        # Core PnL should match
+        assert store_report.daily.entry_count == journal_report.daily.entry_count
+        assert store_report.daily.exit_count == journal_report.daily.exit_count
+        assert store_report.daily.total_pnl_quote == journal_report.daily.total_pnl_quote
+        assert store_report.daily.total_fee_quote == journal_report.daily.total_fee_quote
+
+        # Venue stats
+        assert store_report.venue_stats["binance"].fill_count == journal_report.venue_stats["binance"].fill_count
+        assert store_report.venue_stats["bybit"].failure_count == journal_report.venue_stats["bybit"].failure_count
+
+        # Risk
+        assert store_report.risk_counts == journal_report.risk_counts
+
+        # Diagnostics
+        assert store_report.scan_no_entry_diagnostics_count == journal_report.scan_no_entry_diagnostics_count
+        assert store_report.local_l2_sequence_gap_count == journal_report.local_l2_sequence_gap_count
+        assert store_report.local_l2_sync_failed_count == journal_report.local_l2_sync_failed_count
+        assert store_report.execution_liquidity_blocked_count == journal_report.execution_liquidity_blocked_count
+
+    def test_analyze_journal_or_store_prefers_store(self):
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0, symbol="BTCUSDT"),
+            _make_record(2, "risk.warning_triggered"),
+        ]
+        _td, store, conn = self._setup_store_with_data(records)
+
+        report = analyze_journal_or_store(conn=conn, records=records)
+        assert report.daily.entry_count == 1
+        assert report.risk_counts["risk.warning_triggered"] == 1
+
+    def test_analyze_journal_or_store_falls_back_when_store_empty(self):
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0, symbol="BTCUSDT"),
+        ]
+        td = tempfile.mkdtemp()
+        store = SqliteStore(Path(td) / "test.sqlite")
+        conn = store.open()
+        # No projection — store is empty
+
+        report = analyze_journal_or_store(conn=conn, records=records)
+        assert report.daily.entry_count == 1
+
+    def test_analyze_journal_or_store_handles_missing_conn(self):
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0, symbol="BTCUSDT"),
+        ]
+        report = analyze_journal_or_store(conn=None, records=records)
+        assert report.daily.entry_count == 1
+
+    def test_analyze_journal_or_store_returns_empty_when_no_data(self):
+        report = analyze_journal_or_store(conn=None, records=None)
+        assert report.total_records == 0
+        assert report.daily.entry_count == 0
+
+    def test_store_has_no_recovery_or_lifecycle_data(self):
+        """Recovery and lifecycle events are journal-only — store analysis returns 0 for them."""
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0),
+            _make_record(2, "recovery.live_detected", position_id="p1"),
+            _make_record(3, "runtime.lifecycle_changed", to="running"),
+        ]
+        _td, store, conn = self._setup_store_with_data(records)
+
+        store_report = analyze_from_store(conn)
+        journal_report = analyze_journal_records(records)
+
+        # Store: recovery not projected
+        assert store_report.recovery_counts == {}
+        # Journal: has recovery
+        assert journal_report.recovery_counts["recovery.live_detected"] == 1
+
+        # Store: PnL still captured
+        assert store_report.daily.entry_count == 1
+
+
+class TestProjectionClassification:
+    """Tests for event kind classification boundaries."""
+
+    def test_projected_kinds_are_identified(self):
+        assert is_projected_kind("order.submitted")
+        assert is_projected_kind("order.filled")
+        assert is_projected_kind("entry.opened")
+        assert is_projected_kind("exit.closed")
+        assert is_projected_kind("risk.warning_triggered")
+        assert is_projected_kind("runtime.local_l2_sequence_gap")
+        assert is_projected_kind("scan.no_entry_diagnostics")
+        assert is_projected_kind("execution.entry_liquidity_blocked")
+        assert is_projected_kind("runtime.fail_closed")
+        assert is_projected_kind("runtime.fail_closed_venue_disconnect")
+
+    def test_journal_only_kinds_are_identified(self):
+        assert is_journal_only_kind("recovery.live_detected")
+        assert is_journal_only_kind("recovery.flat")
+        assert is_journal_only_kind("recovery.blocked")
+        assert is_journal_only_kind("recovery.mismatch_detected")
+        assert is_journal_only_kind("recovery.mismatch_flattened")
+        assert is_journal_only_kind("recovery.resumed")
+        assert is_journal_only_kind("runtime.lifecycle_changed")
+        assert is_journal_only_kind("runtime.risk_mode_changed")
+        assert is_journal_only_kind("runtime.booting")
+        assert is_journal_only_kind("runtime.running")
+        assert is_journal_only_kind("runtime.stopped")
+
+    def test_journal_only_is_not_projected(self):
+        for kind in ["recovery.live_detected", "runtime.lifecycle_changed", "runtime.stopped"]:
+            assert is_journal_only_kind(kind)
+            assert not is_projected_kind(kind)
+
+    def test_unknown_kind_is_neither(self):
+        assert not is_projected_kind("some.unknown.kind")
+        assert not is_journal_only_kind("some.unknown.kind")
+
+
+class TestDailyReportWithProjection:
+    """Tests for daily report generation with structured store path."""
+
+    def test_daily_snapshot_generates_via_journal_fallback(self):
+        """When store has no projection data, daily snapshot falls back to journal scan."""
+        records = [
+            {"kind": "entry.opened", "payload": {"entry_fee_quote": 5.0, "symbol": "BTCUSDT"}},
+            {"kind": "exit.closed", "payload": {"net_quote": 50.0, "exit_fee_quote": 3.0}},
+            {"kind": "order.submitted", "payload": {"venue": "binance"}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "test.jsonl"
+            j = Journal(journal_path)
+            j.open()
+            for r in records:
+                j.append(r["kind"], r.get("payload", {}))
+            j.close()
+
+            sqlite_path = Path(td) / "test.sqlite"
+            summary = generate_daily_snapshot(
+                journal_path=journal_path,
+                sqlite_path=sqlite_path,
+                date="2026-05-12",
+            )
+
+            assert summary["total_pnl_quote"] == 50.0
+            assert summary["total_fee_quote"] == 8.0
+            assert summary["entry_count"] == 1
+            assert summary["exit_count"] == 1
+
+            # After fallback, store should have projection data
+            store = SqliteStore(sqlite_path)
+            conn2 = store.open()
+            assert store.has_projection_data(conn2)
+            conn2.close()
+
+    def test_daily_snapshot_with_all_diagnostic_kinds(self):
+        """Report includes all diagnostic breakdowns from structured store when available."""
+        records = [
+            _make_record(1, "entry.opened", entry_fee_quote=5.0),
+            _make_record(2, "exit.closed", net_quote=50.0, exit_fee_quote=3.0),
+            _make_record(3, "scan.no_entry_diagnostics", reason="no_candidates"),
+            _make_record(4, "scan.runtime_gate_blocked", reason="risk_only"),
+            _make_record(5, "execution.entry_liquidity_blocked", reason="spread", eligibility_class="A"),
+            _make_record(6, "runtime.local_l2_sequence_gap", continuity_reason="ws"),
+            _make_record(7, "runtime.local_l2_sync_failed", failure_category="timeout"),
+            _make_record(8, "runtime.fail_closed", reason="venue_error"),
+            _make_record(9, "risk.warning_triggered", health_ratio=0.3),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "test.jsonl"
+            j = Journal(journal_path)
+            j.open()
+            for r in records:
+                j.append(r["kind"], r.get("payload", {}))
+            j.close()
+
+            sqlite_path = Path(td) / "test.sqlite"
+            summary = generate_daily_snapshot(
+                journal_path=journal_path,
+                sqlite_path=sqlite_path,
+                date="2026-05-12",
+            )
+
+            assert summary["scan_no_entry_diagnostics"] == 1
+            assert summary["scan_runtime_gate_blocked"] == 1
+            assert summary["execution_liquidity_blocked"] == 1
+            assert summary["local_l2_sequence_gap_count"] == 1
+            assert summary["local_l2_sync_failed_count"] == 1
+            assert summary["entry_liquidity_blocked_by_reason"]["spread"] == 1
+            assert summary["local_l2_sequence_gap_by_reason"]["ws"] == 1
+            assert summary["local_l2_sync_failed_by_category"]["timeout"] == 1
+            assert summary["fail_closed_reason_counts"]["venue_error"] == 1
+            assert summary["risk_counts"]["risk.warning_triggered"] == 1

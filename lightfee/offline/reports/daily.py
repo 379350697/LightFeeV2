@@ -1,12 +1,21 @@
-"""Daily snapshot report generation."""
+"""Daily snapshot report generation.
+
+Read path: structured store first, journal fallback second.
+After a journal fallback read, backfill the projection store so the next
+read can use the fast path.
+"""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
 
-from lightfee.offline.analysis.journal import analyze_journal_records
+from lightfee.offline.analysis.journal import (
+    analyze_from_store,
+    analyze_journal_records,
+)
 from lightfee.persistence.journal import Journal
+from lightfee.persistence.projection_writer import ProjectionWriter
 from lightfee.persistence.sqlite_store import SqliteStore
 
 
@@ -15,19 +24,27 @@ def generate_daily_snapshot(
     sqlite_path: str | Path,
     date: str,
 ) -> dict:
-    """Generate daily snapshot from journal and write to SQLite.
+    """Generate daily snapshot preferring structured store, falling back to journal.
 
     Returns a summary dict suitable for rendering.
     """
     journal = Journal(journal_path)
-    records = journal.read_all()
-
-    report = analyze_journal_records(records)
-    report.daily.date = date
-
     store = SqliteStore(sqlite_path)
     conn = store.open()
     now_ms = int(time.time() * 1000)
+
+    # Prefer structured store when projection data exists
+    if store.has_projection_data(conn):
+        report = analyze_from_store(conn)
+
+    # Fall back to journal scan when store has no data or returned empty
+    if not store.has_projection_data(conn) or _is_empty_report(report):
+        records = journal.read_all()
+        report = analyze_journal_records(records)
+        # Backfill: project records into store for future fast reads
+        _backfill_projection(store, conn, records)
+
+    report.daily.date = date
 
     for venue in report.venue_stats:
         store.insert_daily_snapshot(
@@ -71,3 +88,25 @@ def generate_daily_snapshot(
         "entry_liquidity_blocked_by_reason": dict(report.entry_liquidity_blocked_by_reason),
         "fail_closed_reason_counts": dict(report.fail_closed_reason_counts),
     }
+
+
+def _backfill_projection(
+    store: SqliteStore,
+    conn: object,
+    records: list[dict],
+) -> dict[str, int]:
+    """Project journal records into the store so future reads use the fast path."""
+    writer = ProjectionWriter(store)
+    return writer.project_records(conn, records)
+
+
+def _is_empty_report(report: object) -> bool:
+    """Check whether a report has no data at all (needs journal fallback)."""
+    return (
+        report.total_records == 0
+        and report.daily.entry_count == 0
+        and report.daily.exit_count == 0
+        and not report.venue_stats
+        and not report.recovery_counts
+        and not report.risk_counts
+    )

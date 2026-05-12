@@ -1,7 +1,14 @@
-"""Journal analysis: venue stats, failure rates, latency, PnL, diagnostics."""
+"""Journal analysis: venue stats, failure rates, latency, PnL, diagnostics.
+
+Read paths:
+- analyze_journal_records() — canonical journal scan (always works, used as fallback)
+- analyze_from_store() — structured store query (fast, requires prior projection)
+- analyze_journal_or_store() — store-first with automatic journal fallback
+"""
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 
 
@@ -197,3 +204,141 @@ def _record_order(
         stats.failure_count += 1
     else:
         stats.order_count += 1
+
+
+# ---------------------------------------------------------------------------
+# Structured store read path (preferred for analytical consumers)
+# ---------------------------------------------------------------------------
+
+def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
+    """Build a JournalAnalysisReport from projection fact tables.
+
+    This is the fast path — it queries normalized SQLite tables instead of
+    scanning raw JSONL. Requires prior projection (see projection_writer.py).
+    Does NOT include journal-only evidence (recovery, lifecycle) since those
+    are intentionally not projected.
+    """
+    report = JournalAnalysisReport()
+
+    # Entry / exit facts
+    for row in conn.execute(
+        "SELECT kind, symbol, entry_fee_quote, exit_fee_quote, net_quote "
+        "FROM entry_exit_facts ORDER BY seq"
+    ):
+        r = dict(row)
+        kind = r["kind"]
+        if kind == "entry.opened":
+            report.daily.entry_count += 1
+            report.daily.total_fee_quote += r["entry_fee_quote"]
+        elif kind == "exit.closed":
+            report.daily.exit_count += 1
+            report.daily.total_pnl_quote += r["net_quote"]
+            report.daily.total_fee_quote += r["exit_fee_quote"]
+
+    # Order facts
+    for row in conn.execute(
+        "SELECT kind, venue, symbol, filled, failed, latency_ms, fee_quote "
+        "FROM order_facts ORDER BY seq"
+    ):
+        r = dict(row)
+        venue = r["venue"]
+        stats = report.venue_stats.setdefault(venue, VenueOrderStats(venue=venue))
+        if r["filled"]:
+            stats.fill_count += 1
+            lat = r["latency_ms"]
+            stats.total_latency_ms += lat
+            stats.max_latency_ms = max(stats.max_latency_ms, lat)
+            stats.min_latency_ms = min(stats.min_latency_ms, lat)
+            stats.total_fee_quote += r["fee_quote"]
+        elif r["failed"]:
+            stats.failure_count += 1
+        else:
+            stats.order_count += 1
+
+    # Risk counter facts
+    for row in conn.execute(
+        "SELECT kind, counter_value FROM risk_counter_facts ORDER BY seq"
+    ):
+        r = dict(row)
+        kind = r["kind"]
+        report.risk_counts[kind] = report.risk_counts.get(kind, 0) + r["counter_value"]
+
+    # Local-L2 health facts
+    for row in conn.execute(
+        "SELECT kind, reason, category, venue FROM local_l2_health_facts ORDER BY seq"
+    ):
+        r = dict(row)
+        kind = r["kind"]
+        if kind == "runtime.local_l2_sequence_gap":
+            report.local_l2_sequence_gap_count += 1
+            report.local_l2_sequence_gap_by_reason[r["reason"]] = (
+                report.local_l2_sequence_gap_by_reason.get(r["reason"], 0) + 1
+            )
+        elif kind == "runtime.local_l2_sync_failed":
+            report.local_l2_sync_failed_count += 1
+            report.local_l2_sync_failed_by_category[r["category"]] = (
+                report.local_l2_sync_failed_by_category.get(r["category"], 0) + 1
+            )
+
+    # Diagnostic facts (scan, execution, fail-closed)
+    for row in conn.execute(
+        "SELECT kind, reason, classification FROM diagnostic_facts ORDER BY seq"
+    ):
+        r = dict(row)
+        kind = r["kind"]
+        if kind == "scan.no_entry_diagnostics":
+            report.scan_no_entry_diagnostics_count += 1
+        elif kind == "scan.runtime_gate_blocked":
+            report.scan_runtime_gate_blocked_count += 1
+        elif kind == "execution.entry_liquidity_blocked":
+            report.execution_liquidity_blocked_count += 1
+            reason = r["reason"]
+            report.entry_liquidity_blocked_by_reason[reason] = (
+                report.entry_liquidity_blocked_by_reason.get(reason, 0) + 1
+            )
+            cls = r["classification"]
+            if cls:
+                report.execution_liquidity_blocked_by_class[cls] = (
+                    report.execution_liquidity_blocked_by_class.get(cls, 0) + 1
+                )
+        elif kind.startswith("runtime.fail_closed"):
+            reason = r["reason"]
+            report.fail_closed_reason_counts[reason] = (
+                report.fail_closed_reason_counts.get(reason, 0) + 1
+            )
+
+    # Total records = sum of all projected facts (approximate but sufficient for reporting)
+    total = 0
+    for table in ["order_facts", "entry_exit_facts", "risk_counter_facts",
+                   "local_l2_health_facts", "diagnostic_facts"]:
+        row = conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()
+        total += row["cnt"] if row else 0
+    report.total_records = total
+
+    return report
+
+
+def analyze_journal_or_store(
+    conn: sqlite3.Connection | None,
+    records: list[dict] | None = None,
+) -> JournalAnalysisReport:
+    """Store-first analysis with journal fallback.
+
+    If the store has projection data, query it directly.
+    Otherwise fall back to journal record scan.
+    Recovery/lifecycle evidence is only available via journal scan.
+    """
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT total_facts_written FROM projection_cursor WHERE id = 1"
+            ).fetchone()
+            if row and row["total_facts_written"] > 0:
+                return analyze_from_store(conn)
+        except Exception:
+            pass  # Fall through to journal scan
+
+    if records is not None:
+        return analyze_journal_records(records)
+
+    return JournalAnalysisReport()

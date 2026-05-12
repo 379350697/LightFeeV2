@@ -40,6 +40,13 @@ class PersistenceMetrics:
     snapshot_reads: int = 0
     sqlite_writes: int = 0
 
+    # Projection counters
+    projection_appends: int = 0
+    projection_skips: int = 0
+    projection_failures: int = 0
+    last_projection_seq: int = 0
+    last_projection_at_ms: int = 0
+
     # Timestamps
     last_journal_append_ms: int = 0
     last_snapshot_write_ms: int = 0
@@ -107,6 +114,25 @@ class PersistenceMetrics:
 
     def record_snapshot_read(self) -> None:
         self.snapshot_reads += 1
+
+    # -------------- Projection methods --------------
+
+    def record_projection_append(self, seq: int, ts_ms: int) -> None:
+        self.projection_appends += 1
+        self.sqlite_writes += 1
+        self.last_projection_seq = seq
+        self.last_projection_at_ms = ts_ms
+
+    def record_projection_skip(self) -> None:
+        self.projection_skips += 1
+
+    def record_projection_failure(self) -> None:
+        self.projection_failures += 1
+
+    @property
+    def projection_lag(self) -> int:
+        """How many journal appends behind the projection cursor is."""
+        return max(0, self.journal_appends - self.last_projection_seq)
 
     # -------------- Runtime health methods --------------
 
