@@ -250,6 +250,8 @@ def replay_journal_records(
     open_ids: set[str] = set()
     pending_entry_ids: set[str] = set()
     pending_close_ids: set[str] = set()
+    # Map close_id -> position_id for correct cleanup on close
+    _close_to_position: dict[str, str] = {}
 
     scan_stats: dict[str, Any] | None = None
     recovery_events: list[dict[str, Any]] = []
@@ -299,6 +301,12 @@ def replay_journal_records(
                 positions[pid] = _normalize_position_snapshot(payload)
                 open_ids.add(pid)
                 pending_entry_ids.discard(pid)
+            # Track recovery.live_detected as a recovery event (V1 parity)
+            if kind == "recovery.live_detected":
+                recovery_events.append({
+                    "kind": kind, "payload": dict(payload),
+                    "seq": record.get("seq"),
+                })
 
         elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
             pid = payload.get("position_id", "")
@@ -306,6 +314,11 @@ def replay_journal_records(
                 del positions[pid]
                 open_ids.discard(pid)
             pending_close_ids.discard(pid)
+            # Also remove any pending close registered for this position
+            stale_closes = [cid for cid, cpid in _close_to_position.items() if cpid == pid]
+            for cid in stale_closes:
+                pending_close_ids.discard(cid)
+                del _close_to_position[cid]
 
         elif kind == "exit.partial_closed":
             pid = payload.get("position_id", "")
@@ -330,8 +343,11 @@ def replay_journal_records(
 
         elif kind == "exit.pending_close_registered":
             cid = payload.get("close_id", "")
+            pid = payload.get("position_id", "")
             if cid:
                 pending_close_ids.add(cid)
+                if pid:
+                    _close_to_position[cid] = pid
 
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")

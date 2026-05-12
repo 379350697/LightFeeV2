@@ -21,19 +21,33 @@ class OpenPosition:
     long_entry_price: float
     short_entry_price: float
     opened_at_ms: int
+    # --- Review & origin (V1 review_id, opportunity_origin_tags, opportunity_hint_source) ---
+    review_id: str | None = None
+    opportunity_origin_tags: list[str] = field(default_factory=list)
+    opportunity_hint_source: str | None = None
     # --- Entry fees (matched Rust V1 total_entry_fee_quote per leg) ---
     long_entry_fee_quote: float = 0.0
     short_entry_fee_quote: float = 0.0
     # --- PnL attribution (matches Rust V1 realized_* fields) ---
     realized_price_pnl_quote: float = 0.0
     realized_exit_fee_quote: float = 0.0
+    # --- Risk/Protection PnL (V1 risk_delever_*, protection_*) ---
+    risk_delever_realized_price_pnl_quote: float = 0.0
+    risk_delever_realized_exit_fee_quote: float = 0.0
+    protection_realized_price_pnl_quote: float = 0.0
+    protection_realized_exit_fee_quote: float = 0.0
     # --- Funding accrual (Rust V1 captured_funding_quote, funding_captured) ---
     captured_funding_quote: float = 0.0
     funding_captured: bool = False
+    # --- Edge breakdowns (V1 funding_edge_bps_entry, total_funding_edge_bps_entry, expected_edge_bps_entry) ---
+    funding_edge_bps_entry: float = 0.0
+    total_funding_edge_bps_entry: float = 0.0
+    expected_edge_bps_entry: float = 0.0
     # --- Edge & net tracking (Rust V1 peak_net_quote, current_net_quote) ---
     peak_net_quote: float = 0.0
     current_net_quote: float = 0.0
     # --- Close deadlines (Rust V1 settlement_half_closed_*, last_risk_action_at_ms) ---
+    settlement_half_closed_quantity: float = 0.0
     settlement_half_closed_at_ms: int = 0
     last_risk_action_at_ms: int = 0
     # --- Risk action tracking (Rust V1 risk_delever_step_count, last_risk_reason) ---
@@ -51,6 +65,22 @@ class OpenPosition:
     second_funding_timestamp_ms: int = 0
     second_stage_funding_captured: bool = False
     second_stage_funding_quote: float = 0.0
+    # --- Transfer & liquidity (V1 transfer_state_at_entry, entry_liquidity_source_at_entry) ---
+    transfer_state_at_entry: str | None = None
+    entry_liquidity_source_at_entry: str | None = None
+    # --- VWAP (V1 long_entry_vwap, short_entry_vwap) ---
+    long_entry_vwap: float | None = None
+    short_entry_vwap: float | None = None
+    # --- Capacity constraints (V1 entry_capacity_constrained) ---
+    entry_capacity_constrained: bool = False
+    # --- Advisories & blocked reasons (V1 advisories, blocked_reasons) ---
+    advisories: list[str] = field(default_factory=list)
+    blocked_reasons: list[str] = field(default_factory=list)
+    # --- Quality markouts (V1 entry_quality_markout_5s/30s_emitted) ---
+    entry_quality_markout_5s_emitted: bool = False
+    entry_quality_markout_30s_emitted: bool = False
+    # --- Exit reason (V1 exit_reason) ---
+    exit_reason: str | None = None
     # --- Fills (orders that created this position, for reconciliation) ---
     long_fill: OrderFill | None = None
     short_fill: OrderFill | None = None
@@ -70,6 +100,8 @@ class PendingEntry:
     long_side: Side
     short_side: Side
     created_at_ms: int
+    # --- Metadata (V1: arbitrary metadata dict for entry context) ---
+    metadata: dict = field(default_factory=dict)
     # --- Order IDs for reconciliation (Rust V1 maker/hedge order tracking) ---
     maker_order_id: str = ""
     hedge_order_id: str = ""
@@ -281,6 +313,25 @@ class EngineState:
     last_tick_ms: int = 0
     tick_count: int = 0
     venue_health: dict[str, str] = field(default_factory=dict)
+    # --- Recovery blocked state (V1 recovery_blocked_reason, recovery_blocked_at_ms) ---
+    recovery_blocked_reason: str | None = None
+    recovery_blocked_at_ms: int = 0
+    # --- Global risk reason (V1 global_risk_reason) ---
+    global_risk_reason: str | None = None
+    # --- Pending residual repairs (V1 pending_residual_repairs) ---
+    pending_residual_repairs: list = field(default_factory=list)
+    # --- Live recovery reduce-only pairs (V1 live_recovery_reduce_only_pairs) ---
+    live_recovery_reduce_only_pairs: list = field(default_factory=list)
+    # --- Venue entry cooldowns (V1 venue_entry_cooldowns) ---
+    venue_entry_cooldowns: dict = field(default_factory=dict)
+    # --- Venue market data degradations (V1 venue_market_data_degradations) ---
+    venue_market_data_degradations: dict = field(default_factory=dict)
+    # --- Transfer truth outage state (V1 transfer_truth) ---
+    transfer_truth: dict = field(default_factory=dict)
+    # --- Entry liquidity qualification records (V1 entry_liquidity_qualification_records) ---
+    entry_liquidity_qualification_records: list = field(default_factory=list)
+    # --- Pending close reconciliations (V1 pending_close_reconciliations) ---
+    pending_close_reconciliations: list = field(default_factory=list)
     # --- Local-L2 state for persistence/recovery (V1 parity) ---
     retained_local_l2_books: list[dict] = field(default_factory=list)
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
@@ -298,6 +349,16 @@ class EngineState:
             "pending_entry_count": len(self.pending_entries),
             "pending_close_count": len(self.pending_closes),
             "pending_passive_close_count": len(self.pending_passive_closes),
+            "global_risk_reason": self.global_risk_reason,
+            "recovery_blocked_reason": self.recovery_blocked_reason,
+            "recovery_blocked_at_ms": self.recovery_blocked_at_ms,
+            "pending_residual_repairs": self.pending_residual_repairs,
+            "live_recovery_reduce_only_pairs": self.live_recovery_reduce_only_pairs,
+            "venue_entry_cooldowns": self.venue_entry_cooldowns,
+            "venue_market_data_degradations": self.venue_market_data_degradations,
+            "transfer_truth": self.transfer_truth,
+            "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,
+            "pending_close_reconciliations": self.pending_close_reconciliations,
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,
@@ -305,6 +366,9 @@ class EngineState:
                 pid: {
                     "position_id": pos.position_id,
                     "symbol": pos.symbol,
+                    "review_id": pos.review_id,
+                    "opportunity_origin_tags": pos.opportunity_origin_tags,
+                    "opportunity_hint_source": pos.opportunity_hint_source,
                     "long_venue": pos.long_venue.value,
                     "short_venue": pos.short_venue.value,
                     "long_quantity": pos.long_quantity,
@@ -319,8 +383,27 @@ class EngineState:
                     "current_net_quote": pos.current_net_quote,
                     "realized_price_pnl_quote": pos.realized_price_pnl_quote,
                     "realized_exit_fee_quote": pos.realized_exit_fee_quote,
+                    "risk_delever_realized_price_pnl_quote": pos.risk_delever_realized_price_pnl_quote,
+                    "risk_delever_realized_exit_fee_quote": pos.risk_delever_realized_exit_fee_quote,
+                    "protection_realized_price_pnl_quote": pos.protection_realized_price_pnl_quote,
+                    "protection_realized_exit_fee_quote": pos.protection_realized_exit_fee_quote,
                     "long_entry_fee_quote": pos.long_entry_fee_quote,
                     "short_entry_fee_quote": pos.short_entry_fee_quote,
+                    "funding_edge_bps_entry": pos.funding_edge_bps_entry,
+                    "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
+                    "expected_edge_bps_entry": pos.expected_edge_bps_entry,
+                    "transfer_state_at_entry": pos.transfer_state_at_entry,
+                    "entry_liquidity_source_at_entry": pos.entry_liquidity_source_at_entry,
+                    "long_entry_vwap": pos.long_entry_vwap,
+                    "short_entry_vwap": pos.short_entry_vwap,
+                    "entry_capacity_constrained": pos.entry_capacity_constrained,
+                    "advisories": pos.advisories,
+                    "blocked_reasons": pos.blocked_reasons,
+                    "entry_quality_markout_5s_emitted": pos.entry_quality_markout_5s_emitted,
+                    "entry_quality_markout_30s_emitted": pos.entry_quality_markout_30s_emitted,
+                    "settlement_half_closed_quantity": pos.settlement_half_closed_quantity,
+                    "settlement_half_closed_at_ms": pos.settlement_half_closed_at_ms,
+                    "exit_reason": pos.exit_reason,
                     "risk_delever_step_count": pos.risk_delever_step_count,
                     "last_risk_reason": pos.last_risk_reason,
                     "single_side_protection_triggered": pos.single_side_protection_triggered,

@@ -179,6 +179,9 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         long_entry_price=float(data.get("long_entry_price", 0)),
         short_entry_price=float(data.get("short_entry_price", 0)),
         opened_at_ms=int(data.get("opened_at_ms", 0)),
+        review_id=data.get("review_id"),
+        opportunity_origin_tags=list(data.get("opportunity_origin_tags", [])),
+        opportunity_hint_source=data.get("opportunity_hint_source"),
         matched_quantity=float(data.get("matched_quantity", 0)),
         captured_funding_quote=float(data.get("captured_funding_quote", 0)),
         funding_captured=bool(data.get("funding_captured", False)),
@@ -186,8 +189,27 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         current_net_quote=float(data.get("current_net_quote", 0)),
         realized_price_pnl_quote=float(data.get("realized_price_pnl_quote", 0)),
         realized_exit_fee_quote=float(data.get("realized_exit_fee_quote", 0)),
+        risk_delever_realized_price_pnl_quote=float(data.get("risk_delever_realized_price_pnl_quote", 0)),
+        risk_delever_realized_exit_fee_quote=float(data.get("risk_delever_realized_exit_fee_quote", 0)),
+        protection_realized_price_pnl_quote=float(data.get("protection_realized_price_pnl_quote", 0)),
+        protection_realized_exit_fee_quote=float(data.get("protection_realized_exit_fee_quote", 0)),
         long_entry_fee_quote=float(data.get("long_entry_fee_quote", 0)),
         short_entry_fee_quote=float(data.get("short_entry_fee_quote", 0)),
+        funding_edge_bps_entry=float(data.get("funding_edge_bps_entry", 0)),
+        total_funding_edge_bps_entry=float(data.get("total_funding_edge_bps_entry", 0)),
+        expected_edge_bps_entry=float(data.get("expected_edge_bps_entry", 0)),
+        transfer_state_at_entry=data.get("transfer_state_at_entry"),
+        entry_liquidity_source_at_entry=data.get("entry_liquidity_source_at_entry"),
+        long_entry_vwap=data.get("long_entry_vwap"),
+        short_entry_vwap=data.get("short_entry_vwap"),
+        entry_capacity_constrained=bool(data.get("entry_capacity_constrained", False)),
+        advisories=list(data.get("advisories", [])),
+        blocked_reasons=list(data.get("blocked_reasons", [])),
+        entry_quality_markout_5s_emitted=bool(data.get("entry_quality_markout_5s_emitted", False)),
+        entry_quality_markout_30s_emitted=bool(data.get("entry_quality_markout_30s_emitted", False)),
+        settlement_half_closed_quantity=float(data.get("settlement_half_closed_quantity", 0)),
+        settlement_half_closed_at_ms=int(data.get("settlement_half_closed_at_ms", 0)),
+        exit_reason=data.get("exit_reason"),
     )
 
 
@@ -196,6 +218,9 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
     return {
         "position_id": pos.position_id,
         "symbol": pos.symbol,
+        "review_id": pos.review_id,
+        "opportunity_origin_tags": pos.opportunity_origin_tags,
+        "opportunity_hint_source": pos.opportunity_hint_source,
         "long_venue": pos.long_venue.value,
         "short_venue": pos.short_venue.value,
         "long_quantity": pos.long_quantity,
@@ -210,8 +235,27 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "current_net_quote": pos.current_net_quote,
         "realized_price_pnl_quote": pos.realized_price_pnl_quote,
         "realized_exit_fee_quote": pos.realized_exit_fee_quote,
+        "risk_delever_realized_price_pnl_quote": pos.risk_delever_realized_price_pnl_quote,
+        "risk_delever_realized_exit_fee_quote": pos.risk_delever_realized_exit_fee_quote,
+        "protection_realized_price_pnl_quote": pos.protection_realized_price_pnl_quote,
+        "protection_realized_exit_fee_quote": pos.protection_realized_exit_fee_quote,
         "long_entry_fee_quote": pos.long_entry_fee_quote,
         "short_entry_fee_quote": pos.short_entry_fee_quote,
+        "funding_edge_bps_entry": pos.funding_edge_bps_entry,
+        "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
+        "expected_edge_bps_entry": pos.expected_edge_bps_entry,
+        "transfer_state_at_entry": pos.transfer_state_at_entry,
+        "entry_liquidity_source_at_entry": pos.entry_liquidity_source_at_entry,
+        "long_entry_vwap": pos.long_entry_vwap,
+        "short_entry_vwap": pos.short_entry_vwap,
+        "entry_capacity_constrained": pos.entry_capacity_constrained,
+        "advisories": pos.advisories,
+        "blocked_reasons": pos.blocked_reasons,
+        "entry_quality_markout_5s_emitted": pos.entry_quality_markout_5s_emitted,
+        "entry_quality_markout_30s_emitted": pos.entry_quality_markout_30s_emitted,
+        "settlement_half_closed_quantity": pos.settlement_half_closed_quantity,
+        "settlement_half_closed_at_ms": pos.settlement_half_closed_at_ms,
+        "exit_reason": pos.exit_reason,
     }
 
 
@@ -236,6 +280,16 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.last_tick_ms = snap.get("last_tick_ms", 0)
     state.tick_count = snap.get("tick_count", 0)
     state.venue_health = snap.get("venue_health", {})
+    state.global_risk_reason = snap.get("global_risk_reason")
+    state.recovery_blocked_reason = snap.get("recovery_blocked_reason")
+    state.recovery_blocked_at_ms = int(snap.get("recovery_blocked_at_ms", 0))
+    state.pending_residual_repairs = snap.get("pending_residual_repairs", [])
+    state.live_recovery_reduce_only_pairs = snap.get("live_recovery_reduce_only_pairs", [])
+    state.venue_entry_cooldowns = snap.get("venue_entry_cooldowns", {})
+    state.venue_market_data_degradations = snap.get("venue_market_data_degradations", {})
+    state.transfer_truth = snap.get("transfer_truth", {})
+    state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
+    state.pending_close_reconciliations = snap.get("pending_close_reconciliations", [])
 
     # Restore operator control state
     op = snap.get("operator", {})
@@ -461,7 +515,8 @@ def recover_from_snapshot(
     3. Assess recovery needs → set lifecycle/risk_mode
     """
     snap = snapshot_store.read()
-    state = _restore_state_from_snapshot_dict(snap) if snap else EngineState()
+    has_snapshot = snap is not None
+    state = _restore_state_from_snapshot_dict(snap) if has_snapshot else EngineState()
 
     # Emit recovery.live_detected for each position restored from snapshot
     # (V1: recovery.live_detected is recorded when live positions are detected at startup)
@@ -522,8 +577,15 @@ def recover_from_snapshot(
 
 
 def is_ambiguous_live_truth(state: EngineState) -> bool:
-    """Check if the live position truth is ambiguous (no private confirmation)."""
-    return state.lifecycle == EngineLifecycle.RECONCILING and len(state.open_positions) > 0
+    """Check if the live position truth is ambiguous (no private confirmation).
+
+    V1: BOOTING with open positions is ambiguous because we haven't confirmed
+    positions against venue truth yet. RECONCILING with open positions is also
+    ambiguous until reconciliation completes.
+    """
+    if len(state.open_positions) == 0:
+        return False
+    return state.lifecycle in (EngineLifecycle.BOOTING, EngineLifecycle.RECONCILING)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +599,18 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     normalizes positions before serialization.
     """
     view = state.to_dict()
+
+    # Add new EngineState V1 fields to persistent view
+    view["global_risk_reason"] = state.global_risk_reason
+    view["recovery_blocked_reason"] = state.recovery_blocked_reason
+    view["recovery_blocked_at_ms"] = state.recovery_blocked_at_ms
+    view["pending_residual_repairs"] = state.pending_residual_repairs
+    view["live_recovery_reduce_only_pairs"] = state.live_recovery_reduce_only_pairs
+    view["venue_entry_cooldowns"] = state.venue_entry_cooldowns
+    view["venue_market_data_degradations"] = state.venue_market_data_degradations
+    view["transfer_truth"] = state.transfer_truth
+    view["entry_liquidity_qualification_records"] = state.entry_liquidity_qualification_records
+    view["pending_close_reconciliations"] = state.pending_close_reconciliations
 
     # Add open position details
     view["open_positions"] = {
