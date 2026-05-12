@@ -7,6 +7,7 @@ Rust references:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional
@@ -14,6 +15,15 @@ from typing import Optional
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.state import OpenPosition
+
+
+def generate_review_id() -> str:
+    """Generate a unique review id for observability tracing.
+
+    V1: review_id is a short unique identifier that survives through the
+    full position lifecycle — entry, journal, state snapshot, offline analysis.
+    """
+    return f"rev-{uuid.uuid4().hex[:12]}"
 
 
 class EntryState(Enum):
@@ -141,6 +151,7 @@ def build_open_position(
     maker_fill: OrderFill,
     hedge_fill: OrderFill,
     now_ms: int,
+    review_id: str | None = None,
 ) -> OpenPosition:
     """Build an OpenPosition from completed entry fills."""
     maker_is_long = ctx.maker_leg == Side.BUY
@@ -169,6 +180,7 @@ def build_open_position(
         long_entry_price=long_entry_price,
         short_entry_price=short_entry_price,
         opened_at_ms=now_ms,
+        review_id=review_id,
         long_fill=long_fill,
         short_fill=short_fill,
     )

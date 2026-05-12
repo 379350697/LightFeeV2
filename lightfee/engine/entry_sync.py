@@ -25,6 +25,7 @@ from lightfee.engine.entry import (
     advance_entry_state,
     build_entry_orders,
     build_open_position,
+    generate_review_id,
 )
 from lightfee.engine.execution_planner import (
     ExecutionRoute,
@@ -73,6 +74,15 @@ class EntrySyncExecutor:
         overrides = config_overrides or {}
         self.deadline_ms: int = overrides.get("deadline_ms", 30_000)
         self.min_matched_ratio: float = overrides.get("min_matched_ratio", 0.95)
+        # --- V1 active entry/passive-maker knobs ---
+        self.maker_entry_max_reposts: int = overrides.get("maker_entry_max_reposts", 0)
+        self.pending_entry_zero_fill_terminal_cooldown_ms: int = overrides.get(
+            "pending_entry_zero_fill_terminal_cooldown_ms", 0
+        )
+        # --- V1 review observability ---
+        self.review_observability_enabled: bool = overrides.get(
+            "review_observability_enabled", False
+        )
 
     # ------------------------------------------------------------------
     # Main execution entry point
@@ -85,12 +95,65 @@ class EntrySyncExecutor:
         - Creates PendingEntry on uncertain outcomes for reconciliation
         - Tracks clientOrderId in all journal events
         - Propagates TIF/reduce-only through order requests
+        - Enforces maker_entry_max_reposts limit
+        - Generates and propagates review_id when review_observability_enabled
         """
         now_ms = int(time.time() * 1000)
         result = EntryExecutionResult(
             route=ExecutionRoute.REJECTED,
             state=EntryState.IDLE,
         )
+
+        # --- V1: check repost limit ---
+        current_repost_count = 0
+        pending_entries = self.state.get("pending_entries", {})
+        if ctx.entry_id in pending_entries:
+            existing = pending_entries[ctx.entry_id]
+            current_repost_count = getattr(existing, "repost_count", 0) if hasattr(existing, "repost_count") else existing.get("repost_count", 0) if isinstance(existing, dict) else 0
+
+        if self.maker_entry_max_reposts > 0 and current_repost_count >= self.maker_entry_max_reposts:
+            self.journal.append(
+                "entry.aborted",
+                {
+                    "position_id": ctx.entry_id,
+                    "reason": f"max reposts reached ({current_repost_count}/{self.maker_entry_max_reposts})",
+                },
+            )
+            result.state = EntryState.FAILED
+            result.route = ExecutionRoute.REJECTED
+            return result
+
+        # --- V1: zero-fill terminal cooldown check ---
+        if self.pending_entry_zero_fill_terminal_cooldown_ms > 0 and ctx.entry_id in pending_entries:
+            existing = pending_entries[ctx.entry_id]
+            zero_fill_since = (
+                getattr(existing, "zero_fill_since_ms", 0)
+                if hasattr(existing, "zero_fill_since_ms")
+                else existing.get("zero_fill_since_ms", 0) if isinstance(existing, dict) else 0
+            )
+            if zero_fill_since > 0 and (now_ms - zero_fill_since) >= self.pending_entry_zero_fill_terminal_cooldown_ms:
+                self.journal.append(
+                    "entry.aborted",
+                    {
+                        "position_id": ctx.entry_id,
+                        "reason": f"zero-fill terminal cooldown expired ({now_ms - zero_fill_since}ms >= {self.pending_entry_zero_fill_terminal_cooldown_ms}ms)",
+                    },
+                )
+                result.state = EntryState.FAILED
+                result.route = ExecutionRoute.REJECTED
+                return result
+
+        # --- V1: review observability ---
+        review_id: str | None = None
+        if self.review_observability_enabled:
+            review_id = generate_review_id()
+            self.journal.append(
+                "review.assigned",
+                {
+                    "position_id": ctx.entry_id,
+                    "review_id": review_id,
+                },
+            )
 
         # Build order requests with clientOrderId, TIF, reduce_only
         maker_req, hedge_req = build_entry_orders(ctx)
@@ -285,7 +348,7 @@ class EntrySyncExecutor:
             return result
 
         # Success — build OpenPosition
-        position = build_open_position(ctx, maker_fill, hedge_fill, now_ms)
+        position = build_open_position(ctx, maker_fill, hedge_fill, now_ms, review_id=review_id)
         result.open_position = position
         result.state = EntryState.COMPLETED
         result.route = ExecutionRoute.PASSIVE_INCREMENTAL
@@ -318,6 +381,7 @@ class EntrySyncExecutor:
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": maker_req.client_order_id,
                 "hedge_client_order_id": hedge_req.client_order_id,
+                "review_id": review_id or "",
             },
         )
         return result
@@ -337,12 +401,53 @@ class EntrySyncExecutor:
         hedge_order_id: str = "",
         maker_filled: float = 0.0,
         hedge_filled: float = 0.0,
+        repost_count: int = 0,
     ) -> PendingEntry:
         """Create a PendingEntry for reconciliation after uncertain outcomes.
 
         V1: after any non-terminal entry outcome, a PendingEntry is created
         so the reconciliation loop can resolve it via venue queries.
+        Repost count is incremented from the previous pending entry if it exists.
+        Zero-fill timing starts when both legs have zero cumulative fills.
         """
+        # Determine repost count and zero-fill state from existing pending entry
+        pending_entries = self.state.get("pending_entries", {})
+        existing = pending_entries.get(ctx.entry_id)
+        if existing is not None and repost_count == 0:
+            repost_count = (
+                getattr(existing, "repost_count", 0)
+                if hasattr(existing, "repost_count")
+                else existing.get("repost_count", 0) if isinstance(existing, dict) else 0
+            )
+        next_repost_count = repost_count + 1
+        maker_filled_total = maker_filled
+        hedge_filled_total = hedge_filled
+        if existing is not None:
+            prev_maker = (
+                getattr(existing, "maker_leg_filled", 0)
+                if hasattr(existing, "maker_leg_filled")
+                else existing.get("maker_leg_filled", 0) if isinstance(existing, dict) else 0
+            )
+            prev_hedge = (
+                getattr(existing, "hedge_leg_filled", 0)
+                if hasattr(existing, "hedge_leg_filled")
+                else existing.get("hedge_leg_filled", 0) if isinstance(existing, dict) else 0
+            )
+            maker_filled_total = maker_filled or prev_maker
+            hedge_filled_total = hedge_filled or prev_hedge
+
+        # Zero-fill detection: both legs still zero
+        zero_fill_since_ms = 0
+        if maker_filled_total == 0.0 and hedge_filled_total == 0.0:
+            prev_zero = 0
+            if existing is not None:
+                prev_zero = (
+                    getattr(existing, "zero_fill_since_ms", 0)
+                    if hasattr(existing, "zero_fill_since_ms")
+                    else existing.get("zero_fill_since_ms", 0) if isinstance(existing, dict) else 0
+                )
+            zero_fill_since_ms = prev_zero if prev_zero > 0 else now_ms
+
         maker_is_long = ctx.maker_leg == Side.BUY
         return PendingEntry(
             pending_id=ctx.entry_id,
@@ -357,8 +462,8 @@ class EntrySyncExecutor:
             hedge_order_id=hedge_order_id,
             maker_client_order_id=maker_req.client_order_id or "",
             hedge_client_order_id=hedge_req.client_order_id or "",
-            maker_leg_filled=maker_filled,
-            hedge_leg_filled=hedge_filled,
+            maker_leg_filled=maker_filled_total,
+            hedge_leg_filled=hedge_filled_total,
             uncertain_outcome=(outcome != "filled"),
             entry_type=ctx.entry_type.value,
             maker_price=maker_req.price or 0.0,
@@ -367,6 +472,8 @@ class EntrySyncExecutor:
             deadline_ms=now_ms + self.deadline_ms,
             entry_route=ctx.planned_route.value,
             outcome=outcome,
+            repost_count=next_repost_count,
+            zero_fill_since_ms=zero_fill_since_ms,
         )
 
     # ------------------------------------------------------------------

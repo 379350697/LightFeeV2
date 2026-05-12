@@ -226,6 +226,7 @@ def _normalize_position_snapshot(pdata: dict[str, Any]) -> dict[str, Any]:
         "second_stage_funding_captured": bool(
             pdata.get("second_stage_funding_captured", False)
         ),
+        "review_id": pdata.get("review_id", None),
     }
 
 
@@ -272,6 +273,7 @@ def replay_journal_records(
         "risk.single_side_protection_unavailable",
         "scan.completed", "scan.no_entry_diagnostics",
         "scan.runtime_gate_blocked",
+        "review.assigned",
     })
 
     if seed_state:

@@ -130,6 +130,10 @@ class PendingEntry:
     # --- V1 entry route and outcome tracking ---
     entry_route: str = ""
     outcome: str = ""  # "filled", "rejected", "uncertain", "partial"
+    # --- V1 maker entry repost tracking ---
+    repost_count: int = 0
+    # --- V1 zero-fill terminal cooldown ---
+    zero_fill_since_ms: int = 0
 
 
 # ---------------------------------------------------------------------------
