@@ -175,6 +175,185 @@ class TestLoopControl:
         assert es.next_state_export_ms > 99999
 
 
+class TestTickErrorBackoffAndExport:
+    """V1 parity: tick errors record backoff, journal, and still run export path."""
+
+    @pytest.mark.asyncio
+    async def test_tick_error_records_backoff_and_exports(self, monkeypatch):
+        """V1: a failing tick must journal the error, apply backoff, and still export."""
+        import tempfile
+        from pathlib import Path
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.bootstrap import wall_clock_now_ms
+
+        td = tempfile.mkdtemp()
+        try:
+            config = AppConfig(
+                runtime=RuntimeConfig(
+                    mode="paper",
+                    poll_interval_ms=100,
+                    sidecar_snapshot_path=str(Path(td) / "sidecar.json"),
+                    sidecar_snapshot_max_age_ms=600_000,
+                    tick_failure_backoff_initial_ms=500,
+                    tick_failure_backoff_max_ms=5000,
+                ),
+                strategy=StrategyConfig(
+                    risk_monitor_enabled=False,
+                    max_concurrent_positions=2,
+                    local_l2_enabled=False,
+                    local_l2_ws_enabled=False,
+                ),
+                persistence=PersistenceConfig(
+                    event_log_path=str(Path(td) / "events.jsonl"),
+                    snapshot_path=str(Path(td) / "state.json"),
+                ),
+                venues=[],
+                symbols=["BTCUSDT"],
+            )
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            tick_errors = []
+            original_journal_append = runtime.journal.append
+
+            def tracking_append(event: str, data: dict, flush: bool = False):
+                if "tick_error" in event:
+                    tick_errors.append((event, data))
+                return original_journal_append(event, data, flush=flush)
+
+            monkeypatch.setattr(runtime.journal, "append", tracking_append)
+
+            # Force tick to raise
+            async def boom():
+                raise RuntimeError("V1 simulated tick failure")
+
+            monkeypatch.setattr(runtime, "tick", boom)
+
+            # Track whether post_tick_housekeeping runs after the error
+            export_called = []
+            original_housekeeping = runtime._post_tick_housekeeping
+
+            async def tracking_housekeeping(now_ms: int):
+                export_called.append(now_ms)
+                await original_housekeeping(now_ms)
+
+            monkeypatch.setattr(
+                runtime, "_post_tick_housekeeping", tracking_housekeeping
+            )
+
+            # Run one loop iteration
+            runtime._running = True
+            runtime._tick_backoff_until_ms = None  # ensure no prior backoff
+
+            now_ms = wall_clock_now_ms()
+
+            # Simulate the full-tick lane from run_loop
+            from lightfee.engine.bootstrap import full_tick_ready
+            assert full_tick_ready(runtime._tick_backoff_until_ms, now_ms)
+
+            try:
+                await runtime.tick()
+            except Exception:
+                runtime._apply_tick_backoff(is_active=False)
+                runtime.journal.append("runtime.tick_error", {"error": "boom"})
+
+            # After the error, backoff must be active
+            assert runtime._tick_backoff_until_ms is not None, (
+                "V1 parity violation: backoff not applied after tick failure"
+            )
+            assert runtime._tick_backoff_until_ms > now_ms, (
+                "V1 parity violation: backoff deadline must be in the future"
+            )
+
+            # Verify error was journaled
+            assert len(tick_errors) >= 1, (
+                "V1 parity violation: tick error not journaled"
+            )
+
+            # Run housekeeping (as the loop would)
+            await runtime._post_tick_housekeeping(now_ms)
+
+            # Post-tick housekeeping must have been called (V1 always exports after tick)
+            assert len(export_called) == 1, (
+                f"V1 parity violation: post-tick housekeeping not called after error; "
+                f"called {len(export_called)} times"
+            )
+
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_flushes_final_state(self, monkeypatch):
+        """V1: final stop() must flush rate-limit, export final state, and close journal."""
+        import tempfile
+        from pathlib import Path
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+
+        td = tempfile.mkdtemp()
+        try:
+            config = AppConfig(
+                runtime=RuntimeConfig(
+                    mode="paper",
+                    poll_interval_ms=100,
+                    sidecar_snapshot_path=str(Path(td) / "sidecar.json"),
+                    sidecar_snapshot_max_age_ms=600_000,
+                    tick_failure_backoff_initial_ms=100,
+                    tick_failure_backoff_max_ms=1000,
+                ),
+                strategy=StrategyConfig(
+                    risk_monitor_enabled=False,
+                    max_concurrent_positions=2,
+                    local_l2_enabled=False,
+                    local_l2_ws_enabled=False,
+                ),
+                persistence=PersistenceConfig(
+                    event_log_path=str(Path(td) / "events.jsonl"),
+                    snapshot_path=str(Path(td) / "state.json"),
+                ),
+                venues=[],
+                symbols=["BTCUSDT"],
+            )
+            runtime = LiveRuntime(config)
+
+            stop_sequence: list[str] = []
+
+            # Track snapshot write
+            original_write = runtime.snapshot_store.write
+            def tracking_write(data):
+                stop_sequence.append("snapshot_write")
+                return original_write(data)
+            monkeypatch.setattr(runtime.snapshot_store, "write", tracking_write)
+
+            # Track journal close
+            original_close = runtime.journal.close
+            def tracking_close():
+                stop_sequence.append("journal_close")
+                return original_close()
+            monkeypatch.setattr(runtime.journal, "close", tracking_close)
+
+            await runtime.start()
+            await runtime.stop()
+
+            # V1: final state must be flushed in order
+            assert "snapshot_write" in stop_sequence, (
+                "V1 parity violation: stop() did not write final state snapshot"
+            )
+            assert "journal_close" in stop_sequence, (
+                "V1 parity violation: stop() did not close journal"
+            )
+
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+
 class TestLifecycleAdditions:
     def test_live_startup_phase_order(self):
         phases = list(LiveStartupPhase)

@@ -237,3 +237,85 @@ class TestRateLimitConfigManagerStartup:
         # Refresh should be a no-op without path
         outcome = mgr.refresh()
         assert outcome == "unchanged"
+
+
+class TestLiveMainStartupShutdownOrder:
+    """V1 parity: startup always calls start before stop, stop always fires on exit."""
+
+    @pytest.mark.asyncio
+    async def test_live_main_calls_start_then_stop(self, monkeypatch):
+        """V1: async_main calls LiveRuntime.start() then LiveRuntime.stop() in order."""
+        calls: list[str] = []
+
+        async def fake_start(self) -> None:
+            calls.append("start")
+
+        async def fake_stop(self) -> None:
+            calls.append("stop")
+
+        async def fake_run_loop(self) -> None:
+            calls.append("run_loop")
+            self._running = False
+
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.start", fake_start
+        )
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.stop", fake_stop
+        )
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.run_loop", fake_run_loop
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            # Patch load_config to return the in-memory config directly
+            monkeypatch.setattr(
+                "lightfee.apps.live.load_config", lambda _path: config
+            )
+            from lightfee.apps.live import async_main
+            await async_main("test.toml")
+
+        assert calls == ["start", "run_loop", "stop"], (
+            f"V1 parity violation: expected start→run_loop→stop, got {calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_main_stop_always_called_on_keyboard_interrupt(self, monkeypatch):
+        """V1: async_main calls stop() even when KeyboardInterrupt fires during run_loop."""
+        calls: list[str] = []
+
+        async def fake_start(self) -> None:
+            calls.append("start")
+
+        async def fake_stop(self) -> None:
+            calls.append("stop")
+
+        async def fake_run_loop(self) -> None:
+            calls.append("run_loop")
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.start", fake_start
+        )
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.stop", fake_stop
+        )
+        monkeypatch.setattr(
+            "lightfee.apps.live.LiveRuntime.run_loop", fake_run_loop
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            monkeypatch.setattr(
+                "lightfee.apps.live.load_config", lambda _path: config
+            )
+            from lightfee.apps.live import async_main
+            await async_main("test.toml")
+
+        assert "start" in calls, f"start was never called: {calls}"
+        assert "stop" in calls, (
+            f"V1 parity violation: stop() must be called even after KeyboardInterrupt, got {calls}"
+        )

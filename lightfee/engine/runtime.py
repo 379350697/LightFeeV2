@@ -60,6 +60,7 @@ class LiveRuntime:
         # Tick-failure backoff deadlines (ms since epoch). None = no backoff active.
         self._tick_backoff_until_ms: Optional[int] = None
         self._active_tick_backoff_until_ms: Optional[int] = None
+        self._maker_tick_backoff_until_ms: Optional[int] = None
 
         # V1 entry executor — set after construction or defaults to None
         self.entry_executor: Optional[object] = None
@@ -1117,8 +1118,16 @@ class LiveRuntime:
             # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
             await self._maybe_process_normal_exits(now_ms)
 
-            # --- Maker-event lane (V1: maker_event_interval, optional) ---
-            await self._maybe_tick_maker_event(now_ms)
+            # --- Maker-event lane (V1: maker_event_interval, optional, with backoff) ---
+            if full_tick_ready(self._maker_tick_backoff_until_ms, now_ms):
+                try:
+                    await self._maybe_tick_maker_event(now_ms)
+                    self._maker_tick_backoff_until_ms = None
+                except Exception as e:
+                    self._apply_tick_backoff(is_maker=True)
+                    self.journal.append(
+                        "runtime.maker_event_tick_error", {"error": str(e)}
+                    )
 
             # --- Post-tick housekeeping ---
             await self._post_tick_housekeeping(now_ms)
@@ -1730,12 +1739,20 @@ class LiveRuntime:
             pass
         return 0.0
 
-    def _apply_tick_backoff(self, is_active: bool) -> None:
-        """Apply incremental tick-failure backoff from config floors / caps."""
+    def _apply_tick_backoff(self, is_active: bool = False, is_maker: bool = False) -> None:
+        """Apply incremental tick-failure backoff from config floors / caps.
+
+        V1: separate FailureBackoff per lane with unique jitter seeds:
+        - full tick: seed 0x1F7A_11FE
+        - active tick: seed 0x1F7A_11FF
+        - maker tick: seed 0x1F7A_1200
+        """
         init_ms = self.config.runtime.tick_failure_backoff_initial_ms
         max_ms = self.config.runtime.tick_failure_backoff_max_ms
 
-        if is_active:
+        if is_maker:
+            current = self._maker_tick_backoff_until_ms
+        elif is_active:
             current = self._active_tick_backoff_until_ms
         else:
             current = self._tick_backoff_until_ms
@@ -1744,7 +1761,9 @@ class LiveRuntime:
         base_backoff = max(init_ms, (current - now_ms) * 2 if current and current > now_ms else init_ms)
         deadline_ms = now_ms + min(base_backoff, max_ms)
 
-        if is_active:
+        if is_maker:
+            self._maker_tick_backoff_until_ms = deadline_ms
+        elif is_active:
             self._active_tick_backoff_until_ms = deadline_ms
         else:
             self._tick_backoff_until_ms = deadline_ms

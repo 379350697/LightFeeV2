@@ -14,14 +14,13 @@ from lightfee.venues.registry import build_adapter_map
 logger = logging.getLogger("lightfee.live")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="lightfee-live: Live trading process")
-    parser.add_argument(
-        "--config", "-c", default="config/example.toml", help="Path to config TOML"
-    )
-    args = parser.parse_args()
+async def async_main(config_path: str = "config/example.toml") -> None:
+    """Async entry point for live trading (testable without event-loop side effects).
 
-    config = load_config(args.config)
+    V1 parity: always calls runtime.start() before the loop, and runtime.stop()
+    on every exit path (normal return, KeyboardInterrupt, or unexpected error).
+    """
+    config = load_config(config_path)
     venue_adapters = build_adapter_map(config)
     logger.info(
         "built %d venue adapters: %s",
@@ -53,34 +52,45 @@ def main() -> None:
     from lightfee.engine.bootstrap import rate_limit_config_path
 
     rate_limit_config_mgr = RateLimitConfigManager(
-        config_path=rate_limit_config_path(args.config)
+        config_path=rate_limit_config_path(config_path)
     )
     rate_limit_rt = RateLimitRuntime(config_manager=rate_limit_config_mgr)
     install_global_rate_limit_runtime(rate_limit_rt)
     # Wire rate-limit runtime to LiveRuntime for periodic reload
     runtime._rate_limit_runtime = rate_limit_rt
 
-    loop = asyncio.new_event_loop()
-
-    shutdown_requested = False
-
-    async def _run() -> None:
-        nonlocal shutdown_requested
-        await runtime.start()
-        await runtime.run_loop()
-        if not shutdown_requested:
-            await _graceful_shutdown()
+    _stopped = False
 
     async def _graceful_shutdown() -> None:
-        nonlocal shutdown_requested
-        if shutdown_requested:
+        nonlocal _stopped
+        if _stopped:
             return
-        shutdown_requested = True
+        _stopped = True
         logger.info("graceful shutdown initiated")
         await runtime.stop()
 
-    def _on_sigint() -> None:
-        asyncio.ensure_future(_graceful_shutdown(), loop=loop)
+    try:
+        await runtime.start()
+        await runtime.run_loop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await _graceful_shutdown()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="lightfee-live: Live trading process")
+    parser.add_argument(
+        "--config", "-c", default="config/example.toml", help="Path to config TOML"
+    )
+    args = parser.parse_args()
+
+    loop = asyncio.new_event_loop()
+    main_task: asyncio.Task | None = None
+
+    def _request_shutdown() -> None:
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
 
     def _on_sighup() -> None:
         """V1: reload rate-limit config on SIGHUP."""
@@ -94,12 +104,9 @@ def main() -> None:
             logger.error("SIGHUP rate-limit reload failed: %s", e)
 
     # Register signal handlers
-    for sig, handler in (
-        (signal.SIGINT, _on_sigint),
-        (signal.SIGTERM, _on_sigint),
-    ):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, handler)
+            loop.add_signal_handler(sig, _request_shutdown)
         except NotImplementedError:
             pass
 
@@ -111,9 +118,13 @@ def main() -> None:
             pass
 
     try:
-        loop.run_until_complete(_run())
-    except KeyboardInterrupt:
-        loop.run_until_complete(_graceful_shutdown())
+        main_task = loop.create_task(async_main(args.config))
+        loop.run_until_complete(main_task)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("shutdown signal received — exiting")
     finally:
-        loop.run_until_complete(runtime.stop())
+        # Flush any remaining pending callbacks
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
