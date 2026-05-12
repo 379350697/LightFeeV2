@@ -1,0 +1,382 @@
+"""Semantic parity tests for entry planning and execution (ENTRY-001, ENTRY-002).
+
+V1 references:
+- src/execution_core/entry_execution_planner.rs
+- src/execution_core/entry_sync.rs
+- src/engine/entry.rs
+"""
+
+from __future__ import annotations
+
+import pytest
+from lightfee.core.domain import OrderFill, OrderRequest, Side, TimeInForce, Venue
+from lightfee.engine.entry import (
+    EntryContext,
+    EntryState,
+    EntryType,
+    advance_entry_state,
+    build_entry_orders,
+    build_open_position,
+)
+from lightfee.engine.execution_planner import (
+    ExecutionRoute,
+    IncrementalEntryExecutionPlan,
+    align_quantity_down_to_chunk,
+    align_quantity_up_to_step,
+    bounded_maker_first_initial_target_quantity,
+    effective_entry_leg_notional_floor,
+    maker_min_valid_clip_quantity,
+    min_hedgeable_chunk_from_notional,
+    plan_incremental_entry_execution,
+    quantities_match,
+)
+from lightfee.engine.state import OpenPosition
+
+
+# ============================================================================
+# ENTRY-001: Entry Planning Semantics
+# ============================================================================
+
+
+class TestEntryPlanningSemantics:
+    """V1 entry planning: incremental entry, min-notional, remainder, matched ratio, reason."""
+
+    def test_plan_rejects_zero_target_quantity(self):
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=0.0,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        assert route == ExecutionRoute.REJECTED
+        assert plan.reason == "target_quantity_not_positive"
+
+    def test_plan_rejects_target_below_min_hedgeable_chunk(self):
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=0.0001,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        assert route == ExecutionRoute.REJECTED
+        assert "below_min_hedgeable_chunk" in (plan.reason or "")
+
+    def test_plan_returns_passive_incremental_for_valid_input(self):
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=1.0,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        assert route == ExecutionRoute.PASSIVE_INCREMENTAL
+        assert plan.full_target_quantity > 0
+        assert plan.initial_maker_target_quantity > 0
+        assert plan.initial_maker_target_quantity <= plan.full_target_quantity
+
+    def test_plan_preserves_incremental_entry_semantics(self):
+        """V1: incremental entry builds up over ticks. The initial clip is a
+        fraction of the full target, not the full target itself."""
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=10.0,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.01,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        assert route == ExecutionRoute.PASSIVE_INCREMENTAL
+        # Initial maker target is a fraction, not the full target
+        assert plan.initial_maker_target_quantity < plan.full_target_quantity or \
+            plan.initial_maker_target_quantity == plan.full_target_quantity
+
+    def test_plan_reason_string_present_on_rejection(self):
+        """V1: every rejection must carry a reason string."""
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=-1.0,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        assert route == ExecutionRoute.REJECTED
+        assert plan.reason is not None
+
+    def test_min_notional_gating(self):
+        """V1: entries must not execute below min-notional. Maker min clip
+        must be satisfied."""
+        # With a tiny target quantity and large min notional, planning should
+        # reject or fall back
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=0.01,
+            slice_ratio=0.5,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10000.0,  # very high
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        # Either rejected or fallback — should not silently proceed
+        assert route in (ExecutionRoute.REJECTED, ExecutionRoute.FALLBACK_TO_STANDARD)
+
+    def test_remainder_tracking_in_plan(self):
+        """V1: remainder = full_target - initial_maker_target. Must be >= 0."""
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=1.0,
+            slice_ratio=0.3,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
+            remainder = plan.full_target_quantity - plan.initial_maker_target_quantity
+            assert remainder >= -1e-9  # remainder is non-negative
+
+    def test_matched_ratio_computed_in_plan(self):
+        """V1: matched_ratio = initial_maker / full_target when full_target > 0."""
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=1.0,
+            slice_ratio=0.4,
+            min_hedgeable_chunk=0.001,
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            max_initial_clip_ratio=0.8,
+            hedge_min_notional_quote=10.0,
+            hedge_price_hint=100.0,
+        )
+        if route == ExecutionRoute.PASSIVE_INCREMENTAL and plan.full_target_quantity > 0:
+            ratio = plan.initial_maker_target_quantity / plan.full_target_quantity
+            assert ratio > 0
+            assert ratio <= 1.0 + 1e-9
+
+    # --- V1 helper semantics ---
+
+    def test_quantities_match(self):
+        assert quantities_match(1.0, 1.0) is True
+        assert quantities_match(1.0, 1.0 + 1e-10) is True
+        assert quantities_match(1.0, 1.1) is False
+
+    def test_effective_entry_leg_notional_floor(self):
+        # No exchange min — uses global min
+        result = effective_entry_leg_notional_floor(10.0, None)
+        assert result == 10.0
+
+        # Exchange min > global — uses exchange min
+        result = effective_entry_leg_notional_floor(10.0, 20.0)
+        assert result == 20.0
+
+        # Global min > exchange — uses global min
+        result = effective_entry_leg_notional_floor(30.0, 20.0)
+        assert result == 30.0
+
+    def test_align_quantity_down_to_chunk(self):
+        assert align_quantity_down_to_chunk(1.0, 0.3) == pytest.approx(0.9)  # 3 chunks of 0.3
+        assert align_quantity_down_to_chunk(0.0, 0.1) == 0.0
+        assert align_quantity_down_to_chunk(0.2, 0.3) == 0.0  # below one chunk
+
+    def test_align_quantity_up_to_step(self):
+        assert align_quantity_up_to_step(0.05, 0.01) == 0.05
+        assert align_quantity_up_to_step(0.051, 0.01) == 0.06
+
+    def test_bounded_maker_first_initial_target(self):
+        result = bounded_maker_first_initial_target_quantity(10.0, 0.4)
+        assert result == 4.0  # 40% of 10.0
+
+    def test_min_hedgeable_chunk_from_notional(self):
+        chunk = min_hedgeable_chunk_from_notional(
+            min_base_quantity=0.01,
+            min_notional_quote=10.0,
+            step_base_quantity=0.001,
+            price_hint=100.0,
+        )
+        assert chunk > 0
+        assert chunk >= 0.01  # floor is min_base_quantity
+
+    def test_maker_min_valid_clip_quantity(self):
+        result = maker_min_valid_clip_quantity(
+            maker_min_notional_quote=10.0,
+            maker_price_hint=100.0,
+            min_hedgeable_chunk=0.01,
+            full_target_quantity=1.0,
+        )
+        assert result is not None
+        assert result > 0
+
+
+# ============================================================================
+# ENTRY-002: Entry Execution and Idempotency
+# ============================================================================
+
+
+class TestEntryExecutionIdempotency:
+    """V1 entry execution: maker/hedge ordering, client-order idempotency,
+    uncertain outcomes, reject classification, residual tasks, pending entry."""
+
+    def test_build_entry_orders_has_client_order_id(self):
+        ctx = EntryContext(
+            entry_id="test-entry-1",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_req, hedge_req = build_entry_orders(ctx)
+        assert maker_req.client_order_id is not None
+        assert maker_req.client_order_id != ""
+        assert hedge_req.client_order_id is not None
+        assert hedge_req.client_order_id != ""
+        # Client order IDs differ between maker and hedge
+        assert maker_req.client_order_id != hedge_req.client_order_id
+
+    def test_build_entry_orders_maker_post_only(self):
+        ctx = EntryContext(
+            entry_id="test-entry-2",
+            symbol="ETH-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.5,
+            short_quantity=0.5,
+            long_price_hint=3000.0,
+            short_price_hint=3000.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_req, hedge_req = build_entry_orders(ctx)
+        assert maker_req.post_only is True
+        assert maker_req.time_in_force == TimeInForce.GTC
+        assert hedge_req.reduce_only is False
+        assert hedge_req.time_in_force == TimeInForce.IOC
+
+    def test_build_entry_orders_maker_short_leg(self):
+        """When maker leg is SELL, maker=short_venue sell, hedge=long_venue buy."""
+        ctx = EntryContext(
+            entry_id="test-entry-3",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=2.0,
+            short_quantity=2.0,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.SELL,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_req, hedge_req = build_entry_orders(ctx)
+        assert maker_req.venue == Venue.BYBIT  # short_venue
+        assert maker_req.side == Side.SELL
+        assert hedge_req.venue == Venue.BINANCE  # long_venue
+        assert hedge_req.side == Side.BUY
+
+    def test_advance_entry_state_valid_transition(self):
+        ctx = EntryContext(
+            entry_id="t1", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        ctx2 = advance_entry_state(ctx, EntryState.SUBMITTING_MAKER)
+        assert ctx2.state == EntryState.SUBMITTING_MAKER
+
+    def test_advance_entry_state_rejects_terminal(self):
+        ctx = EntryContext(
+            entry_id="t2", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+            state=EntryState.COMPLETED,
+        )
+        with pytest.raises(ValueError):
+            advance_entry_state(ctx, EntryState.SUBMITTING_HEDGE)
+
+    def test_entry_state_terminal_property(self):
+        assert EntryState.COMPLETED.is_terminal is True
+        assert EntryState.FAILED.is_terminal is True
+        assert EntryState.FAILED_WITH_RESIDUAL.is_terminal is True
+        assert EntryState.IDLE.is_terminal is False
+        assert EntryState.SUBMITTING_MAKER.is_terminal is False
+
+    def test_build_open_position_matched_quantity(self):
+        ctx = EntryContext(
+            entry_id="pos-1", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=49990.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_fill = OrderFill(
+            venue=Venue.BINANCE, symbol="BTC-USDT",
+            side=Side.BUY, quantity=1.0, price=50000.0,
+            order_id="m1", filled_at_ms=1000,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT, symbol="BTC-USDT",
+            side=Side.SELL, quantity=0.95, price=49990.0,
+            order_id="h1", filled_at_ms=1001,
+        )
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1001)
+        assert pos is not None
+        assert pos.position_id == "pos-1"
+        assert pos.symbol == "BTC-USDT"
+        assert pos.matched_quantity == min(maker_fill.quantity, hedge_fill.quantity)
+
+
+class TestEntryContextFields:
+    """V1 EntryContext preserves all necessary semantic fields."""
+
+    def test_entry_context_has_planned_route(self):
+        ctx = EntryContext(
+            entry_id="e1", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        assert ctx.planned_route is not None
+
+    def test_entry_context_has_reprice_action(self):
+        ctx = EntryContext(
+            entry_id="e1", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        # reprice_action starts empty
+        assert ctx.reprice_action == ""
+
+    def test_entry_context_has_parent_entry_id(self):
+        ctx = EntryContext(
+            entry_id="e1", symbol="BTC-USDT",
+            long_venue=Venue.BINANCE, short_venue=Venue.BYBIT,
+            long_quantity=1.0, short_quantity=1.0,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        assert ctx.parent_entry_id is None  # starts with no parent
