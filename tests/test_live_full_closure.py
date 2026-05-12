@@ -474,6 +474,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
 
             sidecar_path = Path(td) / "sidecar.json"
             sidecar_path.write_text(json.dumps(_mk_sidecar(["BTCUSDT"], 50000.0)))
@@ -502,6 +503,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 2.0
             config.strategy.passive_cancel_replace_threshold_bps = 10.0
 
@@ -539,6 +541,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 2.0
             config.strategy.passive_cancel_replace_threshold_bps = 6.0
 
@@ -579,6 +582,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 5.0
             config.strategy.passive_cancel_replace_threshold_bps = 10.0
 
@@ -611,6 +615,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
             config.strategy.passive_failure_cooldown_ms = 5000
 
@@ -643,6 +648,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
             config.strategy.passive_failure_cooldown_ms = 1000
 
@@ -676,6 +682,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
             config.strategy.passive_max_consecutive_failures = 5
 
@@ -706,6 +713,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
             config.strategy.maker_leg_default = "buy"
 
@@ -747,6 +755,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
 
             sidecar_path = Path(td) / "sidecar.json"
@@ -814,6 +823,7 @@ class TestMakerEventLane:
             config = make_test_config(td)
             config.runtime.maker_event_lane_enabled = True
             config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
             config.strategy.passive_reprice_threshold_bps = 1.0
 
             sidecar_path = Path(td) / "sidecar.json"

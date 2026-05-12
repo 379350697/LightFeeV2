@@ -179,7 +179,7 @@ class TestAdapterContractCompleteness:
         import asyncio
         for _venue, adapter_cls in all_adapters:
             adapter = adapter_cls()
-            asyncio.get_event_loop().run_until_complete(adapter.shutdown())
+            asyncio.run(adapter.shutdown())
 
     def test_all_adapters_have_private_health(self, all_adapters):
         for _venue, adapter_cls in all_adapters:

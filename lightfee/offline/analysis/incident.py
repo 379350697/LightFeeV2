@@ -24,6 +24,10 @@ class IncidentReport:
 
 _INCIDENT_KINDS: dict[str, str] = {
     "runtime.error": "runtime_error",
+    "runtime.tick_error": "runtime_error",
+    "runtime.active_tick_error": "runtime_error",
+    "runtime.maker_event_tick_error": "runtime_error",
+    "runtime.passive_close_tick_error": "runtime_error",
     "runtime.fail_closed": "fail_closed",
     "runtime.fail_closed.venue_error": "venue_error",
     "runtime.fail_closed.margin_insufficient": "margin_insufficient",

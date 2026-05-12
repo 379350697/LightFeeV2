@@ -725,13 +725,26 @@ class LiveRuntime:
             return
 
         local_l2_enabled = self.config.strategy.local_l2_enabled
+        non_parity_mode = self.config.runtime.opportunity_input_mode == "non_parity"
 
         if local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
             await self._maybe_tick_maker_event_local_l2(now_ms, pending_passive)
-        else:
-            # --- Non-parity fallback: sidecar mid-price ---
+        elif non_parity_mode:
+            # --- Explicit non-parity fallback: sidecar mid-price ---
             await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
+        else:
+            # Neither parity nor non-parity — sidecar fallback must be explicit opt-in.
+            # local_l2_enabled=False alone does NOT activate the sidecar path.
+            self.journal.append(
+                "runtime.maker_event_no_eligible_mode",
+                {
+                    "ts_ms": now_ms,
+                    "local_l2_enabled": local_l2_enabled,
+                    "opportunity_input_mode": self.config.runtime.opportunity_input_mode,
+                    "reason": "non-parity fallback requires explicit opportunity_input_mode='non_parity'",
+                },
+            )
 
     async def _maybe_tick_maker_event_local_l2(
         self, now_ms: int, pending_passive: list,
