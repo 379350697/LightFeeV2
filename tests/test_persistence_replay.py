@@ -1,9 +1,15 @@
-"""Tests for persistence replay: journal replay, snapshot recovery, atomic writes.
+"""Tests for persistence replay: journal replay, snapshot recovery, atomic writes,
+and V2 structured replay reads with journal fallback.
 
 Covers Rust V1 behavior from:
 - src/observability_ops/replay_bridge.rs (journal record replay)
 - src/runtime_state/persisted_engine.rs (state normalization)
 - src/runtime_state/snapshot_store.rs (atomic snapshot persistence)
+
+V2 coverage:
+- ReplayDataset.from_structured() reads from SQLite replay_facts
+- ReplayDataset.load() structured-first with journal fallback
+- merge of structured + journal-only events preserves replay semantics
 """
 
 import json
@@ -16,6 +22,7 @@ from lightfee.engine.state import EngineState, OpenPosition, PendingEntry, Pendi
 from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal, replay_journal_records
 from lightfee.persistence.snapshot_store import SnapshotStore
+from lightfee.offline.replay.dataset import ReplayDataset
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -716,3 +723,380 @@ class TestReplayReconstruction:
                          "funding_captured", "second_stage_funding_captured"}
         for key in required_keys:
             assert key in pos, f"Missing key '{key}' in replay position snapshot"
+
+
+# ---------------------------------------------------------------------------
+# V2: Structured replay reads with journal fallback
+# ---------------------------------------------------------------------------
+
+class TestReplayDatasetStructuredRead:
+    """Test that ReplayDataset can read from SQLite replay_facts table."""
+
+    def _make_store_with_facts(
+        self, tmpdir: str, records: list[dict], date_from: str = "", date_to: str = ""
+    ) -> str:
+        """Create a temporary SQLite store with replay_facts table populated."""
+        import sqlite3
+        from lightfee.offline.replay.dataset import _ensure_replay_facts_table, _ts_to_date_str
+
+        store_path = f"{tmpdir}/replay_store.db"
+        conn = sqlite3.connect(store_path)
+        _ensure_replay_facts_table(conn)
+        for r in records:
+            conn.execute(
+                "INSERT INTO replay_facts (seq, run_id, ts_ms, kind, payload_json, date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    r["seq"],
+                    r.get("run_id", "test-run"),
+                    r["ts_ms"],
+                    r["kind"],
+                    json.dumps(r.get("payload", {})),
+                    _ts_to_date_str(r["ts_ms"]),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        return store_path
+
+    def test_from_structured_reads_all_records(self):
+        """Structured path reads all records from replay_facts within date range."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            records = [
+                {"seq": 1, "ts_ms": 1700000000000, "kind": "entry.opened",
+                 "payload": {"position_id": "pos-1"}},
+                {"seq": 2, "ts_ms": 1700000100000, "kind": "scan.completed",
+                 "payload": {"candidate_count": 3}},
+                {"seq": 3, "ts_ms": 1700000200000, "kind": "exit.closed",
+                 "payload": {"position_id": "pos-1"}},
+            ]
+            store_path = self._make_store_with_facts(td, records)
+
+            dataset = ReplayDataset.from_structured(store_path)
+            assert len(dataset.records) == 3
+            assert dataset.source == "structured"
+            kinds = [r["kind"] for r in dataset.records]
+            assert kinds == ["entry.opened", "scan.completed", "exit.closed"]
+
+    def test_from_structured_respects_date_range(self):
+        """Structured path filters by date range using SQL WHERE clause."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # ts_ms for 2026-01-10 = 1768003200000
+            # ts_ms for 2026-01-15 = 1768435200000
+            # ts_ms for 2026-01-20 = 1768867200000
+            records = [
+                {"seq": 1, "ts_ms": 1768003200000, "kind": "entry.opened",
+                 "payload": {}},   # 20260110
+                {"seq": 2, "ts_ms": 1768435200000, "kind": "scan.completed",
+                 "payload": {}},   # 20260115
+                {"seq": 3, "ts_ms": 1768867200000, "kind": "exit.closed",
+                 "payload": {}},   # 20260120
+            ]
+            store_path = self._make_store_with_facts(td, records)
+
+            dataset = ReplayDataset.from_structured(
+                store_path, date_from="20260112", date_to="20260117"
+            )
+            assert len(dataset.records) == 1
+            assert dataset.records[0]["kind"] == "scan.completed"
+
+    def test_from_structured_empty_store_raises_without_journal(self):
+        """Structured path raises ValueError when store has no records and no journal."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            store_path = f"{td}/empty.db"
+            with pytest.raises(ValueError, match="No structured records"):
+                ReplayDataset.from_structured(store_path)
+
+    def test_from_structured_falls_back_to_journal_when_empty(self):
+        """When replay_facts is empty, fall back to full journal scan."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # Empty structured store
+            import sqlite3
+            store_path = f"{td}/empty_facts.db"
+            conn = sqlite3.connect(store_path)
+            from lightfee.offline.replay.dataset import _ensure_replay_facts_table
+            _ensure_replay_facts_table(conn)
+            conn.close()
+
+            # Journal with records
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("entry.opened", {"position_id": "pos-j"}, ts_ms=1768003200000)
+            journal.append("scan.completed", {"candidate_count": 1}, ts_ms=1768003300000)
+            journal.close()
+
+            dataset = ReplayDataset.from_structured(
+                store_path, journal_path=jp
+            )
+            assert len(dataset.records) == 2
+            assert dataset.source == "journal"
+
+    def test_from_structured_merges_journal_only_events(self):
+        """Structured + journal merge: journal-only events (recovery, lifecycle)
+        are read from journal and merged with structured records."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # Structured store with projectable events
+            proj_records = [
+                {"seq": 1, "ts_ms": 1768003200000, "kind": "entry.opened",
+                 "payload": {"position_id": "pos-merge"}},
+                {"seq": 5, "ts_ms": 1768003500000, "kind": "exit.closed",
+                 "payload": {"position_id": "pos-merge"}},
+            ]
+            store_path = self._make_store_with_facts(td, proj_records)
+
+            # Journal with journal-only events
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("runtime.lifecycle_changed",
+                          {"from": "booting", "to": "reconciling"},
+                          ts_ms=1768003150000)
+            journal.append("runtime.risk_mode_changed",
+                          {"from": "running", "to": "reduce_only"},
+                          ts_ms=1768003400000)
+            journal.close()
+
+            dataset = ReplayDataset.from_structured(
+                store_path, journal_path=jp
+            )
+            # Should have 4 records: 2 structured + 2 journal-only
+            assert len(dataset.records) == 4
+            assert dataset.source == "merged"
+
+            kinds = [r["kind"] for r in dataset.records]
+            assert "entry.opened" in kinds
+            assert "exit.closed" in kinds
+            assert "runtime.lifecycle_changed" in kinds
+            assert "runtime.risk_mode_changed" in kinds
+
+    def test_merged_records_sorted_by_seq(self):
+        """Merged records must be sorted by seq to preserve event ordering."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # Structured: seq 10, 30
+            proj_records = [
+                {"seq": 30, "ts_ms": 1768003500000, "kind": "exit.closed",
+                 "payload": {"position_id": "pos-sort"}},
+                {"seq": 10, "ts_ms": 1768003200000, "kind": "entry.opened",
+                 "payload": {"position_id": "pos-sort"}},
+            ]
+            store_path = self._make_store_with_facts(td, proj_records)
+
+            # Journal: seq 20
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("runtime.lifecycle_changed",
+                          {"from": "booting", "to": "running"},
+                          ts_ms=1768003300000)
+            journal.close()
+
+            dataset = ReplayDataset.from_structured(
+                store_path, journal_path=jp
+            )
+            seqs = [r["seq"] for r in dataset.records]
+            assert seqs == sorted(seqs), f"records not sorted by seq: {seqs}"
+
+    def test_from_structured_preserves_payload_fidelity(self):
+        """Structured path must return payloads identical to journal path."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            payload = {
+                "position_id": "pos-fidelity",
+                "symbol": "BTCUSDT",
+                "long_venue": "binance",
+                "short_venue": "okx",
+                "quantity": 0.1,
+                "long_entry_price": 68750.0,
+                "current_net_quote": 1.5,
+            }
+            records = [
+                {"seq": 1, "ts_ms": 1768003200000, "kind": "entry.opened",
+                 "payload": payload},
+            ]
+            store_path = self._make_store_with_facts(td, records)
+
+            # Structured read
+            ds_struct = ReplayDataset.from_structured(store_path)
+            assert ds_struct.records[0]["payload"] == payload
+
+            # Compare with journal read
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("entry.opened", payload, ts_ms=1768003200000)
+            journal.close()
+            ds_journal = ReplayDataset.from_journal_range(jp)
+            assert ds_journal.records[0]["payload"] == payload
+
+
+class TestReplayDatasetLoad:
+    """Test ReplayDataset.load() — the recommended structured-first entry point."""
+
+    def test_load_structured_first_when_store_exists(self):
+        """load() uses structured path when store_path is provided and exists."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            import sqlite3
+            from lightfee.offline.replay.dataset import _ensure_replay_facts_table, _ts_to_date_str
+
+            # Structured store with records
+            store_path = f"{td}/replay_store.db"
+            conn = sqlite3.connect(store_path)
+            _ensure_replay_facts_table(conn)
+            conn.execute(
+                "INSERT INTO replay_facts (seq, run_id, ts_ms, kind, payload_json, date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (1, "test-run", 1768003200000, "entry.opened",
+                 json.dumps({"position_id": "pos-load"}), "20260110"),
+            )
+            conn.commit()
+            conn.close()
+
+            # Journal (should not be the primary source)
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("entry.opened", {"position_id": "pos-from-journal"},
+                          ts_ms=1768003200000)
+            journal.close()
+
+            dataset = ReplayDataset.load(jp, store_path=store_path)
+            assert dataset.source in ("structured", "merged")
+
+    def test_load_falls_back_to_journal_when_store_missing(self):
+        """load() falls back to journal when store_path doesn't exist."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("entry.opened", {"position_id": "pos-fallback"},
+                          ts_ms=1768003200000)
+            journal.close()
+
+            store_path = f"{td}/nonexistent.db"
+            dataset = ReplayDataset.load(jp, store_path=store_path)
+            assert dataset.source == "journal"
+            assert len(dataset.records) == 1
+
+    def test_load_without_store_uses_journal(self):
+        """load() uses journal when store_path is None."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("scan.completed", {"candidate_count": 5},
+                          ts_ms=1768003200000)
+            journal.close()
+
+            dataset = ReplayDataset.load(jp)
+            assert dataset.source == "journal"
+            assert len(dataset.records) == 1
+
+    def test_load_structured_preserves_replay_semantics(self):
+        """Replay semantics must be identical regardless of read path."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            import sqlite3
+            from lightfee.offline.replay.dataset import _ensure_replay_facts_table, _ts_to_date_str
+
+            # Create records covering multiple event kinds
+            all_records = [
+                {"seq": 1, "ts_ms": 1768003200000, "kind": "runtime.lifecycle_changed",
+                 "payload": {"from": "booting", "to": "running"}},
+                {"seq": 2, "ts_ms": 1768003300000, "kind": "entry.opened",
+                 "payload": {"position_id": "pos-sem", "symbol": "ETHUSDT",
+                            "long_venue": "binance", "short_venue": "okx",
+                            "quantity": 1.0}},
+                {"seq": 3, "ts_ms": 1768003400000, "kind": "scan.completed",
+                 "payload": {"candidate_count": 2, "blocked_count": 0,
+                            "accepted_count": 2, "blocked_reasons": {},
+                            "no_entry_reason": ""}},
+                {"seq": 4, "ts_ms": 1768003500000, "kind": "exit.closed",
+                 "payload": {"position_id": "pos-sem", "reason": "profit_take"}},
+            ]
+
+            # Path A: full journal
+            jp = f"{td}/events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            for r in all_records:
+                journal.append(r["kind"], r["payload"], ts_ms=r["ts_ms"])
+            journal.close()
+            ds_journal = ReplayDataset.from_journal_range(jp)
+
+            # Path B: structured (projectable) + journal-only from journal
+            store_path = f"{td}/replay_store.db"
+            conn = sqlite3.connect(store_path)
+            _ensure_replay_facts_table(conn)
+            # Only projectable events go into structured store
+            for r in all_records:
+                from lightfee.offline.replay.dataset import _is_journal_only
+                if _is_journal_only(r["kind"]):
+                    continue
+                conn.execute(
+                    "INSERT INTO replay_facts (seq, run_id, ts_ms, kind, payload_json, date) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["seq"], "test-run", r["ts_ms"], r["kind"],
+                     json.dumps(r["payload"]), _ts_to_date_str(r["ts_ms"])),
+                )
+            conn.commit()
+            conn.close()
+            ds_structured = ReplayDataset.from_structured(
+                store_path, journal_path=jp
+            )
+
+            # Both paths must produce identical replay results
+            from lightfee.persistence.journal import replay_journal_records
+
+            journal_result = replay_journal_records(ds_journal.records)
+            structured_result = replay_journal_records(ds_structured.records)
+
+            assert journal_result["open_position_count"] == structured_result["open_position_count"]
+            assert journal_result["pending_entry_count"] == structured_result["pending_entry_count"]
+            assert journal_result["pending_close_count"] == structured_result["pending_close_count"]
+            assert journal_result["final_lifecycle"] == structured_result["final_lifecycle"]
+            assert journal_result["final_risk_mode"] == structured_result["final_risk_mode"]
+
+
+class TestJournalOnlyClassification:
+    """Test that journal-only event classification is correct."""
+
+    def test_recovery_events_are_journal_only(self):
+        from lightfee.offline.replay.dataset import _is_journal_only
+        assert _is_journal_only("recovery.live_detected")
+        assert _is_journal_only("recovery.flat")
+        assert _is_journal_only("recovery.blocked")
+        assert _is_journal_only("recovery.mismatch_detected")
+        assert _is_journal_only("recovery.resumed")
+
+    def test_lifecycle_events_are_journal_only(self):
+        from lightfee.offline.replay.dataset import _is_journal_only
+        assert _is_journal_only("runtime.lifecycle_changed")
+        assert _is_journal_only("runtime.risk_mode_changed")
+        assert _is_journal_only("runtime.booting")
+        assert _is_journal_only("runtime.running")
+        assert _is_journal_only("runtime.stopped")
+
+    def test_projectable_events_are_not_journal_only(self):
+        from lightfee.offline.replay.dataset import _is_journal_only
+        assert not _is_journal_only("entry.opened")
+        assert not _is_journal_only("exit.closed")
+        assert not _is_journal_only("exit.partial_closed")
+        assert not _is_journal_only("order.submitted")
+        assert not _is_journal_only("order.filled")
+        assert not _is_journal_only("scan.completed")
+        assert not _is_journal_only("scan.no_entry_diagnostics")
+        assert not _is_journal_only("risk.death_triggered")
+        assert not _is_journal_only("risk.warning_triggered")
+        assert not _is_journal_only("runtime.local_l2_sequence_gap")
+        assert not _is_journal_only("entry.pending_registered")
+        assert not _is_journal_only("exit.pending_close_registered")

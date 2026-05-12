@@ -196,3 +196,133 @@ class TestRuntimeLaneScheduling:
         finally:
             import shutil
             shutil.rmtree(td, ignore_errors=True)
+
+
+class TestReplaySmoke:
+    """V2: smoke tests for replay dataset structured reads and journal fallback."""
+
+    def test_replay_dataset_imports(self):
+        """Verify all replay dataset symbols are importable."""
+        from lightfee.offline.replay.dataset import (
+            ReplayDataset,
+            _is_journal_only,
+            _ensure_replay_facts_table,
+            _read_replay_facts,
+            _read_journal_only_events,
+        )
+
+    def test_replay_dataset_load_journal_baseline(self):
+        """load() with only journal_path returns journal-sourced dataset."""
+        import tempfile
+        from pathlib import Path
+        from lightfee.offline.replay.dataset import ReplayDataset
+        from lightfee.persistence.journal import Journal
+
+        with tempfile.TemporaryDirectory() as td:
+            jp = Path(td) / "smoke-events.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            journal.append("entry.opened",
+                          {"position_id": "smoke-pos", "symbol": "BTCUSDT"},
+                          ts_ms=1768003200000)
+            journal.append("runtime.lifecycle_changed",
+                          {"from": "booting", "to": "running"},
+                          ts_ms=1768003300000)
+            journal.close()
+
+            dataset = ReplayDataset.load(str(jp))
+            assert dataset.source == "journal"
+            assert len(dataset.records) == 2
+
+            kinds = {r["kind"] for r in dataset.records}
+            assert "entry.opened" in kinds
+            assert "runtime.lifecycle_changed" in kinds
+
+    def test_replay_dataset_from_journal_range_preserves_filter(self):
+        """from_journal_range date filter works correctly."""
+        import tempfile
+        from pathlib import Path
+        from lightfee.offline.replay.dataset import ReplayDataset
+        from lightfee.persistence.journal import Journal
+
+        with tempfile.TemporaryDirectory() as td:
+            jp = Path(td) / "smoke-filter.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            # Jan 10 2026
+            journal.append("scan.completed", {"candidate_count": 1},
+                          ts_ms=1768003200000)
+            # Jan 15 2026
+            journal.append("scan.completed", {"candidate_count": 2},
+                          ts_ms=1768435200000)
+            # Jan 20 2026
+            journal.append("scan.completed", {"candidate_count": 3},
+                          ts_ms=1768867200000)
+            journal.close()
+
+            dataset = ReplayDataset.from_journal_range(
+                str(jp), date_from="20260112", date_to="20260117"
+            )
+            assert len(dataset.records) == 1
+            assert dataset.records[0]["payload"]["candidate_count"] == 2
+
+    def test_replay_semantics_identical_regardless_of_source(self):
+        """Replay results must be identical whether records come from
+        structured store, journal, or merged path."""
+        import json
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from lightfee.offline.replay.dataset import (
+            ReplayDataset, _ensure_replay_facts_table, _is_journal_only, _ts_to_date_str,
+        )
+        from lightfee.persistence.journal import Journal, replay_journal_records
+
+        with tempfile.TemporaryDirectory() as td:
+            all_records = [
+                {"seq": 1, "ts_ms": 1768003200000, "kind": "entry.opened",
+                 "payload": {"position_id": "pos-smoke", "symbol": "ETHUSDT",
+                            "long_venue": "binance", "short_venue": "okx",
+                            "quantity": 2.0}},
+                {"seq": 2, "ts_ms": 1768003300000, "kind": "runtime.lifecycle_changed",
+                 "payload": {"from": "booting", "to": "running"}},
+                {"seq": 3, "ts_ms": 1768003400000, "kind": "exit.closed",
+                 "payload": {"position_id": "pos-smoke"}},
+            ]
+
+            # Path A: journal
+            jp = Path(td) / "smoke-journal.jsonl"
+            journal = Journal(jp)
+            journal.open()
+            for r in all_records:
+                journal.append(r["kind"], r["payload"], ts_ms=r["ts_ms"])
+            journal.close()
+
+            result_a = replay_journal_records(
+                ReplayDataset.from_journal_range(str(jp)).records
+            )
+
+            # Path B: structured with journal fallback (journal-only events)
+            store_path = Path(td) / "smoke-store.db"
+            conn = sqlite3.connect(str(store_path))
+            _ensure_replay_facts_table(conn)
+            for r in all_records:
+                if _is_journal_only(r["kind"]):
+                    continue
+                conn.execute(
+                    "INSERT INTO replay_facts (seq, run_id, ts_ms, kind, payload_json, date) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["seq"], "test-run", r["ts_ms"], r["kind"],
+                     json.dumps(r["payload"]), _ts_to_date_str(r["ts_ms"])),
+                )
+            conn.commit()
+            conn.close()
+
+            result_b = replay_journal_records(
+                ReplayDataset.from_structured(str(store_path), journal_path=str(jp)).records
+            )
+
+            assert result_a["open_position_count"] == result_b["open_position_count"]
+            assert result_a["final_lifecycle"] == result_b["final_lifecycle"]
+            assert result_a["pending_entry_count"] == result_b["pending_entry_count"]
+            assert result_a["pending_close_count"] == result_b["pending_close_count"]
