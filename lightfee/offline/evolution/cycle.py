@@ -286,6 +286,15 @@ def evaluate_previous_action(
                     notes=[f"Hard risk envelope breach: {breach_name}"],
                 )
 
+    # Soft risk warnings always constrain, even without weighted metrics
+    if observation.soft_risk_warnings:
+        return CycleEvaluation(
+            verdict="constrained",
+            objective_score=0.0,
+            constraint_breaches=[],
+            notes=[f"Soft risk warning: {w}" for w in observation.soft_risk_warnings],
+        )
+
     # Compute weighted objective score
     weighted_sum = 0.0
     total_weight = 0.0
@@ -304,15 +313,6 @@ def evaluate_previous_action(
         )
 
     score = weighted_sum / total_weight
-
-    # Soft risk warnings
-    if observation.soft_risk_warnings:
-        return CycleEvaluation(
-            verdict="constrained",
-            objective_score=score,
-            constraint_breaches=[],
-            notes=[f"Soft risk warning: {w}" for w in observation.soft_risk_warnings],
-        )
 
     # Determine verdict from score
     if score > 0.5:
