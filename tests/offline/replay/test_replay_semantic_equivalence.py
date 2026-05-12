@@ -269,3 +269,50 @@ class TestReplayWithJournalRoundtrip:
         result = replay_journal_records(records)
         assert result["open_position_count"] == 1
         assert result["final_lifecycle"] == "running"
+
+    def test_paper_outcome_events_roundtrip(self, tmp_path):
+        """Paper outcome events survive journal write-read and are analyzable."""
+        journal = Journal(tmp_path / "paper_outcome_roundtrip.jsonl")
+        journal.open()
+        try:
+            journal.append("opportunity.paper_markout", {
+                "paper_id": "p1", "review_id": "rvw-1",
+                "symbol": "LABUSDT",
+                "horizon_kind": "markout_300s",
+                "opportunity_label": "good_trade_missed",
+                "paper_net_quote": 0.33,
+                "evaluated_at_ms": 301000,
+            })
+            journal.append("opportunity.paper_closed", {
+                "paper_id": "p1", "review_id": "rvw-1",
+                "symbol": "LABUSDT",
+                "horizon_kind": "settlement",
+                "opportunity_label": "bad_trade_correctly_rejected",
+                "paper_net_quote": -0.10,
+                "evaluated_at_ms": 3600100,
+            })
+            journal.append("opportunity.real_vs_paper_joined", {
+                "paper_id": "p1", "review_id": "rvw-1",
+                "position_id": "pos-1",
+                "symbol": "LABUSDT",
+                "opportunity_label": "good_trade_executed",
+                "real_net_quote": 0.25,
+                "evaluated_at_ms": 370000,
+            })
+        finally:
+            journal.close()
+
+        records = journal.read_all()
+        # Paper outcome events should not break replay
+        result = replay_journal_records(records)
+        assert result is not None
+
+        # Verify analysis layer can process them
+        from lightfee.offline.analysis.journal import analyze_journal_records
+        report = analyze_journal_records(records)
+        assert report.paper_outcome_markout_count == 1
+        assert report.paper_outcome_closed_count == 1
+        assert report.paper_outcome_joined_count == 1
+        assert report.paper_outcome_by_label["good_trade_missed"] == 1
+        assert report.paper_outcome_by_label["bad_trade_correctly_rejected"] == 1
+        assert report.paper_outcome_by_label["good_trade_executed"] == 1

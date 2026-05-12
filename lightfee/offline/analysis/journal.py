@@ -75,6 +75,12 @@ class JournalAnalysisReport:
     # Fail-closed reason counts (V1: fail_closed_reason_counts)
     fail_closed_reason_counts: dict[str, int] = field(default_factory=dict)
 
+    # Paper outcome tracking (V1: paper_outcome event kinds)
+    paper_outcome_markout_count: int = 0
+    paper_outcome_closed_count: int = 0
+    paper_outcome_joined_count: int = 0
+    paper_outcome_by_label: dict[str, int] = field(default_factory=dict)
+
 
 _RECOVERY_KINDS = frozenset({
     "recovery.live_detected",
@@ -99,6 +105,12 @@ _SCAN_GATE_BLOCKED = "scan.runtime_gate_blocked"
 _EXEC_LIQUIDITY_BLOCKED = "execution.entry_liquidity_blocked"
 _LOCAL_L2_SEQUENCE_GAP = "runtime.local_l2_sequence_gap"
 _LOCAL_L2_SYNC_FAILED = "runtime.local_l2_sync_failed"
+
+_PAPER_OUTCOME_KINDS = frozenset({
+    "opportunity.paper_markout",
+    "opportunity.paper_closed",
+    "opportunity.real_vs_paper_joined",
+})
 
 
 def analyze_journal_records(
@@ -179,6 +191,27 @@ def analyze_journal_records(
             reason = payload.get("reason", "unspecified")
             report.fail_closed_reason_counts[reason] = (
                 report.fail_closed_reason_counts.get(reason, 0) + 1
+            )
+
+        elif kind == "opportunity.paper_markout":
+            report.paper_outcome_markout_count += 1
+            label = payload.get("opportunity_label", "unknown")
+            report.paper_outcome_by_label[label] = (
+                report.paper_outcome_by_label.get(label, 0) + 1
+            )
+
+        elif kind == "opportunity.paper_closed":
+            report.paper_outcome_closed_count += 1
+            label = payload.get("opportunity_label", "unknown")
+            report.paper_outcome_by_label[label] = (
+                report.paper_outcome_by_label.get(label, 0) + 1
+            )
+
+        elif kind == "opportunity.real_vs_paper_joined":
+            report.paper_outcome_joined_count += 1
+            label = payload.get("opportunity_label", "unknown")
+            report.paper_outcome_by_label[label] = (
+                report.paper_outcome_by_label.get(label, 0) + 1
             )
 
     return report
@@ -306,6 +339,23 @@ def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
             report.fail_closed_reason_counts[reason] = (
                 report.fail_closed_reason_counts.get(reason, 0) + 1
             )
+        elif kind in ("opportunity.paper_markout", "opportunity.paper_closed",
+                      "opportunity.real_vs_paper_joined"):
+            import json as _json
+            try:
+                pl = _json.loads(row["payload_json"]) if row["payload_json"] else {}
+            except Exception:
+                pl = {}
+            label = pl.get("opportunity_label", "unknown")
+            report.paper_outcome_by_label[label] = (
+                report.paper_outcome_by_label.get(label, 0) + 1
+            )
+            if kind == "opportunity.paper_markout":
+                report.paper_outcome_markout_count += 1
+            elif kind == "opportunity.paper_closed":
+                report.paper_outcome_closed_count += 1
+            elif kind == "opportunity.real_vs_paper_joined":
+                report.paper_outcome_joined_count += 1
 
     # Total records = sum of all projected facts (approximate but sufficient for reporting)
     total = 0
