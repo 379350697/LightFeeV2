@@ -1,4 +1,8 @@
-"""Protocol contracts (ABCs) matching Rust VenueAdapter trait behavior."""
+"""Protocol contracts (ABCs) matching Rust VenueAdapter trait behavior.
+
+V1 semantic parity: VenueAdapter must expose every V1 adapter capability
+so engine code never reaches into private transport internals.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,8 @@ from typing import Optional
 
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    AccountRiskSnapshot,
+    AssetTransferStatus,
     ExecutionLiquiditySnapshot,
     OrderFill,
     OrderFillReconciliation,
@@ -137,6 +143,149 @@ class VenueAdapter(ABC):
 
     async def shutdown(self) -> None:
         pass
+
+    # --- V1 contract completeness: Private health ---
+
+    @property
+    def private_health(self) -> Optional[dict]:
+        """V1: last known private health snapshot (cached).
+
+        Returns a dict with keys matching V1 PrivateHealth: equity, margin,
+        health_ratio, observed_at_ms. None if never fetched.
+        """
+        return None
+
+    async def fetch_private_health(self) -> Optional[dict]:
+        """V1: fetch and cache the latest private health snapshot.
+
+        Returns the same shape as private_health property.
+        """
+        return None
+
+    @property
+    def cached_private_health(self) -> Optional[dict]:
+        """V1: explicitly cached copy for fail-closed scenarios."""
+        return self.private_health
+
+    # --- V1 contract completeness: Passive progress ---
+
+    @property
+    def private_passive_progress(self) -> bool:
+        """V1: whether this venue supports private passive order progress queries."""
+        return hasattr(self, '_transport') and hasattr(getattr(self, '_transport', None), 'query_passive_order_progress')
+
+    # --- V1 contract completeness: Passive metadata ---
+
+    def passive_metadata(self, symbol: str) -> dict:
+        """V1: metadata for passive orders on this venue.
+
+        Returns: {min_notional, price_tick, quantity_step, max_quantity}.
+        """
+        spec = self._get_spec()
+        return {
+            "min_notional": spec.min_notional if spec else 5.0,
+            "price_tick": spec.price_tick if spec else 0.01,
+            "quantity_step": spec.quantity_step if spec else 0.001,
+            "max_quantity": 0.0,
+        }
+
+    def _get_spec(self):
+        try:
+            from lightfee.venues.specs import get_spec
+            return get_spec(self.venue)
+        except Exception:
+            return None
+
+    # --- V1 contract completeness: Order sizing ---
+
+    def order_sizing_spec(self, symbol: str) -> dict:
+        """V1: order sizing specification for a symbol on this venue.
+
+        Returns: {quantity_step, min_quantity, min_notional, price_tick, contract_size}.
+        """
+        return self.passive_metadata(symbol)
+
+    # --- V1 contract completeness: Entry headroom ---
+
+    async def entry_open_notional_headroom(self, symbol: str) -> Optional[float]:
+        """V1: remaining notional capacity before hitting position limits.
+
+        Returns None if the venue does not support this query.
+        """
+        return None
+
+    # --- V1 contract completeness: Transfer status ---
+
+    async def fetch_transfer_status(
+        self, asset: str, from_venue: Venue, to_venue: Venue
+    ) -> Optional[AssetTransferStatus]:
+        """V1: query asset transfer status between venues.
+
+        Returns None if transfers are unsupported.
+        """
+        return None
+
+    # --- V1 contract completeness: Supported symbols ---
+
+    def supported_symbols(self) -> list[str]:
+        """V1: list of symbols this venue supports for trading.
+
+        Default empty — adapters that filter symbols override this.
+        """
+        return []
+
+    # --- V1 contract completeness: Market data activity control ---
+
+    @property
+    def market_data_active(self) -> bool:
+        """V1: whether market data ingestion is currently active."""
+        return True
+
+    async def pause_market_data(self) -> None:
+        """V1: pause market data ingestion for this venue."""
+        pass
+
+    async def resume_market_data(self) -> None:
+        """V1: resume market data ingestion for this venue."""
+        pass
+
+    # --- V1 contract completeness: Live startup activation ---
+
+    async def activate_for_live(self) -> bool:
+        """V1: activate the adapter for live trading.
+
+        Called during startup phase (after prewarm). Returns True if activated.
+        """
+        return True
+
+    # --- V1 contract completeness: Local-L2 reconcile targets ---
+
+    def local_l2_reconcile_targets(self) -> list[str]:
+        """V1: symbols that should have active local-L2 books.
+
+        Returns a list of canonical symbols. Default empty — adapters
+        with L2 support override this.
+        """
+        return []
+
+    # --- V1 contract completeness: Worker status ---
+
+    def worker_status(self) -> dict:
+        """V1: per-worker status diagnostics.
+
+        Returns: {worker_count, categories: [{category, active, healthy}]}.
+        """
+        return {"worker_count": 0, "categories": self.ws_worker_categories()}
+
+    # --- V1 contract completeness: Prewarm ---
+
+    async def prewarm(self) -> bool:
+        """V1: prewarm the adapter before live trading starts.
+
+        Typically fetches initial snapshots, validates connectivity,
+        and warms rate-limit tokens. Returns True on success.
+        """
+        return True
 
     # --- Passive order contract (V1 resting-order semantics) ---
 

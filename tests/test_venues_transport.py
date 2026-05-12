@@ -1450,10 +1450,11 @@ class TestBitgetRiskHealth:
         maint = row.get("maintenanceMargin")
         assert maint is None
 
-    def test_bitget_supports_risk_health_in_live_mode(self):
+    def test_bitget_supports_risk_health_false_in_live_mode(self):
+        """V1 parity: Bitget risk_health is UNSUPPORTED even in live mode."""
         from lightfee.venues.bitget import BitgetAdapter
         adapter = BitgetAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"))
-        assert adapter.supports_risk_health is True
+        assert adapter.supports_risk_health is False
 
     def test_bitget_supports_risk_health_false_in_paper(self):
         from lightfee.venues.bitget import BitgetAdapter
@@ -1484,10 +1485,11 @@ class TestGateRiskHealth:
         maint = raw.get("maintenance_margin")
         assert maint is None
 
-    def test_gate_supports_risk_health_in_live_mode(self):
+    def test_gate_supports_risk_health_false_in_live_mode(self):
+        """V1 parity: Gate risk_health is UNSUPPORTED even in live mode."""
         from lightfee.venues.gate import GateAdapter
         adapter = GateAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s"))
-        assert adapter.supports_risk_health is True
+        assert adapter.supports_risk_health is False
 
     def test_gate_supports_risk_health_false_in_paper(self):
         from lightfee.venues.gate import GateAdapter

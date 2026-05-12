@@ -142,7 +142,9 @@ class BitgetAdapter(VenueAdapter):
 
     @property
     def supports_risk_health(self) -> bool:
-        return self._mode == "live"
+        # V1 parity: Bitget risk_health is UNSUPPORTED — the account endpoint
+        # does not provide reliable margin/equity data for risk evaluation.
+        return False
 
     # ------------------------------------------------------------------
     # Profile detection

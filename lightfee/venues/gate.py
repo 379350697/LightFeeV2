@@ -34,7 +34,9 @@ class GateAdapter(VenueAdapter):
 
     @property
     def supports_risk_health(self) -> bool:
-        return self._transport.mode == "live"
+        # V1 parity: Gate risk_health is UNSUPPORTED — the account endpoint
+        # does not provide reliable margin/equity data for risk evaluation.
+        return False
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

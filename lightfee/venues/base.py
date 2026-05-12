@@ -152,7 +152,7 @@ class VenueCapabilities:
             ),
             Venue.BITGET: cls(
                 venue=Venue.BITGET,
-                risk_health=CapabilitySupport.SUPPORTED,
+                risk_health=CapabilitySupport.UNSUPPORTED,
                 private_health=CapabilitySupport.SUPPORTED,
                 execution_liquidity=ExecutionLiquidityCapability.TRUE_L2,
                 reconcile_quality=ReconcileQuality.UNSUPPORTED,
@@ -163,7 +163,7 @@ class VenueCapabilities:
             ),
             Venue.GATE: cls(
                 venue=Venue.GATE,
-                risk_health=CapabilitySupport.SUPPORTED,
+                risk_health=CapabilitySupport.UNSUPPORTED,
                 private_health=CapabilitySupport.SUPPORTED,
                 execution_liquidity=ExecutionLiquidityCapability.TRUE_L2,
                 reconcile_quality=ReconcileQuality.UNSUPPORTED,
