@@ -107,57 +107,67 @@ def maybe_export_current_state_snapshot(
 
 
 def _export_runtime_metrics(state: EngineState, path: str) -> None:
-    """Write Prometheus textfile metric samples."""
-    samples = _build_prometheus_metric_samples(state)
+    """Write Prometheus textfile metric samples (V1-compatible)."""
+    from lightfee.ops.metrics import build_prometheus_metric_samples as _v1_build
+
+    samples = _v1_build(state)
     with open(path, "w") as f:
         for sample in samples:
             f.write(f"{sample}\n")
 
 
 def _export_current_state_snapshot(state: EngineState, path: str) -> None:
-    """Write the current-state JSON snapshot atomically."""
+    """Write current-state JSON snapshot with all V1-visible fields.
+
+    V1: CurrentStateSnapshot — schema, generated_at_ms, expires_at_ms, stale,
+    mode, lifecycle, global_risk_mode, global_risk_reason, open_position_count,
+    open_positions (detailed), last_scan.
+    """
+    import time
+
+    now_ms = int(time.time() * 1000)
+    stale_after_ms = current_state_export_interval_ms(
+        __import__("lightfee.config.schema", fromlist=["AppConfig"]).AppConfig()
+    ) * 3
+
+    open_positions = []
+    for pos in state.open_positions.values():
+        open_positions.append({
+            "position_id": pos.position_id,
+            "symbol": pos.symbol,
+            "long_venue": pos.long_venue.value if hasattr(pos.long_venue, "value") else str(pos.long_venue),
+            "short_venue": pos.short_venue.value if hasattr(pos.short_venue, "value") else str(pos.short_venue),
+            "quantity": pos.matched_quantity,
+        })
+
+    mode = "paper"
+    if hasattr(state, "mode"):
+        mode = state.mode.value if hasattr(state.mode, "value") else str(state.mode)
+
     data = {
         "schema": "lightfee.current_state.v1",
+        "generated_at_ms": now_ms,
+        "expires_at_ms": now_ms + stale_after_ms,
+        "stale": False,
+        "mode": mode,
         "lifecycle": state.lifecycle.value,
         "risk_mode": state.risk_mode.value,
+        "global_risk_mode": state.risk_mode.value,
+        "global_risk_reason": getattr(state, "global_risk_reason", None),
         "run_id": state.run_id,
         "tick_count": state.tick_count,
         "last_tick_ms": state.last_tick_ms,
         "open_position_count": len(state.open_positions),
+        "open_positions": open_positions,
         "pending_entry_count": len(state.pending_entries),
         "pending_close_count": len(state.pending_closes),
+        "last_scan": getattr(state, "last_scan", None),
     }
     write_json_atomic(path, data)
 
 
 def _build_prometheus_metric_samples(state: EngineState) -> list[str]:
-    """Assemble Prometheus gauge / counter metric lines from engine state."""
-    samples = [
-        "# HELP lightfee_tick_count Total engine ticks.",
-        "# TYPE lightfee_tick_count counter",
-        f"lightfee_tick_count {state.tick_count}",
-        "# HELP lightfee_open_positions Current open position count.",
-        "# TYPE lightfee_open_positions gauge",
-        f"lightfee_open_positions {len(state.open_positions)}",
-        "# HELP lightfee_lifecycle Engine lifecycle 0=booting 3=running 4=fail_closed.",
-        "# TYPE lightfee_lifecycle gauge",
-        f"lightfee_lifecycle{{state=\"{state.lifecycle.value}\"}} {_lifecycle_code(state.lifecycle.value)}",
-        "# HELP lightfee_risk_mode Global risk mode 0=running 3=fail_closed.",
-        "# TYPE lightfee_risk_mode gauge",
-        f"lightfee_risk_mode{{mode=\"{state.risk_mode.value}\"}} {_risk_mode_code(state.risk_mode.value)}",
-    ]
-    for pos_id, pos in state.open_positions.items():
-        samples.append(
-            f"lightfee_position{{id=\"{pos_id}\",symbol=\"{pos.symbol}\"}} 1"
-        )
-    return samples
+    """Assemble Prometheus metric lines via V1-compatible builder."""
+    from lightfee.ops.metrics import build_prometheus_metric_samples as _v1_build
 
-
-def _lifecycle_code(value: str) -> int:
-    codes = {"booting": 0, "reconciling": 1, "risk_only": 2, "running": 3, "fail_closed": 4}
-    return codes.get(value, -1)
-
-
-def _risk_mode_code(value: str) -> int:
-    codes = {"running": 0, "entry_paused": 1, "reduce_only": 2, "fail_closed": 3}
-    return codes.get(value, -1)
+    return _v1_build(state)
