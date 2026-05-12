@@ -10,8 +10,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from lightfee.persistence.journal_index import JournalIndex
 
 
 class Journal:
@@ -104,6 +108,80 @@ class Journal:
                     except json.JSONDecodeError:
                         pass
         return records
+
+    # ------------------------------------------------------------------
+    # Streaming read primitives (V2 projection/backfill)
+    # ------------------------------------------------------------------
+
+    def _parse_lines(self, f) -> Iterator[dict[str, Any]]:
+        """Yield parsed records from a file object, skipping malformed lines."""
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                pass
+
+    def stream_records(self):
+        """Generator: yield every journal record without materializing the file.
+
+        Use this for projection jobs and backfill to avoid read_all()
+        memory pressure on large journals.
+        """
+        if not self.path.exists():
+            return
+        with open(self.path) as f:
+            yield from self._parse_lines(f)
+
+    def stream_from(self, start_seq: int, *, index: JournalIndex | None = None):
+        """Generator: yield records with seq >= start_seq.
+
+        When `index` is provided and contains `start_seq`, seeks directly
+        to the correct byte offset (sub-linear). Otherwise falls back to
+        a linear scan — correct but slower for large journals.
+        """
+        if not self.path.exists():
+            return
+
+        offset: int | None = None
+        if index is not None:
+            offset = index.offset_for(start_seq)
+
+        with open(self.path) as f:
+            if offset is not None:
+                f.seek(offset)
+            for record in self._parse_lines(f):
+                if record.get("seq", 0) >= start_seq:
+                    yield record
+
+    @property
+    def max_seq(self) -> int:
+        """Highest seq in the on-disk journal (0 if file missing/empty).
+
+        Reads only the last line — constant memory.
+        """
+        if not self.path.exists():
+            return 0
+        try:
+            with open(self.path, "rb") as f:
+                # Seek to last ~4 KiB and find the last complete line
+                f.seek(0, 2)
+                file_size = f.tell()
+                if file_size == 0:
+                    return 0
+                chunk_size = min(4096, file_size)
+                f.seek(max(0, file_size - chunk_size))
+                tail = f.read(chunk_size).decode("utf-8", errors="replace")
+                lines = tail.strip().split("\n")
+                last_line = lines[-1].strip() if lines else ""
+                if last_line:
+                    rec = json.loads(last_line)
+                    return int(rec.get("seq", 0))
+                return 0
+        except (OSError, json.JSONDecodeError, ValueError, KeyError):
+            return 0
 
     @property
     def seq(self) -> int:
