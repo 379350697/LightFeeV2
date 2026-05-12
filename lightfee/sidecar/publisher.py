@@ -109,6 +109,12 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
 
 
 def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
+    # --- V1 compat: convert V1 Rust sidecar format to V2 (see v1_compat.py) ---
+    if d.get("schema_version") == 1:
+        from lightfee.sidecar.v1_compat import convert_v1_snapshot_to_v2
+        d = convert_v1_snapshot_to_v2(d)
+    # --- end V1 compat ---
+
     from lightfee.sidecar.snapshot import (
         CandidateInput,
         FundingLifecycle,

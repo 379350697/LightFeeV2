@@ -122,7 +122,7 @@ def _load_venue_live(raw: dict[str, Any]) -> VenueLiveConfig:
         _merge_defaults(pm, pm_raw)
         cfg.passive_maker = pm
 
-    for key in ("is_testnet",):
+    for key in ("is_testnet", "okx_passive_px_amend_type"):
         if key in raw:
             setattr(cfg, key, raw[key])
 

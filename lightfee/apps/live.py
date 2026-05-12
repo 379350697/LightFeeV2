@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import signal
+import sys
 
 from lightfee.config.loader import load_config
 from lightfee.engine.runtime import LiveRuntime
@@ -79,6 +80,12 @@ async def async_main(config_path: str = "config/example.toml") -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
     parser = argparse.ArgumentParser(description="lightfee-live: Live trading process")
     parser.add_argument(
         "--config", "-c", default="config/example.toml", help="Path to config TOML"

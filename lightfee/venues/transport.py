@@ -188,6 +188,14 @@ class VenueTransport:
             raise ValueError(
                 f"live mode requires credentials for {self._spec.venue_id.value}"
             )
+        # Wallet-key venues (Hyperliquid) use private key + account address,
+        # not api_key + api_secret.
+        if self._spec.requires_wallet_key:
+            if not credential.wallet_private_key:
+                raise ValueError(
+                    f"live mode requires wallet_private_key for {self._spec.venue_id.value}"
+                )
+            return
         if not credential.api_key:
             raise ValueError(
                 f"live mode requires api_key for {self._spec.venue_id.value}"
@@ -199,10 +207,6 @@ class VenueTransport:
         if self._spec.requires_passphrase and not credential.api_passphrase:
             raise ValueError(
                 f"live mode requires passphrase for {self._spec.venue_id.value}"
-            )
-        if self._spec.requires_wallet_key and not credential.wallet_private_key:
-            raise ValueError(
-                f"live mode requires wallet_private_key for {self._spec.venue_id.value}"
             )
 
     # ------------------------------------------------------------------

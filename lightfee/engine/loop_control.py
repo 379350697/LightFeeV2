@@ -103,7 +103,7 @@ def maybe_export_current_state_snapshot(
     if now_ms < export_state.next_state_export_ms:
         return
     export_state.next_state_export_ms = now_ms + current_state_export_interval_ms(config)
-    _export_current_state_snapshot(state, path)
+    _export_current_state_snapshot(state, path, config)
 
 
 def _export_runtime_metrics(state: EngineState, path: str) -> None:
@@ -116,7 +116,7 @@ def _export_runtime_metrics(state: EngineState, path: str) -> None:
             f.write(f"{sample}\n")
 
 
-def _export_current_state_snapshot(state: EngineState, path: str) -> None:
+def _export_current_state_snapshot(state: EngineState, path: str, config: AppConfig) -> None:
     """Write current-state JSON snapshot with all V1-visible fields.
 
     V1: CurrentStateSnapshot — schema, generated_at_ms, expires_at_ms, stale,
@@ -140,9 +140,7 @@ def _export_current_state_snapshot(state: EngineState, path: str) -> None:
             "quantity": pos.matched_quantity,
         })
 
-    mode = "paper"
-    if hasattr(state, "mode"):
-        mode = state.mode.value if hasattr(state.mode, "value") else str(state.mode)
+    mode = config.runtime.mode
 
     data = {
         "schema": "lightfee.current_state.v1",

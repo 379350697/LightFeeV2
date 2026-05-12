@@ -221,32 +221,25 @@ class LiveRuntime:
         )
 
     async def _activate_local_l2_phase(self, now_ms: int) -> None:
-        """Phase 5: Bootstrap local-L2 books with real REST snapshot data.
+        """Phase 5: Activate local-L2 books — WS streams first, then background bootstrap.
 
-        Mirrors Rust V1 local-L2 phased startup:
-        - Derives target (venue, symbol) set from config.venues × config.symbols
-        - Creates a LocalL2Book for each target pair with venue rules
-        - Fetches real REST snapshots via the data plane for each book
-        - Transitions to HOT on successful bootstrap, DEGRADED on failure
-        - Respects live_startup_phase_timeout_ms
-        - Degraded/fail-closed on timeout
+        V1 parity with live_startup_activate_local_l2():
+        1. Create LocalL2Book for each (venue, symbol) target pair
+        2. Start WS depth streams FIRST (deltas buffered during bootstrap gap)
+        3. Start per-venue background bootstrap workers (REST snapshots)
+        4. Return immediately — bootstrap completes asynchronously in background
+
+        WS updates received while a book is BOOTSTRAPPING are buffered and
+        replayed after the REST snapshot completes (V1 pre-snapshot buffer pattern).
         """
         self.journal.append(
             "runtime.local_l2_phase_start",
             {"ts_ms": now_ms},
         )
 
-        timeout_ms = self.config.runtime.live_startup_phase_timeout_ms
-        books_bootstrapped = 0
-        books_failed = 0
-        books_skipped = 0
-        deadline_ms = now_ms + timeout_ms
-
         # Build target (venue, symbol) set from config
         target_pairs: set[tuple[str, str]] = set()
         if self.config.strategy.local_l2_enabled:
-            from lightfee.core.domain import Venue as VenueEnum
-            # Use configured venues from the venue adapters
             active_venues = list(self._venue_adapters.keys())
             for venue in active_venues:
                 venue_str = venue.value if hasattr(venue, 'value') else str(venue)
@@ -265,68 +258,99 @@ class LiveRuntime:
             return
 
         from lightfee.marketdata.local_l2_venues import get_venue_rules
-        from lightfee.core.domain import Venue as VenueEnum
 
+        # Step 1: Create books for all target pairs (V1: mark_binance_local_l2_bootstrapping)
+        books_created = 0
         for venue_str, symbol in sorted(target_pairs):
-            if wall_clock_now_ms() > deadline_ms:
-                self.journal.append(
-                    "runtime.local_l2_phase_timeout",
-                    {"ts_ms": wall_clock_now_ms(), "deadline_ms": deadline_ms,
-                     "remaining_pairs": len(target_pairs) - (books_bootstrapped + books_failed + books_skipped)},
-                )
-                break
-
-            try:
-                rules = get_venue_rules(venue_str)
-                book = self.local_l2_runtime.ensure_book(venue_str, symbol)
-                book.max_depth = rules.default_depth
-                book.max_sequence_gap = rules.max_sequence_gap
-
-                if book.status == L2BookStatus.COLD:
+            rules = get_venue_rules(venue_str)
+            book = self.local_l2_runtime.ensure_book(venue_str, symbol)
+            book.max_depth = rules.default_depth
+            book.max_sequence_gap = rules.max_sequence_gap
+            if book.status == L2BookStatus.COLD:
+                if self.config.runtime.mode == "paper":
+                    book.transition_to_hot()
+                else:
                     book.transition_to_bootstrapping(now_ms)
+                books_created += 1
+
+        # Step 2: Start WS streams FIRST for all venues (V1: start_local_l2_ws)
+        # This ensures delta updates are captured (buffered) during bootstrap gap
+        if (
+            self.config.strategy.local_l2_enabled
+            and getattr(self.config.strategy, 'local_l2_ws_enabled', False)
+            and self.config.runtime.mode != "paper"
+        ):
+            ws_started = 0
+            venue_symbols: dict[str, list[str]] = {}
+            for venue_str, symbol in target_pairs:
+                venue_symbols.setdefault(venue_str, []).append(symbol)
+
+            for venue_str, symbols in venue_symbols.items():
+                try:
+                    from lightfee.core.domain import Venue as VenueEnum
                     ven = VenueEnum.from_str(venue_str)
-                    adapter = self.get_venue_adapter(ven)
-                    if adapter is None:
-                        book.transition_to_degraded("no adapter available during startup")
-                        books_failed += 1
-                        continue
+                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                except (ValueError, KeyError):
+                    adapter = None
 
-                    # Attempt real REST snapshot bootstrap via adapter's public interface
-                    if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
-                        book.transition_to_degraded("no adapter fetch_l2_snapshot during startup")
-                        books_failed += 1
-                        continue
-
-                    if self.config.runtime.mode == "paper":
-                        book.transition_to_hot()
-                        books_bootstrapped += 1
-                        continue
-
-                    success = await self.l2_data_plane.bootstrap_book(
-                        venue=venue_str,
-                        symbol=symbol,
-                        adapter=adapter,
-                        depth=rules.default_depth,
-                        now_ms=wall_clock_now_ms(),
-                    )
-                    if success:
-                        book.transition_to_hot()
-                        books_bootstrapped += 1
-                    else:
-                        book.transition_to_degraded("REST snapshot bootstrap failed")
-                        books_failed += 1
-                elif book.status == L2BookStatus.RESUME_WAITING:
-                    books_skipped += 1
-                elif book.status == L2BookStatus.HOT:
-                    books_bootstrapped += 1
-            except Exception as e:
-                self.journal.append(
-                    "runtime.local_l2_book_error",
-                    {"venue": venue_str, "symbol": symbol, "error": str(e)},
+                registered = self.l2_data_plane.start_ws_streams(
+                    venue_str, symbols, adapter=adapter,
                 )
-                books_failed += 1
+                if registered > 0:
+                    ws_started += registered
+
+            if ws_started > 0:
+                connected = await self.l2_data_plane.connect_ws_streams()
+                ws_started = connected
+                self.journal.append(
+                    "runtime.local_l2_ws_started",
+                    {
+                        "stream_count": ws_started,
+                        "venues": sorted(venue_symbols.keys()),
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
+
+        # Step 3: Start per-venue background bootstrap workers (V1: start_local_l2_bootstrap)
+        # Each worker fetches REST snapshots with concurrency control and retry
+        if self.config.runtime.mode != "paper":
+            bs_total = 0
+            bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
+            bs_jitter = getattr(self.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
+            bs_retry = getattr(self.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+
+            for venue_str, symbols in venue_symbols.items():
+                try:
+                    from lightfee.core.domain import Venue as VenueEnum
+                    ven = VenueEnum.from_str(venue_str)
+                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                except (ValueError, KeyError):
+                    adapter = None
+
+                if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
+                    continue
+
+                self.l2_data_plane.start_background_bootstrap(
+                    venue=venue_str,
+                    symbols=symbols,
+                    adapter=adapter,
+                    batch_size=bs_batch,
+                    jitter_ms=bs_jitter,
+                    retry_backoff_ms=bs_retry,
+                )
+                bs_total += len(symbols)
+
+            self.journal.append(
+                "runtime.local_l2_bootstrap_started",
+                {
+                    "venues": sorted(venue_symbols.keys()),
+                    "total_symbols": bs_total,
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
 
         # Restore retained books from previous state
+        books_retained = 0
         if hasattr(self.state, "retained_local_l2_books"):
             for entry in getattr(self.state, "retained_local_l2_books", []):
                 venue = entry.get("venue", "")
@@ -336,72 +360,18 @@ class LiveRuntime:
                     if book.status == L2BookStatus.COLD:
                         book.pool = L2PoolAssignment.RETAINED
                         book.transition_to_bootstrapping(now_ms)
-                        books_skipped += 1
+                        books_retained += 1
 
-        within_deadline = wall_clock_now_ms() <= deadline_ms
         self.journal.append(
             "runtime.local_l2_phase_complete",
             {
-                "books_bootstrapped": books_bootstrapped,
-                "books_failed": books_failed,
-                "books_skipped": books_skipped,
+                "books_created": books_created,
+                "books_retained": books_retained,
                 "target_pairs": len(target_pairs),
                 "phase_ms": wall_clock_now_ms() - now_ms,
-                "timeout_ms": timeout_ms,
-                "within_deadline": within_deadline,
-                "fail_closed": not within_deadline and books_bootstrapped == 0,
+                "bootstrap_mode": "background_per_venue",
             },
         )
-
-        # Start WebSocket L2 delta streams for HOT books (V1: WS sessions post-bootstrap)
-        if (
-            self.config.strategy.local_l2_enabled
-            and getattr(self.config.strategy, 'local_l2_ws_enabled', False)
-            and books_bootstrapped > 0
-        ):
-            await self._start_local_l2_ws_streams()
-
-    async def _start_local_l2_ws_streams(self) -> None:
-        """Start WebSocket L2 delta streams for books that are HOT after bootstrap.
-
-        Groups symbols by venue and starts WS clients per venue/symbol pair.
-        Passes venue adapter for poller-based venues (Hyperliquid).
-        Books with active WS streaming get reduced REST refresh frequency.
-        """
-        from lightfee.core.domain import Venue as VenueEnum
-
-        venue_symbols: dict[str, list[str]] = {}
-        for book in self.local_l2_runtime.books.values():
-            if book.status == L2BookStatus.HOT:
-                venue_symbols.setdefault(book.venue, []).append(book.symbol)
-
-        total_started = 0
-        for venue_str, symbols in venue_symbols.items():
-            # Resolve adapter for poller-based venues (Hyperliquid)
-            adapter = None
-            try:
-                ven = VenueEnum.from_str(venue_str)
-                adapter = self.get_venue_adapter(ven)
-            except (ValueError, KeyError):
-                pass
-
-            registered = self.l2_data_plane.start_ws_streams(
-                venue_str, symbols, adapter=adapter,
-            )
-            total_started += registered
-
-        # Actually connect the registered WS clients from async context
-        if total_started > 0:
-            connected = await self.l2_data_plane.connect_ws_streams()
-            self.journal.append(
-                "runtime.local_l2_ws_started",
-                {
-                    "stream_count": total_started,
-                    "connected": connected,
-                    "venues": sorted(venue_symbols.keys()),
-                    "ts_ms": wall_clock_now_ms(),
-                },
-            )
 
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot."""

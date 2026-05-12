@@ -18,6 +18,7 @@ external venue data and the internal order book model.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -34,6 +35,9 @@ from lightfee.persistence.journal import Journal
 if TYPE_CHECKING:
     from lightfee.core.contracts import VenueAdapter
     from lightfee.marketdata.local_l2_ws import LocalL2WsClient
+
+# Pre-snapshot buffer capacity per symbol (V1: BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP)
+_PRE_SNAPSHOT_BUFFER_CAP = 512
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,13 @@ class LocalL2DataPlane:
         self._snap_states: dict[LocalL2BookKey, _BookSnapshotState] = {}
         self._ws_clients: dict[LocalL2BookKey, "LocalL2WsClient"] = {}
 
+        # Pre-snapshot buffers: keyed by "venue:symbol" → buffered WS updates
+        # V1: binance_local_l2_pre_snapshot_buffers() — buffers deltas during bootstrap gap
+        self._pre_snapshot_buffers: dict[str, deque[LocalL2Update]] = {}
+
+        # Background bootstrap worker tasks: keyed by "venue"
+        self._bootstrap_tasks: dict[str, asyncio.Task] = {}
+
         # Global config
         self.max_concurrent_snapshots: int = 4
         self.bootstrap_timeout_ms: int = 15_000  # Overall bootstrap phase timeout
@@ -133,6 +144,20 @@ class LocalL2DataPlane:
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
             self._runtime.record_update(update, now_ms)
+
+            # Replay buffered WS updates accumulated during bootstrap gap (V1 parity)
+            replayed = self._replay_buffered_updates(venue, symbol)
+            if replayed > 0:
+                self._journal.append(
+                    "runtime.local_l2_buffered_replay",
+                    {"venue": venue, "symbol": symbol, "replayed": replayed},
+                )
+
+            # Mark book HOT after snapshot + buffered replay (V1: complete_bootstrap)
+            book = self._runtime.get_book(venue, symbol)
+            if book is not None and book.status == L2BookStatus.BOOTSTRAPPING:
+                book.transition_to_hot()
+
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
             ss.last_error = ""
@@ -148,6 +173,10 @@ class LocalL2DataPlane:
                 RuntimeFaultKind.TRANSPORT_FAILURE,
                 f"snapshot_bootstrap: {e}", now_ms,
             )
+            self._journal.append(
+                "runtime.local_l2_snapshot_error",
+                {"venue": venue, "symbol": symbol, "error": str(e), "category": str(e.category)},
+            )
             return False
         except Exception as e:
             ss.consecutive_failures += 1
@@ -156,6 +185,10 @@ class LocalL2DataPlane:
                 venue, symbol,
                 RuntimeFaultKind.TRANSPORT_FAILURE,
                 f"snapshot_bootstrap: {e}", now_ms,
+            )
+            self._journal.append(
+                "runtime.local_l2_snapshot_error",
+                {"venue": venue, "symbol": symbol, "error": str(e)},
             )
             return False
         finally:
@@ -166,14 +199,59 @@ class LocalL2DataPlane:
     ) -> list:
         """Ingest a LocalL2Update from any external data source (WS, relay, REST).
 
-        Single entry point for all data sources to feed into the runtime.
-        Used by WebSocket streams, relay bridges, and REST bootstrap alike.
+        V1 parity: when the target book is BOOTSTRAPPING or REBUILDING, buffer
+        the delta update instead of applying it to an incomplete book. Buffered
+        updates are replayed after the REST snapshot completes (see bootstrap_book).
 
-        Synchronous — the runtime update is a book manipulation that does
-        not perform I/O. Callers (WS client, relay bridge) are responsible
-        for their own I/O and call this with parsed data.
+        Single entry point for all data sources to feed into the runtime.
         """
+        key = f"{update.venue}:{update.symbol}"
+        book = self._runtime.get_book(update.venue, update.symbol)
+
+        # Buffer delta updates during bootstrap/rebuild gap (V1: handle_binance_local_l2_ws_message)
+        if book is not None and book.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+            buf = self._pre_snapshot_buffers.get(key)
+            if buf is None:
+                buf = deque()
+                self._pre_snapshot_buffers[key] = buf
+            if len(buf) >= _PRE_SNAPSHOT_BUFFER_CAP:
+                buf.clear()
+                book.transition_to_rebuilding(now_ms)
+                self._runtime.handle_runtime_failure(
+                    update.venue, update.symbol,
+                    RuntimeFaultKind.SEQUENCE_GAP,
+                    "pre_snapshot_buffer_overflow", now_ms,
+                )
+                return []
+            buf.append(update)
+            return []
+
+        # If there are leftover buffered updates (shouldn't normally happen),
+        # replay them first before applying the current update.
+        if book is not None and self._pre_snapshot_buffers.get(key):
+            self._replay_buffered_updates(update.venue, update.symbol)
+
         return self._runtime.record_update(update, now_ms)
+
+    def _replay_buffered_updates(self, venue: str, symbol: str) -> int:
+        """Replay buffered WS updates accumulated during bootstrap gap.
+
+        V1: replay_binance_buffered_local_l2_depth_updates_for_instance()
+        Returns the number of updates replayed.
+        """
+        key = f"{venue}:{symbol}"
+        buf = self._pre_snapshot_buffers.pop(key, None)
+        if not buf:
+            return 0
+        replayed = 0
+        while buf:
+            update = buf.popleft()
+            try:
+                self._runtime.record_update(update, update.received_at_ms)
+                replayed += 1
+            except Exception:
+                pass
+        return replayed
 
     # ------------------------------------------------------------------
     # Sync: periodic snapshot refresh for books without WS streaming
@@ -239,6 +317,111 @@ class LocalL2DataPlane:
             )
 
         return dispatched
+
+    def start_background_bootstrap(
+        self,
+        venue: str,
+        symbols: list[str],
+        adapter,  # VenueAdapter
+        *,
+        batch_size: int = 4,
+        jitter_ms: int = 250,
+        retry_backoff_ms: int = 5000,
+    ) -> None:
+        """Spawn a background bootstrap worker for a single venue.
+
+        V1 parity: spawn_binance_local_l2_bootstrap_worker().
+        The worker iterates symbols with batch concurrency, fetches REST
+        snapshots, and applies them through bootstrap_book() which handles
+        buffered WS replay and transition to HOT.
+
+        Does NOT block — the worker runs as a background asyncio task.
+        Call cancel_background_bootstrap(venue) to abort.
+        """
+        # Cancel any existing bootstrap task for this venue
+        self.cancel_background_bootstrap(venue)
+
+        async def _bootstrap_worker() -> None:
+            import random
+            sem = asyncio.Semaphore(max(1, batch_size))
+
+            async def _bootstrap_one(index: int, symbol: str) -> None:
+                # Jittered initial delay to stagger requests (V1: binance_local_l2_bootstrap_initial_delay_ms)
+                delay_ms = (index % batch_size) * jitter_ms + random.randint(0, jitter_ms)
+                if delay_ms > 0:
+                    await asyncio.sleep(delay_ms / 1000.0)
+
+                book = self._runtime.get_book(venue, symbol)
+                if book is None:
+                    return
+                if book.status not in (L2BookStatus.COLD, L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED):
+                    return
+
+                backoff = retry_backoff_ms
+                max_backoff = retry_backoff_ms * 8
+                attempt = 0
+                while attempt < 5:  # max 5 retries
+                    now_ms = int(asyncio.get_event_loop().time() * 1000)
+                    book = self._runtime.get_book(venue, symbol)
+                    if book is None or book.status == L2BookStatus.HOT:
+                        return
+
+                    if book.status == L2BookStatus.COLD:
+                        book.transition_to_bootstrapping(now_ms)
+
+                    success = await self.bootstrap_book(
+                        venue=venue, symbol=symbol,
+                        adapter=adapter,
+                        depth=book.max_depth,
+                        now_ms=now_ms,
+                    )
+                    if success:
+                        return
+
+                    attempt += 1
+                    delay = min(backoff, max_backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    # Add jitter
+                    delay = delay + random.randint(0, jitter_ms)
+                    await asyncio.sleep(delay / 1000.0)
+
+            async def _bootstrap_with_sem(index: int, symbol: str) -> None:
+                async with sem:
+                    await _bootstrap_one(index, symbol)
+
+            # Create tasks for all symbols and run with concurrency control
+            tasks = [
+                _bootstrap_with_sem(i, sym)
+                for i, sym in enumerate(symbols)
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            self._journal.append(
+                "runtime.local_l2_bootstrap_worker_done",
+                {"venue": venue, "symbol_count": len(symbols)},
+            )
+
+        self._bootstrap_tasks[venue] = asyncio.create_task(_bootstrap_worker())
+
+    def cancel_background_bootstrap(self, venue: str) -> None:
+        """Cancel a running background bootstrap worker for a venue, if any."""
+        task = self._bootstrap_tasks.pop(venue, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def cancel_all_bootstrap_tasks(self) -> int:
+        """Cancel all background bootstrap workers. Returns count cancelled."""
+        count = 0
+        for task in list(self._bootstrap_tasks.values()):
+            if not task.done():
+                task.cancel()
+                count += 1
+        self._bootstrap_tasks.clear()
+        return count
+
+    @property
+    def bootstrap_tasks_count(self) -> int:
+        return sum(1 for t in self._bootstrap_tasks.values() if not t.done())
 
     @staticmethod
     def _snapshot_interval_for_status(status: L2BookStatus) -> int:
@@ -320,15 +503,13 @@ class LocalL2DataPlane:
     async def stop_ws_streams(self, *, per_client_timeout_s: float = 5.0) -> None:
         """Stop all WebSocket L2 streams with per-client timeout guard.
 
-        Cancelled WS tasks may leave DNS resolution threads in the default
-        executor that survive task cancellation.  A per-client timeout prevents
-        a stuck client from blocking the entire shutdown sequence.
+        Also cancels all background bootstrap workers.
         """
+        self.cancel_all_bootstrap_tasks()
         for client in list(self._ws_clients.values()):
             try:
                 await asyncio.wait_for(client.stop(), timeout=per_client_timeout_s)
             except asyncio.TimeoutError:
-                # Hard-abort: cancel the task and tear down the transport
                 if client._task is not None and not client._task.done():
                     client._task.cancel()
                 client._state = "closed"
@@ -363,7 +544,8 @@ class LocalL2DataPlane:
         return True
 
     def abort_workers(self) -> int:
-        """Hard-abort all WS workers without waiting for graceful shutdown."""
+        """Hard-abort all WS workers and bootstrap tasks without waiting for graceful shutdown."""
+        self.cancel_all_bootstrap_tasks()
         count = 0
         for client in list(self._ws_clients.values()):
             client._state = "closed"
@@ -428,4 +610,7 @@ class LocalL2DataPlane:
             "ws_connected_count": self.active_ws_stream_count,
             "ws_worker_categories": self.ws_worker_categories(),
             "suspicious_worker_count": self.suspicious_worker_count(),
+            "buffered_symbols": len(self._pre_snapshot_buffers),
+            "buffer_total_updates": sum(len(q) for q in self._pre_snapshot_buffers.values()),
+            "bootstrap_tasks_active": self.bootstrap_tasks_count,
         }

@@ -79,6 +79,9 @@ class RuntimeConfig:
     journal_async_queue_capacity: int = 4096
     auto_trade_enabled: bool = True
     live_startup_phase_timeout_ms: int = 15000
+    exchange_http_timeout_ms: int = 12000
+    transfer_status_cache_ms: int = 15000
+    debug_journal_diagnostics_enabled: bool = False
     maker_event_lane_enabled: bool = False
     maker_event_lane_min_wake_interval_ms: int = 15000
     shutdown_grace_period_ms: int = 3000
@@ -143,6 +146,10 @@ class StrategyConfig:
     max_risk_snapshot_age_ms: int = 30000
     execution_liquidity_enabled: bool = True
     entry_sizing_mode: str = "fixed_notional"
+    fixed_live_entry_notional_quote: float = 50.0
+    live_target_leverage: int = 4
+    entry_local_l2_primary_count: int = 8
+    maker_entry_max_reposts: int = 2
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False
     delever_vwap_required: bool = False
@@ -286,6 +293,7 @@ class VenueLiveConfig:
     trade_credentials: TradeCredentials = field(default_factory=TradeCredentials)
     passive_maker: VenuePassiveMakerConfig = field(default_factory=VenuePassiveMakerConfig)
     is_testnet: bool = False
+    okx_passive_px_amend_type: int = 0
 
 
 @dataclass

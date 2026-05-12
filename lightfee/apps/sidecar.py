@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import signal
+import sys
 
 from lightfee.config.loader import load_config
 from lightfee.sidecar.service import SidecarService
 
+logger = logging.getLogger("lightfee.sidecar")
+
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
     parser = argparse.ArgumentParser(description="lightfee-sidecar: Opportunity input data plane")
     parser.add_argument("--config", "-c", default="config/example.toml", help="Path to config TOML")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     args = parser.parse_args()
 
+    logger.info("loading config from %s", args.config)
     config = load_config(args.config)
     service = SidecarService(config)
 

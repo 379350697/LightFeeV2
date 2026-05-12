@@ -39,6 +39,9 @@ lightfee-evolution = "lightfee.apps.evolution:main"
 lightfee-probe = "lightfee.apps.probe:main"
 lightfee-explain = "lightfee.apps.explain:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
