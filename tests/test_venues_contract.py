@@ -783,3 +783,138 @@ class TestAckOnlyOrderIntegration:
             assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
         finally:
             await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Canonical symbol round-trip and venue capability truth (Task 1)
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalSymbolRoundTrip:
+    """Every venue must define symbol_to_venue (canonical → wire) and
+    symbol_from_venue (wire → canonical) lambdas so that wire symbols stay
+    at request/subscribe/parse boundaries and canonical symbols are the
+    sole internal representation.
+
+    symbol_to_venue("BTCUSDT") — canonical → venue wire format
+    symbol_from_venue("<venue-wire>") — venue wire format → canonical
+    """
+
+    def test_all_seven_venues_have_symbol_to_venue(self):
+        from lightfee.venues.specs import get_spec
+        for venue in Venue:
+            spec = get_spec(venue)
+            assert spec.symbol_to_venue is not None, (
+                f"{venue}: symbol_to_venue must not be None"
+            )
+
+    def test_all_seven_venues_have_symbol_from_venue(self):
+        from lightfee.venues.specs import get_spec
+        for venue in Venue:
+            spec = get_spec(venue)
+            assert spec.symbol_from_venue is not None, (
+                f"{venue}: symbol_from_venue must not be None"
+            )
+
+    def test_okx_canonical_to_wire(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.OKX)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTC-USDT-SWAP"
+        assert spec.symbol_to_venue("ETHUSDT") == "ETH-USDT-SWAP"
+
+    def test_okx_wire_to_canonical(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.OKX)
+        assert spec.symbol_from_venue("BTC-USDT-SWAP") == "BTCUSDT"
+        assert spec.symbol_from_venue("ETH-USDT-SWAP") == "ETHUSDT"
+
+    def test_gate_canonical_to_wire(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.GATE)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTC_USDT"
+
+    def test_gate_wire_to_canonical(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.GATE)
+        assert spec.symbol_from_venue("BTC_USDT") == "BTCUSDT"
+
+    def test_hyperliquid_canonical_to_wire(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.HYPERLIQUID)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTC"
+
+    def test_hyperliquid_wire_to_canonical(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.HYPERLIQUID)
+        assert spec.symbol_from_venue("BTC") == "BTCUSDT"
+
+    def test_binance_wire_is_canonical_identity(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.BINANCE)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTCUSDT"
+        assert spec.symbol_from_venue("BTCUSDT") == "BTCUSDT"
+
+    def test_bybit_wire_is_canonical_identity(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.BYBIT)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTCUSDT"
+        assert spec.symbol_from_venue("BTCUSDT") == "BTCUSDT"
+
+    def test_bitget_wire_is_canonical_identity(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.BITGET)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTCUSDT"
+        assert spec.symbol_from_venue("BTCUSDT") == "BTCUSDT"
+
+    def test_aster_wire_is_canonical_identity(self):
+        from lightfee.venues.specs import get_spec
+        spec = get_spec(Venue.ASTER)
+        assert spec.symbol_to_venue("BTCUSDT") == "BTCUSDT"
+        assert spec.symbol_from_venue("BTCUSDT") == "BTCUSDT"
+
+
+class TestVenueCapabilityTruth:
+    """Every venue must have explicit capability declarations;
+    unsupported capabilities must be non-silent (structured enums, not None/False)."""
+
+    def test_all_seven_venues_have_explicit_capabilities(self):
+        from lightfee.venues.base import VenueCapabilities
+        for venue in Venue:
+            caps = VenueCapabilities.for_venue(venue)
+            assert caps.venue == venue
+            assert caps.risk_health is not None, f"{venue}: risk_health must be explicit"
+            assert caps.private_health is not None, f"{venue}: private_health must be explicit"
+            assert caps.execution_liquidity is not None, f"{venue}: execution_liquidity must be explicit"
+            assert caps.reconcile_quality is not None, f"{venue}: reconcile_quality must be explicit"
+            assert caps.testnet_support is not None, f"{venue}: testnet_support must be explicit"
+
+    def test_hyperliquid_unsupported_capabilities_are_explicit(self):
+        from lightfee.venues.base import (
+            CapabilitySupport,
+            ExecutionLiquidityCapability,
+            ReconcileQuality,
+            VenueCapabilities,
+        )
+        caps = VenueCapabilities.for_venue(Venue.HYPERLIQUID)
+        assert caps.risk_health == CapabilitySupport.UNSUPPORTED, (
+            "Hyperliquid risk_health must be explicitly UNSUPPORTED"
+        )
+        assert caps.reconcile_quality == ReconcileQuality.UNSUPPORTED, (
+            "Hyperliquid reconcile_quality must be explicitly UNSUPPORTED"
+        )
+        # Hyperliquid DOES support execution liquidity via REST l2Book
+        assert caps.execution_liquidity == ExecutionLiquidityCapability.TRUE_L2
+
+    def test_bitget_unsupported_capabilities_are_explicit(self):
+        from lightfee.venues.base import ReconcileQuality, VenueCapabilities
+        caps = VenueCapabilities.for_venue(Venue.BITGET)
+        assert caps.reconcile_quality == ReconcileQuality.UNSUPPORTED, (
+            "Bitget reconcile_quality must be explicitly UNSUPPORTED"
+        )
+
+    def test_gate_unsupported_capabilities_are_explicit(self):
+        from lightfee.venues.base import ReconcileQuality, VenueCapabilities
+        caps = VenueCapabilities.for_venue(Venue.GATE)
+        assert caps.reconcile_quality == ReconcileQuality.UNSUPPORTED, (
+            "Gate reconcile_quality must be explicitly UNSUPPORTED"
+        )

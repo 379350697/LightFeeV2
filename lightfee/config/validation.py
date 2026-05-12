@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from lightfee.config.compatibility import REMOVED_FIELD_MESSAGES, VALID_OPPORTUNITY_INPUT_MODES
-from lightfee.config.schema import AppConfig
+from lightfee.config.schema import (
+    AppConfig,
+    _is_valid_generate_time,
+)
+from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
 from lightfee.core.errors import ConfigError
 
@@ -61,6 +65,22 @@ def validate_config(config: AppConfig) -> list[str]:
             Venue.from_str(vc.venue)
         except ValueError:
             issues.append(f"unknown venue: {vc.venue}")
+
+    # V1 directed_pairs validation (CONFIG-001, CONFIG-004)
+    issues.extend(validate_directed_pairs(config.runtime.directed_pairs, config.symbols))
+
+    # V1 daily_universe validation (CONFIG-004)
+    du = config.runtime.daily_universe
+    if du.enabled:
+        if not du.path.strip():
+            issues.append("daily_universe.path must not be empty when enabled")
+        if not _is_valid_generate_time(du.generate_time_local):
+            issues.append(
+                f"daily_universe.generate_time_local must be HH:MM:SS (00:00:00–23:59:59), "
+                f"got: {du.generate_time_local!r}"
+            )
+        if du.max_symbols == 0:
+            issues.append("daily_universe.max_symbols must be > 0")
 
     return issues
 

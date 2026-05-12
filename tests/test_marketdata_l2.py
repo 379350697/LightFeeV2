@@ -522,6 +522,44 @@ class TestChecksumVerification:
         assert result.applied
         assert len(result.events) == 0
 
+    def test_checksum_is_deterministic_for_same_book_state(self):
+        """V1 parity: same book state must produce identical CRC32 checksum."""
+        bids = [PriceLevel(price=50000, quantity=1.5), PriceLevel(price=49900, quantity=2.0)]
+        asks = [PriceLevel(price=50100, quantity=1.0), PriceLevel(price=50200, quantity=0.5)]
+
+        book_a = LocalL2Book(venue="okx", symbol="BTCUSDT")
+        book_a.apply_snapshot(bids, asks, sequence=100, now_ms=10000)
+        csum_a = book_a.compute_checksum()
+
+        book_b = LocalL2Book(venue="okx", symbol="BTCUSDT")
+        book_b.apply_snapshot(bids, asks, sequence=100, now_ms=10000)
+        csum_b = book_b.compute_checksum()
+
+        assert csum_a != 0
+        assert csum_a == csum_b, (
+            f"CRC32 checksum must be deterministic: {csum_a} != {csum_b}"
+        )
+
+    def test_checksum_changes_when_top_of_book_changes(self):
+        """V1 parity: different book state must produce different checksum."""
+        book_a = LocalL2Book(venue="okx", symbol="BTCUSDT")
+        book_a.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=10000,
+        )
+        csum_a = book_a.compute_checksum()
+
+        book_b = LocalL2Book(venue="okx", symbol="BTCUSDT")
+        book_b.apply_snapshot(
+            [PriceLevel(price=50001, quantity=1.0)],  # different best bid
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=10000,
+        )
+        csum_b = book_b.compute_checksum()
+
+        assert csum_a != csum_b, "Different top-of-book must produce different CRC32 checksum"
+
 
 # ---------------------------------------------------------------------------
 # Queries: mid, spread, depth, vwap, crossed

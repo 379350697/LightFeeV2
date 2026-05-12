@@ -84,6 +84,8 @@ def binance_spec() -> VenueSpec:
         api_key_header="X-MBX-APIKEY",
         signature_param="signature",
         timestamp_param="timestamp",
+        symbol_to_venue=lambda s: s,  # Binance USDM wire format matches canonical
+        symbol_from_venue=lambda s: s,
     )
 
 
@@ -136,6 +138,8 @@ def bybit_spec() -> VenueSpec:
         signature_header="X-BAPI-SIGN",
         timestamp_header="X-BAPI-TIMESTAMP",
         recv_window_header="X-BAPI-RECV-WINDOW",
+        symbol_to_venue=lambda s: s,  # Bybit V5 linear wire format matches canonical
+        symbol_from_venue=lambda s: s,
     )
 
 
@@ -161,6 +165,8 @@ def bitget_spec() -> VenueSpec:
         signature_header="ACCESS-SIGN",
         timestamp_header="ACCESS-TIMESTAMP",
         passphrase_header="ACCESS-PASSPHRASE",
+        symbol_to_venue=lambda s: s,  # Bitget USDT-FUTURES wire format matches canonical
+        symbol_from_venue=lambda s: s,
     )
 
 
@@ -209,6 +215,8 @@ def aster_spec() -> VenueSpec:
         api_key_header="X-MBX-APIKEY",
         signature_param="signature",
         timestamp_param="timestamp",
+        symbol_to_venue=lambda s: s,  # Aster (Binance-compatible) wire format matches canonical
+        symbol_from_venue=lambda s: s,
     )
 
 

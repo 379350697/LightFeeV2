@@ -321,6 +321,13 @@ class PassiveCloseExecutor:
             if chunk_quantity <= 0.0:
                 return await self._finalize_passive_close(state, pending)
 
+            if pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER:
+                self._journal.append(
+                    "exit.passive_close_dual_taker_drive",
+                    {"position_id": position_id},
+                )
+                return await self._fallback_to_aggressive_close(state, pending, position)
+
             # Determine maker leg metadata
             maker_leg = pending.phase_state.active_maker_leg
             if maker_leg == ActiveMakerLeg.LONG:
@@ -1164,10 +1171,23 @@ class PassiveCloseExecutor:
                 return
 
         # Submit new maker order
-        await self._submit_maker_order(
+        submitted = await self._submit_maker_order(
             state, pending, position, maker_venue, maker_side,
             maker_leg_label, target_price, remaining_quantity,
         )
+
+        if not submitted:
+            self._journal.append(
+                "exit.passive_close_cancel_replace_submit_failed",
+                {
+                    "position_id": position.position_id,
+                    "old_order_id": old_order_id,
+                    "reason": "replacement maker submit failed",
+                },
+            )
+            if pending.phase_state.phase != PassiveExecutionPhase.DUAL_TAKER:
+                pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            return
 
         self._journal.append(
             "exit.passive_close_cancel_replace_completed",

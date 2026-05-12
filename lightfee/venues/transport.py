@@ -372,6 +372,8 @@ class VenueTransport:
                 resp = await client.get(url, headers=headers)
             elif method.upper() == "POST":
                 resp = await client.post(url, headers=headers, content=req_body)
+            elif method.upper() == "PUT":
+                resp = await client.put(url, headers=headers, content=req_body)
             elif method.upper() == "DELETE":
                 resp = await client.delete(url, headers=headers)
             else:

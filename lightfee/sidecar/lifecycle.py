@@ -64,5 +64,22 @@ class SidecarLifecycleState:
         ]
 
 
+    def to_dict(self) -> dict:
+        """Serialize lifecycle state for current-state export and diagnostics (OPP-002)."""
+        return {
+            "domains": {
+                name: {
+                    "domain": d.domain,
+                    "observed_at_ms": d.observed_at_ms,
+                    "venue_count": d.venue_count,
+                    "status": d.status.value if isinstance(d.status, DomainStatus) else str(d.status),
+                }
+                for name, d in self.domains.items()
+            },
+            "degraded_venues": list(self.degraded_venues),
+            "all_fresh": self.all_fresh(0, 0),  # caller should re-evaluate with proper timestamps
+        }
+
+
 def create_domain_lifecycle(domain: str) -> DomainLifecycle:
     return DomainLifecycle(domain=domain)

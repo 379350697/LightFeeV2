@@ -204,7 +204,7 @@ def evaluate_venue_health(
         view.reasons.append(f"order_health_risk_elevated:{recent_order_health_risk_score:.3f}")
 
     if not supports_risk_health:
-        _apply_unsupported_snapshot_policy(strategy, view, "risk_snapshot_capability_unsupported")
+        _apply_unsupported_snapshot_policy(strategy, view, "risk_snapshot_unavailable")
         return view
 
     if risk_snapshot is None:
@@ -323,10 +323,10 @@ def evaluate_position_risk(
     degraded_reason = None
     degraded_venue = None
     if not long_supports_risk_health:
-        degraded_reason = "long_snapshot_capability_unsupported"
+        degraded_reason = "long_snapshot_unavailable"
         degraded_venue = long_venue
     elif not short_supports_risk_health:
-        degraded_reason = "short_snapshot_capability_unsupported"
+        degraded_reason = "short_snapshot_unavailable"
         degraded_venue = short_venue
     elif long_snapshot is None:
         degraded_reason = "long_snapshot_unavailable"

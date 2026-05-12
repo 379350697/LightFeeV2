@@ -68,6 +68,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
             for ll in s.liquidity_lifecycle
         ],
         "degraded_venues": list(s.degraded_venues),
+        "degraded_domains": list(s.degraded_domains),
         "quotes": {
             k: {
                 "venue": q.venue,
@@ -124,6 +125,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         transfer_lifecycle=[TransferLifecycle(**tl) for tl in d.get("transfer_lifecycle", [])],
         liquidity_lifecycle=[LiquidityLifecycle(**ll) for ll in d.get("liquidity_lifecycle", [])],
         degraded_venues=d.get("degraded_venues", []),
+        degraded_domains=d.get("degraded_domains", []),
         quotes={k: QuoteSnapshot(**v) for k, v in d.get("quotes", {}).items()},
         candidates=[CandidateInput(**c) for c in d.get("candidates", [])],
     )

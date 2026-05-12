@@ -1730,6 +1730,323 @@ class TestNonTerminalPartialFillHedgeGapClosure:
         assert pending.maker_fill.quantity == 0.01
 
 
+# ===========================================================================
+# DUAL_TAKER drive consumption — the drive loop must route DUAL_TAKER to
+# _fallback_to_aggressive_close instead of re-entering maker submit/poll.
+# ===========================================================================
+
+
+class TestDualTakerDriveConsumption:
+    """Test that drive_pending_passive_close consumes DUAL_TAKER state."""
+
+    def test_dual_taker_pending_routes_to_aggressive_fallback(self):
+        """Pending with phase=DUAL_TAKER, valid position, chunk=1.0 →
+        drive calls _fallback_to_aggressive_close and does NOT call maker submit."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+        captured_total_qty = []
+
+        async def fake_execute_close(position, reason, now_ms, long_price_hint,
+                                     short_price_hint, total_quantity, state):
+            captured_total_qty.append(total_quantity)
+            return CloseExecution(
+                position_id=position.position_id, reason=reason,
+                long_close_price=50000.0, short_close_price=50000.0,
+                long_close_qty=total_quantity or 0, short_close_qty=total_quantity or 0,
+                long_fee_quote=1.0, short_fee_quote=1.0,
+                realized_price_pnl_quote=0.0, funding_pnl_quote=0.0, net_quote=-2.0,
+            )
+
+        mock_close_exec = MagicMock(spec=CloseExecutor)
+        mock_close_exec.execute_close = AsyncMock(side_effect=fake_execute_close)
+
+        # Mock adapter with submit_passive_order — must NOT be called
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_with_tick(Venue.OKX)},
+            journal,
+        )
+        executor.set_close_executor(mock_close_exec)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        # _fallback_to_aggressive_close executed → close_executor called with total_quantity=1.0
+        assert len(captured_total_qty) == 1
+        assert abs(captured_total_qty[0] - 1.0) < 1e-9
+
+        # Maker submit was NOT called (DUAL_TAKER → straight to fallback)
+        maker_adapter.submit_passive_order.assert_not_called()
+
+        # Passive pending cleaned up after successful fallback
+        assert position.position_id not in state.pending_passive_closes
+
+        # Journal has dual_taker_drive
+        events = journal.read_all()
+        dual_taker_drives = [e for e in events if e.get("kind") == "exit.passive_close_dual_taker_drive"]
+        assert len(dual_taker_drives) == 1
+
+    def test_submit_unsupported_to_dual_taker_then_fallback_path(self):
+        """First drive: submit_passive_order raises NotImplementedError →
+        phase becomes DUAL_TAKER, returns False.
+        Second drive: DUAL_TAKER consumed → aggressive fallback, no maker submit.
+        """
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+        captured_total_qty = []
+
+        async def fake_execute_close(position, reason, now_ms, long_price_hint,
+                                     short_price_hint, total_quantity, state):
+            captured_total_qty.append(total_quantity)
+            return CloseExecution(
+                position_id=position.position_id, reason=reason,
+                long_close_price=50000.0, short_close_price=50000.0,
+                long_close_qty=total_quantity or 0, short_close_qty=total_quantity or 0,
+                long_fee_quote=1.0, short_fee_quote=1.0,
+                realized_price_pnl_quote=0.0, funding_pnl_quote=0.0, net_quote=-2.0,
+            )
+
+        mock_close_exec = MagicMock(spec=CloseExecutor)
+        mock_close_exec.execute_close = AsyncMock(side_effect=fake_execute_close)
+
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.submit_passive_order = AsyncMock(side_effect=NotImplementedError)
+        maker_adapter.place_order = AsyncMock(return_value=_make_order_fill(venue=Venue.BINANCE))
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_close_executor(mock_close_exec)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        # --- First drive: submit raises NotImplementedError, phase → DUAL_TAKER ---
+        result1 = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+        assert result1 is False
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        assert position.position_id in state.pending_passive_closes
+
+        # Verify not_supported was journaled
+        events1 = journal.read_all()
+        not_supported = [e for e in events1 if e.get("kind") == "exit.passive_close_not_supported"]
+        assert len(not_supported) == 1
+
+        # --- Second drive: DUAL_TAKER consumed → aggressive fallback ---
+        pending.next_retry_at_ms = 0
+        result2 = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        # Close executor was called with total_quantity=1.0 (current chunk residual)
+        assert len(captured_total_qty) == 1
+        assert abs(captured_total_qty[0] - 1.0) < 1e-9
+
+        # Maker submit was called exactly once (first drive only), not on second
+        assert maker_adapter.submit_passive_order.call_count == 1
+
+        # Pending cleaned up
+        assert position.position_id not in state.pending_passive_closes
+
+        # Journal has dual_taker_drive
+        events2 = journal.read_all()
+        dual_taker_drives = [e for e in events2 if e.get("kind") == "exit.passive_close_dual_taker_drive"]
+        assert len(dual_taker_drives) == 1
+
+
+class TestCancelReplaceSubmitFailure:
+    """Test that _cancel_replace_maker_order consumes _submit_maker_order return value."""
+
+    def test_replace_submit_not_implemented_no_completed_journal(self):
+        """Cancel succeeds but replacement submit raises NotImplementedError →
+        no 'completed' journal, phase=DUAL_TAKER, pending retained."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(order_id="old-oid"))
+        mock_adapter.submit_passive_order = AsyncMock(side_effect=NotImplementedError)
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        # Phase set to DUAL_TAKER
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+
+        # Pending NOT cleared
+        assert position.position_id in state.pending_passive_closes
+
+        events = journal.read_all()
+        completed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_completed"]
+        assert len(completed) == 0  # NOT completed
+
+        submit_failed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_submit_failed"]
+        assert len(submit_failed) == 1
+
+    def test_replace_submit_l2_invalid_no_completed_journal(self):
+        """Cancel succeeds but replacement submit fails (no L2/tick) →
+        no 'completed' journal, retry set, pending retained."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(order_id="old-oid"))
+        # submit_passive_order succeeds but _submit_maker_order will fail because tick_size=0
+        mock_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="new-oid", client_order_id="new-cid", price=50100.0,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor._get_tick_size = lambda venue, symbol: 0.0  # force L2/tick failure
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        # Pending NOT cleared
+        assert position.position_id in state.pending_passive_closes
+
+        # Retry set (not DUAL_TAKER, so retry_delay is set)
+        assert pending.next_retry_at_ms > 0
+
+        events = journal.read_all()
+        completed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_completed"]
+        assert len(completed) == 0  # NOT completed
+
+        submit_failed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_submit_failed"]
+        assert len(submit_failed) == 1
+
+    def test_replace_submit_success_still_completed(self):
+        """Cancel succeeds, replacement submit succeeds →
+        'completed' journal present, maker_order_id updated."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(order_id="old-oid"))
+        mock_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="new-oid", client_order_id="new-cid", price=50100.0,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        assert pending.phase_state.maker_order_id == "new-oid"
+
+        events = journal.read_all()
+        completed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_completed"]
+        assert len(completed) == 1
+        assert completed[0]["payload"]["new_order_id"] == "new-oid"
+
+        submit_failed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_submit_failed"]
+        assert len(submit_failed) == 0
+
+
 class TestPassiveManagerProfileAndConfig:
     def test_default_profile(self):
         profile = PassiveCloseManagerProfile()

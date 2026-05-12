@@ -105,6 +105,9 @@ class LocalL2WsClient(ABC):
     data_plane: "LocalL2DataPlane"
     venue_symbol: str = ""  # venue wire symbol (e.g. BTC-USDT-SWAP for OKX); defaults to symbol
 
+    # V1: bounded connection setup (OS TCP timeout can be 60+ s)
+    OPEN_TIMEOUT_SECONDS: float = field(default=10.0, init=False)
+
     # Config
     reconnect_delay_initial_s: float = 1.0
     reconnect_delay_max_s: float = 30.0
@@ -217,7 +220,7 @@ class LocalL2WsClient(ABC):
         async with websockets.connect(
             url,
             ping_interval=self.ping_interval_s,
-            open_timeout=10,  # bound connection setup (OS TCP timeout can be 60+ s)
+            open_timeout=self.OPEN_TIMEOUT_SECONDS,
             close_timeout=5,
             max_size=2**20,  # 1MB
         ) as ws:

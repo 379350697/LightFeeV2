@@ -60,8 +60,16 @@ LEGACY_FIELD_ALIASES: dict[str, str] = {
     "profit_target_quote": "profit_take_quote",
 }
 
-# Acceptable opportunity_input_mode values for the Python runtime
-VALID_OPPORTUNITY_INPUT_MODES = frozenset({"sidecar_backed", "coarse_sidecar"})
+# Acceptable opportunity_input_mode values for the Python runtime (CONFIG-003)
+# V1 parity: direct_market, coarse_sidecar, sidecar_scan, disabled, non_parity
+VALID_OPPORTUNITY_INPUT_MODES = frozenset({
+    "direct_market",
+    "coarse_sidecar",
+    "sidecar_backed",  # alias for coarse_sidecar (V1 compat)
+    "sidecar_scan",
+    "disabled",
+    "non_parity",
+})
 
 
 def apply_legacy_aliases(raw: dict) -> dict:

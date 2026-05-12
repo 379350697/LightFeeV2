@@ -187,7 +187,7 @@ class TestEvaluateVenueHealth:
         strategy = _strategy(unsupported_risk_snapshot_behavior="death_line")
         view = evaluate_venue_health(strategy, Venue.BINANCE, 10000, False, None)
         assert view.action == VenueHealthAction.FAIL_CLOSED
-        assert "risk_snapshot_capability_unsupported" in view.reasons
+        assert "risk_snapshot_unavailable" in view.reasons
 
     def test_order_health_piles_on_top_of_health_ratio(self):
         strategy = _strategy()
@@ -360,7 +360,7 @@ class TestEvaluatePositionRisk:
             None,
             _snapshot(Venue.OKX, 500.0, 100.0, 10000),
         )
-        assert view.degraded_reason == "long_snapshot_capability_unsupported"
+        assert view.degraded_reason == "long_snapshot_unavailable"
         assert view.death_condition
 
 

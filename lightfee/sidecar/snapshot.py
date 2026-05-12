@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 
 SNAPSHOT_SCHEMA_VERSION = 2
+
+
+class SnapshotFreshness(Enum):
+    """V1 snapshot freshness states (CONTRACT OPP-001).
+
+    V1 anchor: src/opportunity_input/types.rs  OpportunityInputDomainState
+    V1 semantics:
+      - FRESH: usable directly
+      - LAST_GOOD_FALLBACK: current stale/missing but recent valid snapshot exists
+      - STALE: current exists but exceeds max_age_ms (warning)
+      - MISSING: no snapshot available at all (blocks trading)
+      - DEGRADED: one or more health domains degraded but snapshot is otherwise usable
+    """
+
+    FRESH = "fresh"
+    LAST_GOOD_FALLBACK = "last_good_fallback"
+    STALE = "stale"
+    MISSING = "missing"
+    DEGRADED = "degraded"
 
 
 @dataclass
@@ -94,5 +114,46 @@ class SidecarSnapshot:
     transfer_lifecycle: list[TransferLifecycle] = field(default_factory=list)
     liquidity_lifecycle: list[LiquidityLifecycle] = field(default_factory=list)
     degraded_venues: list[str] = field(default_factory=list)
+    degraded_domains: list[str] = field(default_factory=list)
     quotes: dict[str, QuoteSnapshot] = field(default_factory=dict)
     candidates: list[CandidateInput] = field(default_factory=list)
+
+
+def evaluate_snapshot_freshness(
+    snapshot: SidecarSnapshot | None,
+    max_age_ms: int,
+    now_ms: int,
+    last_good: SidecarSnapshot | None = None,
+) -> SnapshotFreshness:
+    """Evaluate snapshot freshness per V1 OpportunityInputDomainState semantics.
+
+    V1 anchors: src/opportunity_input/types.rs  OpportunityInputDomainState
+                 src/opportunity_input/sidecar_snapshot.rs  snapshot freshness evaluation
+
+    Priority order:
+    1. MISSING — no snapshot at all
+    2. LAST_GOOD_FALLBACK — current is stale/missing but a recent valid one exists
+    3. STALE — current snapshot exceeds max_age_ms
+    4. DEGRADED — snapshot exists within max_age but has degraded venues/domains
+    5. FRESH — snapshot exists within max_age and has no degradations
+    """
+    if snapshot is None:
+        if last_good is not None:
+            last_good_age = now_ms - last_good.published_at_ms
+            if last_good_age <= max_age_ms:
+                return SnapshotFreshness.LAST_GOOD_FALLBACK
+        return SnapshotFreshness.MISSING
+
+    age_ms = now_ms - snapshot.published_at_ms
+
+    if age_ms > max_age_ms:
+        if last_good is not None:
+            last_good_age = now_ms - last_good.published_at_ms
+            if last_good_age <= max_age_ms:
+                return SnapshotFreshness.LAST_GOOD_FALLBACK
+        return SnapshotFreshness.STALE
+
+    if snapshot.degraded_venues or snapshot.degraded_domains:
+        return SnapshotFreshness.DEGRADED
+
+    return SnapshotFreshness.FRESH

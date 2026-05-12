@@ -1,15 +1,58 @@
-"""Configuration schema matching non-Chillybot Rust config shape."""
+"""Configuration schema matching V1 Rust config shape (Chillybot-free)."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+# V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
+_GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+
+
+def _is_valid_generate_time(s: str) -> bool:
+    if not _GENERATE_TIME_RE.match(s):
+        return False
+    parts = s.split(":")
+    h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+    return 0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59
+
+
+@dataclass
+class DirectedPairConfig:
+    """V1 DirectedPairConfig: restricts pair direction independently from global symbols.
+
+    When symbols is empty, all global symbols are allowed for this direction.
+    V1 anchor: src/runtime_state/config.rs  DirectedPairConfig
+    """
+
+    long: str = ""
+    short: str = ""
+    symbols: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DailyUniverseConfig:
+    """V1 DailyUniverseConfig: daily symbol universe with fallback-to-last-good.
+
+    V1 anchor: src/runtime_state/config.rs  DailyUniverseConfig
+    """
+
+    enabled: bool = False
+    generate_time_local: str = "08:00:00"
+    max_symbols: int = 128
+    fallback_to_last_good: bool = True
+    path: str = ""
 
 
 @dataclass
 class RuntimeConfig:
     mode: str = "paper"
     opportunity_input_mode: str = "coarse_sidecar"
+    # V1 directed_pairs: pair direction restriction (CONFIG-001)
+    directed_pairs: list[DirectedPairConfig] = field(default_factory=list)
+    # V1 daily_universe: generated symbol universe (CONFIG-002)
+    daily_universe: DailyUniverseConfig = field(default_factory=DailyUniverseConfig)
     sidecar_snapshot_path: str = "runtime/opportunity-input-snapshot.json"
     sidecar_snapshot_max_age_ms: int = 10000
     sidecar_refresh_ms: int = 3000

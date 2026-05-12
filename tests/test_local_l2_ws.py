@@ -849,3 +849,11 @@ class TestWorkerLifecycle:
         count = dp.abort_workers()
         assert count >= 0  # abort counts tasks, which may be 0 if no start()
         assert len(dp._ws_clients) == 0  # clients dict is cleared regardless
+
+    def test_ws_connect_has_open_timeout(self):
+        """WebSocket connection setup must be bounded (V1: OS TCP timeout can be 60+ s)."""
+        assert LocalL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
+        # Verify subclasses inherit the constant
+        assert BinanceL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
+        assert OkxL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
+        assert HyperliquidL2Poller.OPEN_TIMEOUT_SECONDS == 10.0
