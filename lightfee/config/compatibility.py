@@ -67,6 +67,7 @@ VALID_OPPORTUNITY_INPUT_MODES = frozenset({
     "coarse_sidecar",
     "sidecar_backed",  # alias for coarse_sidecar (V1 compat)
     "sidecar_scan",
+    "direct_market_enriched",  # V1: enriched provider with hints and transfer resolution
     "disabled",
     "non_parity",
 })

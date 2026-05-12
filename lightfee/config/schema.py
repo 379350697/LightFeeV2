@@ -207,6 +207,32 @@ class StrategyConfig:
     entry_final_gate_max_skew_ms: int = 250
     passive_unavailable_fallback_enabled: bool = False
     passive_unavailable_fallback_max_entry_notional_quote: float = 25.0
+    # V1 real config knobs (gap closure)
+    local_l2_global_max_books: int = 64  # V1 default: 64
+    local_l2_max_books_per_venue: int = 16  # V1 default: 16
+    local_l2_hot_exec_global_budget: int = 16
+    local_l2_hot_exec_per_venue_budget: int = 4
+    entry_min_size_round_up_whitelist: list[str] = field(default_factory=list)
+
+
+    def local_l2_resource_budget(self) -> dict:
+        """V1 local_l2_resource_budget(): spread max_books across active/warm/retained/topo pools.
+
+        V1 anchor: src/runtime_state/config.rs  StrategyConfig::local_l2_resource_budget()
+        """
+        gmax = max(self.local_l2_global_max_books, 1)
+        return {
+            "max_active_books": self.local_l2_global_max_books,
+            "max_active_books_per_venue": self.local_l2_max_books_per_venue,
+            "reserved_hot_global": max(self.local_l2_hot_exec_global_budget, 1),
+            "reserved_hot_per_venue": max(self.local_l2_hot_exec_per_venue_budget, 1),
+            "warm_global": gmax,
+            "warm_per_venue": self.local_l2_max_books_per_venue,
+            "retained_global": gmax,
+            "retained_per_venue": self.local_l2_max_books_per_venue,
+            "topology_coupled_market_global": gmax,
+            "topology_coupled_market_per_venue": self.local_l2_max_books_per_venue,
+        }
 
 
 @dataclass

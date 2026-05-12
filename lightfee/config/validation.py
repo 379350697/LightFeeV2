@@ -60,6 +60,22 @@ def validate_config(config: AppConfig) -> list[str]:
             f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
         )
 
+    # V1 local-L2 resource budget validation
+    if config.strategy.local_l2_global_max_books <= 0:
+        issues.append(
+            f"strategy.local_l2_global_max_books must be > 0, got: {config.strategy.local_l2_global_max_books}"
+        )
+    if config.strategy.local_l2_max_books_per_venue > config.strategy.local_l2_global_max_books:
+        issues.append(
+            f"strategy.local_l2_max_books_per_venue ({config.strategy.local_l2_max_books_per_venue}) "
+            f"must be <= strategy.local_l2_global_max_books ({config.strategy.local_l2_global_max_books})"
+        )
+    if config.strategy.local_l2_hot_exec_global_budget > config.strategy.local_l2_global_max_books:
+        issues.append(
+            f"strategy.local_l2_hot_exec_global_budget ({config.strategy.local_l2_hot_exec_global_budget}) "
+            f"must be <= strategy.local_l2_global_max_books ({config.strategy.local_l2_global_max_books})"
+        )
+
     for vc in config.venues:
         try:
             Venue.from_str(vc.venue)

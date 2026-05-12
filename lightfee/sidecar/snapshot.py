@@ -115,6 +115,9 @@ class SidecarSnapshot:
     liquidity_lifecycle: list[LiquidityLifecycle] = field(default_factory=list)
     degraded_venues: list[str] = field(default_factory=list)
     degraded_domains: list[str] = field(default_factory=list)
+    # V1 provider-depth semantics: provenance tracking
+    source_mode: str = ""  # "direct_market" | "direct_market_enriched" | "coarse_sidecar" | "sidecar_scan"
+    acquisition_mode: str = ""  # "fresh_sidecar" | "last_good_sidecar" | "direct_market_view" | "unavailable"
     quotes: dict[str, QuoteSnapshot] = field(default_factory=dict)
     candidates: list[CandidateInput] = field(default_factory=list)
 

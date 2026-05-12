@@ -86,7 +86,12 @@ class LiveRuntime:
 
         # V1 local-L2 runtime (data-plane: book, assignment, events, metrics)
         from lightfee.marketdata.local_l2_runtime import LocalL2Runtime
-        self.local_l2_runtime = LocalL2Runtime()
+
+        budget = config.strategy.local_l2_resource_budget()
+        self.local_l2_runtime = LocalL2Runtime(
+            max_hot_exec=budget["reserved_hot_global"],
+            max_warm=budget["warm_global"],
+        )
 
         # V1 local-L2 data plane (REST snapshot bootstrap + WS streaming)
         from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
