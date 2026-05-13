@@ -1425,11 +1425,14 @@ class LiveRuntime:
             if pending.reconcile_next_attempt_ms > 0 and now_ms < pending.reconcile_next_attempt_ms:
                 continue
 
-            # Hard deadline check
-            if pending.deadline_ms > 0 and now_ms > pending.deadline_ms:
+            # Hard deadline check (V1: recovery deadline, 10 min from creation)
+            effective_deadline = pending.deadline_ms if pending.deadline_ms > 0 else (
+                pending.created_at_ms + self._RECONCILE_HARD_DEADLINE_MS if pending.created_at_ms > 0 else 0
+            )
+            if effective_deadline > 0 and now_ms > effective_deadline:
                 self.journal.append(
                     "reconciliation.entry_abandoned_deadline",
-                    {"entry_id": entry_id, "deadline_ms": pending.deadline_ms},
+                    {"entry_id": entry_id, "deadline_ms": effective_deadline},
                 )
                 resolved_entry_ids.append(entry_id)
                 continue
