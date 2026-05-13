@@ -974,6 +974,57 @@ def normalize_engine_state(state: EngineState) -> None:
     for pid in zero_ids:
         del state.open_positions[pid]
 
+    # 9. Validate and clean bad pending entries (V1: type safety + normalize)
+    # Drop entries with missing/broken data that would cause reconciliation failures.
+    import logging
+    _logger = logging.getLogger("lightfee.engine.recovery")
+    bad_entry_ids: list[str] = []
+    for entry_id, pe in list(state.pending_entries.items()):
+        # Must have a valid symbol
+        if not pe.symbol or not isinstance(pe.symbol, str) or not pe.symbol.strip():
+            bad_entry_ids.append(entry_id)
+            _logger.warning("recovery: dropping pending entry %s — empty symbol", entry_id)
+            continue
+        # Must have valid venues
+        if not pe.long_venue or not pe.short_venue:
+            bad_entry_ids.append(entry_id)
+            _logger.warning("recovery: dropping pending entry %s — missing venue", entry_id)
+            continue
+        # Must have positive target quantity
+        try:
+            qty = float(pe.target_quantity)
+            if qty <= 0:
+                bad_entry_ids.append(entry_id)
+                _logger.warning("recovery: dropping pending entry %s — zero quantity", entry_id)
+                continue
+        except (ValueError, TypeError):
+            bad_entry_ids.append(entry_id)
+            _logger.warning("recovery: dropping pending entry %s — unparseable quantity", entry_id)
+            continue
+        # Backfill missing timestamps
+        if pe.created_at_ms <= 0:
+            pe.created_at_ms = pe.reconcile_next_attempt_ms if pe.reconcile_next_attempt_ms > 0 else int(time.time() * 1000)
+        # Ensure reconcile backoff defaults
+        if pe.reconcile_next_attempt_ms <= 0:
+            pe.reconcile_next_attempt_ms = pe.created_at_ms
+    for eid in bad_entry_ids:
+        state.pending_entries.pop(eid, None)
+    if bad_entry_ids:
+        _logger.warning("recovery: dropped %d bad pending entries: %s", len(bad_entry_ids), bad_entry_ids)
+
+    # 10. Validate pending closes similarly
+    bad_close_ids: list[str] = []
+    for close_id, pc in list(state.pending_closes.items()):
+        if not pc.position_id or not pc.symbol:
+            bad_close_ids.append(close_id)
+            continue
+        if pc.created_at_ms <= 0:
+            pc.created_at_ms = int(time.time() * 1000)
+        if pc.reconcile_next_attempt_ms <= 0:
+            pc.reconcile_next_attempt_ms = pc.created_at_ms
+    for cid in bad_close_ids:
+        state.pending_closes.pop(cid, None)
+
 
 # ---------------------------------------------------------------------------
 # Recovery dedup: prevent duplicate orders after restart (V1 clientOrderId)

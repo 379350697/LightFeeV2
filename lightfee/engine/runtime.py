@@ -1425,17 +1425,14 @@ class LiveRuntime:
             if pending.reconcile_next_attempt_ms > 0 and now_ms < pending.reconcile_next_attempt_ms:
                 continue
 
-            # Hard deadline check (V1: recovery deadline, 10 min from creation)
-            effective_deadline = pending.deadline_ms if pending.deadline_ms > 0 else (
-                pending.created_at_ms + self._RECONCILE_HARD_DEADLINE_MS if pending.created_at_ms > 0 else 0
-            )
-            if effective_deadline > 0 and now_ms > effective_deadline:
-                self.journal.append(
-                    "reconciliation.entry_abandoned_deadline",
-                    {"entry_id": entry_id, "deadline_ms": effective_deadline},
-                )
-                resolved_entry_ids.append(entry_id)
-                continue
+            # V1: abandon via live-size probe, not hard deadline.
+            # After 1+ failed attempts, if the entry no longer references an active
+            # position and both venues report ~zero live size → abandon immediately.
+            if pending.reconcile_attempt >= 1:
+                abandoned = await self._try_abandon_stale_entry(pending, entry_id)
+                if abandoned:
+                    resolved_entry_ids.append(entry_id)
+                    continue
 
             pending.reconcile_attempt += 1
             try:
@@ -1551,6 +1548,55 @@ class LiveRuntime:
                 "runtime.reconciling_complete",
                 {"reason": "all_pending_resolved", "ts_ms": now_ms},
             )
+
+    async def _try_abandon_stale_entry(self, pending, entry_id: str) -> bool:
+        """V1-style stale entry abandonment via live-size probe.
+
+        V1: try_abandon_stale_pending_close_reconciliation() — after 1 failed
+        reconciliation, if the entry no longer references an active position AND
+        both venues report ~zero live size, the entry is abandoned immediately.
+        No hard deadline — real evidence only.
+        """
+        # Entry must reference a position_id that is no longer active
+        pos_id = pending.position_id if hasattr(pending, 'position_id') else pending.pending_id
+        if self.state.open_positions.get(pos_id) is not None:
+            return False  # still active, don't abandon
+
+        # Probe both venues for live position size
+        try:
+            from lightfee.core.domain import Venue as VenueEnum
+            long_ven = VenueEnum.from_str(pending.long_venue) if isinstance(pending.long_venue, str) else pending.long_venue
+            short_ven = VenueEnum.from_str(pending.short_venue) if isinstance(pending.short_venue, str) else pending.short_venue
+            long_adapter = self._venue_adapters.get(long_ven)
+            short_adapter = self._venue_adapters.get(short_ven)
+        except (ValueError, KeyError):
+            long_adapter = None
+            short_adapter = None
+
+        long_zero = True
+        short_zero = True
+        try:
+            if long_adapter is not None:
+                pos = await long_adapter.fetch_position(pending.symbol)
+                long_zero = pos.quantity <= 0.0
+        except Exception:
+            long_zero = False  # can't probe → assume not zero
+
+        try:
+            if short_adapter is not None:
+                pos = await short_adapter.fetch_position(pending.symbol)
+                short_zero = pos.quantity <= 0.0
+        except Exception:
+            short_zero = False
+
+        if long_zero and short_zero:
+            self.journal.append(
+                "reconciliation.entry_abandoned_flat",
+                {"entry_id": entry_id, "reason": "both_venues_zero"},
+            )
+            return True
+
+        return False
 
     @staticmethod
     def _apply_reconcile_backoff(pending, now_ms: int) -> None:
