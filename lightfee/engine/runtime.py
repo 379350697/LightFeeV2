@@ -423,16 +423,13 @@ class LiveRuntime:
             return
 
         # Collect (venue, symbol) pairs from candidates that need L2
+        # CandidateInput has long_venue/short_venue as str fields (not leg objects)
         needed: dict[str, set[str]] = {}  # venue -> {symbols}
         for c in candidates:
-            for leg in (getattr(c, 'long_leg', None), getattr(c, 'short_leg', None)):
-                if leg is None:
+            sym = getattr(c, 'symbol', '')
+            for ven_str in (getattr(c, 'long_venue', ''), getattr(c, 'short_venue', '')):
+                if not ven_str or not sym:
                     continue
-                ven = getattr(leg, 'venue', None)
-                sym = getattr(leg, 'symbol', None)
-                if ven is None or sym is None:
-                    continue
-                ven_str = ven.value if hasattr(ven, 'value') else str(ven)
                 # Skip if already active
                 book = self.local_l2_runtime.get_book(ven_str, sym)
                 if book is not None and book.status in (
