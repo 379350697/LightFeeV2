@@ -431,15 +431,14 @@ class LocalL2DataPlane:
 
     async def sync_snapshots(
         self,
-        adapters: dict,  # [Venue, VenueAdapter-like] — provides transport via adapter.transport
+        adapters: dict,
         now_ms: int,
     ) -> int:
-        """Periodic REST snapshot refresh for all managed books.
+        """Periodic REST snapshot refresh — only for books without active WS stream.
 
-        Books in COLD/BOOTSTRAPPING/REBUILDING get priority snapshots.
-        HOT books get periodic refresh only if they have no WS stream.
-
-        Returns the number of snapshots dispatched.
+        V1: REST snapshots are ONLY for bootstrap. After HOT, WS deltas maintain
+        the book.  This poller exists only as a fallback for books that lost their
+        WS stream (DEGRADED/REBUILDING) or never had one.
         """
         dispatched = 0
 
@@ -447,28 +446,20 @@ class LocalL2DataPlane:
             if dispatched >= self.max_concurrent_snapshots:
                 break
 
-            # Determine if this book needs a snapshot
-            interval_ms = self._snapshot_interval_for_status(book.status)
-
-            # HOT books: skip if WS is active (future), otherwise periodic refresh
+            # V1: only snapshot books that need recovery — HOT books rely on WS deltas
             if book.status == L2BookStatus.HOT:
-                if book.last_snapshot_ms > 0 and (now_ms - book.last_snapshot_ms) < interval_ms:
-                    continue
-
-            # COLD/BOOTSTRAPPING/REBUILDING: snapshot on every eligible pass
-            if interval_ms == 0:
-                pass  # Always eligible
-            elif book.last_snapshot_ms > 0 and (now_ms - book.last_snapshot_ms) < interval_ms:
                 continue
 
-            # Resolve adapter
+            interval_ms = self._snapshot_interval_for_status(book.status)
+            if interval_ms > 0 and book.last_snapshot_ms > 0:
+                if (now_ms - book.last_snapshot_ms) < interval_ms:
+                    continue
+
             from lightfee.core.domain import Venue
             ven = Venue.from_str(key.venue)
             adapter = adapters.get(ven)
             if adapter is None:
                 continue
-
-            # Use adapter's public fetch_l2_snapshot() — never access _transport
             if not hasattr(adapter, 'fetch_l2_snapshot'):
                 continue
 
