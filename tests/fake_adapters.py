@@ -35,6 +35,7 @@ class FakeVenueAdapter(VenueAdapter):
 
     # --- Programmable outcomes (consumed FIFO) ---
     place_order_outcomes: list[OrderFill | OrderSubmitError] = field(default_factory=list)
+    submit_passive_order_outcomes: list = field(default_factory=list)
     position_snapshots: list[PositionSnapshot] = field(default_factory=list)
 
     # --- Default outcomes (used when queue is empty) ---
@@ -45,6 +46,7 @@ class FakeVenueAdapter(VenueAdapter):
     # --- Spy fields ---
     last_request: Optional[OrderRequest] = None
     place_order_call_count: int = 0
+    submit_passive_order_call_count: int = 0
     fetch_position_call_count: int = 0
 
     @property
@@ -91,6 +93,27 @@ class FakeVenueAdapter(VenueAdapter):
         """Cancel existing order — no-op for fake testing."""
         self.last_request = request
         return None
+
+    async def submit_passive_order(self, request: OrderRequest):
+        """Submit a GTC post-only maker order. Returns ack, not fill."""
+        from lightfee.core.domain import PassiveOrderAck
+        self.submit_passive_order_call_count += 1
+        self.last_request = request
+        if self.submit_passive_order_outcomes:
+            outcome = self.submit_passive_order_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return PassiveOrderAck(
+            venue=self._venue,
+            symbol=request.symbol,
+            side=request.side,
+            order_id=f"passive-{self._venue.value}-{self.submit_passive_order_call_count}",
+            client_order_id=request.client_order_id or "",
+            price=request.price or 0.0,
+            quantity=request.quantity,
+            accepted_at_ms=1234,
+        )
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         self.fetch_position_call_count += 1

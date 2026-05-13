@@ -47,6 +47,10 @@ class _RejectingAdapter(VenueAdapter):
     async def place_order(self, request: OrderRequest) -> OrderFill:
         raise OrderSubmitError(SubmitFailureClass.REJECTED, "test reject")
 
+    async def submit_passive_order(self, request: OrderRequest):
+        """Reject passive orders too — consistent with place_order."""
+        raise OrderSubmitError(SubmitFailureClass.REJECTED, "test reject")
+
     async def fetch_position(self, symbol: str) -> "PositionSnapshot":
         from lightfee.core.domain import PositionSnapshot
         return PositionSnapshot(venue=self._venue, symbol=symbol, quantity=0.0)

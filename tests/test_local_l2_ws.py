@@ -715,7 +715,9 @@ class TestNoTransportAccessInProductionPaths:
         dp, rt, _ = _make_data_plane()
         from lightfee.core.domain import Venue
 
-        rt.ensure_book("binance", "BTCUSDT")
+        from lightfee.marketdata.l2 import L2PoolAssignment
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.pool = L2PoolAssignment.RETAINED
 
         class NoTransportAttr:
             """Adapter that has fetch_l2_snapshot() but NO _transport attribute."""

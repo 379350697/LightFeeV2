@@ -116,7 +116,7 @@ def _export_runtime_metrics(state: EngineState, path: str) -> None:
             f.write(f"{sample}\n")
 
 
-def _export_current_state_snapshot(state: EngineState, path: str, config: AppConfig) -> None:
+def _export_current_state_snapshot(state: EngineState, path: str, config: Optional[AppConfig] = None) -> None:
     """Write current-state JSON snapshot with all V1-visible fields.
 
     V1: CurrentStateSnapshot — schema, generated_at_ms, expires_at_ms, stale,
@@ -126,9 +126,9 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: AppCon
     import time
 
     now_ms = int(time.time() * 1000)
-    stale_after_ms = current_state_export_interval_ms(
-        __import__("lightfee.config.schema", fromlist=["AppConfig"]).AppConfig()
-    ) * 3
+    if config is None:
+        config = AppConfig()
+    stale_after_ms = current_state_export_interval_ms(config) * 3
 
     open_positions = []
     for pos in state.open_positions.values():

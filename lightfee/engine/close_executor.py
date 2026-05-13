@@ -367,7 +367,7 @@ def _legs_to_records(legs: list[CloseExecutionLeg]) -> list[CloseLegRecord]:
             order_id=leg.fill.order_id,
             client_order_id=leg.client_order_id,
             quantity=leg.fill.quantity,
-            average_price=leg.fill.average_price,
+            average_price=leg.fill.price,
             fee_quote=leg.fill.fee_quote,
         ))
     return records
@@ -573,6 +573,7 @@ class CloseExecutor:
 
         # V1: exit.closed is a critical event — synchronous durability
         self.journal.append_critical(
+            now_ms,
             "exit.closed",
             {
                 "position_id": position.position_id,
@@ -670,6 +671,7 @@ class CloseExecutor:
         # V1: exit.partial_closed is a critical event
         if position.matched_quantity > 1e-12:
             self.journal.append_critical(
+                now_ms,
                 "exit.partial_closed",
                 {
                     "position_id": position.position_id,
@@ -692,6 +694,7 @@ class CloseExecutor:
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(position.position_id, None)
             self.journal.append_critical(
+                now_ms,
                 "exit.closed",
                 {
                     "position_id": position.position_id,

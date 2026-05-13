@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from lightfee.core.domain import (
+    OrderFill,
     OrderRequest,
     PositionSnapshot,
     Side,
@@ -43,6 +44,9 @@ from lightfee.venues.transport import (
     TransportError,
     TransportErrorCategory,
     VenueTransport,
+    _safe_float,
+    _require_bybit_success,
+    _require_bitget_success,
     build_hmac_sha256_hex,
     build_hmac_sha256_base64,
     build_hmac_sha512_hex,
@@ -151,7 +155,7 @@ class TestOkxBitgetHeaders:
         cred = LiveCredential(api_key="okx-key", api_secret="okx-secret",
                               api_passphrase="okx-pass")
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
-        headers = transport._build_auth_headers("GET", "/api/v5/account/positions")
+        headers = transport._build_auth_headers("GET", "/api/v5/account/positions", private=True)
         # OKX must use OK-ACCESS-* header names
         assert "OK-ACCESS-KEY" in headers, f"Expected OK-ACCESS-KEY in {list(headers.keys())}"
         assert "OK-ACCESS-SIGN" in headers
@@ -167,7 +171,7 @@ class TestOkxBitgetHeaders:
         cred = LiveCredential(api_key="bg-key", api_secret="bg-secret",
                               api_passphrase="bg-pass")
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
-        headers = transport._build_auth_headers("GET", "/api/mix/v1/position/singlePosition")
+        headers = transport._build_auth_headers("GET", "/api/mix/v1/position/singlePosition", private=True)
         # Bitget must use ACCESS-* header names
         assert "ACCESS-KEY" in headers
         assert "ACCESS-SIGN" in headers
@@ -187,8 +191,8 @@ class TestOkxBitgetHeaders:
         t_okx = VenueTransport(spec=okx_s, mode="live", credential=cred)
         t_bg = VenueTransport(spec=bg_s, mode="live", credential=cred)
 
-        h_okx = t_okx._build_auth_headers("GET", "/test")
-        h_bg = t_bg._build_auth_headers("GET", "/test")
+        h_okx = t_okx._build_auth_headers("GET", "/test", private=True)
+        h_bg = t_bg._build_auth_headers("GET", "/test", private=True)
 
         okx_keys = set(h_okx.keys())
         bg_keys = set(h_bg.keys())
@@ -214,6 +218,7 @@ class TestBinanceAsterPostSigning:
         qs, headers, body = transport._build_signed_request(
             "POST", "/fapi/v1/order",
             body={"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.01"},
+            private=True,
         )
         # Query string must contain timestamp and signature
         assert "timestamp=" in qs, f"Missing timestamp in query string: {qs}"
@@ -228,6 +233,7 @@ class TestBinanceAsterPostSigning:
         qs, headers, body = transport._build_signed_request(
             "POST", "/fapi/v1/order",
             body={"symbol": "BTCUSDT", "side": "SELL", "quantity": "0.01"},
+            private=True,
         )
         assert "timestamp=" in qs
         assert "signature=" in qs
@@ -241,6 +247,7 @@ class TestBinanceAsterPostSigning:
         qs, headers, body = transport._build_signed_request(
             "POST", "/fapi/v1/order",
             body={"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.01"},
+            private=True,
         )
         # Parse query string
         params = dict(p.split("=", 1) for p in qs.lstrip("?").split("&"))
@@ -258,6 +265,7 @@ class TestBinanceAsterPostSigning:
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
         qs, headers, body = transport._build_signed_request(
             "GET", "/fapi/v2/positionRisk",
+            private=True,
         )
         assert "timestamp=" in qs
         assert "signature=" in qs
@@ -659,6 +667,7 @@ class TestOkxGetSignature:
         qs, headers, _body = transport._build_signed_request(
             "GET", "/api/v5/account/positions",
             params={"instId": "BTC-USDT-SWAP"},
+            private=True,
         )
         # Verify query string is in the URL
         assert "instId=BTC-USDT-SWAP" in qs
@@ -680,6 +689,7 @@ class TestOkxGetSignature:
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
         qs, headers, _body = transport._build_signed_request(
             "GET", "/api/v5/account/positions",
+            private=True,
         )
         sig = headers.get("OK-ACCESS-SIGN")
         ts = headers["OK-ACCESS-TIMESTAMP"]
@@ -695,6 +705,7 @@ class TestOkxGetSignature:
         _qs, headers, body = transport._build_signed_request(
             "POST", "/api/v5/trade/order",
             body={"instId": "BTC-USDT-SWAP", "tdMode": "cross", "sz": "1", "side": "buy", "ordType": "market"},
+            private=True,
         )
         sig = headers.get("OK-ACCESS-SIGN")
         ts = headers["OK-ACCESS-TIMESTAMP"]
@@ -719,6 +730,7 @@ class TestBybitGetSignature:
         qs, headers, _body = transport._build_signed_request(
             "GET", "/v5/position/list",
             params={"category": "linear", "symbol": "BTCUSDT"},
+            private=True,
         )
         assert "category=linear" in qs
         assert "symbol=BTCUSDT" in qs
@@ -739,6 +751,7 @@ class TestBybitGetSignature:
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
         _qs, headers, _body = transport._build_signed_request(
             "GET", "/v5/position/list",
+            private=True,
         )
         sig = headers.get("X-BAPI-SIGN")
         ts = headers["X-BAPI-TIMESTAMP"]
@@ -754,6 +767,7 @@ class TestBybitGetSignature:
         _qs, headers, body = transport._build_signed_request(
             "POST", "/v5/order/create",
             body={"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": "0.01"},
+            private=True,
         )
         sig = headers.get("X-BAPI-SIGN")
         ts = headers["X-BAPI-TIMESTAMP"]
@@ -910,96 +924,70 @@ class TestPrivateBaseUrl:
 
 
 class TestPositionSideParsing:
-    """Position parser must correctly identify SELL from various field values."""
-
-    SHORT_FIXTURES = [
-        # (name, data)
-        ("binance_short", {"symbol": "BTCUSDT", "positionSide": "SHORT",
-         "positionAmt": "-0.01", "entryPrice": "50000.0"}),
-        ("bybit_sell", {"symbol": "BTCUSDT", "side": "Sell",
-         "size": "0.01", "avgPrice": "50000.0"}),
-        ("okx_short", {"instId": "BTC-USDT-SWAP", "posSide": "short",
-         "pos": "1", "avgPx": "50000.0"}),
-        ("bitget_sell", {"symbol": "BTCUSDT", "holdSide": "short",
-         "total": "0.01", "openPriceAvg": "50000.0"}),
-        ("gate_short_by_negative", {"contract": "BTCUSDT", "size": "-1",
-         "entry_price": "50000.0"}),
-        ("hyperliquid_short_by_negative", {"position": {"coin": "BTC", "szi": "-0.01", "entryPx": "50000.0"}}),
-    ]
-
-    def _make_raw(self, data: dict) -> dict:
-        """Wrap data in venue-appropriate response envelope."""
-        return {"data": data}
+    """Position parser must correctly identify SELL from various field values.
+    Updated for Task 7: uses venue-specific parser functions with proper envelopes."""
 
     def test_binance_short_position_side(self):
-        spec = binance_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"symbol": "BTCUSDT", "positionSide": "SHORT",
-               "positionAmt": "0.01", "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        from lightfee.venues.transport import _parse_binance_like_position
+        raw = [{"symbol": "BTCUSDT", "positionSide": "SHORT",
+                "positionAmt": "0.01", "entryPrice": "50000.0"}]
+        pos = _parse_binance_like_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.SELL
         assert pos.quantity == 0.01
 
     def test_binance_negative_position_amt_is_short(self):
-        spec = binance_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"symbol": "BTCUSDT", "positionSide": "", "positionAmt": "-0.01",
-               "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        from lightfee.venues.transport import _parse_binance_like_position
+        raw = [{"symbol": "BTCUSDT", "positionSide": "", "positionAmt": "-0.01",
+                "entryPrice": "50000.0"}]
+        pos = _parse_binance_like_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.SELL
         assert pos.quantity == 0.01
 
     def test_bybit_sell_side_is_short(self):
-        spec = bybit_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"result": {"list": [
+        from lightfee.venues.transport import _parse_bybit_position
+        raw = {"retCode": 0, "result": {"list": [
             {"symbol": "BTCUSDT", "side": "Sell", "size": "0.01", "avgPrice": "50000.0"}
         ]}}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        pos = _parse_bybit_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.SELL
         assert pos.quantity == 0.01
 
     def test_okx_lowercase_short_is_short(self):
-        spec = okx_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
+        from lightfee.venues.transport import _parse_okx_position
         raw = {"code": "0", "data": [
             {"instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "1", "avgPx": "50000.0"}
         ]}
-        pos = transport._parse_position(raw, "BTC-USDT-SWAP", 1000)
+        pos = _parse_okx_position(raw, "BTC-USDT-SWAP", 1000)
         assert pos.side == Side.SELL
 
     def test_gate_negative_size_is_short(self):
-        spec = gate_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
+        from lightfee.venues.transport import _parse_gate_position
         raw = {"contract": "BTCUSDT", "size": "-1", "entry_price": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        pos = _parse_gate_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.SELL
         assert pos.quantity == 1.0
 
     def test_hyperliquid_negative_szi_is_short(self):
-        spec = hyperliquid_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
+        from lightfee.venues.transport import _parse_hyperliquid_position
         raw = {"assetPositions": [
             {"position": {"coin": "BTC", "szi": "-0.01", "entryPx": "50000.0"}}
         ]}
-        pos = transport._parse_position(raw, "BTC", 1000)
+        pos = _parse_hyperliquid_position(raw, "BTC", 1000)
         assert pos.side == Side.SELL
         assert pos.quantity == 0.01
 
     def test_long_position_still_works(self):
-        spec = binance_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"symbol": "BTCUSDT", "positionSide": "LONG",
-               "positionAmt": "0.01", "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        from lightfee.venues.transport import _parse_binance_like_position
+        raw = [{"symbol": "BTCUSDT", "positionSide": "LONG",
+                "positionAmt": "0.01", "entryPrice": "50000.0"}]
+        pos = _parse_binance_like_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.BUY
         assert pos.quantity == 0.01
 
     def test_no_side_no_quantity_defaults_buy(self):
-        spec = binance_spec()
-        transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"symbol": "BTCUSDT", "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        from lightfee.venues.transport import _parse_binance_like_position
+        raw = [{"symbol": "BTCUSDT", "entryPrice": "50000.0"}]
+        pos = _parse_binance_like_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.BUY
         assert pos.quantity == 0.0
 
@@ -1030,6 +1018,7 @@ class TestOkxGetSigningWithQueryString:
         qs, headers, body = transport._build_signed_request(
             "GET", "/api/v5/account/positions",
             params={"instId": "BTC-USDT-SWAP"},
+            private=True,
         )
         # Verify query string is in the URL
         assert "instId=BTC-USDT-SWAP" in qs
@@ -1055,6 +1044,7 @@ class TestOkxGetSigningWithQueryString:
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
         qs, headers, body = transport._build_signed_request(
             "GET", "/api/v5/account/config",
+            private=True,
         )
         sign = headers["OK-ACCESS-SIGN"]
         ts = headers["OK-ACCESS-TIMESTAMP"]
@@ -1072,6 +1062,7 @@ class TestOkxGetSigningWithQueryString:
             "POST", "/api/v5/trade/order",
             body={"instId": "BTC-USDT-SWAP", "tdMode": "cross",
                   "side": "buy", "ordType": "market", "sz": "1"},
+            private=True,
         )
         sign = headers["OK-ACCESS-SIGN"]
         ts = headers["OK-ACCESS-TIMESTAMP"]
@@ -1095,6 +1086,7 @@ class TestBybitGetSigningWithQueryString:
         qs, headers, body = transport._build_signed_request(
             "GET", "/v5/position/list",
             params={"category": "linear", "symbol": "BTCUSDT"},
+            private=True,
         )
         assert headers.get("X-BAPI-SIGN")
         sign = headers["X-BAPI-SIGN"]
@@ -1119,6 +1111,7 @@ class TestBybitGetSigningWithQueryString:
             "POST", "/v5/order/create",
             body={"category": "linear", "symbol": "BTCUSDT",
                   "side": "Buy", "orderType": "Market", "qty": "0.01"},
+            private=True,
         )
         sign = headers["X-BAPI-SIGN"]
         ts = headers["X-BAPI-TIMESTAMP"]
@@ -1673,8 +1666,8 @@ class TestBitgetRiskHealthRealMethod:
         assert result.health_ratio == 10.0
         assert result.available_balance_quote == 8000.0
         assert result.source == "bitget_account_risk"
-        # UTA path used
-        assert any("/api/v3/account/assets" in u for u in call_urls)
+        # UTA path used: adapter delegates to spec.account_risk_path
+        assert any("/api/v2/mix/account/account" in u for u in call_urls)
 
     @pytest.mark.asyncio
     async def test_classic_cached_goes_direct_to_classic_endpoint(self):
@@ -2023,3 +2016,534 @@ class TestPendingEntryRecoveryRoundtrip:
         assert pe.maker_price == 0.0
         assert pe.long_quantity == 0.0
         assert pe.short_quantity == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task 1: ACK-only and exchange error envelope tests
+# ---------------------------------------------------------------------------
+
+FIXTURE_DIR_T1 = "tests/fixtures/venues"
+
+
+def _fixture(relative_path: str):
+    """Load a JSON fixture from tests/fixtures/venues/"""
+    import json as _json
+    path = f"{FIXTURE_DIR_T1}/{relative_path}"
+    with open(path) as f:
+        return _json.load(f)
+
+
+def _make_live_transport_with_mock_response(venue: Venue, fixture_path: str):
+    """Create a VenueTransport in live mode that returns the given fixture JSON."""
+    fixture = _fixture(fixture_path)
+    spec_fn = {
+        Venue.BYBIT: bybit_spec,
+        Venue.BITGET: bitget_spec,
+        Venue.BINANCE: binance_spec,
+        Venue.OKX: okx_spec,
+    }[venue]
+    spec = spec_fn()
+    cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+    transport = VenueTransport(spec=spec, mode="live", credential=cred)
+    transport._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _req: httpx.Response(200, json=fixture)
+        )
+    )
+    return transport
+
+
+def _make_live_transport(venue: Venue, handler):
+    """Create a VenueTransport with a custom async request handler."""
+    spec_fn = {
+        Venue.BYBIT: bybit_spec,
+        Venue.BITGET: bitget_spec,
+        Venue.BINANCE: binance_spec,
+        Venue.OKX: okx_spec,
+    }[venue]
+    spec = spec_fn()
+    cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
+    transport = VenueTransport(spec=spec, mode="live", credential=cred)
+    transport._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
+    return transport
+
+
+class TestAckOnlyResponses:
+    """Task 1 Step 2: ACK-only responses must be uncertain in place_order
+    and return PassiveOrderAck in submit_passive_order."""
+
+    @pytest.mark.asyncio
+    async def test_bybit_ack_only_place_order_is_uncertain_but_passive_submit_is_ack(self):
+        transport = _make_live_transport_with_mock_response(
+            Venue.BYBIT, "bybit/place_order_ack_only.json"
+        )
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.001,
+            price=50000.0,
+            post_only=True,
+            client_order_id="lfv2-entry-maker-001",
+        )
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.place_order(req)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+
+        transport2 = _make_live_transport_with_mock_response(
+            Venue.BYBIT, "bybit/place_order_ack_only.json"
+        )
+        ack = await transport2.submit_passive_order(req)
+        assert ack.order_id == "1321003749386327552"
+        assert ack.client_order_id == "lfv2-entry-maker-001"
+
+    @pytest.mark.asyncio
+    async def test_bitget_ack_only_place_order_is_uncertain_but_passive_submit_is_ack(self):
+        transport = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/classic_place_order_ack_only.json"
+        )
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.001,
+            price=50000.0,
+            post_only=True,
+            client_order_id="lfv2-entry-maker-001",
+        )
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.place_order(req)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+
+        transport2 = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/classic_place_order_ack_only.json"
+        )
+        ack = await transport2.submit_passive_order(req)
+        assert ack.order_id == "121211212122"
+        assert ack.client_order_id == "lfv2-entry-maker-001"
+
+
+class TestExchangeErrorEnvelopes:
+    """Task 1 Step 3: Exchange error codes map to REJECTED."""
+
+    @pytest.mark.asyncio
+    async def test_bybit_retcode_reject_maps_to_rejected(self):
+        transport = _make_live_transport_with_mock_response(
+            Venue.BYBIT, "bybit/place_order_reject_retcode.json"
+        )
+        req = OrderRequest(
+            venue=Venue.BYBIT, symbol="BTCUSDT", side=Side.BUY, quantity=0.001,
+        )
+        # With the guard active (Task 2), retCode != 0 triggers REJECTED
+        # before parsing even starts
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.place_order(req)
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "110003" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_bitget_code_reject_maps_to_rejected(self):
+        fixture = {"code": "40001", "msg": "Invalid parameter", "data": None}
+        transport = _make_live_transport(Venue.BITGET, lambda _: httpx.Response(200, json=fixture))
+        req = OrderRequest(
+            venue=Venue.BITGET, symbol="BTCUSDT", side=Side.BUY, quantity=0.001,
+        )
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.place_order(req)
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "40001" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Safe float and venue-specific guards
+# ---------------------------------------------------------------------------
+
+
+class TestSafeFloat:
+    """Task 2 Step 1: safe float helper."""
+
+    def test_safe_float_empty_string_returns_default(self):
+        assert _safe_float("", default=0.0) == 0.0
+        assert _safe_float(None, default=0.0) == 0.0
+        assert _safe_float("1.25", default=0.0) == 1.25
+
+    def test_safe_float_invalid_input_returns_default(self):
+        assert _safe_float("not_a_number", default=0.0) == 0.0
+        assert _safe_float([], default=0.0) == 0.0
+        assert _safe_float({}, default=0.0) == 0.0
+        assert _safe_float("   ", default=5.0) == 5.0
+
+    def test_safe_float_zero_default(self):
+        assert _safe_float(None) == 0.0
+        assert _safe_float("") == 0.0
+
+
+class TestBybitPositionListShape:
+    """Task 2 Step 1: bybit position parser handles empty strings in list shape."""
+
+    def test_bybit_position_result_list_shape_is_supported(self):
+        raw = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [
+                    {"symbol": "BTCUSDT", "side": "Buy", "size": "", "avgPrice": ""}
+                ]
+            }
+        }
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        pos = transport._parse_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.quantity == 0.0
+        assert pos.entry_price == 0.0
+
+    def test_bybit_position_empty_list_returns_zero(self):
+        raw = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {"list": []}
+        }
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        pos = transport._parse_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.quantity == 0.0
+
+
+class TestVenueSuccessGuards:
+    """Task 2 Step 2: venue success guard functions."""
+
+    def test_require_bybit_success_passes_on_retcode_zero(self):
+        _require_bybit_success({"retCode": 0, "retMsg": "OK"}, "test")
+
+    def test_require_bybit_success_raises_on_nonzero(self):
+        with pytest.raises(OrderSubmitError) as exc:
+            _require_bybit_success({"retCode": 110003, "retMsg": "bad price"}, "bybit order")
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "110003" in str(exc.value)
+
+    def test_require_bitget_success_passes_on_code_00000(self):
+        _require_bitget_success({"code": "00000", "msg": "success"}, "test")
+
+    def test_require_bitget_success_passes_on_code_0(self):
+        _require_bitget_success({"code": "0", "msg": "success"}, "test")
+
+    def test_require_bitget_success_raises_on_error_code(self):
+        with pytest.raises(OrderSubmitError) as exc:
+            _require_bitget_success({"code": "40001", "msg": "bad"}, "bitget order")
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "40001" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Fix Bybit Order Builders
+# ---------------------------------------------------------------------------
+
+
+class TestBybitOrderBody:
+    """Task 3 Step 2: Bybit order body uses correct V5 field names."""
+
+    @pytest.mark.asyncio
+    async def test_bybit_passive_order_body_uses_qty_order_link_id_and_position_idx(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bybit/place_order_ack_only.json"))
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.001,
+            price=50000.0,
+            post_only=True,
+            client_order_id="lfv2-entry-maker-001",
+        )
+
+        await transport.submit_passive_order(req)
+
+        assert seen_body["category"] == "linear"
+        assert seen_body["symbol"] == "BTCUSDT"
+        assert seen_body["side"] == "Buy"
+        assert seen_body["orderType"] == "Limit"
+        assert seen_body["timeInForce"] == "PostOnly"
+        assert seen_body["qty"] == "0.001"
+        assert seen_body["orderLinkId"] == "lfv2-entry-maker-001"
+        assert seen_body["positionIdx"] in (0, 1, 2)
+        assert "quantity" not in seen_body
+        assert "newClientOrderId" not in seen_body
+
+    @pytest.mark.asyncio
+    async def test_bybit_market_order_body_uses_qty_and_position_idx(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bybit/place_order_ack_only.json"))
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.002,
+            client_order_id="lfv2-hedge-001",
+        )
+
+        from lightfee.core.domain import OrderFill
+        transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BYBIT, symbol=sym, side=req.side,
+            quantity=req.quantity, price=50000.0, order_id="123",
+        )
+        await transport.place_order(req)
+
+        assert seen_body["qty"] == "0.002"
+        assert seen_body["side"] == "Sell"
+        assert seen_body["orderLinkId"] == "lfv2-hedge-001"
+        assert seen_body["positionIdx"] == 2  # Sell in hedge mode
+        assert "quantity" not in seen_body
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Fix Bitget Classic/UTA Order Builders
+# ---------------------------------------------------------------------------
+
+
+class TestBitgetOrderBody:
+    """Task 4 Steps 2-4: Bitget profile-aware order path and body."""
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_passive_order_body_uses_v2_mix_contract_fields(self):
+        import json as _json
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        seen: dict = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = _json.loads(request.content.decode())
+            return httpx.Response(200, json=_fixture("bitget/classic_place_order_ack_only.json"))
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.001,
+            price=50000.0,
+            post_only=True,
+            client_order_id="lfv2-entry-maker-001",
+        )
+
+        await adapter.submit_passive_order(req)
+
+        assert seen["path"] == "/api/v2/mix/order/place-order"
+        assert seen["body"]["productType"] == "USDT-FUTURES"
+        assert seen["body"]["marginMode"] == "crossed"
+        assert seen["body"]["marginCoin"] == "USDT"
+        assert seen["body"]["size"] == "0.001"
+        assert seen["body"]["side"] == "sell"
+        assert seen["body"]["orderType"] == "limit"
+        assert seen["body"]["force"] == "post_only"
+        assert seen["body"]["clientOid"] == "lfv2-entry-maker-001"
+        assert "quantity" not in seen["body"]
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_passive_order_body_uses_v3_trade_fields(self):
+        import json as _json
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        seen: dict = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = _json.loads(request.content.decode())
+            return httpx.Response(200, json=_fixture("bitget/uta_place_order_ack_only.json"))
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.001,
+            price=50000.0,
+            post_only=True,
+            client_order_id="lfv2-entry-maker-001",
+        )
+
+        await adapter.submit_passive_order(req)
+
+        assert seen["path"] == "/api/v3/trade/place-order"
+        assert seen["body"]["category"] == "USDT-FUTURES"
+        assert seen["body"]["qty"] == "0.001"
+        assert seen["body"]["side"] == "buy"
+        assert seen["body"]["orderType"] == "limit"
+        assert seen["body"]["timeInForce"] == "post_only"
+        assert seen["body"]["clientOid"] == "lfv2-entry-maker-001"
+        assert "quantity" not in seen["body"]
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Restore Official Aster Endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestAsterSpec:
+    """Task 5 Step 1: Aster spec uses official asterdex.com hosts."""
+
+    def test_aster_spec_uses_official_asterdex_hosts(self):
+        spec = aster_spec()
+        assert spec.public_base_url == "https://fapi.asterdex.com"
+        assert spec.private_base_url == "https://fapi.asterdex.com"
+        assert spec.l2_snapshot_path == "/fapi/v1/depth"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: Bitget L2 Metadata Guard and Official Orderbook Parser
+# ---------------------------------------------------------------------------
+
+
+class TestBitgetL2Guard:
+    """Task 6 Step 2-3: Bitget L2 metadata guard and V3 orderbook parser."""
+
+    @pytest.mark.asyncio
+    async def test_bitget_l2_unsupported_symbol_is_blocked_before_http_call(self):
+        transport = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/orderbook_uta_success.json"
+        )
+        transport.set_symbol_metadata({"BTCUSDT": {"sizeMultiplier": "0.001"}})
+
+        with pytest.raises(TransportError) as exc:
+            await transport.fetch_l2_snapshot("INJUSDT", depth=50)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+        assert "metadata missing" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_bitget_l2_v3_orderbook_parses_a_b_arrays(self):
+        transport = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/orderbook_uta_success.json"
+        )
+        transport.set_symbol_metadata({"BTCUSDT": {"sizeMultiplier": "0.001"}})
+        update = await transport.fetch_l2_snapshot("BTCUSDT", depth=50)
+
+        assert update.venue == "bitget"
+        assert update.symbol == "BTCUSDT"
+        assert update.bids[0].price == 71213.8
+        assert update.asks[0].price == 73000.0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Venue-Specific Position Parsers
+# ---------------------------------------------------------------------------
+
+
+class TestVenuePositionParsers:
+    """Task 7 Step 1-4: venue-specific position parsers with safe numeric handling."""
+
+    def test_bybit_position_parser_handles_list_shape(self):
+        from lightfee.venues.transport import _parse_bybit_position
+        raw = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [
+                    {"symbol": "BTCUSDT", "side": "Buy", "size": "0.01", "avgPrice": "50000.0"}
+                ]
+            }
+        }
+        pos = _parse_bybit_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.quantity == 0.01
+        assert pos.entry_price == 50000.0
+        assert pos.side == Side.BUY
+
+    def test_bybit_position_parser_handles_empty_fields(self):
+        from lightfee.venues.transport import _parse_bybit_position
+        raw = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [
+                    {"symbol": "BTCUSDT", "side": "Buy", "size": "", "avgPrice": ""}
+                ]
+            }
+        }
+        pos = _parse_bybit_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.quantity == 0.0
+        assert pos.entry_price == 0.0
+
+    def test_bitget_position_parser_accepts_data_list_and_empty_numbers(self):
+        from lightfee.venues.transport import _parse_bitget_position
+        raw = {
+            "code": "00000",
+            "msg": "success",
+            "data": [
+                {
+                    "symbol": "BTCUSDT",
+                    "total": "",
+                    "holdSide": "long",
+                    "openPriceAvg": ""
+                }
+            ]
+        }
+        pos = _parse_bitget_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.quantity == 0.0
+        assert pos.entry_price == 0.0
+
+    def test_bitget_position_parser_handles_short_side(self):
+        from lightfee.venues.transport import _parse_bitget_position
+        raw = {
+            "code": "00000",
+            "msg": "success",
+            "data": [
+                {
+                    "symbol": "BTCUSDT",
+                    "total": "0.01",
+                    "holdSide": "short",
+                    "openPriceAvg": "50000.0"
+                }
+            ]
+        }
+        pos = _parse_bitget_position(raw, "BTCUSDT", now_ms=1000)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 0.01
+
+    def test_okx_position_parser_scales_contracts_and_handles_empty_pos(self):
+        from lightfee.venues.transport import _parse_okx_position
+        raw = {
+            "code": "0",
+            "data": [
+                {"instId": "BTC-USDT-SWAP", "pos": "", "posSide": "long", "avgPx": ""}
+            ]
+        }
+        pos = _parse_okx_position(raw, "BTC-USDT-SWAP", now_ms=1000, contract_size=0.01)
+        assert pos.quantity == 0.0
+        assert pos.entry_price == 0.0
+
+    def test_okx_position_parser_scales_contract_size(self):
+        from lightfee.venues.transport import _parse_okx_position
+        raw = {
+            "code": "0",
+            "data": [
+                {"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "long", "avgPx": "50000"}
+            ]
+        }
+        pos = _parse_okx_position(raw, "BTC-USDT-SWAP", now_ms=1000, contract_size=0.01)
+        assert pos.quantity == 0.1  # 10 contracts * 0.01

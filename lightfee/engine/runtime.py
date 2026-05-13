@@ -734,6 +734,19 @@ class LiveRuntime:
                 for candidate in tradeable:
                     if len(self.state.open_positions) >= max_slots:
                         break
+                    # V2 Task 9: entry local L2 selection blocker (prewarm/dual-ready)
+                    l2_blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
+                    if l2_blocker:
+                        self.journal.append(
+                            "runtime.entry_blocked_local_l2_selection",
+                            {
+                                "symbol": candidate.symbol,
+                                "pair_id": getattr(candidate, "pair_id", ""),
+                                "reason": l2_blocker,
+                                "ts_ms": now_ms,
+                            },
+                        )
+                        continue
                     mid_price = price_hints.get(candidate.symbol, 0.0)
                     await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
                     dispatched += 1
@@ -1906,6 +1919,31 @@ class LiveRuntime:
     # Entry dispatch
     # ------------------------------------------------------------------
 
+    def _entry_local_l2_selection_blocker(self, candidate, now_ms: int) -> str | None:
+        """V2 Task 9: Check if candidate is blocked at selection (prewarm/dual-ready).
+
+        Returns a reason string if blocked, or None if ready to proceed.
+        Does NOT relax the final execution gate — that remains strict.
+        """
+        if not self.config.strategy.local_l2_enabled:
+            return None
+        prewarm_window_s = getattr(
+            self.config.strategy, "entry_local_l2_prewarm_window_secs", 480,
+        )
+        if prewarm_window_s > 0:
+            created_at = getattr(candidate, "created_at_ms", 0)
+            if created_at > 0 and (now_ms - created_at) < (prewarm_window_s * 1000):
+                return "entry_local_l2_waiting_for_prewarm_window"
+        # Check entry_l2_sessions for dual ready
+        pair_id = getattr(candidate, "pair_id", "")
+        if pair_id and hasattr(self, "entry_l2_sessions"):
+            session = self.entry_l2_sessions.sessions.get(pair_id)
+            if session is None:
+                return "entry_local_l2_no_session"
+            if not getattr(session, "both_legs_ready", lambda _ms, _age: True)(now_ms, 300_000):
+                return "entry_local_l2_waiting_for_dual_ready"
+        return None
+
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> None:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
@@ -2010,30 +2048,39 @@ class LiveRuntime:
             short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
 
             not_ready_reasons: list[str] = []
+            max_age_ms = self.config.strategy.max_liquidity_snapshot_age_ms
             if long_book is None:
-                not_ready_reasons.append(f"long book missing: {long_venue.value}:{candidate.symbol}")
+                not_ready_reasons.append(
+                    f"long book missing: {long_venue.value}:{candidate.symbol} "
+                    f"max_age_ms={max_age_ms}"
+                )
             else:
                 liq = execution_liquidity_from_local_l2(
-                    long_book, max_age_ms=self.config.strategy.max_liquidity_snapshot_age_ms,
+                    long_book, max_age_ms=max_age_ms,
                     now_ms=now_ms, require_ready=True,
                 )
                 if not liq.book_ready:
                     not_ready_reasons.append(
                         f"long leg not ready: {long_venue.value}:{candidate.symbol} "
-                        f"status={long_book.status.value} age={long_book.age_ms(now_ms)}ms"
+                        f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
+                        f"age={long_book.age_ms(now_ms)}ms max_age_ms={max_age_ms}"
                     )
 
             if short_book is None:
-                not_ready_reasons.append(f"short book missing: {short_venue.value}:{candidate.symbol}")
+                not_ready_reasons.append(
+                    f"short book missing: {short_venue.value}:{candidate.symbol} "
+                    f"max_age_ms={max_age_ms}"
+                )
             else:
                 liq = execution_liquidity_from_local_l2(
-                    short_book, max_age_ms=self.config.strategy.max_liquidity_snapshot_age_ms,
+                    short_book, max_age_ms=max_age_ms,
                     now_ms=now_ms, require_ready=True,
                 )
                 if not liq.book_ready:
                     not_ready_reasons.append(
                         f"short leg not ready: {short_venue.value}:{candidate.symbol} "
-                        f"status={short_book.status.value} age={short_book.age_ms(now_ms)}ms"
+                        f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
+                        f"age={short_book.age_ms(now_ms)}ms max_age_ms={max_age_ms}"
                     )
 
             if not_ready_reasons:

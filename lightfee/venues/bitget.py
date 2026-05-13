@@ -259,30 +259,61 @@ class BitgetAdapter(VenueAdapter):
             return await self._transport.place_order(request)
 
         try:
+            from lightfee.venues.transport import (
+                _build_bitget_order_request,
+                _require_bitget_success,
+            )
+
             profile = await self.detect_profile()
             venue_sym = self._transport._venue_symbol(request.symbol)
             now_ms = int(__import__("time").time() * 1000)
 
-            body: dict = {
-                "symbol": venue_sym,
-                "side": request.side.value.upper(),
-                "quantity": str(request.quantity),
-                "marginCoin": "USDT",
-                "orderType": "market",
-            }
-            if request.reduce_only:
-                body["reduceOnly"] = "true"
+            req_path, body = _build_bitget_order_request(
+                request, venue_sym,
+                passive=False,
+                profile=profile.value,
+                hedge_mode=self._transport._hedge_mode,
+            )
+            raw = await self._transport._request("POST", req_path, body=body, private=True)
 
-            if profile == BitgetAccountProfile.CLASSIC:
-                raw = await self._transport._request(
-                    "POST", "/api/v2/mix/order/placeOrder", body=body, private=True
-                )
-            else:
-                raw = await self._transport._request(
-                    "POST", "/api/v3/order/placeOrder", body=body, private=True
-                )
-
+            _require_bitget_success(raw, "bitget order failed")
             return self._transport._parse_order_fill(raw, request, venue_sym, now_ms)
+        except TransportError as e:
+            if e.category == TransportErrorCategory.REQUEST_REJECTED:
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, str(e)) from e
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e)) from e
+        except OrderSubmitError:
+            raise
+        except Exception as e:
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e)) from e
+
+    async def submit_passive_order(self, request: OrderRequest):
+        """Submit a GTC post-only maker order via profile-aware routing."""
+        from lightfee.core.domain import PassiveOrderAck
+
+        if self._mode != "live":
+            return await self._transport.submit_passive_order(request)
+
+        try:
+            from lightfee.venues.transport import (
+                _build_bitget_order_request,
+                _require_bitget_success,
+            )
+
+            profile = await self.detect_profile()
+            venue_sym = self._transport._venue_symbol(request.symbol)
+            now_ms = int(__import__("time").time() * 1000)
+
+            req_path, body = _build_bitget_order_request(
+                request, venue_sym,
+                passive=True,
+                profile=profile.value,
+                hedge_mode=self._transport._hedge_mode,
+            )
+            raw = await self._transport._request("POST", req_path, body=body, private=True)
+
+            _require_bitget_success(raw, "bitget passive order failed")
+            return self._transport._parse_passive_order_ack(raw, request, venue_sym, now_ms)
         except TransportError as e:
             if e.category == TransportErrorCategory.REQUEST_REJECTED:
                 raise OrderSubmitError(SubmitFailureClass.REJECTED, str(e)) from e

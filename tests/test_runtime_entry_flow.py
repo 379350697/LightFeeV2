@@ -66,6 +66,17 @@ class FakeVenueAdapter(VenueAdapter):
         return PositionSnapshot(venue=self._venue, symbol=symbol, side=self.default_position_side,
                                 quantity=self.default_position_qty, entry_price=0.0, observed_at_ms=1000)
 
+    async def submit_passive_order(self, request):
+        from lightfee.core.domain import PassiveOrderAck
+        self.last_request = request
+        return PassiveOrderAck(
+            venue=self._venue, symbol=request.symbol, side=request.side,
+            order_id=f"passive-{self._venue.value}-1",
+            client_order_id=request.client_order_id or "",
+            price=request.price or 0.0, quantity=request.quantity,
+            accepted_at_ms=1000,
+        )
+
     async def normalize_quantity(self, symbol, quantity):
         return quantity
 

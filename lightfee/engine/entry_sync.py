@@ -163,6 +163,18 @@ class EntrySyncExecutor:
         result.journal_entries.extend(maker_result.get("journal", []))
         result.maker_fill = maker_result.get("fill")
 
+        # V2: post_only maker is resting — create pending entry, no hedge yet
+        if maker_result["outcome"] == "resting":
+            ack = maker_result.get("ack")
+            result.state = EntryState.MAKER_RESTING
+            result.pending_entry = self._make_pending_entry(
+                ctx, maker_req, hedge_req, now_ms,
+                outcome="maker_resting",
+                maker_order_id=ack.order_id if ack else "",
+                hedge_order_id="",
+            )
+            return result
+
         if maker_result["outcome"] == "rejected":
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
@@ -357,7 +369,7 @@ class EntrySyncExecutor:
 
         # V1: entry.opened is a critical event — synchronous durability
         self.journal.append_critical(
-            "entry.opened",
+            now_ms, "entry.opened",
             {
                 "position_id": position.position_id,
                 "symbol": position.symbol,
@@ -531,7 +543,10 @@ class EntrySyncExecutor:
     ) -> dict[str, Any]:
         """Submit an order through the venue adapter and classify outcome.
 
-        Returns dict with outcome, fill, order_id, and client_order_id.
+        V2 fix: post_only maker orders go through submit_passive_order.
+        Hedge/taker orders continue to use place_order for IOC fills.
+
+        Returns dict with outcome, fill/ack, order_id, and client_order_id.
         """
         import time as _time
         adapter = self.adapters.get(request.venue)
@@ -548,6 +563,10 @@ class EntrySyncExecutor:
                 },
             )
             return {"outcome": "rejected", "fill": None, "order_id": ""}
+
+        # V2: post_only maker orders go through passive submit (ACK, not fill)
+        if is_maker and request.post_only:
+            return await self._submit_passive_order(request, position_id, leg, adapter)
 
         try:
             fill = await adapter.place_order(request)
@@ -633,6 +652,69 @@ class EntrySyncExecutor:
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                     "is_maker": is_maker,
+                },
+            )
+            return {"outcome": "uncertain", "fill": None, "order_id": ""}
+
+    async def _submit_passive_order(
+        self, request: OrderRequest, position_id: str, leg: str, adapter
+    ) -> dict[str, Any]:
+        """Submit a post_only maker order via submit_passive_order.
+
+        Returns ack-based outcomes: resting (ACK received), rejected, or uncertain.
+        """
+        try:
+            ack = await adapter.submit_passive_order(request)
+            self.journal.append(
+                "order.passive_submitted",
+                {
+                    "position_id": position_id,
+                    "leg": leg,
+                    "venue": request.venue.value,
+                    "symbol": request.symbol,
+                    "order_id": ack.order_id,
+                    "client_order_id": ack.client_order_id,
+                    "price": ack.price,
+                    "quantity": ack.quantity,
+                },
+            )
+            return {"outcome": "resting", "ack": ack, "order_id": ack.order_id}
+
+        except OrderSubmitError as e:
+            if e.is_rejected:
+                self.journal.append(
+                    "order.rejected",
+                    {
+                        "position_id": position_id,
+                        "leg": leg,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                        "is_maker": True,
+                    },
+                )
+                return {"outcome": "rejected", "fill": None, "order_id": ""}
+            else:
+                self.journal.append(
+                    "order.uncertain",
+                    {
+                        "position_id": position_id,
+                        "leg": leg,
+                        "reason": str(e),
+                        "client_order_id": request.client_order_id,
+                        "is_maker": True,
+                    },
+                )
+                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+
+        except Exception as e:
+            self.journal.append(
+                "order.uncertain",
+                {
+                    "position_id": position_id,
+                    "leg": leg,
+                    "reason": str(e),
+                    "client_order_id": request.client_order_id,
+                    "is_maker": True,
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}

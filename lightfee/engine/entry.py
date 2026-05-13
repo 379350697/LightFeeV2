@@ -92,7 +92,7 @@ def build_entry_orders(
     """Build maker and hedge order requests with V1 TIF/reduce-only/clientOrderId.
 
     V1 semantics:
-    - Maker: GTC post-only with deterministic clientOrderId
+    - Maker: GTC post-only for passive entries, IOC for taker entries
     - Hedge: IOC reduce-only=False (hedge is opening, not closing)
     - Both legs carry clientOrderId for idempotency and reconciliation
     """
@@ -100,6 +100,7 @@ def build_entry_orders(
 
     maker_cid = f"{ctx.entry_id}-maker"
     hedge_cid = f"{ctx.entry_id}-hedge"
+    is_passive = ctx.entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK)
 
     if ctx.maker_leg == Side.BUY:
         maker_req = OrderRequest(
@@ -108,8 +109,8 @@ def build_entry_orders(
             side=Side.BUY,
             quantity=ctx.long_quantity,
             price=ctx.long_price_hint,
-            post_only=True,
-            time_in_force=TimeInForce.GTC,
+            post_only=is_passive,
+            time_in_force=TimeInForce.GTC if is_passive else TimeInForce.IOC,
             client_order_id=maker_cid,
         )
         hedge_req = OrderRequest(
@@ -129,8 +130,8 @@ def build_entry_orders(
             side=Side.SELL,
             quantity=ctx.short_quantity,
             price=ctx.short_price_hint,
-            post_only=True,
-            time_in_force=TimeInForce.GTC,
+            post_only=is_passive,
+            time_in_force=TimeInForce.GTC if is_passive else TimeInForce.IOC,
             client_order_id=maker_cid,
         )
         hedge_req = OrderRequest(

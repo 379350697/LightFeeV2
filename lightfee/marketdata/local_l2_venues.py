@@ -292,14 +292,35 @@ def parse_bitget_l2_update(
 ) -> LocalL2Update:
     """Parse Bitget orderbook snapshot/delta into LocalL2Update.
 
-    Bitget format:
+    Bitget REST V3 market/orderbook snapshot format:
+      {"code": "00000", "requestTime": 1730969017897,
+       "data": {"a": [[73000.0, 0.007]], "b": [[71213.8, 1.836]], "ts": "1730969017964"}}
+
+    Bitget WS format:
       {"action": "snapshot"/"update", "arg": {"instId": "BTCUSDT"},
        "data": [{"bids": [["50000", "1.0"]], "asks": [["50100", "1.5"]],
                  "seqId": 123, "ts": "1234567890"}]}
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
-    data = payload.get("data", [])
+    data = payload.get("data", {}) or {}
+
+    # REST V3 orderbook: data.a (asks), data.b (bids)
+    if isinstance(data, dict) and ("a" in data or "b" in data):
+        asks_raw = data.get("a", [])
+        bids_raw = data.get("b", [])
+        bids = [PriceLevel(price=float(b[0]), quantity=float(b[1])) for b in bids_raw if b and float(b[1]) > 0]
+        asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if a and float(a[1]) > 0]
+        observed_at_ms = int(data.get("ts") or payload.get("requestTime") or now_ms)
+        return LocalL2Update(
+            venue=venue, symbol=symbol,
+            bids=bids, asks=asks,
+            sequence=observed_at_ms, previous_sequence=0,
+            event_time_ms=observed_at_ms, received_at_ms=now_ms,
+            update_kind=LocalL2UpdateKind.SNAPSHOT,
+        )
+
+    # WS format
     if not data:
         raise ValueError("Bitget L2 update: missing data array")
     entry = data[0] if isinstance(data, list) else data

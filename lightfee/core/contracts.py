@@ -88,6 +88,25 @@ class VenueAdapter(ABC):
     ) -> Optional[OrderFillReconciliation]:
         return None
 
+    async def fetch_order_status(
+        self,
+        symbol: str,
+        *,
+        order_id: str = "",
+        client_order_id: str = "",
+    ) -> Optional[OrderFillReconciliation]:
+        """Task 11: Query order status by exchange ID or client ID.
+
+        Bybit uses orderLinkId; Bitget uses clientOid.
+        Returns OrderFillReconciliation if found, or None.
+        """
+        transport = getattr(self, "_transport", None)
+        if transport is not None and hasattr(transport, "fetch_order_status"):
+            return await transport.fetch_order_status(
+                symbol, order_id=order_id, client_order_id=client_order_id,
+            )
+        return None
+
     async def fetch_perp_liquidity_snapshot(
         self, symbol: str
     ) -> Optional[PerpLiquiditySnapshot]:

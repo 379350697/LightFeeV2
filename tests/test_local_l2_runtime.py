@@ -468,7 +468,9 @@ class TestDataPlaneSync:
         from lightfee.core.domain import Venue
 
         rt = LocalL2Runtime()
-        rt.ensure_book("binance", "BTCUSDT")
+        book = rt.ensure_book("binance", "BTCUSDT")
+        from lightfee.marketdata.l2 import L2PoolAssignment
+        book.pool = L2PoolAssignment.RETAINED
         import tempfile, os as _os
         jpath = _os.path.join(tempfile.mkdtemp(), "test.journal")
         journal = Journal(jpath)

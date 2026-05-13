@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 
 from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.persistence.journal import Journal
+from tests.fake_adapters import FakeVenueAdapter
 from lightfee.engine.entry import (
     EntryContext,
     EntryState,
@@ -53,6 +55,8 @@ class _FakeAdapter(VenueAdapter):
     default_fill_price: float = 0.0
     last_request: _Optional[OrderRequest] = None
     place_order_call_count: int = 0
+    submit_passive_order_call_count: int = 0
+    submit_passive_order_outcomes: list = field(default_factory=list)
 
     @property
     def venue(self) -> Venue:
@@ -71,6 +75,23 @@ class _FakeAdapter(VenueAdapter):
                          quantity=request.quantity, price=price,
                          order_id=f"fake-{self._venue.value}-{self.place_order_call_count}",
                          filled_at_ms=1000)
+
+    async def submit_passive_order(self, request):
+        from lightfee.core.domain import PassiveOrderAck
+        self.submit_passive_order_call_count += 1
+        self.last_request = request
+        if self.submit_passive_order_outcomes:
+            outcome = self.submit_passive_order_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return PassiveOrderAck(
+            venue=self._venue, symbol=request.symbol, side=request.side,
+            order_id=f"passive-{self._venue.value}-{self.submit_passive_order_call_count}",
+            client_order_id=request.client_order_id or "",
+            price=request.price or 0.0, quantity=request.quantity,
+            accepted_at_ms=1000,
+        )
 
     async def fetch_position(self, symbol):
         return PositionSnapshot(venue=self._venue, symbol=symbol, side=Side.BUY,
@@ -131,7 +152,7 @@ def btc_context():
         long_price_hint=50000.0,
         short_price_hint=50000.0,
         maker_leg=Side.BUY,
-        entry_type=EntryType.PASSIVE_INCREMENTAL,
+        entry_type=EntryType.STANDARD_DUAL_TAKER,
         created_at_ms=1000,
     )
 
@@ -365,3 +386,94 @@ class TestExecuteEntryConvenience:
 
         assert result.open_position is None
         assert result.route == ExecutionRoute.REJECTED
+
+
+# ---------------------------------------------------------------------------
+# Task 8: Passive maker lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+class TestPassiveMakerLifecycle:
+    """Task 8: Maker post_only must use submit_passive_order not place_order."""
+
+    @pytest.mark.asyncio
+    async def test_entry_maker_uses_submit_passive_order_not_place_order(self):
+        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.core.domain import PassiveOrderAck
+
+        maker = FakeVenueAdapter(Venue.BINANCE)
+        hedge = FakeVenueAdapter(Venue.OKX)
+        maker.submit_passive_order_outcomes = [
+            PassiveOrderAck(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                order_id="maker-order-1",
+                client_order_id="entry-1-maker",
+                price=50000.0,
+                quantity=0.001,
+                accepted_at_ms=1000,
+            )
+        ]
+
+        journal = Journal("/tmp/test_entry_passive.jsonl")
+        journal.open()
+        executor = EntrySyncExecutor(
+            adapters={Venue.BINANCE: maker, Venue.OKX: hedge},
+            journal=journal,
+        )
+
+        ctx = EntryContext(
+            entry_id="entry-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.001,
+            short_quantity=0.001,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+            created_at_ms=1000,
+        )
+        # Force post_only on the maker leg
+        result = await executor.execute(ctx)
+
+        assert maker.submit_passive_order_call_count == 1
+        assert maker.place_order_call_count == 0
+        assert hedge.place_order_call_count == 0
+        assert result.pending_entry is not None
+        assert result.pending_entry.maker_order_id == "maker-order-1"
+        assert result.state == EntryState.MAKER_RESTING
+        journal.close()
+
+    @pytest.mark.asyncio
+    async def test_taker_order_still_uses_place_order(self):
+        maker = FakeVenueAdapter(Venue.BINANCE)
+        hedge = FakeVenueAdapter(Venue.OKX)
+
+        journal = Journal("/tmp/test_entry_taker.jsonl")
+        journal.open()
+        executor = EntrySyncExecutor(
+            adapters={Venue.BINANCE: maker, Venue.OKX: hedge},
+            journal=journal,
+        )
+
+        ctx = EntryContext(
+            entry_id="entry-2",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.001,
+            short_quantity=0.001,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            created_at_ms=1000,
+        )
+        result = await executor.execute(ctx)
+
+        assert maker.place_order_call_count == 1
+        assert maker.submit_passive_order_call_count == 0
+        journal.close()
