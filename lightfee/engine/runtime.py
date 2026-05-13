@@ -1397,19 +1397,7 @@ class LiveRuntime:
         for cid in resolved_ids:
             self.state.pending_closes.pop(cid, None)
 
-    @staticmethod
-    def _apply_reconcile_backoff(pending, now_ms: int) -> None:
-        """Apply exponential backoff to a PendingEntry or PendingClose.
-
-        V1: CLOSE_RECONCILIATION_RETRY_BASE_MS=30s, max=300s.
-        """
-        backoff = min(
-            LiveRuntime._RECONCILE_RETRY_BASE_MS * (2 ** max(pending.reconcile_attempt - 1, 0)),
-            LiveRuntime._RECONCILE_RETRY_MAX_MS,
-        )
-        pending.reconcile_next_attempt_ms = now_ms + backoff
-
-    # --- Transition out of RECONCILING if all work is done ---
+        # Transition out of RECONCILING if all work is done
         if (
             self.state.lifecycle == EngineLifecycle.RECONCILING
             and not self.state.pending_entries
@@ -1422,6 +1410,18 @@ class LiveRuntime:
                 "runtime.reconciling_complete",
                 {"reason": "all_pending_resolved", "ts_ms": now_ms},
             )
+
+    @staticmethod
+    def _apply_reconcile_backoff(pending, now_ms: int) -> None:
+        """Apply exponential backoff to a PendingEntry or PendingClose.
+
+        V1: CLOSE_RECONCILIATION_RETRY_BASE_MS=30s, max=300s.
+        """
+        backoff = min(
+            LiveRuntime._RECONCILE_RETRY_BASE_MS * (2 ** max(pending.reconcile_attempt - 1, 0)),
+            LiveRuntime._RECONCILE_RETRY_MAX_MS,
+        )
+        pending.reconcile_next_attempt_ms = now_ms + backoff
 
     # ------------------------------------------------------------------
     # Housekeeping
