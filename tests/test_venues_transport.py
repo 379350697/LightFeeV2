@@ -2449,6 +2449,168 @@ class TestBitgetL2Guard:
         assert update.bids[0].price == 71213.8
         assert update.asks[0].price == 73000.0
 
+    @pytest.mark.asyncio
+    async def test_empty_metadata_rejects_all_symbols_on_transport(self):
+        """When _symbol_metadata is empty (production default), unsupported symbols
+        must be rejected BEFORE making an HTTP call (no 400172 from exchange)."""
+        transport = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/orderbook_uta_success.json"
+        )
+        # Default: _symbol_metadata is empty — no set_symbol_metadata() call
+        assert not transport._symbol_metadata
+
+        with pytest.raises(TransportError) as exc:
+            await transport.fetch_l2_snapshot("INJUSDT", depth=50)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+        assert "metadata missing" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_empty_metadata_rejects_even_known_symbols(self):
+        """Even BTCUSDT must be blocked when metadata is empty — the guard
+        must not be bypassed just because the symbol looks valid."""
+        transport = _make_live_transport_with_mock_response(
+            Venue.BITGET, "bitget/orderbook_uta_success.json"
+        )
+        assert not transport._symbol_metadata
+
+        with pytest.raises(TransportError) as exc:
+            await transport.fetch_l2_snapshot("BTCUSDT", depth=50)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+
+
+# ---------------------------------------------------------------------------
+# Task 3 regression: BitgetAdapter L2 metadata guard (no bare transport)
+# ---------------------------------------------------------------------------
+
+
+class TestBitgetAdapterL2MetadataGuard:
+    """Regr: BitgetAdapter.fetch_l2_snapshot must load metadata and guard before HTTP.
+
+    V1: bitget_fetch_execution_liquidity_snapshot() requires metadata.get(symbol)
+    before sending any HTTP request. The adapter (not bare transport) is the
+    primary integration point.
+    """
+
+    @pytest.mark.asyncio
+    async def test_adapter_unsupported_symbol_raises_no_http_orderbook_call(self):
+        """BitgetAdapter.fetch_l2_snapshot with unsupported symbol must raise
+        TransportError without ever calling /api/v3/market/orderbook."""
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        adapter = BitgetAdapter(mode="paper")
+
+        # Inject mock _request that records calls
+        calls = []
+
+        async def mock_request(method, path, **kwargs):
+            calls.append((method, path))
+            if "contracts" in path:
+                # Return empty contract list — no symbols supported
+                return {"code": "00000", "msg": "success", "data": []}
+            return {}
+
+        adapter._transport._request = mock_request
+
+        with pytest.raises(TransportError) as exc:
+            await adapter.fetch_l2_snapshot("INJUSDT", depth=50)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+        assert "metadata missing" in str(exc.value).lower()
+
+        # Must NOT have called orderbook endpoint
+        orderbook_calls = [c for c in calls if "orderbook" in c[1]]
+        assert len(orderbook_calls) == 0, (
+            f"HTTP orderbook call should not happen for unsupported symbol; got {orderbook_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_adapter_loads_metadata_when_empty(self):
+        """When transport metadata is empty, adapter.fetch_l2_snapshot must
+        load contract catalog before checking metadata."""
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import TransportError
+
+        adapter = BitgetAdapter(mode="paper")
+
+        # Simulate a contract catalog with only BTCUSDT supported
+        async def mock_request(method, path, **kwargs):
+            if "contracts" in path:
+                return {
+                    "code": "00000", "msg": "success",
+                    "data": [
+                        {"symbol": "BTCUSDT", "sizeMultiplier": "0.001",
+                         "minTradeNum": "1", "pricePlace": "2", "volumePlace": "0",
+                         "symbolName": "BTCUSDT"},
+                    ]
+                }
+            if "orderbook" in path:
+                # Should only reach here for supported symbols
+                return _bitget_l2_response()
+            return {}
+
+        adapter._transport._request = mock_request
+
+        # BTCUSDT is supported → should load metadata and succeed
+        # (orderbook call will return mock l2 data)
+        update = await adapter.fetch_l2_snapshot("BTCUSDT", depth=50)
+        assert update is not None
+        assert adapter._transport._symbol_metadata
+        assert "BTCUSDT" in adapter._transport._symbol_metadata
+
+    @pytest.mark.asyncio
+    async def test_adapter_rejects_unsupported_after_catalog_load(self):
+        """After loading catalog (only BTCUSDT), ETHUSDT must be rejected
+        without an orderbook HTTP call."""
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        adapter = BitgetAdapter(mode="paper")
+
+        api_calls = []
+
+        async def mock_request(method, path, **kwargs):
+            api_calls.append(path)
+            if "contracts" in path:
+                return {
+                    "code": "00000", "msg": "success",
+                    "data": [
+                        {"symbol": "BTCUSDT", "sizeMultiplier": "0.001",
+                         "minTradeNum": "1", "pricePlace": "2", "volumePlace": "0",
+                         "symbolName": "BTCUSDT"},
+                    ]
+                }
+            return {}
+
+        adapter._transport._request = mock_request
+
+        with pytest.raises(TransportError) as exc:
+            await adapter.fetch_l2_snapshot("ETHUSDT", depth=50)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+        # Must have called contracts endpoint (to load catalog)
+        contracts_calls = [c for c in api_calls if "contracts" in c]
+        assert len(contracts_calls) >= 1
+        # Must NOT have called orderbook endpoint
+        orderbook_calls = [c for c in api_calls if "orderbook" in c]
+        assert len(orderbook_calls) == 0
+
+
+def _bitget_l2_response():
+    """Minimal valid Bitget V3 orderbook response."""
+    return {
+        "code": "00000",
+        "msg": "success",
+        "requestTime": "1000000",
+        "data": {
+            "bids": [["71213.8", "1.0"], ["70000.0", "2.0"]],
+            "asks": [["73000.0", "1.0"], ["74000.0", "2.0"]],
+            "ts": "1000000",
+        },
+    }
+
 
 # ---------------------------------------------------------------------------
 # Task 7: Venue-Specific Position Parsers

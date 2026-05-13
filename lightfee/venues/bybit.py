@@ -54,5 +54,26 @@ class BybitAdapter(VenueAdapter):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> Optional["OrderFillReconciliation"]:
+        """V1: Bybit fetch_order_fill_reconciliation via /v5/order/realtime.
+
+        Uses orderLinkId for client_order_id lookup (V1: bybit.rs:1522-1523).
+        Falls through to transport.fetch_order_status then converts to
+        OrderFillReconciliation.
+        """
+        from lightfee.core.domain import OrderFillReconciliation
+
+        status = await self._transport.fetch_order_status(
+            symbol, order_id=order_id, client_order_id=client_order_id or "",
+        )
+        if status is not None:
+            return status
+        return None
+
     async def shutdown(self) -> None:
         await self._transport.close()

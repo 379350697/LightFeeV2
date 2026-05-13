@@ -715,3 +715,182 @@ class TestReconciliationService:
         # Default fake adapters return None → UNCERTAIN
         assert result.long_status == "uncertain"
         assert result.short_status == "uncertain"
+
+
+# ---------------------------------------------------------------------------
+# Task 2 regression: client_order_id reconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestClientOrderIdReconciliation:
+    """Regr: fetch_order_fill_reconciliation must work with client_order_id only."""
+
+    def _make_fill(self, venue, symbol, side, qty, price):
+        return OrderFill(
+            venue=venue, symbol=symbol, side=side,
+            quantity=qty, price=price, order_id="",
+            client_order_id="",
+        )
+
+    def _make_mock_bybit_transport(self):
+        """Create a Bybit transport in paper mode with mocked fetch_order_status."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        return VenueTransport(spec=bybit_spec(), mode="paper")
+
+    def _make_mock_bitget_transport(self):
+        """Create a Bitget transport in paper mode with mocked fetch_order_status."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        return VenueTransport(spec=bitget_spec(), mode="paper")
+
+    @pytest.mark.asyncio
+    async def test_fake_transport_fetch_order_status_returns_fill(self):
+        """fetch_order_fill_reconciliation must not return None when
+        fetch_order_status has a fill."""
+        from lightfee.core.domain import Venue as V, OrderFillReconciliation as OFR
+
+        transport = self._make_mock_bybit_transport()
+
+        called_with_cid = None
+
+        async def mock_fetch_order_status(symbol, *, order_id="", client_order_id=""):
+            nonlocal called_with_cid
+            called_with_cid = client_order_id
+            return OFR(
+                venue=V.BYBIT, symbol=symbol,
+                side=Side.BUY, quantity=0.5, average_price=50000.0,
+                order_id="bybit-ord-1", client_order_id="my-client-cid",
+                filled_at_ms=5000,
+            )
+
+        transport.fetch_order_status = mock_fetch_order_status
+
+        from lightfee.venues.bybit import BybitAdapter
+        adapter = BybitAdapter(mode="paper")
+        adapter._transport = transport
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="my-client-cid",
+        )
+        assert result is not None, "must return a fill, not None"
+        assert result.order_id == "bybit-ord-1"
+        assert result.quantity == 0.5
+        assert called_with_cid == "my-client-cid"
+
+    @pytest.mark.asyncio
+    async def test_order_reconciler_transitions_ack_to_filled_via_cid(self):
+        """OrderReconciler: pending ACK (only client_order_id) must resolve to filled
+        when adapter.fetch_order_fill_reconciliation supports cid lookup."""
+        from lightfee.core.domain import Venue as V, OrderFillReconciliation as OFR
+
+        transport = self._make_mock_bybit_transport()
+
+        async def mock_fetch_status(symbol, *, order_id="", client_order_id=""):
+            return OFR(
+                venue=V.BYBIT, symbol=symbol,
+                side=Side.BUY, quantity=0.3, average_price=60000.0,
+                order_id="resolved-ord", client_order_id=client_order_id or "ack-cid",
+                filled_at_ms=6000,
+            )
+
+        transport.fetch_order_status = mock_fetch_status
+
+        from lightfee.venues.bybit import BybitAdapter
+        long_adapter = BybitAdapter(mode="paper")
+        long_adapter._transport = transport
+
+        from tests.fake_adapters import FakeVenueAdapter
+        short_adapter = FakeVenueAdapter(V.OKX)
+
+        reconciler = OrderReconciler(adapters={V.BYBIT: long_adapter, V.OKX: short_adapter})
+        result = await reconciler.reconcile_position(
+            position_id="pos-ack-1",
+            symbol="BTCUSDT",
+            long_venue=V.BYBIT,
+            short_venue=V.OKX,
+            long_order_id="",  # ACK: no exchange order id
+            long_client_order_id="ack-cid",
+        )
+        assert result.long_status == "filled", f"expected filled, got {result.long_status}"
+        assert result.long_fill is not None
+
+    @pytest.mark.asyncio
+    async def test_bybit_override_uses_order_link_id(self):
+        """BybitAdapter.fetch_order_fill_reconciliation must use orderLinkId
+        for client_order_id lookup (V1: bybit.rs:1522-1523)."""
+        from lightfee.core.domain import Venue as V, OrderFillReconciliation as OFR
+
+        transport = self._make_mock_bybit_transport()
+
+        captured_params = {}
+
+        async def mock_fetch_status(symbol, *, order_id="", client_order_id=""):
+            captured_params["order_id"] = order_id
+            captured_params["client_order_id"] = client_order_id
+            captured_params["symbol"] = symbol
+            return OFR(
+                venue=V.BYBIT, symbol=symbol,
+                side=Side.BUY, quantity=0.2, average_price=50000.0,
+                order_id="bybit-ord", client_order_id=client_order_id,
+                filled_at_ms=7000,
+            )
+
+        transport.fetch_order_status = mock_fetch_status
+
+        from lightfee.venues.bybit import BybitAdapter
+        adapter = BybitAdapter(mode="paper")
+        adapter._transport = transport
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="test-link-id",
+        )
+        assert result is not None
+        assert captured_params["client_order_id"] == "test-link-id"
+
+    @pytest.mark.asyncio
+    async def test_bitget_override_uses_client_oid(self):
+        """BitgetAdapter.fetch_order_fill_reconciliation must use clientOid
+        for client_order_id lookup (V1: bitget.rs:2942 clientOid)."""
+        from lightfee.core.domain import Venue as V, OrderFillReconciliation as OFR
+
+        transport = self._make_mock_bitget_transport()
+
+        captured_cid = None
+
+        async def mock_fetch_status(symbol, *, order_id="", client_order_id=""):
+            nonlocal captured_cid
+            captured_cid = client_order_id
+            return OFR(
+                venue=V.BITGET, symbol=symbol,
+                side=Side.SELL, quantity=0.25, average_price=50000.0,
+                order_id="bitget-ord", client_order_id=client_order_id,
+                filled_at_ms=8000,
+            )
+
+        transport.fetch_order_status = mock_fetch_status
+
+        from lightfee.venues.bitget import BitgetAdapter
+        adapter = BitgetAdapter(mode="paper")
+        adapter._transport = transport
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="test-oid",
+        )
+        assert result is not None
+        assert captured_cid == "test-oid"
+
+    @pytest.mark.asyncio
+    async def test_vanilla_fetch_order_fill_reconciliation_returns_none_without_override(self):
+        """Default VenueAdapter.fetch_order_fill_reconciliation returns None.
+        Only Bybit/Bitget overrides return actual data."""
+        from lightfee.core.contracts import VenueAdapter as VA
+        from lightfee.core.domain import Venue as V
+
+        # OKX does not override fetch_order_fill_reconciliation
+        adapter = FakeVenueAdapter(V.OKX)
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", "some-order", "some-cid",
+        )
+        # FakeVenueAdapter default returns None
+        assert result is None

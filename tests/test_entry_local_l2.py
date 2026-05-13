@@ -357,3 +357,164 @@ class TestSelectTrackedOpportunities:
         assert result[0].class_ == TrackedOpportunityClass.PRIMARY
         assert result[1].class_ == TrackedOpportunityClass.PRIMARY
         assert result[2].class_ == TrackedOpportunityClass.SHADOW
+
+
+# ---------------------------------------------------------------------------
+# make_candidate_pair_id
+# ---------------------------------------------------------------------------
+
+
+from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+
+class TestMakeCandidatePairId:
+    def test_stable_format(self):
+        pid = make_candidate_pair_id("BTCUSDT", "binance", "bybit")
+        assert pid == "btcusdt:binance->bybit"
+
+    def test_lowercase_symbol(self):
+        pid = make_candidate_pair_id("ETHUSDT", "binance", "bybit")
+        assert pid == "ethusdt:binance->bybit"
+
+    def test_deterministic_for_same_inputs(self):
+        a = make_candidate_pair_id("SOLUSDT", "okx", "gate")
+        b = make_candidate_pair_id("SOLUSDT", "okx", "gate")
+        assert a == b
+        assert a == "solusdt:okx->gate"
+
+
+# ---------------------------------------------------------------------------
+# select_tracked_opportunities with missing pair_id
+# ---------------------------------------------------------------------------
+
+
+class TestSelectTrackedWithMissingPairId:
+    def test_fallbacks_to_make_candidate_pair_id(self):
+        """CandidateInput lacking pair_id gets stable id from symbol+venues."""
+
+        class CandidateInput:
+            symbol = "BTCUSDT"
+            long_venue = "binance"
+            short_venue = "bybit"
+            ranking_edge_bps = 15.0
+
+        result = select_tracked_opportunities([CandidateInput], primary_count=1, shadow_count=0)
+        assert len(result) == 1
+        assert result[0].pair_id == "btcusdt:binance->bybit"
+
+    def test_respects_existing_pair_id(self):
+        """When candidate already has pair_id, it is preserved."""
+
+        class CandidateInput:
+            symbol = "BTCUSDT"
+            long_venue = "okx"
+            short_venue = "gate"
+            pair_id = "custom-pair-42"
+            ranking_edge_bps = 15.0
+
+        result = select_tracked_opportunities([CandidateInput], primary_count=1, shadow_count=0)
+        assert result[0].pair_id == "custom-pair-42"
+
+
+# ---------------------------------------------------------------------------
+# _entry_local_l2_selection_blocker regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestEntryLocalL2SelectionBlocker:
+    """Regression: blocker must work with real CandidateInput (no pair_id/created_at_ms hacks)."""
+
+    @pytest.fixture
+    def runtime_with_l2(self, tmp_path):
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="live", sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                                  sidecar_snapshot_max_age_ms=600_000),
+            strategy=StrategyConfig(local_l2_enabled=True, local_l2_ws_enabled=False,
+                                    max_concurrent_positions=2),
+            persistence=PersistenceConfig(event_log_path=str(tmp_path / "events.jsonl"),
+                                          snapshot_path=str(tmp_path / "state.json")),
+        )
+        return LiveRuntime(config)
+
+    class RealCandidate:
+        """Mimics actual CandidateInput — no pair_id, no created_at_ms."""
+        def __init__(self, symbol="BTCUSDT", long_venue="binance", short_venue="bybit",
+                     ranking_edge_bps=15.0, funding_timestamp_ms=5000):
+            self.symbol = symbol
+            self.long_venue = long_venue
+            self.short_venue = short_venue
+            self.ranking_edge_bps = ranking_edge_bps
+            self.funding_timestamp_ms = funding_timestamp_ms
+            self.entry_notional_quote = 1000.0
+            self.expected_edge_bps = 15.0
+            self.worst_case_edge_bps = 10.0
+            self.funding_edge_bps = 15.0
+
+    def test_no_session_dual_ready_must_block(self, runtime_with_l2):
+        """Real candidate with no session MUST be blocked."""
+        rt = runtime_with_l2
+        c = self.RealCandidate(funding_timestamp_ms=5000)
+        # No session — must block
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is not None, "entry should be blocked without session"
+        assert "dual_ready" in reason or "primary_tracking" in reason or "prewarm" in reason
+
+    def test_missing_funding_timestamp_blocks_with_prewarm(self, runtime_with_l2):
+        """Candidate without funding_timestamp_ms must be blocked for prewarm."""
+        rt = runtime_with_l2
+        c = self.RealCandidate(funding_timestamp_ms=0)
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_local_l2_waiting_for_prewarm_window"
+
+    def test_dual_ready_session_allows_entry(self, runtime_with_l2):
+        """Dual-ready session for a tracked primary allows entry."""
+        rt = runtime_with_l2
+        c = self.RealCandidate()
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+
+        # Tracked as primary
+        rt._tracked_primary_pair_ids.add(pair_id)
+
+        # Create dual-ready session
+        session = rt.entry_l2_sessions.get_or_create_session(pair_id)
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.refresh_state(now_ms=10000, stale_after_ms=300_000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is None, f"dual-ready entry should not be blocked, got: {reason}"
+
+    def test_not_in_primary_set_blocks(self, runtime_with_l2):
+        """Session exists but not in tracked primary set → blocked."""
+        rt = runtime_with_l2
+        c = self.RealCandidate()
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+
+        # Session exists but NOT in primary set
+        session = rt.entry_l2_sessions.get_or_create_session(pair_id)
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_local_l2_waiting_for_primary_tracking"
+
+    def test_not_blocked_when_local_l2_disabled(self, runtime_with_l2):
+        """When local_l2_enabled=False, blocker returns None always."""
+        runtime_with_l2.config.strategy.local_l2_enabled = False
+        c = self.RealCandidate(funding_timestamp_ms=0)
+        reason = runtime_with_l2._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is None
+
+    def test_no_created_at_ms_field_on_candidate_is_ok(self, runtime_with_l2):
+        """The blocker must NOT rely on created_at_ms. V1 uses funding_timestamp_ms for prewarm."""
+        rt = runtime_with_l2
+        c = self.RealCandidate(funding_timestamp_ms=5000)
+        assert not hasattr(c, "created_at_ms"), "candidate should not have created_at_ms"
+        # With funding timestamp but no session — should still block correctly
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is not None

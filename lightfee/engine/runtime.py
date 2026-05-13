@@ -103,6 +103,7 @@ class LiveRuntime:
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
+        self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
@@ -728,6 +729,29 @@ class LiveRuntime:
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
                 )
+                # V1: refresh tracked entry local L2 opportunities per tick
+                # select_tracked_entry_local_l2_opportunities → primary + shadow
+                if self.config.strategy.local_l2_enabled:
+                    primary_count = getattr(
+                        self.config.strategy, "entry_local_l2_primary_count", 3,
+                    )
+                    shadow_count = getattr(
+                        self.config.strategy, "entry_local_l2_shadow_count", 1,
+                    )
+                    from lightfee.engine.entry_local_l2 import (
+                        select_tracked_opportunities,
+                        make_candidate_pair_id,
+                    )
+                    tracked = select_tracked_opportunities(
+                        tradeable, primary_count, shadow_count,
+                    )
+                    self._tracked_primary_pair_ids = {
+                        t.pair_id for t in tracked
+                        if t.class_.value == "primary_tracked"
+                    }
+                    # Refresh session state for all tracked opportunities
+                    for t in tracked:
+                        self.entry_l2_sessions.track_opportunity(t, now_ms)
                 # V1: iterate entire shortlist until slot budget exhausted
                 max_slots = self.config.strategy.max_concurrent_positions
                 dispatched = 0
@@ -1920,28 +1944,53 @@ class LiveRuntime:
     # ------------------------------------------------------------------
 
     def _entry_local_l2_selection_blocker(self, candidate, now_ms: int) -> str | None:
-        """V2 Task 9: Check if candidate is blocked at selection (prewarm/dual-ready).
+        """V1 entry local L2 selection gate: check prewarm, primary tracking, dual-ready.
 
         Returns a reason string if blocked, or None if ready to proceed.
-        Does NOT relax the final execution gate — that remains strict.
+
+        V1 (Rust: final_gate.rs entry_final_gate_result_from_candidate_local_l2):
+        - Live + local_l2_enabled → gate applies
+        - Candidate must be in primary tracked set
+        - Session must exist for pair_id
+        - Both legs must be ready (dual-ready)
+        - Book must be exportable as valid ExecutionLiquiditySnapshot
+
+        Blocker reasons (V1 stable labels):
+        - entry_local_l2_waiting_for_prewarm_window
+        - entry_local_l2_waiting_for_primary_tracking
+        - entry_local_l2_waiting_for_dual_ready
         """
         if not self.config.strategy.local_l2_enabled:
             return None
-        prewarm_window_s = getattr(
-            self.config.strategy, "entry_local_l2_prewarm_window_secs", 480,
-        )
-        if prewarm_window_s > 0:
-            created_at = getattr(candidate, "created_at_ms", 0)
-            if created_at > 0 and (now_ms - created_at) < (prewarm_window_s * 1000):
-                return "entry_local_l2_waiting_for_prewarm_window"
-        # Check entry_l2_sessions for dual ready
-        pair_id = getattr(candidate, "pair_id", "")
-        if pair_id and hasattr(self, "entry_l2_sessions"):
-            session = self.entry_l2_sessions.sessions.get(pair_id)
-            if session is None:
-                return "entry_local_l2_no_session"
-            if not getattr(session, "both_legs_ready", lambda _ms, _age: True)(now_ms, 300_000):
-                return "entry_local_l2_waiting_for_dual_ready"
+        if self.config.runtime.mode not in ("live", "paper"):
+            return None
+
+        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+        symbol = getattr(candidate, "symbol", "")
+        long_ven = str(getattr(candidate, "long_venue", ""))
+        short_ven = str(getattr(candidate, "short_venue", ""))
+        pair_id = getattr(candidate, "pair_id", None)
+        if not pair_id:
+            pair_id = make_candidate_pair_id(symbol, long_ven, short_ven)
+
+        # Funding prewarm: candidate must have funding timestamp evidence
+        funding_ts = getattr(candidate, "funding_timestamp_ms", 0)
+        if funding_ts <= 0:
+            return "entry_local_l2_waiting_for_prewarm_window"
+
+        # Primary tracking: candidate must be in primary tracked set
+        if pair_id not in self._tracked_primary_pair_ids:
+            return "entry_local_l2_waiting_for_primary_tracking"
+
+        # Session dual-ready check
+        session = self.entry_l2_sessions.sessions.get(pair_id)
+        if session is None:
+            return "entry_local_l2_waiting_for_dual_ready"
+
+        if not session.both_legs_ready(now_ms, stale_after_ms=300_000):
+            return "entry_local_l2_waiting_for_dual_ready"
+
         return None
 
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> None:

@@ -408,8 +408,90 @@ class BitgetAdapter(VenueAdapter):
         )
         return _parse_bitget_risk_from_rowlike(raw, now_ms)
 
+    # ------------------------------------------------------------------
+    # Local-L2 snapshot with metadata guard (V1: bitget.rs:5464-5512)
+    # ------------------------------------------------------------------
+
+    async def fetch_l2_snapshot(
+        self, symbol: str, depth: int = 50,
+    ) -> "LocalL2Update":
+        """Fetch Bitget order book depth with metadata guard.
+
+        V1: bitget_fetch_execution_liquidity_snapshot() requires symbol metadata
+        before making any HTTP call. If metadata is missing for the symbol,
+        raises TransportError(REQUEST_REJECTED) without sending an HTTP request
+        (avoids exchange 400172 errors from unsupported symbols).
+        """
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        venue_sym = self._transport._venue_symbol(symbol)
+
+        # Ensure symbol catalog/metadata is loaded
+        if not self._transport._symbol_metadata:
+            await self._load_symbol_metadata()
+
+        # Guard: block unsupported symbols before any HTTP call
+        if venue_sym not in self._transport._symbol_metadata:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"bitget execution liquidity metadata missing for {venue_sym}",
+            )
+
+        return await self._transport.fetch_l2_snapshot(symbol=symbol, depth=depth)
+
+    async def _load_symbol_metadata(self) -> None:
+        """Load Bitget contract metadata from /api/v2/mix/market/contracts.
+
+        V1: refresh_symbol_catalog() — fetches contract catalog, filters
+        tradeable contracts, and populates metadata + supported_symbols.
+        """
+        raw = await self._transport._request(
+            "GET",
+            "/api/v2/mix/market/contracts",
+            params={"productType": "USDT-FUTURES"},
+            private=False,
+        )
+        data = raw.get("data", raw)
+        items = data if isinstance(data, list) else [data]
+        metadata: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sym = item.get("symbol", "")
+            if not sym:
+                continue
+            metadata[sym] = {
+                "sizeMultiplier": str(item.get("sizeMultiplier", "0.001")),
+                "minTradeNum": str(item.get("minTradeNum", "1")),
+                "pricePlace": str(item.get("pricePlace", "2")),
+                "volumePlace": str(item.get("volumePlace", "0")),
+                "symbolName": str(item.get("symbolName", sym)),
+            }
+        self._transport.set_symbol_metadata(metadata)
+
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> Optional["OrderFillReconciliation"]:
+        """V1: Bitget fetch_order_fill_reconciliation via /api/v3/trade/order-info.
+
+        Uses clientOid for client_order_id lookup (V1: bitget.rs:2912-2948).
+        Falls through to transport.fetch_order_status then converts to
+        OrderFillReconciliation.
+        """
+        from lightfee.core.domain import OrderFillReconciliation
+
+        status = await self._transport.fetch_order_status(
+            symbol, order_id=order_id, client_order_id=client_order_id or "",
+        )
+        if status is not None:
+            return status
+        return None
 
     async def shutdown(self) -> None:
         await self._transport.close()

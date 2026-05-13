@@ -222,12 +222,23 @@ class EntryLocalL2SessionRuntime:
 # ---------------------------------------------------------------------------
 
 
+def make_candidate_pair_id(symbol: str, long_venue: str, short_venue: str) -> str:
+    """Create a stable candidate pair id matching entry_sync/pending pair key.
+
+    V1: CandidateOpportunity.pair_id is the stable identity used across
+    tracked opportunities, sessions, and final gate.  The canonical form is:
+        "{symbol.lower()}:{long_venue}->{short_venue}"
+    """
+    return f"{symbol.lower()}:{long_venue}->{short_venue}"
+
+
 def select_tracked_opportunities(
     candidates: list, primary_count: int, shadow_count: int
 ) -> list[TrackedOpportunity]:
     """Select primary and shadow tracked opportunities from candidates.
 
     Top primary_count become PRIMARY, next shadow_count become SHADOW.
+    Uses stable pair_id from make_candidate_pair_id() when candidate lacks one.
     """
     tracked_count = primary_count + shadow_count
     result: list[TrackedOpportunity] = []
@@ -236,11 +247,17 @@ def select_tracked_opportunities(
             TrackedOpportunityClass.PRIMARY if i < primary_count
             else TrackedOpportunityClass.SHADOW
         )
+        symbol = getattr(c, "symbol", "")
+        long_venue = str(getattr(c, "long_venue", ""))
+        short_venue = str(getattr(c, "short_venue", ""))
+        pair_id = getattr(c, "pair_id", None)
+        if not pair_id:
+            pair_id = make_candidate_pair_id(symbol, long_venue, short_venue)
         result.append(TrackedOpportunity(
-            pair_id=getattr(c, "pair_id", f"pair-{i}"),
-            symbol=getattr(c, "symbol", ""),
-            long_venue=str(getattr(c, "long_venue", "")),
-            short_venue=str(getattr(c, "short_venue", "")),
+            pair_id=pair_id,
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
             ranking_edge_bps=getattr(c, "ranking_edge_bps", 0.0),
             class_=class_,
         ))

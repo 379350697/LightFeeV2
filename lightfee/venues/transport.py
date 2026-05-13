@@ -1173,11 +1173,15 @@ class VenueTransport:
             )
 
         # Bitget metadata guard: block unsupported symbols before HTTP
+        # V1: bitget_fetch_execution_liquidity_snapshot() requires metadata before
+        # calling /api/v3/market/orderbook.  When metadata is empty (not yet loaded)
+        # or the symbol is absent, reject immediately — never send an orderbook HTTP
+        # request for an unsupported symbol.
         if spec.venue_id == Venue.BITGET:
-            if self._symbol_metadata and venue_sym not in self._symbol_metadata:
+            if not self._symbol_metadata or venue_sym not in self._symbol_metadata:
                 raise TransportError(
                     TransportErrorCategory.REQUEST_REJECTED,
-                    f"Bitget L2 snapshot blocked: metadata missing for {venue_sym}",
+                    f"bitget execution liquidity metadata missing for {venue_sym}",
                 )
 
         if self.mode == "paper":
