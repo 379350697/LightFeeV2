@@ -18,6 +18,7 @@ external venue data and the internal order book model.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
@@ -393,7 +394,7 @@ class LocalL2DataPlane:
             # No overlap — gap between snapshot and buffered updates
             book.sequence = 0
             book.last_update_id = 0
-            book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+            book.transition_to_rebuilding(int(time.time() * 1000))
             self._runtime.handle_runtime_failure(
                 venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                 "buffered_replay_snapshot_boundary: no overlapping update", 0,
@@ -412,7 +413,7 @@ class LocalL2DataPlane:
                 if bu.update.previous_sequence > 0 and bu.update.previous_sequence != previous_sequence:
                     book.sequence = 0
                     book.last_update_id = 0
-                    book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                    book.transition_to_rebuilding(int(time.time() * 1000))
                     self._runtime.handle_runtime_failure(
                         venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                         f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}", 0,
@@ -422,7 +423,7 @@ class LocalL2DataPlane:
                 # First replay: gap between snapshot and first buffered
                 book.sequence = 0
                 book.last_update_id = 0
-                book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                book.transition_to_rebuilding(int(time.time() * 1000))
                 self._runtime.handle_runtime_failure(
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                     f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}", 0,
@@ -436,7 +437,7 @@ class LocalL2DataPlane:
             except Exception:
                 book.sequence = 0
                 book.last_update_id = 0
-                book.transition_to_rebuilding(int(asyncio.get_event_loop().time() * 1000))
+                book.transition_to_rebuilding(int(time.time() * 1000))
                 self._runtime.handle_runtime_failure(
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                     f"buffered_replay_apply_failed at index {i}", 0,
@@ -563,7 +564,7 @@ class LocalL2DataPlane:
                 backoff = retry_backoff_ms
                 max_backoff = retry_backoff_ms * 8
                 while True:  # V1: loop {} — infinite retry until success
-                    now_ms = int(asyncio.get_event_loop().time() * 1000)
+                    now_ms = int(time.time() * 1000)
                     book = self._runtime.get_book(venue, symbol)
 
                     # V1: resume_without_bootstrap inline polling (250ms slices)
