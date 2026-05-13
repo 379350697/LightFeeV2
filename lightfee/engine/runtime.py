@@ -1937,6 +1937,21 @@ class LiveRuntime:
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
                 )
+                # V1: review.candidate_rejected — per-candidate rejection logging
+                self.journal.append(
+                    "review.candidate_rejected",
+                    {
+                        "symbol": candidate.symbol,
+                        "long_venue": candidate.long_venue,
+                        "short_venue": candidate.short_venue,
+                        "rejected_stage": "runtime_entry_gate",
+                        "rejected_reason": f"{gate_name}: {reason}",
+                        "ranking_edge_bps": candidate.ranking_edge_bps,
+                        "expected_edge_bps": candidate.expected_edge_bps,
+                        "funding_edge_bps": candidate.funding_edge_bps,
+                        "ts_ms": now_ms,
+                    },
+                )
                 return
 
         # V1 price gate: require valid quote before constructing entry context
@@ -1948,6 +1963,18 @@ class LiveRuntime:
                     "price_hint": price_hint,
                     "notional": candidate.entry_notional_quote,
                     "reason": "no valid quote to construct entry — V1 rejects",
+                },
+            )
+            self.journal.append(
+                "review.candidate_rejected",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": candidate.long_venue,
+                    "short_venue": candidate.short_venue,
+                    "rejected_stage": "price_gate",
+                    "rejected_reason": "no valid quote",
+                    "ranking_edge_bps": candidate.ranking_edge_bps,
+                    "ts_ms": now_ms,
                 },
             )
             return
@@ -2125,7 +2152,40 @@ class LiveRuntime:
             created_at_ms=now_ms,
         )
 
+        # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
+        self.journal.append(
+            "review.candidate_shortlisted",
+            {
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "ranking_edge_bps": candidate.ranking_edge_bps,
+                "expected_edge_bps": candidate.expected_edge_bps,
+                "funding_edge_bps": candidate.funding_edge_bps,
+                "worst_case_edge_bps": candidate.worst_case_edge_bps,
+                "entry_notional_quote": candidate.entry_notional_quote,
+                "route": route.value,
+                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
+                "ts_ms": now_ms,
+            },
+        )
+
         try:
+            # V1: execution.entry_selected — engine decided to open this candidate
+            self.journal.append(
+                "execution.entry_selected",
+                {
+                    "symbol": candidate.symbol,
+                    "entry_id": entry_id,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "quantity": effective_quantity,
+                    "route": route.value,
+                    "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
+                    "price_hint": price_hint,
+                    "ts_ms": now_ms,
+                },
+            )
             result = await self.entry_executor.execute(ctx)
             self.journal.append(
                 "runtime.entry_dispatched",

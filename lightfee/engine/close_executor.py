@@ -571,7 +571,8 @@ class CloseExecutor:
 
         pnl_attr = build_exit_pnl_attribution(position, close)
 
-        self.journal.append(
+        # V1: exit.closed is a critical event — synchronous durability
+        self.journal.append_critical(
             "exit.closed",
             {
                 "position_id": position.position_id,
@@ -666,8 +667,9 @@ class CloseExecutor:
             )
 
         # Emit partial close when position remains open
+        # V1: exit.partial_closed is a critical event
         if position.matched_quantity > 1e-12:
-            self.journal.append(
+            self.journal.append_critical(
                 "exit.partial_closed",
                 {
                     "position_id": position.position_id,
@@ -686,9 +688,10 @@ class CloseExecutor:
             )
 
         # Fully closed → remove from open positions
+        # V1: exit.closed is a critical event
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(position.position_id, None)
-            self.journal.append(
+            self.journal.append_critical(
                 "exit.closed",
                 {
                     "position_id": position.position_id,
@@ -722,16 +725,21 @@ class CloseExecutor:
         try:
             fill = await adapter.place_order(request)
             if fill.quantity > 0:
+                # V1 parity: execution.order_filled includes venue/symbol/side/filled_at_ms
                 self.journal.append(
                     "order.filled",
                     {
                         "position_id": position_id,
                         "leg": leg,
+                        "venue": fill.venue.value if hasattr(fill.venue, 'value') else str(fill.venue),
+                        "symbol": fill.symbol,
+                        "side": fill.side.value if hasattr(fill.side, 'value') else str(fill.side),
                         "order_id": fill.order_id,
                         "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
                         "price": fill.price,
                         "fee_quote": fill.fee_quote,
+                        "filled_at_ms": fill.filled_at_ms,
                     },
                 )
                 return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}

@@ -355,7 +355,8 @@ class EntrySyncExecutor:
         result.maker_fill = maker_fill
         result.hedge_fill = hedge_fill
 
-        self.journal.append(
+        # V1: entry.opened is a critical event — synchronous durability
+        self.journal.append_critical(
             "entry.opened",
             {
                 "position_id": position.position_id,
@@ -554,16 +555,21 @@ class EntrySyncExecutor:
             if submit_started_at_ms > 0 and fill.filled_at_ms > 0:
                 latency_ms = fill.filled_at_ms - submit_started_at_ms
             if fill.quantity > 0:
+                # V1 parity: execution.order_filled includes venue/symbol/side/filled_at_ms
                 self.journal.append(
                     "order.filled",
                     {
                         "position_id": position_id,
                         "leg": leg,
+                        "venue": fill.venue.value if hasattr(fill.venue, 'value') else str(fill.venue),
+                        "symbol": fill.symbol,
+                        "side": fill.side.value if hasattr(fill.side, 'value') else str(fill.side),
                         "order_id": fill.order_id,
                         "client_order_id": request.client_order_id,
                         "quantity": fill.quantity,
                         "price": fill.price,
                         "fee_quote": fill.fee_quote,
+                        "filled_at_ms": fill.filled_at_ms,
                         "latency_ms": latency_ms,
                         "is_maker": is_maker,
                     },
