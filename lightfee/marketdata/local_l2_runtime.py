@@ -186,20 +186,27 @@ class LocalL2Runtime:
     def _apply_update(
         self, book: LocalL2Book, update: LocalL2Update, now_ms: int
     ):
-        """Apply and produce result with events."""
+        """Apply and produce result with events.
+
+        V1: observed_at_ms uses the exchange server timestamp from the REST/WS
+        response (e.g. Binance E field), not local wall clock.  This ensures
+        staleness checks compare exchange-observed time, not local processing time.
+        """
+        # Prefer exchange server timestamp over local clock (V1 parity)
+        effective_ms = update.event_time_ms if update.event_time_ms > 0 else now_ms
         if update.update_kind == LocalL2UpdateKind.SNAPSHOT:
             return book.apply_snapshot(
                 update.bids, update.asks,
                 sequence=update.sequence,
                 checksum=update.checksum,
-                now_ms=now_ms,
+                now_ms=effective_ms,
             )
         else:
             return book.apply_delta(
                 update.bids, update.asks,
                 sequence=update.sequence,
                 previous_sequence=update.previous_sequence,
-                now_ms=now_ms,
+                now_ms=effective_ms,
             )
 
     def remove_book(self, venue: str, symbol: str) -> None:
