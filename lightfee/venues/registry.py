@@ -51,7 +51,10 @@ def all_live_perp_venues() -> list[Venue]:
 def _resolve_env(env_var: str) -> str:
     if not env_var:
         return ""
-    return os.environ.get(env_var, "")
+    val = os.environ.get(env_var, "")
+    # Defend against CRLF line terminators in env files:
+    # bash reads \r into the value, which breaks HTTP headers and signatures.
+    return val.strip("\r")
 
 
 def build_adapter(venue: Venue, vc: VenueConfig, mode: str,
