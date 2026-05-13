@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
@@ -23,9 +23,13 @@ class BybitAdapter(VenueAdapter):
         self,
         mode: str = "paper",
         credential: Optional[LiveCredential] = None,
+        exchange_http_timeout_ms: int = 10000,
+        rate_limiter: Any = None,
     ) -> None:
         spec = bybit_spec()
-        self._transport = VenueTransport(spec=spec, mode=mode, credential=credential)
+        self._transport = VenueTransport(spec=spec, mode=mode, credential=credential,
+                                         exchange_http_timeout_ms=exchange_http_timeout_ms,
+                                         rate_limiter=rate_limiter)
 
     @property
     def venue(self) -> Venue:

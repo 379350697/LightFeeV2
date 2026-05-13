@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import datetime
+import random
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -136,6 +139,143 @@ def _sign_payload(scheme: AuthScheme, secret: str, payload: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter — V1-aligned: scoped cooldowns + host pacing
+# ---------------------------------------------------------------------------
+
+
+class EndpointRateLimiter:
+    """V1-aligned rate limiter with per-scope cooldown + pacing.
+
+    V1 reference: resilience.rs EndpointRateLimiter
+    - ``initial_ms`` / ``max_ms``: exponential backoff for rate-limit cooldowns
+    - ``pacing_interval_ms``: minimum interval between requests (0 = no pacing)
+    - ``wait_until_ready_for_scopes``: block until all scopes are out of cooldown
+    - ``pace_for_scopes``: enforce minimum pacing interval
+    - ``record_rate_limit_for_scopes``: record a rate-limit event (429/418)
+    - ``record_success_for_scopes``: record success (no-op, matching V1)
+    """
+
+    def __init__(self, initial_ms: int, max_ms: int, pacing_interval_ms: int = 0) -> None:
+        self._initial_ms = max(initial_ms, 1)
+        self._max_ms = max(max_ms, self._initial_ms)
+        self._pacing_interval_ms = pacing_interval_ms
+        # Per-scope cooldown state
+        self._cooldowns: dict[str, tuple[int, int]] = {}  # scope -> (next_allowed_at_ms, failures)
+        # Per-scope pacing state
+        self._last_request_ms: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Cooldown helpers
+    # ------------------------------------------------------------------
+
+    def _failure_backoff_ms(self, failures: int) -> int:
+        """Exponential backoff: initial * 2^failures, capped at max_ms.
+
+        V1: failure_backoff_delay_ms — left-shift by min(failures, 20), clamp to max.
+        """
+        shift = min(failures, 20)
+        return min(self._initial_ms << shift, self._max_ms)
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def wait_until_ready_for_scopes(self, scopes: list[str]) -> None:
+        """Block until all scopes are out of cooldown."""
+        while True:
+            delay_ms = self._cooldown_remaining_ms_for_scopes(scopes)
+            if delay_ms is None:
+                return
+            await asyncio.sleep(delay_ms / 1000.0)
+
+    async def pace_for_scopes(self, scopes: list[str]) -> None:
+        """Enforce minimum pacing interval for each scope."""
+        if self._pacing_interval_ms <= 0:
+            return
+        now_ms = self._now_ms()
+        delay_ms = 0
+        async with self._lock:
+            for scope in scopes:
+                last = self._last_request_ms.get(scope, 0)
+                remaining = last + self._pacing_interval_ms - now_ms
+                if remaining > delay_ms:
+                    delay_ms = remaining
+            if delay_ms > 0:
+                # Mark all scopes as being used at now_ms + delay_ms
+                next_at = now_ms + delay_ms
+                for scope in scopes:
+                    self._last_request_ms[scope] = next_at
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
+
+    def record_rate_limit_for_scopes(self, scopes: list[str], retry_after_ms: Optional[int] = None) -> int:
+        """Record a rate-limit event. Returns the cooldown delay in ms."""
+        now_ms = self._now_ms()
+        retry_after = retry_after_ms or 0
+        max_delay = retry_after
+        for scope in scopes:
+            if not scope:
+                continue
+            cooldown = self._cooldowns.get(scope)
+            if cooldown is None:
+                failures = 0
+                next_at = 0
+            else:
+                next_at, failures = cooldown
+            backoff = self._failure_backoff_ms(failures)
+            delay_ms = max(backoff, retry_after)
+            new_next_at = max(next_at, now_ms + delay_ms)
+            self._cooldowns[scope] = (new_next_at, failures + 1)
+            if delay_ms > max_delay:
+                max_delay = delay_ms
+        return max_delay
+
+    def record_success_for_scopes(self, scopes: list[str]) -> None:
+        """Record a successful request. No-op in V1, matching here."""
+        pass
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _cooldown_remaining_ms_for_scopes(self, scopes: list[str]) -> Optional[int]:
+        """Return the max remaining cooldown across all scopes, or None if all clear."""
+        now_ms = self._now_ms()
+        max_remaining = 0
+        for scope in scopes:
+            cooldown = self._cooldowns.get(scope)
+            if cooldown is not None:
+                remaining = cooldown[0] - now_ms
+                if remaining > max_remaining:
+                    max_remaining = remaining
+        return max_remaining if max_remaining > 0 else None
+
+
+# Global rate limiter instance, created once and shared across transports.
+# V1 uses Arc<EndpointRateLimiter> with pacing (1000ms initial, 8000ms max, 25ms interval).
+# For V2 we create it lazily — the first caller initialises it.
+_global_rate_limiter: Optional[EndpointRateLimiter] = None
+_rate_limiter_lock = asyncio.Lock()
+
+
+async def _get_global_rate_limiter(pacing_ms: int = 25) -> EndpointRateLimiter:
+    """Return the global EndpointRateLimiter, creating it on first call."""
+    global _global_rate_limiter
+    if _global_rate_limiter is not None:
+        return _global_rate_limiter
+    async with _rate_limiter_lock:
+        if _global_rate_limiter is not None:
+            return _global_rate_limiter
+        # V1 defaults: 1000ms initial, 8000ms max, pacing_interval=25ms
+        _global_rate_limiter = EndpointRateLimiter(1000, 8000, pacing_ms)
+        return _global_rate_limiter
+
+
+# ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
 
@@ -148,10 +288,14 @@ class VenueTransport:
         spec: VenueSpec,
         mode: str = "paper",
         credential: Optional[LiveCredential] = None,
+        exchange_http_timeout_ms: int = 10000,
+        rate_limiter: Optional[EndpointRateLimiter] = None,
     ) -> None:
         self._spec = spec
         self.mode = mode
         self._credential = credential
+        self._exchange_http_timeout_ms = exchange_http_timeout_ms
+        self._rate_limiter = rate_limiter
         self._client: Optional[httpx.AsyncClient] = None
         self._hl_meta_cache: dict[str, int] = {}
 
@@ -168,8 +312,9 @@ class VenueTransport:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            timeout_s = self._exchange_http_timeout_ms / 1000.0
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0),
+                timeout=httpx.Timeout(timeout_s),
                 limits=httpx.Limits(max_keepalive_connections=4),
             )
         return self._client
@@ -219,11 +364,13 @@ class VenueTransport:
         path: str,
         query_string: str = "",
         body: str = "",
+        private: bool = False,
     ) -> dict[str, str]:
         spec = self._spec
         cred = self._credential
 
-        if cred is None:
+        # Public endpoints must not include auth headers (V1 parity)
+        if not private or cred is None:
             return {}
 
         headers: dict[str, str] = {}
@@ -316,25 +463,35 @@ class VenueTransport:
         path: str,
         params: Optional[dict[str, Any]] = None,
         body: Optional[dict[str, Any]] = None,
+        private: bool = False,
     ) -> tuple[str, dict[str, str], Optional[str]]:
         spec = self._spec
         query_string = ""
         req_body: Optional[str] = None
 
-        # Binance / Aster always require timestamp + signature in the query
-        # string, even for POST requests with a JSON body.
-        if spec.signature_param:
+        # Binance / Aster: only sign private requests. V1 sends public depth
+        # requests without auth headers — adding them causes unnecessary
+        # server-side verification overhead.
+        if spec.signature_param and private and self._credential:
             qp: dict[str, Any] = dict(params) if params else {}
             ts = str(int(time.time() * 1000))
             if spec.timestamp_param:
                 qp[spec.timestamp_param] = ts
-            if self._credential:
-                encoded = "&".join(f"{k}={v}" for k, v in sorted(qp.items()))
-                sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
-                qp[spec.signature_param] = sig
+            encoded = "&".join(f"{k}={v}" for k, v in sorted(qp.items()))
+            sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
+            qp[spec.signature_param] = sig
             query_string = "?" + "&".join(
                 f"{k}={v}" for k, v in sorted(qp.items())
             )
+        elif spec.signature_param and not private:
+            # Public request — no signature, just params
+            if params:
+                qp = dict(params)
+                if spec.timestamp_param and spec.timestamp_param not in qp:
+                    qp[spec.timestamp_param] = str(int(time.time() * 1000))
+                query_string = "?" + "&".join(
+                    f"{k}={v}" for k, v in sorted(qp.items())
+                )
         elif params:
             query_parts = []
             for k, v in sorted(params.items()):
@@ -345,7 +502,7 @@ class VenueTransport:
         if body is not None:
             req_body = json.dumps(body)
 
-        headers = self._build_auth_headers(method, path, query_string, req_body or "")
+        headers = self._build_auth_headers(method, path, query_string, req_body or "", private=private)
         if req_body and "Content-Type" not in headers:
             headers["Content-Type"] = "application/json"
 
@@ -368,8 +525,14 @@ class VenueTransport:
             self._spec.private_base_url if private
             else self._spec.public_base_url
         )
-        qs, headers, req_body = self._build_signed_request(method, path, params, body)
+        qs, headers, req_body = self._build_signed_request(method, path, params, body, private=private)
         url = base_url + path + qs
+
+        # V1-aligned rate limiting: wait_until_ready + pace before every request
+        if self._rate_limiter is not None:
+            rate_limit_scope = f"host:{base_url}"
+            await self._rate_limiter.wait_until_ready_for_scopes([rate_limit_scope])
+            await self._rate_limiter.pace_for_scopes([rate_limit_scope])
 
         try:
             if method.upper() == "GET":
@@ -384,6 +547,10 @@ class VenueTransport:
                 raise ValueError(f"unsupported HTTP method: {method}")
 
             if resp.status_code >= 400:
+                # V1: record rate-limit for 429/418 to trigger cooldown
+                if resp.status_code in (429, 418) and self._rate_limiter is not None:
+                    rate_limit_scope = f"host:{base_url}"
+                    self._rate_limiter.record_rate_limit_for_scopes([rate_limit_scope])
                 cat = classify_transport_error(resp.status_code, resp.text)
                 if cat:
                     raise TransportError(
@@ -540,6 +707,9 @@ class VenueTransport:
 
     async def fetch_l2_snapshot(
         self, symbol: str, depth: int = 50,
+        retry_initial_ms: int = 5000,
+        retry_max_ms: int = 40000,
+        max_retries: int = 8,
     ) -> "LocalL2Update":
         """Fetch full order book depth snapshot for local-L2 bootstrap.
 
@@ -548,6 +718,11 @@ class VenueTransport:
 
         Uses the venue's public REST depth endpoint — no authentication needed.
         Hyperliquid uses POST to /info API with l2Book type.
+
+        Retry: V1-aligned exponential backoff with jitter.
+        V1 bootstrap_binance_local_l2_symbol loops indefinitely with
+        FailureBackoff (5s initial, 40s max).  Python equivalent retries
+        up to *max_retries* times.
         """
         from lightfee.marketdata.local_l2_venues import parse_l2_update
 
@@ -570,48 +745,58 @@ class VenueTransport:
                 received_at_ms=now_ms,
             )
 
-        try:
-            if spec.venue_id == Venue.HYPERLIQUID:
-                # Hyperliquid: POST /info {"type": "l2Book", "coin": "BTC"}
-                body = {"type": "l2Book", "coin": venue_sym}
-                raw = await self._request("POST", spec.l2_snapshot_path, body=body)
-            else:
-                params: dict[str, Any] = {}
-                if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
-                    params["symbol"] = venue_sym
-                    params["limit"] = str(depth)
-                elif spec.venue_id == Venue.OKX:
-                    params["instId"] = venue_sym
-                    params["sz"] = str(depth)
-                elif spec.venue_id == Venue.BYBIT:
-                    params["category"] = "linear"
-                    params["symbol"] = venue_sym
-                    params["limit"] = str(depth)
-                elif spec.venue_id == Venue.BITGET:
-                    params["symbol"] = venue_sym
-                    params["limit"] = str(depth)
-                elif spec.venue_id == Venue.GATE:
-                    params["contract"] = venue_sym  # Already converted via _venue_symbol
-                    params["limit"] = str(depth)
+        failures = 0
+        while True:
+            try:
+                if spec.venue_id == Venue.HYPERLIQUID:
+                    body = {"type": "l2Book", "coin": venue_sym}
+                    raw = await self._request("POST", spec.l2_snapshot_path, body=body)
+                else:
+                    params: dict[str, Any] = {}
+                    if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                        params["symbol"] = venue_sym
+                        params["limit"] = str(depth)
+                    elif spec.venue_id == Venue.OKX:
+                        params["instId"] = venue_sym
+                        params["sz"] = str(depth)
+                    elif spec.venue_id == Venue.BYBIT:
+                        params["category"] = "linear"
+                        params["symbol"] = venue_sym
+                        params["limit"] = str(depth)
+                    elif spec.venue_id == Venue.BITGET:
+                        params["symbol"] = venue_sym
+                        params["limit"] = str(depth)
+                    elif spec.venue_id == Venue.GATE:
+                        params["contract"] = venue_sym
+                        params["limit"] = str(depth)
 
-                raw = await self._request("GET", spec.l2_snapshot_path, params=params)
+                    raw = await self._request("GET", spec.l2_snapshot_path, params=params)
 
-            result = parse_l2_update(
-                spec.venue_id.value, payload=raw,
-                symbol=venue_sym, now_ms=now_ms,
-            )
-            # Ensure canonical symbol is returned, not the venue wire symbol.
-            # The caller passes the canonical symbol in `symbol` — the result
-            # must use that key so it lands in the correct runtime book.
-            result.symbol = symbol
-            return result
-        except TransportError:
-            raise
-        except Exception as e:
-            raise TransportError(
-                TransportErrorCategory.TRANSPORT_FAILURE,
-                f"L2 snapshot failed for {spec.venue_id.value}:{symbol}: {e}",
-            )
+                result = parse_l2_update(
+                    spec.venue_id.value, payload=raw,
+                    symbol=venue_sym, now_ms=now_ms,
+                )
+                result.symbol = symbol
+                return result
+
+            except TransportError as e:
+                if e.category != TransportErrorCategory.TRANSPORT_FAILURE:
+                    raise
+                failures += 1
+                if failures > max_retries:
+                    raise
+                # V1 exponential backoff with jitter: delay = min(initial * 2^failures, max)
+                shift = min(failures - 1, 20)
+                delay_ms = min(retry_initial_ms << shift, retry_max_ms)
+                jitter = random.randint(0, max(delay_ms // 5, 1))
+                delay_ms += jitter
+                await asyncio.sleep(delay_ms / 1000.0)
+
+            except Exception as e:
+                raise TransportError(
+                    TransportErrorCategory.TRANSPORT_FAILURE,
+                    f"L2 snapshot failed for {spec.venue_id.value}:{symbol}: {e}",
+                )
 
     # ------------------------------------------------------------------
     # Position fetch

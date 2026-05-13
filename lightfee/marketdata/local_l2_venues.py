@@ -377,7 +377,11 @@ def parse_hyperliquid_l2_update(
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
+    if payload is None:
+        payload = {}
     data = payload.get("data", payload)
+    if data is None or not isinstance(data, dict):
+        data = {}
     levels = data.get("levels", [])
 
     def _parse_side(raw_levels: list) -> list[PriceLevel]:
@@ -385,12 +389,16 @@ def parse_hyperliquid_l2_update(
             return []
         result = []
         for lvl in raw_levels:
+            if lvl is None:
+                continue
             if isinstance(lvl, dict):
                 px = float(lvl.get("px", 0))
                 sz = float(lvl.get("sz", 0))
+            elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                px = float(lvl[0])
+                sz = float(lvl[1])
             else:
-                px = float(lvl.get("px", lvl.get("price", 0)))
-                sz = float(lvl.get("sz", lvl.get("size", 0)))
+                continue
             if sz > 0:
                 result.append(PriceLevel(price=px, quantity=sz))
         return result

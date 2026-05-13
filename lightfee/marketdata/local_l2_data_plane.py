@@ -184,6 +184,10 @@ class LocalL2DataPlane:
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
             ss.last_error = ""
+            self._journal.append(
+                "runtime.local_l2_snapshot_ok",
+                {"venue": venue, "symbol": symbol},
+            )
             return True
         except TransportError as e:
             ss.consecutive_failures += 1
@@ -528,7 +532,11 @@ class LocalL2DataPlane:
                 book = self._runtime.get_book(venue, symbol)
                 if book is None:
                     return
-                if book.status not in (L2BookStatus.COLD, L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED):
+                # V1: never skip based on status — every status reaches the
+                # snapshot fetch. Blocking is only for the resume_without_bootstrap
+                # window, which V2 handles via RESUME_WAITING status.
+                # Skip only HOT (already bootstrapped) and SUSPENDED (paused).
+                if book.status in (L2BookStatus.HOT, L2BookStatus.SUSPENDED):
                     return
 
                 backoff = retry_backoff_ms
@@ -540,7 +548,7 @@ class LocalL2DataPlane:
                     if book is None or book.status == L2BookStatus.HOT:
                         return
 
-                    if book.status == L2BookStatus.COLD:
+                    if book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED):
                         book.transition_to_bootstrapping(now_ms)
 
                     success = await self.bootstrap_book(
@@ -568,7 +576,17 @@ class LocalL2DataPlane:
                 _bootstrap_with_sem(i, sym)
                 for i, sym in enumerate(symbols)
             ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Log any exceptions that were swallowed by return_exceptions=True
+            import logging
+            _logger = logging.getLogger("lightfee.marketdata")
+            error_count = 0
+            for r in results:
+                if isinstance(r, Exception):
+                    error_count += 1
+                    _logger.error("bootstrap worker %s exception: %s", venue, r)
+            if error_count > 0:
+                _logger.warning("bootstrap worker %s: %d tasks failed with exceptions", venue, error_count)
 
             self._journal.append(
                 "runtime.local_l2_bootstrap_worker_done",

@@ -54,10 +54,13 @@ def _resolve_env(env_var: str) -> str:
     return os.environ.get(env_var, "")
 
 
-def build_adapter(venue: Venue, vc: VenueConfig, mode: str) -> VenueAdapter:
+def build_adapter(venue: Venue, vc: VenueConfig, mode: str,
+                  exchange_http_timeout_ms: int = 10000,
+                  rate_limiter = None) -> VenueAdapter:
     cls = _ADAPTER_CLASSES[venue]
     if mode == "paper":
-        return cls(mode="paper")
+        return cls(mode="paper", exchange_http_timeout_ms=exchange_http_timeout_ms,
+                   rate_limiter=rate_limiter)
 
     creds = vc.live.trade_credentials
     credential = LiveCredential(
@@ -67,16 +70,24 @@ def build_adapter(venue: Venue, vc: VenueConfig, mode: str) -> VenueAdapter:
         wallet_private_key=_resolve_env(creds.wallet_private_key_env or ""),
         account_address=_resolve_env(creds.account_address_env or ""),
     )
-    return cls(mode="live", credential=credential)
+    return cls(mode="live", credential=credential,
+               exchange_http_timeout_ms=exchange_http_timeout_ms,
+               rate_limiter=rate_limiter)
 
 
 def build_adapter_map(config: AppConfig) -> dict[Venue, VenueAdapter]:
     mode = config.runtime.mode
+    exchange_http_timeout_ms = config.runtime.exchange_http_timeout_ms
+    # Create a shared rate limiter (V1: Arc<EndpointRateLimiter>)
+    from lightfee.venues.transport import EndpointRateLimiter
+    rate_limiter = EndpointRateLimiter(1000, 8000, 25)
     adapters: dict[Venue, VenueAdapter] = {}
     for vc in config.venues:
         try:
             venue = Venue.from_str(vc.venue)
         except ValueError:
             continue
-        adapters[venue] = build_adapter(venue, vc, mode)
+        adapters[venue] = build_adapter(venue, vc, mode,
+                                        exchange_http_timeout_ms=exchange_http_timeout_ms,
+                                        rate_limiter=rate_limiter)
     return adapters

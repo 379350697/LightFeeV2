@@ -224,27 +224,59 @@ class LiveRuntime:
         """Phase 5: Activate local-L2 books — WS streams first, then background bootstrap.
 
         V1 parity with live_startup_activate_local_l2():
-        1. Create LocalL2Book for each (venue, symbol) target pair
-        2. Start WS depth streams FIRST (deltas buffered during bootstrap gap)
-        3. Start per-venue background bootstrap workers (REST snapshots)
-        4. Return immediately — bootstrap completes asynchronously in background
+        1. Derive target pairs from retained state (retained_local_l2_books) and
+           hot positions — NOT all config.symbols (V1: startup_local_l2_symbols)
+        2. Create LocalL2Book for each target pair
+        3. Start WS depth streams FIRST (deltas buffered during bootstrap gap)
+        4. Start per-venue background bootstrap workers (REST snapshots)
+        5. Return immediately — bootstrap completes asynchronously in background
 
         WS updates received while a book is BOOTSTRAPPING are buffered and
         replayed after the REST snapshot completes (V1 pre-snapshot buffer pattern).
+
+        Runtime L2 activation for new entry symbols is handled separately by
+        _ensure_l2_active_for_candidates() on each tick.
         """
         self.journal.append(
             "runtime.local_l2_phase_start",
             {"ts_ms": now_ms},
         )
 
-        # Build target (venue, symbol) set from config
+        # V1: startup_local_l2_symbols() → retained + hot symbols only
+        # NOT all config.symbols — L2 is only bootstrapped for symbols with activity
         target_pairs: set[tuple[str, str]] = set()
         if self.config.strategy.local_l2_enabled:
             active_venues = list(self._venue_adapters.keys())
-            for venue in active_venues:
-                venue_str = venue.value if hasattr(venue, 'value') else str(venue)
-                for symbol in self.config.symbols:
-                    target_pairs.add((venue_str, symbol))
+            venue_set = {
+                v.value if hasattr(v, 'value') else str(v)
+                for v in active_venues
+            }
+
+            # 1. Retained books from previous run (V1: retained_local_l2_books)
+            for book in (self.state.retained_local_l2_books or []):
+                ven = book.get("venue", "")
+                sym = book.get("symbol", "")
+                if ven in venue_set and sym:
+                    target_pairs.add((ven, sym))
+
+            # 2. Hot symbols from active positions (V1: hot_local_l2_symbols)
+            hot_budget = max(
+                getattr(self.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
+            )
+            hot_count = 0
+            for pos in getattr(self.state, 'open_positions', []) or []:
+                if hot_count >= hot_budget:
+                    break
+                ven = getattr(pos, 'venue', '')
+                sym = getattr(pos, 'symbol', '')
+                if isinstance(ven, str) and ven in venue_set and sym:
+                    target_pairs.add((ven, sym))
+                    hot_count += 1
+                elif hasattr(ven, 'value'):
+                    ven_str = ven.value
+                    if ven_str in venue_set and sym:
+                        target_pairs.add((ven_str, sym))
+                        hot_count += 1
 
         if not target_pairs:
             self.journal.append(
@@ -373,6 +405,90 @@ class LiveRuntime:
             },
         )
 
+    async def _ensure_l2_active_for_candidates(self, candidates, now_ms: int) -> None:
+        """Ensure L2 books are active for candidate entry symbols.
+
+        V1 parity: activity_local_l2_symbols() → live_startup_activate_local_l2().
+
+        Called on each tick when tradeable candidates are discovered.  For each
+        candidate's long/short venue+symbol pair that does NOT already have an
+        active L2 book, create the book, start a WS stream, and spawn a
+        background bootstrap worker.
+
+        Respects local_l2_hot_exec_per_venue_budget (V1).
+        """
+        if not self.config.strategy.local_l2_enabled:
+            return
+        if self.config.runtime.mode == "paper":
+            return
+
+        # Collect (venue, symbol) pairs from candidates that need L2
+        needed: dict[str, set[str]] = {}  # venue -> {symbols}
+        for c in candidates:
+            for leg in (getattr(c, 'long_leg', None), getattr(c, 'short_leg', None)):
+                if leg is None:
+                    continue
+                ven = getattr(leg, 'venue', None)
+                sym = getattr(leg, 'symbol', None)
+                if ven is None or sym is None:
+                    continue
+                ven_str = ven.value if hasattr(ven, 'value') else str(ven)
+                # Skip if already active
+                book = self.local_l2_runtime.get_book(ven_str, sym)
+                if book is not None and book.status in (
+                    L2BookStatus.HOT, L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED,
+                ):
+                    continue
+                needed.setdefault(ven_str, set()).add(sym)
+
+        if not needed:
+            return
+
+        per_venue_budget = max(
+            getattr(self.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
+        )
+        from lightfee.marketdata.local_l2_venues import get_venue_rules
+
+        for ven_str, symbols in needed.items():
+            # Limit per venue budget (V1: take(per_venue_budget))
+            symbols_list = sorted(symbols)[:per_venue_budget]
+            if not symbols_list:
+                continue
+
+            try:
+                from lightfee.core.domain import Venue as VenueEnum
+                ven = VenueEnum.from_str(ven_str)
+                adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+            except (ValueError, KeyError):
+                adapter = None
+            if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
+                continue
+
+            # Ensure books exist
+            for sym in symbols_list:
+                rules = get_venue_rules(ven_str)
+                book = self.local_l2_runtime.ensure_book(ven_str, sym)
+                book.max_depth = rules.default_depth
+                book.max_sequence_gap = rules.max_sequence_gap
+                if book.status == L2BookStatus.COLD:
+                    book.transition_to_bootstrapping(now_ms)
+
+            # Start WS stream for this venue's new symbols
+            self.l2_data_plane.start_ws_streams(ven_str, symbols_list, adapter=adapter)
+
+            # Start background bootstrap worker
+            bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
+            bs_jitter = getattr(self.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
+            bs_retry = getattr(self.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+            self.l2_data_plane.start_background_bootstrap(
+                venue=ven_str,
+                symbols=symbols_list,
+                adapter=adapter,
+                batch_size=bs_batch,
+                jitter_ms=bs_jitter,
+                retry_backoff_ms=bs_retry,
+            )
+
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot."""
         if not hasattr(self.state, "local_l2_books_snapshot"):
@@ -390,9 +506,18 @@ class LiveRuntime:
             book.sequence = entry.get("sequence", 0)
             book.last_snapshot_ms = entry.get("last_snapshot_ms", 0)
             book.last_delta_ms = entry.get("last_delta_ms", 0)
-            book.pool = L2PoolAssignment.RETAINED
-            # Restored book is never automatically HOT — must prove freshness
-            book.status = L2BookStatus.RESUME_WAITING
+            # Restore the persisted pool — only RETAINED books should be
+            # re-bootstrapped at startup (V1: retained_local_l2_books).
+            pool_str = entry.get("pool", "dropped")
+            try:
+                book.pool = L2PoolAssignment(pool_str)
+            except ValueError:
+                book.pool = L2PoolAssignment.DROPPED
+            # Restored book is never automatically HOT — must prove freshness.
+            # But don't overwrite a book that is already being bootstrapped
+            # (set by _activate_local_l2_phase for retained/hot symbols).
+            if book.status in (L2BookStatus.COLD,):
+                book.status = L2BookStatus.RESUME_WAITING
 
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
@@ -468,6 +593,10 @@ class LiveRuntime:
                 snapshot.candidates, self.config.strategy, now_ms
             )
             if tradeable:
+                # V1: activity_local_l2_symbols() → ensure L2 active for candidate symbols
+                # Only bootstrap L2 for symbols that have actual activity (shortlist/finalist)
+                await self._ensure_l2_active_for_candidates(tradeable, now_ms)
+
                 self.journal.append(
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
