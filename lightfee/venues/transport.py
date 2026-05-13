@@ -794,6 +794,7 @@ class VenueTransport:
                         params["symbol"] = venue_sym
                         params["limit"] = str(depth)
                     elif spec.venue_id == Venue.BITGET:
+                        params["category"] = "USDT-FUTURES"  # V1: BITGET_PRODUCT_TYPE
                         params["symbol"] = venue_sym
                         params["limit"] = str(depth)
                     elif spec.venue_id == Venue.GATE:

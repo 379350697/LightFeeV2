@@ -155,12 +155,12 @@ def bitget_spec() -> VenueSpec:
         min_quantity=0.001,
         min_notional=5.0,
         price_tick=0.01,
-        # V2 API paths (Bitget V1 /api/mix/v1/ decommissioned 2026-05)
+        # V3 API paths (Bitget V1/V2 decommissioned 2026-05)
         market_snapshot_path="/api/v2/mix/market/tickers",
         position_path="/api/v2/mix/position/all-position",
         order_path="/api/v2/mix/order/place-order",
         account_risk_path="/api/v2/mix/account/account",
-        l2_snapshot_path="/api/v2/mix/market/orderbook",
+        l2_snapshot_path="/api/v3/market/orderbook",
         requires_passphrase=True,
         api_key_header="ACCESS-KEY",
         signature_header="ACCESS-SIGN",
