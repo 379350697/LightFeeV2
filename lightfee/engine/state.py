@@ -255,6 +255,21 @@ class PendingPassiveClose:
 
 
 @dataclass
+class CloseLegRecord:
+    """V1 CloseLegRecord: per-leg fill data for close reconciliation.
+
+    Tracks individual fill details for each venue leg of a close execution,
+    used for post-close reconciliation to verify order outcomes.
+    """
+    venue: str
+    order_id: str = ""
+    client_order_id: str = ""
+    quantity: float = 0.0
+    average_price: float = 0.0
+    fee_quote: float = 0.0
+
+
+@dataclass
 class PendingClose:
     close_id: str
     position_id: str
@@ -285,6 +300,9 @@ class PendingClose:
     # --- V1 chunk tracking for large closes ---
     chunk_index: int = 0
     total_chunks: int = 1
+    # --- V1 per-leg fill records (CloseLegRecord vectors) ---
+    long_legs: list[CloseLegRecord] = field(default_factory=list)
+    short_legs: list[CloseLegRecord] = field(default_factory=list)
 
 
 @dataclass

@@ -39,7 +39,7 @@ from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
-from lightfee.sidecar.pairing import check_stale_snapshot
+from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
 
@@ -106,6 +106,14 @@ class LiveRuntime:
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
+
+        # V1 entry gate cooldown state
+        self._venue_cooldown_until_ms: dict[str, int] = {}
+        self._zero_fill_cooldown_until_ms: dict[tuple, int] = {}
+
+        # V1 live scan recovery state (B2)
+        self._live_scan_success_streak: int = 0
+        self._last_good_snapshot = None
 
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
@@ -177,6 +185,39 @@ class LiveRuntime:
                     "ts_ms": wall_clock_now_ms(),
                 },
             )
+
+            # V1: finalize_startup_position_recovery — ordered recovery sequence
+            now_ms = wall_clock_now_ms()
+
+            # 1. reconcile_open_positions (force_reconcile — ignore backoff)
+            await self._reconcile_pending_entries_force(now_ms)
+
+            # 2. process pending_entry_hedges — re-drive any uncertain maker orders
+            await self._recover_pending_entry_hedges(now_ms)
+
+            # 3. process pending_passive_closes — resume passive close cycles
+            await self._maybe_tick_passive_close(now_ms)
+
+            # 4. process pending_close_reconciliations
+            # (already handled by _reconcile_pending_state in housekeeping)
+
+            # 5. residual repairs
+            await self._recover_residual_repairs(now_ms)
+
+            # 6. manage_open_positions — if still over max, enter fail_closed
+            max_positions = self.config.strategy.max_concurrent_positions
+            if len(self.state.open_positions) > max_positions:
+                from lightfee.engine.lifecycle import enter_fail_closed
+                enter_fail_closed(self.state)
+                self.journal.append(
+                    "runtime.recovery_fail_closed",
+                    {
+                        "reason": "open_positions_exceed_max_after_recovery",
+                        "open_positions": len(self.state.open_positions),
+                        "max": max_positions,
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
         else:
             self.journal.append(
                 "runtime.recovery_blocked",
@@ -263,20 +304,28 @@ class LiveRuntime:
             hot_budget = max(
                 getattr(self.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
             )
+            hot_global_budget = max(
+                getattr(self.config.strategy, 'local_l2_hot_exec_global_budget', 0), 0,
+            )
             hot_count = 0
+            hot_global_count = 0
             for pos in getattr(self.state, 'open_positions', []) or []:
                 if hot_count >= hot_budget:
+                    break
+                if hot_global_budget > 0 and hot_global_count >= hot_global_budget:
                     break
                 ven = getattr(pos, 'venue', '')
                 sym = getattr(pos, 'symbol', '')
                 if isinstance(ven, str) and ven in venue_set and sym:
                     target_pairs.add((ven, sym))
                     hot_count += 1
+                    hot_global_count += 1
                 elif hasattr(ven, 'value'):
                     ven_str = ven.value
                     if ven_str in venue_set and sym:
                         target_pairs.add((ven_str, sym))
                         hot_count += 1
+                        hot_global_count += 1
 
         if not target_pairs:
             self.journal.append(
@@ -487,7 +536,13 @@ class LiveRuntime:
             )
 
     async def _restore_local_l2_state(self) -> None:
-        """Phase 6: Restore retained local-L2 books and session state from snapshot."""
+        """Phase 6: Restore retained local-L2 books and session state from snapshot.
+
+        V1: Restores PersistedRetainedLocalL2Book including bids/asks book data
+        and generation tracking for stale-snapshot detection.
+        """
+        from lightfee.marketdata.l2 import PriceLevel
+
         if not hasattr(self.state, "local_l2_books_snapshot"):
             return
         snap = getattr(self.state, "local_l2_books_snapshot", None)
@@ -503,6 +558,14 @@ class LiveRuntime:
             book.sequence = entry.get("sequence", 0)
             book.last_snapshot_ms = entry.get("last_snapshot_ms", 0)
             book.last_delta_ms = entry.get("last_delta_ms", 0)
+            # V1: restore generation for stale-snapshot gating
+            if hasattr(book, 'generation'):
+                book.generation = entry.get("generation", 1)
+            # V1: restore book data (bids/asks) if available
+            if entry.get("bids"):
+                book.bids = [PriceLevel(price=l["price"], quantity=l["quantity"]) for l in entry["bids"]]
+            if entry.get("asks"):
+                book.asks = [PriceLevel(price=l["price"], quantity=l["quantity"]) for l in entry["asks"]]
             # Restore the persisted pool — only RETAINED books should be
             # re-bootstrapped at startup (V1: retained_local_l2_books).
             pool_str = entry.get("pool", "dropped")
@@ -510,10 +573,14 @@ class LiveRuntime:
                 book.pool = L2PoolAssignment(pool_str)
             except ValueError:
                 book.pool = L2PoolAssignment.DROPPED
+            # V1: retained books bootstrap directly (retained_local_l2_books)
+            if book.pool == L2PoolAssignment.RETAINED:
+                if book.status in (L2BookStatus.COLD, L2BookStatus.RESUME_WAITING):
+                    book.transition_to_bootstrapping(0)
             # Restored book is never automatically HOT — must prove freshness.
             # But don't overwrite a book that is already being bootstrapped
             # (set by _activate_local_l2_phase for retained/hot symbols).
-            if book.status in (L2BookStatus.COLD,):
+            elif book.status in (L2BookStatus.COLD,):
                 book.status = L2BookStatus.RESUME_WAITING
 
     async def stop(self) -> None:
@@ -568,16 +635,42 @@ class LiveRuntime:
         snapshot = load_snapshot(self.config.runtime.sidecar_snapshot_path)
         max_age = self.config.runtime.sidecar_snapshot_max_age_ms
 
-        if snapshot is None:
+        # V1: evaluate_snapshot_freshness — multi-state freshness evaluation
+        freshness = evaluate_snapshot_freshness(
+            snapshot=snapshot,
+            max_age_ms=max_age,
+            now_ms=now_ms,
+            last_good=self._last_good_snapshot,
+        )
+        if freshness == SnapshotFreshness.MISSING:
+            self._live_scan_success_streak = 0
             self.journal.append("runtime.snapshot_missing", {"ts_ms": now_ms})
             return
+        if freshness == SnapshotFreshness.STALE:
+            self._live_scan_success_streak = 0
+            if self._last_good_snapshot is not None:
+                snapshot = self._last_good_snapshot
+                self.journal.append("runtime.snapshot_fallback_last_good", {"ts_ms": now_ms})
+            else:
+                self.journal.append("runtime.snapshot_stale", {"ts_ms": now_ms})
+                return
+        if freshness == SnapshotFreshness.DEGRADED:
+            # Some venues degraded but can still trade on healthy ones
+            self._live_scan_success_streak += 1
+            self._last_good_snapshot = snapshot
+            self.journal.append("runtime.snapshot_degraded",
+                {"venues": snapshot.degraded_venues, "ts_ms": now_ms})
+        if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
+            # Current snapshot is stale/missing; fall back to last good
+            snapshot = self._last_good_snapshot
+            self._live_scan_success_streak += 1
+            self.journal.append("runtime.snapshot_fallback_last_good", {"ts_ms": now_ms})
+        if freshness == SnapshotFreshness.FRESH:
+            self._live_scan_success_streak += 1
+            self._last_good_snapshot = snapshot
 
-        if check_stale_snapshot(snapshot.published_at_ms, max_age, now_ms):
-            self.journal.append(
-                "runtime.snapshot_stale",
-                {"published_at_ms": snapshot.published_at_ms, "max_age_ms": max_age},
-            )
-            return
+        # V1 pre-scan L2 sync: refresh execution-owned books only (scan_promoted=False)
+        await self._sync_local_l2_data(now_ms, scan_promoted=False)
 
         # --- Build price lookup from snapshot quotes ---
         price_hints: dict[str, float] = {}
@@ -585,6 +678,16 @@ class LiveRuntime:
             price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0 if quote.bid > 0 and quote.ask > 0 else 0.0
 
         # --- Discover tradeable candidates ---
+        # V1 live scan recovery gate: require consecutive fresh snapshots before entry
+        live_scan_recovery_count = getattr(self.config.strategy, 'live_scan_recovery_success_count', 3)
+        if self._live_scan_success_streak < live_scan_recovery_count:
+            self.journal.append(
+                "runtime.live_scan_recovery_warmup",
+                {"success_streak": self._live_scan_success_streak,
+                 "required": live_scan_recovery_count, "ts_ms": now_ms},
+            )
+            return
+
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
@@ -594,14 +697,46 @@ class LiveRuntime:
                 # Only bootstrap L2 for symbols that have actual activity (shortlist/finalist)
                 await self._ensure_l2_active_for_candidates(tradeable, now_ms)
 
+                # V1 post-shortlist L2 sync: allows scan-promoted books (scan_promoted=True)
+                await self._sync_local_l2_data(now_ms, scan_promoted=True)
+
+                # V1 market data warmup: funding coverage must meet threshold before entry
+                if hasattr(snapshot, 'funding_lifecycle') and snapshot.funding_lifecycle:
+                    funding_warmup_required = getattr(
+                        self.config.strategy, 'funding_warmup_min_coverage_ratio', 0.5,
+                    )
+                    total_count = sum(
+                        fl.symbol_count for fl in snapshot.funding_lifecycle
+                    )
+                    venue_count = len(snapshot.funding_lifecycle)
+                    funding_warmup_ok = (
+                        venue_count >= 1 and total_count > 0
+                    )
+                    if not funding_warmup_ok and not self.state.open_positions:
+                        self.journal.append(
+                            "runtime.funding_warmup_insufficient",
+                            {
+                                "funding_venue_count": venue_count,
+                                "funding_symbol_count": total_count,
+                                "warmup_ratio_required": funding_warmup_required,
+                                "ts_ms": now_ms,
+                            },
+                        )
+                        return
+
                 self.journal.append(
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
                 )
-                # Dispatch first tradeable candidate to entry executor
-                # (V1 policy: one new entry per tick to avoid correlated fills)
-                mid_price = price_hints.get(tradeable[0].symbol, 0.0)
-                await self._dispatch_entry(tradeable[0], now_ms, price_hint=mid_price)
+                # V1: iterate entire shortlist until slot budget exhausted
+                max_slots = self.config.strategy.max_concurrent_positions
+                dispatched = 0
+                for candidate in tradeable:
+                    if len(self.state.open_positions) >= max_slots:
+                        break
+                    mid_price = price_hints.get(candidate.symbol, 0.0)
+                    await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
+                    dispatched += 1
 
     # ------------------------------------------------------------------
     # Risk snapshot runtime cache (V1: fetch_account_risk_with_runtime_cache)
@@ -769,12 +904,14 @@ class LiveRuntime:
     # Local-L2 data sync (V1: periodic snapshot refresh per book)
     # ------------------------------------------------------------------
 
-    async def _sync_local_l2_data(self, now_ms: int) -> None:
+    async def _sync_local_l2_data(self, now_ms: int, *, scan_promoted: bool = False) -> None:
         """Periodic snapshot refresh for local-L2 books without WS streaming.
 
-        Called each tick. Delegates to the data plane which respects per-book
-        cooldown intervals and only refreshes books that need it (COLD,
-        BOOTSTRAPPING, REBUILDING with priority; HOT at slower interval).
+        Called at two points per tick (V1 dual-phase):
+        1. Pre-scan (scan_promoted=False): execution-owned books only
+        2. Post-shortlist (scan_promoted=True): allows scan-promoted books
+
+        Delegates to the data plane which respects per-book cooldown intervals.
         """
         if not self.config.strategy.local_l2_enabled:
             return
@@ -783,6 +920,7 @@ class LiveRuntime:
             dispatched = await self.l2_data_plane.sync_snapshots(
                 adapters=self._venue_adapters,
                 now_ms=now_ms,
+                scan_promoted=scan_promoted,
             )
             if dispatched > 0:
                 self.local_l2_runtime.sync(now_ms)
@@ -1423,6 +1561,139 @@ class LiveRuntime:
         )
         pending.reconcile_next_attempt_ms = now_ms + backoff
 
+    async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
+        """Force-reconcile pending entries ignoring backoff windows.
+
+        V1: reconcile_open_positions() with force_reconcile=true — used at
+        startup recovery to immediately resolve any uncertain outcomes before
+        resuming normal operations.
+        """
+        if self.reconciler is None or not self._venue_adapters:
+            return
+
+        resolved_ids: list[str] = []
+        for entry_id, pending in list(self.state.pending_entries.items()):
+            if not pending.uncertain_outcome:
+                resolved_ids.append(entry_id)
+                continue
+
+            try:
+                result = await self.reconciler.reconcile_position(
+                    position_id=entry_id,
+                    symbol=pending.symbol,
+                    long_venue=pending.long_venue,
+                    short_venue=pending.short_venue,
+                    long_order_id=pending.maker_order_id,
+                    short_order_id=pending.hedge_order_id,
+                    long_client_order_id=pending.maker_client_order_id,
+                    short_client_order_id=pending.hedge_client_order_id,
+                )
+            except Exception as e:
+                self.journal.append(
+                    "recovery.force_reconcile_entry_error",
+                    {"entry_id": entry_id, "error": str(e)},
+                )
+                continue
+
+            if result.long_status == "filled" and result.short_status == "filled":
+                resolved_ids.append(entry_id)
+            elif result.is_flat:
+                resolved_ids.append(entry_id)
+
+        for eid in resolved_ids:
+            self.state.pending_entries.pop(eid, None)
+
+        self.journal.append(
+            "recovery.force_reconcile_complete",
+            {"resolved_entries": len(resolved_ids), "ts_ms": now_ms},
+        )
+
+    async def _recover_pending_entry_hedges(self, now_ms: int) -> None:
+        """Re-drive pending entry hedges with uncertain maker orders after restart.
+
+        V1: process_pending_entry_hedges() in finalize_startup_position_recovery —
+        re-polls the maker order status for any pending entry hedge that survived
+        a restart with an uncertain outcome.
+        """
+        if not self._venue_adapters:
+            return
+
+        for entry_id, pending in list(self.state.pending_entries.items()):
+            if not pending.uncertain_outcome:
+                continue
+            if not pending.maker_order_id and not pending.hedge_order_id:
+                continue
+
+            # Check if either venue adapter can report on the order
+            for ven in (pending.long_venue, pending.short_venue):
+                adapter = self.get_venue_adapter(ven)
+                if adapter is None:
+                    continue
+                try:
+                    if hasattr(adapter, 'get_order_status'):
+                        status = await adapter.get_order_status(
+                            symbol=pending.symbol,
+                            order_id=pending.maker_order_id or pending.hedge_order_id,
+                        )
+                        if status and getattr(status, 'status', '') == "filled":
+                            pending.uncertain_outcome = False
+                            pending.outcome = "filled"
+                            self.journal.append(
+                                "recovery.entry_hedge_resolved",
+                                {"entry_id": entry_id, "venue": str(ven), "status": status.status},
+                            )
+                            break
+                except Exception:
+                    continue
+
+    async def _recover_residual_repairs(self, now_ms: int) -> None:
+        """Process pending residual repair tasks after startup recovery.
+
+        V1: process_pending_residual_repairs() — iterates over
+        pending_residual_repairs and attempts to repair one-sided exposure
+        by submitting reduce-only orders on the over-exposed venue.
+        """
+        if not self.state.pending_residual_repairs:
+            return
+
+        if self.close_executor is None:
+            self.journal.append(
+                "recovery.residual_repairs_skipped_no_executor",
+                {"count": len(self.state.pending_residual_repairs), "ts_ms": now_ms},
+            )
+            return
+
+        repaired = 0
+        for task in list(self.state.pending_residual_repairs):
+            if not isinstance(task, dict):
+                continue
+            position_id = task.get("position_id", "")
+            pos = self.state.open_positions.get(position_id)
+            if pos is None:
+                self.state.pending_residual_repairs.remove(task)
+                continue
+
+            try:
+                await self.close_executor.execute_close(
+                    pos, "residual_repair", now_ms,
+                    long_price_hint=self._resolve_local_l2_mid(pos.long_venue, pos.symbol),
+                    short_price_hint=self._resolve_local_l2_mid(pos.short_venue, pos.symbol),
+                    state=self.state,
+                )
+                self.state.pending_residual_repairs.remove(task)
+                repaired += 1
+            except Exception as e:
+                self.journal.append(
+                    "recovery.residual_repair_error",
+                    {"position_id": position_id, "error": str(e)},
+                )
+
+        if repaired > 0:
+            self.journal.append(
+                "recovery.residual_repairs_complete",
+                {"repaired": repaired, "ts_ms": now_ms},
+            )
+
     # ------------------------------------------------------------------
     # Housekeeping
     # ------------------------------------------------------------------
@@ -1448,9 +1719,12 @@ class LiveRuntime:
     # ------------------------------------------------------------------
 
     def _snapshot_local_l2_state(self) -> None:
-        """Snapshot local-L2 runtime state into EngineState for persistence/recovery."""
+        """Snapshot local-L2 runtime state into EngineState for persistence/recovery.
+
+        V1: PersistedRetainedLocalL2Book with bids/asks + generation tracking.
+        """
         diag = self.local_l2_runtime.diagnostics_snapshot()
-        # Retained books metadata
+        # Retained books metadata (V1: persisted with full book data)
         self.state.retained_local_l2_books = [
             {
                 "venue": b.venue,
@@ -1460,6 +1734,10 @@ class LiveRuntime:
                 "sequence": b.sequence,
                 "last_snapshot_ms": b.last_snapshot_ms,
                 "last_delta_ms": b.last_delta_ms,
+                "last_update_id": b.last_update_id,
+                "generation": getattr(b, 'generation', 1),
+                "bids": [{"price": l.price, "quantity": l.quantity} for l in b.bids] if hasattr(b, 'bids') else [],
+                "asks": [{"price": l.price, "quantity": l.quantity} for l in b.asks] if hasattr(b, 'asks') else [],
             }
             for b in self.local_l2_runtime.books.values()
             if b.pool == L2PoolAssignment.RETAINED
@@ -1476,6 +1754,9 @@ class LiveRuntime:
                 "last_snapshot_ms": b.last_snapshot_ms,
                 "last_delta_ms": b.last_delta_ms,
                 "observed_at_ms": b.observed_at_ms,
+                "generation": getattr(b, 'generation', 1),
+                "bids": [{"price": l.price, "quantity": l.quantity} for l in b.bids] if hasattr(b, 'bids') else [],
+                "asks": [{"price": l.price, "quantity": l.quantity} for l in b.asks] if hasattr(b, 'asks') else [],
             }
             for b in self.local_l2_runtime.books.values()
         ]
@@ -1484,6 +1765,93 @@ class LiveRuntime:
             s.diagnostics_snapshot(now_ms=wall_clock_now_ms(), stale_after_ms=5000)
             for s in self.entry_l2_sessions.sessions.values()
         ]
+
+    # ------------------------------------------------------------------
+    # Entry guards (V1: apply_runtime_entry_guards)
+    # ------------------------------------------------------------------
+
+    def _gate_pending_close_reconciliation(self, candidate) -> tuple[bool, str]:
+        """Block entry if a pending close reconciliation exists for same symbol+venues."""
+        sym = getattr(candidate, 'symbol', '')
+        long_v = getattr(candidate, 'long_venue', '')
+        short_v = getattr(candidate, 'short_venue', '')
+        for pc in self.state.pending_closes.values():
+            if getattr(pc, 'symbol', '') != sym:
+                continue
+            pc_long = getattr(pc, 'long_venue', None)
+            pc_short = getattr(pc, 'short_venue', None)
+            pc_long_s = pc_long.value if hasattr(pc_long, 'value') else str(pc_long)
+            pc_short_s = pc_short.value if hasattr(pc_short, 'value') else str(pc_short)
+            if (pc_long_s == long_v and pc_short_s == short_v) or \
+               (pc_long_s == short_v and pc_short_s == long_v):
+                return False, "pending_close_reconciliation_conflict"
+        return True, ""
+
+    def _gate_passive_close_pending(self, candidate) -> tuple[bool, str]:
+        """Block entry if a passive close is in-flight for the same symbol pair."""
+        sym = getattr(candidate, 'symbol', '')
+        long_v = getattr(candidate, 'long_venue', '')
+        short_v = getattr(candidate, 'short_venue', '')
+        for pos_id in list(self.state.pending_passive_closes.keys()):
+            pos = self.state.open_positions.get(pos_id)
+            if pos is None:
+                continue
+            if getattr(pos, 'symbol', '') != sym:
+                continue
+            pos_long = getattr(pos, 'long_venue', None)
+            pos_short = getattr(pos, 'short_venue', None)
+            pos_long_s = pos_long.value if hasattr(pos_long, 'value') else str(pos_long)
+            pos_short_s = pos_short.value if hasattr(pos_short, 'value') else str(pos_short)
+            if (pos_long_s == long_v and pos_short_s == short_v) or \
+               (pos_long_s == short_v and pos_short_s == long_v):
+                return False, "passive_close_in_flight"
+        return True, ""
+
+    def _gate_reduce_only(self, candidate) -> tuple[bool, str]:
+        """Block new entry when lifecycle/risk mode is reduce-only or fail-closed."""
+        if self.state.lifecycle in (EngineLifecycle.RISK_ONLY, EngineLifecycle.FAIL_CLOSED):
+            return False, f"lifecycle_{self.state.lifecycle.value}"
+        if self.state.risk_mode.value in ("reduce_only", "fail_closed"):
+            return False, f"risk_mode_{self.state.risk_mode.value}"
+        return True, ""
+
+    def _gate_venue_cooldown(self, candidate, now_ms: int) -> tuple[bool, str]:
+        """Block entry if either venue is in cooldown."""
+        for ven_str in (getattr(candidate, 'long_venue', ''), getattr(candidate, 'short_venue', '')):
+            if not ven_str:
+                continue
+            until = self._venue_cooldown_until_ms.get(ven_str, 0)
+            if until > 0 and now_ms < until:
+                return False, f"venue_cooldown_{ven_str}"
+        return True, ""
+
+    def _gate_zero_fill_cooldown(self, candidate, now_ms: int) -> tuple[bool, str]:
+        """Block entry if a zero-fill terminal event is in cooldown for the same pair.
+
+        Zero-fill means a recent entry attempt on this pair produced no fills,
+        indicating the venue may be rejecting orders or the spread is too wide.
+        """
+        pair_key = (getattr(candidate, 'symbol', ''), getattr(candidate, 'long_venue', ''), getattr(candidate, 'short_venue', ''))
+        until = self._zero_fill_cooldown_until_ms.get(pair_key, 0)
+        if until > 0 and now_ms < until:
+            return False, "zero_fill_cooldown"
+        return True, ""
+
+    def _gate_pending_entry_dedup(self, candidate) -> tuple[bool, str]:
+        """Block entry if a pending entry already exists for same symbol+venue pair."""
+        from lightfee.engine.recovery import has_pending_entry_for_symbol
+        sym = getattr(candidate, 'symbol', '')
+        long_v = getattr(candidate, 'long_venue', '')
+        short_v = getattr(candidate, 'short_venue', '')
+        if has_pending_entry_for_symbol(self.state, sym, long_v, short_v):
+            return False, "pending_entry_duplicate"
+        return True, ""
+
+    def _gate_entry_sizing(self, candidate) -> tuple[bool, str]:
+        """Block entry if notional quote is zero or negative."""
+        if getattr(candidate, 'entry_notional_quote', 0.0) <= 0:
+            return False, "entry_notional_zero_or_negative"
+        return True, ""
 
     # ------------------------------------------------------------------
     # Entry dispatch
@@ -1503,6 +1871,25 @@ class LiveRuntime:
             plan_incremental_entry_execution,
         )
 
+        # V1: apply_runtime_entry_guards — 8+ gate checks before entry
+        gates = [
+            ("reduce_only", self._gate_reduce_only, ()),
+            ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
+            ("passive_close_in_flight", self._gate_passive_close_pending, ()),
+            ("pending_entry_duplicate", self._gate_pending_entry_dedup, ()),
+            ("entry_sizing", self._gate_entry_sizing, ()),
+            ("venue_cooldown", self._gate_venue_cooldown, (now_ms,)),
+            ("zero_fill_cooldown", self._gate_zero_fill_cooldown, (now_ms,)),
+        ]
+        for gate_name, gate_fn, gate_args in gates:
+            allowed, reason = gate_fn(candidate, *gate_args)
+            if not allowed:
+                self.journal.append(
+                    "runtime.entry_blocked_gate",
+                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
+                )
+                return
+
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
             self.journal.append(
@@ -1520,6 +1907,23 @@ class LiveRuntime:
         long_venue = Venue.from_str(candidate.long_venue)
         short_venue = Venue.from_str(candidate.short_venue)
         quantity = candidate.entry_notional_quote / price_hint
+
+        # V1 runtime entry guards (apply_runtime_entry_guards)
+        gate_checks = [
+            ("pending_close_reconciliation", self._gate_pending_close_reconciliation),
+            ("passive_close_pending", self._gate_passive_close_pending),
+            ("reduce_only", self._gate_reduce_only),
+            ("venue_cooldown", self._gate_venue_cooldown),
+            ("zero_fill_cooldown", self._gate_zero_fill_cooldown),
+        ]
+        for gate_name, gate_fn in gate_checks:
+            allowed, reason = gate_fn(candidate, now_ms) if gate_name in ("venue_cooldown", "zero_fill_cooldown") else gate_fn(candidate)
+            if not allowed:
+                self.journal.append(
+                    "runtime.entry_blocked_gate",
+                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
+                )
+                return
 
         # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
         # but either leg's book is not ready (stale, degraded, cold, etc.)

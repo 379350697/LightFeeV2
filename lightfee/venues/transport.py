@@ -63,11 +63,13 @@ class TransportErrorCategory(Enum):
 
 class TransportError(Exception):
     def __init__(self, category: TransportErrorCategory, message: str,
-                 status_code: int = 0, body: str = "") -> None:
+                 status_code: int = 0, body: str = "",
+                 headers: dict[str, str] | None = None) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.body = body
+        self.headers: dict[str, str] = headers or {}
 
 
 def classify_transport_error(
@@ -86,6 +88,30 @@ def classify_transport_error(
     if status_code >= 500:
         return TransportErrorCategory.TRANSPORT_FAILURE
     return TransportErrorCategory.TRANSPORT_FAILURE
+
+
+def _parse_retry_after_ms(headers: dict[str, str]) -> Optional[int]:
+    """Extract Retry-After value from response headers, returned as milliseconds.
+
+    V1: parse_retry_after_ms() — supports both delta-seconds and HTTP-date.
+    """
+    retry_after = headers.get("Retry-After", headers.get("retry-after", ""))
+    if not retry_after:
+        return None
+    try:
+        # delta-seconds (e.g. "120")
+        return int(retry_after) * 1000
+    except ValueError:
+        pass
+    try:
+        # HTTP-date (e.g. "Wed, 21 Oct 2015 07:28:00 GMT")
+        from email.utils import parsedate_to_datetime
+        retry_dt = parsedate_to_datetime(retry_after)
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        delta = (retry_dt - now_dt).total_seconds()
+        return max(0, int(delta * 1000))
+    except Exception:
+        return None
 
 
 def _map_to_submit_error(
@@ -550,12 +576,16 @@ class VenueTransport:
                 # V1: record rate-limit for 429/418 to trigger cooldown
                 if resp.status_code in (429, 418) and self._rate_limiter is not None:
                     rate_limit_scope = f"host:{base_url}"
-                    self._rate_limiter.record_rate_limit_for_scopes([rate_limit_scope])
+                    retry_after_ms = _parse_retry_after_ms(resp.headers)
+                    self._rate_limiter.record_rate_limit_for_scopes(
+                        [rate_limit_scope], retry_after_ms=retry_after_ms,
+                    )
                 cat = classify_transport_error(resp.status_code, resp.text)
                 if cat:
                     raise TransportError(
                         cat, f"HTTP {resp.status_code}: {resp.text[:200]}",
                         status_code=resp.status_code, body=resp.text,
+                        headers=dict(resp.headers),
                     )
 
             if not resp.text:
@@ -787,7 +817,12 @@ class VenueTransport:
                     raise
                 # V1 exponential backoff with jitter: delay = min(initial * 2^failures, max)
                 shift = min(failures - 1, 20)
-                delay_ms = min(retry_initial_ms << shift, retry_max_ms)
+                backoff_ms = min(retry_initial_ms << shift, retry_max_ms)
+                # V1: extract Retry-After from rate-limit response, take max
+                retry_after_ms = 0
+                if e.status_code in (429, 418):
+                    retry_after_ms = _parse_retry_after_ms(e.headers) or 0
+                delay_ms = max(backoff_ms, retry_after_ms)
                 jitter = random.randint(0, max(delay_ms // 5, 1))
                 delay_ms += jitter
                 await asyncio.sleep(delay_ms / 1000.0)

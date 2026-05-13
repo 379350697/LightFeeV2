@@ -22,7 +22,7 @@ from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
-from lightfee.engine.state import OpenPosition, PendingClose
+from lightfee.engine.state import CloseLegRecord, OpenPosition, PendingClose
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
 
@@ -353,6 +353,26 @@ class CloseExecConfig:
     close_chunk_min_interval_ms: int = 1_000
 
 
+def _legs_to_records(legs: list[CloseExecutionLeg]) -> list[CloseLegRecord]:
+    """Convert CloseExecutionLeg list to CloseLegRecord list for persistence.
+
+    V1: close_leg_record() in exit.rs — maps filled leg data into
+    serializable CloseLegRecord for PendingClose reconciliation.
+    """
+    records: list[CloseLegRecord] = []
+    for leg in legs:
+        ven_str = leg.fill.venue.value if hasattr(leg.fill.venue, 'value') else str(leg.fill.venue)
+        records.append(CloseLegRecord(
+            venue=ven_str,
+            order_id=leg.fill.order_id,
+            client_order_id=leg.client_order_id,
+            quantity=leg.fill.quantity,
+            average_price=leg.fill.average_price,
+            fee_quote=leg.fill.fee_quote,
+        ))
+    return records
+
+
 class CloseExecutor:
     """Async close executor using venue adapters.
 
@@ -545,6 +565,8 @@ class CloseExecutor:
                 short_client_order_id=", ".join(chunk_short_cids),
                 long_client_order_id=", ".join(chunk_long_cids),
                 chunk_count=total_chunks,
+                long_legs=long_legs,
+                short_legs=short_legs,
             )
 
         pnl_attr = build_exit_pnl_attribution(position, close)
@@ -589,6 +611,8 @@ class CloseExecutor:
         short_client_order_id: str = "",
         long_client_order_id: str = "",
         chunk_count: int = 1,
+        long_legs: list[CloseExecutionLeg] | None = None,
+        short_legs: list[CloseExecutionLeg] | None = None,
     ) -> None:
         """Write close execution results back into EngineState.
 
@@ -625,6 +649,8 @@ class CloseExecutor:
                 short_uncertain=short_uncertain,
                 chunk_index=0,
                 total_chunks=chunk_count,
+                long_legs=_legs_to_records(long_legs or []),
+                short_legs=_legs_to_records(short_legs or []),
             )
             self.journal.append(
                 "exit.pending_close_registered",

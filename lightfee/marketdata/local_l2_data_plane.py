@@ -166,6 +166,20 @@ class LocalL2DataPlane:
         ss.snapshot_in_flight = True
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+
+            # V1: binance_local_l2_snapshot_is_stale — reject snapshot if sequence <= book's
+            book = self._runtime.get_book(venue, symbol)
+            if book is not None and update.sequence > 0 and book.last_update_id > 0:
+                if update.sequence <= book.last_update_id:
+                    self._journal.append(
+                        "runtime.local_l2_snapshot_stale",
+                        {"venue": venue, "symbol": symbol,
+                         "snapshot_seq": update.sequence, "book_seq": book.last_update_id},
+                    )
+                    # Small delay to avoid tight loop re-fetching the same stale snapshot
+                    await asyncio.sleep(0.25)
+                    return False
+
             self._runtime.record_update(update, now_ms)
 
             # Replay buffered WS updates accumulated during bootstrap gap (V1 parity)
@@ -195,6 +209,9 @@ class LocalL2DataPlane:
             if e.category == TransportErrorCategory.UNSUPPORTED_CAPABILITY:
                 # Don't retry unsupported — mark degraded
                 ss.consecutive_failures = ss.max_consecutive_failures
+            # V1: clear pre-snapshot buffers on failure (clear_binance_local_l2_depth_updates_for_instance)
+            buf_key = f"{venue}:{symbol}"
+            self._pre_snapshot_buffers.pop(buf_key, None)
             self._runtime.handle_runtime_failure(
                 venue, symbol,
                 RuntimeFaultKind.TRANSPORT_FAILURE,
@@ -208,6 +225,9 @@ class LocalL2DataPlane:
         except Exception as e:
             ss.consecutive_failures += 1
             ss.last_error = str(e)
+            # V1: clear pre-snapshot buffers on any failure
+            buf_key = f"{venue}:{symbol}"
+            self._pre_snapshot_buffers.pop(buf_key, None)
             self._runtime.handle_runtime_failure(
                 venue, symbol,
                 RuntimeFaultKind.TRANSPORT_FAILURE,
@@ -433,12 +453,17 @@ class LocalL2DataPlane:
         self,
         adapters: dict,
         now_ms: int,
+        *,
+        scan_promoted: bool = False,
     ) -> int:
         """Periodic REST snapshot refresh — only for books without active WS stream.
 
         V1: REST snapshots are ONLY for bootstrap. After HOT, WS deltas maintain
         the book.  This poller exists only as a fallback for books that lost their
         WS stream (DEGRADED/REBUILDING) or never had one.
+
+        scan_promoted=True (post-shortlist) allows refreshing books promoted by the
+        scan phase; False (pre-scan) refreshes execution-owned books only.
         """
         dispatched = 0
 
@@ -448,6 +473,11 @@ class LocalL2DataPlane:
 
             # V1: only snapshot books that need recovery — HOT books rely on WS deltas
             if book.status == L2BookStatus.HOT:
+                continue
+
+            # V1 dual-phase gating: pre-scan only refreshes execution-owned books
+            # (RETAINED or HOT_EXEC); post-shortlist allows scan-promoted books too
+            if not scan_promoted and book.pool not in (L2PoolAssignment.RETAINED, L2PoolAssignment.HOT_EXEC):
                 continue
 
             interval_ms = self._snapshot_interval_for_status(book.status)
@@ -516,7 +546,7 @@ class LocalL2DataPlane:
 
             async def _bootstrap_one(index: int, symbol: str) -> None:
                 # Jittered initial delay to stagger requests (V1: binance_local_l2_bootstrap_initial_delay_ms)
-                delay_ms = (index % batch_size) * jitter_ms + random.randint(0, jitter_ms)
+                delay_ms = jitter_ms * (index % batch_size) // batch_size
                 if delay_ms > 0:
                     await asyncio.sleep(delay_ms / 1000.0)
 
@@ -532,10 +562,17 @@ class LocalL2DataPlane:
 
                 backoff = retry_backoff_ms
                 max_backoff = retry_backoff_ms * 8
-                attempt = 0
-                while attempt < 5:  # max 5 retries
+                while True:  # V1: loop {} — infinite retry until success
                     now_ms = int(asyncio.get_event_loop().time() * 1000)
                     book = self._runtime.get_book(venue, symbol)
+
+                    # V1: resume_without_bootstrap inline polling (250ms slices)
+                    if book is not None:
+                        remaining = book.resume_waiting_remaining_ms(now_ms)
+                        if remaining > 0:
+                            await asyncio.sleep(min(remaining, 250) / 1000.0)
+                            continue
+
                     if book is None or book.status == L2BookStatus.HOT:
                         return
 
@@ -551,7 +588,6 @@ class LocalL2DataPlane:
                     if success:
                         return
 
-                    attempt += 1
                     delay = min(backoff, max_backoff)
                     backoff = min(backoff * 2, max_backoff)
                     # Add jitter

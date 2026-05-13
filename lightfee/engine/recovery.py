@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from lightfee.engine.state import (
     ActiveMakerLeg,
+    CloseLegRecord,
     EngineState,
     OpenPosition,
     OperatorControlState,
@@ -213,6 +214,22 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
     )
 
 
+def _restore_close_leg_records(data: list[dict[str, Any]]) -> list[CloseLegRecord]:
+    """Restore CloseLegRecord list from serialized snapshot data."""
+    records: list[CloseLegRecord] = []
+    for item in (data or []):
+        if isinstance(item, dict):
+            records.append(CloseLegRecord(
+                venue=str(item.get("venue", "")),
+                order_id=str(item.get("order_id", "")),
+                client_order_id=str(item.get("client_order_id", "")),
+                quantity=float(item.get("quantity", 0)),
+                average_price=float(item.get("average_price", 0)),
+                fee_quote=float(item.get("fee_quote", 0)),
+            ))
+    return records
+
+
 def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
     """Serialize an OpenPosition for snapshot storage."""
     return {
@@ -379,10 +396,22 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     created_at_ms=int(cdata.get("created_at_ms", 0)),
                     long_order_id=str(cdata.get("long_order_id", "")),
                     short_order_id=str(cdata.get("short_order_id", "")),
+                    long_client_order_id=str(cdata.get("long_client_order_id", "")),
+                    short_client_order_id=str(cdata.get("short_client_order_id", "")),
+                    long_target_close_qty=float(cdata.get("long_target_close_qty", 0)),
+                    short_target_close_qty=float(cdata.get("short_target_close_qty", 0)),
                     long_closed=float(cdata.get("long_closed", 0)),
                     short_closed=float(cdata.get("short_closed", 0)),
                     long_uncertain=bool(cdata.get("long_uncertain", False)),
                     short_uncertain=bool(cdata.get("short_uncertain", False)),
+                    deadline_ms=int(cdata.get("deadline_ms", 0)),
+                    reconcile_attempt=int(cdata.get("reconcile_attempt", 0)),
+                    reconcile_next_attempt_ms=int(cdata.get("reconcile_next_attempt_ms", 0)),
+                    run_id=str(cdata.get("run_id", "")),
+                    chunk_index=int(cdata.get("chunk_index", 0)),
+                    total_chunks=int(cdata.get("total_chunks", 1)),
+                    long_legs=_restore_close_leg_records(cdata.get("long_legs", [])),
+                    short_legs=_restore_close_leg_records(cdata.get("short_legs", [])),
                 )
 
     # Restore pending passive closes
@@ -583,6 +612,9 @@ def recover_from_snapshot(
                 "reason": "startup_no_recovery_work",
             })
 
+    # V1: normalize_engine_state_positions — applied after every recovery load
+    normalize_engine_state(state)
+
     return state
 
 
@@ -671,8 +703,42 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "created_at_ms": c.created_at_ms,
             "long_order_id": c.long_order_id,
             "short_order_id": c.short_order_id,
+            "long_client_order_id": c.long_client_order_id,
+            "short_client_order_id": c.short_client_order_id,
+            "long_target_close_qty": c.long_target_close_qty,
+            "short_target_close_qty": c.short_target_close_qty,
+            "long_closed": c.long_closed,
+            "short_closed": c.short_closed,
             "long_uncertain": c.long_uncertain,
             "short_uncertain": c.short_uncertain,
+            "deadline_ms": c.deadline_ms,
+            "reconcile_attempt": c.reconcile_attempt,
+            "reconcile_next_attempt_ms": c.reconcile_next_attempt_ms,
+            "run_id": c.run_id,
+            "chunk_index": c.chunk_index,
+            "total_chunks": c.total_chunks,
+            "long_legs": [
+                {
+                    "venue": lr.venue,
+                    "order_id": lr.order_id,
+                    "client_order_id": lr.client_order_id,
+                    "quantity": lr.quantity,
+                    "average_price": lr.average_price,
+                    "fee_quote": lr.fee_quote,
+                }
+                for lr in c.long_legs
+            ],
+            "short_legs": [
+                {
+                    "venue": lr.venue,
+                    "order_id": lr.order_id,
+                    "client_order_id": lr.client_order_id,
+                    "quantity": lr.quantity,
+                    "average_price": lr.average_price,
+                    "fee_quote": lr.fee_quote,
+                }
+                for lr in c.short_legs
+            ],
         }
         for cid, c in state.pending_closes.items()
     }
@@ -835,19 +901,78 @@ def normalize_engine_state(state: EngineState) -> None:
 
     Rust V1: normalize_engine_state_positions() — sorts and deduplicates
     positions, migrates dust residuals, fixes timestamp defaults.
+    Performs 12+ repair operations matching V1 semantics.
     """
-    # Move dust positions out of open_positions
-    dust_ids = set()
-    for pid, pos in list(state.open_positions.items()):
-        if pos.matched_quantity < 1e-12:
-            dust_ids.add(pid)
-    for pid in dust_ids:
-        del state.open_positions[pid]
+    # 1. Timestamp repair: backfill zero funding_timestamp_ms
+    for pos in state.open_positions.values():
+        if pos.funding_timestamp_ms == 0:
+            pos.funding_timestamp_ms = pos.opened_at_ms
 
-    # Ensure matched_quantity is set
+    # 2. Edge repair: backfill zero total_funding_edge_bps_entry
+    for pos in state.open_positions.values():
+        if pos.total_funding_edge_bps_entry == 0.0:
+            pos.total_funding_edge_bps_entry = pos.funding_edge_bps_entry
+
+    # 3. Ensure matched_quantity is set
     for pos in state.open_positions.values():
         if pos.matched_quantity == 0.0:
             pos.matched_quantity = min(pos.long_quantity, pos.short_quantity)
+
+    # 4. Dedup open_positions by position_id
+    seen_ids: set[str] = set()
+    deduped: dict[str, OpenPosition] = {}
+    for pid, pos in state.open_positions.items():
+        if pid not in seen_ids:
+            seen_ids.add(pid)
+            deduped[pid] = pos
+    state.open_positions = deduped
+
+    # 5. Dust migration: move positions with exchange_min_notional_dust exit_reason
+    dust_ids: list[str] = []
+    for pid, pos in list(state.open_positions.items()):
+        if pos.exit_reason and "exchange_min_notional_dust" in pos.exit_reason:
+            dust_ids.append(pid)
+    for pid in dust_ids:
+        pos = state.open_positions.pop(pid, None)
+        if pos is not None:
+            state.pending_residual_repairs.append({
+                "position_id": pid,
+                "symbol": pos.symbol,
+                "long_venue": pos.long_venue.value if hasattr(pos.long_venue, 'value') else str(pos.long_venue),
+                "short_venue": pos.short_venue.value if hasattr(pos.short_venue, 'value') else str(pos.short_venue),
+                "reason": "exchange_min_notional_dust",
+                "migrated_at_ms": pos.opened_at_ms,
+            })
+
+    # 6. Dedup live_recovery_reduce_only_pairs
+    if state.live_recovery_reduce_only_pairs:
+        seen_pairs: set[str] = set()
+        deduped_pairs: list = []
+        for pair in state.live_recovery_reduce_only_pairs:
+            if isinstance(pair, dict):
+                key = f"{pair.get('long_venue','')}:{pair.get('short_venue','')}:{pair.get('symbol','')}"
+            else:
+                key = str(pair)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                deduped_pairs.append(pair)
+        state.live_recovery_reduce_only_pairs = deduped_pairs
+
+    # 7. PassivePhaseState fill: ensure empty phase states have defaults
+    from lightfee.engine.state import PassivePhaseState
+    for ppc in state.pending_passive_closes.values():
+        ps = ppc.phase_state
+        if ps.phase_started_at_ms == 0:
+            ps.phase_started_at_ms = ppc.created_cycle or 1
+        if ps.cycle_started_at_ms == 0:
+            ps.cycle_started_at_ms = ps.phase_started_at_ms
+        if ps.cycle_attempt == 0:
+            ps.cycle_attempt = 1
+
+    # 8. Remove zero-quantity positions
+    zero_ids = [pid for pid, pos in state.open_positions.items() if pos.matched_quantity < 1e-12]
+    for pid in zero_ids:
+        del state.open_positions[pid]
 
 
 # ---------------------------------------------------------------------------
