@@ -37,7 +37,7 @@ from lightfee.engine.state import EngineState
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
-from lightfee.risk.modes import EngineLifecycle
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
@@ -115,6 +115,11 @@ class LiveRuntime:
         # V1 live scan recovery state (B2)
         self._live_scan_success_streak: int = 0
         self._last_good_snapshot = None
+
+        # V1 maker venue request budget tracker (CONTRACT RECOVERY-005)
+        # Per-venue sliding window of operation timestamps for cancel/submit
+        # rate limiting. V1: try_consume_maker_venue_request_budget
+        self._maker_venue_op_history: dict[str, list[int]] = {}
 
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
@@ -219,6 +224,10 @@ class LiveRuntime:
                         "ts_ms": wall_clock_now_ms(),
                     },
                 )
+            elif self.state.lifecycle == EngineLifecycle.RECONCILING:
+                # Safety net: if _recover_pending_entry_hedges returned early
+                # (e.g. no venue adapters) without finalizing, do it now.
+                self._finalize_startup_recovery()
         else:
             self.journal.append(
                 "runtime.recovery_blocked",
@@ -1704,42 +1713,638 @@ class LiveRuntime:
         )
 
     async def _recover_pending_entry_hedges(self, now_ms: int) -> None:
-        """Re-drive pending entry hedges with uncertain maker orders after restart.
+        """Re-drive pending entry hedges with full V1 startup recovery semantics.
 
-        V1: process_pending_entry_hedges() in finalize_startup_position_recovery —
-        re-polls the maker order status for any pending entry hedge that survived
-        a restart with an uncertain outcome.
+        V1: process_pending_entry_hedges() + drive_pending_entry_hedge() +
+            force_terminalize_pending_entry_if_budget_exhausted() +
+            hydrate_pending_entry_from_live_balanced_exposure()
+
+        For each pending entry that is startup_recovery_ready:
+        1. Query venue order status to resolve uncertain outcomes
+        2. Try to hydrate from live balanced exposure (reconcile from exchange positions)
+        3. Compute terminalization budget (lifetime vs hard_ceiling/force_terminal)
+        4. If budget exhausted → abort or finalize per V1 rules
+        5. If maker filled but hedge missing → attempt to drive hedge
         """
         if not self._venue_adapters:
             return
 
+        strategy = self.config.strategy
+        hard_ceiling_ms = strategy.pending_entry_hard_ceiling_ms
+        force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
+
         for entry_id, pending in list(self.state.pending_entries.items()):
-            if not pending.uncertain_outcome:
-                continue
-            if not pending.maker_order_id and not pending.hedge_order_id:
+            # V1: startup_recovery_ready gate — skip entries that don't need recovery yet
+            if not pending.startup_recovery_ready():
                 continue
 
-            # Check if either venue adapter can report on the order
-            for ven in (pending.long_venue, pending.short_venue):
-                adapter = self.get_venue_adapter(ven)
-                if adapter is None:
+            lifetime_ms = pending.compute_lifetime_ms(now_ms)
+
+            # --- Step 1: Query venue for order status (resolve uncertain outcomes) ---
+            if pending.uncertain_outcome:
+                await self._recover_poll_order_status(entry_id, pending)
+
+            # Re-check after order status poll: if no longer startup_recovery_ready, skip
+            if not pending.startup_recovery_ready():
+                continue
+
+            # --- Step 2: Try hydrate from live balanced exposure ---
+            # V1: hydrate_pending_entry_from_live_balanced_exposure —
+            # fetches live positions from both venues; if there's already balanced
+            # exposure, applies fills and may finalize.
+            hydrated = await self._recover_hydrate_from_live_positions(pending)
+            if hydrated:
+                self.journal.append(
+                    "recovery.pending_entry_live_balance_hydrated",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_filled": pending.maker_leg_filled,
+                        "hedge_filled": pending.hedge_leg_filled,
+                    },
+                )
+
+            # Re-check after hydration: if no longer needs recovery, skip
+            if not pending.startup_recovery_ready():
+                continue
+
+            # --- Step 3: Terminalization budget ---
+            # V1: pending_entry_terminalization_budget_from_input
+            has_inflight = pending.uncertain_outcome and bool(pending.maker_order_id)
+            hard_ceiling_reached = lifetime_ms >= hard_ceiling_ms
+            force_terminal_reached = (
+                lifetime_ms >= force_terminal_after_ms
+                and (not pending.has_any_fill() or pending.missing_hedge_quantity() <= 1e-9)
+            )
+
+            if has_inflight and not hard_ceiling_reached:
+                # V1: inflight hedge blocks terminalization until hard ceiling
+                pending.reconcile_attempt += 1
+                self._apply_reconcile_backoff(pending, now_ms)
+                continue
+
+            budget_active = hard_ceiling_reached or force_terminal_reached
+            if not budget_active:
+                # Below terminalization thresholds — re-poll, don't force
+                pending.reconcile_attempt += 1
+                self._apply_reconcile_backoff(pending, now_ms)
+                continue
+
+            final_reason = (
+                "pending_entry_max_lifetime_exhausted"
+                if hard_ceiling_reached
+                else "pending_entry_zero_fill_lifetime_exhausted"
+            )
+
+            # --- Step 4: Handle terminalization ---
+            # V1: force_terminalize_pending_entry_if_budget_exhausted
+            # Two main paths: maker not completed (cancel first) vs maker completed
+
+            # --- 4a: Maker not completed → cancel maker order first (V1 cancel-before-abort) ---
+            if not pending.maker_completed() and pending.maker_order_id:
+                cancel_issued = await self._recover_cancel_maker_order(
+                    pending, entry_id, final_reason
+                )
+                if hard_ceiling_reached and not cancel_issued:
+                    # V1: hard ceiling + cancel failed → abort immediately
+                    self.journal.append(
+                        "recovery.pending_entry_hard_ceiling_aborted",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": final_reason,
+                            "detail": "cancel_failed_or_not_issued",
+                            "lifetime_ms": lifetime_ms,
+                        },
+                    )
+                    self.state.pending_entries.pop(entry_id, None)
                     continue
-                try:
-                    if hasattr(adapter, 'get_order_status'):
-                        status = await adapter.get_order_status(
-                            symbol=pending.symbol,
-                            order_id=pending.maker_order_id or pending.hedge_order_id,
-                        )
-                        if status and getattr(status, 'status', '') == "filled":
-                            pending.uncertain_outcome = False
-                            pending.outcome = "filled"
+                if cancel_issued:
+                    # V1: cancel was issued
+                    if hard_ceiling_reached:
+                        if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
+                            # Balanced fill → finalize even on hard ceiling
                             self.journal.append(
-                                "recovery.entry_hedge_resolved",
-                                {"entry_id": entry_id, "venue": str(ven), "status": status.status},
+                                "recovery.pending_entry_finalized",
+                                {"entry_id": entry_id, "symbol": pending.symbol,
+                                 "reason": "cancel_completed_entry_balanced"},
                             )
-                            break
-                except Exception:
+                        else:
+                            # Has fills with missing hedge or no fills → abort
+                            self.journal.append(
+                                "recovery.pending_entry_hard_ceiling_aborted",
+                                {"entry_id": entry_id, "symbol": pending.symbol,
+                                 "reason": final_reason, "detail": "cancel_issued_hard_ceiling"},
+                            )
+                        self.state.pending_entries.pop(entry_id, None)
+                        continue
+                    # Cancel issued but below hard ceiling → keep for progress poll
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
                     continue
+                # Cancel not issued (e.g. budget delayed) and below hard ceiling → keep
+                if not hard_ceiling_reached:
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    continue
+
+            # --- 4b: Zero fills → abort or try taker fallback ---
+            if not pending.has_any_fill():
+                # V1: try taker fallback when tradeable (config gated)
+                if getattr(strategy, "pending_entry_force_fallback_when_tradeable", False):
+                    fallback_ok = await self._recover_try_taker_fallback(
+                        pending, entry_id, final_reason
+                    )
+                    if fallback_ok:
+                        continue
+                # Abort immediately — zero fills, no recovery possible
+                self.journal.append(
+                    "recovery.pending_entry_aborted",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": final_reason,
+                        "lifetime_ms": lifetime_ms,
+                        "hard_ceiling_ms": hard_ceiling_ms,
+                    },
+                )
+                self.state.pending_entries.pop(entry_id, None)
+                continue
+
+            # --- 4c: Has fills + missing hedge → try to drive hedge ---
+            if pending.missing_hedge_quantity() > 1e-9:
+                # V1: check if tradeable before hedging (config gated)
+                if not getattr(strategy, "pending_entry_force_fallback_when_tradeable", False):
+                    # When fallback_when_tradeable is false (default), skip tradeability
+                    # check and go straight to abort on hard ceiling
+                    if hard_ceiling_reached:
+                        self.journal.append(
+                            "recovery.pending_entry_hard_ceiling_aborted",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "reason": final_reason,
+                                "lifetime_ms": lifetime_ms,
+                            },
+                        )
+                        self.state.pending_entries.pop(entry_id, None)
+                        continue
+
+                hedge_driven = await self._recover_drive_missing_hedge(
+                    pending, final_reason
+                )
+                if hedge_driven:
+                    # V1: if hedge completes the entry → finalize immediately
+                    if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                        self.journal.append(
+                            "recovery.pending_entry_finalized",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "reason": "recovery_hedge_completed_entry",
+                            },
+                        )
+                        self.state.pending_entries.pop(entry_id, None)
+                        continue
+
+                    # Hedge submitted but entry not yet complete — keep for reconciliation
+                    self.journal.append(
+                        "recovery.pending_entry_hedge_driven",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": final_reason,
+                            "missing_hedge": pending.missing_hedge_quantity(),
+                        },
+                    )
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    continue
+
+                if hard_ceiling_reached:
+                    # Hard ceiling with unresolved hedge → abort
+                    self.journal.append(
+                        "recovery.pending_entry_hard_ceiling_aborted",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": final_reason,
+                            "lifetime_ms": lifetime_ms,
+                        },
+                    )
+                    self.state.pending_entries.pop(entry_id, None)
+                    continue
+
+            # --- 4d: Fully filled → finalize ---
+            if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                self.journal.append(
+                    "recovery.pending_entry_finalized",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": final_reason,
+                    },
+                )
+                self.state.pending_entries.pop(entry_id, None)
+                continue
+
+            # --- 4e: Fallback — still pending and hard ceiling reached → abort ---
+            if hard_ceiling_reached:
+                self.journal.append(
+                    "recovery.pending_entry_hard_ceiling_aborted",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": "pending_entry_max_lifetime_exhausted",
+                        "lifetime_ms": lifetime_ms,
+                    },
+                )
+                self.state.pending_entries.pop(entry_id, None)
+                continue
+
+            pending.reconcile_attempt += 1
+            self._apply_reconcile_backoff(pending, now_ms)
+
+        # --- Post-recovery lifecycle transition ---
+        self._finalize_startup_recovery()
+
+    async def _recover_poll_order_status(self, entry_id: str, pending) -> None:
+        """Query venue adapters for order status to resolve uncertain outcomes."""
+        for ven in (pending.long_venue, pending.short_venue):
+            adapter = self.get_venue_adapter(ven)
+            if adapter is None:
+                continue
+            try:
+                if hasattr(adapter, "get_order_status"):
+                    order_id = pending.maker_order_id or pending.hedge_order_id
+                    if not order_id:
+                        continue
+                    status = await adapter.get_order_status(
+                        symbol=pending.symbol,
+                        order_id=order_id,
+                    )
+                    if status and getattr(status, "status", "") == "filled":
+                        pending.uncertain_outcome = False
+                        pending.outcome = "filled"
+                        # Update fill quantities if available
+                        filled_qty = getattr(status, "filled_quantity", 0.0) or getattr(status, "executed_qty", 0.0)
+                        if filled_qty and filled_qty > 0:
+                            if ven == pending.long_venue:
+                                pending.maker_leg_filled = max(pending.maker_leg_filled, float(filled_qty))
+                            elif ven == pending.short_venue:
+                                pending.hedge_leg_filled = max(pending.hedge_leg_filled, float(filled_qty))
+                        self.journal.append(
+                            "recovery.entry_order_status_resolved",
+                            {
+                                "entry_id": entry_id,
+                                "venue": str(ven),
+                                "status": status.status,
+                            },
+                        )
+                        return
+                    elif status and getattr(status, "status", "") == "canceled":
+                        # Order was cancelled — resolve as terminal
+                        pending.uncertain_outcome = False
+                        pending.outcome = "canceled"
+                        self.journal.append(
+                            "recovery.entry_order_canceled",
+                            {"entry_id": entry_id, "venue": str(ven)},
+                        )
+                        return
+            except Exception:
+                continue
+
+    async def _recover_hydrate_from_live_positions(self, pending) -> bool:
+        """Try to hydrate pending entry from live exchange positions.
+
+        V1: hydrate_pending_entry_from_live_balanced_exposure() —
+        If both venues have position size > 0 (long) and < 0 (short),
+        and the balanced quantity exceeds current fill, apply fills.
+
+        V1 skips hydration when inflight_hedge is active (the hedge may
+        still fill). We approximate this by checking for an active hedge
+        order id with uncertain outcome.
+        """
+        # V1: skip hydration while hedge is inflight
+        if pending.uncertain_outcome and pending.hedge_order_id:
+            return False
+
+        try:
+            long_adapter = self.get_venue_adapter(pending.long_venue)
+            short_adapter = self.get_venue_adapter(pending.short_venue)
+            if long_adapter is None or short_adapter is None:
+                return False
+
+            long_pos = await long_adapter.fetch_position(pending.symbol)
+            short_pos = await short_adapter.fetch_position(pending.symbol)
+
+            # V1: need long position > 0 and short position < 0 for balanced exposure
+            if long_pos.quantity <= 1e-9 or short_pos.quantity >= -1e-9:
+                return False
+
+            live_balanced = min(abs(long_pos.quantity), abs(short_pos.quantity))
+            current_balanced = min(pending.maker_leg_filled, pending.hedge_leg_filled)
+            if live_balanced <= current_balanced + 1e-9:
+                return False
+
+            # Apply recovered fills
+            long_delta = min(live_balanced, abs(long_pos.quantity)) - pending.maker_leg_filled
+            short_delta = min(live_balanced, abs(short_pos.quantity)) - pending.hedge_leg_filled
+            if long_delta > 1e-9:
+                pending.maker_leg_filled += long_delta
+            if short_delta > 1e-9:
+                pending.hedge_leg_filled += short_delta
+
+            # If both legs now filled, mark as resolved
+            if pending.maker_completed() and pending.missing_hedge_quantity() <= 1e-9:
+                pending.uncertain_outcome = False
+                pending.outcome = "filled"
+
+            return True
+        except Exception:
+            return False
+
+    def _try_consume_maker_venue_budget(
+        self, venue, now_ms: int
+    ) -> bool:
+        """Check and consume maker venue request budget for a cancel/submit op.
+
+        V1: try_consume_maker_venue_request_budget (entry_sync.rs:2410-2431)
+        Uses sliding-window budget: max_ops per window_ms, submit costs 2.
+        Returns True if the operation is allowed (budget consumed).
+
+        During recovery, operations are rare (one cancel per stuck entry),
+        but the budget prevents accidental tight-loop retries.
+        """
+        strategy = self.config.strategy
+        window_ms = strategy.maker_venue_budget_window_ms
+        max_ops = strategy.maker_venue_budget_max_ops
+        cost = strategy.maker_venue_submit_cost  # cancel uses submit cost
+
+        venue_key = str(venue) if hasattr(venue, "value") else str(venue)
+        history = self._maker_venue_op_history.setdefault(venue_key, [])
+
+        # Prune expired timestamps
+        cutoff = now_ms - window_ms
+        history[:] = [ts for ts in history if ts > cutoff]
+
+        # V1: check if budget remaining allows this operation
+        current_ops = sum(1 for _ in history)
+        if current_ops + cost > max_ops:
+            return False
+
+        # Consume budget: record this operation
+        history.append(now_ms)
+        return True
+
+    async def _recover_cancel_maker_order(
+        self, pending, entry_id: str, reason: str
+    ) -> bool:
+        """Attempt to cancel the maker order before abort.
+
+        V1: cancel_pending_entry_passive_order (entry_sync.rs:2401-2445) —
+        1. Returns false if maker already completed or cancel already requested
+        2. Checks make_venue_request_budget (rate-limit gate)
+        3. If budget exhausted → sets backoff, returns false
+        4. Issues cancel_order on the maker venue adapter
+        5. Returns true if cancel was successfully issued
+        """
+        if pending.maker_completed():
+            return False
+
+        maker_venue = pending.long_venue
+        adapter = self.get_venue_adapter(maker_venue)
+        if adapter is None:
+            return False
+
+        if not pending.maker_order_id:
+            return False
+
+        if getattr(pending, "_cancel_requested", False):
+            return False
+
+        # V1: check maker venue request budget before issuing cancel
+        now_ms = wall_clock_now_ms()
+        if not self._try_consume_maker_venue_budget(maker_venue, now_ms):
+            # Budget exhausted — delay and retry later
+            pending.next_progress_poll_ms = (
+                now_ms + self.config.strategy.maker_venue_budget_window_ms
+            )
+            self.journal.append(
+                "recovery.maker_cancel_budget_delayed",
+                {"entry_id": entry_id, "venue": str(maker_venue),
+                 "reason": reason, "next_poll_ms": pending.next_progress_poll_ms},
+            )
+            return False
+
+        try:
+            from lightfee.core.domain import OrderRequest
+            cancel_req = OrderRequest(
+                venue=maker_venue,
+                symbol=pending.symbol,
+                side=pending.long_side,
+                quantity=pending.target_quantity,
+                price=0.0,
+                order_id=pending.maker_order_id,
+                client_order_id=pending.maker_client_order_id or "",
+            )
+            await adapter.cancel_order(cancel_req)
+            pending._cancel_requested = True
+            pending.reconcile_next_attempt_ms = (
+                now_ms + self._RECONCILE_RETRY_BASE_MS
+            )
+            self.journal.append(
+                "recovery.maker_cancel_requested",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": str(maker_venue),
+                    "maker_order_id": pending.maker_order_id,
+                    "reason": reason,
+                },
+            )
+            return True
+        except Exception as e:
+            if not pending.has_any_fill():
+                self.journal.append(
+                    "recovery.maker_cancel_failed_assumed_terminal",
+                    {"entry_id": entry_id, "symbol": pending.symbol,
+                     "error": str(e), "action": "abort_without_fail_closed"},
+                )
+                return False
+            from lightfee.engine.lifecycle import enter_fail_closed
+            enter_fail_closed(self.state)
+            self.state.last_error = (
+                f"pending_entry_lifetime_cancel_failed:{entry_id}: {e}"
+            )
+            self.journal.append(
+                "recovery.maker_cancel_failed_fail_closed",
+                {"entry_id": entry_id, "symbol": pending.symbol,
+                 "error": str(e), "reason": reason},
+            )
+            return False
+
+    async def _recover_try_taker_fallback(
+        self, pending, entry_id: str, reason: str
+    ) -> bool:
+        """V1: try_terminal_taker_fallback() — taker order for zero-fill entries.
+
+        Requires MarketView for tradeability check. Not available during
+        recovery without a snapshot. Returns False → caller proceeds to abort.
+        """
+        return False
+
+    async def _recover_drive_missing_hedge(self, pending, reason: str) -> bool:
+        """Submit a hedge order for the missing quantity.
+
+        V1: hedge_pending_entry_delta() —
+        1. Normalize quantity via adapter.normalize_quantity (exchange lot size)
+        2. Use maker fill price as hedge price hint (better than pure market)
+        3. Submit order; gate only on FAIL_CLOSED (recovery lifecycle is RECONCILING)
+        """
+        hedge_venue = pending.short_venue
+        adapter = self.get_venue_adapter(hedge_venue)
+        if adapter is None:
+            return False
+
+        missing = pending.missing_hedge_quantity()
+        if missing <= 1e-9:
+            return False
+
+        if self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED:
+            self._try_journal(
+                "recovery.hedge_blocked_fail_closed",
+                {"entry_id": pending.pending_id, "reason": reason},
+            )
+            return False
+
+        try:
+            from lightfee.core.domain import OrderRequest
+
+            # V1: normalize to exchange lot size
+            normalized = missing
+            if hasattr(adapter, "normalize_quantity"):
+                normalized = await adapter.normalize_quantity(pending.symbol, missing)
+
+            if normalized <= 1e-9:
+                self.journal.append(
+                    "recovery.hedge_quantity_below_min_notional",
+                    {"entry_id": pending.pending_id, "symbol": pending.symbol,
+                     "raw_quantity": missing, "normalized_quantity": normalized},
+                )
+                return False
+
+            # V1: use maker fill price as hedge price hint
+            hedge_price = pending.maker_price if pending.maker_price > 0 else 0.0
+
+            req = OrderRequest(
+                venue=hedge_venue,
+                symbol=pending.symbol,
+                side=pending.short_side,
+                quantity=normalized,
+                price=hedge_price,
+                post_only=False,
+                reduce_only=False,
+                client_order_id=f"{pending.pending_id}-recovery-hedge",
+            )
+            fill = await adapter.place_order(req)
+            if fill.quantity > 0:
+                pending.hedge_leg_filled += fill.quantity
+                pending.hedge_order_id = fill.order_id
+                if pending.missing_hedge_quantity() <= 1e-9:
+                    pending.uncertain_outcome = False
+                    pending.outcome = "filled"
+                return True
+            return False
+        except Exception as e:
+            self.journal.append(
+                "recovery.hedge_submit_error",
+                {"entry_id": pending.pending_id, "symbol": pending.symbol,
+                 "error": str(e), "reason": reason},
+            )
+            return False
+
+    def _finalize_startup_recovery(self) -> None:
+        """Transition lifecycle after startup recovery per V1 semantics.
+
+        V1: finalize_startup_position_recovery() lifecycle transitions:
+        - No open positions, no pending entries, no pending work → RUNNING
+        - Has pending entries but no open positions → RISK_ONLY with blocked reason
+        - Has open positions → RUNNING (normal, positions are managed)
+        """
+        from lightfee.engine.lifecycle import enter_fail_closed
+
+        has_opens = len(self.state.open_positions) > 0
+        has_pending = len(self.state.pending_entries) > 0
+        has_pending_closes = len(self.state.pending_closes) > 0
+        has_passive_closes = len(self.state.pending_passive_closes) > 0
+
+        if not has_opens and not has_pending and not has_pending_closes and not has_passive_closes:
+            # All clear — transition to RUNNING
+            from lightfee.engine.lifecycle import transition_to_running
+            transition_to_running(self.state)
+            self.state.last_error = None
+            self._try_journal("runtime.running",
+                {"reason": "startup_recovery_completed", "ts_ms": wall_clock_now_ms()})
+            return
+
+        if has_opens:
+            # Has open positions — normal operation
+            max_positions = self.config.strategy.max_concurrent_positions
+            if len(self.state.open_positions) > max_positions:
+                enter_fail_closed(self.state)
+                self.state.last_error = "open_positions_exceed_configured_max"
+                self._try_journal("recovery.blocked", {
+                    "reason": "open_positions_exceed_configured_max",
+                    "open_positions": len(self.state.open_positions),
+                    "max": max_positions,
+                })
+            else:
+                from lightfee.engine.lifecycle import transition_to_running
+                transition_to_running(self.state)
+                self.state.last_error = None
+                self._try_journal("runtime.running", {
+                    "reason": "startup_recovery_completed_with_positions",
+                    "open_positions": len(self.state.open_positions),
+                    "ts_ms": wall_clock_now_ms(),
+                })
+            return
+
+        # No open positions but has pending work → RISK_ONLY
+        if has_pending or has_pending_closes or has_passive_closes:
+            blocked_reason = (
+                "startup_recovery_pending_work_without_open_positions"
+            )
+            self.state.recovery_blocked_reason = blocked_reason
+            self.state.recovery_blocked_at_ms = wall_clock_now_ms()
+            self.state.last_error = (
+                f"startup recovery blocked: pending_entries={len(self.state.pending_entries)}, "
+                f"pending_closes={len(self.state.pending_closes)}, "
+                f"pending_passive_closes={len(self.state.pending_passive_closes)}"
+            )
+            set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+            self._try_journal("recovery.blocked", {
+                "reason": blocked_reason,
+                "pending_entries": list(self.state.pending_entries.keys()),
+                "ts_ms": wall_clock_now_ms(),
+            })
+
+    def _try_journal(self, kind: str, payload: dict) -> None:
+        """Append to journal if open; temporarily open if not (for recovery diagnostics)."""
+        try:
+            self.journal.append(kind, payload)
+        except RuntimeError:
+            # Journal not open — temporarily open for this event
+            try:
+                self.journal.open()
+                self.journal.append(kind, payload)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.journal.close()
+                except Exception:
+                    pass
 
     async def _recover_residual_repairs(self, now_ms: int) -> None:
         """Process pending residual repair tasks after startup recovery.

@@ -19,6 +19,7 @@ class BlockReason(Enum):
     EXPECTED_EDGE_BELOW_FLOOR = "expected_edge_below_floor"
     WORST_CASE_EDGE_BELOW_FLOOR = "worst_case_edge_below_floor"
     TRANSFER_UNAVAILABLE = "transfer_unavailable"
+    MISSING_CANDIDATE_IDENTITY = "missing_candidate_identity_or_funding_timestamp"
 
 
 def discover_tradeable_candidates(
@@ -26,14 +27,27 @@ def discover_tradeable_candidates(
     config: StrategyConfig,
     now_ms: int,
 ) -> list[CandidateInput]:
-    """Filter and rank candidates through strategy gates. Returns tradeable list."""
+    """Filter and rank candidates through strategy gates. Returns tradeable list.
+
+    Block reasons are annotated onto the candidate's blocked_reasons list
+    so that callers and tests can distinguish why a candidate was rejected
+    (V1 parity: reasons must not be silently swallowed).
+    """
     passed: list[tuple[CandidateInput, list[BlockReason]]] = []
 
     for c in candidates:
         if c.blocked:
+            # Pre-blocked candidates: mark with existing blocked_reasons
+            # but also check if it's the missing-identity case
+            if "missing_candidate_identity_or_funding_timestamp" in c.blocked_reasons:
+                continue
             continue
 
         reasons: list[BlockReason] = []
+
+        # V1 parity: check for missing identity fields before other gates
+        if c.first_funding_timestamp_ms <= 0:
+            reasons.append(BlockReason.MISSING_CANDIDATE_IDENTITY)
 
         # Funding edge floor
         if c.funding_edge_bps < config.min_funding_edge_bps:
@@ -52,6 +66,8 @@ def discover_tradeable_candidates(
             reasons.append(BlockReason.ZERO_ORDER_SIZE)
 
         if reasons:
+            # Annotate candidate with rejection reasons so tests/logs can inspect
+            c.blocked_reasons = list(c.blocked_reasons) + [r.value for r in reasons]
             continue
 
         passed.append((c, []))

@@ -148,7 +148,7 @@ class StrategyConfig:
     entry_sizing_mode: str = "fixed_notional"
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
-    entry_local_l2_primary_count: int = 8
+    entry_local_l2_primary_count: int = 6  # V1 default (V2 was 8 — misaligned)
     maker_entry_max_reposts: int = 2
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False
@@ -187,6 +187,8 @@ class StrategyConfig:
     pending_entry_phase_zero_fill_budget: int = 2
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
+    pending_entry_zero_fill_terminal_cooldown_ms: int = 30000  # V1 default (CONTRACT RECOVERY-004)
+    local_l2_max_age_ms: int = 1000  # V1 default for local-L2 book readiness (was missing)
     local_l2_bootstrap_batch_size: int = 4
     local_l2_bootstrap_jitter_ms: int = 250
     local_l2_bootstrap_retry_backoff_ms: int = 5000
@@ -205,11 +207,11 @@ class StrategyConfig:
     local_l2_enabled: bool = True
     local_l2_ws_enabled: bool = True  # WS L2 delta streaming
     bybit_local_l2_depth: int = 50
-    local_l2_short_prewarm_enabled: bool = True
+    local_l2_short_prewarm_enabled: bool = False  # V1 default (V2 was True — misaligned)
     local_l2_short_prewarm_window_secs: int = 900
-    local_l2_short_prewarm_max_pairs: int = 3
-    local_l2_short_prewarm_max_rank: int = 3
-    local_l2_scan_assignment_lease_enabled: bool = True
+    local_l2_short_prewarm_max_pairs: int = 1  # V1 default (V2 was 3 — misaligned)
+    local_l2_short_prewarm_max_rank: int = 1  # V1 default (V2 was 3 — misaligned)
+    local_l2_scan_assignment_lease_enabled: bool = False  # V1 default (V2 was True — misaligned)
     local_l2_scan_assignment_lease_ttl_secs: int = 90
     entry_final_gate_max_skew_ms: int = 250
     passive_unavailable_fallback_enabled: bool = False

@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Deploy manifest integrity verification.
+
+Ensures that .deploy_version hash matches the actual deployed files,
+preventing the "deploy says X but code is Y" bug seen on cloud.
+
+Usage:
+  python scripts/verify_deploy_manifest.py [--local] [--remote root@host]
+  python scripts/verify_deploy_manifest.py --check /opt/lightfee-v2
+
+V1 parity: deployment MUST sync all git-tracked files and verify key
+runtime files match. Not doing so caused the cloud incident where
+.deploy_version=4974d9b but runtime.py/snapshot.py hashes didn't match.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# --- Files that MUST match between local and remote ---
+# These are the files that were mismatched on the cloud deployment.
+CRITICAL_FILES = [
+    "lightfee/engine/runtime.py",
+    "lightfee/engine/recovery.py",
+    "lightfee/engine/entry_sync.py",
+    "lightfee/engine/state.py",
+    "lightfee/sidecar/snapshot.py",
+    "lightfee/sidecar/publisher.py",
+    "lightfee/sidecar/v1_compat.py",
+    "lightfee/config/schema.py",
+    "lightfee/engine/lifecycle.py",
+]
+
+# --- Files/dirs to exclude from sync ---
+EXCLUDE_PATTERNS = [
+    ".venv",
+    "__pycache__",
+    "*.pyc",
+    ".git",
+    "config/live.toml",       # local secrets
+    "config/*.local.toml",    # local secrets
+    "runtime/",               # runtime output
+    "logs/",
+    ".env",
+    "*.log",
+    ".DS_Store",
+    ".claude/",
+    "docs/",                  # docs not needed on server
+]
+
+
+def repo_root() -> Path:
+    """Find the git repo root."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent,
+    )
+    if result.returncode != 0:
+        print("ERROR: not in a git repository", file=sys.stderr)
+        sys.exit(1)
+    return Path(result.stdout.strip())
+
+
+def git_tracked_files(root: Path) -> list[str]:
+    """List all git-tracked files (relative paths)."""
+    result = subprocess.run(
+        ["git", "ls-files"],
+        capture_output=True, text=True, cwd=root,
+    )
+    if result.returncode != 0:
+        print("ERROR: git ls-files failed", file=sys.stderr)
+        sys.exit(1)
+    return [f for f in result.stdout.strip().split("\n") if f]
+
+
+def should_exclude(path: str) -> bool:
+    """Check if a path matches any exclude pattern."""
+    import fnmatch
+    for pattern in EXCLUDE_PATTERNS:
+        if fnmatch.fnmatch(path, pattern) or path.startswith(pattern.rstrip("/").rstrip("*")):
+            return True
+        # Also match any path component
+        parts = path.split("/")
+        for part in parts:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+    return False
+
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_manifest(root: Path) -> dict[str, str]:
+    """Build {relpath: sha256} manifest for all deployable files."""
+    all_files = git_tracked_files(root)
+    manifest = {}
+    for f in all_files:
+        if should_exclude(f):
+            continue
+        fpath = root / f
+        if fpath.is_file():
+            manifest[f] = sha256_file(fpath)
+    return manifest
+
+
+def check_critical_files(manifest: dict[str, str]) -> list[str]:
+    """Verify all CRITICAL_FILES are in the manifest."""
+    missing = []
+    for f in CRITICAL_FILES:
+        if f not in manifest:
+            missing.append(f)
+    return missing
+
+
+def verify_remote_manifest(remote_host: str, remote_path: str, local_manifest: dict[str, str]) -> bool:
+    """SSH to remote and verify sha256 of critical files match local."""
+    all_ok = True
+    for f in CRITICAL_FILES:
+        local_hash = local_manifest.get(f)
+        if local_hash is None:
+            print(f"  SKIP {f}: not in local manifest")
+            continue
+
+        remote_file = f"{remote_path}/{f}"
+        cmd = f"sha256sum {remote_file} 2>/dev/null | cut -d' ' -f1"
+        result = subprocess.run(
+            ["ssh", remote_host, cmd],
+            capture_output=True, text=True,
+        )
+        remote_hash = result.stdout.strip()
+
+        if not remote_hash:
+            print(f"  MISSING {f}: file not found on remote")
+            all_ok = False
+        elif remote_hash != local_hash:
+            print(f"  MISMATCH {f}:")
+            print(f"    local:  {local_hash}")
+            print(f"    remote: {remote_hash}")
+            all_ok = False
+        else:
+            print(f"  OK {f}")
+
+    return all_ok
+
+
+def read_deploy_version(remote_host: str, remote_path: str) -> str | None:
+    """Read .deploy_version from remote."""
+    cmd = f"cat {remote_path}/.deploy_version 2>/dev/null"
+    result = subprocess.run(
+        ["ssh", remote_host, cmd],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() or None
+
+
+def check_deploy_version_matches(remote_host: str, remote_path: str) -> bool:
+    """Verify .deploy_version on remote matches local HEAD."""
+    root = repo_root()
+    local_head = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, cwd=root,
+    ).stdout.strip()
+
+    remote_ver = read_deploy_version(remote_host, remote_path)
+    if remote_ver is None:
+        print("  WARN: .deploy_version not found on remote")
+        return False
+
+    if remote_ver != local_head:
+        print(f"  MISMATCH .deploy_version:")
+        print(f"    local:  {local_head}")
+        print(f"    remote: {remote_ver}")
+        return False
+
+    print(f"  OK .deploy_version: {remote_ver}")
+    return True
+
+
+def generate_deploy_script(root: Path, remote_host: str, remote_path: str) -> str:
+    """Generate a safe rsync deploy script that syncs all tracked files."""
+    manifest = build_manifest(root)
+    # Write manifest
+    manifest_path = root / ".deploy_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+
+    # Build rsync exclude args
+    exclude_args = []
+    for pat in EXCLUDE_PATTERNS:
+        exclude_args.extend(["--exclude", pat])
+    exclude_args.extend(["--exclude", ".deploy_manifest.json"])
+
+    head = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, cwd=root,
+    ).stdout.strip()
+
+    script = f"""#!/bin/bash
+# Auto-generated deploy script — syncs all git-tracked files to remote
+# Generated: {head}
+set -euo pipefail
+
+REMOTE="{remote_host}:{remote_path}"
+
+echo "=== Syncing files to $REMOTE ==="
+rsync -avz --delete {' '.join(exclude_args)} "{root}/" "$REMOTE/"
+
+echo "=== Writing .deploy_version ==="
+echo "{head}" | ssh {remote_host} "cat > {remote_path}/.deploy_version"
+
+echo "=== Verifying critical file hashes ==="
+python3 {remote_path}/scripts/verify_deploy_manifest.py --check {remote_path}
+
+echo "=== Deploy complete: {head} ==="
+"""
+    return script
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Deploy manifest integrity verification")
+    parser.add_argument("--local", action="store_true", help="Build and save local manifest")
+    parser.add_argument("--remote", type=str, help="SSH host (e.g., root@38.60.253.248)")
+    parser.add_argument("--path", type=str, default="/opt/lightfee-v2", help="Remote path")
+    parser.add_argument("--check", type=str, help="Verify manifest at given path (local)")
+    parser.add_argument("--generate-deploy", action="store_true", help="Generate deploy script")
+    args = parser.parse_args()
+
+    root = repo_root()
+
+    if args.local:
+        manifest = build_manifest(root)
+        manifest_path = root / ".deploy_manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        print(f"Manifest written: {manifest_path} ({len(manifest)} files)")
+        missing = check_critical_files(manifest)
+        if missing:
+            print(f"WARNING: critical files missing from manifest: {missing}")
+        else:
+            print("All critical files present in manifest")
+
+    elif args.check:
+        check_path = Path(args.check)
+        if not check_path.exists():
+            print(f"ERROR: path does not exist: {args.check}")
+            sys.exit(1)
+
+        # Load or build manifest
+        manifest_path = check_path / ".deploy_manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                expected = json.load(f)
+        else:
+            print("WARNING: no .deploy_manifest.json, building from local git")
+            expected = build_manifest(root)
+
+        print(f"Checking {len(CRITICAL_FILES)} critical files...")
+        all_ok = True
+        for f in CRITICAL_FILES:
+            fpath = check_path / f
+            if not fpath.exists():
+                print(f"  MISSING {f}")
+                all_ok = False
+                continue
+            actual = sha256_file(fpath)
+            expected_hash = expected.get(f)
+            if expected_hash is None:
+                print(f"  WARN {f}: not in manifest, hash={actual[:12]}...")
+            elif actual != expected_hash:
+                print(f"  MISMATCH {f}:")
+                print(f"    expected: {expected_hash}")
+                print(f"    actual:   {actual}")
+                all_ok = False
+            else:
+                print(f"  OK {f}")
+
+        if not all_ok:
+            print("\nFAIL: deployment manifest integrity check failed")
+            sys.exit(1)
+        print("\nPASS: all critical files verified")
+
+    elif args.remote:
+        print(f"Building local manifest...")
+        manifest = build_manifest(root)
+        print(f"Manifest: {len(manifest)} files")
+
+        print(f"\nChecking .deploy_version on {args.remote}...")
+        ver_ok = check_deploy_version_matches(args.remote, args.path)
+
+        print(f"\nVerifying critical files on {args.remote}:{args.path}...")
+        files_ok = verify_remote_manifest(args.remote, args.path, manifest)
+
+        if ver_ok and files_ok:
+            print("\nPASS: deployment integrity verified")
+        else:
+            print("\nFAIL: deployment integrity mismatch detected")
+            sys.exit(1)
+
+    elif args.generate_deploy:
+        script = generate_deploy_script(root, args.remote or "root@YOUR_HOST", args.path)
+        script_path = root / "scripts" / "deploy.sh"
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+        print(f"Deploy script written: {script_path}")
+        print("Review before running!")
+
+    else:
+        # Default: build manifest and check local
+        manifest = build_manifest(root)
+        print(f"Manifest: {len(manifest)} files")
+        missing = check_critical_files(manifest)
+        if missing:
+            print(f"WARNING: critical files missing from manifest: {missing}")
+            sys.exit(1)
+        print("All critical files present in manifest")
+        print("\nCritical file hashes:")
+        for f in CRITICAL_FILES:
+            print(f"  {manifest[f][:16]}  {f}")
+
+
+if __name__ == "__main__":
+    main()

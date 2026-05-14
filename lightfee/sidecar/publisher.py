@@ -105,6 +105,8 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "pair_id": c.pair_id,
                 "funding_timestamp_ms": c.funding_timestamp_ms,
                 "first_funding_timestamp_ms": c.first_funding_timestamp_ms,
+                "long_funding_timestamp_ms": c.long_funding_timestamp_ms,
+                "short_funding_timestamp_ms": c.short_funding_timestamp_ms,
             }
             for c in s.candidates
         ],
@@ -138,6 +140,10 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         snapshot quotes so the runtime can apply the prewarm gate correctly.
         If we cannot derive a usable timestamp, the candidate is marked
         blocked — it must not appear tradeable with first_funding_timestamp_ms=0.
+
+        Derivation order (V1 parity):
+        1. Raw candidate long_funding_timestamp_ms / short_funding_timestamp_ms
+        2. Snapshot quotes for long_venue:symbol and short_venue:symbol
         """
         pair_id = str(c.get("pair_id", "") or "")
         symbol = str(c.get("symbol", ""))
@@ -149,10 +155,27 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
 
         ff_ts = int(c.get("first_funding_timestamp_ms", 0) or 0)
         f_ts = int(c.get("funding_timestamp_ms", 0) or 0)
+        long_fts = int(c.get("long_funding_timestamp_ms", 0) or 0)
+        short_fts = int(c.get("short_funding_timestamp_ms", 0) or 0)
 
-        if ff_ts <= 0:
-            # Derive from quotes: min positive funding_timestamp_ms across
-            # long-venue:symbol and short-venue:symbol
+        # Derive long/short timestamps from quotes if missing in raw candidate
+        if long_fts <= 0 or short_fts <= 0:
+            for venue, target in [(long_ven, "long"), (short_ven, "short")]:
+                qkey = f"{venue}:{symbol}"
+                q = quotes_raw.get(qkey, {})
+                if isinstance(q, dict):
+                    qts = int(q.get("funding_timestamp_ms", 0) or 0)
+                    if qts > 0:
+                        if target == "long" and long_fts <= 0:
+                            long_fts = qts
+                        elif target == "short" and short_fts <= 0:
+                            short_fts = qts
+
+        # Derive first_funding_timestamp_ms from per-leg timestamps (V1: min(long, short))
+        if ff_ts <= 0 and long_fts > 0 and short_fts > 0:
+            ff_ts = min(long_fts, short_fts)
+        elif ff_ts <= 0:
+            # Fallback: derive from quotes
             ts_candidates: list[int] = []
             for venue in (long_ven, short_ven):
                 qkey = f"{venue}:{symbol}"
@@ -163,8 +186,13 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
                         ts_candidates.append(qts)
             if ts_candidates:
                 ff_ts = min(ts_candidates)
-                if f_ts <= 0:
-                    f_ts = ff_ts
+        if f_ts <= 0 and ff_ts > 0:
+            f_ts = ff_ts
+
+        # Compute second_funding_timestamp_ms (V1: max(long, short))
+        second_fts = 0
+        if long_fts > 0 and short_fts > 0:
+            second_fts = max(long_fts, short_fts)
 
         candidate = CandidateInput(**c)
         if pair_id:
@@ -173,6 +201,12 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
             candidate.first_funding_timestamp_ms = ff_ts
         if f_ts > 0:
             candidate.funding_timestamp_ms = f_ts
+        if long_fts > 0:
+            candidate.long_funding_timestamp_ms = long_fts
+        if short_fts > 0:
+            candidate.short_funding_timestamp_ms = short_fts
+        if second_fts > 0:
+            candidate.second_funding_timestamp_ms = second_fts
 
         # Fail-closed: candidates without usable funding timestamp are not tradeable.
         # V1 never emits a tradeable candidate with first_funding_timestamp_ms=0.

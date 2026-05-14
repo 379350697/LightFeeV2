@@ -104,6 +104,9 @@ class CandidateInput:
     pair_id: str = ""
     funding_timestamp_ms: int = 0
     first_funding_timestamp_ms: int = 0
+    long_funding_timestamp_ms: int = 0
+    short_funding_timestamp_ms: int = 0
+    second_funding_timestamp_ms: int = 0
 
 
 @dataclass

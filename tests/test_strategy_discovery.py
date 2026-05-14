@@ -89,6 +89,7 @@ class TestDiscovery:
                 funding_diff_bps=10.0, funding_edge_bps=10.0,
                 expected_edge_bps=5.0, worst_case_edge_bps=2.0,
                 ranking_edge_bps=2.5, entry_notional_quote=100.0,
+                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
             )
         ]
         result = discover_tradeable_candidates(candidates, config, 0)
@@ -102,12 +103,14 @@ class TestDiscovery:
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=2.0,
                 entry_notional_quote=100.0,
+                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
             ),
             CandidateInput(
                 long_venue="a", short_venue="c", symbol="X",
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
                 entry_notional_quote=100.0,
+                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
             ),
         ]
         result = discover_tradeable_candidates(candidates, config, 0)

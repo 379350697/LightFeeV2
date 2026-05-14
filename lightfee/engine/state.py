@@ -135,6 +135,52 @@ class PendingEntry:
     # --- V1 zero-fill terminal cooldown ---
     zero_fill_since_ms: int = 0
 
+    # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
+
+    def missing_hedge_quantity(self) -> float:
+        """Quantity still needed on the hedge leg.
+
+        V1: PendingEntryHedge.missing_hedge_quantity() — the gap between
+        what the maker leg has filled and what the hedge leg has filled,
+        capped by the balanced (matched) quantity.
+        """
+        balanced = min(self.maker_leg_filled, self.target_quantity)
+        return max(0.0, balanced - self.hedge_leg_filled)
+
+    def maker_completed(self) -> bool:
+        """Whether the maker leg is fully filled.
+
+        V1: PendingEntryHedge.maker_completed() — maker leg fill >= target.
+        """
+        return self.maker_leg_filled >= self.target_quantity - 1e-9
+
+    def has_any_fill(self) -> bool:
+        """Whether any leg has any fill quantity."""
+        return self.maker_leg_filled > 1e-9 or self.hedge_leg_filled > 1e-9
+
+    def startup_recovery_ready(self) -> bool:
+        """Whether this pending entry is ready for startup recovery.
+
+        V1: PendingEntryHedge.startup_recovery_ready() —
+        true when inflight_hedge exists, cancel is requested, maker is completed,
+        or hedge quantity is missing > 1e-9.
+
+        In V2, inflight_hedge maps to uncertain_outcome (an uncertain submit
+        implies an order may still be in-flight). Maker completion and missing
+        hedge are computed from local fill quantities.
+        """
+        return (
+            self.uncertain_outcome
+            or self.maker_completed()
+            or self.missing_hedge_quantity() > 1e-9
+        )
+
+    def compute_lifetime_ms(self, now_ms: int) -> int:
+        """Compute the lifetime of this pending entry in milliseconds."""
+        if self.created_at_ms <= 0:
+            return 0
+        return max(0, now_ms - self.created_at_ms)
+
 
 # ---------------------------------------------------------------------------
 # Passive close state (V1 PendingPassiveClose parity)

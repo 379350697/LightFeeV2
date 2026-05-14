@@ -97,10 +97,35 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
     """
     edge = float(raw.get("funding_edge_bps", 0.0))
     penalty = float(raw.get("quality_penalty_bps", 0.0))
+    symbol = raw.get("symbol", "")
+    long_venue = raw.get("long_venue", "")
+    short_venue = raw.get("short_venue", "")
+
+    # --- V1 parity: derive candidate identity from raw fields (CONTRACT OPP-002) ---
+    # V1: pair_id = {symbol.lower()}:{long_venue}->{short_venue}
+    # V1: first_funding_timestamp_ms = min(long_funding_timestamp_ms, short_funding_timestamp_ms)
+    pair_id = raw.get("pair_id", "") or ""
+    if not pair_id and symbol and long_venue and short_venue:
+        pair_id = f"{symbol.lower()}:{long_venue}->{short_venue}"
+
+    long_fts = int(raw.get("long_funding_timestamp_ms", 0) or 0)
+    short_fts = int(raw.get("short_funding_timestamp_ms", 0) or 0)
+    ff_ts = int(raw.get("first_funding_timestamp_ms", 0) or 0)
+    f_ts = int(raw.get("funding_timestamp_ms", 0) or 0)
+
+    # Derive first_funding_timestamp_ms from per-leg timestamps when missing.
+    # V1: build_candidate_from_precomputed_pair always computes min/max from
+    # the paired funding timestamps. Schema-1 Rust sidecar may omit the
+    # pre-computed field, but the raw leg timestamps are always present.
+    if ff_ts <= 0 and long_fts > 0 and short_fts > 0:
+        ff_ts = min(long_fts, short_fts)
+    if f_ts <= 0 and ff_ts > 0:
+        f_ts = ff_ts
+
     return {
-        "long_venue": raw.get("long_venue", ""),
-        "short_venue": raw.get("short_venue", ""),
-        "symbol": raw.get("symbol", ""),
+        "long_venue": long_venue,
+        "short_venue": short_venue,
+        "symbol": symbol,
         "funding_diff_bps": edge,  # V1 only emits edge, no separate diff field
         "funding_edge_bps": edge,
         "expected_edge_bps": edge - penalty,
@@ -114,9 +139,12 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         "short_venue_index": 0,
         "entry_notional_quote": 50.0,  # V1 fixed_live_entry_notional_quote — DELETE with this file
         # V1 parity: preserve candidate identity + prewarm fields
-        "pair_id": raw.get("pair_id", ""),
-        "funding_timestamp_ms": int(raw.get("funding_timestamp_ms", 0)),
-        "first_funding_timestamp_ms": int(raw.get("first_funding_timestamp_ms", 0)),
+        "pair_id": pair_id,
+        "funding_timestamp_ms": f_ts,
+        "first_funding_timestamp_ms": ff_ts,
+        "long_funding_timestamp_ms": long_fts,
+        "short_funding_timestamp_ms": short_fts,
+        "second_funding_timestamp_ms": max(long_fts, short_fts) if long_fts > 0 and short_fts > 0 else 0,
     }
 
 
