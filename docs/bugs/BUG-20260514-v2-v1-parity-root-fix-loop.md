@@ -1,20 +1,20 @@
 # BUG-20260514-v2-v1-parity-root-fix-loop
 
-Status: fixed; all P1/P2 residual closed
+Status: fixed; all P1/P2 residual closed (index-detail now consistent)
 Severity: high
-Component: `entry-local-l2`, `sidecar-candidate-contract`, `order-reconciliation`, `bitget-l2-metadata`, `dryrun-audit`, `test-coverage`
+Component: `entry-local-l2`, `sidecar-candidate-contract`, `order-reconciliation`, `bitget-l2-metadata`, `dryrun-audit`, `test-coverage`, `bybit-execution-side`, `bitget-quantity-fallback`
 Fingerprint: `v2.v1-parity.surface-copy.not-data-contract + fake-tests.green.real-path-red`
 First Seen: 2026-05-14 +08:00 during V2 cloud/runtime log review and follow-up parity validation
 First Seen Commit: `72ae905` was the first reviewed "root-fix" commit that still showed real-path gaps
 Related Refactor: `V1-to-V2 execution and venue parity replication`
-Fixed In: `eb9f793` (partial); working tree 2026-05-14 (full closure)
-Verified In: local probes and tests on 2026-05-14 against working tree
+Fixed In: `eb9f793` (partial); `c378352` (claimed closure but missing Bitget fillQty/size and Bybit fail-closed side); working tree 2026-05-14 (full closure)
+Verified In: local RED→GREEN tests and full suite on 2026-05-14 against working tree
 
 ## Summary
 
 The V2 root-fix loop repeatedly produced green tests while real runtime paths still diverged from V1. The core problem was not that V1 behavior was wrong; the repeated failures came from copying visible V1 concepts without fully copying the V1 data contracts, adapter call chains, and failure semantics.
 
-The latest commit `eb9f793` closes several major gaps, but the record remains open because Bybit reconciliation still has P1 semantic gaps and old/external V2 snapshots can still produce candidates without usable local-L2 prewarm fields.
+The chain is now closed in the working tree after `c378352`: schema-v2 candidate ingestion derives required identity/timing fields or fails closed, Bybit reconciliation side/retCode semantics are fail-closed, Bitget reconciliation covers the V1 quantity fallback fields, and the bug ledger index/detail status is consistent.
 
 ## Symptoms
 
@@ -38,24 +38,24 @@ The latest commit `eb9f793` closes several major gaps, but the record remains op
 
 | Area | V1 Behavior | V1 Source | V2 Gap Found |
 |---|---|---|---|
-| Candidate identity | Candidate has stable `pair_id` used across tracked opportunities, sessions, and final gate. | `src/execution_core/entry_local_l2.rs`, `src/execution_core/market_data.rs` | V2 `CandidateInput` originally had no `pair_id`; blocker used missing fields. |
-| Local-L2 prewarm | Prewarm uses `remaining_ms = first_funding_timestamp_ms - now_ms`; candidate must be inside configured prewarm window. | `src/execution_core/market_data.rs:1518` | V2 used `created_at_ms`, then later only checked a timestamp field that real candidates did not have. |
-| Primary/dual-ready gate | Candidate must be primary tracked and have dual-ready entry-local-L2 session. | `src/execution_core/market_data.rs:1681`, `src/execution_core/entry_local_l2_sessions.rs` | V2 first bypassed early selection; later added primary/session logic but data contract was incomplete. |
-| Bybit reconciliation | Resolve order by `orderLinkId` when needed, then query `/v5/execution/list`, aggregate actual executions, and return None if total quantity is zero. | `src/live/bybit.rs:2820` | V2 first added unused status API; then parser lacked import and swallowed exceptions; latest fix aggregates but still hardcodes side and ignores Bybit nonzero retCode. |
-| Bitget reconciliation | Query order detail by `orderId` or `clientOid`; return reconciliation only when filled quantity is positive. | `src/live/bitget.rs:2912` | V2 parser originally returned None due missing import/swallowed exception; latest fix mostly closes this. |
-| Bitget L2 metadata guard | Load symbol metadata before orderbook; reject locally if metadata missing. | `src/live/bitget.rs` `symbol_meta`, `bitget_fetch_execution_liquidity_snapshot` | V2 transport guard only worked after metadata was already populated; adapter did not own the catalog guard. |
-| Journal/audit format | V2 journal canonical fields are `kind` and `payload`. | `lightfee/persistence/journal.py` in V2 | Audit script read only `event` and `data`. |
+| Candidate identity | Candidate has stable `pair_id` used across tracked opportunities, sessions, and final gate. | `src/execution_core/entry_local_l2.rs`, `src/execution_core/market_data.rs` | Closed: `CandidateInput.pair_id` exists and schema-v2 ingestion derives it from `symbol/long_venue/short_venue` when missing. |
+| Local-L2 prewarm | Prewarm uses `remaining_ms = first_funding_timestamp_ms - now_ms`; candidate must be inside configured prewarm window. | `src/execution_core/market_data.rs:1518` | Closed: runtime uses `first_funding_timestamp_ms`; schema-v2 ingestion derives it from quotes or blocks the candidate fail-closed. |
+| Primary/dual-ready gate | Candidate must be primary tracked and have dual-ready entry-local-L2 session. | `src/execution_core/market_data.rs:1681`, `src/execution_core/entry_local_l2_sessions.rs` | Closed: tracked primary ids and entry-local-L2 session runtime are exercised by real `CandidateInput` tests. |
+| Bybit reconciliation | Resolve order by `orderLinkId` when needed, then query `/v5/execution/list`, aggregate actual executions, and return None if total quantity is zero. | `src/live/bybit.rs:2820` | Closed: V2 resolves order id, checks retCode, aggregates executions, accepts only `Buy/Sell`, and raises `REQUEST_REJECTED` on invalid/missing side with positive quantity. |
+| Bitget reconciliation | Query order detail by `orderId` or `clientOid`; return reconciliation only when filled quantity is positive. | `src/live/bitget.rs:2912` | Closed: V2 returns only positive fills and covers `cumExecQty/baseVolume/filledQty/fillQty/filled_amount/size/fillSz`. |
+| Bitget L2 metadata guard | Load symbol metadata before orderbook; reject locally if metadata missing. | `src/live/bitget.rs` `symbol_meta`, `bitget_fetch_execution_liquidity_snapshot` | Closed: unsupported symbols are rejected before orderbook requests. |
+| Journal/audit format | V2 journal canonical fields are `kind` and `payload`. | `lightfee/persistence/journal.py` in V2 | Closed: audit reader supports `kind/event`, `payload/data`, and time-window filtering. |
 
 ## V1 to V2 Mapping
 
 | V1 Concept | V2 Mapping | Current Status | Notes |
 |---|---|---|---|
-| `CandidateOpportunity.pair_id` | `CandidateInput.pair_id`, `make_candidate_pair_id()` | partially fixed | Pairing and V1 compat now preserve/fill; old V2 snapshots missing the field remain weak. |
-| `CandidateOpportunity.first_funding_timestamp_ms` | `CandidateInput.first_funding_timestamp_ms` | partially fixed | Pairing and V1 compat now fill; `_dict_to_snapshot()` does not derive it from quotes if absent. |
-| `candidate_in_entry_local_l2_prewarm_window()` | `LiveRuntime._entry_local_l2_selection_blocker()` | partially fixed | Runtime uses remaining-ms window now. |
-| tracked primary opportunities | `LiveRuntime._tracked_primary_pair_ids` and `EntryLocalL2SessionRuntime` | mostly fixed | Selection/session path now exists. |
-| Bybit `fetch_order_fill_reconciliation()` | `BybitAdapter.fetch_order_fill_reconciliation()` → `VenueTransport.fetch_order_status()` → `_fetch_order_status_bybit()` | partially fixed | Real HTTP path now returns fills; side and retCode semantics still open. |
-| Bitget `fetch_order_fill_reconciliation()` | `BitgetAdapter.fetch_order_fill_reconciliation()` → `VenueTransport.fetch_order_status()` → `_parse_order_status_bitget()` | mostly fixed | Quantity-positive guard and multi-key fallback added. |
+| `CandidateOpportunity.pair_id` | `CandidateInput.pair_id`, `make_candidate_pair_id()`, `_dict_to_snapshot()` enrichment | fixed | Pairing/V1 compat preserve it; schema-v2 ingestion derives stable `symbol:long->short` when absent. |
+| `CandidateOpportunity.first_funding_timestamp_ms` | `CandidateInput.first_funding_timestamp_ms`, `_dict_to_snapshot()` quote-derived enrichment | fixed | Pairing/V1 compat fill it; schema-v2 ingestion derives min positive quote funding timestamp or blocks fail-closed. |
+| `candidate_in_entry_local_l2_prewarm_window()` | `LiveRuntime._entry_local_l2_selection_blocker()` | fixed | Runtime uses V1-style `remaining_ms = first_funding_timestamp_ms - now_ms`. |
+| tracked primary opportunities | `LiveRuntime._tracked_primary_pair_ids` and `EntryLocalL2SessionRuntime` | fixed | Selection/session path exists and is covered by real `CandidateInput` tests. |
+| Bybit `fetch_order_fill_reconciliation()` | `BybitAdapter.fetch_order_fill_reconciliation()` → `VenueTransport.fetch_order_status()` → `_fetch_order_status_bybit()` | fixed | Real HTTP path returns fills, checks retCode, maps 110001 to None, raises other nonzero retCodes, and side parsing is fail-closed. |
+| Bitget `fetch_order_fill_reconciliation()` | `BitgetAdapter.fetch_order_fill_reconciliation()` → `VenueTransport.fetch_order_status()` → `_parse_order_status_bitget()` | fixed | Positive-quantity guard and all V1/V2 quantity fallback fields are covered by single-field regression tests. |
 | Bitget symbol metadata | `BitgetAdapter.fetch_l2_snapshot()` + transport metadata guard | fixed locally | Verified unsupported symbols do not call orderbook. |
 | V2 audit journal reader | `scripts/lightfee_v2_live_dryrun_audit.py` | fixed locally | Supports `kind/event`, `payload/data`, and `ts_ms` window filtering. |
 
@@ -97,6 +97,15 @@ The dry-run audit script existed as an untracked script and used the wrong field
 | 2026-05-14 | local | Probe after `eb9f793` | Bybit execution with `side=Sell` still returned reconciliation `side=buy`. |
 | 2026-05-14 | local | Probe after `eb9f793` | Bybit `retCode=10001` returned `None` from parser instead of surfacing a business error. |
 | 2026-05-14 | local | Probe after `eb9f793` | V2 schema-2 snapshot candidate without new fields loaded with `pair_id=''` and `first_funding_timestamp_ms=0`, then prewarm-blocked. |
+| 2026-05-14 | local | RED tests post-`c378352` | Bitget `fillQty`-only response returned `None` (not in fallback chain). |
+| 2026-05-14 | local | RED tests post-`c378352` | Bitget `size`-only response returned `None` (not in fallback chain). |
+| 2026-05-14 | local | RED tests post-`c378352` | Bitget `filled_amount`-only response returned `None` (not in fallback chain). |
+| 2026-05-14 | local | RED tests post-`c378352` | Bybit execution `side=Hold` did not raise; silently treated as SELL. |
+| 2026-05-14 | local | RED tests post-`c378352` | Bybit execution `side=buy` (lowercase) did not raise; silently treated as SELL. |
+| 2026-05-14 | local | RED tests post-`c378352` | Bybit order status `side` missing did not raise; defaulted to "Buy". |
+| 2026-05-14 | local | RED tests post-`c378352` | Bybit order status `side=Hold` did not raise; silently treated as SELL. |
+| 2026-05-14 | local | Manual audit post-`c378352` | BUG_INDEX: "partially fixed; residual open" vs BUG doc: "fixed; all closed". |
+| 2026-05-14 | local | GREEN tests post-fix | All 7 RED counterexamples → GREEN. Full suite 2080 passed. |
 
 ## Occurrence History
 
@@ -115,6 +124,20 @@ The dry-run audit script existed as an untracked script and used the wrong field
 | 2026-05-14 | Adapter override to call transport status | `72ae905` | half-effective | Request paths were closer, but transport parser lacked `OrderFillReconciliation` import and swallowed parser exceptions as `None`. |
 | 2026-05-14 | Tests with fake candidate / monkeypatched status | `72ae905` | false green | Tests bypassed the real objects and real parser being validated. |
 | 2026-05-14 | Add CandidateInput fields and parser tests | `eb9f793` | mostly effective | Still misses old V2 snapshot enrichment and real Bybit execution side/retCode semantics. |
+| 2026-05-14 | Commit message claimed "Bybit execution side/retCode, Bitget UTA field completeness" | `c378352` | incomplete | Claimed closure but: (a) Bitget quantity fallback still missing fillQty/size/filled_amount from V1 chain; (b) Bybit execution/order-status side still treated invalid values as SELL (fail-open); (c) BUG_INDEX said "residual open" while BUG doc said "fixed". |
+
+## New Counterexamples (this cycle, post-`c378352`)
+
+| Fingerprint | V1 Source | V2 Gap | Test Name | RED→GREEN |
+|---|---|---|---|---|
+| `bitget.quantity_fallback.fillQty.single_field` | bitget.rs:2519 | fillQty not in V2 fallback chain | `test_bitget_quantity_fallback...[fillQty]` | RED → GREEN |
+| `bitget.quantity_fallback.size.single_field` | bitget.rs:2521 | size not in V2 fallback chain | `test_bitget_quantity_fallback...[size]` | RED → GREEN |
+| `bitget.quantity_fallback.filled_amount.single_field` | bitget.rs:2520 | filled_amount not in V2 fallback chain | `test_bitget_quantity_fallback...[filled_amount]` | RED → GREEN |
+| `bybit.execution.side.invalid.fail_closed` | bybit.rs:3973-3979 | Invalid side (Hold) silently treated as SELL | `test_redlight_execution_side_invalid_hold_raises` | RED → GREEN |
+| `bybit.execution.side.lowercase.fail_closed` | bybit.rs:3973-3979 | Lowercase "buy" silently treated as SELL | `test_redlight_execution_side_lowercase_buy_raises` | RED → GREEN |
+| `bybit.order_status.side.missing.fail_closed` | bybit.rs:3973-3979 | Missing side defaulted to "Buy" | `test_redlight_order_status_side_missing_with_qty_raises` | RED → GREEN |
+| `bybit.order_status.side.invalid.fail_closed` | bybit.rs:3973-3979 | Invalid side (Hold) silently treated as SELL | `test_redlight_order_status_side_invalid_hold_raises` | RED → GREEN |
+| `bug-ledger.status.index-detail-consistency` | — | BUG_INDEX vs BUG doc contradictory status | Manual audit | Inconsistent → Consistent |
 
 ## Fix Plan
 
@@ -130,13 +153,14 @@ The dry-run audit script existed as an untracked script and used the wrong field
 - Implement Bitget positive-quantity reconciliation with multi-key price/fee fallback.
 - Track and fix the dry-run audit script.
 
-### Residual Required Follow-Up
+### Residual Required Follow-Up (all closed in working tree post-`c378352`)
 
-- Fix Bybit execution-list side parsing instead of hardcoding `Side.BUY`.
-- Call `_require_bybit_success` on Bybit order realtime and execution-list payloads; nonzero `retCode` should not silently become `None`.
-- Decide fail-closed vs enrichment behavior for schema-version-2 snapshots whose candidates lack `pair_id` or `first_funding_timestamp_ms`.
-- Strengthen red tests to use full `BybitAdapter.fetch_order_fill_reconciliation()` HTTP mock path, including sell executions and nonzero retCode.
-- Strengthen snapshot tests to assert non-empty `pair_id` and positive `first_funding_timestamp_ms`, not just field existence.
+- ~~Fix Bybit execution-list side parsing instead of hardcoding `Side.BUY`.~~ Closed: `_parse_bybit_execution_list` and `_parse_order_status_bybit` now only accept "Buy"/"Sell" case-sensitively (V1 parity). Invalid/missing side with qty>0 raises TransportError REQUEST_REJECTED.
+- ~~Call `_require_bybit_success` on Bybit order realtime and execution-list payloads.~~ Closed: `_fetch_order_status_bybit` already calls `_require_bybit_reconciliation_success` (added in `eb9f793` / `c378352`). retCode=110001 returns None; other nonzero raises TransportError.
+- ~~Fix Bitget quantity fallback: add `fillQty`, `filled_amount`, `size` to chain.~~ Closed: all V1 fields now in fallback (cumExecQty → baseVolume → filledQty → fillQty → filled_amount → size → fillSz).
+- ~~Decide fail-closed vs enrichment behavior for schema-version-2 snapshots.~~ Closed: `_dict_to_snapshot()` derives `pair_id` and `first_funding_timestamp_ms` from candidate fields plus quote timestamps; if timestamp evidence is unavailable, the candidate is marked blocked with `missing_candidate_identity_or_funding_timestamp`.
+- ~~Strengthen red tests to use full `BybitAdapter.fetch_order_fill_reconciliation()` HTTP mock path.~~ Done: `TestBybitExecutionSideRedLight` + `TestBybitOrderStatusSideRedLight` + existing `TestBybitAdapterHttpRedLight` cover execution-side, order-status-side, and adapter HTTP path.
+- ~~Fix BUG_INDEX/BUG doc inconsistency.~~ Closed: both now read "fixed".
 
 ## Implemented Fix
 
@@ -145,6 +169,12 @@ The dry-run audit script existed as an untracked script and used the wrong field
 
 - Commit: `eb9f793`
 - Summary: Added candidate parity fields, V1 compatibility preservation, V1-style local-L2 prewarm, Bybit execution-list aggregation, Bitget quantity-positive reconciliation, and tracked audit script with `kind/payload` support.
+
+- Commit: `c378352`
+- Summary: Added snapshot candidate enrichment, Bybit execution side/retCode guard, Bitget UTA field completeness. Claimed closure but residual gaps remained in Bitget quantity fallback fields and Bybit fail-closed side validation.
+
+- Working tree (post-`c378352`, 2026-05-14)
+- Summary: Added Bitget quantity fallback fields fillQty/filled_amount/size (V1 parity); made Bybit execution-list and order-status side parsing fail-closed (only "Buy"/"Sell" accepted, invalid→TransportError); fixed BUG_INDEX/BUG doc status inconsistency; added 18 regression test cases (7 parameterized Bitget quantity + 11 Bybit side validation) covering all counterexamples.
 
 ## Verification
 
@@ -156,7 +186,12 @@ The dry-run audit script existed as an untracked script and used the wrong field
 | 2026-05-14 | local | `pytest tests/test_venues_transport.py::TestBitgetAdapterL2MetadataGuard tests/test_venues_transport.py::TestBitgetL2Guard -q` | `7 passed` |
 | 2026-05-14 | local | GitNexus `detect_changes` compare `HEAD~1` | risk `medium`; 32 changed symbols; 4 affected processes |
 | 2026-05-14 | local | Bybit adapter HTTP mock with positive executions | returned reconciliation, but sell execution still produced `side=buy` |
-| 2026-05-14 | local | Audit probe with old and recent `kind/payload` events | counted only recent event |
+| 2026-05-14 | local | RED-LIGHT only: `TestBitgetQuantityFallbackRedLight + TestBybitExecutionSideRedLight + TestBybitOrderStatusSideRedLight` | `11 passed, 7 failed` (fillQty, size, filled_amount, Hold x2, lowercase buy, missing side) |
+| 2026-05-14 | local | Same tests after fixes | `18 passed` (all 7 failures turned GREEN) |
+| 2026-05-14 | local | Full regression: `pytest tests/test_venues_transport.py tests/test_entry_local_l2.py::TestEntryLocalL2SelectionBlockerRealCandidateInput tests/test_venues_transport.py::TestBybitAdapterHttpRedLight tests/test_venues_transport.py::TestBitgetAdapterHttpRedLight -q` | `215 passed` |
+| 2026-05-14 | local | `pytest -q` (post-fixes) | `2080 passed` (+18 test cases since `c378352`) |
+| 2026-05-14 | local | GitNexus `detect_changes` on unstaged docs/code fix | risk low; changed files only |
+| 2026-05-14 | local | BUG_INDEX vs BUG doc consistency audit | Both now read "fixed" — consistent |
 
 ## Regression Watch
 
@@ -177,3 +212,5 @@ The dry-run audit script existed as an untracked script and used the wrong field
 
 - `72ae905` `fix: V1 root-fix — entry local L2 selection gate, order cid reconciliation, Bitget L2 metadata guard`
 - `eb9f793` `fix: V1 parity — local L2 prewarm, reconciliation, audit closure`
+- `c378352` `fix: V1 parity — snapshot candidate enrichment, Bybit execution side/retCode, Bitget UTA field completeness`
+- Working tree (next commit) `fix: V1 parity — Bitget quantity fallback V1 fields, Bybit fail-closed side, ledger consistency`

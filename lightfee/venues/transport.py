@@ -1958,8 +1958,18 @@ class VenueTransport:
         client_id = str(data.get("orderLinkId", ""))
         cum_qty = _safe_float(data.get("cumExecQty", "0"))
         avg_price = _safe_float(data.get("avgPrice", "0"))
-        side_str = str(data.get("side", "Buy"))
-        side = Side.BUY if side_str == "Buy" else Side.SELL
+        side_raw = str(data.get("side", "")).strip()
+        if side_raw == "Buy":
+            side = Side.BUY
+        elif side_raw == "Sell":
+            side = Side.SELL
+        elif cum_qty <= 0.0:
+            return None  # zero qty: no side needed (V1: Err for missing, but qty=0 exits early)
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"bybit order status has invalid/missing side value {side_raw!r}",
+            )
         status_str = str(data.get("orderStatus", "")).upper()
         filled_at = int(data.get("updatedTime", now_ms))
 
@@ -2022,9 +2032,18 @@ class VenueTransport:
                 latest_fill_ms = ex_time
 
             # V1: parse side from execution (docs: side=Buy|Sell)
-            side_str = str(ex.get("side", "")).strip().lower()
-            if side_str:
-                ex_side = Side.BUY if side_str == "buy" else Side.SELL
+            side_raw = str(ex.get("side", "")).strip()
+            if side_raw:
+                if side_raw == "Buy":
+                    ex_side = Side.BUY
+                elif side_raw == "Sell":
+                    ex_side = Side.SELL
+                else:
+                    raise TransportError(
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        f"bybit execution has invalid side value {side_raw!r} "
+                        f"(orderId={order_id})",
+                    )
                 if resolved_side is None:
                     resolved_side = ex_side
                 elif resolved_side != ex_side:
@@ -2071,9 +2090,9 @@ class VenueTransport:
 
         order_id = str(data.get("orderId", ""))
         client_id = str(data.get("clientOid", ""))
-        # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, size
+        # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, filled_amount, size
         cum_qty = _safe_float(
-            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillSz", "0"))))
+            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillQty", data.get("filled_amount", data.get("size", data.get("fillSz", "0")))))))
         )
         avg_price = _safe_float(
             data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))

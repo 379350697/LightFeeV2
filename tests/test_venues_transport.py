@@ -3131,3 +3131,329 @@ class TestBitgetAdapterHttpRedLight:
             )
 
         await adapter._transport.close()
+
+
+# ===========================================================================
+# RED-LIGHT: Bitget quantity fallback — every V1 field individually
+# ===========================================================================
+
+
+class TestBitgetQuantityFallbackRedLight:
+    """RED-LIGHT: _parse_order_status_bitget quantity fallback must cover
+    every V1 field so no single-field response returns None.
+
+    V1 fields (bitget.rs:2516-2522): baseVolume, filledQty, fillQty, filled_amount, size
+    V2 extra compatibility: cumExecQty, fillSz
+
+    Current V2 chain: cumExecQty → baseVolume → filledQty → fillSz → 0
+    Missing V1 fields: fillQty, filled_amount, size
+    """
+
+    @pytest.mark.parametrize("field", [
+        "baseVolume",
+        "filledQty",
+        "fillQty",       # RED: not in V2 chain
+        "fillSz",
+        "cumExecQty",
+        "size",          # RED: not in V2 chain
+        "filled_amount", # RED: not in V2 chain (V1 field)
+    ])
+    def test_bitget_quantity_fallback_each_field_alone_returns_positive_qty(self, field):
+        """Each quantity field alone must produce positive reconciliation."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import OrderFillReconciliation
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                field: "0.5",
+                "priceAvg": "51000", "avgPrice": "51000",
+                "side": "buy", "uTime": "2000000",
+                "cTime": "2000000", "fee": "0.1",
+            },
+        }
+        result = transport._parse_order_status_bitget(raw, "BTCUSDT", 2000000)
+        assert isinstance(result, OrderFillReconciliation), (
+            f"RED-LIGHT: field={field} alone should produce reconciliation, got None"
+        )
+        assert result.quantity == pytest.approx(0.5), (
+            f"RED-LIGHT: field={field} quantity should be 0.5, got {result.quantity}"
+        )
+
+
+# ===========================================================================
+# RED-LIGHT: Bybit execution side validation — fail-closed, V1 parity
+# ===========================================================================
+
+
+class TestBybitExecutionSideRedLight:
+    """RED-LIGHT: _parse_bybit_execution_list must fail-closed on invalid side.
+
+    V1 ref: bybit.rs bybit_side_from_string (lines 3973-3979)
+    V1 accepts only "Buy"→Buy, "Sell"→Sell; any other value → Err.
+
+    Current V2 gap: any non-"buy" side (case-insensitive) defaults to SELL
+    instead of raising TransportError. Missing side with qty=0 exits early
+    before the side check.
+    """
+
+    def test_redlight_execution_side_buy_returns_buy(self):
+        """side=Buy → Side.BUY."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import Side, OrderFillReconciliation
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.5", "execPrice": "50000", "side": "Buy",
+                 "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
+            ]},
+        }
+        result = transport._parse_bybit_execution_list(
+            raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+        )
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.side == Side.BUY, (
+            f"side=Buy should produce BUY, got {result.side}"
+        )
+        assert result.quantity == pytest.approx(0.5)
+
+    def test_redlight_execution_side_sell_returns_sell(self):
+        """side=Sell → Side.SELL."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import Side, OrderFillReconciliation
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.5", "execPrice": "50000", "side": "Sell",
+                 "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
+            ]},
+        }
+        result = transport._parse_bybit_execution_list(
+            raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+        )
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.side == Side.SELL, (
+            f"side=Sell should produce SELL, got {result.side}"
+        )
+        assert result.quantity == pytest.approx(0.5)
+
+    def test_redlight_execution_side_missing_with_qty_raises(self):
+        """All executions missing side field with total_qty>0 → TransportError."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.5", "execPrice": "50000",
+                 "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
+            ]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_bybit_execution_list(
+                raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+            )
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"missing side with qty>0 must raise REQUEST_REJECTED, got {exc.value.category}"
+        )
+
+    def test_redlight_execution_side_invalid_hold_raises(self):
+        """side=Hold (invalid) with qty>0 → TransportError, NOT default to sell."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.5", "execPrice": "50000", "side": "Hold",
+                 "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
+            ]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_bybit_execution_list(
+                raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+            )
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"RED-LIGHT: invalid side='Hold' must raise, not default to SELL. "
+            f"Got category={exc.value.category}"
+        )
+        assert "Hold" in str(exc.value) or "side" in str(exc.value).lower(), (
+            f"Error message must mention the invalid side value, got: {exc.value}"
+        )
+
+    def test_redlight_execution_side_lowercase_buy_raises(self):
+        """side=buy (lowercase, not V1-accepted 'Buy') → TransportError."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.5", "execPrice": "50000", "side": "buy",
+                 "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
+            ]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_bybit_execution_list(
+                raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+            )
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"lowercase 'buy' should raise (V1 is case-sensitive), got category={exc.value.category}"
+        )
+
+    def test_redlight_execution_side_mixed_buy_sell_raises(self):
+        """Mixed Buy and Sell in same execution list → TransportError."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0.3", "execPrice": "50000", "side": "Buy",
+                 "execFee": "0.05", "execTime": "2000", "symbol": "BTCUSDT"},
+                {"execQty": "0.2", "execPrice": "51000", "side": "Sell",
+                 "execFee": "0.05", "execTime": "2001", "symbol": "BTCUSDT"},
+            ]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_bybit_execution_list(
+                raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+            )
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"mixed Buy/Sell must raise, got category={exc.value.category}"
+        )
+        assert "inconsistent" in str(exc.value).lower(), (
+            f"Error must mention inconsistent sides, got: {exc.value}"
+        )
+
+    def test_redlight_execution_side_missing_but_zero_qty_returns_none(self):
+        """Missing side with total_qty=0 → None (no error needed)."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [
+                {"execQty": "0", "execPrice": "0",
+                 "execFee": "0", "execTime": "0", "symbol": "BTCUSDT"},
+            ]},
+        }
+        result = transport._parse_bybit_execution_list(
+            raw, "BTCUSDT", "oid-1", "cid-1", 2000000,
+        )
+        assert result is None, f"zero qty should return None even with missing side"
+
+
+# ===========================================================================
+# RED-LIGHT: Bybit order status side validation (parse_order_status_bybit)
+# ===========================================================================
+
+
+class TestBybitOrderStatusSideRedLight:
+    """RED-LIGHT: _parse_order_status_bybit must fail-closed on invalid side.
+
+    V1 ref: bybit.rs bybit_side_from_string (lines 3973-3979)
+    V1 only accepts "Buy"→Buy, "Sell"→Sell.
+    Missing side → Err (not default "Buy").
+
+    Current V2 gap: defaults missing side to "Buy", treats any non-"Buy"
+    (including "Hold", "buy" lowercase) as SELL.
+    """
+
+    def test_redlight_order_status_side_missing_with_qty_raises(self):
+        """side field absent with cumQty>0 → TransportError (V1: missing side err)."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Filled", "cumExecQty": "0.5",
+                "avgPrice": "50000",
+                "updatedTime": "1000000",
+            }]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"RED-LIGHT: missing side with qty>0 should raise, "
+            f"got category={exc.value.category}"
+        )
+
+    def test_redlight_order_status_side_invalid_hold_raises(self):
+        """side=Hold with cumQty>0 → TransportError, not default to SELL."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Filled", "cumExecQty": "0.5",
+                "avgPrice": "50000", "side": "Hold",
+                "updatedTime": "1000000",
+            }]},
+        }
+        with pytest.raises(TransportError) as exc:
+            transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED, (
+            f"RED-LIGHT: invalid side='Hold' should raise, not default to SELL. "
+            f"Got category={exc.value.category}"
+        )
+
+    def test_redlight_order_status_side_buy_returns_buy(self):
+        """side=Buy → Side.BUY (existing behavior, prevent regression)."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import Side, OrderFillReconciliation
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Filled", "cumExecQty": "0.5",
+                "avgPrice": "50000", "side": "Buy",
+                "updatedTime": "1000000",
+            }]},
+        }
+        result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.side == Side.BUY
+
+    def test_redlight_order_status_side_sell_returns_sell(self):
+        """side=Sell → Side.SELL (existing behavior, prevent regression)."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import Side, OrderFillReconciliation
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Filled", "cumExecQty": "0.5",
+                "avgPrice": "50000", "side": "Sell",
+                "updatedTime": "1000000",
+            }]},
+        }
+        result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.side == Side.SELL
