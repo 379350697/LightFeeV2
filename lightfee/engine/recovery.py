@@ -382,6 +382,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     run_id=str(pdata.get("run_id", "")),
                     entry_route=str(pdata.get("entry_route", "")),
                     outcome=str(pdata.get("outcome", "")),
+                    repost_count=int(pdata.get("repost_count", 0)),
+                    zero_fill_since_ms=int(pdata.get("zero_fill_since_ms", 0)),
+                    maker_leg=str(pdata.get("maker_leg", "long")),
                 )
 
     # Restore pending closes

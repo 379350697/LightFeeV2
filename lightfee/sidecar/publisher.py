@@ -208,6 +208,13 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         if second_fts > 0:
             candidate.second_funding_timestamp_ms = second_fts
 
+        # V1: first_funding_leg — which leg's funding settles first
+        # discovery.rs:850-863 — Long if long_ts <= short_ts, else Short
+        if long_fts > 0 and short_fts > 0:
+            candidate.first_funding_leg = (
+                "long" if long_fts <= short_fts else "short"
+            )
+
         # Fail-closed: candidates without usable funding timestamp are not tradeable.
         # V1 never emits a tradeable candidate with first_funding_timestamp_ms=0.
         if candidate.first_funding_timestamp_ms <= 0:

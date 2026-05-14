@@ -216,14 +216,18 @@ def generate_deploy_script(root: Path, remote_host: str, remote_path: str) -> st
 set -euo pipefail
 
 REMOTE="{remote_host}:{remote_path}"
+LOCAL="{root}"
+
+echo "=== Generating deploy manifest ==="
+python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
 
 echo "=== Syncing files to $REMOTE ==="
-rsync -avz --delete {' '.join(exclude_args)} "{root}/" "$REMOTE/"
+rsync -avz --delete {' '.join(exclude_args)} "$LOCAL/" "$REMOTE/"
 
 echo "=== Writing .deploy_version ==="
 echo "{head}" | ssh {remote_host} "cat > {remote_path}/.deploy_version"
 
-echo "=== Verifying critical file hashes ==="
+echo "=== Verifying critical file hashes on remote ==="
 ssh {remote_host} "cd {remote_path} && python3 scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Deploy complete: {head} ==="

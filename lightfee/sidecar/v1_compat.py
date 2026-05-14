@@ -122,6 +122,12 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
     if f_ts <= 0 and ff_ts > 0:
         f_ts = ff_ts
 
+    # V1: first_funding_leg = the leg whose funding timestamp is smaller
+    # discovery.rs:850-863 — Long if long_ts <= short_ts, else Short
+    first_funding_leg = ""
+    if long_fts > 0 and short_fts > 0:
+        first_funding_leg = "long" if long_fts <= short_fts else "short"
+
     return {
         "long_venue": long_venue,
         "short_venue": short_venue,
@@ -145,6 +151,7 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         "long_funding_timestamp_ms": long_fts,
         "short_funding_timestamp_ms": short_fts,
         "second_funding_timestamp_ms": max(long_fts, short_fts) if long_fts > 0 and short_fts > 0 else 0,
+        "first_funding_leg": first_funding_leg,
     }
 
 

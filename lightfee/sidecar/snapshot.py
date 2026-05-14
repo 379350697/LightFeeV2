@@ -107,6 +107,8 @@ class CandidateInput:
     long_funding_timestamp_ms: int = 0
     short_funding_timestamp_ms: int = 0
     second_funding_timestamp_ms: int = 0
+    # V1: FundingLeg — which side's funding settles first
+    first_funding_leg: str = ""  # "long" or "short"
 
 
 @dataclass
