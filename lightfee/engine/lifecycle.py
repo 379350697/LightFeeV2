@@ -21,7 +21,13 @@ def set_lifecycle(state: EngineState, lifecycle: EngineLifecycle) -> None:
 
 
 def set_global_risk_mode(state: EngineState, risk_mode: GlobalRiskMode) -> None:
-    state.risk_mode = state.risk_mode.max(risk_mode)
+    """V1: EngineState.set_global_risk_mode (state.rs:336-360) — direct assignment.
+
+    V1 directly sets self.state.global_risk_mode = risk_mode without a max()
+    gate. This allows recovery to transition FailClosed → Running. Callers
+    are responsible for only escalating risk when appropriate.
+    """
+    state.risk_mode = risk_mode
 
 
 def enter_fail_closed(state: EngineState) -> None:
