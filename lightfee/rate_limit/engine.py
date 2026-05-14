@@ -276,22 +276,104 @@ class RateLimitRuntime:
         if self.recommendation_engine is not None:
             self.recommendation_engine.flush()
 
+    async def async_wait_until_ready_for_scopes(
+        self, scopes: list[str], timeout_ms: int = 0
+    ) -> bool:
+        """Async version: block until scopes are available."""
+        import asyncio
+        deadline = int(time.time() * 1000) + timeout_ms
+        while True:
+            try:
+                self.engine.try_consume_scopes(scopes)
+                return True
+            except RateLimitError as e:
+                if timeout_ms > 0 and int(time.time() * 1000) + e.retry_in_ms > deadline:
+                    return False
+                await asyncio.sleep(max(0.0, e.retry_in_ms / 1000.0))
+
     def _apply_config(self, config) -> None:
-        """Populate engine from a rate-limit config object."""
+        """Populate engine from a V1-shaped RateLimitConfig.
+
+        V1 registers:
+          - host:<host> and venue:<venue> buckets with budget_per_minute * margin
+          - endpoint weights and min intervals
+          - group:<group> and group:<venue>:<group> weights and min intervals
+          - ws_public / ws_private group buckets when ws_budget_per_minute exists
+        """
         if config is None:
             return
+
+        margin = getattr(config, "default_margin", 0.95)
+        if hasattr(config, "global_config"):
+            margin = config.global_config.default_margin
+
         for host_id, host in getattr(config, "hosts", {}).items():
-            self.engine.register_bucket(
-                host_id,
-                getattr(host, "capacity", 100.0),
-                getattr(host, "refill_per_sec", 10.0),
-            )
+            budget = getattr(host, "budget_per_minute", None)
+            min_interval = getattr(host, "min_interval_ms", None)
+            if budget is None:
+                # Legacy compat: old-style config with capacity/refill_per_sec
+                cap = getattr(host, "capacity", None)
+                refill = getattr(host, "refill_per_sec", None)
+                if cap is not None:
+                    budget = int(cap)
+                else:
+                    continue
+            capacity = float(budget) * margin
+            refill_per_sec = float(budget) / 60.0
+            scope = f"host:{host_id}"
+            self.engine.register_bucket(scope, capacity, refill_per_sec)
+            if min_interval is not None:
+                self.engine.register_min_interval(scope, scope, min_interval)
+
         for venue_id, venue in getattr(config, "venues", {}).items():
-            self.engine.register_bucket(
-                venue_id,
-                getattr(venue, "capacity", 50.0),
-                getattr(venue, "refill_per_sec", 5.0),
-            )
+            budget = getattr(venue, "budget_per_minute", None)
+            min_interval = getattr(venue, "min_interval_ms", None)
+            if budget is None:
+                continue
+            capacity = float(budget) * margin
+            refill_per_sec = float(budget) / 60.0
+            venue_scope = f"venue:{venue_id}"
+            self.engine.register_bucket(venue_scope, capacity, refill_per_sec)
+
+            # Endpoint weights and scopes
+            endpoint_weights = getattr(venue, "endpoint_weights", {}) or {}
+            endpoint_min_interval = getattr(venue, "endpoint_min_interval_ms", {}) or {}
+            venue_scopes = getattr(venue, "scopes", {}) or {}
+            for endpoint, weight in endpoint_weights.items():
+                self.engine.register_weight(venue_scope, endpoint, float(weight))
+                if endpoint in venue_scopes:
+                    group = venue_scopes[endpoint]
+                    group_scope = f"group:{venue_id}:{group}"
+                    self.engine.register_weight(venue_scope, group_scope, float(weight))
+            for endpoint, ep_min in endpoint_min_interval.items():
+                self.engine.register_min_interval(venue_scope, endpoint, ep_min)
+
+            # Group weights and min intervals
+            group_weights = getattr(venue, "group_weights", {}) or {}
+            group_min_intervals = getattr(venue, "group_min_interval_ms", {}) or {}
+            for group, gw in group_weights.items():
+                group_scope = f"group:{venue_id}:{group}"
+                self.engine.register_weight(venue_scope, group_scope, float(gw))
+                if group in group_min_intervals:
+                    self.engine.register_min_interval(venue_scope, group_scope, group_min_intervals[group])
+                # Also register plain group: scope for backward compat
+                plain_group = f"group:{group}"
+                self.engine.register_weight(venue_scope, plain_group, float(gw))
+                if group in group_min_intervals:
+                    self.engine.register_min_interval(venue_scope, plain_group, group_min_intervals[group])
+
+            # WS budget buckets
+            ws_budget = getattr(venue, "ws_budget_per_minute", None)
+            if ws_budget is not None and ws_budget > 0:
+                ws_capacity = float(ws_budget) * margin
+                ws_refill = float(ws_budget) / 60.0
+                for ws_group in ("ws_public", "ws_private"):
+                    ws_scope = f"group:{venue_id}:{ws_group}"
+                    self.engine.register_bucket(ws_scope, ws_capacity, ws_refill)
+                    if ws_group in group_weights:
+                        self.engine.register_weight(ws_scope, ws_scope, float(group_weights[ws_group]))
+                    if ws_group in group_min_intervals:
+                        self.engine.register_min_interval(ws_scope, ws_scope, group_min_intervals[ws_group])
 
 
 # Global singleton helpers -----------------------------------------------

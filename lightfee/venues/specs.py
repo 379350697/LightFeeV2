@@ -63,6 +63,16 @@ class VenueSpec:
     symbol_to_venue: Optional[Callable[[str], str]] = None
     symbol_from_venue: Optional[Callable[[str], str]] = None
 
+    # V1 transport metadata (Task 4)
+    server_time_path: str = ""
+    server_time_safety_margin_ms: int = 0
+    recv_window_ms: int | None = None
+    venue_scope: str = ""
+    rest_group_scope: str = "group:rest"
+    endpoint_scope_map: dict[str, str] = field(default_factory=dict)
+    endpoint_weights: dict[str, int] = field(default_factory=dict)
+    endpoint_min_interval_ms: dict[str, int] = field(default_factory=dict)
+
 
 def binance_spec() -> VenueSpec:
     return VenueSpec(
@@ -86,6 +96,11 @@ def binance_spec() -> VenueSpec:
         timestamp_param="timestamp",
         symbol_to_venue=lambda s: s,  # Binance USDM wire format matches canonical
         symbol_from_venue=lambda s: s,
+        # V1 transport metadata
+        server_time_path="/fapi/v1/time",
+        server_time_safety_margin_ms=1000,
+        recv_window_ms=10000,
+        venue_scope="venue:binance",
     )
 
 
@@ -114,6 +129,9 @@ def okx_spec() -> VenueSpec:
         use_iso8601_timestamp=True,
         symbol_to_venue=lambda s: s.replace("USDT", "-USDT-SWAP"),
         symbol_from_venue=lambda s: s.replace("-USDT-SWAP", "USDT").replace("-SWAP", ""),
+        # V1 transport metadata
+        server_time_path="/api/v5/public/time",
+        venue_scope="venue:okx",
     )
 
 
@@ -140,6 +158,10 @@ def bybit_spec() -> VenueSpec:
         recv_window_header="X-BAPI-RECV-WINDOW",
         symbol_to_venue=lambda s: s,  # Bybit V5 linear wire format matches canonical
         symbol_from_venue=lambda s: s,
+        # V1 transport metadata
+        server_time_path="/v5/market/time",
+        recv_window_ms=5000,
+        venue_scope="venue:bybit",
     )
 
 
@@ -168,6 +190,8 @@ def bitget_spec() -> VenueSpec:
         passphrase_header="ACCESS-PASSPHRASE",
         symbol_to_venue=lambda s: s,  # Bitget USDT-FUTURES wire format matches canonical
         symbol_from_venue=lambda s: s,
+        # V1 transport metadata
+        venue_scope="venue:bitget",
     )
 
 
@@ -193,6 +217,8 @@ def gate_spec() -> VenueSpec:
         timestamp_header="Timestamp",
         symbol_to_venue=lambda s: s.replace("USDT", "_USDT") if "_" not in s else s,
         symbol_from_venue=lambda s: s.replace("_USDT", "USDT").replace("_", ""),
+        # V1 transport metadata
+        venue_scope="venue:gate",
     )
 
 
@@ -218,6 +244,11 @@ def aster_spec() -> VenueSpec:
         timestamp_param="timestamp",
         symbol_to_venue=lambda s: s,  # Aster (Binance-compatible) wire format matches canonical
         symbol_from_venue=lambda s: s,
+        # V1 transport metadata
+        server_time_path="/fapi/v1/time",
+        server_time_safety_margin_ms=0,
+        recv_window_ms=10000,
+        venue_scope="venue:aster",
     )
 
 
@@ -241,6 +272,8 @@ def hyperliquid_spec() -> VenueSpec:
         live_order_supported=True,
         symbol_to_venue=lambda s: s.replace("USDT", "").replace("usdt", ""),
         symbol_from_venue=lambda s: s + "USDT" if "USDT" not in s.upper() else s,
+        # V1 transport metadata
+        venue_scope="venue:hyperliquid",
     )
 
 

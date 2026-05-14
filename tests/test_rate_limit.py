@@ -120,8 +120,8 @@ class TestRateLimitConfig:
 
     def test_built_in_defaults_has_hosts(self):
         cfg = built_in_defaults()
-        assert "binance.com" in cfg.hosts
-        assert "okx.com" in cfg.hosts
+        assert "fapi.binance.com" in cfg.hosts
+        assert "www.okx.com" in cfg.hosts
 
     def test_config_manager_starts_with_builtins(self):
         mgr = RateLimitConfigManager()
@@ -172,3 +172,242 @@ class TestRateLimitRuntime:
     def test_refresh_interval(self):
         rt = RateLimitRuntime()
         assert rt.refresh_interval_secs() == 30
+
+
+# ============================================================================
+# Task 1: V1 Rate-Limit Defaults
+# ============================================================================
+
+EXPECTED_HOSTS = {
+    "fapi.binance.com": (2400, 25),
+    "fapi.asterdex.com": (1200, 50),
+    "api.bybit.com": (600, 75),
+    "api.bitget.com": (600, 100),
+    "www.okx.com": (600, 100),
+    "api.gateio.ws": (900, 75),
+    "api.hyperliquid.xyz": (1200, 50),
+}
+
+EXPECTED_VENUES = {
+    "binance": (2400, 25, 600),
+    "aster": (1200, 50, 600),
+    "bybit": (600, 75, 300),
+    "bitget": (600, 100, 300),
+    "okx": (600, 100, 300),
+    "gate": (900, 75, 300),
+    "hyperliquid": (1200, 50, 300),
+}
+
+EXPECTED_GROUP_WEIGHTS = {
+    "depth": 5,
+    "market": 1,
+    "order": 1,
+    "account": 1,
+    "ws_public": 1,
+    "ws_private": 1,
+}
+
+EXPECTED_BINANCE_ENDPOINTS = {
+    "GET /fapi/v1/depth": (5, 25, "depth"),
+    "GET /fapi/v1/exchangeInfo": (10, None, "market"),
+    "GET /fapi/v1/ticker/bookTicker": (2, None, "market"),
+    "GET /fapi/v1/premiumIndex": (1, None, "market"),
+    "POST /fapi/v1/order": (1, None, "order"),
+}
+
+EXPECTED_BYBIT_ENDPOINTS = {
+    "GET /v5/market/orderbook": (5, 75, "depth"),
+    "GET /v5/market/tickers": (1, None, "market"),
+    "GET /v5/market/instruments-info": (2, None, "market"),
+    "POST /v5/order/create": (1, None, "order"),
+    "GET /v5/account/fee-rate": (1, None, "account"),
+}
+
+EXPECTED_OKX_ENDPOINTS = {
+    "GET /api/v5/market/books": (5, 100, "depth"),
+    "GET /api/v5/public/funding-rate": (1, None, "market"),
+    "GET /api/v5/market/tickers": (1, None, "market"),
+    "POST /api/v5/trade/order": (1, None, "order"),
+    "GET /api/v5/account/config": (1, None, "account"),
+}
+
+
+class TestV1RateLimitDefaults:
+    """Task 1: Verify V2 built-in defaults match V1 host/venue/group/endpoint tables."""
+
+    def test_host_defaults_exact(self):
+        cfg = built_in_defaults()
+        for host, (budget, min_interval) in EXPECTED_HOSTS.items():
+            h = cfg.hosts.get(host)
+            assert h is not None, f"Missing host config: {host}"
+            assert h.budget_per_minute == budget, (
+                f"{host}: budget_per_minute={h.budget_per_minute} != {budget}"
+            )
+            assert h.min_interval_ms == min_interval, (
+                f"{host}: min_interval_ms={h.min_interval_ms} != {min_interval}"
+            )
+
+    def test_host_count_exact_seven(self):
+        cfg = built_in_defaults()
+        assert len(cfg.hosts) == 7
+
+    def test_venue_defaults_exact(self):
+        cfg = built_in_defaults()
+        for venue, (budget, min_interval, ws_budget) in EXPECTED_VENUES.items():
+            v = cfg.venues.get(venue)
+            assert v is not None, f"Missing venue config: {venue}"
+            assert v.budget_per_minute == budget, (
+                f"{venue}: budget_per_minute={v.budget_per_minute} != {budget}"
+            )
+            assert v.min_interval_ms == min_interval, (
+                f"{venue}: min_interval_ms={v.min_interval_ms} != {min_interval}"
+            )
+            assert v.ws_budget_per_minute == ws_budget, (
+                f"{venue}: ws_budget_per_minute={v.ws_budget_per_minute} != {ws_budget}"
+            )
+
+    def test_group_weights_exact(self):
+        cfg = built_in_defaults()
+        for venue_name in EXPECTED_VENUES:
+            v = cfg.venues.get(venue_name)
+            assert v is not None
+            for group, expected_weight in EXPECTED_GROUP_WEIGHTS.items():
+                assert group in v.group_weights, (
+                    f"{venue_name}: missing group weight '{group}'"
+                )
+                assert v.group_weights[group] == expected_weight, (
+                    f"{venue_name}: group '{group}' weight={v.group_weights[group]} != {expected_weight}"
+                )
+
+    def test_group_min_intervals_match_venue(self):
+        cfg = built_in_defaults()
+        for venue_name, (_budget, min_interval, _ws) in EXPECTED_VENUES.items():
+            v = cfg.venues.get(venue_name)
+            assert v is not None
+            for group in EXPECTED_GROUP_WEIGHTS:
+                assert group in v.group_min_interval_ms, (
+                    f"{venue_name}: missing group min interval '{group}'"
+                )
+                assert v.group_min_interval_ms[group] == min_interval, (
+                    f"{venue_name}: group '{group}' min_interval={v.group_min_interval_ms[group]} != {min_interval}"
+                )
+
+    def test_binance_endpoint_weights_exact(self):
+        cfg = built_in_defaults()
+        v = cfg.venues["binance"]
+        for endpoint, (weight, min_interval, scope) in EXPECTED_BINANCE_ENDPOINTS.items():
+            assert endpoint in v.endpoint_weights, f"binance: missing endpoint weight '{endpoint}'"
+            assert v.endpoint_weights[endpoint] == weight, (
+                f"binance: endpoint '{endpoint}' weight={v.endpoint_weights[endpoint]} != {weight}"
+            )
+            assert endpoint in v.scopes, f"binance: missing scope '{endpoint}'"
+            assert v.scopes[endpoint] == scope, (
+                f"binance: endpoint '{endpoint}' scope={v.scopes[endpoint]} != {scope}"
+            )
+            if min_interval is not None:
+                assert endpoint in v.endpoint_min_interval_ms, (
+                    f"binance: missing endpoint min_interval '{endpoint}'"
+                )
+                assert v.endpoint_min_interval_ms[endpoint] == min_interval
+
+    def test_bybit_endpoint_weights_exact(self):
+        cfg = built_in_defaults()
+        v = cfg.venues["bybit"]
+        for endpoint, (weight, min_interval, scope) in EXPECTED_BYBIT_ENDPOINTS.items():
+            assert endpoint in v.endpoint_weights
+            assert v.endpoint_weights[endpoint] == weight
+            assert endpoint in v.scopes
+            assert v.scopes[endpoint] == scope
+            if min_interval is not None:
+                assert endpoint in v.endpoint_min_interval_ms
+                assert v.endpoint_min_interval_ms[endpoint] == min_interval
+
+    def test_okx_endpoint_weights_exact(self):
+        cfg = built_in_defaults()
+        v = cfg.venues["okx"]
+        for endpoint, (weight, min_interval, scope) in EXPECTED_OKX_ENDPOINTS.items():
+            assert endpoint in v.endpoint_weights
+            assert v.endpoint_weights[endpoint] == weight
+            assert endpoint in v.scopes
+            assert v.scopes[endpoint] == scope
+            if min_interval is not None:
+                assert endpoint in v.endpoint_min_interval_ms
+                assert v.endpoint_min_interval_ms[endpoint] == min_interval
+
+    def test_docs_fallback_present(self):
+        cfg = built_in_defaults()
+        for venue_name in EXPECTED_VENUES:
+            v = cfg.venues.get(venue_name)
+            assert v is not None
+            assert v.docs_fallback is not None, f"{venue_name}: missing docs_fallback"
+
+    def test_global_defaults_match_v1(self):
+        cfg = built_in_defaults()
+        assert cfg.global_config.default_margin == 0.95
+        assert cfg.global_config.refresh_interval_secs == 30
+
+
+# ============================================================================
+# Task 3: V1 Engine Semantics
+# ============================================================================
+
+
+class TestRateLimitEngineV1Scopes:
+    """Task 3: Verify engine enforces V1 weights, min intervals, backoff, cooldown."""
+
+    def test_endpoint_weight_consumed(self):
+        eng = RateLimitEngine(default_margin=1.0)
+        eng.register_bucket("binance", capacity=100.0, refill_per_sec=10.0)
+        eng.register_weight("binance", "GET /fapi/v1/depth", 5.0)
+        eng.register_weight("binance", "POST /fapi/v1/order", 1.0)
+        eng.try_consume("binance", ["GET /fapi/v1/depth"], now_ms=0)
+        snap = eng.bucket_snapshot("binance")
+        assert snap["tokens"] == 95.0  # 100 - 5
+
+    def test_group_fallback_weight(self):
+        eng = RateLimitEngine(default_margin=1.0)
+        eng.register_bucket("binance", capacity=100.0, refill_per_sec=10.0)
+        # Register group weight for "depth" — should apply when endpoint not found
+        eng.register_weight("binance", "depth", 5.0)
+        eng.try_consume("binance", ["depth"], now_ms=0)
+        snap = eng.bucket_snapshot("binance")
+        assert snap["tokens"] == 95.0  # 100 - 5
+
+    def test_min_interval_enforced_for_endpoint(self):
+        eng = RateLimitEngine(default_margin=1.0)
+        eng.register_bucket("binance", capacity=100.0, refill_per_sec=10.0)
+        eng.register_min_interval("binance", "GET /fapi/v1/depth", 25)
+        eng.try_consume("binance", ["GET /fapi/v1/depth"], now_ms=0)
+        with pytest.raises(RateLimitError) as exc:
+            eng.try_consume("binance", ["GET /fapi/v1/depth"], now_ms=10)
+        assert exc.value.reason == RateLimitErrorReason.MIN_INTERVAL
+
+    def test_cooldown_with_retry_after_blocks_all_scopes(self):
+        eng = RateLimitEngine(default_margin=1.0)
+        eng.register_bucket("host:fapi.binance.com", capacity=100.0, refill_per_sec=10.0)
+        eng.register_bucket("venue:binance", capacity=100.0, refill_per_sec=10.0)
+        eng.apply_cooldown("host:fapi.binance.com", 5000, now_ms=0)
+        eng.apply_cooldown("venue:binance", 5000, now_ms=0)
+        with pytest.raises(RateLimitError):
+            eng.try_consume("host:fapi.binance.com", ["GET /fapi/v1/depth"], now_ms=1000)
+        with pytest.raises(RateLimitError):
+            eng.try_consume("venue:binance", ["GET /fapi/v1/depth"], now_ms=1000)
+
+    def test_backoff_starts_at_1000ms_caps_at_8000ms(self):
+        from lightfee.venues.transport import EndpointRateLimiter
+        rl = EndpointRateLimiter(initial_ms=1000, max_ms=8000)
+        assert rl._failure_backoff_ms(0) == 1000
+        assert rl._failure_backoff_ms(1) == 2000
+        assert rl._failure_backoff_ms(2) == 4000
+        assert rl._failure_backoff_ms(3) == 8000
+        assert rl._failure_backoff_ms(10) == 8000  # capped
+
+    def test_success_resets_cooldown(self):
+        from lightfee.venues.transport import EndpointRateLimiter
+        rl = EndpointRateLimiter(initial_ms=1000, max_ms=8000)
+        rl.record_rate_limit_for_scopes(["test"], retry_after_ms=5000)
+        assert rl._cooldown_remaining_ms_for_scopes(["test"]) is not None
+        rl.record_success_for_scopes(["test"])
+        # V1: record_success is no-op; cooldown stays
+        # This test confirms V1 behavior — success does NOT clear cooldown
+        assert rl._cooldown_remaining_ms_for_scopes(["test"]) is not None

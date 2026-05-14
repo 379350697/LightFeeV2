@@ -268,6 +268,61 @@ def _parse_retry_after_ms(headers: dict[str, str]) -> Optional[int]:
         return None
 
 
+def _parse_reset_header_ms(headers: dict[str, str], header_name: str, now_ms: int) -> int | None:
+    """Parse a reset-timestamp header (e.g. X-Bapi-Limit-Reset-Timestamp) into ms from now."""
+    value = headers.get(header_name, "")
+    if not value:
+        return None
+    try:
+        reset_ts = int(value)
+        delay = reset_ts - now_ms
+        return max(0, delay)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_venue_retry_after_ms(
+    venue: Venue, headers: dict[str, str], now_ms: int,
+) -> int | None:
+    """Parse venue-specific retry delay from response headers.
+
+    V1: checks Retry-After first, then venue-specific reset headers.
+    """
+    # Common: Retry-After
+    retry = _parse_retry_after_ms(headers)
+    if retry is not None:
+        return retry
+
+    # Bybit: X-Bapi-Limit-Reset-Timestamp
+    if venue == Venue.BYBIT:
+        reset = _parse_reset_header_ms(headers, "X-Bapi-Limit-Reset-Timestamp", now_ms)
+        if reset is not None:
+            return reset
+
+    # Gate: X-RateLimit-Reset or X-Gate-RateLimit-Reset
+    if venue == Venue.GATE:
+        for hdr in ("X-RateLimit-Reset", "X-Gate-RateLimit-Reset"):
+            reset = _parse_reset_header_ms(headers, hdr, now_ms)
+            if reset is not None:
+                return reset
+
+    return None
+
+
+def _normalize_rest_endpoint_key(method: str, path: str) -> str:
+    """Normalize a REST endpoint to V1 key format: 'METHOD /path'."""
+    clean_path = path.split("?", 1)[0]
+    return f"{method.upper()} {clean_path}".strip()
+
+
+def _normalize_host_scope(base_url: str) -> str:
+    """Extract hostname from base URL for 'host:<hostname>' scope."""
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url.rstrip("/"))
+    host = parsed.netloc or parsed.path.split("/")[0]
+    return f"host:{host}"
+
+
 def _map_to_submit_error(
     category: TransportErrorCategory, message: str
 ) -> OrderSubmitError:
@@ -303,6 +358,12 @@ def _iso8601_now() -> str:
     ) + "Z"
 
 
+def _iso8601_from_ms(timestamp_ms: int) -> str:
+    """Convert epoch milliseconds to ISO-8601 string (OKX format)."""
+    dt = datetime.datetime.fromtimestamp(timestamp_ms / 1000.0, tz=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def build_hmac_sha512_hex(secret: str, payload: str) -> str:
     mac = hmac.new(secret.encode(), payload.encode(), hashlib.sha512)
     return mac.hexdigest()
@@ -316,6 +377,12 @@ def _sign_payload(scheme: AuthScheme, secret: str, payload: str) -> str:
     if scheme == AuthScheme.HMAC_SHA512_HEX:
         return build_hmac_sha512_hex(secret, payload)
     raise ValueError(f"unsupported auth scheme: {scheme}")
+
+
+def _build_query_v1(params: list[tuple[str, str]]) -> str:
+    """Build URL-encoded query string, preserving caller order (V1: form_urlencoded::Serializer)."""
+    from urllib.parse import urlencode
+    return urlencode(params)
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +802,7 @@ class VenueTransport:
         self._client: Optional[httpx.AsyncClient] = None
         self._hl_meta_cache: dict[str, int] = {}
         self._symbol_metadata: dict[str, dict[str, Any]] = {}  # sym → vendor contract info
+        self._time_offset_ms: int | None = None  # V1: cached server-time offset
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -792,10 +860,98 @@ class VenueTransport:
             )
 
     # ------------------------------------------------------------------
+    # Server-time offset (V1 parity)
+    # ------------------------------------------------------------------
+
+    async def _server_timestamp_ms(self) -> int:
+        """Return adjusted server timestamp, fetching and caching offset on first call.
+
+        Binance/Aster: offset = server_time - now_ms - safety_margin
+        OKX: offset = server_time - now_ms
+        Bybit: offset = server_time - now_ms
+
+        Falls back to wall-clock time if server time endpoint is unavailable.
+        """
+        now_ms = int(time.time() * 1000)
+        spec = self._spec
+
+        if self._time_offset_ms is not None:
+            return now_ms + self._time_offset_ms
+
+        if not spec.server_time_path:
+            return now_ms
+
+        try:
+            raw = await self._request_public_raw("GET", spec.server_time_path)
+            server_time = self._parse_server_time(raw)
+            if server_time > 0:
+                offset = server_time - now_ms - spec.server_time_safety_margin_ms
+                self._time_offset_ms = offset
+                return now_ms + offset
+        except Exception:
+            pass
+
+        # Fallback: use wall clock
+        return now_ms
+
+    async def _request_public_raw(self, method: str, path: str) -> dict[str, Any]:
+        """Issue a public GET request without auth, rate-limiting, or error wrapping.
+
+        Used for server-time fetches where we can't rate-limit or sign yet.
+        """
+        client = await self._get_client()
+        base_url = self._spec.public_base_url
+        url = base_url + path
+        resp = await client.get(url)
+        if resp.status_code >= 400:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"public raw {method} {path} returned {resp.status_code}",
+            )
+        if not resp.text:
+            return {}
+        return resp.json()
+
+    def _parse_server_time(self, raw: dict[str, Any]) -> int:
+        """Parse server time from venue-specific response."""
+        spec = self._spec
+        vid = spec.venue_id
+
+        # Binance/Aster: {"serverTime": 1234567890000}
+        if vid in (Venue.BINANCE, Venue.ASTER):
+            return int(raw.get("serverTime", 0))
+
+        # OKX: {"code":"0","data":[{"ts":"1234567890000"}]}
+        if vid == Venue.OKX:
+            data = raw.get("data", [])
+            if isinstance(data, list) and data:
+                ts = data[0].get("ts", "0")
+                return int(ts)
+            return 0
+
+        # Bybit: {"retCode":0,"result":{"timeSecond":"1234567890","timeNano":"..."}}
+        if vid == Venue.BYBIT:
+            result = raw.get("result", {})
+            if isinstance(result, dict):
+                time_second = result.get("timeSecond")
+                if time_second:
+                    return int(time_second) * 1000
+                time_nano = result.get("timeNano")
+                if time_nano:
+                    return int(time_nano) // 1_000_000
+            return 0
+
+        return 0
+
+    def _clear_server_time_offset(self) -> None:
+        """Clear cached server-time offset (V1: on timestamp/signature error)."""
+        self._time_offset_ms = None
+
+    # ------------------------------------------------------------------
     # Auth header construction
     # ------------------------------------------------------------------
 
-    def _build_auth_headers(
+    async def _build_auth_headers_async(
         self,
         method: str,
         path: str,
@@ -817,16 +973,15 @@ class VenueTransport:
             headers["Content-Type"] = "application/json"
             return headers
 
-        # --- Binance / Aster: query-string signature ---
+        # --- Binance / Aster: query-string signature with server time ---
         if spec.signature_param:
-            ts = str(int(time.time() * 1000))
+            ts = str(await self._server_timestamp_ms())
             payload = query_string.lstrip("?") if query_string else ""
             if spec.timestamp_param and spec.timestamp_param not in (payload or ""):
                 ts_param = f"{spec.timestamp_param}={ts}"
                 payload = f"{ts_param}&{payload}" if payload else ts_param
             headers[spec.api_key_header] = cred.api_key
             sig = _sign_payload(spec.auth_scheme, cred.api_secret, payload)
-            # signature is added to query params in _build_signed_request
             return headers
 
         # --- Gate: HMAC-SHA512 with body hash, seconds timestamp, newline payload ---
@@ -860,9 +1015,13 @@ class VenueTransport:
         # --- Header-based signature (OKX, Bybit) ---
         if spec.signature_header:
             if spec.use_iso8601_timestamp:
-                ts = _iso8601_now()
+                # OKX: use server-time offset for timestamp
+                server_ms = await self._server_timestamp_ms()
+                ts = _iso8601_from_ms(server_ms)
             else:
-                ts = str(int(time.time() * 1000))
+                # Bybit: use server-time offset for timestamp
+                server_ms = await self._server_timestamp_ms()
+                ts = str(server_ms)
 
             headers[spec.api_key_header] = cred.api_key
             headers[spec.timestamp_header] = ts
@@ -871,7 +1030,8 @@ class VenueTransport:
                 headers[spec.passphrase_header] = cred.api_passphrase
 
             if spec.recv_window_header:
-                headers[spec.recv_window_header] = "5000"
+                # Bybit: use X-BAPI-RECV-WINDOW=5000
+                headers[spec.recv_window_header] = str(spec.recv_window_ms or 5000)
 
             # OKX style: ts + method + path (+ query_string for GET/DELETE, body for POST)
             if spec.use_iso8601_timestamp:
@@ -881,8 +1041,6 @@ class VenueTransport:
                     sign_payload = ts + method.upper() + path + (body or "")
             else:
                 # Bybit V5 style: ts + api_key + recv_window
-                #   GET/DELETE: + query_string_without_question_mark
-                #   POST:       + JSON body
                 recv = headers.get(spec.recv_window_header, "5000")
                 if query_string and method.upper() in ("GET", "DELETE"):
                     sign_payload = ts + cred.api_key + recv + query_string.lstrip("?")
@@ -894,6 +1052,134 @@ class VenueTransport:
 
         return headers
 
+    # Sync auth headers kept for backward-compatible test calls
+    def _build_auth_headers(
+        self,
+        method: str,
+        path: str,
+        query_string: str = "",
+        body: str = "",
+        private: bool = False,
+    ) -> dict[str, str]:
+        spec = self._spec
+        cred = self._credential
+        if not private or cred is None:
+            return {}
+        headers: dict[str, str] = {}
+        if spec.auth_scheme == AuthScheme.EIP712:
+            headers["Content-Type"] = "application/json"
+            return headers
+        if spec.signature_param:
+            ts = str(int(time.time() * 1000))
+            payload = query_string.lstrip("?") if query_string else ""
+            if spec.timestamp_param and spec.timestamp_param not in (payload or ""):
+                ts_param = f"{spec.timestamp_param}={ts}"
+                payload = f"{ts_param}&{payload}" if payload else ts_param
+            headers[spec.api_key_header] = cred.api_key
+            return headers
+        if spec.auth_scheme == AuthScheme.HMAC_SHA512_HEX:
+            import hashlib as _hashlib
+            ts = str(int(time.time()))
+            body_hash = _hashlib.sha512((body or "").encode()).hexdigest()
+            sign_payload = f"{method.upper()}\n{path}\n{query_string.lstrip('?')}\n{body_hash}\n{ts}"
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers["KEY"] = cred.api_key
+            headers["Timestamp"] = ts
+            headers["SIGN"] = sig
+            headers["Content-Type"] = "application/json"
+            headers["X-Gate-Size-Decimal"] = "1"
+            return headers
+        if spec.venue_id == Venue.BITGET:
+            ts = str(int(time.time() * 1000))
+            request_path = f"{path}?{query_string.lstrip('?')}" if query_string else path
+            sign_payload = ts + method.upper() + request_path + (body or "")
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers["ACCESS-KEY"] = cred.api_key
+            headers["ACCESS-SIGN"] = sig
+            headers["ACCESS-TIMESTAMP"] = ts
+            headers["ACCESS-PASSPHRASE"] = cred.api_passphrase
+            headers["Content-Type"] = "application/json"
+            headers["locale"] = "en-US"
+            return headers
+        if spec.signature_header:
+            if spec.use_iso8601_timestamp:
+                ts = _iso8601_now()
+            else:
+                ts = str(int(time.time() * 1000))
+            headers[spec.api_key_header] = cred.api_key
+            headers[spec.timestamp_header] = ts
+            if spec.requires_passphrase and spec.passphrase_header:
+                headers[spec.passphrase_header] = cred.api_passphrase
+            if spec.recv_window_header:
+                headers[spec.recv_window_header] = "5000"
+            if spec.use_iso8601_timestamp:
+                if query_string and method.upper() in ("GET", "DELETE"):
+                    sign_payload = ts + method.upper() + path + query_string
+                else:
+                    sign_payload = ts + method.upper() + path + (body or "")
+            else:
+                recv = headers.get(spec.recv_window_header, "5000")
+                if query_string and method.upper() in ("GET", "DELETE"):
+                    sign_payload = ts + cred.api_key + recv + query_string.lstrip("?")
+                else:
+                    sign_payload = ts + cred.api_key + recv + (body or "")
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, sign_payload)
+            headers[spec.signature_header] = sig
+        return headers
+
+    async def _build_signed_request_async(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
+        private: bool = False,
+    ) -> tuple[str, dict[str, str], Optional[str]]:
+        """Build signed request with V1 parity: server time, recvWindow, query-only for Binance/Aster."""
+        spec = self._spec
+        query_string = ""
+        req_body: Optional[str] = None
+        cred = self._credential
+
+        # Binance/Aster private requests: query-only signing with recvWindow
+        if spec.signature_param and private and cred:
+            # Build ordered query params (V1: preserve caller order, no sort)
+            qp_list: list[tuple[str, str]] = []
+            if params:
+                for k, v in params.items():
+                    qp_list.append((k, str(v)))
+            ts = str(await self._server_timestamp_ms())
+            if spec.timestamp_param:
+                qp_list.append((spec.timestamp_param, ts))
+            # V1: recvWindow=10000 for Binance/Aster
+            if spec.recv_window_ms:
+                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
+            # Build query without signature, then sign
+            encoded = _build_query_v1(qp_list)
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, encoded)
+            qp_list.append((spec.signature_param, sig))
+            query_string = "?" + _build_query_v1(qp_list)
+            req_body = None  # Binance/Aster: no body for order placement
+
+        elif spec.signature_param and not private:
+            # Public request — no signature, just params
+            if params:
+                qp_list = [(k, str(v)) for k, v in params.items()]
+                query_string = "?" + _build_query_v1(qp_list)
+        elif params:
+            qp_list = [(k, str(v)) for k, v in sorted(params.items())]
+            query_string = "?" + _build_query_v1(qp_list) if qp_list else ""
+
+        if body is not None:
+            req_body = json.dumps(body)
+
+        headers = await self._build_auth_headers_async(method, path, query_string, req_body or "", private=private)
+        if req_body and "Content-Type" not in headers:
+            headers["Content-Type"] = "application/json"
+
+        return query_string, headers, req_body
+
+    # Keep sync version for backward compatibility with tests
     def _build_signed_request(
         self,
         method: str,
@@ -902,41 +1188,38 @@ class VenueTransport:
         body: Optional[dict[str, Any]] = None,
         private: bool = False,
     ) -> tuple[str, dict[str, str], Optional[str]]:
+        """Synchronous fallback: uses wall-clock time. Tests should prefer async path."""
         spec = self._spec
         query_string = ""
         req_body: Optional[str] = None
+        cred = self._credential
 
-        # Binance / Aster: only sign private requests. V1 sends public depth
-        # requests without auth headers — adding them causes unnecessary
-        # server-side verification overhead.
-        if spec.signature_param and private and self._credential:
-            qp: dict[str, Any] = dict(params) if params else {}
+        if spec.signature_param and private and cred:
+            qp_list: list[tuple[str, str]] = []
+            if params:
+                for k, v in params.items():
+                    qp_list.append((k, str(v)))
             ts = str(int(time.time() * 1000))
             if spec.timestamp_param:
-                qp[spec.timestamp_param] = ts
-            encoded = "&".join(f"{k}={v}" for k, v in sorted(qp.items()))
-            sig = _sign_payload(spec.auth_scheme, self._credential.api_secret, encoded)
-            qp[spec.signature_param] = sig
-            query_string = "?" + "&".join(
-                f"{k}={v}" for k, v in sorted(qp.items())
-            )
-        elif spec.signature_param and not private:
-            # Public request — no signature, just params
-            if params:
-                qp = dict(params)
-                if spec.timestamp_param and spec.timestamp_param not in qp:
-                    qp[spec.timestamp_param] = str(int(time.time() * 1000))
-                query_string = "?" + "&".join(
-                    f"{k}={v}" for k, v in sorted(qp.items())
-                )
-        elif params:
-            query_parts = []
-            for k, v in sorted(params.items()):
-                query_parts.append(f"{k}={v}")
-            if query_parts:
-                query_string = "?" + "&".join(query_parts)
+                qp_list.append((spec.timestamp_param, ts))
+            if spec.recv_window_ms:
+                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
+            encoded = _build_query_v1(qp_list)
+            sig = _sign_payload(spec.auth_scheme, cred.api_secret, encoded)
+            qp_list.append((spec.signature_param, sig))
+            query_string = "?" + _build_query_v1(qp_list)
+            req_body = None
 
-        if body is not None:
+        elif spec.signature_param and not private:
+            if params:
+                qp_list = [(k, str(v)) for k, v in params.items()]
+                query_string = "?" + _build_query_v1(qp_list)
+        elif params:
+            qp_list = [(k, str(v)) for k, v in sorted(params.items())]
+            query_string = "?" + _build_query_v1(qp_list) if qp_list else ""
+
+        # Binance/Aster: body fields go into query string, not JSON body
+        if body is not None and not (spec.signature_param and private and cred):
             req_body = json.dumps(body)
 
         headers = self._build_auth_headers(method, path, query_string, req_body or "", private=private)
@@ -956,20 +1239,29 @@ class VenueTransport:
         params: Optional[dict[str, Any]] = None,
         body: Optional[dict[str, Any]] = None,
         private: bool = False,
+        _retry_ts_error: bool = True,
     ) -> dict[str, Any]:
+        """Send an HTTP request with V1 parity: server time, scoped rate limiting, time error retry."""
         client = await self._get_client()
         base_url = (
             self._spec.private_base_url if private
             else self._spec.public_base_url
         )
-        qs, headers, req_body = self._build_signed_request(method, path, params, body, private=private)
+        qs, headers, req_body = await self._build_signed_request_async(method, path, params, body, private=private)
         url = base_url + path + qs
 
-        # V1-aligned rate limiting: wait_until_ready + pace before every request
+        # V1-aligned scoped rate limiting
+        scopes = self._rest_rate_limit_scopes(method, path, base_url, private=private)
+
         if self._rate_limiter is not None:
-            rate_limit_scope = f"host:{base_url}"
-            await self._rate_limiter.wait_until_ready_for_scopes([rate_limit_scope])
-            await self._rate_limiter.pace_for_scopes([rate_limit_scope])
+            await self._rate_limiter.wait_until_ready_for_scopes(scopes)
+            await self._rate_limiter.pace_for_scopes(scopes)
+
+        # Global runtime check
+        from lightfee.rate_limit.engine import global_rate_limit_runtime as _get_global_rt
+        global_rt = _get_global_rt()
+        if global_rt is not None:
+            await global_rt.async_wait_until_ready_for_scopes(scopes)
 
         try:
             if method.upper() == "GET":
@@ -984,13 +1276,33 @@ class VenueTransport:
                 raise ValueError(f"unsupported HTTP method: {method}")
 
             if resp.status_code >= 400:
-                # V1: record rate-limit for 429/418 to trigger cooldown
-                if resp.status_code in (429, 418) and self._rate_limiter is not None:
-                    rate_limit_scope = f"host:{base_url}"
-                    retry_after_ms = _parse_retry_after_ms(resp.headers)
-                    self._rate_limiter.record_rate_limit_for_scopes(
-                        [rate_limit_scope], retry_after_ms=retry_after_ms,
+                # V1: record rate-limit for 429/418 to trigger cooldown on all scopes
+                if resp.status_code in (429, 418):
+                    now_ms = int(time.time() * 1000)
+                    retry_after_ms = _parse_venue_retry_after_ms(
+                        self._spec.venue_id, dict(resp.headers), now_ms,
                     )
+                    if self._rate_limiter is not None:
+                        self._rate_limiter.record_rate_limit_for_scopes(
+                            scopes, retry_after_ms=retry_after_ms,
+                        )
+                    # Also record in global runtime
+                    if global_rt is not None:
+                        global_rt.record_rate_limit_for_scopes(
+                            scopes, retry_after_ms=retry_after_ms or 0,
+                        )
+
+                # Binance/Aster time error retry (Task 10)
+                if _retry_ts_error and private and self._is_time_offset_retryable(
+                    resp.status_code, resp.text
+                ):
+                    self._clear_server_time_offset()
+                    await asyncio.sleep(0.1)  # V1: short delay before retry
+                    return await self._request(
+                        method, path, params=params, body=body,
+                        private=private, _retry_ts_error=False,
+                    )
+
                 cat = classify_transport_error(resp.status_code, resp.text)
                 if cat:
                     raise TransportError(
@@ -998,6 +1310,10 @@ class VenueTransport:
                         status_code=resp.status_code, body=resp.text,
                         headers=dict(resp.headers),
                     )
+
+            # V1: record success for all scopes
+            if self._rate_limiter is not None:
+                self._rate_limiter.record_success_for_scopes(scopes)
 
             if not resp.text:
                 return {}
@@ -1019,6 +1335,50 @@ class VenueTransport:
                 TransportErrorCategory.TRANSPORT_FAILURE,
                 f"unexpected error: {method} {path}: {e}",
             )
+
+    def _is_time_offset_retryable(self, status_code: int, body: str) -> bool:
+        """V1: should_retry_binance_order_error — retry once on time/signature/order-mode/5xx errors.
+
+        V1 predicate matches (case-insensitive, on error message):
+          code=-1021, recvwindow, timestamp, position-side mismatch, 500-504
+        """
+        spec = self._spec
+        if spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
+            return False
+        msg = f"status={status_code} {body}".lower()
+        return (
+            "code=-1021" in msg
+            or "recvwindow" in msg
+            or "timestamp" in msg
+            or ("position side" in msg and "setting" in msg)
+            or "positionside" in msg
+            or "status=500" in msg
+            or "status=502" in msg
+            or "status=503" in msg
+            or "status=504" in msg
+        )
+
+    def _rest_rate_limit_scopes(
+        self, method: str, path: str, base_url: str, *, private: bool = False,
+    ) -> list[str]:
+        """Derive V1 rate-limit scopes for a REST request."""
+        spec = self._spec
+        endpoint = _normalize_rest_endpoint_key(method, path)
+        host_scope = _normalize_host_scope(base_url)
+        scopes = [endpoint, host_scope]
+
+        if spec.venue_scope:
+            scopes.append(spec.venue_scope)
+
+        # Add group scope from endpoint_scope_map
+        if endpoint in spec.endpoint_scope_map:
+            group_name = spec.endpoint_scope_map[endpoint]
+            scopes.append(f"group:{group_name}")
+            if spec.venue_scope:
+                venue_id = spec.venue_scope.split(":", 1)[-1]
+                scopes.append(f"group:{venue_id}:{group_name}")
+
+        return scopes
 
     # ------------------------------------------------------------------
     # Market snapshot
@@ -1652,7 +2012,11 @@ class VenueTransport:
                     if self._credential and self._credential.account_address:
                         body["vaultAddress"] = self._credential.account_address
 
-            raw = await self._request("POST", spec.order_path, body=body, private=True)
+            # V1: Binance/Aster use query-only private signing (order fields in query, not body)
+            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                raw = await self._request("POST", spec.order_path, params=body, private=True)
+            else:
+                raw = await self._request("POST", spec.order_path, body=body, private=True)
 
             # V2: venue-specific success guard before parsing
             if spec.venue_id == Venue.BYBIT:
@@ -2210,7 +2574,11 @@ class VenueTransport:
                 body["timeInForce"] = "Gtc"
                 body["postOnly"] = True
 
-            raw = await self._request("POST", spec.order_path, body=body, private=True)
+            # V1: Binance/Aster use query-only private signing
+            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                raw = await self._request("POST", spec.order_path, params=body, private=True)
+            else:
+                raw = await self._request("POST", spec.order_path, body=body, private=True)
 
             # V2: venue-specific success guard before parsing
             if spec.venue_id == Venue.BYBIT:

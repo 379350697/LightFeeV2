@@ -1,9 +1,8 @@
-"""Rate-limit config: per-venue defaults and TOML hot-reload manager."""
+"""Rate-limit config: V1-parity dataclasses, built-in defaults, and TOML hot-reload."""
 
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -15,51 +14,290 @@ class RefreshOutcome(Enum):
 
 
 @dataclass
-class RateLimitHostConfig:
-    """Per-host (IP/domain) rate-limit budget."""
+class RateLimitGlobalConfig:
+    default_margin: float = 0.95
+    refresh_interval_secs: int = 30
 
-    capacity: float = 100.0
-    refill_per_sec: float = 10.0
+
+@dataclass
+class RateLimitHostConfig:
+    budget_per_minute: int | None = None
+    min_interval_ms: int | None = None
+
+
+@dataclass
+class VenueDocsFallback:
+    budget_per_minute: int | None = None
+    min_interval_ms: int | None = None
 
 
 @dataclass
 class RateLimitVenueConfig:
-    """Per-venue rate-limit budget."""
-
-    capacity: float = 50.0
-    refill_per_sec: float = 5.0
+    budget_per_minute: int | None = None
+    min_interval_ms: int | None = None
+    ws_budget_per_minute: int | None = None
+    endpoint_weights: dict[str, int] = field(default_factory=dict)
+    group_weights: dict[str, int] = field(default_factory=dict)
+    endpoint_min_interval_ms: dict[str, int] = field(default_factory=dict)
+    group_min_interval_ms: dict[str, int] = field(default_factory=dict)
+    scopes: dict[str, str] = field(default_factory=dict)
+    docs_fallback: VenueDocsFallback = field(default_factory=VenueDocsFallback)
 
 
 @dataclass
 class RateLimitConfig:
-    """Top-level rate-limit configuration (mirrors rate_limits.toml)."""
-
-    default_margin: float = 0.95
-    refresh_interval_secs: int = 30
+    global_config: RateLimitGlobalConfig = field(default_factory=RateLimitGlobalConfig)
     hosts: dict[str, RateLimitHostConfig] = field(default_factory=dict)
     venues: dict[str, RateLimitVenueConfig] = field(default_factory=dict)
 
+    @property
+    def default_margin(self) -> float:
+        return self.global_config.default_margin
+
+    @default_margin.setter
+    def default_margin(self, value: float) -> None:
+        self.global_config.default_margin = value
+
+    @property
+    def refresh_interval_secs(self) -> int:
+        return self.global_config.refresh_interval_secs
+
+    @refresh_interval_secs.setter
+    def refresh_interval_secs(self, value: int) -> None:
+        self.global_config.refresh_interval_secs = value
+
+
+# ---------------------------------------------------------------------------
+# V1 built-in defaults (exact copy from Rust rate_limit/config.rs)
+# ---------------------------------------------------------------------------
+
+_V1_COMMON_GROUP_WEIGHTS: dict[str, int] = {
+    "depth": 5,
+    "market": 1,
+    "order": 1,
+    "account": 1,
+    "ws_public": 1,
+    "ws_private": 1,
+}
+
+
+def _common_group_min_intervals(default_ms: int) -> dict[str, int]:
+    return {k: default_ms for k in _V1_COMMON_GROUP_WEIGHTS}
+
 
 def built_in_defaults() -> RateLimitConfig:
-    """Return per-venue built-in defaults for all 7 supported exchanges."""
-    venue_defaults = {
-        "binance": RateLimitVenueConfig(capacity=1200.0, refill_per_sec=20.0),
-        "okx": RateLimitVenueConfig(capacity=400.0, refill_per_sec=10.0),
-        "bybit": RateLimitVenueConfig(capacity=600.0, refill_per_sec=10.0),
-        "bitget": RateLimitVenueConfig(capacity=200.0, refill_per_sec=5.0),
-        "gate": RateLimitVenueConfig(capacity=200.0, refill_per_sec=4.0),
-        "aster": RateLimitVenueConfig(capacity=100.0, refill_per_sec=3.0),
-        "hyperliquid": RateLimitVenueConfig(capacity=1200.0, refill_per_sec=20.0),
-    }
     hosts = {
-        "binance.com": RateLimitHostConfig(capacity=1200.0, refill_per_sec=20.0),
-        "okx.com": RateLimitHostConfig(capacity=400.0, refill_per_sec=10.0),
-        "bybit.com": RateLimitHostConfig(capacity=600.0, refill_per_sec=10.0),
-        "bitget.com": RateLimitHostConfig(capacity=200.0, refill_per_sec=5.0),
-        "gate.io": RateLimitHostConfig(capacity=200.0, refill_per_sec=4.0),
-        "hyperliquid.xyz": RateLimitHostConfig(capacity=1200.0, refill_per_sec=20.0),
+        "fapi.binance.com": RateLimitHostConfig(budget_per_minute=2400, min_interval_ms=25),
+        "fapi.asterdex.com": RateLimitHostConfig(budget_per_minute=1200, min_interval_ms=50),
+        "api.bybit.com": RateLimitHostConfig(budget_per_minute=600, min_interval_ms=75),
+        "api.bitget.com": RateLimitHostConfig(budget_per_minute=600, min_interval_ms=100),
+        "www.okx.com": RateLimitHostConfig(budget_per_minute=600, min_interval_ms=100),
+        "api.gateio.ws": RateLimitHostConfig(budget_per_minute=900, min_interval_ms=75),
+        "api.hyperliquid.xyz": RateLimitHostConfig(budget_per_minute=1200, min_interval_ms=50),
     }
-    return RateLimitConfig(hosts=hosts, venues=venue_defaults)
+
+    venues = {
+        "binance": _venue_binance_defaults(),
+        "aster": _venue_aster_defaults(),
+        "bybit": _venue_bybit_defaults(),
+        "bitget": _venue_bitget_defaults(),
+        "okx": _venue_okx_defaults(),
+        "gate": _venue_gate_defaults(),
+        "hyperliquid": _venue_hyperliquid_defaults(),
+    }
+
+    return RateLimitConfig(
+        global_config=RateLimitGlobalConfig(default_margin=0.95, refresh_interval_secs=30),
+        hosts=hosts,
+        venues=venues,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-venue builders (exact V1 values)
+# ---------------------------------------------------------------------------
+
+
+def _venue_binance_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=2400,
+        min_interval_ms=25,
+        ws_budget_per_minute=600,
+        endpoint_weights={
+            "GET /fapi/v1/depth": 5,
+            "GET /fapi/v1/exchangeInfo": 10,
+            "GET /fapi/v1/ticker/bookTicker": 2,
+            "GET /fapi/v1/premiumIndex": 1,
+            "POST /fapi/v1/order": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"GET /fapi/v1/depth": 25},
+        group_min_interval_ms=_common_group_min_intervals(25),
+        scopes={
+            "GET /fapi/v1/depth": "depth",
+            "GET /fapi/v1/exchangeInfo": "market",
+            "GET /fapi/v1/ticker/bookTicker": "market",
+            "GET /fapi/v1/premiumIndex": "market",
+            "POST /fapi/v1/order": "order",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=1200, min_interval_ms=50),
+    )
+
+
+def _venue_aster_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=1200,
+        min_interval_ms=50,
+        ws_budget_per_minute=600,
+        endpoint_weights={
+            "GET /fapi/v1/depth": 5,
+            "GET /fapi/v1/exchangeInfo": 10,
+            "GET /fapi/v1/ticker/bookTicker": 2,
+            "GET /fapi/v1/premiumIndex": 1,
+            "POST /fapi/v1/order": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"GET /fapi/v1/depth": 50},
+        group_min_interval_ms=_common_group_min_intervals(50),
+        scopes={
+            "GET /fapi/v1/depth": "depth",
+            "GET /fapi/v1/exchangeInfo": "market",
+            "GET /fapi/v1/ticker/bookTicker": "market",
+            "GET /fapi/v1/premiumIndex": "market",
+            "POST /fapi/v1/order": "order",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=1200, min_interval_ms=50),
+    )
+
+
+def _venue_bybit_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=600,
+        min_interval_ms=75,
+        ws_budget_per_minute=300,
+        endpoint_weights={
+            "GET /v5/market/orderbook": 5,
+            "GET /v5/market/tickers": 1,
+            "GET /v5/market/instruments-info": 2,
+            "POST /v5/order/create": 1,
+            "GET /v5/account/fee-rate": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"GET /v5/market/orderbook": 75},
+        group_min_interval_ms=_common_group_min_intervals(75),
+        scopes={
+            "GET /v5/market/orderbook": "depth",
+            "GET /v5/market/tickers": "market",
+            "GET /v5/market/instruments-info": "market",
+            "POST /v5/order/create": "order",
+            "GET /v5/account/fee-rate": "account",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=600, min_interval_ms=100),
+    )
+
+
+def _venue_bitget_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=600,
+        min_interval_ms=100,
+        ws_budget_per_minute=300,
+        endpoint_weights={
+            "GET /api/v3/market/orderbook": 1,
+            "GET /api/v2/mix/market/merge-depth": 5,
+            "GET /api/v2/mix/market/ticker": 1,
+            "GET /api/v2/mix/market/contracts": 2,
+            "POST /api/v2/mix/order/place-order": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={
+            "GET /api/v3/market/orderbook": 100,
+            "GET /api/v2/mix/market/merge-depth": 100,
+        },
+        group_min_interval_ms=_common_group_min_intervals(100),
+        scopes={
+            "GET /api/v3/market/orderbook": "depth",
+            "GET /api/v2/mix/market/merge-depth": "depth",
+            "GET /api/v2/mix/market/ticker": "market",
+            "GET /api/v2/mix/market/contracts": "market",
+            "POST /api/v2/mix/order/place-order": "order",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=600, min_interval_ms=100),
+    )
+
+
+def _venue_okx_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=600,
+        min_interval_ms=100,
+        ws_budget_per_minute=300,
+        endpoint_weights={
+            "GET /api/v5/market/books": 5,
+            "GET /api/v5/public/funding-rate": 1,
+            "GET /api/v5/market/tickers": 1,
+            "POST /api/v5/trade/order": 1,
+            "GET /api/v5/account/config": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"GET /api/v5/market/books": 100},
+        group_min_interval_ms=_common_group_min_intervals(100),
+        scopes={
+            "GET /api/v5/market/books": "depth",
+            "GET /api/v5/public/funding-rate": "market",
+            "GET /api/v5/market/tickers": "market",
+            "POST /api/v5/trade/order": "order",
+            "GET /api/v5/account/config": "account",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=600, min_interval_ms=100),
+    )
+
+
+def _venue_gate_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=900,
+        min_interval_ms=75,
+        ws_budget_per_minute=300,
+        endpoint_weights={
+            "GET /api/v4/futures/usdt/order_book": 5,
+            "GET /api/v4/futures/usdt/tickers": 1,
+            "GET /api/v4/futures/usdt/contracts": 2,
+            "POST /api/v4/futures/usdt/orders": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"GET /api/v4/futures/usdt/order_book": 75},
+        group_min_interval_ms=_common_group_min_intervals(75),
+        scopes={
+            "GET /api/v4/futures/usdt/order_book": "depth",
+            "GET /api/v4/futures/usdt/tickers": "market",
+            "GET /api/v4/futures/usdt/contracts": "market",
+            "POST /api/v4/futures/usdt/orders": "order",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=900, min_interval_ms=75),
+    )
+
+
+def _venue_hyperliquid_defaults() -> RateLimitVenueConfig:
+    return RateLimitVenueConfig(
+        budget_per_minute=1200,
+        min_interval_ms=50,
+        ws_budget_per_minute=300,
+        endpoint_weights={
+            "POST /info": 2,
+            "POST /exchange": 1,
+        },
+        group_weights=dict(_V1_COMMON_GROUP_WEIGHTS),
+        endpoint_min_interval_ms={"POST /info": 50},
+        group_min_interval_ms=_common_group_min_intervals(50),
+        scopes={
+            "POST /info": "market",
+            "POST /exchange": "order",
+        },
+        docs_fallback=VenueDocsFallback(budget_per_minute=1200, min_interval_ms=50),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config manager with disk-backed hot-reload
+# ---------------------------------------------------------------------------
 
 
 class RateLimitConfigManager:
@@ -111,42 +349,90 @@ def _read_file(path: str) -> str:
 def _parse_toml_config(raw: str) -> RateLimitConfig:
     """Parse a rate_limits.toml string into RateLimitConfig.
 
-    Tolerates missing sections; falls back to built-in defaults per venue.
+    Supports V1 table format:
+
+    [global]
+    default_margin = 0.95
+    refresh_interval_secs = 30
+
+    [host."fapi.binance.com"]
+    budget_per_minute = 2400
+    min_interval_ms = 25
+
+    [venue.binance]
+    budget_per_minute = 2400
+    min_interval_ms = 25
+    ws_budget_per_minute = 600
     """
     try:
         import tomllib
     except ImportError:
-        import tomli as tomllib  # Python < 3.11 fallback
+        import tomli as tomllib
 
     data = tomllib.loads(raw)
-    config = built_in_defaults()
+    baseline = built_in_defaults()
 
-    margin = data.get("global", {}).get("default_margin")
-    if isinstance(margin, (int, float)):
-        config.default_margin = float(margin)
+    # [global]
+    global_raw = data.get("global", {})
+    if isinstance(global_raw, dict):
+        margin = global_raw.get("default_margin")
+        if isinstance(margin, (int, float)):
+            baseline.global_config.default_margin = float(margin)
+        refresh = global_raw.get("refresh_interval_secs")
+        if isinstance(refresh, int):
+            baseline.global_config.refresh_interval_secs = refresh
 
-    refresh = data.get("global", {}).get("refresh_interval_secs")
-    if isinstance(refresh, int):
-        config.refresh_interval_secs = refresh
-
-    # Merge host overrides
-    hosts_raw = data.get("hosts", {})
-    if isinstance(hosts_raw, dict):
-        for host_id, hdata in hosts_raw.items():
+    # [host."hostname"]
+    host_raw = data.get("host", {})
+    if isinstance(host_raw, dict):
+        for host_id, hdata in host_raw.items():
             if isinstance(hdata, dict):
-                config.hosts[host_id] = RateLimitHostConfig(
-                    capacity=float(hdata.get("capacity", 100.0)),
-                    refill_per_sec=float(hdata.get("refill_per_sec", 10.0)),
-                )
+                cfg = RateLimitHostConfig()
+                if "budget_per_minute" in hdata:
+                    cfg.budget_per_minute = int(hdata["budget_per_minute"])
+                if "min_interval_ms" in hdata:
+                    cfg.min_interval_ms = int(hdata["min_interval_ms"])
+                baseline.hosts[host_id] = cfg
 
-    # Merge venue overrides
-    venues_raw = data.get("venues", {})
-    if isinstance(venues_raw, dict):
-        for venue_id, vdata in venues_raw.items():
-            if isinstance(vdata, dict):
-                config.venues[venue_id] = RateLimitVenueConfig(
-                    capacity=float(vdata.get("capacity", 50.0)),
-                    refill_per_sec=float(vdata.get("refill_per_sec", 5.0)),
-                )
+    # [venue.name]
+    venue_raw = data.get("venue", {})
+    if isinstance(venue_raw, dict):
+        for venue_id, vdata in venue_raw.items():
+            if not isinstance(vdata, dict):
+                continue
+            entry = baseline.venues.setdefault(venue_id, RateLimitVenueConfig())
+            if "budget_per_minute" in vdata:
+                entry.budget_per_minute = int(vdata["budget_per_minute"])
+            if "min_interval_ms" in vdata:
+                entry.min_interval_ms = int(vdata["min_interval_ms"])
+            if "ws_budget_per_minute" in vdata:
+                entry.ws_budget_per_minute = int(vdata["ws_budget_per_minute"])
 
-    return config
+            def _update_dict(target: dict, source: dict) -> None:
+                for k, v in source.items():
+                    target[k] = int(v)
+
+            endpoints_raw = vdata.get("endpoint_weights", {})
+            if isinstance(endpoints_raw, dict):
+                _update_dict(entry.endpoint_weights, endpoints_raw)
+            groups_raw = vdata.get("group_weights", {})
+            if isinstance(groups_raw, dict):
+                _update_dict(entry.group_weights, groups_raw)
+            endpoint_min_raw = vdata.get("endpoint_min_interval_ms", {})
+            if isinstance(endpoint_min_raw, dict):
+                _update_dict(entry.endpoint_min_interval_ms, endpoint_min_raw)
+            group_min_raw = vdata.get("group_min_interval_ms", {})
+            if isinstance(group_min_raw, dict):
+                _update_dict(entry.group_min_interval_ms, group_min_raw)
+            scopes_raw = vdata.get("scopes", {})
+            if isinstance(scopes_raw, dict):
+                for k, v in scopes_raw.items():
+                    entry.scopes[k] = str(v)
+            docs_raw = vdata.get("docs_fallback", {})
+            if isinstance(docs_raw, dict):
+                if "budget_per_minute" in docs_raw:
+                    entry.docs_fallback.budget_per_minute = int(docs_raw["budget_per_minute"])
+                if "min_interval_ms" in docs_raw:
+                    entry.docs_fallback.min_interval_ms = int(docs_raw["min_interval_ms"])
+
+    return baseline

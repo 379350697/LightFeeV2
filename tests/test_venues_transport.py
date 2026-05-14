@@ -241,7 +241,7 @@ class TestBinanceAsterPostSigning:
         assert headers.get("X-MBX-APIKEY") == "ak"
 
     def test_binance_post_signature_matches_signed_payload(self):
-        """The signature must be HMAC-SHA256 of the sorted query params."""
+        """The signature must be HMAC-SHA256 of the URL-encoded query params (V1 order, with recvWindow)."""
         spec = binance_spec()
         cred = LiveCredential(api_key="bk", api_secret="bs")
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
@@ -250,13 +250,25 @@ class TestBinanceAsterPostSigning:
             body={"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.01"},
             private=True,
         )
-        # Parse query string
-        params = dict(p.split("=", 1) for p in qs.lstrip("?").split("&"))
-        assert "signature" in params
-        sig = params.pop("signature")
-        # Recompute expected signature
-        payload = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        expected = build_hmac_sha256_hex("bs", payload)
+        # body should be None for Binance (query-only signing)
+        assert body is None, f"Binance order must not have JSON body, got: {body}"
+        # Parse query string preserving order
+        params_list = [tuple(p.split("=", 1)) for p in qs.lstrip("?").split("&")]
+        sig = None
+        pre_sig_pairs = []
+        for k, v in params_list:
+            if k == "signature":
+                sig = v
+                break
+            pre_sig_pairs.append((k, v))
+        assert sig is not None, "Missing signature in query string"
+        assert "timestamp" in dict(pre_sig_pairs)
+        assert "recvWindow" in dict(pre_sig_pairs)
+        assert dict(pre_sig_pairs)["recvWindow"] == "10000"
+        # Recompute: signature is over URL-encoded query before signature
+        from urllib.parse import urlencode
+        pre_sig_query = urlencode(pre_sig_pairs)
+        expected = build_hmac_sha256_hex("bs", pre_sig_query)
         assert sig == expected, f"Signature mismatch: {sig} != {expected}"
 
     def test_binance_get_without_params_still_signs(self):
