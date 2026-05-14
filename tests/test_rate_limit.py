@@ -46,10 +46,10 @@ class TestRateLimitEngine:
 
     def test_weight_multiplier(self):
         eng = RateLimitEngine(default_margin=1.0)
-        eng.register_bucket("test", capacity=5.0, refill_per_sec=0.0)
-        eng.register_weight("test", "write", 3.0)
-        eng.try_consume("test", ["write"], now_ms=0)
-        snap = eng.bucket_snapshot("test")
+        eng.register_bucket("bucket", budget_per_minute=5.0)
+        eng.register_weight("write", 3.0)
+        eng.try_consume_scopes(["write", "bucket"], weight=3.0, now_ms=0)
+        snap = eng.bucket_snapshot("bucket")
         assert snap["tokens"] == 2.0  # 5 - 3 = 2
 
     def test_cooldown_blocks(self):
@@ -99,15 +99,15 @@ class TestRateLimitEngine:
 
     def test_try_consume_scopes(self):
         eng = RateLimitEngine(default_margin=1.0)
-        eng.register_bucket("a", capacity=5.0, refill_per_sec=0.0)
-        eng.register_bucket("b", capacity=5.0, refill_per_sec=0.0)
-        eng.try_consume_scopes(["read"], now_ms=0)
+        eng.register_bucket("a", budget_per_minute=5.0)
+        eng.register_bucket("b", budget_per_minute=5.0)
+        eng.try_consume_scopes(["a", "b"], weight=1.0, now_ms=0)
         assert eng.bucket_snapshot("a")["tokens"] == 4.0
         assert eng.bucket_snapshot("b")["tokens"] == 4.0
 
     def test_default_margin(self):
         eng = RateLimitEngine(default_margin=0.5)
-        eng.register_bucket("test", capacity=10.0, refill_per_sec=1.0)
+        eng.register_bucket("test", budget_per_minute=10.0)
         snap = eng.bucket_snapshot("test")
         assert snap["capacity"] == 5.0  # 10 * 0.5
 
@@ -357,20 +357,24 @@ class TestRateLimitEngineV1Scopes:
 
     def test_endpoint_weight_consumed(self):
         eng = RateLimitEngine(default_margin=1.0)
-        eng.register_bucket("binance", capacity=100.0, refill_per_sec=10.0)
-        eng.register_weight("binance", "GET /fapi/v1/depth", 5.0)
-        eng.register_weight("binance", "POST /fapi/v1/order", 1.0)
-        eng.try_consume("binance", ["GET /fapi/v1/depth"], now_ms=0)
-        snap = eng.bucket_snapshot("binance")
+        eng.register_bucket("venue:binance", budget_per_minute=100.0)
+        eng.register_weight("GET /fapi/v1/depth", 5.0)
+        eng.register_weight("POST /fapi/v1/order", 1.0)
+        eng.try_consume_scopes(
+            ["GET /fapi/v1/depth", "venue:binance"], weight=5.0, now_ms=0
+        )
+        snap = eng.bucket_snapshot("venue:binance")
         assert snap["tokens"] == 95.0  # 100 - 5
 
     def test_group_fallback_weight(self):
         eng = RateLimitEngine(default_margin=1.0)
-        eng.register_bucket("binance", capacity=100.0, refill_per_sec=10.0)
+        eng.register_bucket("venue:binance", budget_per_minute=100.0)
         # Register group weight for "depth" — should apply when endpoint not found
-        eng.register_weight("binance", "depth", 5.0)
-        eng.try_consume("binance", ["depth"], now_ms=0)
-        snap = eng.bucket_snapshot("binance")
+        eng.register_weight("group:depth", 5.0)
+        eng.try_consume_scopes(
+            ["some_endpoint", "venue:binance", "group:depth"], weight=5.0, now_ms=0
+        )
+        snap = eng.bucket_snapshot("venue:binance")
         assert snap["tokens"] == 95.0  # 100 - 5
 
     def test_min_interval_enforced_for_endpoint(self):

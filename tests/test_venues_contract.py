@@ -150,6 +150,12 @@ class TestLiveModeFailFast:
 # ---------------------------------------------------------------------------
 
 
+def _inject_mock_client(adapter, mock_transport):
+    """Inject mock transport and pre-fill server-time offset for V1 fail-closed compat."""
+    adapter._transport._client = httpx.AsyncClient(transport=mock_transport)
+    adapter._transport._time_offset_ms = 0
+
+
 def _build_mock_transport(fixture_json, status=200):
     """Build an httpx.MockTransport that returns fixture_json."""
 
@@ -205,6 +211,7 @@ class TestFixtureDrivenMarketSnapshot:
         # Inject the mock transport
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             snap = await adapter.fetch_market_snapshot([symbol])
@@ -238,6 +245,7 @@ class TestFixtureDrivenPosition:
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             pos = await adapter.fetch_position(symbol)
@@ -275,6 +283,7 @@ class TestFixtureDrivenOrderSuccess:
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         # Hyperliquid needs the asset index pre-populated so the mock
         # transport (single-response) doesn't need to serve metadata.
@@ -313,6 +322,7 @@ class TestFixtureDrivenOrderReject:
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         # Pre-populate Hyperliquid asset index so mock only handles the order
         if venue_id == Venue.HYPERLIQUID:
@@ -351,6 +361,7 @@ class TestBinanceOrderRequestShape:
         adapter = BinanceAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             req = OrderRequest(venue=Venue.BINANCE, symbol="BTCUSDT",
@@ -381,6 +392,7 @@ class TestAsterOrderRequestShape:
         adapter = AsterAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
@@ -409,6 +421,7 @@ class TestHyperliquidLiveOrderNowSupported:
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         # Pre-populate asset index cache to avoid mock needing metadata response
         transport._hl_meta_cache["BTC"] = 0
 
@@ -455,6 +468,7 @@ class TestBitgetProfileDetectionIntegration:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             pos = await adapter.fetch_position("BTCUSDT")
@@ -487,6 +501,7 @@ class TestBitgetProfileDetectionIntegration:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             # fetch_position will probe UTA first, get error, fall back to classic
@@ -515,6 +530,7 @@ class TestLiveModeNoSilentFakeData:
         adapter = BinanceAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             snap = await adapter.fetch_market_snapshot(["BTCUSDT"])
@@ -557,6 +573,7 @@ class TestBitgetProfileDetectionFullFlow:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             pos = await adapter.fetch_position("BTCUSDT")
@@ -574,6 +591,7 @@ class TestBitgetProfileDetectionFullFlow:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             with pytest.raises(TransportError) as exc_info:
@@ -594,6 +612,7 @@ class TestBitgetProfileDetectionFullFlow:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             with pytest.raises(TransportError) as exc_info:
@@ -637,6 +656,7 @@ class TestBitgetProfileDetectionFullFlow:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             from lightfee.venues.bitget import BitgetAccountProfile
@@ -688,6 +708,7 @@ class TestHyperliquidCapabilityConsistency:
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         transport._hl_meta_cache["BTC"] = 0
 
         try:
@@ -710,6 +731,7 @@ class TestHyperliquidCapabilityConsistency:
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             snap = await adapter.fetch_market_snapshot(["BTC"])
@@ -729,6 +751,7 @@ class TestHyperliquidCapabilityConsistency:
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             pos = await adapter.fetch_position("BTC")
@@ -755,6 +778,7 @@ class TestAckOnlyOrderIntegration:
         adapter = BybitAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             req = OrderRequest(venue=Venue.BYBIT, symbol="BTCUSDT",
@@ -774,6 +798,7 @@ class TestAckOnlyOrderIntegration:
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
+        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
             req = OrderRequest(venue=Venue.BITGET, symbol="BTCUSDT",

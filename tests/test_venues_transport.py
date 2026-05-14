@@ -2063,6 +2063,8 @@ def _make_live_transport_with_mock_response(venue: Venue, fixture_path: str):
             lambda _req: httpx.Response(200, json=fixture)
         )
     )
+    # V1: pre-fill server-time offset so mock transports don't hit server-time endpoint
+    transport._time_offset_ms = 0
     return transport
 
 
@@ -2080,6 +2082,8 @@ def _make_live_transport(venue: Venue, handler):
     transport._client = httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     )
+    # V1: pre-fill server-time offset so mock transports don't hit server-time endpoint
+    transport._time_offset_ms = 0
     return transport
 
 
@@ -2941,6 +2945,8 @@ class TestBybitAdapterHttpRedLight:
         adapter._transport._client = httpx.AsyncClient(
             transport=httpx.MockTransport(mock_handler),
         )
+        # V1: pre-fill server-time offset so mock transport doesn't hit server-time endpoint
+        adapter._transport._time_offset_ms = 0
 
         result = await adapter.fetch_order_fill_reconciliation(
             "BTCUSDT", order_id="", client_order_id="cid-1",
@@ -2987,6 +2993,8 @@ class TestBybitAdapterHttpRedLight:
         adapter._transport._client = httpx.AsyncClient(
             transport=httpx.MockTransport(mock_handler),
         )
+        # V1: pre-fill server-time offset so mock transport doesn't hit server-time endpoint
+        adapter._transport._time_offset_ms = 0
 
         with pytest.raises(TransportError):
             await adapter.fetch_order_fill_reconciliation(

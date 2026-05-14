@@ -864,13 +864,11 @@ class VenueTransport:
     # ------------------------------------------------------------------
 
     async def _server_timestamp_ms(self) -> int:
-        """Return adjusted server timestamp, fetching and caching offset on first call.
+        """V1: fetch server time, cache offset. Raises on failure — NO fallback to local time.
 
         Binance/Aster: offset = server_time - now_ms - safety_margin
         OKX: offset = server_time - now_ms
-        Bybit: offset = server_time - now_ms
-
-        Falls back to wall-clock time if server time endpoint is unavailable.
+        Bybit: offset = server_time - now_ms (auth timestamp applies separate backoff)
         """
         now_ms = int(time.time() * 1000)
         spec = self._spec
@@ -881,33 +879,64 @@ class VenueTransport:
         if not spec.server_time_path:
             return now_ms
 
-        try:
-            raw = await self._request_public_raw("GET", spec.server_time_path)
-            server_time = self._parse_server_time(raw)
-            if server_time > 0:
-                offset = server_time - now_ms - spec.server_time_safety_margin_ms
-                self._time_offset_ms = offset
-                return now_ms + offset
-        except Exception:
-            pass
-
-        # Fallback: use wall clock
-        return now_ms
-
-    async def _request_public_raw(self, method: str, path: str) -> dict[str, Any]:
-        """Issue a public GET request without auth, rate-limiting, or error wrapping.
-
-        Used for server-time fetches where we can't rate-limit or sign yet.
-        """
-        client = await self._get_client()
-        base_url = self._spec.public_base_url
-        url = base_url + path
-        resp = await client.get(url)
-        if resp.status_code >= 400:
+        # V1: server-time fetch must go through rate limiter path (send_public_request)
+        raw = await self._fetch_server_time_via_limiter("GET", spec.server_time_path)
+        server_time = self._parse_server_time(raw)
+        if server_time <= 0:
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"public raw {method} {path} returned {resp.status_code}",
+                f"{spec.venue_id.value}: failed to decode server time from response",
             )
+        offset = server_time - now_ms - spec.server_time_safety_margin_ms
+        self._time_offset_ms = offset
+        return now_ms + offset
+
+    async def _fetch_server_time_via_limiter(self, method: str, path: str) -> dict[str, Any]:
+        """V1: server-time request through limiter + pacing (send_public_request path).
+
+        On 429/418: record cooldown/backoff on all scopes exactly as _request() /
+        V1 send_*_request_with_limiter wrappers do, before raising TransportError.
+        """
+        base_url = self._spec.public_base_url
+        scopes = self._rest_rate_limit_scopes(method, path, base_url, private=False)
+
+        if self._rate_limiter is not None:
+            await self._rate_limiter.wait_until_ready_for_scopes(scopes)
+            await self._rate_limiter.pace_for_scopes(scopes)
+
+        from lightfee.rate_limit.engine import global_rate_limit_runtime as _get_global_rt
+        global_rt = _get_global_rt()
+        if global_rt is not None:
+            await global_rt.async_wait_until_ready_for_scopes(scopes)
+
+        client = await self._get_client()
+        url = base_url + path
+        resp = await client.get(url)
+
+        if resp.status_code >= 400:
+            # V1: record rate-limit for 429/418 on ALL scopes before raising
+            if resp.status_code in (429, 418):
+                now_ms = int(time.time() * 1000)
+                retry_after_ms = _parse_venue_retry_after_ms(
+                    self._spec.venue_id, dict(resp.headers), now_ms,
+                )
+                if self._rate_limiter is not None:
+                    self._rate_limiter.record_rate_limit_for_scopes(
+                        scopes, retry_after_ms=retry_after_ms,
+                    )
+                if global_rt is not None:
+                    global_rt.record_rate_limit_for_scopes(
+                        scopes, retry_after_ms=retry_after_ms or 0,
+                    )
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"server-time {method} {path} returned {resp.status_code}",
+                status_code=resp.status_code, body=resp.text,
+                headers=dict(resp.headers),
+            )
+        # V1: record success for all scopes
+        if self._rate_limiter is not None:
+            self._rate_limiter.record_success_for_scopes(scopes)
         if not resp.text:
             return {}
         return resp.json()
@@ -1019,8 +1048,10 @@ class VenueTransport:
                 server_ms = await self._server_timestamp_ms()
                 ts = _iso8601_from_ms(server_ms)
             else:
-                # Bybit: use server-time offset for timestamp
+                # Bybit: V1 applies 1500ms safety backoff to auth timestamp
                 server_ms = await self._server_timestamp_ms()
+                if spec.venue_id == Venue.BYBIT:
+                    server_ms = max(0, server_ms - 1500)  # V1: BYBIT_AUTH_TIMESTAMP_BACKOFF_MS
                 ts = str(server_ms)
 
             headers[spec.api_key_header] = cred.api_key
@@ -1106,6 +1137,8 @@ class VenueTransport:
                 ts = _iso8601_now()
             else:
                 ts = str(int(time.time() * 1000))
+                # V1: Bybit auth timestamp backoff not possible in sync path (no server time),
+                # but live path uses _build_auth_headers_async which applies -1500ms.
             headers[spec.api_key_header] = cred.api_key
             headers[spec.timestamp_header] = ts
             if spec.requires_passphrase and spec.passphrase_header:
@@ -1148,12 +1181,12 @@ class VenueTransport:
             if params:
                 for k, v in params.items():
                     qp_list.append((k, str(v)))
+            # V1: recvWindow BEFORE timestamp
+            if spec.recv_window_ms:
+                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
             ts = str(await self._server_timestamp_ms())
             if spec.timestamp_param:
                 qp_list.append((spec.timestamp_param, ts))
-            # V1: recvWindow=10000 for Binance/Aster
-            if spec.recv_window_ms:
-                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
             # Build query without signature, then sign
             encoded = _build_query_v1(qp_list)
             sig = _sign_payload(spec.auth_scheme, cred.api_secret, encoded)
@@ -1199,11 +1232,12 @@ class VenueTransport:
             if params:
                 for k, v in params.items():
                     qp_list.append((k, str(v)))
+            # V1: recvWindow BEFORE timestamp
+            if spec.recv_window_ms:
+                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
             ts = str(int(time.time() * 1000))
             if spec.timestamp_param:
                 qp_list.append((spec.timestamp_param, ts))
-            if spec.recv_window_ms:
-                qp_list.append(("recvWindow", str(spec.recv_window_ms)))
             encoded = _build_query_v1(qp_list)
             sig = _sign_payload(spec.auth_scheme, cred.api_secret, encoded)
             qp_list.append((spec.signature_param, sig))
@@ -1361,22 +1395,46 @@ class VenueTransport:
     def _rest_rate_limit_scopes(
         self, method: str, path: str, base_url: str, *, private: bool = False,
     ) -> list[str]:
-        """Derive V1 rate-limit scopes for a REST request."""
+        """Derive V1 rate-limit scopes for a REST request.
+
+        V1 reference: augment_scopes_from_config (rate_limit/mod.rs:586-636).
+        Scopes are derived from [venue.*.scopes] in rate_limits.toml / built-in config,
+        NOT from VenueSpec.endpoint_scope_map (which is empty).
+        """
         spec = self._spec
         endpoint = _normalize_rest_endpoint_key(method, path)
         host_scope = _normalize_host_scope(base_url)
         scopes = [endpoint, host_scope]
 
-        if spec.venue_scope:
-            scopes.append(spec.venue_scope)
+        # Venue scope
+        venue_id = spec.venue_id.value
+        venue_scope = f"venue:{venue_id}"
+        scopes.append(venue_scope)
 
-        # Add group scope from endpoint_scope_map
-        if endpoint in spec.endpoint_scope_map:
-            group_name = spec.endpoint_scope_map[endpoint]
-            scopes.append(f"group:{group_name}")
-            if spec.venue_scope:
-                venue_id = spec.venue_scope.split(":", 1)[-1]
+        # V1: derive group scopes from rate-limit config [venue.*.scopes]
+        from lightfee.rate_limit.config import built_in_defaults
+        from lightfee.rate_limit.engine import global_rate_limit_runtime as _get_global_rt
+
+        # Try global runtime config first, fall back to built-in defaults
+        global_rt = _get_global_rt()
+        if global_rt is not None and global_rt.config_manager is not None:
+            config = global_rt.config_manager.config
+        else:
+            config = built_in_defaults()
+
+        venue_config = config.venues.get(venue_id) if config else None
+        if venue_config is not None:
+            # Look up endpoint -> group mapping from [venue.*.scopes]
+            scope_map = getattr(venue_config, "scopes", {}) or {}
+            if endpoint in scope_map:
+                group_name = scope_map[endpoint]
                 scopes.append(f"group:{venue_id}:{group_name}")
+                scopes.append(f"group:{group_name}")
+            # Also derive from default group weights if no explicit scope mapping
+            group_weights = getattr(venue_config, "group_weights", {}) or {}
+            for group_name in group_weights:
+                if group_name not in ("ws_public", "ws_private"):
+                    continue  # only websocket groups are auto-included; REST groups use scopes map
 
         return scopes
 

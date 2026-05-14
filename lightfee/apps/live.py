@@ -55,7 +55,11 @@ async def async_main(config_path: str = "config/example.toml") -> None:
     rate_limit_config_mgr = RateLimitConfigManager(
         config_path=rate_limit_config_path(config_path)
     )
+    # V1: RateLimitRuntime::new() immediately calls build_engine_from_config
+    # with the current (built-in) config. Then refresh() tries disk config.
     rate_limit_rt = RateLimitRuntime(config_manager=rate_limit_config_mgr)
+    # Force initial refresh from disk (V1: first refresh after construction)
+    await rate_limit_rt.refresh()
     install_global_rate_limit_runtime(rate_limit_rt)
     # Wire rate-limit runtime to LiveRuntime for periodic reload
     runtime._rate_limit_runtime = rate_limit_rt
