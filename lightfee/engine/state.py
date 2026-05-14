@@ -134,6 +134,11 @@ class PendingEntry:
     repost_count: int = 0
     # --- V1 zero-fill terminal cooldown ---
     zero_fill_since_ms: int = 0
+    # --- V1 maker-leg routing (CONTRACT RECOVERY-006) ---
+    # V1: PendingEntryHedge.maker_leg: HedgeLeg — determines which venue
+    # is the maker (passive) and which is the hedge (aggressive).
+    # "long" = maker on long_venue (default), "short" = maker on short_venue.
+    maker_leg: str = "long"
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -181,21 +186,43 @@ class PendingEntry:
             return 0
         return max(0, now_ms - self.created_at_ms)
 
-    def maker_venue(self):
-        """The venue where the maker (passive) order was placed.
+    # --- V1 venue/side routing (exact replica of PendingEntryHedge methods) ---
 
-        V1: pending.maker_venue() — determined by maker_leg.
-        Default convention: maker on long venue (BUY side is passive).
+    def maker_venue(self):
+        """V1: PendingEntryHedge.maker_venue() — venue where maker order was placed.
+
+        entry_sync.rs:336-341 — match maker_leg { Long→long_venue, Short→short_venue }
         """
+        if self.maker_leg == "short":
+            return self.short_venue
         return self.long_venue
 
     def hedge_venue(self):
-        """The venue where the hedge (aggressive) order was placed.
+        """V1: PendingEntryHedge.hedge_venue() — venue where hedge order was placed.
 
-        V1: pending.hedge_venue() — opposite of maker_venue.
-        Default convention: hedge on short venue (SELL side is aggressive).
+        entry_sync.rs:354-359 — match maker_leg { Long→short_venue, Short→long_venue }
         """
+        if self.maker_leg == "short":
+            return self.long_venue
         return self.short_venue
+
+    def maker_side(self):
+        """V1: PendingEntryHedge.maker_side() — Side of the maker leg.
+
+        entry_sync.rs:368-373 — match maker_leg { Long→Buy, Short→Sell }
+        """
+        if self.maker_leg == "short":
+            return self.short_side
+        return self.long_side
+
+    def hedge_side(self):
+        """V1: PendingEntryHedge.hedge_side() — Side of the hedge leg.
+
+        entry_sync.rs:375-377 — maker_side().opposite()
+        """
+        if self.maker_leg == "short":
+            return self.long_side
+        return self.short_side
 
 
 # ---------------------------------------------------------------------------

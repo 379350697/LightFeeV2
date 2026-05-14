@@ -2170,15 +2170,10 @@ class LiveRuntime:
 
         try:
             from lightfee.core.domain import OrderRequest
-            # Determine maker side from the entry: if long_venue is maker → long_side
-            maker_side = (
-                pending.long_side if maker_venue == pending.long_venue
-                else pending.short_side
-            )
             cancel_req = OrderRequest(
                 venue=maker_venue,
                 symbol=pending.symbol,
-                side=maker_side,
+                side=pending.maker_side(),
                 quantity=pending.target_quantity,
                 price=0.0,
                 order_id=pending.maker_order_id,
@@ -2238,7 +2233,7 @@ class LiveRuntime:
         2. Use maker fill price as hedge price hint (better than pure market)
         3. Submit order; gate only on FAIL_CLOSED (recovery lifecycle is RECONCILING)
         """
-        hedge_venue = pending.short_venue
+        hedge_venue = pending.hedge_venue()
         adapter = self.get_venue_adapter(hedge_venue)
         if adapter is None:
             return False
@@ -2276,7 +2271,7 @@ class LiveRuntime:
             req = OrderRequest(
                 venue=hedge_venue,
                 symbol=pending.symbol,
-                side=pending.short_side,
+                side=pending.hedge_side(),
                 quantity=normalized,
                 price=hedge_price,
                 post_only=False,

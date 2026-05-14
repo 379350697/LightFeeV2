@@ -487,6 +487,7 @@ class EntrySyncExecutor:
             outcome=outcome,
             repost_count=next_repost_count,
             zero_fill_since_ms=zero_fill_since_ms,
+            maker_leg="long" if maker_is_long else "short",
         )
 
     # ------------------------------------------------------------------
