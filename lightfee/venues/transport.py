@@ -52,6 +52,10 @@ class LiveCredential:
 # ---------------------------------------------------------------------------
 
 
+class _BybitOrderNotFound(Exception):
+    """Internal sentinel: Bybit retCode=110001, order does not exist."""
+
+
 class TransportErrorCategory(Enum):
     TRANSPORT_FAILURE = "transport_failure"
     AUTH_FAILURE = "auth_failure"
@@ -1847,7 +1851,11 @@ class VenueTransport:
                 )
                 return self._parse_order_status_bitget(raw, venue_sym, now_ms)
 
-        except TransportError:
+        except TransportError as e:
+            if e.category == TransportErrorCategory.REQUEST_REJECTED:
+                raise
+            return None
+        except _BybitOrderNotFound:
             return None
 
         return None
@@ -1881,6 +1889,9 @@ class VenueTransport:
             raw = await self._request(
                 "GET", "/v5/order/realtime", params=params, private=True,
             )
+            # V1: check retCode before parsing (Bybit error codes doc)
+            self._require_bybit_reconciliation_success(raw, "bybit order realtime")
+
             result = raw.get("result", {})
             data = result.get("list", [None])[0] if isinstance(result, dict) and result.get("list") else result
             if not isinstance(data, dict):
@@ -1900,10 +1911,35 @@ class VenueTransport:
         exec_raw = await self._request(
             "GET", "/v5/execution/list", params=exec_params, private=True,
         )
+        # V1: check retCode for execution list too
+        self._require_bybit_reconciliation_success(exec_raw, "bybit execution reconciliation")
 
         # Step 3: aggregate executions
         return self._parse_bybit_execution_list(
             exec_raw, venue_sym, resolved_order_id, resolved_client_id, now_ms,
+        )
+
+    def _require_bybit_reconciliation_success(
+        self, raw: dict[str, Any], context: str,
+    ) -> None:
+        """Check Bybit retCode for reconciliation responses.
+
+        V1: bybit.rs checks ret_code and surfaces business errors.
+        Docs: https://bybit-exchange.github.io/docs/v5/error
+
+        - retCode=0: success → no-op
+        - retCode=110001 (Order does not exist): returns None (caller handles)
+        - Other non-zero: raises TransportError(REQUEST_REJECTED)
+        """
+        ret_code = int(raw.get("retCode", 0) or 0)
+        if ret_code == 0:
+            return
+        if ret_code == 110001:
+            # Order does not exist — caller should return None
+            raise _BybitOrderNotFound()
+        raise TransportError(
+            TransportErrorCategory.REQUEST_REJECTED,
+            f"{context}: bybit retCode={ret_code} retMsg={raw.get('retMsg', '')}",
         )
 
     def _parse_order_status_bybit(
@@ -1956,6 +1992,10 @@ class VenueTransport:
 
         V1: bybit.rs lines 2870-2893 — sum execQty, weighted notional,
         abs(execFee), max(execTime). total_quantity <= 0 → None.
+
+        Side is parsed from each execution entry (official field: side=Buy|Sell).
+        All execution sides must be consistent — mismatch raises TransportError
+        rather than silently picking one.
         """
         result = raw.get("result", {})
         executions = result.get("list", []) if isinstance(result, dict) else []
@@ -1966,6 +2006,8 @@ class VenueTransport:
         weighted_notional = 0.0
         total_fee = 0.0
         latest_fill_ms = 0
+        resolved_side: Optional[Side] = None
+
         for ex in executions:
             if not isinstance(ex, dict):
                 continue
@@ -1979,13 +2021,32 @@ class VenueTransport:
             if ex_time > latest_fill_ms:
                 latest_fill_ms = ex_time
 
+            # V1: parse side from execution (docs: side=Buy|Sell)
+            side_str = str(ex.get("side", "")).strip().lower()
+            if side_str:
+                ex_side = Side.BUY if side_str == "buy" else Side.SELL
+                if resolved_side is None:
+                    resolved_side = ex_side
+                elif resolved_side != ex_side:
+                    raise TransportError(
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        f"bybit execution list has inconsistent sides: "
+                        f"{resolved_side.value} vs {ex_side.value} (orderId={order_id})",
+                    )
+
         if total_qty <= 0.0:
             return None
+
+        if resolved_side is None:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"bybit execution list has no side field (orderId={order_id})",
+            )
 
         return OrderFillReconciliation(
             venue=Venue.BYBIT,
             symbol=venue_sym,
-            side=Side.BUY,
+            side=resolved_side,
             quantity=total_qty,
             average_price=weighted_notional / total_qty,
             order_id=order_id,
@@ -2010,9 +2071,9 @@ class VenueTransport:
 
         order_id = str(data.get("orderId", ""))
         client_id = str(data.get("clientOid", ""))
-        # V1 multi-key fallback: baseVolume, filledQty, fillQty, size
+        # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, size
         cum_qty = _safe_float(
-            data.get("baseVolume", data.get("filledQty", data.get("fillSz", "0")))
+            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillSz", "0"))))
         )
         avg_price = _safe_float(
             data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))
@@ -2032,7 +2093,15 @@ class VenueTransport:
             fee_quote = abs(_safe_float(fee_val))
         if fee_quote is None and "feeDetail" in data:
             fd = data["feeDetail"]
-            if isinstance(fd, dict):
+            if isinstance(fd, list):
+                # Sum individual fee entries (official UTA shape)
+                fee_sum = 0.0
+                for entry in fd:
+                    if isinstance(entry, dict):
+                        fee_sum += abs(_safe_float(entry.get("fee", "0")))
+                if fee_sum > 0:
+                    fee_quote = fee_sum
+            elif isinstance(fd, dict):
                 tf = fd.get("totalFee")
                 if tf is not None:
                     fee_quote = abs(_safe_float(tf))

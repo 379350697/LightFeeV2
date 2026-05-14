@@ -703,3 +703,216 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         c = self._make_real_candidate()
         reason = runtime_with_l2._entry_local_l2_selection_blocker(c, now_ms=10000)
         assert reason is None
+
+    # ------------------------------------------------------------------
+    # RED-LIGHT: V2 snapshot ingress enriches missing candidate fields
+    # ------------------------------------------------------------------
+
+    def test_redlight_snapshot_v2_ingress_fills_pair_id_and_funding_ts(self):
+        """RED-LIGHT: _dict_to_snapshot() must fill pair_id and
+        first_funding_timestamp_ms from symbol/venues/quotes when missing.
+
+        V1: CandidateOpportunity always has pair_id + first_funding_timestamp_ms.
+        V2 gap: _dict_to_snapshot() passes CandidateInput(**c) which defaults
+        pair_id="" and first_funding_timestamp_ms=0 for schema-2 snapshots
+        where the sidecar didn't include these fields. This makes the candidate
+        permanently prewarm-blocked in runtime.
+
+        This test MUST FAIL on current V2 code — proving the gap exists.
+        """
+        from lightfee.sidecar.publisher import _dict_to_snapshot
+
+        snapshot_dict = {
+            "schema_version": 2,
+            "published_at_ms": 10000,
+            "market_observed_at_ms": 10000,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {
+                    "venue": "binance", "symbol": "BTCUSDT",
+                    "bid": 50000, "ask": 50010,
+                    "funding_rate_bps": 10.0, "funding_timestamp_ms": 15000,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit", "symbol": "BTCUSDT",
+                    "bid": 50005, "ask": 50015,
+                    "funding_rate_bps": -5.0, "funding_timestamp_ms": 15000,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance", "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0, "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0, "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+                # NOTE: no pair_id, no first_funding_timestamp_ms, no funding_timestamp_ms
+            }],
+        }
+        snapshot = _dict_to_snapshot(snapshot_dict)
+        assert len(snapshot.candidates) == 1
+        c = snapshot.candidates[0]
+
+        # RED-LIGHT: pair_id must be derived from symbol + venues
+        assert c.pair_id == "btcusdt:binance->bybit", (
+            f"RED-LIGHT FAIL: pair_id should be 'btcusdt:binance->bybit', "
+            f"got {c.pair_id!r}. _dict_to_snapshot() must derive it from "
+            f"symbol/long_venue/short_venue when absent."
+        )
+
+        # RED-LIGHT: first_funding_timestamp_ms must be derived from quotes
+        assert c.first_funding_timestamp_ms == 15000, (
+            f"RED-LIGHT FAIL: first_funding_timestamp_ms should be 15000 "
+            f"(min of long/short quote funding_timestamp_ms), "
+            f"got {c.first_funding_timestamp_ms}. "
+            f"_dict_to_snapshot() must derive it from quotes when absent."
+        )
+
+        # RED-LIGHT: funding_timestamp_ms synced to first_funding_timestamp_ms
+        assert c.funding_timestamp_ms == 15000, (
+            f"RED-LIGHT FAIL: funding_timestamp_ms should be 15000, "
+            f"got {c.funding_timestamp_ms}. Must sync with first_funding_timestamp_ms."
+        )
+
+    def test_redlight_snapshot_v2_enriched_candidate_passes_prewarm(
+        self, runtime_with_l2,
+    ):
+        """RED-LIGHT: candidate enriched by _dict_to_snapshot() must pass
+        the prewarm gate when primary-tracked and dual-ready.
+
+        Proves end-to-end: snapshot load → runtime blocker → None (not blocked).
+        """
+        from lightfee.sidecar.publisher import _dict_to_snapshot
+
+        snapshot_dict = {
+            "schema_version": 2,
+            "published_at_ms": 10000,
+            "market_observed_at_ms": 10000,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {
+                    "venue": "binance", "symbol": "BTCUSDT",
+                    "bid": 50000, "ask": 50010,
+                    "funding_rate_bps": 10.0, "funding_timestamp_ms": 15000,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit", "symbol": "BTCUSDT",
+                    "bid": 50005, "ask": 50015,
+                    "funding_rate_bps": -5.0, "funding_timestamp_ms": 15000,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance", "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0, "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0, "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+            }],
+        }
+        snapshot = _dict_to_snapshot(snapshot_dict)
+        c = snapshot.candidates[0]
+
+        # Ensure enrichment happened (if not, this itself is the red-light)
+        assert c.pair_id and c.first_funding_timestamp_ms > 0, (
+            "prerequisite: candidate must be enriched by _dict_to_snapshot()"
+        )
+
+        rt = runtime_with_l2
+        pair_id = c.pair_id
+        rt._tracked_primary_pair_ids.add(pair_id)
+        session = rt.entry_l2_sessions.get_or_create_session(pair_id)
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.refresh_state(now_ms=10000, stale_after_ms=300_000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is None, (
+            f"RED-LIGHT FAIL: enriched candidate with future funding ts + "
+            f"primary tracking + dual-ready should NOT be blocked. "
+            f"Blocker returned: {reason}"
+        )
+
+    def test_redlight_snapshot_v2_missing_quotes_fail_closed(self):
+        """RED-LIGHT: when candidate AND quotes lack funding_timestamp_ms,
+        the candidate must be blocked, NOT silently become tradeable.
+
+        V1: a candidate without usable funding timestamp is not tradeable.
+        V2 gap: candidate loads with first_funding_timestamp_ms=0, which
+        looks tradeable in discovery but permanently prewarm-blocks in
+        runtime. The fix must either:
+          - fail closed: candidate.blocked=True with clear reason, OR
+          - raise a snapshot schema error.
+
+        This test MUST FAIL on current V2 — where candidate loads as
+        non-blocked with first_funding_timestamp_ms=0.
+        """
+        from lightfee.sidecar.publisher import _dict_to_snapshot
+
+        snapshot_dict = {
+            "schema_version": 2,
+            "published_at_ms": 10000,
+            "market_observed_at_ms": 10000,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                # quotes present but funding_timestamp_ms=0
+                "binance:BTCUSDT": {
+                    "venue": "binance", "symbol": "BTCUSDT",
+                    "bid": 50000, "ask": 50010,
+                    "funding_rate_bps": 10.0, "funding_timestamp_ms": 0,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit", "symbol": "BTCUSDT",
+                    "bid": 50005, "ask": 50015,
+                    "funding_rate_bps": -5.0, "funding_timestamp_ms": 0,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance", "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0, "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0, "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+            }],
+        }
+        snapshot = _dict_to_snapshot(snapshot_dict)
+        assert len(snapshot.candidates) == 1
+        c = snapshot.candidates[0]
+
+        # RED-LIGHT: candidate with no usable funding timestamp must be
+        # blocked or schema must reject it. It must NOT be silently tradeable
+        # with first_funding_timestamp_ms=0.
+        is_fail_closed = (
+            c.blocked
+            and any(
+                "missing_candidate_identity_or_funding_timestamp" in r
+                for r in c.blocked_reasons
+            )
+        )
+        assert is_fail_closed, (
+            f"RED-LIGHT FAIL: candidate with zero first_funding_timestamp_ms "
+            f"must be blocked or schema-rejected. Got blocked={c.blocked}, "
+            f"blocked_reasons={c.blocked_reasons}, "
+            f"first_funding_timestamp_ms={c.first_funding_timestamp_ms}. "
+            f"Silently generating tradeable-looking candidates with ts=0 "
+            f"is a data-contract violation."
+        )

@@ -127,6 +127,63 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         TransferLifecycle,
     )
 
+    quotes_raw = d.get("quotes", {})
+
+    def _enrich_candidate(c: dict) -> CandidateInput:
+        """Enrich a candidate dict with V1-required identity + prewarm fields.
+
+        V1: every CandidateOpportunity carries a stable pair_id and a usable
+        first_funding_timestamp_ms.  When a schema-2 snapshot omits these
+        fields, we derive them from the candidate's own symbol/venues and the
+        snapshot quotes so the runtime can apply the prewarm gate correctly.
+        If we cannot derive a usable timestamp, the candidate is marked
+        blocked — it must not appear tradeable with first_funding_timestamp_ms=0.
+        """
+        pair_id = str(c.get("pair_id", "") or "")
+        symbol = str(c.get("symbol", ""))
+        long_ven = str(c.get("long_venue", ""))
+        short_ven = str(c.get("short_venue", ""))
+
+        if not pair_id and symbol and long_ven and short_ven:
+            pair_id = f"{symbol.lower()}:{long_ven}->{short_ven}"
+
+        ff_ts = int(c.get("first_funding_timestamp_ms", 0) or 0)
+        f_ts = int(c.get("funding_timestamp_ms", 0) or 0)
+
+        if ff_ts <= 0:
+            # Derive from quotes: min positive funding_timestamp_ms across
+            # long-venue:symbol and short-venue:symbol
+            ts_candidates: list[int] = []
+            for venue in (long_ven, short_ven):
+                qkey = f"{venue}:{symbol}"
+                q = quotes_raw.get(qkey, {})
+                if isinstance(q, dict):
+                    qts = int(q.get("funding_timestamp_ms", 0) or 0)
+                    if qts > 0:
+                        ts_candidates.append(qts)
+            if ts_candidates:
+                ff_ts = min(ts_candidates)
+                if f_ts <= 0:
+                    f_ts = ff_ts
+
+        candidate = CandidateInput(**c)
+        if pair_id:
+            candidate.pair_id = pair_id
+        if ff_ts > 0:
+            candidate.first_funding_timestamp_ms = ff_ts
+        if f_ts > 0:
+            candidate.funding_timestamp_ms = f_ts
+
+        # Fail-closed: candidates without usable funding timestamp are not tradeable.
+        # V1 never emits a tradeable candidate with first_funding_timestamp_ms=0.
+        if candidate.first_funding_timestamp_ms <= 0:
+            candidate.blocked = True
+            candidate.blocked_reasons = list(candidate.blocked_reasons) + [
+                "missing_candidate_identity_or_funding_timestamp"
+            ]
+
+        return candidate
+
     return SidecarSnapshot(
         schema_version=d.get("schema_version", 0),
         published_at_ms=d.get("published_at_ms", 0),
@@ -139,6 +196,6 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         degraded_domains=d.get("degraded_domains", []),
         source_mode=d.get("source_mode", ""),
         acquisition_mode=d.get("acquisition_mode", ""),
-        quotes={k: QuoteSnapshot(**v) for k, v in d.get("quotes", {}).items()},
-        candidates=[CandidateInput(**c) for c in d.get("candidates", [])],
+        quotes={k: QuoteSnapshot(**v) for k, v in quotes_raw.items()},
+        candidates=[_enrich_candidate(c) for c in d.get("candidates", [])],
     )

@@ -2867,3 +2867,267 @@ class TestBitgetParseOrderStatusRedLight:
         assert result.average_price == pytest.approx(51000)
         assert result.order_id == "oid-1"
         assert result.client_order_id == "cid-1"
+
+
+# ===========================================================================
+# RED-LIGHT: Bybit adapter real HTTP path — execution side + retCode
+# ===========================================================================
+
+
+class TestBybitAdapterHttpRedLight:
+    """RED-LIGHT: BybitAdapter.fetch_order_fill_reconciliation() via real
+    HTTP mock must parse execution side and surface retCode errors.
+
+    V1 ref: src/live/bybit.rs fetch_order_fill_reconciliation (lines 2820-2894)
+    Docs: https://bybit-exchange.github.io/docs/zh-TW/v5/order/execution
+          https://bybit-exchange.github.io/docs/v5/error
+
+    Current V2 gaps:
+      - _parse_bybit_execution_list() hardcodes side=Side.BUY
+      - _fetch_order_status_bybit() doesn't call _require_bybit_success()
+      - Nonzero retCode silently returns None instead of raising TransportError
+    """
+
+    @pytest.mark.anyio
+    async def test_redlight_bybit_adapter_sell_execution_side(self):
+        """RED-LIGHT: BybitAdapter with MockTransport, execution side=Sell
+        → result.side must be SELL, not BUY.
+
+        Uses full adapter path: BybitAdapter → transport.fetch_order_status
+        → _fetch_order_status_bybit → _parse_bybit_execution_list.
+        No monkeypatching of parser or fetcher methods.
+        """
+        import httpx
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.core.domain import Side
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/v5/order/realtime" in url:
+                return httpx.Response(200, json={
+                    "retCode": 0, "retMsg": "OK",
+                    "result": {"list": [{
+                        "orderId": "oid-1", "orderLinkId": "cid-1",
+                    }]},
+                })
+            if "/v5/execution/list" in url:
+                return httpx.Response(200, json={
+                    "retCode": 0, "retMsg": "OK",
+                    "result": {"list": [{
+                        "execQty": "0.5", "execPrice": "50000",
+                        "execFee": "0.1", "execTime": "2000",
+                        "side": "Sell", "symbol": "BTCUSDT",
+                    }]},
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="cid-1",
+        )
+        await adapter._transport.close()
+
+        assert result is not None, (
+            "RED-LIGHT FAIL: fetch_order_fill_reconciliation returned None "
+            "for sell-side execution"
+        )
+        assert result.side == Side.SELL, (
+            f"RED-LIGHT FAIL: execution side=Sell should produce Side.SELL, "
+            f"got {result.side}. _parse_bybit_execution_list hardcodes Side.BUY."
+        )
+        assert result.quantity == pytest.approx(0.5)
+        assert result.average_price == pytest.approx(50000)
+
+    @pytest.mark.anyio
+    async def test_redlight_bybit_retcode_nonzero_raises(self):
+        """RED-LIGHT: Bybit retCode=10001 (Request parameter error) must
+        raise TransportError, NOT silently return None.
+
+        V1: bybit.rs checks ret_code and surfaces business errors.
+        V2 gap: _fetch_order_status_bybit doesn't call _require_bybit_success,
+        so retCode != 0 passes through to the parser which may return None.
+        """
+        import httpx
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import LiveCredential, TransportError
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/v5/order/realtime" in url:
+                return httpx.Response(200, json={
+                    "retCode": 10001,
+                    "retMsg": "Request parameter error",
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        with pytest.raises(TransportError):
+            await adapter.fetch_order_fill_reconciliation(
+                "BTCUSDT", order_id="", client_order_id="cid-1",
+            )
+
+        await adapter._transport.close()
+
+    @pytest.mark.anyio
+    async def test_redlight_bybit_retcode_order_not_found_returns_none(self):
+        """Bybit retCode=110001 (Order does not exist) may return None
+        (order-not-found is not a transport error — the order simply
+        doesn't exist).
+        """
+        import httpx
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import LiveCredential
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/v5/order/realtime" in url:
+                return httpx.Response(200, json={
+                    "retCode": 110001,
+                    "retMsg": "Order does not exist",
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="cid-1",
+        )
+        await adapter._transport.close()
+
+        assert result is None, (
+            f"order-not-found (110001) should return None, got {result}"
+        )
+
+
+# ===========================================================================
+# RED-LIGHT: Bitget official UTA field regression
+# ===========================================================================
+
+
+class TestBitgetAdapterHttpRedLight:
+    """RED-LIGHT: BitgetAdapter.fetch_order_fill_reconciliation() must
+    handle official UTA field shapes including cumExecQty, avgPrice,
+    orderStatus, side, and feeDetail list.
+
+    Docs: https://www.bitget.com/api-doc/uta/trade/Get-Order-Details
+    """
+
+    @pytest.mark.anyio
+    async def test_redlight_bitget_official_uta_fields(self):
+        """Bitget official UTA order-info response shape regression.
+
+        Official fields: code, cumExecQty, avgPrice, orderStatus, side,
+        feeDetail (list of fee entries).
+        """
+        import httpx
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.core.domain import Side
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/api/v3/trade/order-info" in url:
+                return httpx.Response(200, json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": {
+                        "orderId": "oid-1",
+                        "clientOid": "cid-1",
+                        "symbol": "BTCUSDT",
+                        "orderStatus": "filled",
+                        "side": "sell",
+                        "cumExecQty": "0.5",
+                        "avgPrice": "51000",
+                        "feeDetail": [
+                            {"fee": "0.05", "feeCoin": "USDT"},
+                            {"fee": "0.05", "feeCoin": "USDT"},
+                        ],
+                        "cTime": "2000000",
+                        "uTime": "2000000",
+                    },
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="cid-1",
+        )
+        await adapter._transport.close()
+
+        assert result is not None, "should return reconciliation for filled order"
+        assert result.side == Side.SELL, (
+            f"RED-LIGHT: side should be SELL, got {result.side}"
+        )
+        assert result.quantity == pytest.approx(0.5), (
+            f"RED-LIGHT: quantity should be 0.5 (from cumExecQty), got {result.quantity}"
+        )
+        assert result.average_price == pytest.approx(51000), (
+            f"RED-LIGHT: avg price should be 51000 (from avgPrice), got {result.average_price}"
+        )
+        assert result.fee_quote is not None and result.fee_quote == pytest.approx(0.1), (
+            f"RED-LIGHT: fee should be 0.1 (sum of feeDetail fees), got {result.fee_quote}"
+        )
+
+    @pytest.mark.anyio
+    async def test_redlight_bitget_nonzero_code_raises(self):
+        """Bitget code != 00000 must raise, not return None.
+
+        _require_bitget_success raises OrderSubmitError(REJECTED), which
+        propagates through fetch_order_fill_reconciliation.
+        """
+        import httpx
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.core.errors import OrderSubmitError
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/api/v3/trade/order-info" in url:
+                return httpx.Response(200, json={
+                    "code": "40001",
+                    "msg": "Invalid parameter",
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        with pytest.raises(OrderSubmitError):
+            await adapter.fetch_order_fill_reconciliation(
+                "BTCUSDT", order_id="", client_order_id="cid-1",
+            )
+
+        await adapter._transport.close()
