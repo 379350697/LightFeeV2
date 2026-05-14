@@ -46,3 +46,16 @@ def transition_to_running(state: EngineState) -> None:
     """Transition to RUNNING after successful reconciliation."""
     set_lifecycle(state, EngineLifecycle.RUNNING)
     set_global_risk_mode(state, GlobalRiskMode.RUNNING)
+
+
+def clear_risk_mode_for_recovery(state: EngineState) -> None:
+    """Explicitly reset risk_mode to RUNNING after successful startup recovery.
+
+    V1: EngineState.clear_recovery_blocked_state() in recovery.rs —
+    when recovery completes without blocking work, the fail_closed / reduced
+    risk mode must be cleared. set_global_risk_mode uses .max() which keeps
+    FAIL_CLOSED(3) > RUNNING(0) sticky — this bypass exists specifically
+    for the recovery completion path.
+    """
+    state.risk_mode = GlobalRiskMode.RUNNING
+    state.lifecycle = EngineLifecycle.RUNNING

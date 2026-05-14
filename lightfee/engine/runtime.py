@@ -2312,12 +2312,8 @@ class LiveRuntime:
 
         if not has_opens and not has_pending and not has_pending_closes and not has_passive_closes:
             # All clear — transition to RUNNING
-            # V1: after successful recovery, risk_mode must be RUNNING.
-            # set_global_risk_mode uses .max() which would keep FAIL_CLOSED(3) >
-            # RUNNING(0) sticky. Explicitly reset here.
-            from lightfee.risk.modes import GlobalRiskMode
-            set_lifecycle(self.state, EngineLifecycle.RUNNING)
-            self.state.risk_mode = GlobalRiskMode.RUNNING
+            from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+            clear_risk_mode_for_recovery(self.state)
             self.state.last_error = None
             self._try_journal("runtime.running",
                 {"reason": "startup_recovery_completed", "ts_ms": wall_clock_now_ms()})
@@ -2335,9 +2331,8 @@ class LiveRuntime:
                     "max": max_positions,
                 })
             else:
-                from lightfee.risk.modes import GlobalRiskMode
-                set_lifecycle(self.state, EngineLifecycle.RUNNING)
-                self.state.risk_mode = GlobalRiskMode.RUNNING
+                from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+                clear_risk_mode_for_recovery(self.state)
                 self.state.last_error = None
                 self._try_journal("runtime.running", {
                     "reason": "startup_recovery_completed_with_positions",
