@@ -100,6 +100,10 @@ class CandidateInput:
     long_venue_index: int = 0
     short_venue_index: int = 0
     entry_notional_quote: float = 0.0
+    # V1 parity fields (CONTRACT OPP-002: candidate identity + prewarm)
+    pair_id: str = ""
+    funding_timestamp_ms: int = 0
+    first_funding_timestamp_ms: int = 0
 
 
 @dataclass

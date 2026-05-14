@@ -421,8 +421,13 @@ class TestSelectTrackedWithMissingPairId:
 # ---------------------------------------------------------------------------
 
 
-class TestEntryLocalL2SelectionBlocker:
-    """Regression: blocker must work with real CandidateInput (no pair_id/created_at_ms hacks)."""
+class TestEntryLocalL2SelectionBlockerRealCandidateInput:
+    """RED-LIGHT: blocker MUST work with real CandidateInput loaded from snapshot dict.
+
+    Current V2 CandidateInput lacks first_funding_timestamp_ms, funding_timestamp_ms,
+    and pair_id. These tests use ONLY the real CandidateInput class (no fakes).
+    Tests marked REDLIGHT must FAIL on current V2 code.
+    """
 
     @pytest.fixture
     def runtime_with_l2(self, tmp_path):
@@ -441,80 +446,260 @@ class TestEntryLocalL2SelectionBlocker:
         )
         return LiveRuntime(config)
 
-    class RealCandidate:
-        """Mimics actual CandidateInput — no pair_id, no created_at_ms."""
-        def __init__(self, symbol="BTCUSDT", long_venue="binance", short_venue="bybit",
-                     ranking_edge_bps=15.0, funding_timestamp_ms=5000):
-            self.symbol = symbol
-            self.long_venue = long_venue
-            self.short_venue = short_venue
-            self.ranking_edge_bps = ranking_edge_bps
-            self.funding_timestamp_ms = funding_timestamp_ms
-            self.entry_notional_quote = 1000.0
-            self.expected_edge_bps = 15.0
-            self.worst_case_edge_bps = 10.0
-            self.funding_edge_bps = 15.0
+    @staticmethod
+    def _make_real_candidate(**overrides) -> "CandidateInput":
+        """Build a real CandidateInput from the actual dataclass — no fake classes."""
+        from lightfee.sidecar.snapshot import CandidateInput
+        kwargs = dict(
+            long_venue="binance", short_venue="bybit", symbol="BTCUSDT",
+            funding_diff_bps=15.0, funding_edge_bps=15.0,
+            expected_edge_bps=15.0, worst_case_edge_bps=10.0,
+            ranking_edge_bps=15.0,
+        )
+        kwargs.update(overrides)
+        return CandidateInput(**kwargs)
 
-    def test_no_session_dual_ready_must_block(self, runtime_with_l2):
-        """Real candidate with no session MUST be blocked."""
-        rt = runtime_with_l2
-        c = self.RealCandidate(funding_timestamp_ms=5000)
-        # No session — must block
-        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason is not None, "entry should be blocked without session"
-        assert "dual_ready" in reason or "primary_tracking" in reason or "prewarm" in reason
+    # ------------------------------------------------------------------
+    # REDLIGHT 1: real CandidateInput with all conditions met → currently blocked
+    # ------------------------------------------------------------------
 
-    def test_missing_funding_timestamp_blocks_with_prewarm(self, runtime_with_l2):
-        """Candidate without funding_timestamp_ms must be blocked for prewarm."""
+    def test_redlight_real_candidate_dual_ready_blocked_by_missing_funding_ts(
+        self, runtime_with_l2,
+    ):
+        """WAS RED-LIGHT, NOW GREEN: real CandidateInput with future
+        first_funding_timestamp_ms within prewarm window + primary tracking
+        + dual-ready session → blocker returns None.
+        """
         rt = runtime_with_l2
-        c = self.RealCandidate(funding_timestamp_ms=0)
-        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason == "entry_local_l2_waiting_for_prewarm_window"
+        # first_funding_timestamp_ms at 15000, now_ms at 10000 → remaining_ms=5000
+        # prewarm_window=480s*1000=480000ms → 5000 < 480000 → within window
+        c = self._make_real_candidate(first_funding_timestamp_ms=15000)
 
-    def test_dual_ready_session_allows_entry(self, runtime_with_l2):
-        """Dual-ready session for a tracked primary allows entry."""
-        rt = runtime_with_l2
-        c = self.RealCandidate()
         pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
 
-        # Tracked as primary
+        # Set up primary tracking
         rt._tracked_primary_pair_ids.add(pair_id)
 
-        # Create dual-ready session
+        # Set up dual-ready session
         session = rt.entry_l2_sessions.get_or_create_session(pair_id)
         session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
         session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
         session.refresh_state(now_ms=10000, stale_after_ms=300_000)
 
-        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason is None, f"dual-ready entry should not be blocked, got: {reason}"
+        assert session.both_legs_ready(10000, 300_000), "session should be dual-ready"
+        assert pair_id in rt._tracked_primary_pair_ids, "pair should be primary tracked"
 
-    def test_not_in_primary_set_blocks(self, runtime_with_l2):
-        """Session exists but not in tracked primary set → blocked."""
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is None, (
+            f"dual-ready + primary-tracked candidate with future funding ts "
+            f"should NOT be blocked, but blocker returned: {reason}."
+        )
+
+    def test_first_funding_ts_outside_prewarm_window_blocked(self, runtime_with_l2):
+        """Candidate with first_funding_timestamp_ms too far in future is blocked."""
         rt = runtime_with_l2
-        c = self.RealCandidate()
-        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
-
-        # Session exists but NOT in primary set
-        session = rt.entry_l2_sessions.get_or_create_session(pair_id)
-        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
-        session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        # remaining_ms = 1000000 - 10000 = 990000 > prewarm_window(480000)
+        c = self._make_real_candidate(first_funding_timestamp_ms=1000000)
 
         reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason == "entry_local_l2_waiting_for_primary_tracking"
+        assert reason == "entry_local_l2_waiting_for_prewarm_window"
 
-    def test_not_blocked_when_local_l2_disabled(self, runtime_with_l2):
-        """When local_l2_enabled=False, blocker returns None always."""
+    def test_first_funding_ts_in_past_blocked(self, runtime_with_l2):
+        """Candidate with first_funding_timestamp_ms in the past is blocked."""
+        rt = runtime_with_l2
+        # remaining_ms = 5000 - 10000 = -5000 <= 0
+        c = self._make_real_candidate(first_funding_timestamp_ms=5000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_local_l2_waiting_for_prewarm_window"
+
+    # ------------------------------------------------------------------
+    # REDLIGHT 2: snapshot dict load drops pair_id and funding timestamps
+    # ------------------------------------------------------------------
+
+    def test_redlight_snapshot_dict_load_drops_pair_id_and_funding_ts(self):
+        """RED-LIGHT: _dict_to_snapshot() with V2 data drops pair_id and
+        first_funding_timestamp_ms from CandidateInput.
+
+        V1 snapshot candidates carry pair_id, funding_timestamp_ms, and
+        first_funding_timestamp_ms. Current V2 CandidateInput silently lacks
+        these fields. This test proves they are missing after snapshot load.
+        """
+        from lightfee.sidecar.publisher import _dict_to_snapshot
+
+        snapshot_dict = {
+            "schema_version": 2,
+            "published_at_ms": 10000,
+            "market_observed_at_ms": 10000,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {
+                    "venue": "binance", "symbol": "BTCUSDT",
+                    "bid": 50000, "ask": 50010,
+                    "funding_rate_bps": 10.0, "funding_timestamp_ms": 15000,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit", "symbol": "BTCUSDT",
+                    "bid": 50005, "ask": 50015,
+                    "funding_rate_bps": -5.0, "funding_timestamp_ms": 15000,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance", "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0, "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0, "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+            }],
+        }
+        snapshot = _dict_to_snapshot(snapshot_dict)
+        assert len(snapshot.candidates) == 1
+        c = snapshot.candidates[0]
+
+        # RED-LIGHT: CandidateInput should eventually carry pair_id and
+        # first_funding_timestamp_ms. Currently it does not.
+        pair_id_from_field = getattr(c, "pair_id", None)
+        ff_ts = getattr(c, "first_funding_timestamp_ms", None)
+        f_ts = getattr(c, "funding_timestamp_ms", None)
+
+        # These assertions MUST fail on current V2 — proving the fields are missing
+        assert pair_id_from_field is not None, (
+            "RED-LIGHT FAIL: CandidateInput should have pair_id field"
+        )
+        assert ff_ts is not None, (
+            "RED-LIGHT FAIL: CandidateInput should have first_funding_timestamp_ms field"
+        )
+        assert f_ts is not None, (
+            "RED-LIGHT FAIL: CandidateInput should have funding_timestamp_ms field"
+        )
+
+    # ------------------------------------------------------------------
+    # REDLIGHT 3: V1 snapshot → V2 drops pair_id/funding timestamps
+    # ------------------------------------------------------------------
+
+    def test_redlight_v1_snapshot_to_v2_drops_pair_id_and_ts(self):
+        """RED-LIGHT: convert_v1_snapshot_to_v2 drops pair_id, funding_timestamp_ms,
+        and first_funding_timestamp_ms from V1 candidates.
+        """
+        from lightfee.sidecar.v1_compat import convert_v1_snapshot_to_v2
+
+        v1_snapshot = {
+            "schema_version": 1,
+            "published_at_ms": 10000,
+            "market_observed_at_ms": 10000,
+            "quotes": {
+                "binance": {
+                    "BTCUSDT": {
+                        "best_bid": 50000, "best_ask": 50010,
+                        "funding_rate": 10.0, "funding_timestamp_ms": 15000,
+                    },
+                },
+                "bybit": {
+                    "BTCUSDT": {
+                        "best_bid": 50005, "best_ask": 50015,
+                        "funding_rate": -5.0, "funding_timestamp_ms": 15000,
+                    },
+                },
+            },
+            "candidates": [{
+                "symbol": "BTCUSDT",
+                "long_venue": "binance", "short_venue": "bybit",
+                "pair_id": "btcusdt:binance->bybit",
+                "funding_timestamp_ms": 15000,
+                "first_funding_timestamp_ms": 15000,
+                "funding_edge_bps": 15.0, "quality_penalty_bps": 0.0,
+                "rank": 1,
+            }],
+        }
+        v2_dict = convert_v1_snapshot_to_v2(v1_snapshot)
+        candidates = v2_dict.get("candidates", [])
+        assert len(candidates) == 1
+        c = candidates[0]
+
+        # RED-LIGHT: these must fail on current V2 — V1 compat drops the fields
+        assert c.get("pair_id") is not None, (
+            "RED-LIGHT FAIL: V1→V2 compat should preserve pair_id"
+        )
+        assert c.get("first_funding_timestamp_ms") is not None, (
+            "RED-LIGHT FAIL: V1→V2 compat should preserve first_funding_timestamp_ms"
+        )
+        assert c.get("funding_timestamp_ms") is not None, (
+            "RED-LIGHT FAIL: V1→V2 compat should preserve funding_timestamp_ms"
+        )
+
+    # ------------------------------------------------------------------
+    # REDLIGHT 4: journal pair_id is empty for real CandidateInput
+    # ------------------------------------------------------------------
+
+    def test_journal_blocked_event_has_stable_pair_id(self, tmp_path):
+        """Journal blocked event must write stable pair_id, not empty string."""
+        import json
+        from lightfee.persistence.journal import Journal
+
+        journal_path = tmp_path / "test.jsonl"
+        journal = Journal(journal_path)
+        journal.open()
+
+        journal.append(
+            "runtime.entry_blocked_local_l2_selection",
+            {
+                "symbol": "BTCUSDT",
+                "pair_id": "btcusdt:binance->bybit",
+                "reason": "entry_local_l2_waiting_for_prewarm_window",
+                "ts_ms": 10000,
+            },
+        )
+        journal.close()
+
+        events = [
+            json.loads(line) for line in
+            journal_path.read_text().strip().splitlines() if line.strip()
+        ]
+        blocked_events = [
+            e for e in events
+            if e.get("kind") == "runtime.entry_blocked_local_l2_selection"
+        ]
+        assert len(blocked_events) >= 1, "should have at least one blocked event"
+        pair_id = blocked_events[0].get("payload", {}).get("pair_id", "")
+
+        assert pair_id != "", "journal pair_id must not be empty"
+        assert ":" in pair_id and "->" in pair_id, (
+            f"pair_id must follow canonical format, got: {pair_id!r}"
+        )
+        assert pair_id == "btcusdt:binance->bybit"
+
+    # ------------------------------------------------------------------
+    # Non-red-light: tests that should already pass (smoke)
+    # ------------------------------------------------------------------
+
+    def test_no_session_must_block_with_real_candidate(self, runtime_with_l2):
+        """Real CandidateInput with no session → blocked."""
+        rt = runtime_with_l2
+        c = self._make_real_candidate()
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason is not None, "entry should be blocked without session"
+        assert "prewarm" in reason or "dual_ready" in reason or "primary_tracking" in reason
+
+    def test_prewarm_blocked_when_no_funding_ts(self, runtime_with_l2):
+        """Real CandidateInput (no funding_timestamp_ms) → prewarm blocked."""
+        rt = runtime_with_l2
+        c = self._make_real_candidate()
+        # CandidateInput has no funding_timestamp_ms → getattr returns 0 → prewarm blocked
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_local_l2_waiting_for_prewarm_window"
+
+    def test_local_l2_disabled_allows_entry_even_without_funding_ts(
+        self, runtime_with_l2,
+    ):
+        """When local_l2_enabled=False, blocker returns None."""
         runtime_with_l2.config.strategy.local_l2_enabled = False
-        c = self.RealCandidate(funding_timestamp_ms=0)
+        c = self._make_real_candidate()
         reason = runtime_with_l2._entry_local_l2_selection_blocker(c, now_ms=10000)
         assert reason is None
-
-    def test_no_created_at_ms_field_on_candidate_is_ok(self, runtime_with_l2):
-        """The blocker must NOT rely on created_at_ms. V1 uses funding_timestamp_ms for prewarm."""
-        rt = runtime_with_l2
-        c = self.RealCandidate(funding_timestamp_ms=5000)
-        assert not hasattr(c, "created_at_ms"), "candidate should not have created_at_ms"
-        # With funding timestamp but no session — should still block correctly
-        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason is not None

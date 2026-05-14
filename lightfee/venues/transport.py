@@ -20,6 +20,7 @@ import httpx
 
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
     Side,
@@ -1810,8 +1811,15 @@ class VenueTransport:
     ) -> Optional["OrderFillReconciliation"]:
         """Query order status by exchange order ID or client order ID.
 
-        Bybit: uses /v5/order/realtime with orderId/orderLinkId
-        Bitget: uses /api/v3/trade/order-info with orderId/clientOid
+        Bybit (V1: bybit.rs:2820-2894): two-step —
+          1. If no order_id, resolve via /v5/order/realtime with orderLinkId
+          2. Query /v5/execution/list with resolved orderId
+          3. Aggregate execQty * execPrice for weighted avg, abs(execFee), max(execTime)
+          4. total_quantity <= 0 → None
+
+        Bitget (V1: bitget.rs:2912-2949): single-step —
+          /api/v3/trade/order-info with orderId/clientOid,
+          multi-key fallback for price/fee, quantity <= 0 → None
 
         Returns OrderFillReconciliation with filled quantity if found, or None.
         """
@@ -1824,19 +1832,9 @@ class VenueTransport:
 
         try:
             if spec.venue_id == Venue.BYBIT:
-                params: dict[str, Any] = {
-                    "category": "linear",
-                    "symbol": venue_sym,
-                    "openOnly": 0,
-                }
-                if order_id:
-                    params["orderId"] = order_id
-                if client_order_id:
-                    params["orderLinkId"] = client_order_id
-                raw = await self._request(
-                    "GET", "/v5/order/realtime", params=params, private=True,
+                return await self._fetch_order_status_bybit(
+                    venue_sym, order_id, client_order_id, now_ms,
                 )
-                return self._parse_order_status_bybit(raw, venue_sym, now_ms)
 
             elif spec.venue_id == Venue.BITGET:
                 params: dict[str, Any] = {}
@@ -1849,15 +1847,72 @@ class VenueTransport:
                 )
                 return self._parse_order_status_bitget(raw, venue_sym, now_ms)
 
-        except (TransportError, Exception):
+        except TransportError:
             return None
 
         return None
 
+    async def _fetch_order_status_bybit(
+        self,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        """Bybit V1 two-step reconciliation: resolve orderId → execution/list → aggregate.
+
+        V1: bybit.rs fetch_order_fill_reconciliation (lines 2820-2894)
+        """
+        resolved_order_id = order_id
+        resolved_client_id = ""
+
+        # Step 1: resolve orderId from client_order_id if needed
+        if not resolved_order_id:
+            params: dict[str, Any] = {
+                "category": "linear",
+                "symbol": venue_sym,
+                "openOnly": 0,
+            }
+            if client_order_id:
+                params["orderLinkId"] = client_order_id
+            else:
+                return None  # need at least one identifier
+
+            raw = await self._request(
+                "GET", "/v5/order/realtime", params=params, private=True,
+            )
+            result = raw.get("result", {})
+            data = result.get("list", [None])[0] if isinstance(result, dict) and result.get("list") else result
+            if not isinstance(data, dict):
+                return None
+
+            resolved_order_id = str(data.get("orderId", ""))
+            resolved_client_id = str(data.get("orderLinkId", ""))
+            if not resolved_order_id:
+                return None
+
+        # Step 2: query /v5/execution/list with resolved orderId
+        exec_params = {
+            "category": "linear",
+            "symbol": venue_sym,
+            "orderId": resolved_order_id,
+        }
+        exec_raw = await self._request(
+            "GET", "/v5/execution/list", params=exec_params, private=True,
+        )
+
+        # Step 3: aggregate executions
+        return self._parse_bybit_execution_list(
+            exec_raw, venue_sym, resolved_order_id, resolved_client_id, now_ms,
+        )
+
     def _parse_order_status_bybit(
         self, raw: dict[str, Any], venue_sym: str, now_ms: int,
     ) -> Optional["OrderFillReconciliation"]:
-        """Parse Bybit /v5/order/realtime response into OrderFillReconciliation."""
+        """Parse Bybit /v5/order/realtime response into OrderFillReconciliation.
+
+        V1: total_quantity <= 0 → None. NEW/ACTIVE with 0 fill NOT treated as filled.
+        """
         result = raw.get("result", {})
         data = result.get("list", [None])[0] if isinstance(result, dict) and result.get("list") else result
         if not isinstance(data, dict):
@@ -1872,7 +1927,10 @@ class VenueTransport:
         status_str = str(data.get("orderStatus", "")).upper()
         filled_at = int(data.get("updatedTime", now_ms))
 
-        if status_str not in ("FILLED", "PARTIALLY_FILLED", "NEW", "UNTRIGGERED", "ACTIVE"):
+        # V1: only Filled/PartiallyFilled orders with quantity > 0
+        if status_str not in ("FILLED", "PARTIALLY_FILLED"):
+            return None
+        if cum_qty <= 0.0:
             return None
 
         return OrderFillReconciliation(
@@ -1886,10 +1944,63 @@ class VenueTransport:
             filled_at_ms=filled_at,
         )
 
+    def _parse_bybit_execution_list(
+        self,
+        raw: dict[str, Any],
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        """Parse Bybit /v5/execution/list response, aggregate executions.
+
+        V1: bybit.rs lines 2870-2893 — sum execQty, weighted notional,
+        abs(execFee), max(execTime). total_quantity <= 0 → None.
+        """
+        result = raw.get("result", {})
+        executions = result.get("list", []) if isinstance(result, dict) else []
+        if not executions:
+            return None
+
+        total_qty = 0.0
+        weighted_notional = 0.0
+        total_fee = 0.0
+        latest_fill_ms = 0
+        for ex in executions:
+            if not isinstance(ex, dict):
+                continue
+            qty = _safe_float(ex.get("execQty", "0"))
+            price = _safe_float(ex.get("execPrice", "0"))
+            fee = _safe_float(ex.get("execFee", "0"))
+            ex_time = int(ex.get("execTime", 0))
+            total_qty += qty
+            weighted_notional += price * qty
+            total_fee += abs(fee)
+            if ex_time > latest_fill_ms:
+                latest_fill_ms = ex_time
+
+        if total_qty <= 0.0:
+            return None
+
+        return OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol=venue_sym,
+            side=Side.BUY,
+            quantity=total_qty,
+            average_price=weighted_notional / total_qty,
+            order_id=order_id,
+            client_order_id=client_order_id or None,
+            fee_quote=total_fee if total_fee > 0 else None,
+            filled_at_ms=latest_fill_ms if latest_fill_ms > 0 else now_ms,
+        )
+
     def _parse_order_status_bitget(
         self, raw: dict[str, Any], venue_sym: str, now_ms: int,
     ) -> Optional["OrderFillReconciliation"]:
-        """Parse Bitget /api/v3/trade/order-info response into OrderFillReconciliation."""
+        """Parse Bitget /api/v3/trade/order-info response into OrderFillReconciliation.
+
+        V1: quantity <= 0 → None. Multi-key fallback for price/fee/orderId/clientOid.
+        """
         _require_bitget_success(raw, "bitget order status failed")
         data = raw.get("data", raw)
         if isinstance(data, list):
@@ -1899,11 +2010,32 @@ class VenueTransport:
 
         order_id = str(data.get("orderId", ""))
         client_id = str(data.get("clientOid", ""))
-        cum_qty = _safe_float(data.get("filledQty", data.get("fillSz", data.get("baseVolume", "0"))))
-        avg_price = _safe_float(data.get("avgPrice", data.get("priceAvg", "0")))
+        # V1 multi-key fallback: baseVolume, filledQty, fillQty, size
+        cum_qty = _safe_float(
+            data.get("baseVolume", data.get("filledQty", data.get("fillSz", "0")))
+        )
+        avg_price = _safe_float(
+            data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))
+        )
         side_str = str(data.get("side", "buy")).lower()
         side = Side.BUY if side_str == "buy" else Side.SELL
-        filled_at = int(data.get("cTime", data.get("uTime", now_ms)))
+        filled_at = int(data.get("uTime", data.get("cTime", data.get("updateTime", data.get("filledTime", now_ms)))))
+
+        # V1: quantity <= 0 → None
+        if cum_qty <= 0.0:
+            return None
+
+        # Fee extraction with multi-key fallback (V1: bitget.rs:2934-2938)
+        fee_quote = None
+        fee_val = data.get("fee", data.get("totalFee", data.get("filledFee")))
+        if fee_val is not None:
+            fee_quote = abs(_safe_float(fee_val))
+        if fee_quote is None and "feeDetail" in data:
+            fd = data["feeDetail"]
+            if isinstance(fd, dict):
+                tf = fd.get("totalFee")
+                if tf is not None:
+                    fee_quote = abs(_safe_float(tf))
 
         return OrderFillReconciliation(
             venue=Venue.BITGET,
@@ -1913,6 +2045,7 @@ class VenueTransport:
             average_price=avg_price,
             order_id=order_id,
             client_order_id=client_id,
+            fee_quote=fee_quote,
             filled_at_ms=filled_at,
         )
 

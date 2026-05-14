@@ -761,11 +761,20 @@ class LiveRuntime:
                     # V2 Task 9: entry local L2 selection blocker (prewarm/dual-ready)
                     l2_blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
                     if l2_blocker:
+                        # Compute stable pair_id from symbol+venues if not on candidate
+                        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+                        pid = getattr(candidate, "pair_id", "")
+                        if not pid:
+                            pid = make_candidate_pair_id(
+                                str(getattr(candidate, "symbol", "")),
+                                str(getattr(candidate, "long_venue", "")),
+                                str(getattr(candidate, "short_venue", "")),
+                            )
                         self.journal.append(
                             "runtime.entry_blocked_local_l2_selection",
                             {
                                 "symbol": candidate.symbol,
-                                "pair_id": getattr(candidate, "pair_id", ""),
+                                "pair_id": pid,
                                 "reason": l2_blocker,
                                 "ts_ms": now_ms,
                             },
@@ -1948,12 +1957,13 @@ class LiveRuntime:
 
         Returns a reason string if blocked, or None if ready to proceed.
 
-        V1 (Rust: final_gate.rs entry_final_gate_result_from_candidate_local_l2):
+        V1 (Rust: market_data.rs:1518-1526, final_gate.rs entry_final_gate_result_from_candidate_local_l2):
         - Live + local_l2_enabled → gate applies
         - Candidate must be in primary tracked set
         - Session must exist for pair_id
         - Both legs must be ready (dual-ready)
-        - Book must be exportable as valid ExecutionLiquiditySnapshot
+        - V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms;
+          remaining_ms > 0 && remaining_ms <= prewarm_window_secs * 1000
 
         Blocker reasons (V1 stable labels):
         - entry_local_l2_waiting_for_prewarm_window
@@ -1974,9 +1984,13 @@ class LiveRuntime:
         if not pair_id:
             pair_id = make_candidate_pair_id(symbol, long_ven, short_ven)
 
-        # Funding prewarm: candidate must have funding timestamp evidence
-        funding_ts = getattr(candidate, "funding_timestamp_ms", 0)
-        if funding_ts <= 0:
+        # V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms
+        first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
+        if first_funding_ts <= 0:
+            return "entry_local_l2_waiting_for_prewarm_window"
+        remaining_ms = first_funding_ts - max(now_ms, 0)
+        prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
+        if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
             return "entry_local_l2_waiting_for_prewarm_window"
 
         # Primary tracking: candidate must be in primary tracked set

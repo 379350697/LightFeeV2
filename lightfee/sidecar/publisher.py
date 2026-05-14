@@ -102,6 +102,9 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "opportunity_type": c.opportunity_type,
                 "blocked": c.blocked,
                 "blocked_reasons": c.blocked_reasons,
+                "pair_id": c.pair_id,
+                "funding_timestamp_ms": c.funding_timestamp_ms,
+                "first_funding_timestamp_ms": c.first_funding_timestamp_ms,
             }
             for c in s.candidates
         ],

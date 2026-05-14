@@ -1,7 +1,8 @@
-"""Tests for shared venue transport, signing, error mapping, and sizing."""
+"""Tests for shared venue transport, signing, error mapping, sizing, and reconciliation."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -2709,3 +2710,160 @@ class TestVenuePositionParsers:
         }
         pos = _parse_okx_position(raw, "BTC-USDT-SWAP", now_ms=1000, contract_size=0.01)
         assert pos.quantity == 0.1  # 10 contracts * 0.01
+
+
+# ===========================================================================
+# RED-LIGHT: order fill reconciliation parsers (Bybit + Bitget)
+#
+# These tests directly call the real _parse_order_status_* functions with
+# mock raw HTTP response dicts. No monkeypatching of target functions.
+# The parser code is the production code being tested.
+# ===========================================================================
+
+
+class TestBybitParseOrderStatusRedLight:
+    """RED-LIGHT: _parse_order_status_bybit must follow V1 semantics.
+
+    V1 reference: src/live/bybit.rs fetch_order_fill_reconciliation (lines 2820-2894)
+    V1 semantics:
+      - resolve orderId from client_order_id via orderLinkId
+      - query /v5/execution/list
+      - aggregate execQty, weighted avg price, total fee
+      - total_quantity <= 0 → return None
+
+    Current V2 _parse_order_status_bybit only reads cumExecQty/avgPrice
+    from /v5/order/realtime and returns OrderFillReconciliation even when
+    cumExecQty=0 for NEW/ACTIVE orders.
+    """
+
+    def test_bybit_new_order_zero_fill_returns_none(self):
+        """WAS RED-LIGHT, NOW GREEN: NEW order with cumExecQty=0 → None (V1 parity)."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "New", "cumExecQty": "0",
+                "avgPrice": "0", "side": "Buy",
+                "updatedTime": "1000000",
+            }]},
+        }
+        result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert result is None, f"NEW 0-fill should return None, got {result}"
+
+    def test_bybit_active_untriggered_zero_fill_returns_none(self):
+        """Active/Untriggered with cumExecQty=0 → None."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Active", "cumExecQty": "0",
+                "avgPrice": "0", "side": "Buy",
+                "updatedTime": "1000000",
+            }]},
+        }
+        result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert result is None, f"Active 0-fill should return None, got {result}"
+
+    def test_bybit_filled_returns_reconciliation_with_correct_fields(self):
+        """Filled order returns correct reconciliation fields."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import OrderFillReconciliation
+
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [{
+                "orderId": "oid-1", "orderLinkId": "cid-1",
+                "orderStatus": "Filled", "cumExecQty": "0.5",
+                "avgPrice": "50000", "side": "Buy",
+                "updatedTime": "1000000",
+            }]},
+        }
+        result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.quantity == pytest.approx(0.5)
+        assert result.average_price == pytest.approx(50000)
+        assert result.order_id == "oid-1"
+        assert result.client_order_id == "cid-1"
+
+
+class TestBitgetParseOrderStatusRedLight:
+    """RED-LIGHT: _parse_order_status_bitget must follow V1 semantics.
+
+    V1 reference: src/live/bitget.rs fetch_order_fill_reconciliation (lines 2912-2949)
+    V1 semantics:
+      - /api/v3/trade/order-info with orderId/clientOid
+      - quantity from baseVolume/filledQty/fillQty/size fallback
+      - quantity <= 0 → None
+      - multi-key avg price, fee, orderId/clientOid extraction
+    """
+
+    def test_bitget_zero_filled_qty_returns_none(self):
+        """WAS RED-LIGHT, NOW GREEN: filledQty=0 → None (V1 parity)."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                "filledQty": "0", "baseVolume": "0",
+                "priceAvg": "0", "avgPrice": "0",
+                "side": "buy", "uTime": "1000000",
+                "cTime": "1000000", "fee": "0",
+            },
+        }
+        result = transport._parse_order_status_bitget(raw, "BTCUSDT", 1000000)
+        assert result is None, f"zero-filled bitget order should return None, got {result}"
+
+    def test_bitget_zero_base_volume_returns_none(self):
+        """baseVolume=0 → None."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                "filledQty": "0", "baseVolume": "0",
+                "priceAvg": "50000", "avgPrice": "50000",
+                "side": "buy", "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(raw, "BTCUSDT", 1000000)
+        assert result is None, f"zero baseVolume should return None, got {result}"
+
+    def test_bitget_positive_fill_returns_correct_fields(self):
+        """Non-red-light: verify parser returns correct fields for positive fill."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import OrderFillReconciliation
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                "filledQty": "0.5", "baseVolume": "0.5",
+                "priceAvg": "51000", "avgPrice": "51000",
+                "side": "buy", "uTime": "2000000",
+                "cTime": "2000000", "fee": "0.1",
+            },
+        }
+        result = transport._parse_order_status_bitget(raw, "BTCUSDT", 2000000)
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.quantity == pytest.approx(0.5)
+        assert result.average_price == pytest.approx(51000)
+        assert result.order_id == "oid-1"
+        assert result.client_order_id == "cid-1"

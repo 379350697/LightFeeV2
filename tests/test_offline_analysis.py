@@ -719,3 +719,139 @@ class TestDailyReportWithProjection:
             assert summary["local_l2_sync_failed_by_category"]["timeout"] == 1
             assert summary["fail_closed_reason_counts"]["venue_error"] == 1
             assert summary["risk_counts"]["risk.warning_triggered"] == 1
+
+
+# ===========================================================================
+# RED-LIGHT: dry-run audit script (V2 journal format + ts_ms filtering)
+# ===========================================================================
+
+
+class TestDryRunAuditRedLight:
+    """RED-LIGHT: scripts/lightfee_v2_live_dryrun_audit.py must handle V2 journal format.
+
+    Current audit script bugs:
+      1. Reads `event` field — V2 journal uses `kind`
+      2. Prioritizes `data` over `payload` — V2 uses `payload`
+      3. No ts_ms window filtering — `minutes` param unused
+      4. Script is untracked in git
+
+    These tests MUST fail on current V2 to prove the bugs exist.
+    """
+
+    @staticmethod
+    def _write_journal(path: str, lines: list[dict]) -> None:
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+    @staticmethod
+    def _import_audit():
+        import sys
+        from pathlib import Path as _Path
+        scripts_dir = str(_Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        # Force reimport to avoid stale cached module
+        import importlib
+        mod_name = "lightfee_v2_live_dryrun_audit"
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+        mod = importlib.import_module(mod_name)
+        return mod.audit
+
+    def test_audit_reads_kind_field(self, tmp_path):
+        """WAS RED-LIGHT, NOW GREEN: V2 journal 'kind' field is read."""
+        import time
+        audit = self._import_audit()
+        now_ms = int(time.time() * 1000)
+
+        journal = tmp_path / "test.jsonl"
+        self._write_journal(str(journal), [
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {"reason": "entry_local_l2_waiting_for_prewarm_window",
+                            "pair_id": "btcusdt:binance->bybit"},
+            },
+        ])
+
+        # Use huge minutes value to ensure event is within window
+        result = audit(str(journal), minutes=52560000)  # 100 years
+        counts = result.get("counts", {})
+        blocked_count = counts.get("entry_blocked_local_l2_selection", 0)
+        assert blocked_count >= 1, (
+            f"audit should count entry_blocked_local_l2_selection from 'kind', "
+            f"found {blocked_count}"
+        )
+
+    def test_audit_reads_payload_field(self, tmp_path):
+        """WAS RED-LIGHT, NOW GREEN: V2 journal 'payload' field is read."""
+        import time
+        audit = self._import_audit()
+        now_ms = int(time.time() * 1000)
+
+        journal = tmp_path / "test2.jsonl"
+        self._write_journal(str(journal), [
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {"reason": "entry_local_l2_waiting_for_prewarm_window"},
+            },
+        ])
+
+        result = audit(str(journal), minutes=52560000)
+        l2_reasons = result.get("l2_selection_reasons", {})
+        assert "entry_local_l2_waiting_for_prewarm_window" in l2_reasons, (
+            f"audit should extract reason from 'payload', got: {l2_reasons}"
+        )
+
+    def test_audit_ts_ms_window_filtering(self, tmp_path):
+        """WAS RED-LIGHT, NOW GREEN: ts_ms window filtering excludes old events."""
+        import time
+
+        audit = self._import_audit()
+        now_ms = int(time.time() * 1000)
+        old_ms = now_ms - 3 * 3600 * 1000  # 3 hours ago
+
+        journal = tmp_path / "test3.jsonl"
+        self._write_journal(str(journal), [
+            {
+                "ts_ms": old_ms,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {"reason": "stale_event"},
+            },
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {"reason": "recent_event"},
+            },
+        ])
+
+        result = audit(str(journal), minutes=120)
+        l2_reasons = result.get("l2_selection_reasons", {})
+
+        # old event (3h ago) should be excluded by ts_ms window
+        stale_count = l2_reasons.get("stale_event", 0)
+        assert stale_count == 0, (
+            f"stale event from 3h ago should not be counted with minutes=120, "
+            f"but got stale_event={stale_count}"
+        )
+        # Recent event should be counted
+        assert l2_reasons.get("recent_event", 0) >= 1, "recent event should be counted"
+
+    def test_script_is_tracked_by_git(self):
+        """Verify the audit script is tracked by git.
+
+        RED-LIGHT: script was untracked (?? in git status).
+        """
+        import subprocess
+        script_path = Path(__file__).parent.parent / "scripts" / "lightfee_v2_live_dryrun_audit.py"
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(script_path)],
+            capture_output=True, cwd=str(script_path.parent.parent),
+        )
+        tracked = result.returncode == 0
+        assert tracked, (
+            "RED-LIGHT FAIL: audit script must be tracked by git "
+            "(currently untracked/new file)"
+        )

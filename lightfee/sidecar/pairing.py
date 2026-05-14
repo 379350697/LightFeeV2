@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
 
 
@@ -36,6 +37,12 @@ def build_same_symbol_pairs(
                 reference_mid = (short_q.bid + long_q.ask) / 2.0 if reference_mid_valid(long_q, short_q) else 1.0
                 raw_cross_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10000.0 if reference_mid > 0 else 0.0
 
+                pair_id = make_candidate_pair_id(symbol, long_q.venue, short_q.venue)
+                # First funding timestamp is the earlier of the two venue timestamps
+                first_funding_ts = min(
+                    long_q.funding_timestamp_ms, short_q.funding_timestamp_ms,
+                )
+
                 candidates.append(
                     CandidateInput(
                         long_venue=long_q.venue,
@@ -46,6 +53,9 @@ def build_same_symbol_pairs(
                         expected_edge_bps=funding_diff + raw_cross_bps,
                         worst_case_edge_bps=funding_diff + raw_cross_bps,
                         ranking_edge_bps=funding_diff + raw_cross_bps,
+                        pair_id=pair_id,
+                        funding_timestamp_ms=first_funding_ts,
+                        first_funding_timestamp_ms=first_funding_ts,
                     )
                 )
 
