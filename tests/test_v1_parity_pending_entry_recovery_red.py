@@ -383,10 +383,12 @@ class TestRecoveryWithLivePositionHydration:
                 entry_price=0.505, observed_at_ms=1700000000000,
             )
         ]
+        # V2 transport returns side=SELL with quantity=abs(net) for shorts.
+        # This test must match real adapter behavior to catch the sign bug.
         bitget_adapter.position_snapshots = [
             PositionSnapshot(
                 venue=Venue.BITGET, symbol="SAGAUSDT",
-                side=Side.SELL, quantity=-827.0,
+                side=Side.SELL, quantity=827.0,  # positive! real transport uses abs(net)
                 entry_price=0.505, observed_at_ms=1700000000000,
             )
         ]
@@ -404,10 +406,61 @@ class TestRecoveryWithLivePositionHydration:
         # Run hydration directly
         result = asyncio.run(runtime._recover_hydrate_from_live_positions(saga))
 
-        assert result is True, "Hydration should succeed when both venues have positions"
+        assert result is True, (
+            f"Hydration must succeed when both venues have positions. "
+            f"Real transport returns side=SELL, quantity=abs(net)=positive."
+        )
         # After hydration, hedge should have been filled from live position
         assert saga.hedge_leg_filled > 0, (
             f"hedge_leg_filled={saga.hedge_leg_filled}, expected > 0 after hydration"
         )
 
+        runtime.journal.close()
+
+    def test_hydrate_rejects_wrong_side(self):
+        """Hydration must reject positions on the wrong side.
+
+        If short venue returns BUY instead of SELL, there's no real short
+        exposure to balance — must return False.
+        """
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+        from tests.fake_adapters import FakeVenueAdapter
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="paper"),
+            strategy=StrategyConfig(),
+            persistence=PersistenceConfig(),
+        )
+
+        gate_adapter = FakeVenueAdapter(_venue=Venue.GATE)
+        bitget_adapter = FakeVenueAdapter(_venue=Venue.BITGET)
+
+        # Short venue returns BUY side (wrong — not a real short position)
+        gate_adapter.position_snapshots = [
+            PositionSnapshot(
+                venue=Venue.GATE, symbol="SAGAUSDT",
+                side=Side.BUY, quantity=827.0,
+                entry_price=0.505, observed_at_ms=1700000000000,
+            )
+        ]
+        bitget_adapter.position_snapshots = [
+            PositionSnapshot(
+                venue=Venue.BITGET, symbol="SAGAUSDT",
+                side=Side.BUY, quantity=500.0,  # wrong side — same direction as long
+                entry_price=0.505, observed_at_ms=1700000000000,
+            )
+        ]
+
+        runtime = LiveRuntime(config, venue_adapters={
+            Venue.GATE: gate_adapter,
+            Venue.BITGET: bitget_adapter,
+        })
+        runtime.journal.open()
+
+        saga = _make_saga_pending_entry()
+        result = asyncio.run(runtime._recover_hydrate_from_live_positions(saga))
+        assert result is False, (
+            "Hydration must reject when both venues are on the same side"
+        )
         runtime.journal.close()

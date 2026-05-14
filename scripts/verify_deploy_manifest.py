@@ -224,7 +224,7 @@ echo "=== Writing .deploy_version ==="
 echo "{head}" | ssh {remote_host} "cat > {remote_path}/.deploy_version"
 
 echo "=== Verifying critical file hashes ==="
-python3 {remote_path}/scripts/verify_deploy_manifest.py --check {remote_path}
+ssh {remote_host} "cd {remote_path} && python3 scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Deploy complete: {head} ==="
 """
@@ -260,14 +260,16 @@ def main() -> None:
             print(f"ERROR: path does not exist: {args.check}")
             sys.exit(1)
 
-        # Load or build manifest
+        # Load manifest from the deployed path (no git required for --check)
         manifest_path = check_path / ".deploy_manifest.json"
         if manifest_path.exists():
             with open(manifest_path) as f:
                 expected = json.load(f)
+            print(f"Loaded manifest: {len(expected)} files")
         else:
-            print("WARNING: no .deploy_manifest.json, building from local git")
-            expected = build_manifest(root)
+            print("WARNING: no .deploy_manifest.json at check path — "
+                  "verifying file existence only (no hash comparison)")
+            expected = {}
 
         print(f"Checking {len(CRITICAL_FILES)} critical files...")
         all_ok = True
@@ -280,7 +282,7 @@ def main() -> None:
             actual = sha256_file(fpath)
             expected_hash = expected.get(f)
             if expected_hash is None:
-                print(f"  WARN {f}: not in manifest, hash={actual[:12]}...")
+                print(f"  WARN {f}: not in manifest, actual_hash={actual[:16]}...")
             elif actual != expected_hash:
                 print(f"  MISMATCH {f}:")
                 print(f"    expected: {expected_hash}")

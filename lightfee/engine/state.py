@@ -181,6 +181,22 @@ class PendingEntry:
             return 0
         return max(0, now_ms - self.created_at_ms)
 
+    def maker_venue(self):
+        """The venue where the maker (passive) order was placed.
+
+        V1: pending.maker_venue() — determined by maker_leg.
+        Default convention: maker on long venue (BUY side is passive).
+        """
+        return self.long_venue
+
+    def hedge_venue(self):
+        """The venue where the hedge (aggressive) order was placed.
+
+        V1: pending.hedge_venue() — opposite of maker_venue.
+        Default convention: hedge on short venue (SELL side is aggressive).
+        """
+        return self.short_venue
+
 
 # ---------------------------------------------------------------------------
 # Passive close state (V1 PendingPassiveClose parity)

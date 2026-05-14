@@ -1969,50 +1969,72 @@ class LiveRuntime:
         self._finalize_startup_recovery()
 
     async def _recover_poll_order_status(self, entry_id: str, pending) -> None:
-        """Query venue adapters for order status to resolve uncertain outcomes."""
-        for ven in (pending.long_venue, pending.short_venue):
-            adapter = self.get_venue_adapter(ven)
-            if adapter is None:
-                continue
-            try:
-                if hasattr(adapter, "get_order_status"):
-                    order_id = pending.maker_order_id or pending.hedge_order_id
-                    if not order_id:
-                        continue
-                    status = await adapter.get_order_status(
+        """Query each venue for its respective order status.
+
+        V1: queries maker venue with maker_order_id and hedge venue with
+        hedge_order_id independently, rather than using a fallback chain
+        that shadows the hedge order when a maker order exists.
+        """
+        # Query maker venue with maker order
+        if pending.maker_order_id:
+            maker_ven = pending.maker_venue()
+            maker_adapter = self.get_venue_adapter(maker_ven)
+            if maker_adapter is not None and hasattr(maker_adapter, "get_order_status"):
+                try:
+                    status = await maker_adapter.get_order_status(
                         symbol=pending.symbol,
-                        order_id=order_id,
+                        order_id=pending.maker_order_id,
                     )
                     if status and getattr(status, "status", "") == "filled":
                         pending.uncertain_outcome = False
                         pending.outcome = "filled"
-                        # Update fill quantities if available
                         filled_qty = getattr(status, "filled_quantity", 0.0) or getattr(status, "executed_qty", 0.0)
                         if filled_qty and filled_qty > 0:
-                            if ven == pending.long_venue:
-                                pending.maker_leg_filled = max(pending.maker_leg_filled, float(filled_qty))
-                            elif ven == pending.short_venue:
-                                pending.hedge_leg_filled = max(pending.hedge_leg_filled, float(filled_qty))
+                            pending.maker_leg_filled = max(pending.maker_leg_filled, float(filled_qty))
                         self.journal.append(
-                            "recovery.entry_order_status_resolved",
-                            {
-                                "entry_id": entry_id,
-                                "venue": str(ven),
-                                "status": status.status,
-                            },
+                            "recovery.maker_order_status_resolved",
+                            {"entry_id": entry_id, "venue": str(maker_ven), "status": status.status},
                         )
                         return
                     elif status and getattr(status, "status", "") == "canceled":
-                        # Order was cancelled — resolve as terminal
                         pending.uncertain_outcome = False
                         pending.outcome = "canceled"
                         self.journal.append(
-                            "recovery.entry_order_canceled",
-                            {"entry_id": entry_id, "venue": str(ven)},
+                            "recovery.maker_order_canceled",
+                            {"entry_id": entry_id, "venue": str(maker_ven)},
                         )
                         return
-            except Exception:
-                continue
+                except Exception:
+                    pass
+
+        # Query hedge venue with hedge order (independent of maker query)
+        if pending.hedge_order_id:
+            hedge_ven = pending.hedge_venue()
+            hedge_adapter = self.get_venue_adapter(hedge_ven)
+            if hedge_adapter is not None and hasattr(hedge_adapter, "get_order_status"):
+                try:
+                    status = await hedge_adapter.get_order_status(
+                        symbol=pending.symbol,
+                        order_id=pending.hedge_order_id,
+                    )
+                    if status and getattr(status, "status", "") == "filled":
+                        pending.uncertain_outcome = False
+                        pending.outcome = "filled"
+                        filled_qty = getattr(status, "filled_quantity", 0.0) or getattr(status, "executed_qty", 0.0)
+                        if filled_qty and filled_qty > 0:
+                            pending.hedge_leg_filled = max(pending.hedge_leg_filled, float(filled_qty))
+                        self.journal.append(
+                            "recovery.hedge_order_status_resolved",
+                            {"entry_id": entry_id, "venue": str(hedge_ven), "status": status.status},
+                        )
+                        return
+                    elif status and getattr(status, "status", "") == "canceled":
+                        self.journal.append(
+                            "recovery.hedge_order_canceled",
+                            {"entry_id": entry_id, "venue": str(hedge_ven)},
+                        )
+                except Exception:
+                    pass
 
     async def _recover_hydrate_from_live_positions(self, pending) -> bool:
         """Try to hydrate pending entry from live exchange positions.
@@ -2038,18 +2060,27 @@ class LiveRuntime:
             long_pos = await long_adapter.fetch_position(pending.symbol)
             short_pos = await short_adapter.fetch_position(pending.symbol)
 
-            # V1: need long position > 0 and short position < 0 for balanced exposure
-            if long_pos.quantity <= 1e-9 or short_pos.quantity >= -1e-9:
+            # V1: need long position (BUY side, qty > 0) and short (SELL side, qty > 0)
+            # V2 transport returns side=SELL with quantity=abs(net) for shorts,
+            # so checking quantity >= 0 is wrong — must check side field.
+            from lightfee.core.domain import Side
+            long_has_position = (
+                long_pos.side == Side.BUY and long_pos.quantity > 1e-9
+            )
+            short_has_position = (
+                short_pos.side == Side.SELL and short_pos.quantity > 1e-9
+            )
+            if not long_has_position or not short_has_position:
                 return False
 
-            live_balanced = min(abs(long_pos.quantity), abs(short_pos.quantity))
+            live_balanced = min(long_pos.quantity, short_pos.quantity)
             current_balanced = min(pending.maker_leg_filled, pending.hedge_leg_filled)
             if live_balanced <= current_balanced + 1e-9:
                 return False
 
-            # Apply recovered fills
-            long_delta = min(live_balanced, abs(long_pos.quantity)) - pending.maker_leg_filled
-            short_delta = min(live_balanced, abs(short_pos.quantity)) - pending.hedge_leg_filled
+            # Apply recovered fills (quantities already positive per side check above)
+            long_delta = min(live_balanced, long_pos.quantity) - pending.maker_leg_filled
+            short_delta = min(live_balanced, short_pos.quantity) - pending.hedge_leg_filled
             if long_delta > 1e-9:
                 pending.maker_leg_filled += long_delta
             if short_delta > 1e-9:
@@ -2112,7 +2143,7 @@ class LiveRuntime:
         if pending.maker_completed():
             return False
 
-        maker_venue = pending.long_venue
+        maker_venue = pending.maker_venue()
         adapter = self.get_venue_adapter(maker_venue)
         if adapter is None:
             return False
@@ -2139,10 +2170,15 @@ class LiveRuntime:
 
         try:
             from lightfee.core.domain import OrderRequest
+            # Determine maker side from the entry: if long_venue is maker → long_side
+            maker_side = (
+                pending.long_side if maker_venue == pending.long_venue
+                else pending.short_side
+            )
             cancel_req = OrderRequest(
                 venue=maker_venue,
                 symbol=pending.symbol,
-                side=pending.long_side,
+                side=maker_side,
                 quantity=pending.target_quantity,
                 price=0.0,
                 order_id=pending.maker_order_id,
