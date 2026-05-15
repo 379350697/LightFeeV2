@@ -9,6 +9,7 @@ Uses fake venue adapters to simulate the full production loop.
 import asyncio
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -395,6 +396,45 @@ class TestLiveStartupPreflight:
             assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
             records = runtime.journal.read_all()
             assert any(r.get("kind") == "runtime.stale_fail_closed_cleared" for r in records)
+
+    @pytest.mark.asyncio
+    async def test_tick_populates_last_scan_with_fresh_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            sidecar_path = Path(td) / "sidecar.json"
+            now_ms = int(time.time() * 1000)
+            sidecar_path.write_text(json.dumps({
+                "schema_version": 2,
+                "published_at_ms": now_ms - 1000,
+                "quotes": {
+                    "BINANCE:BTCUSDT": {
+                        "venue": "binance", "symbol": "BTCUSDT",
+                        "bid": 50000.0, "ask": 50005.0,
+                        "bid_size": 1.0, "ask_size": 1.0,
+                        "funding_rate_bps": 5.0,
+                        "funding_timestamp_ms": now_ms - 1000,
+                        "mark_price": 50002.0,
+                        "index_price": 50002.0,
+                        "volume_24h_quote": 1000000.0,
+                        "open_interest": 1000.0,
+                    },
+                },
+                "candidates": [],
+                "degraded_venues": [],
+            }))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+            await runtime.tick()
+
+            assert runtime.state.last_scan is not None, "last_scan must be populated after tick"
+            assert "snapshot_freshness" in runtime.state.last_scan
+            assert "candidate_count" in runtime.state.last_scan
+            assert "tradeable_count" in runtime.state.last_scan
+            assert "degraded_venues" in runtime.state.last_scan
+            assert "no_entry_reason" in runtime.state.last_scan
+            assert runtime.state.last_scan["ts_ms"] > 0
 
 
 # ---------------------------------------------------------------------------

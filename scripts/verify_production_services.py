@@ -16,6 +16,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from lightfee.ops.production_health import (
+    HealthReport,
     analyze_current_state,
     analyze_resolver_config,
     analyze_sidecar_snapshot,
@@ -56,10 +57,34 @@ def main() -> None:
 
     if Path(args.snapshot).exists():
         reports.append(analyze_sidecar_snapshot(_read_json(args.snapshot), now_ms=now_ms, max_age_ms=args.snapshot_max_age_ms))
+    else:
+        reports.append(HealthReport(
+            name="sidecar_snapshot",
+            ok=False,
+            severity="critical",
+            fingerprints=["snapshot_file_missing"],
+            details={"path": args.snapshot},
+        ))
     if Path(args.current_state).exists():
         reports.append(analyze_current_state(_read_json(args.current_state), now_ms=now_ms, max_tick_age_ms=args.max_tick_age_ms))
+    else:
+        reports.append(HealthReport(
+            name="current_state",
+            ok=False,
+            severity="critical",
+            fingerprints=["current_state_file_missing"],
+            details={"path": args.current_state},
+        ))
     if Path(args.resolv_conf).exists():
         reports.append(analyze_resolver_config(Path(args.resolv_conf).read_text()))
+    else:
+        reports.append(HealthReport(
+            name="resolver_config",
+            ok=False,
+            severity="warning",
+            fingerprints=["resolver_file_missing"],
+            details={"path": args.resolv_conf},
+        ))
 
     summary = summarize_reports(reports)
     payload = asdict(summary)

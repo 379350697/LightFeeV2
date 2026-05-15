@@ -189,3 +189,45 @@ def test_deploy_systemd_templates_pass_contract():
 def test_deploy_dns_template_prefers_verified_resolver():
     text = Path("deploy/network/NetworkManager-lightfee-dns.conf").read_text()
     assert analyze_resolver_config(text).ok
+
+
+def test_cli_reports_missing_snapshot_and_current_state(tmp_path):
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    (unit_dir / "lightfee-sidecar.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/root/projects/LightFee/target/release/opportunity_input_sidecar --config /root/projects/LightFee/config/live.auto.toml\n"
+    )
+    (unit_dir / "lightfee-live.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.live --config /opt/lightfee-v2/config/live.toml\n"
+    )
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+
+    # snapshot and current-state paths point to non-existent files
+    snapshot = tmp_path / "no-such-snapshot.json"
+    current = tmp_path / "no-such-current.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir", str(unit_dir),
+            "--snapshot", str(snapshot),
+            "--current-state", str(current),
+            "--resolv-conf", str(resolv),
+            "--now-ms", "1778787000000",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1, result.stderr + result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["critical_count"] >= 2  # snapshot + current-state both critical
+    fingerprints = [fp for r in payload["reports"] for fp in r.get("fingerprints", [])]
+    assert "snapshot_file_missing" in fingerprints
+    assert "current_state_file_missing" in fingerprints
