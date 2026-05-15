@@ -35,6 +35,11 @@ CRITICAL_FILES = [
     "lightfee/sidecar/v1_compat.py",
     "lightfee/config/schema.py",
     "lightfee/engine/lifecycle.py",
+    "lightfee/ops/production_health.py",
+    "scripts/verify_production_services.py",
+    "deploy/systemd/lightfee-live.service",
+    "deploy/systemd/lightfee-sidecar-rust-v1.service",
+    "deploy/network/NetworkManager-lightfee-dns.conf",
 ]
 
 # --- Files/dirs to exclude from sync ---

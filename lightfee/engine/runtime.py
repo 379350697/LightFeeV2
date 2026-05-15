@@ -32,6 +32,7 @@ from lightfee.engine.recovery import (
     build_recovery_dedup_index,
     is_client_order_id_duplicate,
     has_pending_entry_for_symbol,
+    clear_stale_fail_closed_if_recovery_clean,
 )
 from lightfee.engine.state import EngineState
 from lightfee.engine.supervisor import Supervisor
@@ -175,6 +176,7 @@ class LiveRuntime:
 
         if recovery_class == "clean":
             set_lifecycle(self.state, EngineLifecycle.RUNNING)
+            clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
             self.journal.append(
                 "runtime.running",
                 {"reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms()},
@@ -679,6 +681,15 @@ class LiveRuntime:
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
 
+        self.state.last_scan = {
+            "ts_ms": now_ms,
+            "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
+            "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
+            "tradeable_count": 0,
+            "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
+            "no_entry_reason": None,
+        }
+
         # V1 pre-scan L2 sync: refresh execution-owned books only (scan_promoted=False)
         await self._sync_local_l2_data(now_ms, scan_promoted=False)
 
@@ -691,6 +702,7 @@ class LiveRuntime:
         # V1 live scan recovery gate: require consecutive fresh snapshots before entry
         live_scan_recovery_count = getattr(self.config.strategy, 'live_scan_recovery_success_count', 3)
         if self._live_scan_success_streak < live_scan_recovery_count:
+            self.state.last_scan["no_entry_reason"] = "live_scan_recovery_warmup"
             self.journal.append(
                 "runtime.live_scan_recovery_warmup",
                 {"success_streak": self._live_scan_success_streak,
@@ -702,6 +714,9 @@ class LiveRuntime:
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
             )
+            self.state.last_scan["tradeable_count"] = len(tradeable)
+            if not tradeable:
+                self.state.last_scan["no_entry_reason"] = "no_tradeable_candidates"
             if tradeable:
                 # V1: activity_local_l2_symbols() → ensure L2 active for candidate symbols
                 # Only bootstrap L2 for symbols that have actual activity (shortlist/finalist)

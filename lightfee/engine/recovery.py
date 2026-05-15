@@ -865,6 +865,38 @@ def is_safe_to_resume(state: EngineState) -> bool:
     return not needs_reconciliation(state)
 
 
+def clear_stale_fail_closed_if_recovery_clean(state: EngineState, journal: Journal | None = None) -> bool:
+    """Clear persisted fail_closed only when there is no recovery or operator block.
+
+    This is deliberately narrower than RESUME_IF_SAFE. It handles stale persisted
+    state from prior incidents after open/pending work is already gone.
+    """
+    if state.risk_mode != GlobalRiskMode.FAIL_CLOSED:
+        return False
+    if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
+        return False
+    if needs_reconciliation(state):
+        return False
+    if state.recovery_blocked_reason:
+        return False
+
+    previous = state.risk_mode.value
+    state.risk_mode = GlobalRiskMode.RUNNING
+    state.lifecycle = EngineLifecycle.RUNNING
+    state.global_risk_reason = None
+    state.recovery_blocked_at_ms = 0
+    if journal is not None:
+        _try_emit_recovery(journal, "runtime.risk_mode_changed", {
+            "from": previous,
+            "to": state.risk_mode.value,
+            "reason": "startup_clean_stale_fail_closed_cleared",
+        })
+        _try_emit_recovery(journal, "runtime.stale_fail_closed_cleared", {
+            "reason": "startup_clean_no_recovery_work",
+        })
+    return True
+
+
 def _try_emit_recovery(journal: Journal, kind: str, payload: dict[str, Any]) -> None:
     """Emit a recovery diagnostic event through the journal.
 

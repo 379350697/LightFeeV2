@@ -447,6 +447,7 @@ class EngineState:
     retained_local_l2_books: list[dict] = field(default_factory=list)
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
     local_l2_session_snapshot: list[dict] = field(default_factory=list)
+    last_scan: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -470,6 +471,7 @@ class EngineState:
             "transfer_truth": self.transfer_truth,
             "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,
             "pending_close_reconciliations": self.pending_close_reconciliations,
+            "last_scan": self.last_scan,
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,

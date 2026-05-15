@@ -137,26 +137,30 @@ class SidecarService:
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
 
-        # --- Liquidity fetch (reuses funding data, independent lifecycle) ---
-        for venue_name in [vc.venue for vc in self.config.venues]:
-            if venue_name in degraded_venues:
+        # --- Liquidity fetch (independent domain, own timeout, own source) ---
+        liquidity_results = await self._fetch_liquidity_all_venues(
+            symbols, timeout_s=self._liquidity_timeout_s,
+        )
+        for venue_name, liq_data, liq_error, liq_failed_symbols in liquidity_results:
+            if liq_error is not None:
+                degraded_venues.add(venue_name)
                 liquidity_lifecycle.append(LiquidityLifecycle(
                     venue=venue_name, observed_at_ms=now_ms, symbol_count=0,
-                    coverage_usable=0, degraded_reason="venue degraded in funding fetch",
+                    coverage_usable=0, degraded_reason=str(liq_error),
                 ))
-            else:
-                # Count symbols with volume/OI data from quotes
-                liq_count = sum(1 for k, q in quotes.items() if q.venue == venue_name and q.volume_24h_quote > 0)
-                liq_usable = liq_count
-                liq_degraded = degraded_symbols.get(venue_name, [])
-                liq_reason = ""
-                if liq_degraded:
-                    liq_reason = "; ".join(f"{s}: no OI/volume" for s in liq_degraded)
-                    liq_usable -= len(liq_degraded)
-                liquidity_lifecycle.append(LiquidityLifecycle(
-                    venue=venue_name, observed_at_ms=now_ms, symbol_count=liq_count,
-                    coverage_usable=max(0, liq_usable), degraded_reason=liq_reason,
-                ))
+                continue
+
+            if liq_failed_symbols:
+                existing = degraded_symbols.get(venue_name, [])
+                degraded_symbols[venue_name] = sorted(set(existing) | liq_failed_symbols)
+
+            count = len(liq_data) if liq_data else 0
+            usable = count - len(liq_failed_symbols)
+            liquidity_lifecycle.append(LiquidityLifecycle(
+                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                coverage_usable=max(0, usable),
+                degraded_reason="; ".join(f"{s}: fetch failed" for s in liq_failed_symbols) if liq_failed_symbols else "",
+            ))
 
         # --- Transfer lifecycle (empty-compatible, independent) ---
         transfer_lifecycle: list[TransferLifecycle] = []
@@ -185,7 +189,7 @@ class SidecarService:
             degraded_domains=[],
             degraded_symbols=degraded_symbols,
             source_mode="direct_market",
-            acquisition_mode="fresh_sidecar" if not degraded_venues else "last_good_sidecar" if self._last_good_quotes else "fresh_sidecar",
+            acquisition_mode=_resolve_acquisition_mode(degraded_venues, self._last_good_quotes),
             quotes=quotes,
             candidates=candidates,
         )
@@ -222,6 +226,33 @@ class SidecarService:
         return list(results)
 
     # ------------------------------------------------------------------
+    # Per-venue liquidity fetch (independent timeout, independent source)
+    # ------------------------------------------------------------------
+
+    async def _fetch_liquidity_all_venues(
+        self, symbols: list[str], timeout_s: float,
+    ) -> list[tuple[str, Optional[dict], Optional[Exception], set[str]]]:
+        """Fetch perp liquidity from all venues concurrently with independent timeout."""
+
+        async def _fetch_one(venue_name: str) -> tuple[str, Optional[dict], Optional[Exception], set[str]]:
+            source = self._liquidity_sources.get(venue_name)
+            if source is None:
+                return (venue_name, None, None, set())
+            try:
+                result = await asyncio.wait_for(source.fetch_perp_liquidity(symbols), timeout=timeout_s)
+                return (venue_name, result, None, set())
+            except asyncio.TimeoutError:
+                return (venue_name, None, TimeoutError(f"liquidity timeout {timeout_s}s"), set())
+            except Exception as e:
+                return (venue_name, None, e, set())
+
+        results = await asyncio.gather(
+            *[_fetch_one(vc.venue) for vc in self.config.venues],
+            return_exceptions=False,
+        )
+        return list(results)
+
+    # ------------------------------------------------------------------
     # Last-good fallback
     # ------------------------------------------------------------------
 
@@ -236,3 +267,17 @@ class SidecarService:
             if q is not None:
                 result[key] = q
         return result
+
+
+def _resolve_acquisition_mode(degraded_venues: set[str], last_good: dict) -> str:
+    """Resolve acquisition_mode matching V1 semantics.
+
+    - No degradation → fresh_sidecar
+    - Degradation + last-good cache available → last_good_sidecar
+    - Degradation + no last-good cache → degraded_sidecar (not fresh!)
+    """
+    if not degraded_venues:
+        return "fresh_sidecar"
+    if last_good:
+        return "last_good_sidecar"
+    return "degraded_sidecar"

@@ -334,23 +334,22 @@ class TestLiveStartupPreflight:
             ), f"Expected RECONCILING or RUNNING, got {runtime.state.lifecycle}"
 
     @pytest.mark.asyncio
-    async def test_fail_closed_state_is_preserved_on_startup(self):
+    async def test_operator_requested_fail_closed_is_preserved_on_startup(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-
             snap = __import__("lightfee.persistence.snapshot_store", fromlist=["SnapshotStore"]).SnapshotStore(
                 config.persistence.snapshot_path
             )
             snap.write({
                 "lifecycle": "risk_only",
                 "risk_mode": "fail_closed",
+                "operator": {"requested_mode": "fail_closed"},
             })
 
             runtime = LiveRuntime(config)
             await runtime.start()
 
-            # Fail-closed state must be preserved
-            assert runtime.state.risk_mode.at_least(GlobalRiskMode.ENTRY_PAUSED)
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
 
     @pytest.mark.asyncio
     async def test_operator_control_restored_from_snapshot(self):
@@ -370,6 +369,32 @@ class TestLiveStartupPreflight:
 
             # Risk mode restored
             assert runtime.state.risk_mode == GlobalRiskMode.REDUCE_ONLY
+
+    @pytest.mark.asyncio
+    async def test_stale_fail_closed_clean_state_is_cleared_on_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            snap = __import__("lightfee.persistence.snapshot_store", fromlist=["SnapshotStore"]).SnapshotStore(
+                config.persistence.snapshot_path
+            )
+            snap.write({
+                "lifecycle": "running",
+                "risk_mode": "fail_closed",
+                "open_positions": {},
+                "pending_entries": {},
+                "pending_closes": {},
+                "pending_passive_closes": {},
+                "global_risk_reason": None,
+                "recovery_blocked_reason": None,
+            })
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            records = runtime.journal.read_all()
+            assert any(r.get("kind") == "runtime.stale_fail_closed_cleared" for r in records)
 
 
 # ---------------------------------------------------------------------------

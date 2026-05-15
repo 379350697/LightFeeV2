@@ -188,6 +188,28 @@ class TestCurrentStateExportV1Semantics:
         finally:
             os.unlink(path)
 
+    def test_export_includes_populated_last_scan_when_scan_ran(self):
+        state = EngineState(lifecycle=EngineLifecycle.RUNNING, risk_mode=GlobalRiskMode.RUNNING)
+        state.last_scan = {
+            "ts_ms": 1778787000000,
+            "snapshot_freshness": "fresh",
+            "candidate_count": 12,
+            "tradeable_count": 3,
+            "degraded_venues": [],
+            "no_entry_reason": None,
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            _export_current_state_snapshot(state, path)
+            with open(path) as f:
+                data = json.load(f)
+            assert data["last_scan"]["candidate_count"] == 12
+            assert data["last_scan"]["tradeable_count"] == 3
+        finally:
+            os.unlink(path)
+
     def test_export_atomic_write(self):
         """V1: current-state is written atomically (temp file + rename)."""
         state = EngineState(
