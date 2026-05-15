@@ -74,6 +74,20 @@ def _now_ms() -> int:
 
 MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS = 50
 
+# V1 parity: per-symbol OKX funding-rate concurrency limit
+_OKX_FUNDING_RATE_SEMAPHORE = 20
+_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 4.0
+
+
+def _next_hour_boundary(now_ms: int) -> int:
+    """Round up to the next hour boundary in milliseconds.
+
+    V1 anchor: src/live/hyperliquid.rs  next_hour_boundary
+    Hyperliquid funding settles at the top of each hour.
+    """
+    hour_ms = 3_600_000
+    return ((now_ms // hour_ms) + 1) * hour_ms
+
 
 # ---------------------------------------------------------------------------
 # MarketDataClient
@@ -444,19 +458,22 @@ class MarketDataClient:
             if sym in venue_sym_to_canon:
                 ticker_map[sym] = item
 
-        # 2. per-symbol funding-rate
+        # 2. per-symbol funding-rate (V1 parity: bounded concurrency, no hard symbol limit)
         funding_map: dict[str, dict] = {}
-        if spec.funding_rate_path and len(venue_sym_to_canon) <= MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS:
-            sem = asyncio.Semaphore(16)
+        if spec.funding_rate_path:
+            sem = asyncio.Semaphore(_OKX_FUNDING_RATE_SEMAPHORE)
 
             async def _fetch_funding(venue_sym: str) -> None:
                 async with sem:
                     try:
-                        fr = await self._public_get(
-                            spec.funding_rate_path,
-                            params={"instId": venue_sym},
+                        fr = await asyncio.wait_for(
+                            self._public_get(
+                                spec.funding_rate_path,
+                                params={"instId": venue_sym},
+                            ),
+                            timeout=_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S,
                         )
-                    except PublicTransportError:
+                    except (PublicTransportError, asyncio.TimeoutError):
                         return
                     fr_data = fr.get("data", [])
                     if isinstance(fr_data, list) and fr_data:
@@ -528,7 +545,7 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=0,  # Bybit ticker does not include funding time
+                funding_timestamp_ms=_now_ms(),  # Bybit ticker does not include funding time; use observed
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
                 open_interest_quote=_safe_float(item.get("openInterestValue", 0)),
             )
@@ -612,6 +629,7 @@ class MarketDataClient:
         spec = self._spec
         venue_str = spec.venue_id.value
         canonical_set = {s.upper() for s in symbols}
+        observed_at_ms = _now_ms()
 
         # Use metaAndAssetCtxs as a bulk call (plan requirement)
         body = {"type": "metaAndAssetCtxs"}
@@ -635,6 +653,9 @@ class MarketDataClient:
             if name:
                 ctx_by_name[name] = ctx
 
+        # V1 parity: funding timestamp is next hour boundary
+        funding_ts = _next_hour_boundary(observed_at_ms)
+
         result: dict[str, FundingTicker] = {}
         for item in universe:
             name = str(item.get("name", ""))
@@ -644,17 +665,38 @@ class MarketDataClient:
 
             ctx = ctx_by_name.get(name, {})
             mark = _safe_float(ctx.get("markPx", item.get("markPx", 0)))
+
+            # V1 parity: mid price fallback from midPx → markPx
+            mid_price = _safe_float(ctx.get("midPx", 0))
+            if mid_price <= 0:
+                mid_price = mark
+
+            # V1 parity: bid/ask from impact prices list (sorted: [bid, ask, ...])
+            impact_pxs = ctx.get("impactPxs")
+            if isinstance(impact_pxs, list) and len(impact_pxs) >= 2:
+                pxs = sorted(_safe_float(v) for v in impact_pxs[:2])
+                best_bid = pxs[0] if pxs[0] > 0 else mid_price
+                best_ask = pxs[1] if pxs[1] > 0 else mid_price
+            else:
+                best_bid = mid_price
+                best_ask = mid_price
+
+            # V1 parity: bid/ask sizes from impact notional
+            impact_notional = 6_000.0 if name not in ("BTC", "ETH") else 20_000.0
+            bid_size = impact_notional / best_bid if best_bid > 0 else 0.0
+            ask_size = impact_notional / best_ask if best_ask > 0 else 0.0
+
             result[f"{venue_str}:{canon.upper()}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon.upper(),
-                bid=mark,  # HL bulk: use mark as best estimate
-                ask=mark,
-                bid_size=0.0,
-                ask_size=0.0,
+                bid=best_bid,
+                ask=best_ask,
+                bid_size=bid_size,
+                ask_size=ask_size,
                 mark_price=mark,
                 index_price=_safe_float(item.get("indexPx", 0)),
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
-                funding_timestamp_ms=0,  # HL metaAndAssetCtxs does not include precise funding time
+                funding_timestamp_ms=funding_ts,
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
                 open_interest_quote=_safe_float(ctx.get("openInterest", 0)),
             )

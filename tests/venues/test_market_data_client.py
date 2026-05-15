@@ -327,10 +327,20 @@ class TestProductionSidecarParserRegressions:
         assert result["binance:S0USDT"].open_interest_quote == 0.0
 
     @pytest.mark.asyncio
-    async def test_okx_large_universe_skips_per_symbol_funding_enrichment(self):
+    async def test_okx_large_universe_funding_fetched_with_bounded_concurrency(self):
+        """OKX large universe (620-like) MUST fetch per-symbol funding via bounded concurrency.
+
+        V1 parity: funding_rate coverage must be non-zero for large universes.
+        The semaphore bounds concurrency; individual failures must not drop quotes.
+        """
         symbols = [f"S{i}USDT" for i in range(64)]
 
         class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.active_funding = 0
+                self.max_active_funding = 0
+
             async def _public_get(self, path, params=None):
                 if path == "/api/v5/market/tickers":
                     return {
@@ -340,7 +350,69 @@ class TestProductionSidecarParserRegressions:
                         ]
                     }
                 if path == "/api/v5/public/funding-rate":
-                    raise AssertionError("large live universes must not block on per-symbol funding")
+                    self.active_funding += 1
+                    self.max_active_funding = max(self.max_active_funding, self.active_funding)
+                    await asyncio.sleep(0.005)
+                    self.active_funding -= 1
+                    return {
+                        "data": [{
+                            "fundingRate": "0.0002",
+                            "fundingTime": "1700000000000",
+                            "markPrice": "10.5",
+                            "indexPrice": "10.4",
+                        }]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        result = await client._fetch_okx_style(symbols)
+
+        assert len(result) == len(symbols)
+        # V1 parity: funding_rate_bps must be non-zero for large universe
+        assert result["okx:S0USDT"].funding_rate_bps == 2.0  # 0.0002 * 10000
+        assert result["okx:S63USDT"].funding_rate_bps == 2.0
+        # mark/index must be populated from per-symbol funding response
+        assert result["okx:S0USDT"].mark_price == 10.5
+        assert result["okx:S0USDT"].index_price == 10.4
+        # funding_timestamp_ms must be from funding response
+        assert result["okx:S0USDT"].funding_timestamp_ms == 1700000000000
+        # Bounded concurrency: concurrent requests > 1 to prove parallelism
+        assert client.max_active_funding > 1
+
+    @pytest.mark.asyncio
+    async def test_okx_funding_partial_failure_does_not_drop_quotes(self):
+        """Individual funding-rate failures must not drop bid/ask/mark for a symbol."""
+        symbols = [f"S{i}USDT" for i in range(10)]
+
+        call_count = {"count": 0}
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {"instId": f"S{i}-USDT-SWAP", "bidPx": "10", "askPx": "11", "markPx": "10.2"}
+                            for i in range(10)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    call_count["count"] += 1
+                    inst_id = params.get("instId", "")
+                    # Fail funding for S5USDT specifically
+                    if "S5" in inst_id:
+                        raise PublicTransportError(
+                            PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                            "timeout",
+                        )
+                    return {
+                        "data": [{
+                            "fundingRate": "0.0003",
+                            "fundingTime": "1700000000000",
+                            "markPrice": "10.5",
+                        }]
+                    }
                 if path == "/api/v5/public/open-interest":
                     return {"data": []}
                 return {}
@@ -348,4 +420,103 @@ class TestProductionSidecarParserRegressions:
         result = await FakeOkxClient(okx_spec())._fetch_okx_style(symbols)
 
         assert len(result) == len(symbols)
-        assert result["okx:S0USDT"].funding_rate_bps == 0.0
+        # Successful symbols get funding
+        assert result["okx:S0USDT"].funding_rate_bps == pytest.approx(3.0)
+        # Failed symbol keeps bid/ask from tickers, uses mark from tickers, funding = 0
+        assert result["okx:S5USDT"].bid == 10.0
+        assert result["okx:S5USDT"].ask == 11.0
+        assert result["okx:S5USDT"].mark_price == 10.2  # from ticker
+        assert result["okx:S5USDT"].funding_rate_bps == 0.0  # failed
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_impact_prices_for_bid_ask(self):
+        """Hyperliquid bid/ask must use impact prices (V1 parity), not mark price."""
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                return [
+                    {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+                    [
+                        {
+                            "coin": "BTC", "markPx": "65000", "funding": "0.0001",
+                            "dayNtlVlm": "1000", "openInterest": "20",
+                            "impactPxs": ["64000", "66000"], "midPx": "65000",
+                        },
+                        {
+                            "coin": "ETH", "markPx": "3000", "funding": "0.0002",
+                            "dayNtlVlm": "2000", "openInterest": "50",
+                            "impactPxs": ["2950", "3050"], "midPx": "3000",
+                        },
+                    ],
+                ]
+
+        result = await FakeHyperliquidClient(hyperliquid_spec())._fetch_hyperliquid_style(
+            ["BTCUSDT", "ETHUSDT"]
+        )
+
+        btc = result["hyperliquid:BTCUSDT"]
+        # V1 parity: bid/ask from impact prices, not mark
+        assert btc.bid == 64000.0
+        assert btc.ask == 66000.0
+        assert btc.mark_price == 65000.0  # mark still from markPx
+        assert btc.funding_rate_bps == 1.0  # 0.0001 * 10000
+
+        eth = result["hyperliquid:ETHUSDT"]
+        assert eth.bid == 2950.0
+        assert eth.ask == 3050.0
+        assert eth.mark_price == 3000.0
+        assert eth.funding_rate_bps == 2.0  # 0.0002 * 10000
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_funding_timestamp_is_next_hour_boundary(self):
+        """Hyperliquid funding_timestamp_ms must be next hour boundary, not 0."""
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                return [
+                    {"universe": [{"name": "BTC"}]},
+                    [{
+                        "coin": "BTC", "markPx": "65000", "funding": "0.0001",
+                        "dayNtlVlm": "1000", "openInterest": "20",
+                        "impactPxs": ["64000", "66000"],
+                    }],
+                ]
+
+        result = await FakeHyperliquidClient(hyperliquid_spec())._fetch_hyperliquid_style(
+            ["BTCUSDT"]
+        )
+
+        ticker = result["hyperliquid:BTCUSDT"]
+        # funding_timestamp_ms must be a reasonable next-hour boundary (not 0)
+        assert ticker.funding_timestamp_ms > 0
+        # Must be aligned to hour boundary (divisible by 3600000)
+        assert ticker.funding_timestamp_ms % 3_600_000 == 0
+
+    @pytest.mark.asyncio
+    async def test_funding_timestamp_ms_not_zero_for_venues_without_explicit_time(self):
+        """Venues without explicit funding time (Bybit, etc.) must use observed_at_ms."""
+        class FakeBybitClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "bid1Price": "50000", "ask1Price": "50001",
+                                "bid1Size": "1", "ask1Size": "1",
+                                "markPrice": "50000.5", "indexPrice": "50000",
+                                "fundingRate": "0.0001",
+                                "turnover24h": "1000000",
+                                "openInterestValue": "500000",
+                            }
+                        ]
+                    }
+                }
+
+        result = await FakeBybitClient(bybit_spec())._fetch_bybit_style(["BTCUSDT"])
+
+        ticker = result["bybit:BTCUSDT"]
+        # Bybit ticker doesn't include funding timestamp, must use observed_at_ms
+        assert ticker.funding_timestamp_ms > 0
+        # Should be within last few seconds (not 0)
+        import time
+        now_ms = int(time.time() * 1000)
+        assert abs(ticker.funding_timestamp_ms - now_ms) < 10_000
