@@ -431,6 +431,9 @@ class MarketDataClient:
         for venue_sym, canon in venue_sym_to_canon.items():
             t = ticker_map.get(venue_sym, {})
             pi = pi_map.get(venue_sym, {})
+            if not pi:
+                # V1 parity: not a perpetual contract — no premiumIndex data → skip
+                continue
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
