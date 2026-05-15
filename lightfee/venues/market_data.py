@@ -430,7 +430,7 @@ class MarketDataClient:
                 mark_price=_safe_float(pi.get("markPrice", 0)),
                 index_price=_safe_float(pi.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(pi.get("lastFundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(pi.get("lastFundingTime", 0))),
+                funding_timestamp_ms=int(_safe_float(pi.get("nextFundingTime", 0))),
                 volume_24h_quote=vol_map.get(venue_sym, 0.0),
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
             )
@@ -510,7 +510,7 @@ class MarketDataClient:
                 mark_price=_safe_float(fr.get("markPrice", t.get("markPx", 0))),
                 index_price=_safe_float(fr.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(fr.get("fundingTime", 0))),
+                funding_timestamp_ms=int(_safe_float(fr.get("nextFundingTime", 0))),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
             )
@@ -545,7 +545,7 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=_now_ms(),  # Bybit ticker does not include funding time; use observed
+                funding_timestamp_ms=int(_safe_float(item.get("nextFundingTime", 0))),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
                 open_interest_quote=_safe_float(item.get("openInterestValue", 0)),
             )
@@ -580,7 +580,7 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(item.get("nextFundTime", 0))),
+                funding_timestamp_ms=_now_ms(),  # Bitget REST ticker does not include funding time
                 volume_24h_quote=_safe_float(item.get("usdtVolume", 0)),
                 open_interest_quote=_safe_float(item.get("openInterest", 0)),
             )
@@ -617,7 +617,7 @@ class MarketDataClient:
                 mark_price=mark,
                 index_price=_safe_float(item.get("index_price", 0)),
                 funding_rate_bps=_safe_float(item.get("funding_rate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(item.get("funding_next_apply", 0))),
+                funding_timestamp_ms=_now_ms(),  # Gate REST ticker does not include funding next apply time
                 volume_24h_quote=_safe_float(item.get("volume_24h_quote", item.get("volume_24h", 0))),
                 open_interest_quote=oi_contracts * quanto * mark if quanto > 0 and mark > 0 else oi_contracts,
             )
