@@ -8,6 +8,13 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+# Ensure repo root is on sys.path when invoked as a script (subprocess, cron, etc.)
+# Python sets sys.path[0] to the script's directory, which is scripts/, not the
+# repo root containing the lightfee package.
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
 from lightfee.ops.production_health import (
     analyze_current_state,
     analyze_resolver_config,
