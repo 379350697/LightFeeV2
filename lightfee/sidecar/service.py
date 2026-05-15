@@ -26,7 +26,7 @@ from lightfee.sidecar.sources.transfer import TransferSource
 from lightfee.venues.specs import get_spec
 
 # V1 parity: per-domain timeout defaults (matching V1 sidecar_budget_ms configs)
-DEFAULT_FUNDING_TIMEOUT_S = 10.0
+DEFAULT_FUNDING_TIMEOUT_S = 30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
 DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
 DEFAULT_TRANSFER_TIMEOUT_S = 5.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0

@@ -75,8 +75,15 @@ def _now_ms() -> int:
 MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS = 50
 
 # V1 parity: per-symbol OKX funding-rate concurrency limit
-_OKX_FUNDING_RATE_SEMAPHORE = 20
-_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 4.0
+_OKX_FUNDING_RATE_SEMAPHORE = 40
+_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
+
+# V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
+_FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
+# V1 parity: funding timestamp must be at least this far in the future to be cache-usable.
+# When funding just settled, the exchange publishes the next funding time, so stale-on-settlement
+# avoids using a just-expired timestamp.
+_FUNDING_CACHE_MIN_FUTURE_MS = 30_000  # 30 seconds
 
 
 def _next_hour_boundary(now_ms: int) -> int:
@@ -111,6 +118,10 @@ class MarketDataClient:
         self._exchange_http_timeout_ms = exchange_http_timeout_ms
         self._rate_limiter = rate_limiter
         self._client: Optional[httpx.AsyncClient] = None
+        # V1 parity: per-symbol funding rate cache (OKX, etc.)
+        # {venue_key:symbol -> FundingTicker} with observed_at_ms
+        self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
+        self._funding_cache_observed_at_ms: int = 0
 
     @property
     def venue(self) -> Venue:
@@ -436,7 +447,24 @@ class MarketDataClient:
             )
         return result
 
-    # -- OKX --------------------------------------------------------------
+    # -- OKX (with V1 funding cache) -------------------------------------
+
+    def _funding_rate_is_fresh(self, cache_key: str, now_ms: int) -> bool:
+        """V1 parity: okx_funding_cache_entry_is_fresh.
+
+        Two conditions must hold (src/live/okx.rs:313-316):
+        1. funding_timestamp_ms is sufficiently in the future
+        2. observed_at_ms is within _FUNDING_CACHE_MAX_OBSERVED_AGE_MS
+        """
+        entry = self._funding_cache.get(cache_key)
+        if entry is None:
+            return False
+        _rate_bps, funding_ts_ms, observed_at_ms = entry
+        if funding_ts_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+            return False
+        if now_ms - observed_at_ms > _FUNDING_CACHE_MAX_OBSERVED_AGE_MS:
+            return False
+        return True
 
     async def _fetch_okx_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
         spec = self._spec
@@ -444,7 +472,19 @@ class MarketDataClient:
         canonical_symbols = {s.upper() for s in symbols}
         venue_sym_to_canon: dict[str, str] = {}
         for s in symbols:
-            venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
+            venue_sym = self._to_venue_symbol(s)
+            venue_sym_to_canon[venue_sym] = s.upper()
+            # V1 parity: OKX drops 1000/1000000 prefix from some contracts
+            # e.g. 1000BONKUSDT → BONK-USDT-SWAP (not 1000BONK-USDT-SWAP)
+            for prefix in ("1000000", "1000"):
+                if s.upper().startswith(prefix):
+                    stripped_sym = s.upper()[len(prefix):]
+                    stripped_venue = self._to_venue_symbol(stripped_sym)
+                    if stripped_venue != venue_sym:
+                        venue_sym_to_canon[stripped_venue] = s.upper()
+                    break  # only strip the longest matching prefix
+
+        now_ms = _now_ms()
 
         # 1. market/tickers?instType=SWAP (bid/ask, volume, OI from volCcy24h)
         ticker_path = spec.funding_ticker_path
@@ -458,28 +498,50 @@ class MarketDataClient:
             if sym in venue_sym_to_canon:
                 ticker_map[sym] = item
 
-        # 2. per-symbol funding-rate (V1 parity: bounded concurrency, no hard symbol limit)
+        # 2. per-symbol funding-rate with V1 parity cache
         funding_map: dict[str, dict] = {}
         if spec.funding_rate_path:
-            sem = asyncio.Semaphore(_OKX_FUNDING_RATE_SEMAPHORE)
+            # Separate symbols into cache-hit (fresh) and cache-miss (need fetch)
+            symbols_to_fetch: list[str] = []
+            for venue_sym in venue_sym_to_canon:
+                cache_key = f"{venue_str}:{venue_sym_to_canon[venue_sym]}"
+                if self._funding_rate_is_fresh(cache_key, now_ms):
+                    rate_bps, ts_ms, _ = self._funding_cache[cache_key]
+                    funding_map[venue_sym] = {
+                        "fundingRate": str(rate_bps / 10000.0),
+                        "nextFundingTime": str(ts_ms),
+                    }
+                else:
+                    symbols_to_fetch.append(venue_sym)
 
-            async def _fetch_funding(venue_sym: str) -> None:
-                async with sem:
-                    try:
-                        fr = await asyncio.wait_for(
-                            self._public_get(
-                                spec.funding_rate_path,
-                                params={"instId": venue_sym},
-                            ),
-                            timeout=_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S,
-                        )
-                    except (PublicTransportError, asyncio.TimeoutError):
-                        return
-                    fr_data = fr.get("data", [])
-                    if isinstance(fr_data, list) and fr_data:
-                        funding_map[venue_sym] = fr_data[0]
+            # Fetch only stale or missing symbols
+            if symbols_to_fetch:
+                sem = asyncio.Semaphore(_OKX_FUNDING_RATE_SEMAPHORE)
 
-            await asyncio.gather(*[_fetch_funding(sym) for sym in venue_sym_to_canon])
+                async def _fetch_funding(venue_sym: str) -> None:
+                    async with sem:
+                        try:
+                            fr = await asyncio.wait_for(
+                                self._public_get(
+                                    spec.funding_rate_path,
+                                    params={"instId": venue_sym},
+                                ),
+                                timeout=_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S,
+                            )
+                        except (PublicTransportError, asyncio.TimeoutError):
+                            return
+                        fr_data = fr.get("data", [])
+                        if isinstance(fr_data, list) and fr_data:
+                            item = fr_data[0]
+                            funding_map[venue_sym] = item
+                            # V1 parity: update cache
+                            cache_key = f"{venue_str}:{venue_sym_to_canon.get(venue_sym, venue_sym)}"
+                            rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
+                            ts_ms = int(_safe_float(item.get("nextFundingTime", 0)))
+                            if ts_ms > 0:
+                                self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
+
+                await asyncio.gather(*[_fetch_funding(sym) for sym in symbols_to_fetch])
 
         # 3. open-interest?instType=SWAP
         oi_map: dict[str, float] = {}
@@ -495,8 +557,15 @@ class MarketDataClient:
                 pass
 
         result: dict[str, FundingTicker] = {}
+        seen_canon: set[str] = set()  # dedup: 1000-prefix stripping may produce duplicate entries
         for venue_sym, canon in venue_sym_to_canon.items():
+            if canon in seen_canon:
+                continue
             t = ticker_map.get(venue_sym, {})
+            if not t:
+                # V1 parity: symbol not listed on OKX — skip (no quote row)
+                continue
+            seen_canon.add(canon)
             fr = funding_map.get(venue_sym, {})
             vol_ccy = _safe_float(t.get("volCcy24h", 0))
             last = _safe_float(t.get("last", 0))
