@@ -31,38 +31,46 @@ class SnapshotFreshness(Enum):
 
 @dataclass
 class FundingLifecycle:
-    """Funding data freshness metadata."""
+    """Funding data freshness metadata — V1 domain-level lifecycle."""
 
     venue: str
     observed_at_ms: int
     symbol_count: int
+    coverage_usable: int = 0
+    degraded_reason: str = ""
 
 
 @dataclass
 class MarketLifecycle:
-    """Market data freshness metadata."""
+    """Market data freshness metadata — V1 domain-level lifecycle."""
 
     venue: str
     observed_at_ms: int
     symbol_count: int
+    coverage_usable: int = 0
+    degraded_reason: str = ""
 
 
 @dataclass
 class TransferLifecycle:
-    """Transfer status freshness metadata."""
+    """Transfer status freshness metadata — V1 domain-level lifecycle."""
 
     from_venue: str
     to_venue: str
     observed_at_ms: int
+    coverage_usable: int = 0
+    degraded_reason: str = ""
 
 
 @dataclass
 class LiquidityLifecycle:
-    """Liquidity data freshness metadata."""
+    """Liquidity data freshness metadata — V1 domain-level lifecycle."""
 
     venue: str
     observed_at_ms: int
     symbol_count: int
+    coverage_usable: int = 0
+    degraded_reason: str = ""
 
 
 @dataclass
@@ -109,6 +117,9 @@ class CandidateInput:
     second_funding_timestamp_ms: int = 0
     # V1: FundingLeg — which side's funding settles first
     first_funding_leg: str = ""  # "long" or "short"
+    # V2: direction consistency and interval alignment (V1 fix)
+    direction_consistent: bool = False
+    interval_aligned: bool = False
 
 
 @dataclass
@@ -124,6 +135,7 @@ class SidecarSnapshot:
     liquidity_lifecycle: list[LiquidityLifecycle] = field(default_factory=list)
     degraded_venues: list[str] = field(default_factory=list)
     degraded_domains: list[str] = field(default_factory=list)
+    degraded_symbols: dict[str, list[str]] = field(default_factory=dict)  # venue -> [symbol, ...]
     # V1 provider-depth semantics: provenance tracking
     source_mode: str = ""  # "direct_market" | "direct_market_enriched" | "coarse_sidecar" | "sidecar_scan"
     acquisition_mode: str = ""  # "fresh_sidecar" | "last_good_sidecar" | "direct_market_view" | "unavailable"
@@ -165,7 +177,7 @@ def evaluate_snapshot_freshness(
                 return SnapshotFreshness.LAST_GOOD_FALLBACK
         return SnapshotFreshness.STALE
 
-    if snapshot.degraded_venues or snapshot.degraded_domains:
+    if snapshot.degraded_venues or snapshot.degraded_domains or snapshot.degraded_symbols:
         return SnapshotFreshness.DEGRADED
 
     return SnapshotFreshness.FRESH

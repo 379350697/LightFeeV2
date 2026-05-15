@@ -73,6 +73,15 @@ class VenueSpec:
     endpoint_weights: dict[str, int] = field(default_factory=dict)
     endpoint_min_interval_ms: dict[str, int] = field(default_factory=dict)
 
+    # V2 sidecar public endpoint paths
+    funding_ticker_path: str = ""
+    funding_rate_path: str = ""
+    premium_index_path: str = ""
+    volume_24h_path: str = ""
+    open_interest_path: str = ""
+    transfer_status_path: str = ""
+    ticker_includes_volume_oi: bool = False
+
 
 def binance_spec() -> VenueSpec:
     return VenueSpec(
@@ -101,6 +110,11 @@ def binance_spec() -> VenueSpec:
         server_time_safety_margin_ms=1000,
         recv_window_ms=10000,
         venue_scope="venue:binance",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/fapi/v1/ticker/bookTicker",
+        premium_index_path="/fapi/v1/premiumIndex",
+        volume_24h_path="/fapi/v1/ticker/24hr",
+        open_interest_path="/fapi/v1/openInterest",
     )
 
 
@@ -132,6 +146,10 @@ def okx_spec() -> VenueSpec:
         # V1 transport metadata
         server_time_path="/api/v5/public/time",
         venue_scope="venue:okx",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/api/v5/market/tickers",
+        funding_rate_path="/api/v5/public/funding-rate",
+        open_interest_path="/api/v5/public/open-interest",
     )
 
 
@@ -162,6 +180,9 @@ def bybit_spec() -> VenueSpec:
         server_time_path="/v5/market/time",
         recv_window_ms=5000,
         venue_scope="venue:bybit",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/v5/market/tickers",
+        ticker_includes_volume_oi=True,
     )
 
 
@@ -192,6 +213,9 @@ def bitget_spec() -> VenueSpec:
         symbol_from_venue=lambda s: s,
         # V1 transport metadata
         venue_scope="venue:bitget",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/api/v2/mix/market/tickers",
+        ticker_includes_volume_oi=True,
     )
 
 
@@ -219,6 +243,9 @@ def gate_spec() -> VenueSpec:
         symbol_from_venue=lambda s: s.replace("_USDT", "USDT").replace("_", ""),
         # V1 transport metadata
         venue_scope="venue:gate",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/api/v4/futures/usdt/tickers",
+        ticker_includes_volume_oi=True,
     )
 
 
@@ -249,6 +276,11 @@ def aster_spec() -> VenueSpec:
         server_time_safety_margin_ms=0,
         recv_window_ms=10000,
         venue_scope="venue:aster",
+        # V2 sidecar public endpoints (Binance-compatible)
+        funding_ticker_path="/fapi/v1/ticker/bookTicker",
+        premium_index_path="/fapi/v1/premiumIndex",
+        volume_24h_path="/fapi/v1/ticker/24hr",
+        open_interest_path="/fapi/v1/openInterest",
     )
 
 
@@ -274,6 +306,9 @@ def hyperliquid_spec() -> VenueSpec:
         symbol_from_venue=lambda s: s + "USDT" if "USDT" not in s.upper() else s,
         # V1 transport metadata
         venue_scope="venue:hyperliquid",
+        # V2 sidecar public endpoints
+        funding_ticker_path="/info",
+        ticker_includes_volume_oi=True,
     )
 
 

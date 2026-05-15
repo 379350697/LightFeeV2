@@ -1,4 +1,8 @@
-"""Shared venue transport: HTTP client, auth signing, error classification."""
+"""Shared venue transport: HTTP client, auth signing, error classification.
+
+VenueTransport inherits public-data methods from MarketDataClient and adds
+private trading methods (order, position, account risk, signed requests).
+"""
 
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.common import normalize_venue_quantity
+from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.specs import AuthScheme, VenueSpec
 
 
@@ -783,8 +788,8 @@ def _normalize_symbol(sym: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class VenueTransport:
-    """Shared async transport that owns HTTP lifecycle, auth, and error mapping."""
+class VenueTransport(MarketDataClient):
+    """Shared async transport: inherits public data from MarketDataClient, adds private trading."""
 
     def __init__(
         self,
@@ -794,40 +799,15 @@ class VenueTransport:
         exchange_http_timeout_ms: int = 10000,
         rate_limiter: Optional[EndpointRateLimiter] = None,
     ) -> None:
-        self._spec = spec
+        super().__init__(spec, exchange_http_timeout_ms=exchange_http_timeout_ms, rate_limiter=rate_limiter)
         self.mode = mode
         self._credential = credential
-        self._exchange_http_timeout_ms = exchange_http_timeout_ms
-        self._rate_limiter = rate_limiter
-        self._client: Optional[httpx.AsyncClient] = None
         self._hl_meta_cache: dict[str, int] = {}
         self._symbol_metadata: dict[str, dict[str, Any]] = {}  # sym → vendor contract info
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
 
         if mode == "live":
             self._validate_live_credentials(credential)
-
-    @property
-    def venue(self) -> Venue:
-        return self._spec.venue_id
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            timeout_s = self._exchange_http_timeout_ms / 1000.0
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_s),
-                limits=httpx.Limits(max_keepalive_connections=4),
-            )
-        return self._client
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
 
     # ------------------------------------------------------------------
     # Credential validation
@@ -3037,10 +3017,8 @@ class VenueTransport:
         self._symbol_metadata = dict(metadata)
 
     def _venue_symbol(self, symbol: str) -> str:
-        spec = self._spec
-        if spec.symbol_to_venue is not None:
-            return spec.symbol_to_venue(symbol)
-        return symbol
+        """Alias for _to_venue_symbol — kept for internal backward compat."""
+        return self._to_venue_symbol(symbol)
 
     # ------------------------------------------------------------------
     # Hyperliquid asset index resolution

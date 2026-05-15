@@ -52,23 +52,28 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
         "published_at_ms": s.published_at_ms,
         "market_observed_at_ms": s.market_observed_at_ms,
         "funding_lifecycle": [
-            {"venue": fl.venue, "observed_at_ms": fl.observed_at_ms, "symbol_count": fl.symbol_count}
+            {"venue": fl.venue, "observed_at_ms": fl.observed_at_ms, "symbol_count": fl.symbol_count,
+             "coverage_usable": fl.coverage_usable, "degraded_reason": fl.degraded_reason}
             for fl in s.funding_lifecycle
         ],
         "market_lifecycle": [
-            {"venue": ml.venue, "observed_at_ms": ml.observed_at_ms, "symbol_count": ml.symbol_count}
+            {"venue": ml.venue, "observed_at_ms": ml.observed_at_ms, "symbol_count": ml.symbol_count,
+             "coverage_usable": ml.coverage_usable, "degraded_reason": ml.degraded_reason}
             for ml in s.market_lifecycle
         ],
         "transfer_lifecycle": [
-            {"from_venue": tl.from_venue, "to_venue": tl.to_venue, "observed_at_ms": tl.observed_at_ms}
+            {"from_venue": tl.from_venue, "to_venue": tl.to_venue, "observed_at_ms": tl.observed_at_ms,
+             "coverage_usable": tl.coverage_usable, "degraded_reason": tl.degraded_reason}
             for tl in s.transfer_lifecycle
         ],
         "liquidity_lifecycle": [
-            {"venue": ll.venue, "observed_at_ms": ll.observed_at_ms, "symbol_count": ll.symbol_count}
+            {"venue": ll.venue, "observed_at_ms": ll.observed_at_ms, "symbol_count": ll.symbol_count,
+             "coverage_usable": ll.coverage_usable, "degraded_reason": ll.degraded_reason}
             for ll in s.liquidity_lifecycle
         ],
         "degraded_venues": list(s.degraded_venues),
         "degraded_domains": list(s.degraded_domains),
+        "degraded_symbols": {k: list(v) for k, v in s.degraded_symbols.items()},
         "source_mode": s.source_mode,
         "acquisition_mode": s.acquisition_mode,
         "quotes": {
@@ -107,6 +112,10 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "first_funding_timestamp_ms": c.first_funding_timestamp_ms,
                 "long_funding_timestamp_ms": c.long_funding_timestamp_ms,
                 "short_funding_timestamp_ms": c.short_funding_timestamp_ms,
+                "second_funding_timestamp_ms": c.second_funding_timestamp_ms,
+                "first_funding_leg": c.first_funding_leg,
+                "direction_consistent": c.direction_consistent,
+                "interval_aligned": c.interval_aligned,
             }
             for c in s.candidates
         ],
@@ -235,8 +244,19 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         liquidity_lifecycle=[LiquidityLifecycle(**ll) for ll in d.get("liquidity_lifecycle", [])],
         degraded_venues=d.get("degraded_venues", []),
         degraded_domains=d.get("degraded_domains", []),
+        degraded_symbols=_parse_degraded_symbols(d.get("degraded_symbols", {})),
         source_mode=d.get("source_mode", ""),
         acquisition_mode=d.get("acquisition_mode", ""),
         quotes={k: QuoteSnapshot(**v) for k, v in quotes_raw.items()},
         candidates=[_enrich_candidate(c) for c in d.get("candidates", [])],
     )
+
+
+def _parse_degraded_symbols(raw: object) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if isinstance(v, list):
+            result[str(k)] = [str(x) for x in v]
+    return result

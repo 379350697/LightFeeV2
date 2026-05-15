@@ -26,7 +26,8 @@ def _v1_lifecycle_to_v2(lifecycle: dict, venues: list[str]) -> list[dict]:
     observed_at_ms = lifecycle.get("observed_at_ms", 0)
     coverage = lifecycle.get("coverage_usable", 0)
     return [
-        {"venue": v, "observed_at_ms": observed_at_ms, "symbol_count": coverage}
+        {"venue": v, "observed_at_ms": observed_at_ms, "symbol_count": coverage,
+         "coverage_usable": coverage, "degraded_reason": lifecycle.get("degraded_reason", "")}
         for v in venues
     ]
 
@@ -152,6 +153,9 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         "short_funding_timestamp_ms": short_fts,
         "second_funding_timestamp_ms": max(long_fts, short_fts) if long_fts > 0 and short_fts > 0 else 0,
         "first_funding_leg": first_funding_leg,
+        # V1 parity: preserve direction_consistent and interval_aligned (V1 computes both)
+        "direction_consistent": bool(raw.get("direction_consistent", False)),
+        "interval_aligned": bool(raw.get("interval_aligned", False)),
     }
 
 
@@ -197,11 +201,22 @@ def convert_v1_snapshot_to_v2(raw: dict) -> dict:
         ),
         "degraded_venues": raw.get("degraded_venues", []),
         "degraded_domains": [],
+        "degraded_symbols": _v1_degraded_symbols(raw.get("degraded_symbols", {})),
         "source_mode": raw.get("source_mode", ""),
         "acquisition_mode": raw.get("source_mode", ""),
         "quotes": _v1_quotes_to_v2(raw.get("quotes", {})),
         "candidates": _v1_candidates_to_v2(raw.get("candidates", [])),
     }
+
+
+def _v1_degraded_symbols(raw: object) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if isinstance(v, list):
+            result[str(k)] = [str(x) for x in v]
+    return result
 
 
 def _collect_venues(raw: dict) -> list[str]:

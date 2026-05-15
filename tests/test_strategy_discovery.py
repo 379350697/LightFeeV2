@@ -130,6 +130,38 @@ class TestDiscovery:
         assert len(result) == 0
 
 
+class TestZeroSizeGate:
+    """V2 fix: entry_notional_quote must be non-zero for tradeable candidates."""
+
+    def test_zero_entry_notional_blocked(self):
+        config = StrategyConfig(max_concurrent_positions=8, min_funding_edge_bps=0)
+        candidates = [
+            CandidateInput(
+                long_venue="a", short_venue="b", symbol="X",
+                funding_diff_bps=10, funding_edge_bps=10,
+                expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
+                entry_notional_quote=0.0,  # V2 fix: zero should be blocked
+                first_funding_timestamp_ms=1700000000000,
+            )
+        ]
+        result = discover_tradeable_candidates(candidates, config, 0)
+        assert len(result) == 0
+
+    def test_nonzero_entry_notional_passes(self):
+        config = StrategyConfig(max_concurrent_positions=8, min_funding_edge_bps=0)
+        candidates = [
+            CandidateInput(
+                long_venue="a", short_venue="b", symbol="X",
+                funding_diff_bps=10, funding_edge_bps=10,
+                expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
+                entry_notional_quote=100.0,
+                first_funding_timestamp_ms=1700000000000,
+            )
+        ]
+        result = discover_tradeable_candidates(candidates, config, 0)
+        assert len(result) == 1
+
+
 class TestTransferBias:
     def test_clear_transfer_positive_bias(self):
         config = StrategyConfig(transfer_healthy_bias_bps=0.25)

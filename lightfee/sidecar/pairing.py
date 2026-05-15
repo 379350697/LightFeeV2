@@ -1,9 +1,14 @@
-"""Same-symbol venue pair building matching Rust pairing logic."""
+"""Same-symbol venue pair building with V1 parity identity and timing fields."""
 
 from __future__ import annotations
 
 from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
+
+
+# V1: fixed live/paper entry notional — non-zero to avoid ZERO_ORDER_SIZE gate
+_DEFAULT_ENTRY_NOTIONAL_QUOTE = 50.0
+_INTERVAL_ALIGNED_THRESHOLD_MS = 60_000
 
 
 def build_same_symbol_pairs(
@@ -12,8 +17,11 @@ def build_same_symbol_pairs(
 ) -> list[CandidateInput]:
     """Build directed (long, short) pairs for each symbol across venues.
 
-    Matches Rust pairing: lower-funding venue becomes long side,
-    higher-funding venue becomes short side.
+    V2 fixes:
+    - direction_consistent uses long/short mid prices, not ask
+    - interval_aligned = abs(long_ts - short_ts) <= 60_000
+    - pair_id, first_funding_leg, second_funding_timestamp_ms always populated
+    - entry_notional_quote always non-zero
     """
     candidates: list[CandidateInput] = []
 
@@ -34,14 +42,35 @@ def build_same_symbol_pairs(
                     continue
 
                 funding_diff = short_q.funding_rate_bps - long_q.funding_rate_bps
-                reference_mid = (short_q.bid + long_q.ask) / 2.0 if reference_mid_valid(long_q, short_q) else 1.0
-                raw_cross_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10000.0 if reference_mid > 0 else 0.0
+
+                # V2 fix: use mid prices for reference_mid and direction_consistent
+                long_mid = (long_q.bid + long_q.ask) / 2.0
+                short_mid = (short_q.bid + short_q.ask) / 2.0
+                reference_mid = (long_mid + short_mid) / 2.0 if long_mid > 0 and short_mid > 0 else 1.0
+
+                raw_cross_bps = 0.0
+                if reference_mid > 0 and long_q.ask > 0 and short_q.bid > 0:
+                    raw_cross_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10000.0
+
+                # V2 fix: direction_consistent using mid prices
+                direction_consistent = (
+                    funding_diff > 0
+                    and short_mid >= long_mid
+                    and long_mid > 0
+                    and short_mid > 0
+                )
+
+                long_ts = long_q.funding_timestamp_ms
+                short_ts = short_q.funding_timestamp_ms
+
+                # Timing fields
+                interval_aligned = abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS if long_ts > 0 and short_ts > 0 else False
+                first_ts = min(long_ts, short_ts)
+                second_ts = max(long_ts, short_ts)
+                first_leg = "long" if long_ts <= short_ts else "short" if long_ts > 0 and short_ts > 0 else ""
+                opportunity_type = "aligned" if interval_aligned else "staggered"
 
                 pair_id = make_candidate_pair_id(symbol, long_q.venue, short_q.venue)
-                # First funding timestamp is the earlier of the two venue timestamps
-                first_funding_ts = min(
-                    long_q.funding_timestamp_ms, short_q.funding_timestamp_ms,
-                )
 
                 candidates.append(
                     CandidateInput(
@@ -54,8 +83,16 @@ def build_same_symbol_pairs(
                         worst_case_edge_bps=funding_diff + raw_cross_bps,
                         ranking_edge_bps=funding_diff + raw_cross_bps,
                         pair_id=pair_id,
-                        funding_timestamp_ms=first_funding_ts,
-                        first_funding_timestamp_ms=first_funding_ts,
+                        funding_timestamp_ms=first_ts,
+                        first_funding_timestamp_ms=first_ts,
+                        long_funding_timestamp_ms=long_ts,
+                        short_funding_timestamp_ms=short_ts,
+                        second_funding_timestamp_ms=second_ts,
+                        first_funding_leg=first_leg,
+                        direction_consistent=direction_consistent,
+                        interval_aligned=interval_aligned,
+                        opportunity_type=opportunity_type,
+                        entry_notional_quote=_DEFAULT_ENTRY_NOTIONAL_QUOTE,
                     )
                 )
 

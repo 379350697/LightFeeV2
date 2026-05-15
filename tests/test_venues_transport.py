@@ -40,6 +40,7 @@ from lightfee.venues.specs import (
     aster_spec,
     hyperliquid_spec,
 )
+from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.transport import (
     LiveCredential,
     TransportError,
@@ -64,6 +65,17 @@ class TestTransportConstruction:
         transport = VenueTransport(spec=binance_spec(), mode="paper")
         assert transport.mode == "paper"
         assert transport.venue == Venue.BINANCE
+
+    def test_inherits_from_market_data_client(self):
+        transport = VenueTransport(spec=binance_spec(), mode="paper")
+        assert isinstance(transport, MarketDataClient)
+
+    def test_has_market_data_client_methods(self):
+        transport = VenueTransport(spec=binance_spec(), mode="paper")
+        assert hasattr(transport, "fetch_funding_tickers")
+        assert hasattr(transport, "fetch_perp_liquidity")
+        assert hasattr(transport, "fetch_l2_snapshot")
+        assert hasattr(transport, "spec")
 
     def test_live_mode_fails_without_credentials(self):
         with pytest.raises(ValueError, match="credentials"):

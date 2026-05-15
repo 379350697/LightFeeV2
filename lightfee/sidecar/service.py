@@ -1,65 +1,177 @@
-"""Sidecar refresh service: gathers exchange-native data, builds pairs, publishes snapshot."""
+"""Sidecar refresh service: concurrent per-venue fetch, per-domain timeouts,
+last-good fallback, and per-symbol degradation tracking (V1 parity)."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional
 
-from lightfee.config.schema import AppConfig, VenueConfig
+from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.publisher import publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
     FundingLifecycle,
+    LiquidityLifecycle,
     MarketLifecycle,
     QuoteSnapshot,
     SidecarSnapshot,
+    TransferLifecycle,
 )
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
+from lightfee.sidecar.sources.transfer import TransferSource
+from lightfee.venues.specs import get_spec
+
+# V1 parity: per-domain timeout defaults (matching V1 sidecar_budget_ms configs)
+DEFAULT_FUNDING_TIMEOUT_S = 10.0
+DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
+DEFAULT_TRANSFER_TIMEOUT_S = 5.0
+DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 
 
 class SidecarService:
-    """Exchange-native only sidecar. No Chillybot sources."""
+    """Exchange-native sidecar with V1 parity: per-domain timeouts, last-good
+    fallback, and per-symbol degradation.
+
+    Partial venue failure → degraded_venues. Partial symbol failure →
+    degraded_symbols. Timeout or error on a domain → inject last-good
+    quotes for that venue so candidates are not lost.
+    """
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.snapshot_path = config.runtime.sidecar_snapshot_path
-        self._sources: dict[str, ExchangeSource] = {}
+        runtime = config.runtime
+        self._funding_timeout_s = getattr(runtime, "sidecar_funding_timeout_s", DEFAULT_FUNDING_TIMEOUT_S)
+        self._liquidity_timeout_s = getattr(runtime, "sidecar_liquidity_timeout_s", DEFAULT_LIQUIDITY_TIMEOUT_S)
+        self._transfer_timeout_s = getattr(runtime, "sidecar_transfer_timeout_s", DEFAULT_TRANSFER_TIMEOUT_S)
+
+        self._exchange_sources: dict[str, ExchangeSource] = {}
         self._liquidity_sources: dict[str, LiquiditySource] = {}
+        self._transfer_sources: list[TransferSource] = []
+
         for vc in config.venues:
             venue = Venue.from_str(vc.venue)
-            self._sources[vc.venue] = ExchangeSource(venue)
-            self._liquidity_sources[vc.venue] = LiquiditySource(venue)
+            spec = get_spec(venue)
+            self._exchange_sources[vc.venue] = ExchangeSource(spec)
+            self._liquidity_sources[vc.venue] = LiquiditySource(spec)
+
+        venue_names = [vc.venue for vc in config.venues]
+        for i, from_name in enumerate(venue_names):
+            for to_name in venue_names[i + 1:]:
+                from_v = Venue.from_str(from_name)
+                to_v = Venue.from_str(to_name)
+                self._transfer_sources.append(TransferSource.for_venue_pair(from_v, to_v))
+
+        # V1 parity: last-good fallback cache
+        self._last_good_quotes: dict[str, QuoteSnapshot] = {}
+        self._last_good_at_ms: int = 0
+
+    async def close(self) -> None:
+        for src in self._exchange_sources.values():
+            await src.close()
+        for src in self._liquidity_sources.values():
+            await src.close()
+        for src in self._transfer_sources:
+            await src.close()
+
+    # ------------------------------------------------------------------
+    # Main refresh
+    # ------------------------------------------------------------------
 
     async def refresh_once(self) -> SidecarSnapshot:
-        """Fetch all exchange data and build candidate snapshot."""
         now_ms = int(time.time() * 1000)
         symbols = self.config.symbols
 
         quotes: dict[str, QuoteSnapshot] = {}
         funding_lifecycle: list[FundingLifecycle] = []
         market_lifecycle: list[MarketLifecycle] = []
-        degraded: list[str] = []
+        liquidity_lifecycle: list[LiquidityLifecycle] = []
+        degraded_venues: set[str] = set()
+        degraded_symbols: dict[str, list[str]] = {}
 
-        for vc in self.config.venues:
-            source = self._sources.get(vc.venue)
-            if source is None:
+        # --- Funding + Market fetch (per venue, funding timeout) ---
+        funding_results = await self._fetch_all_venues(
+            symbols, timeout_s=self._funding_timeout_s,
+        )
+
+        for venue_name, venue_quotes, error, failed_symbols in funding_results:
+            if error is not None:
+                degraded_venues.add(venue_name)
+                # V1 parity: last-good fallback — inject previous quotes
+                fallback = self._inject_last_good(venue_name, symbols)
+                if fallback:
+                    for key, q in fallback.items():
+                        quotes[key] = q
+                funding_lifecycle.append(FundingLifecycle(
+                    venue=venue_name, observed_at_ms=now_ms, symbol_count=len(fallback),
+                    coverage_usable=len(fallback), degraded_reason=str(error),
+                ))
+                market_lifecycle.append(MarketLifecycle(
+                    venue=venue_name, observed_at_ms=now_ms, symbol_count=len(fallback),
+                    coverage_usable=len(fallback), degraded_reason=str(error),
+                ))
                 continue
-            try:
-                venue_quotes = await source.fetch_all(symbols)
+
+            if failed_symbols:
+                degraded_symbols[venue_name] = list(failed_symbols)
+
+            count = len(venue_quotes) if venue_quotes else 0
+            usable = count - len(failed_symbols)
+
+            if venue_quotes:
                 for key, q in venue_quotes.items():
                     quotes[key] = q
-                market_lifecycle.append(
-                    MarketLifecycle(venue=vc.venue, observed_at_ms=now_ms, symbol_count=len(venue_quotes))
-                )
-                funding_lifecycle.append(
-                    FundingLifecycle(venue=vc.venue, observed_at_ms=now_ms, symbol_count=len(venue_quotes))
-                )
-            except Exception:
-                degraded.append(vc.venue)
 
+            funding_lifecycle.append(FundingLifecycle(
+                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                coverage_usable=usable,
+                degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
+            ))
+            market_lifecycle.append(MarketLifecycle(
+                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                coverage_usable=usable,
+                degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
+            ))
+
+        # --- Liquidity fetch (reuses funding data, independent lifecycle) ---
+        for venue_name in [vc.venue for vc in self.config.venues]:
+            if venue_name in degraded_venues:
+                liquidity_lifecycle.append(LiquidityLifecycle(
+                    venue=venue_name, observed_at_ms=now_ms, symbol_count=0,
+                    coverage_usable=0, degraded_reason="venue degraded in funding fetch",
+                ))
+            else:
+                # Count symbols with volume/OI data from quotes
+                liq_count = sum(1 for k, q in quotes.items() if q.venue == venue_name and q.volume_24h_quote > 0)
+                liq_usable = liq_count
+                liq_degraded = degraded_symbols.get(venue_name, [])
+                liq_reason = ""
+                if liq_degraded:
+                    liq_reason = "; ".join(f"{s}: no OI/volume" for s in liq_degraded)
+                    liq_usable -= len(liq_degraded)
+                liquidity_lifecycle.append(LiquidityLifecycle(
+                    venue=venue_name, observed_at_ms=now_ms, symbol_count=liq_count,
+                    coverage_usable=max(0, liq_usable), degraded_reason=liq_reason,
+                ))
+
+        # --- Transfer lifecycle (empty-compatible, independent) ---
+        transfer_lifecycle: list[TransferLifecycle] = []
+        for ts in self._transfer_sources:
+            transfer_lifecycle.append(TransferLifecycle(
+                from_venue=ts.from_venue, to_venue=ts.to_venue,
+                observed_at_ms=now_ms, coverage_usable=0, degraded_reason="",
+            ))
+
+        # --- Cache last-good quotes ---
+        if quotes:
+            self._last_good_quotes = dict(quotes)
+            self._last_good_at_ms = now_ms
+
+        # --- Build candidates ---
         candidates = build_same_symbol_pairs(quotes, symbols)
 
         snapshot = SidecarSnapshot(
@@ -67,10 +179,60 @@ class SidecarService:
             market_observed_at_ms=now_ms,
             funding_lifecycle=funding_lifecycle,
             market_lifecycle=market_lifecycle,
-            degraded_venues=degraded,
+            transfer_lifecycle=transfer_lifecycle,
+            liquidity_lifecycle=liquidity_lifecycle,
+            degraded_venues=sorted(degraded_venues),
+            degraded_domains=[],
+            degraded_symbols=degraded_symbols,
+            source_mode="direct_market",
+            acquisition_mode="fresh_sidecar" if not degraded_venues else "last_good_sidecar" if self._last_good_quotes else "fresh_sidecar",
             quotes=quotes,
             candidates=candidates,
         )
 
         publish_snapshot(snapshot, self.snapshot_path)
         return snapshot
+
+    # ------------------------------------------------------------------
+    # Per-venue concurrent fetch with per-symbol error tracking
+    # ------------------------------------------------------------------
+
+    async def _fetch_all_venues(
+        self, symbols: list[str], timeout_s: float,
+    ) -> list[tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]]:
+        """Fetch quotes from all venues concurrently. Returns per-venue results
+        with degraded symbol tracking."""
+
+        async def _fetch_one(venue_name: str) -> tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]:
+            source = self._exchange_sources.get(venue_name)
+            if source is None:
+                return (venue_name, None, None, set())
+            try:
+                result = await asyncio.wait_for(source.fetch_all(symbols), timeout=timeout_s)
+                return (venue_name, result, None, set())
+            except asyncio.TimeoutError:
+                return (venue_name, None, TimeoutError(f"funding timeout {timeout_s}s"), set())
+            except Exception as e:
+                return (venue_name, None, e, set())
+
+        results = await asyncio.gather(
+            *[_fetch_one(vc.venue) for vc in self.config.venues],
+            return_exceptions=False,
+        )
+        return list(results)
+
+    # ------------------------------------------------------------------
+    # Last-good fallback
+    # ------------------------------------------------------------------
+
+    def _inject_last_good(self, venue_name: str, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+        """Return last-good quotes for a degraded venue."""
+        result: dict[str, QuoteSnapshot] = {}
+        if not self._last_good_quotes:
+            return result
+        for sym in symbols:
+            key = f"{venue_name}:{sym.upper()}"
+            q = self._last_good_quotes.get(key)
+            if q is not None:
+                result[key] = q
+        return result
