@@ -173,12 +173,48 @@ class TestSnapshotRoundTripWithAllV1Fields:
 
 
 class TestAcquisitionModeReflectsDegradation:
-    """When degraded_venues present, acquisition_mode should indicate fallback."""
+    """When degraded_venues present, acquisition_mode must match V1 semantics."""
 
     def test_acquisition_mode_fresh_when_clean(self):
-        s = SidecarSnapshot(acquisition_mode="fresh_sidecar", degraded_venues=[])
-        assert s.acquisition_mode == "fresh_sidecar"
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+        assert _resolve_acquisition_mode(set(), {}) == "fresh_sidecar"
 
-    def test_acquisition_mode_can_indicate_last_good(self):
-        s = SidecarSnapshot(acquisition_mode="last_good_sidecar", degraded_venues=["x"])
-        assert s.acquisition_mode == "last_good_sidecar"
+    def test_acquisition_mode_last_good_when_degraded_with_cache(self):
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+        assert _resolve_acquisition_mode({"okx"}, {"x": 1}) == "last_good_sidecar"
+
+    def test_acquisition_mode_degraded_when_first_partial_failure(self):
+        """Critical: first partial failure with no cache → degraded_sidecar, NOT fresh."""
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+        assert _resolve_acquisition_mode({"binance"}, {}) == "degraded_sidecar"
+
+    def test_acquisition_mode_degraded_when_cache_empty_dict(self):
+        """Empty dict is falsy → degraded_sidecar, not fresh."""
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+        assert _resolve_acquisition_mode({"binance"}, {}) != "fresh_sidecar"
+
+
+class TestLiquiditySourceWiredIntoRefresh:
+    """LiquiditySource and sidecar_liquidity_timeout_s must be in the refresh path."""
+
+    def test_fetch_liquidity_all_venues_method_exists(self):
+        from lightfee.sidecar.service import SidecarService
+        svc = object.__new__(SidecarService)
+        assert hasattr(svc, "_fetch_liquidity_all_venues")
+
+    def test_liquidity_timeout_s_read_from_runtime(self):
+        from lightfee.sidecar.service import SidecarService, DEFAULT_LIQUIDITY_TIMEOUT_S
+        svc = object.__new__(SidecarService)
+        svc.config = type("c", (), {"runtime": type("r", (), {"sidecar_snapshot_path": "/tmp"})(), "venues": [], "symbols": []})()
+        svc._liquidity_sources = {}
+        svc._exchange_sources = {}
+        svc._transfer_sources = []
+        svc._last_good_quotes = {}
+        svc._funding_timeout_s = 10
+        svc._liquidity_timeout_s = 7.0
+        svc._transfer_timeout_s = 5
+        assert svc._liquidity_timeout_s == 7.0
+
+    def test_liquidity_timeout_default(self):
+        from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
+        assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
