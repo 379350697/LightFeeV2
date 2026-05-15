@@ -1,5 +1,8 @@
 """End-to-end configuration and runtime smoke tests."""
 
+import subprocess
+import sys
+
 import pytest
 
 from lightfee.config.loader import load_config
@@ -69,6 +72,16 @@ class TestImportSmoke:
 
     def test_apps_imports(self):
         from lightfee.apps import live, sidecar, scheduler, ops, report, replay, evolution, probe
+
+    def test_sidecar_module_help_invokes_main(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "lightfee.apps.sidecar", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "lightfee-sidecar" in result.stdout
 
     def test_ops_imports(self):
         from lightfee.ops import commands

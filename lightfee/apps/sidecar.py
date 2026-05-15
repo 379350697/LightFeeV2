@@ -39,3 +39,7 @@ def main() -> None:
             await asyncio.sleep(config.runtime.sidecar_refresh_ms / 1000.0)
 
     asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()

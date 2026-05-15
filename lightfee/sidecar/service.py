@@ -83,7 +83,8 @@ class SidecarService:
     # ------------------------------------------------------------------
 
     async def refresh_once(self) -> SidecarSnapshot:
-        now_ms = int(time.time() * 1000)
+        observed_ms = int(time.time() * 1000)
+        had_last_good_before_refresh = bool(self._last_good_quotes)
         symbols = self.config.symbols
 
         quotes: dict[str, QuoteSnapshot] = {}
@@ -107,11 +108,11 @@ class SidecarService:
                     for key, q in fallback.items():
                         quotes[key] = q
                 funding_lifecycle.append(FundingLifecycle(
-                    venue=venue_name, observed_at_ms=now_ms, symbol_count=len(fallback),
+                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
                 market_lifecycle.append(MarketLifecycle(
-                    venue=venue_name, observed_at_ms=now_ms, symbol_count=len(fallback),
+                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
                 continue
@@ -127,12 +128,12 @@ class SidecarService:
                     quotes[key] = q
 
             funding_lifecycle.append(FundingLifecycle(
-                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
                 coverage_usable=usable,
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
             market_lifecycle.append(MarketLifecycle(
-                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
                 coverage_usable=usable,
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
@@ -145,7 +146,7 @@ class SidecarService:
             if liq_error is not None:
                 degraded_venues.add(venue_name)
                 liquidity_lifecycle.append(LiquidityLifecycle(
-                    venue=venue_name, observed_at_ms=now_ms, symbol_count=0,
+                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=0,
                     coverage_usable=0, degraded_reason=str(liq_error),
                 ))
                 continue
@@ -157,7 +158,7 @@ class SidecarService:
             count = len(liq_data) if liq_data else 0
             usable = count - len(liq_failed_symbols)
             liquidity_lifecycle.append(LiquidityLifecycle(
-                venue=venue_name, observed_at_ms=now_ms, symbol_count=count,
+                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
                 coverage_usable=max(0, usable),
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in liq_failed_symbols) if liq_failed_symbols else "",
             ))
@@ -167,20 +168,23 @@ class SidecarService:
         for ts in self._transfer_sources:
             transfer_lifecycle.append(TransferLifecycle(
                 from_venue=ts.from_venue, to_venue=ts.to_venue,
-                observed_at_ms=now_ms, coverage_usable=0, degraded_reason="",
+                observed_at_ms=observed_ms, coverage_usable=0, degraded_reason="",
             ))
+
+        last_good_for_acquisition = self._last_good_quotes if had_last_good_before_refresh else {}
+
+        # --- Build candidates ---
+        candidates = build_same_symbol_pairs(quotes, symbols)
+        published_ms = int(time.time() * 1000)
 
         # --- Cache last-good quotes ---
         if quotes:
             self._last_good_quotes = dict(quotes)
-            self._last_good_at_ms = now_ms
-
-        # --- Build candidates ---
-        candidates = build_same_symbol_pairs(quotes, symbols)
+            self._last_good_at_ms = published_ms
 
         snapshot = SidecarSnapshot(
-            published_at_ms=now_ms,
-            market_observed_at_ms=now_ms,
+            published_at_ms=published_ms,
+            market_observed_at_ms=observed_ms,
             funding_lifecycle=funding_lifecycle,
             market_lifecycle=market_lifecycle,
             transfer_lifecycle=transfer_lifecycle,
@@ -189,7 +193,7 @@ class SidecarService:
             degraded_domains=[],
             degraded_symbols=degraded_symbols,
             source_mode="direct_market",
-            acquisition_mode=_resolve_acquisition_mode(degraded_venues, self._last_good_quotes),
+            acquisition_mode=_resolve_acquisition_mode(degraded_venues, last_good_for_acquisition),
             quotes=quotes,
             candidates=candidates,
         )

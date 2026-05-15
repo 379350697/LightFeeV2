@@ -218,3 +218,78 @@ class TestLiquiditySourceWiredIntoRefresh:
     def test_liquidity_timeout_default(self):
         from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
         assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
+
+
+class TestRefreshPublicationSemantics:
+    """Refresh metadata must distinguish market observation from publish time."""
+
+    @pytest.mark.asyncio
+    async def test_published_at_ms_uses_refresh_completion_time(self, monkeypatch, tmp_path):
+        from lightfee.sidecar.service import SidecarService
+
+        svc = object.__new__(SidecarService)
+        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.snapshot_path = tmp_path / "sidecar.json"
+        svc._funding_timeout_s = 10.0
+        svc._liquidity_timeout_s = 10.0
+        svc._transfer_sources = []
+        svc._last_good_quotes = {}
+        svc._last_good_at_ms = 0
+
+        async def fake_fetch_all_venues(symbols, timeout_s):
+            return [(
+                "binance",
+                {"binance:BTCUSDT": QuoteSnapshot(
+                    venue="binance", symbol="BTCUSDT", bid=50000, ask=50001,
+                    funding_rate_bps=1.0, funding_timestamp_ms=1000,
+                )},
+                None,
+                set(),
+            )]
+
+        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
+            return [("binance", {}, None, set())]
+
+        svc._fetch_all_venues = fake_fetch_all_venues
+        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
+        times = iter([1.0, 7.0])
+        monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
+
+        snapshot = await svc.refresh_once()
+
+        assert snapshot.market_observed_at_ms == 1000
+        assert snapshot.published_at_ms == 7000
+        assert svc._last_good_at_ms == 7000
+
+    @pytest.mark.asyncio
+    async def test_first_partial_degradation_without_cache_is_degraded_sidecar(self, tmp_path):
+        from lightfee.sidecar.service import SidecarService
+
+        svc = object.__new__(SidecarService)
+        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.snapshot_path = tmp_path / "sidecar.json"
+        svc._funding_timeout_s = 10.0
+        svc._liquidity_timeout_s = 10.0
+        svc._transfer_sources = []
+        svc._last_good_quotes = {}
+        svc._last_good_at_ms = 0
+
+        async def fake_fetch_all_venues(symbols, timeout_s):
+            return [
+                ("binance", None, TimeoutError("funding timeout 10.0s"), set()),
+                ("okx", {"okx:BTCUSDT": QuoteSnapshot(
+                    venue="okx", symbol="BTCUSDT", bid=50010, ask=50011,
+                    funding_rate_bps=2.0, funding_timestamp_ms=1000,
+                )}, None, set()),
+            ]
+
+        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
+            return []
+
+        svc._fetch_all_venues = fake_fetch_all_venues
+        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
+
+        snapshot = await svc.refresh_once()
+
+        assert snapshot.degraded_venues == ["binance"]
+        assert snapshot.acquisition_mode == "degraded_sidecar"

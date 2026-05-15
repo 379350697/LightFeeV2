@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from lightfee.core.domain import Venue
@@ -212,3 +214,138 @@ class TestParserFixtures:
     def test_hyperliquid_meta_and_asset_ctxs(self):
         spec = hyperliquid_spec()
         assert spec.funding_ticker_path == "/info"
+
+
+class TestProductionSidecarParserRegressions:
+    """Regression coverage for live sidecar deployment failures."""
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_error_does_not_drop_quotes(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "HTTP 400: symbol required",
+                        status_code=400,
+                    )
+                return {}
+
+        result = await FakeBinanceClient(binance_spec())._fetch_binance_style(["BTCUSDT"])
+
+        ticker = result["binance:BTCUSDT"]
+        assert ticker.bid == 100.0
+        assert ticker.ask == 101.0
+        assert ticker.open_interest_quote == 0.0
+
+    @pytest.mark.asyncio
+    async def test_okx_funding_rate_requests_are_concurrent(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.active_funding = 0
+                self.max_active_funding = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {"instId": f"S{i}-USDT-SWAP", "bidPx": "10", "askPx": "11"}
+                            for i in range(8)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    self.active_funding += 1
+                    self.max_active_funding = max(self.max_active_funding, self.active_funding)
+                    await asyncio.sleep(0.01)
+                    self.active_funding -= 1
+                    return {
+                        "data": [{
+                            "fundingRate": "0.0002",
+                            "fundingTime": "1700000000000",
+                            "markPrice": "10.5",
+                        }]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        result = await client._fetch_okx_style([f"S{i}USDT" for i in range(8)])
+
+        assert len(result) == 8
+        assert client.max_active_funding > 1
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_meta_dict_universe_is_parsed(self):
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                assert body == {"type": "metaAndAssetCtxs"}
+                return [
+                    {"universe": [{"name": "BTC"}]},
+                    [{"coin": "BTC", "markPx": "65000", "funding": "0.0001", "dayNtlVlm": "1000", "openInterest": "20"}],
+                ]
+
+        result = await FakeHyperliquidClient(hyperliquid_spec())._fetch_hyperliquid_style(["BTCUSDT"])
+
+        ticker = result["hyperliquid:BTCUSDT"]
+        assert ticker.bid == 65000.0
+        assert ticker.ask == 65000.0
+        assert ticker.funding_rate_bps == 1.0
+
+    @pytest.mark.asyncio
+    async def test_binance_large_universe_skips_per_symbol_open_interest(self):
+        symbols = [f"S{i}USDT" for i in range(64)]
+
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": symbol, "bidPrice": "100", "askPrice": "101"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {"symbol": symbol, "lastFundingRate": "0.0001", "markPrice": "100.5"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": symbol, "quoteVolume": "12345"} for symbol in symbols]
+                if path == "/fapi/v1/openInterest":
+                    raise AssertionError("large live universes must not block on per-symbol OI")
+                return {}
+
+        result = await FakeBinanceClient(binance_spec())._fetch_binance_style(symbols)
+
+        assert len(result) == len(symbols)
+        assert result["binance:S0USDT"].open_interest_quote == 0.0
+
+    @pytest.mark.asyncio
+    async def test_okx_large_universe_skips_per_symbol_funding_enrichment(self):
+        symbols = [f"S{i}USDT" for i in range(64)]
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {"instId": f"S{i}-USDT-SWAP", "bidPx": "10", "askPx": "11"}
+                            for i in range(64)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    raise AssertionError("large live universes must not block on per-symbol funding")
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(symbols)
+
+        assert len(result) == len(symbols)
+        assert result["okx:S0USDT"].funding_rate_bps == 0.0

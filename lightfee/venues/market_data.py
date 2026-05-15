@@ -72,6 +72,9 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS = 50
+
+
 # ---------------------------------------------------------------------------
 # MarketDataClient
 # ---------------------------------------------------------------------------
@@ -378,15 +381,26 @@ class MarketDataClient:
                 if sym in venue_sym_to_canon:
                     vol_map[sym] = _safe_float(item.get("quoteVolume", item.get("volume", 0)))
 
-        # 4. openInterest
+        # 4. openInterest. Binance-compatible venues expose this per symbol;
+        # failures must not drop otherwise usable quote rows.
         oi_map: dict[str, float] = {}
-        if spec.open_interest_path:
-            raw_oi = await self._public_get(spec.open_interest_path)
-            items_oi = raw_oi if isinstance(raw_oi, list) else [raw_oi]
-            for item in items_oi:
-                sym = str(item.get("symbol", ""))
-                if sym in venue_sym_to_canon:
-                    oi_map[sym] = _safe_float(item.get("openInterest", 0))
+        if spec.open_interest_path and len(venue_sym_to_canon) <= MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS:
+            sem = asyncio.Semaphore(16)
+
+            async def _fetch_oi(venue_sym: str) -> None:
+                async with sem:
+                    try:
+                        raw_oi = await self._public_get(
+                            spec.open_interest_path,
+                            params={"symbol": venue_sym},
+                        )
+                    except PublicTransportError:
+                        return
+                    item = raw_oi[0] if isinstance(raw_oi, list) and raw_oi else raw_oi
+                    if isinstance(item, dict):
+                        oi_map[venue_sym] = _safe_float(item.get("openInterest", 0))
+
+            await asyncio.gather(*[_fetch_oi(sym) for sym in venue_sym_to_canon])
 
         result: dict[str, FundingTicker] = {}
         for venue_sym, canon in venue_sym_to_canon.items():
@@ -432,15 +446,23 @@ class MarketDataClient:
 
         # 2. per-symbol funding-rate
         funding_map: dict[str, dict] = {}
-        if spec.funding_rate_path:
-            for venue_sym in venue_sym_to_canon:
-                try:
-                    fr = await self._public_get(spec.funding_rate_path, params={"instId": venue_sym})
+        if spec.funding_rate_path and len(venue_sym_to_canon) <= MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS:
+            sem = asyncio.Semaphore(16)
+
+            async def _fetch_funding(venue_sym: str) -> None:
+                async with sem:
+                    try:
+                        fr = await self._public_get(
+                            spec.funding_rate_path,
+                            params={"instId": venue_sym},
+                        )
+                    except PublicTransportError:
+                        return
                     fr_data = fr.get("data", [])
                     if isinstance(fr_data, list) and fr_data:
                         funding_map[venue_sym] = fr_data[0]
-                except PublicTransportError:
-                    continue
+
+            await asyncio.gather(*[_fetch_funding(sym) for sym in venue_sym_to_canon])
 
         # 3. open-interest?instType=SWAP
         oi_map: dict[str, float] = {}
@@ -599,7 +621,11 @@ class MarketDataClient:
         universe: list[dict] = []
         asset_ctxs: list[dict] = []
         if isinstance(raw, list) and len(raw) >= 2:
-            universe = raw[0] if isinstance(raw[0], list) else []
+            if isinstance(raw[0], dict):
+                maybe_universe = raw[0].get("universe", [])
+                universe = maybe_universe if isinstance(maybe_universe, list) else []
+            else:
+                universe = raw[0] if isinstance(raw[0], list) else []
             asset_ctxs = raw[1] if isinstance(raw[1], list) else []
 
         # Index asset contexts by coin name
@@ -621,8 +647,8 @@ class MarketDataClient:
             result[f"{venue_str}:{canon.upper()}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon.upper(),
-                bid=_safe_float(item.get("markPx", 0)),  # HL bulk: use mark as best estimate
-                ask=_safe_float(item.get("markPx", 0)),
+                bid=mark,  # HL bulk: use mark as best estimate
+                ask=mark,
                 bid_size=0.0,
                 ask_size=0.0,
                 mark_price=mark,
