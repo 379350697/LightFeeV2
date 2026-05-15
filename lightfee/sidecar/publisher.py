@@ -113,6 +113,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "long_funding_timestamp_ms": c.long_funding_timestamp_ms,
                 "short_funding_timestamp_ms": c.short_funding_timestamp_ms,
                 "second_funding_timestamp_ms": c.second_funding_timestamp_ms,
+                "entry_notional_quote": c.entry_notional_quote,
                 "first_funding_leg": c.first_funding_leg,
                 "direction_consistent": c.direction_consistent,
                 "interval_aligned": c.interval_aligned,

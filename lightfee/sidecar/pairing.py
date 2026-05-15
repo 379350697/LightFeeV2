@@ -79,9 +79,11 @@ def build_same_symbol_pairs(
                         symbol=symbol,
                         funding_diff_bps=funding_diff,
                         funding_edge_bps=funding_diff,
-                        expected_edge_bps=funding_diff + raw_cross_bps,
-                        worst_case_edge_bps=funding_diff + raw_cross_bps,
-                        ranking_edge_bps=funding_diff + raw_cross_bps,
+                        # V1 parity: sidecar emits pure funding edge without cross-spread deduction.
+                        # Entry/exit cross costs are computed in the engine from live L2 order books.
+                        expected_edge_bps=funding_diff,
+                        worst_case_edge_bps=funding_diff,
+                        ranking_edge_bps=funding_diff + raw_cross_bps,  # cross-spread used for ranking only
                         pair_id=pair_id,
                         funding_timestamp_ms=first_ts,
                         first_funding_timestamp_ms=first_ts,
