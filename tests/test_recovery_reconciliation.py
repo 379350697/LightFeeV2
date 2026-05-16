@@ -716,6 +716,41 @@ class TestReconciliationService:
         assert result.long_status == "uncertain"
         assert result.short_status == "uncertain"
 
+    @pytest.mark.asyncio
+    async def test_reconciler_records_sanitized_order_reconcile_result(self):
+        long_adapter = FakeVenueAdapter(Venue.BINANCE)
+        short_adapter = FakeVenueAdapter(Venue.OKX)
+
+        reconciler = OrderReconciler(adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter})
+        await reconciler.reconcile_position(
+            position_id="pos-log",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_order_id="long-order",
+            short_order_id="short-order",
+            long_client_order_id="long-client",
+            short_client_order_id="short-client",
+        )
+
+        events = reconciler.drain_order_diagnostics()
+        assert [event["kind"] for event in events] == [
+            "order.reconcile_result",
+            "order.reconcile_result",
+        ]
+        payload = events[0]["payload"]
+        assert payload["venue"] == "binance"
+        assert payload["symbol"] == "BTCUSDT"
+        assert payload["endpoint"] == "fetch_order_status"
+        assert payload["product_type"] == "reconciliation"
+        assert payload["category"] == "reconciliation"
+        assert payload["client_order_id"] == "long-client"
+        assert payload["order_id"] == "long-order"
+        assert payload["response_classification"] == "uncertain"
+        serialized = json.dumps(events)
+        assert "secret" not in serialized.lower()
+        assert "signature" not in serialized.lower()
+
 
 # ---------------------------------------------------------------------------
 # Task 2 regression: client_order_id reconciliation

@@ -11,12 +11,14 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import datetime
 import random
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Optional
 
@@ -65,6 +67,29 @@ def _missing_hyperliquid_signing_dependencies() -> list[str]:
         if importlib.util.find_spec(module_name) is None:
             missing.append(package_name)
     return missing
+
+
+def _floor_to_step(value: float, step: float) -> float:
+    if step <= 0 or not math.isfinite(value):
+        return value
+    return math.floor((value / step) + 1e-12) * step
+
+
+def _ceil_to_step(value: float, step: float) -> float:
+    if step <= 0 or not math.isfinite(value):
+        return value
+    return math.ceil((value / step) - 1e-12) * step
+
+
+def _format_decimal(value: float) -> str:
+    return format(Decimal(str(round(float(value), 12))).normalize(), "f")
+
+
+def _step_decimals(step: float) -> int:
+    if step <= 0 or not math.isfinite(step):
+        return 12
+    text = f"{step:.12f}".rstrip("0").rstrip(".")
+    return len(text.split(".", 1)[1]) if "." in text else 0
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +845,7 @@ class VenueTransport(MarketDataClient):
         self._hl_meta_cache: dict[str, int] = {}
         self._symbol_metadata: dict[str, dict[str, Any]] = {}  # sym → vendor contract info
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
+        self._order_diagnostics: list[dict[str, Any]] = []
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -859,6 +885,103 @@ class VenueTransport(MarketDataClient):
             raise ValueError(
                 f"live mode requires passphrase for {self._spec.venue_id.value}"
             )
+
+    @property
+    def order_diagnostics(self) -> list[dict[str, Any]]:
+        return list(self._order_diagnostics)
+
+    def drain_order_diagnostics(self) -> list[dict[str, Any]]:
+        events = list(self._order_diagnostics)
+        self._order_diagnostics.clear()
+        return events
+
+    def _record_order_diagnostic(self, kind: str, payload: dict[str, Any]) -> None:
+        blocked = ("secret", "signature", "api_key", "private_key", "header", "auth")
+        clean = {
+            str(k): v
+            for k, v in payload.items()
+            if not any(token in str(k).lower() for token in blocked)
+        }
+        self._order_diagnostics.append({"kind": kind, "payload": clean})
+
+    def startup_preflight(self) -> dict[str, Any]:
+        missing: list[str] = []
+        if self._spec.requires_wallet_key:
+            missing = _missing_hyperliquid_signing_dependencies()
+        return {
+            "venue": self._spec.venue_id.value,
+            "status": "failed" if missing else "ok",
+            "missing_dependencies": missing,
+            "endpoint": self._spec.order_path,
+            "product_type": self._product_type(),
+        }
+
+    def _product_type(self) -> str:
+        if self._spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+            return "usdm_futures"
+        if self._spec.venue_id == Venue.BYBIT:
+            return "linear"
+        if self._spec.venue_id == Venue.OKX:
+            return "swap"
+        if self._spec.venue_id == Venue.BITGET:
+            return "mix"
+        if self._spec.venue_id == Venue.GATE:
+            return "futures"
+        if self._spec.venue_id == Venue.HYPERLIQUID:
+            return "perp"
+        return ""
+
+    def preflight_order_request(self, request: OrderRequest) -> dict[str, Any]:
+        spec = self._spec
+        tick_size = float(spec.price_tick or 0.0)
+        quantity_step = float(spec.quantity_step or 0.0)
+        raw_qty = float(request.quantity)
+        raw_price = float(request.price) if request.price is not None else None
+        quantized_qty = _floor_to_step(raw_qty, quantity_step) if quantity_step > 0 else raw_qty
+        quantized_qty = round(quantized_qty, _step_decimals(quantity_step))
+        if spec.venue_id == Venue.GATE:
+            quantized_qty = float(int(quantized_qty))
+        quantized_price = raw_price
+        if raw_price is not None and tick_size > 0:
+            quantized_price = (
+                _floor_to_step(raw_price, tick_size)
+                if request.side == Side.BUY
+                else _ceil_to_step(raw_price, tick_size)
+            )
+            quantized_price = round(float(quantized_price), _step_decimals(tick_size))
+        payload = {
+            "venue": spec.venue_id.value,
+            "symbol": request.symbol,
+            "endpoint": spec.order_path,
+            "product_type": self._product_type(),
+            "category": self._product_type(),
+            "client_order_id": request.client_order_id or "",
+            "order_id": request.order_id or "",
+            "raw_price": raw_price,
+            "raw_qty": raw_qty,
+            "quantized_price": quantized_price,
+            "quantized_qty": quantized_qty,
+            "tick_size": tick_size,
+            "quantity_step": quantity_step,
+        }
+        if quantized_qty <= 0 or not math.isfinite(quantized_qty):
+            payload["response_classification"] = "precision_rejected"
+            payload["reason"] = "quantity_step_rejected"
+            self._record_order_diagnostic("order.submit_result", payload)
+            raise OrderSubmitError(SubmitFailureClass.REJECTED, "quantity_step_rejected")
+        notional_price = quantized_price if quantized_price is not None else raw_price
+        if notional_price is not None and not request.reduce_only:
+            notional = abs(quantized_qty * float(notional_price))
+            if notional < spec.min_notional:
+                payload["response_classification"] = "precision_rejected"
+                payload["reason"] = "min_notional_rejected"
+                self._record_order_diagnostic("order.submit_result", payload)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"min_notional_rejected notional={notional} min_notional={spec.min_notional}",
+                )
+        payload["response_classification"] = "attempt"
+        return payload
 
     # ------------------------------------------------------------------
     # Server-time offset (V1 parity)
@@ -1982,10 +2105,21 @@ class VenueTransport(MarketDataClient):
             )
 
         try:
+            preflight = self.preflight_order_request(request)
+            self._record_order_diagnostic("order.submit_attempt", preflight)
+            request = replace(
+                request,
+                quantity=float(preflight["quantized_qty"]),
+                price=(
+                    None
+                    if preflight["quantized_price"] is None
+                    else float(preflight["quantized_price"])
+                ),
+            )
             body: dict[str, Any] = {
                 "symbol": venue_sym,
                 "side": request.side.value.upper(),
-                "quantity": str(request.quantity),
+                "quantity": _format_decimal(request.quantity),
             }
 
             if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
@@ -1994,7 +2128,7 @@ class VenueTransport(MarketDataClient):
                     body["reduceOnly"] = "true"
                 if request.price is not None:
                     body["type"] = "LIMIT"
-                    body["price"] = str(request.price)
+                    body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
             elif spec.venue_id == Venue.OKX:
                 body["instId"] = venue_sym
@@ -2007,6 +2141,10 @@ class VenueTransport(MarketDataClient):
                     request, venue_sym, passive=False,
                     hedge_mode=self._hedge_mode,
                 )
+                if "qty" in body:
+                    body["qty"] = _format_decimal(request.quantity)
+                if request.price is not None:
+                    body["price"] = _format_decimal(request.price)
             elif spec.venue_id == Venue.BITGET:
                 body["marginCoin"] = "USDT"
                 body["orderType"] = "market"
@@ -2018,11 +2156,11 @@ class VenueTransport(MarketDataClient):
                 if request.reduce_only:
                     body["reduce_only"] = True
                 if request.price is not None:
-                    body["price"] = str(request.price)
+                    body["price"] = _format_decimal(request.price)
             elif spec.venue_id == Venue.HYPERLIQUID:
                 is_buy = request.side == Side.BUY
                 tif = "Gtc" if request.price else "Ioc"
-                limit_px = str(request.price) if request.price else "0"
+                limit_px = _format_decimal(request.price) if request.price else "0"
 
                 if self.mode == "live":
                     from lightfee.venues.hyperliquid_signing import (
@@ -2083,7 +2221,25 @@ class VenueTransport(MarketDataClient):
             elif spec.venue_id == Venue.BITGET:
                 _require_bitget_success(raw, "bitget order failed")
 
-            return self._parse_order_fill(raw, request, venue_sym, now_ms)
+            try:
+                fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
+            except OrderSubmitError as exc:
+                order_id, client_order_id = self._extract_order_identifiers(raw)
+                result_payload = dict(preflight)
+                result_payload["order_id"] = order_id
+                result_payload["client_order_id"] = client_order_id or request.client_order_id or ""
+                result_payload["response_classification"] = (
+                    "ack_accepted" if exc.class_ == SubmitFailureClass.UNCERTAIN and order_id
+                    else exc.class_.value
+                )
+                self._record_order_diagnostic("order.submit_result", result_payload)
+                raise
+            result_payload = dict(preflight)
+            result_payload["order_id"] = fill.order_id
+            result_payload["client_order_id"] = fill.client_order_id or request.client_order_id or ""
+            result_payload["response_classification"] = "filled"
+            self._record_order_diagnostic("order.submit_result", result_payload)
+            return fill
 
         except TransportError as e:
             if e.category == TransportErrorCategory.REQUEST_REJECTED:
@@ -2224,6 +2380,27 @@ class VenueTransport(MarketDataClient):
             client_order_id=request.client_order_id,
             filled_at_ms=now_ms,
         )
+
+    @staticmethod
+    def _extract_order_identifiers(raw: dict[str, Any]) -> tuple[str, str]:
+        data: Any = raw.get("data", raw)
+        if isinstance(data, dict) and isinstance(data.get("result"), dict):
+            data = data["result"]
+        elif isinstance(data, dict) and isinstance(data.get("result"), list) and data["result"]:
+            data = data["result"][0]
+        elif isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict):
+            return "", ""
+        order_id = str(data.get("orderId", data.get("ordId", data.get("id", data.get("order_id", "")))) or "")
+        client_order_id = str(
+            data.get(
+                "orderLinkId",
+                data.get("clientOrderId", data.get("clOrdId", data.get("client_order_id", ""))),
+            )
+            or ""
+        )
+        return order_id, client_order_id
 
     # ------------------------------------------------------------------
     # Order status reconciliation (Task 11)

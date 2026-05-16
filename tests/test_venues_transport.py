@@ -1432,6 +1432,102 @@ class TestOrderAckNotFill:
         assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
 
 
+class TestOrderSubmitDiagnosticsAndQuantization:
+    @pytest.mark.asyncio
+    async def test_bybit_live_place_order_quantizes_and_records_sanitized_attempt_result(self):
+        spec = bybit_spec()
+        transport = VenueTransport(
+            spec=spec,
+            mode="live",
+            credential=LiveCredential(api_key="key-secret", api_secret="sign-secret"),
+        )
+        sent: list[dict] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or params or {})})
+            return {"retCode": 0, "result": {"orderId": "bybit_ack_1", "orderLinkId": "cli_1"}}
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.00749,
+            price=50000.129,
+            client_order_id="cli_1",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.place_order(req)
+
+        assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert sent[0]["body"]["qty"] == "0.007"
+        assert sent[0]["body"]["price"] == "50000.12"
+        events = transport.order_diagnostics
+        assert [e["kind"] for e in events] == ["order.submit_attempt", "order.submit_result"]
+        payload = events[0]["payload"]
+        assert payload["venue"] == "bybit"
+        assert payload["endpoint"] == spec.order_path
+        assert payload["product_type"] == "linear"
+        assert payload["client_order_id"] == "cli_1"
+        assert payload["raw_price"] == 50000.129
+        assert payload["raw_qty"] == 0.00749
+        assert payload["quantized_price"] == 50000.12
+        assert payload["quantized_qty"] == 0.007
+        assert payload["tick_size"] == spec.price_tick
+        assert payload["quantity_step"] == spec.quantity_step
+        assert payload["response_classification"] == "attempt"
+        serialized = json.dumps(events)
+        assert "sign-secret" not in serialized
+        assert "key-secret" not in serialized
+
+    @pytest.mark.parametrize(
+        "spec_fn,raw_qty,price,expected_qty",
+        [
+            (gate_spec, 1.7, 50000.0, 1.0),
+            (binance_spec, 0.00749, 50000.129, 0.007),
+            (aster_spec, 0.00749, 50000.129, 0.007),
+        ],
+    )
+    def test_order_preflight_quantizes_contract_or_step_sizes(
+        self, spec_fn, raw_qty, price, expected_qty,
+    ):
+        transport = VenueTransport(spec=spec_fn(), mode="paper")
+        preflight = transport.preflight_order_request(
+            OrderRequest(
+                venue=transport.venue,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=raw_qty,
+                price=price,
+                client_order_id="cli_step",
+            )
+        )
+        assert preflight["quantized_qty"] == expected_qty
+        assert preflight["quantity_step"] == transport.spec.quantity_step
+        assert preflight["tick_size"] == transport.spec.price_tick
+
+    def test_order_preflight_rejects_below_min_notional_fail_closed(self):
+        transport = VenueTransport(spec=binance_spec(), mode="paper")
+        with pytest.raises(OrderSubmitError) as exc_info:
+            transport.preflight_order_request(
+                OrderRequest(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.001,
+                    price=100.0,
+                    client_order_id="too_small",
+                )
+            )
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert "min_notional" in str(exc_info.value)
+        event = transport.order_diagnostics[-1]
+        assert event["kind"] == "order.submit_result"
+        assert event["payload"]["response_classification"] == "precision_rejected"
+
+
 class TestHyperliquidSigningDependencyPreflight:
     """Live Hyperliquid startup must expose missing signing deps without secrets."""
 

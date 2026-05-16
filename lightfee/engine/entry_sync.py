@@ -571,6 +571,7 @@ class EntrySyncExecutor:
 
         try:
             fill = await adapter.place_order(request)
+            self._flush_adapter_order_diagnostics(adapter)
             latency_ms = 0
             if submit_started_at_ms > 0 and fill.filled_at_ms > 0:
                 latency_ms = fill.filled_at_ms - submit_started_at_ms
@@ -619,6 +620,7 @@ class EntrySyncExecutor:
                 }
 
         except OrderSubmitError as e:
+            self._flush_adapter_order_diagnostics(adapter)
             if e.is_rejected:
                 self.journal.append(
                     "order.rejected",
@@ -645,6 +647,7 @@ class EntrySyncExecutor:
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
+            self._flush_adapter_order_diagnostics(adapter)
             self.journal.append(
                 "order.uncertain",
                 {
@@ -656,6 +659,17 @@ class EntrySyncExecutor:
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}
+
+    def _flush_adapter_order_diagnostics(self, adapter) -> None:
+        transport = getattr(adapter, "_transport", adapter)
+        drain = getattr(transport, "drain_order_diagnostics", None)
+        if not callable(drain):
+            return
+        for event in drain():
+            kind = event.get("kind", "")
+            payload = event.get("payload", {})
+            if isinstance(kind, str) and isinstance(payload, dict):
+                self.journal.append(kind, payload)
 
     async def _submit_passive_order(
         self, request: OrderRequest, position_id: str, leg: str, adapter

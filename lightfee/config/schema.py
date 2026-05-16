@@ -188,7 +188,12 @@ class StrategyConfig:
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
     pending_entry_zero_fill_terminal_cooldown_ms: int = 30000  # V1 default (CONTRACT RECOVERY-004)
-    local_l2_max_age_ms: int = 1000  # V1 default for local-L2 book readiness (was missing)
+    # Entry book readiness uses entry_local_l2_book_stale_after_ms first, then
+    # local_l2_quiet_book_grace_ms/local_l2_max_age_ms when explicitly set,
+    # and finally a 300s fallback so quiet HOT books do not flap.
+    entry_local_l2_book_stale_after_ms: int = 0
+    local_l2_quiet_book_grace_ms: int = 0
+    local_l2_max_age_ms: int = 0
     local_l2_bootstrap_batch_size: int = 4
     local_l2_bootstrap_jitter_ms: int = 250
     local_l2_bootstrap_retry_backoff_ms: int = 5000

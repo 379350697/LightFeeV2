@@ -7,6 +7,7 @@ Rust references:
 """
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 
@@ -178,6 +179,44 @@ class TestRuntimePreflight:
             await runtime.start()
             # Must not raise — error is journaled
             await runtime.stop()
+
+    @pytest.mark.asyncio
+    async def test_startup_emits_order_path_preflight_without_secrets(self):
+        class PreflightTransport:
+            def startup_preflight(self):
+                return {
+                    "venue": "hyperliquid",
+                    "status": "failed",
+                    "missing_dependencies": ["eth-account"],
+                    "endpoint": "/exchange",
+                    "product_type": "perp",
+                    "secret": "must-not-leak",
+                }
+
+        class PreflightAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.HYPERLIQUID)
+                self._transport = PreflightTransport()
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config, venue_adapters={Venue.HYPERLIQUID: PreflightAdapter()})
+            await runtime.start()
+            await runtime.stop()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            preflight = next(
+                r["payload"] for r in records
+                if r["kind"] == "startup.order_path_preflight"
+            )
+            assert preflight["venue"] == "hyperliquid"
+            assert preflight["status"] == "failed"
+            assert preflight["missing_dependencies"] == ["eth-account"]
+            assert "secret" not in json.dumps(preflight)
 
             assert runtime.journal._file is None
 

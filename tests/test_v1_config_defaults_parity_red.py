@@ -55,12 +55,12 @@ class TestV1ConfigDefaultsParity:
             f"pending_entry_zero_fill_terminal_cooldown_ms={cfg.pending_entry_zero_fill_terminal_cooldown_ms}, expected 30000 (V1 default)"
         )
 
-    def test_local_l2_max_age_ms_is_1000(self):
-        """V1 default: 1000 (was missing in V2 — field added)."""
+    def test_local_l2_entry_book_stale_window_falls_back_to_runtime_default(self):
+        """Production entry-L2 uses a 300s fallback unless explicitly configured."""
         cfg = StrategyConfig()
-        assert cfg.local_l2_max_age_ms == 1000, (
-            f"local_l2_max_age_ms={cfg.local_l2_max_age_ms}, expected 1000 (V1 default)"
-        )
+        assert cfg.entry_local_l2_book_stale_after_ms == 0
+        assert cfg.local_l2_quiet_book_grace_ms == 0
+        assert cfg.local_l2_max_age_ms == 0
 
     def test_pending_entry_hard_ceiling_defaults(self):
         """V1 reliability-contract defaults for pending entry terminalization."""

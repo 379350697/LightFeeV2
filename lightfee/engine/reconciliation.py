@@ -9,7 +9,7 @@ Rust references:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
@@ -70,9 +70,46 @@ class OrderReconciler:
         adapters: dict[Venue, VenueAdapter],
     ) -> None:
         self._adapters = dict(adapters)
+        self._order_diagnostics: list[dict[str, Any]] = []
 
     def _adapter_for(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._adapters.get(venue)
+
+    def drain_order_diagnostics(self) -> list[dict[str, Any]]:
+        events = list(self._order_diagnostics)
+        self._order_diagnostics.clear()
+        return events
+
+    def _record_reconcile_result(
+        self,
+        *,
+        venue: Optional[Venue],
+        symbol: str,
+        order_id: str,
+        client_order_id: str,
+        status: str,
+    ) -> None:
+        if venue is None:
+            return
+        self._order_diagnostics.append({
+            "kind": "order.reconcile_result",
+            "payload": {
+                "venue": venue.value if hasattr(venue, "value") else str(venue),
+                "symbol": symbol,
+                "endpoint": "fetch_order_status",
+                "product_type": "reconciliation",
+                "category": "reconciliation",
+                "client_order_id": client_order_id,
+                "order_id": order_id,
+                "raw_price": None,
+                "raw_qty": None,
+                "quantized_price": None,
+                "quantized_qty": None,
+                "tick_size": None,
+                "quantity_step": None,
+                "response_classification": status,
+            },
+        })
 
     async def reconcile_position(
         self,
@@ -154,6 +191,20 @@ class OrderReconciler:
                 abs(result.short_position.quantity),
             )
 
+        self._record_reconcile_result(
+            venue=long_venue,
+            symbol=symbol,
+            order_id=long_order_id,
+            client_order_id=long_client_order_id,
+            status=result.long_status,
+        )
+        self._record_reconcile_result(
+            venue=short_venue,
+            symbol=symbol,
+            order_id=short_order_id,
+            client_order_id=short_client_order_id,
+            status=result.short_status,
+        )
         return result
 
 

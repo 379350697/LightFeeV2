@@ -144,6 +144,35 @@ class LiveRuntime:
     def get_venue_adapters(self) -> dict[Venue, VenueAdapter]:
         return dict(self._venue_adapters)
 
+    def _emit_startup_order_path_preflight(self) -> None:
+        """Emit sanitized startup visibility for order signing/dependency readiness."""
+        blocked = {"api_key", "api_secret", "secret", "signature", "private_key", "headers", "auth"}
+        for venue, adapter in sorted(
+            self._venue_adapters.items(),
+            key=lambda item: item[0].value if hasattr(item[0], "value") else str(item[0]),
+        ):
+            transport = getattr(adapter, "_transport", adapter)
+            preflight_fn = getattr(transport, "startup_preflight", None)
+            if not callable(preflight_fn):
+                continue
+            try:
+                raw_payload = preflight_fn()
+            except Exception as exc:
+                raw_payload = {
+                    "venue": venue.value if hasattr(venue, "value") else str(venue),
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            payload = {}
+            for key, value in dict(raw_payload or {}).items():
+                key_s = str(key)
+                if any(token in key_s.lower() for token in blocked):
+                    continue
+                payload[key_s] = value
+            payload.setdefault("venue", venue.value if hasattr(venue, "value") else str(venue))
+            payload.setdefault("status", "ok")
+            self.journal.append("startup.order_path_preflight", payload)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -162,6 +191,7 @@ class LiveRuntime:
             {"run_id": self.state.run_id, "ts_ms": self.state.started_at_ms},
             flush=True,
         )
+        self._emit_startup_order_path_preflight()
 
         # Phase 2 – Resolve runtime symbols (daily-universe integration point)
         await prepare_runtime_symbols(self.config)
@@ -670,14 +700,29 @@ class LiveRuntime:
                 snapshot = self._last_good_snapshot
                 self.journal.append("runtime.snapshot_fallback_last_good", {"ts_ms": now_ms})
             else:
-                self.journal.append("runtime.snapshot_stale", {"ts_ms": now_ms})
+                self.journal.append(
+                    "runtime.snapshot_stale",
+                    self._snapshot_health_payload(
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        max_age_ms=max_age,
+                        freshness="stale",
+                    ),
+                )
                 return
         if freshness == SnapshotFreshness.DEGRADED:
             # Some venues degraded but can still trade on healthy ones
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
-            self.journal.append("runtime.snapshot_degraded",
-                {"venues": snapshot.degraded_venues, "ts_ms": now_ms})
+            self.journal.append(
+                "runtime.snapshot_degraded",
+                self._snapshot_health_payload(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    max_age_ms=max_age,
+                    freshness="degraded",
+                ),
+            )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             # Current snapshot is stale/missing; fall back to last good
             snapshot = self._last_good_snapshot
@@ -1557,7 +1602,9 @@ class LiveRuntime:
                     long_client_order_id=pending.maker_client_order_id,
                     short_client_order_id=pending.hedge_client_order_id,
                 )
+                self._flush_reconciler_order_diagnostics()
             except Exception as e:
+                self._flush_reconciler_order_diagnostics()
                 self.journal.append(
                     "reconciliation.entry_reconcile_error",
                     {"entry_id": entry_id, "error": str(e)},
@@ -1617,7 +1664,9 @@ class LiveRuntime:
                         long_venue=pos.long_venue,
                         short_venue=pos.short_venue,
                     )
+                    self._flush_reconciler_order_diagnostics()
                 except Exception as e:
+                    self._flush_reconciler_order_diagnostics()
                     self.journal.append(
                         "reconciliation.reconcile_error",
                         {"close_id": close_id, "error": str(e)},
@@ -1748,7 +1797,9 @@ class LiveRuntime:
                     long_client_order_id=pending.maker_client_order_id,
                     short_client_order_id=pending.hedge_client_order_id,
                 )
+                self._flush_reconciler_order_diagnostics()
             except Exception as e:
+                self._flush_reconciler_order_diagnostics()
                 self.journal.append(
                     "recovery.force_reconcile_entry_error",
                     {"entry_id": entry_id, "error": str(e)},
@@ -1767,6 +1818,18 @@ class LiveRuntime:
             "recovery.force_reconcile_complete",
             {"resolved_entries": len(resolved_ids), "ts_ms": now_ms},
         )
+
+    def _flush_reconciler_order_diagnostics(self) -> None:
+        if self.reconciler is None:
+            return
+        drain = getattr(self.reconciler, "drain_order_diagnostics", None)
+        if not callable(drain):
+            return
+        for event in drain():
+            kind = event.get("kind", "")
+            payload = event.get("payload", {})
+            if isinstance(kind, str) and isinstance(payload, dict):
+                self.journal.append(kind, payload)
 
     async def _recover_pending_entry_hedges(self, now_ms: int) -> None:
         """Re-drive pending entry hedges with full V1 startup recovery semantics.
@@ -2641,17 +2704,97 @@ class LiveRuntime:
         return True, ""
 
     def _entry_local_l2_stale_after_ms(self) -> int:
-        return max(
-            int(
-                getattr(
-                    self.config.strategy,
-                    "local_l2_max_age_ms",
-                    getattr(self.config.strategy, "max_liquidity_snapshot_age_ms", 5000),
-                )
-                or 0
-            ),
-            0,
+        for field_name in (
+            "entry_local_l2_book_stale_after_ms",
+            "local_l2_quiet_book_grace_ms",
+            "local_l2_max_age_ms",
+        ):
+            value = int(getattr(self.config.strategy, field_name, 0) or 0)
+            if value > 0:
+                return value
+        return 300_000
+
+    def _snapshot_health_payload(
+        self,
+        *,
+        snapshot,
+        now_ms: int,
+        max_age_ms: int,
+        freshness: str,
+    ) -> dict:
+        from collections import Counter as _Counter
+        import hashlib
+
+        per_venue_quote_count: _Counter[str] = _Counter()
+        per_venue_candidate_count: _Counter[str] = _Counter()
+        for quote in getattr(snapshot, "quotes", {}).values():
+            venue = str(getattr(quote, "venue", "") or "")
+            if venue:
+                per_venue_quote_count[venue] += 1
+        for candidate in getattr(snapshot, "candidates", []) or []:
+            for venue_attr in ("long_venue", "short_venue"):
+                venue = str(getattr(candidate, venue_attr, "") or "")
+                if venue:
+                    per_venue_candidate_count[venue] += 1
+
+        published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
+        market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
+        snapshot_publish_age_ms = now_ms - published_at_ms if published_at_ms > 0 else 0
+        market_observed_age_ms = (
+            now_ms - market_observed_at_ms if market_observed_at_ms > 0 else 0
         )
+        degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
+        degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
+        degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
+        top_degraded_symbols: list[str] = []
+        if isinstance(degraded_symbols, dict):
+            for symbols in degraded_symbols.values():
+                for symbol in symbols:
+                    symbol_s = str(symbol)
+                    if symbol_s and symbol_s not in top_degraded_symbols:
+                        top_degraded_symbols.append(symbol_s)
+                    if len(top_degraded_symbols) >= 24:
+                        break
+                if len(top_degraded_symbols) >= 24:
+                    break
+
+        domains = list(degraded_domains)
+        if snapshot_publish_age_ms > max_age_ms:
+            domains.append("snapshot_publish_stale")
+        if market_observed_age_ms > max_age_ms:
+            domains.append("market_observed_stale")
+        for lifecycle_name, rows in (
+            ("market", getattr(snapshot, "market_lifecycle", []) or []),
+            ("funding", getattr(snapshot, "funding_lifecycle", []) or []),
+            ("liquidity", getattr(snapshot, "liquidity_lifecycle", []) or []),
+            ("transfer", getattr(snapshot, "transfer_lifecycle", []) or []),
+        ):
+            for row in rows:
+                reason = str(getattr(row, "degraded_reason", "") or "")
+                if reason and lifecycle_name not in domains:
+                    domains.append(lifecycle_name)
+
+        snapshot_path = str(self.config.runtime.sidecar_snapshot_path)
+        config_hash = hashlib.sha256(
+            f"{snapshot_path}|{max_age_ms}|{self.config.runtime.mode}".encode()
+        ).hexdigest()[:12]
+        return {
+            "freshness": freshness,
+            "venues": degraded_venues,
+            "degraded_venues": degraded_venues,
+            "degraded_domains": degraded_domains,
+            "stale_degraded_domains": domains,
+            "top_degraded_symbols": top_degraded_symbols,
+            "snapshot_publish_age_ms": max(snapshot_publish_age_ms, 0),
+            "market_observed_age_ms": max(market_observed_age_ms, 0),
+            "per_venue_quote_count": dict(sorted(per_venue_quote_count.items())),
+            "per_venue_candidate_count": dict(sorted(per_venue_candidate_count.items())),
+            "source_mode": str(getattr(snapshot, "source_mode", "") or ""),
+            "acquisition_mode": str(getattr(snapshot, "acquisition_mode", "") or ""),
+            "snapshot_path": snapshot_path,
+            "config_hash": config_hash,
+            "ts_ms": now_ms,
+        }
 
     def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
         """Sync entry-local-L2 session legs from local-L2 book readiness."""
@@ -2801,7 +2944,7 @@ class LiveRuntime:
 
         readiness = self._entry_l2_readiness_diagnostics_payload()
         candidate_samples = []
-        for candidate in (list(tradeable)[:24]):
+        for rank, candidate in enumerate(list(tradeable)[:24], start=1):
             pair_id = getattr(candidate, "pair_id", "")
             if not pair_id:
                 pair_id = make_candidate_pair_id(
@@ -2809,15 +2952,24 @@ class LiveRuntime:
                     str(getattr(candidate, "long_venue", "")),
                     str(getattr(candidate, "short_venue", "")),
                 )
+            first_funding_ms = int(getattr(candidate, "first_funding_timestamp_ms", 0) or 0)
             candidate_samples.append({
+                "rank": rank,
                 "pair_id": pair_id,
                 "symbol": str(getattr(candidate, "symbol", "")),
                 "long_venue": str(getattr(candidate, "long_venue", "")),
                 "short_venue": str(getattr(candidate, "short_venue", "")),
+                "remaining_ms": first_funding_ms - now_ms if first_funding_ms > 0 else 0,
+                "primary_tracked": pair_id in self._tracked_primary_pair_ids,
                 "ranking_edge_bps": float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
                 "blocked_reasons": list(getattr(candidate, "blocked_reasons", []) or [])[:8],
                 "selection_blocker": candidate_blockers.get(pair_id, ""),
             })
+
+        execution_liquidity_blocked_counts: Counter[str] = Counter()
+        for reason_key, count in blocked_reason_counts.items():
+            if "liquidity" in reason_key or reason_key.startswith("execution_"):
+                execution_liquidity_blocked_counts[str(reason_key)] += int(count)
 
         payload = {
             "reason": reason,
@@ -2826,6 +2978,13 @@ class LiveRuntime:
             "selected_candidate_count": selected_candidate_count,
             "remaining_slots": max(int(remaining_slots), 0),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
+            "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
+            "execution_liquidity_blocked_counts": dict(
+                sorted(execution_liquidity_blocked_counts.items())
+            ),
+            "entry_final_gate_blocked_counts": dict(
+                sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
+            ),
             "tradeable_selection_blocker_counts": dict(
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
             ),

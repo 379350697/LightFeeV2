@@ -1171,6 +1171,50 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert diag["reason"] == expected_reason
         assert diag["detail"] == expected_detail
 
+    def test_default_entry_l2_stale_window_keeps_quiet_hot_book_ready(self, runtime_with_l2):
+        from lightfee.marketdata.l2 import PriceLevel
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+
+        rt = runtime_with_l2
+        c = self._make_real_candidate(first_funding_timestamp_ms=370000)
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+        rt._tracked_primary_pair_ids.add(pair_id)
+        rt.entry_l2_sessions.track_opportunity(
+            TrackedOpportunity(
+                pair_id=pair_id,
+                symbol=c.symbol,
+                long_venue=c.long_venue,
+                short_venue=c.short_venue,
+                ranking_edge_bps=c.ranking_edge_bps,
+                class_=TrackedOpportunityClass.PRIMARY,
+            ),
+            now_ms=10000,
+        )
+
+        for venue in ("binance", "bybit"):
+            book = rt.local_l2_runtime.ensure_book(venue, c.symbol)
+            book.transition_to_bootstrapping(now_ms=10000)
+            book.apply_snapshot(
+                [PriceLevel(price=50000.0, quantity=1.0)],
+                [PriceLevel(price=50001.0, quantity=1.0)],
+                sequence=10,
+                now_ms=10000,
+            )
+            book.transition_to_hot()
+
+        rt._refresh_entry_l2_session_readiness(now_ms=12000)
+        assert rt._entry_local_l2_selection_blocker(c, now_ms=12000) is None
+
+        rt.config.strategy.local_l2_max_age_ms = 1000
+        rt._refresh_entry_l2_session_readiness(now_ms=12000)
+        assert (
+            rt._entry_local_l2_selection_blocker(c, now_ms=12000)
+            == "entry_local_l2_waiting_for_dual_ready"
+        )
+
     @pytest.mark.asyncio
     async def test_scan_no_entry_diagnostics_has_local_l2_reason_counts_and_samples(
         self, tmp_path, monkeypatch,
@@ -1303,6 +1347,16 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert len(no_entry["entry_local_l2_primary_not_ready_detail_samples"]) == 2
         assert no_entry["entry_local_l2_primary_not_ready_detail_samples"][0]["reason"] == "book_missing"
         assert no_entry["candidates"][0]["pair_id"] == "btcusdt:binance->bybit"
+        assert no_entry["entry_candidate_blocked_counts"] == {}
+        assert no_entry["execution_liquidity_blocked_counts"] == {}
+        assert no_entry["entry_final_gate_blocked_counts"] == {
+            "entry_local_l2_waiting_for_dual_ready": 1
+        }
+        assert no_entry["candidates"][0]["rank"] == 1
+        assert no_entry["candidates"][0]["remaining_ms"] == 360000
+        assert no_entry["candidates"][0]["primary_tracked"] is True
+        assert no_entry["candidates"][0]["selection_blocker"] == "entry_local_l2_waiting_for_dual_ready"
+        assert "blocked_reasons" in no_entry["candidates"][0]
 
         readiness = next(
             r["payload"] for r in records
@@ -1311,3 +1365,118 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert readiness["primary_pair_ids"] == ["btcusdt:binance->bybit"]
         assert len(readiness["not_ready"]) == 2
         assert readiness["not_ready"][0]["reason"] == "book_missing"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_degraded_and_stale_events_include_root_diagnostics(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from lightfee.config.schema import (
+            AppConfig,
+            PersistenceConfig,
+            RuntimeConfig,
+            StrategyConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 10000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms,
+        )
+
+        snapshot_path = tmp_path / "sidecar.json"
+        event_path = tmp_path / "events.jsonl"
+        base_snapshot = {
+            "schema_version": 2,
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms - 100,
+            "funding_lifecycle": [],
+            "market_lifecycle": [
+                {
+                    "venue": "binance",
+                    "observed_at_ms": now_ms - 100,
+                    "symbol_count": 1,
+                    "coverage_usable": 1,
+                    "degraded_reason": "",
+                }
+            ],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [
+                {
+                    "venue": "bybit",
+                    "observed_at_ms": now_ms - 500,
+                    "symbol_count": 1,
+                    "coverage_usable": 0,
+                    "degraded_reason": "book_stale",
+                }
+            ],
+            "degraded_venues": ["bybit"],
+            "degraded_domains": ["liquidity"],
+            "degraded_symbols": {"bybit": ["BTCUSDT"]},
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {"venue": "binance", "symbol": "BTCUSDT", "bid": 1, "ask": 2},
+                "bybit:BTCUSDT": {"venue": "bybit", "symbol": "BTCUSDT", "bid": 1, "ask": 2},
+            },
+            "candidates": [
+                {
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "symbol": "BTCUSDT",
+                    "funding_diff_bps": 1.0,
+                    "funding_edge_bps": 1.0,
+                    "expected_edge_bps": 1.0,
+                    "worst_case_edge_bps": 1.0,
+                    "ranking_edge_bps": 1.0,
+                    "first_funding_timestamp_ms": now_ms + 60000,
+                }
+            ],
+        }
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(snapshot_path),
+                sidecar_snapshot_max_age_ms=5000,
+                live_scan_recovery_success_count=1,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(event_path),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+        rt = LiveRuntime(config)
+        rt.journal.open()
+
+        snapshot_path.write_text(json.dumps(base_snapshot))
+        await rt.tick()
+        stale_snapshot = dict(base_snapshot)
+        stale_snapshot["published_at_ms"] = now_ms - 6000
+        stale_snapshot["market_observed_at_ms"] = now_ms - 7000
+        stale_snapshot["degraded_venues"] = []
+        stale_snapshot["degraded_domains"] = []
+        stale_snapshot["degraded_symbols"] = {}
+        rt._last_good_snapshot = None
+        snapshot_path.write_text(json.dumps(stale_snapshot))
+        await rt.tick()
+        rt.journal.close()
+
+        records = [json.loads(line) for line in event_path.read_text().splitlines() if line.strip()]
+        degraded = next(r["payload"] for r in records if r["kind"] == "runtime.snapshot_degraded")
+        stale = next(r["payload"] for r in records if r["kind"] == "runtime.snapshot_stale")
+
+        for payload in (degraded, stale):
+            assert payload["snapshot_publish_age_ms"] >= 0
+            assert payload["market_observed_age_ms"] >= 0
+            assert payload["per_venue_quote_count"]
+            assert payload["per_venue_candidate_count"]
+            assert payload["stale_degraded_domains"]
+            assert payload["source_mode"] == "direct_market"
+            assert payload["acquisition_mode"] == "fresh_sidecar"
+            assert payload["snapshot_path"] == str(snapshot_path)
+
+        assert degraded["top_degraded_symbols"] == ["BTCUSDT"]
+        assert "liquidity" in degraded["stale_degraded_domains"]
+        assert "snapshot_publish_stale" in stale["stale_degraded_domains"]

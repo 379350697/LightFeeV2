@@ -2,6 +2,8 @@
 projection writer, and structured store read paths."""
 
 import json
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -118,6 +120,39 @@ class TestJournalAnalysis:
         ]
         report = analyze_journal_records(records)
         assert report.execution_liquidity_blocked_count == 3
+
+
+class TestProductionBlockerAnalyzer:
+    def test_synthetic_20260515_fixture_counts_entry_l2_snapshot_and_orders(self):
+        fixture = Path("tests/fixtures/journals/production_entry_l2_blockers_20260515.jsonl")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/analyze_production_blockers.py",
+                "--since",
+                "2026-05-15T00:00:00+08:00",
+                "--json",
+                str(fixture),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report = json.loads(result.stdout)
+
+        assert report["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_prewarm_window"] == 1
+        assert report["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_dual_ready"] == 1
+        assert report["entry_l2_not_ready_reason_counts"]["book_missing"] == 1
+        assert report["entry_l2_not_ready_reason_counts"]["waiting_for_dual_ready"] == 1
+        assert report["snapshot_degraded_counts"]["liquidity"] == 1
+        assert report["snapshot_stale_counts"]["snapshot_publish_stale"] == 1
+        assert report["order_event_counts"]["order.submit_attempt"] == 1
+        assert report["order_event_counts"]["order.submit_result"] == 1
+        assert report["exchange_error_counts"]["precision_rejected"] == 1
+        assert report["top_pairs"][0]["pair_id"] == "polyxusdt:binance->hyperliquid"
+        assert report["top_symbols"][0]["symbol"] == "POLYXUSDT"
+        assert report["first_ts_ms"] == 1778784001000
+        assert report["last_ts_ms"] == 1778784009000
 
     def test_consumes_local_l2_diagnostics(self):
         records = [

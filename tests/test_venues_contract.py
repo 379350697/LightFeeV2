@@ -292,7 +292,10 @@ class TestFixtureDrivenOrderSuccess:
 
         try:
             req = OrderRequest(
-                venue=venue_id, symbol=symbol, side=Side.BUY, quantity=1.0 if venue_id == Venue.HYPERLIQUID else 0.01,
+                venue=venue_id,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=1.0 if venue_id in (Venue.GATE, Venue.HYPERLIQUID) else 0.01,
             )
             fill = await adapter.place_order(req)
             assert isinstance(fill, OrderFill)
