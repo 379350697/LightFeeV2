@@ -1345,6 +1345,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "candidate_count",
             "tradeable_count",
             "selected_candidate_count",
+            "dispatched_candidate_count",
             "remaining_slots",
             "blocked_reason_counts",
             "tradeable_selection_blocker_counts",
@@ -1358,7 +1359,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert no_entry["reason"] == "entry_local_l2_selection_blocked"
         assert no_entry["candidate_count"] == 1
         assert no_entry["tradeable_count"] == 1
-        assert no_entry["selected_candidate_count"] == 0
+        assert no_entry["selected_candidate_count"] == 1
+        assert no_entry["dispatched_candidate_count"] == 0
         assert no_entry["remaining_slots"] == 2
         assert no_entry["tradeable_selection_blocker_counts"] == {
             "entry_local_l2_waiting_for_dual_ready": 1

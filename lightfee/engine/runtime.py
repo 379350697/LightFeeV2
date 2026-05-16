@@ -766,6 +766,8 @@ class LiveRuntime:
             "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
             "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
             "tradeable_count": 0,
+            "selected_candidate_count": 0,
+            "dispatched_candidate_count": 0,
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
@@ -833,6 +835,8 @@ class LiveRuntime:
                 snapshot.candidates, self.config.strategy, now_ms
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
+            self.state.last_scan["selected_candidate_count"] = 0
+            self.state.last_scan["dispatched_candidate_count"] = 0
             if not tradeable:
                 self.state.last_scan["no_entry_reason"] = "no_tradeable_candidates"
             if tradeable:
@@ -899,10 +903,13 @@ class LiveRuntime:
                     self._refresh_entry_l2_session_readiness(now_ms)
                 # V1: iterate entire shortlist until slot budget exhausted
                 max_slots = self.config.strategy.max_concurrent_positions
+                remaining_slots = max(max_slots - len(self.state.open_positions), 0)
+                finalists = list(tradeable)
+                self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = 0
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
-                for candidate in tradeable:
+                for candidate in finalists:
                     if len(self.state.open_positions) >= max_slots:
                         break
                     # V2 Task 9: entry local L2 selection blocker (prewarm/dual-ready)
@@ -932,6 +939,7 @@ class LiveRuntime:
                     mid_price = price_hints.get(candidate.symbol, 0.0)
                     await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
                     dispatched += 1
+                self.state.last_scan["dispatched_candidate_count"] = dispatched
                 if dispatched == 0:
                     reason = (
                         "entry_local_l2_selection_blocked"
@@ -941,8 +949,9 @@ class LiveRuntime:
                         reason=reason,
                         snapshot=snapshot,
                         tradeable=tradeable,
-                        selected_candidate_count=dispatched,
-                        remaining_slots=max_slots - len(self.state.open_positions),
+                        selected_candidate_count=len(finalists),
+                        dispatched_candidate_count=dispatched,
+                        remaining_slots=remaining_slots,
                         tradeable_selection_blocker_counts=selection_blocker_counts,
                         candidate_blockers=candidate_blockers,
                         now_ms=now_ms,
@@ -953,6 +962,7 @@ class LiveRuntime:
                     snapshot=snapshot,
                     tradeable=[],
                     selected_candidate_count=0,
+                    dispatched_candidate_count=0,
                     remaining_slots=self.config.strategy.max_concurrent_positions - len(self.state.open_positions),
                     tradeable_selection_blocker_counts=Counter(),
                     candidate_blockers={},
@@ -2993,6 +3003,7 @@ class LiveRuntime:
         snapshot,
         tradeable: list,
         selected_candidate_count: int,
+        dispatched_candidate_count: int,
         remaining_slots: int,
         tradeable_selection_blocker_counts: Counter,
         candidate_blockers: dict[str, str],
@@ -3041,6 +3052,7 @@ class LiveRuntime:
             "candidate_count": len(getattr(snapshot, "candidates", []) or []),
             "tradeable_count": len(tradeable),
             "selected_candidate_count": selected_candidate_count,
+            "dispatched_candidate_count": dispatched_candidate_count,
             "remaining_slots": max(int(remaining_slots), 0),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
@@ -3066,6 +3078,8 @@ class LiveRuntime:
             "reason": payload["reason"],
             "candidate_count": payload["candidate_count"],
             "tradeable_count": payload["tradeable_count"],
+            "selected_candidate_count": payload["selected_candidate_count"],
+            "dispatched_candidate_count": payload["dispatched_candidate_count"],
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
             "entry_local_l2_primary_not_ready_reason_totals": payload[
                 "entry_local_l2_primary_not_ready_reason_totals"
