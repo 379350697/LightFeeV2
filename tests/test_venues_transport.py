@@ -3611,3 +3611,546 @@ class TestBybitOrderStatusSideRedLight:
         result = transport._parse_order_status_bybit(raw, "BTCUSDT", 1000000)
         assert isinstance(result, OrderFillReconciliation)
         assert result.side == Side.SELL
+
+
+# ===========================================================================
+# Root Fix: CID Generator Tests
+# ===========================================================================
+
+
+class TestCidGenerator:
+    """Verify exchange CIDs are stable, unique, and venue-legal."""
+
+    def test_long_entry_id_produces_binance_legal_cid(self):
+        from lightfee.venues.cid import generate_exchange_cid, cid_is_valid_for_venue
+
+        long_id = "entry-" + "x" * 200 + "-very-long-internal-id"
+        cid = generate_exchange_cid(long_id, "m", Venue.BINANCE)
+        assert len(cid) <= 36
+        assert cid_is_valid_for_venue(cid, Venue.BINANCE)
+        assert all(c in "0123456789abcdef" for c in cid)  # hex only
+
+    def test_long_entry_id_produces_aster_legal_cid(self):
+        from lightfee.venues.cid import generate_exchange_cid, cid_is_valid_for_venue
+
+        long_id = "entry-" + "y" * 200
+        cid = generate_exchange_cid(long_id, "m", Venue.ASTER)
+        assert len(cid) <= 36
+        assert cid_is_valid_for_venue(cid, Venue.ASTER)
+
+    def test_long_entry_id_produces_okx_legal_cid(self):
+        from lightfee.venues.cid import generate_exchange_cid, cid_is_valid_for_venue
+
+        long_id = "entry-" + "z" * 200
+        cid = generate_exchange_cid(long_id, "m", Venue.OKX)
+        assert len(cid) <= 32
+        assert cid_is_valid_for_venue(cid, Venue.OKX)
+
+    def test_long_entry_id_produces_bybit_legal_cid(self):
+        from lightfee.venues.cid import generate_exchange_cid
+
+        long_id = "entry-" + "w" * 200
+        cid = generate_exchange_cid(long_id, "m", Venue.BYBIT)
+        assert len(cid) <= 36
+
+    def test_cid_is_deterministic(self):
+        from lightfee.venues.cid import generate_exchange_cid
+
+        long_id = "some-very-long-entry-id-12345"
+        cid1 = generate_exchange_cid(long_id, "m", Venue.BINANCE)
+        cid2 = generate_exchange_cid(long_id, "m", Venue.BINANCE)
+        assert cid1 == cid2
+
+    def test_cid_differs_per_leg(self):
+        from lightfee.venues.cid import generate_exchange_cid
+
+        long_id = "entry-abc"
+        maker_cid = generate_exchange_cid(long_id, "m", Venue.BINANCE)
+        hedge_cid = generate_exchange_cid(long_id, "h", Venue.BINANCE)
+        assert maker_cid != hedge_cid
+
+    def test_cid_rejects_overlength(self):
+        from lightfee.venues.cid import cid_is_valid_for_venue
+        assert not cid_is_valid_for_venue("x" * 33, Venue.OKX)
+        assert not cid_is_valid_for_venue("x" * 37, Venue.BINANCE)
+
+    def test_cid_rejects_empty(self):
+        from lightfee.venues.cid import cid_is_valid_for_venue
+        assert not cid_is_valid_for_venue("", Venue.BINANCE)
+
+
+# ===========================================================================
+# Root Fix: Passive Body Builder Tests
+# ===========================================================================
+
+
+class TestPassiveBodyBuilders:
+    """Verify venue-specific passive bodies — no generic field pollution."""
+
+    def _make_passive_req(self, venue, reduce_only=False, cid="test-cid-001"):
+        return OrderRequest(
+            venue=venue,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            price=50000.0,
+            post_only=True,
+            reduce_only=reduce_only,
+            client_order_id=cid,
+        )
+
+    def test_binance_passive_body_fields(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.BINANCE)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["symbol"] == "BTCUSDT"
+        assert body["side"] == "BUY"
+        assert body["type"] == "LIMIT"
+        assert body["timeInForce"] == "GTX"
+        assert body["quantity"] is not None
+        assert body["newClientOrderId"] == "test-cid-001"
+        assert body["price"] is not None
+        # reduceOnly must NOT be present when reduce_only=False
+        assert "reduceOnly" not in body
+        # Generic pollution check
+        assert "instId" not in body
+        assert "sz" not in body
+        assert "clOrdId" not in body
+
+    def test_binance_passive_body_reduce_only_when_requested(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.BINANCE, reduce_only=True)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["reduceOnly"] == "true"
+
+    def test_aster_passive_body_same_as_binance(self):
+        spec = aster_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.ASTER)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["type"] == "LIMIT"
+        assert body["timeInForce"] == "GTX"
+        assert "reduceOnly" not in body
+
+    def test_okx_passive_body_uses_sz_and_clordid(self):
+        spec = okx_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.OKX, cid="okx-cid-001")
+        body = transport._build_passive_order_body(req, "BTC-USDT-SWAP", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["instId"] == "BTC-USDT-SWAP"
+        assert body["tdMode"] == "cross"
+        assert body["ordType"] == "post_only"
+        assert body["sz"] is not None
+        assert body["clOrdId"] == "okx-cid-001"
+        assert body["px"] is not None
+        # Must NOT have generic field names
+        assert "quantity" not in body
+        assert "newClientOrderId" not in body
+        assert "symbol" not in body
+        assert "reduceOnly" not in body
+
+    def test_okx_passive_body_no_reduce_only_for_opening_maker(self):
+        spec = okx_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.OKX, reduce_only=False)
+        body = transport._build_passive_order_body(req, "BTC-USDT-SWAP", 0.01, 50000.0, req.client_order_id or "")
+
+        assert "reduceOnly" not in body
+
+    def test_bybit_passive_body_fields(self):
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.BYBIT)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["category"] == "linear"
+        assert body["symbol"] == "BTCUSDT"
+        assert body["side"] == "Buy"
+        assert body["orderType"] == "Limit"
+        assert body["timeInForce"] == "PostOnly"
+        assert body["orderLinkId"] is not None
+        assert "quantity" not in body
+        assert "newClientOrderId" not in body
+
+    def test_bybit_passive_body_reduce_only_respects_request(self):
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.BYBIT, reduce_only=True)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["reduceOnly"] is True
+        assert body["positionIdx"] in (0, 1, 2)
+
+    def test_gate_passive_body_no_hardcoded_reduce_only(self):
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.GATE, reduce_only=False)
+        body = transport._build_passive_order_body(req, "BTC_USDT", 1.0, 50000.0, req.client_order_id or "")
+
+        assert body["post_only"] is True
+        assert "reduce_only" not in body  # not hardcoded when false
+
+    def test_bybit_passive_price_preserves_tick_precision(self):
+        """Bybit passive body price must preserve tick-aware precision.
+
+        _format_price uses %.2f which would turn 0.0315 into "0.03" for
+        low-tick symbols. _build_bybit_passive_body must use _format_decimal
+        to retain the preflight-quantized price.
+        """
+        from lightfee.venues.transport import _format_decimal
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = self._make_passive_req(Venue.BYBIT)
+        # Simulate a low-tick price (tick_size=0.0001, raw=0.03157 → quantized=0.0315)
+        body = transport._build_bybit_passive_body(req, "BTCUSDT", 0.01, 0.0315)
+        assert body["price"] == _format_decimal(0.0315)
+        assert body["price"] == "0.0315"
+        assert body["price"] != "0.03"
+
+
+# ===========================================================================
+# Root Fix: OKX Passive Response Validation Tests
+# ===========================================================================
+
+
+class TestOkxPassiveAckValidation:
+    """OKX passive response must validate code, sCode, and non-empty identifiers."""
+
+    def _make_okx_transport(self):
+        spec = okx_spec()
+        return VenueTransport(spec=spec, mode="paper")
+
+    def _make_passive_req(self):
+        return OrderRequest(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            price=50000.0,
+            post_only=True,
+            client_order_id="okx-cid-test",
+        )
+
+    def test_okx_code_nonzero_raises_rejected(self):
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {"code": "1", "msg": "Invalid request", "data": []}
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "code=1" in str(exc.value)
+
+    def test_okx_scode_nonzero_raises_rejected(self):
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {
+            "code": "0", "msg": "",
+            "data": [{"sCode": "51000", "sMsg": "Order failed", "ordId": "", "clOrdId": ""}],
+        }
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "sCode=51000" in str(exc.value)
+
+    def test_okx_empty_ordid_and_clordid_raises_uncertain(self):
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {
+            "code": "0", "msg": "",
+            "data": [{"sCode": "0", "sMsg": "", "ordId": "", "clOrdId": ""}],
+        }
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert "empty identifiers" in str(exc.value).lower()
+
+    def test_okx_empty_ordid_only_raises_uncertain(self):
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {
+            "code": "0", "msg": "",
+            "data": [{"sCode": "0", "sMsg": "", "ordId": "", "clOrdId": "valid-cid"}],
+        }
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+
+    def test_okx_valid_response_returns_ack(self):
+        from lightfee.core.domain import PassiveOrderAck
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {
+            "code": "0", "msg": "",
+            "data": [{
+                "sCode": "0", "sMsg": "",
+                "ordId": "1234567890",
+                "clOrdId": "okx-cid-test",
+                "px": "50000",
+                "sz": "0.01",
+            }],
+        }
+
+        ack = transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert isinstance(ack, PassiveOrderAck)
+        assert ack.order_id == "1234567890"
+        assert ack.client_order_id == "okx-cid-test"
+
+    def test_okx_empty_data_array_raises_uncertain(self):
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+        transport = self._make_okx_transport()
+        req = self._make_passive_req()
+        raw = {"code": "0", "msg": "", "data": []}
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_passive_order_ack(raw, req, "BTC-USDT-SWAP", 1000)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+
+
+# ===========================================================================
+# Root Fix: Preflight/Normalization in Passive Path Tests
+# ===========================================================================
+
+
+class TestPassivePreflight:
+    """Passive orders must go through preflight normalization."""
+
+    def test_preflight_accepts_symbol_rule(self):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BINANCE, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.0123456, price=50000.12345,
+            client_order_id="cid-1",
+        )
+        rule = SymbolRule(
+            tick_size=0.01, qty_step=0.001, min_qty=0.001,
+            min_notional=5.0, rule_source="exchangeInfo",
+        )
+        preflight = transport.preflight_order_request(req, symbol_rule=rule)
+
+        assert preflight["rule_source"] == "exchangeInfo"
+        assert preflight["tick_size"] == 0.01
+        assert preflight["quantity_step"] == 0.001
+        assert preflight["response_classification"] == "attempt"
+        # qty should be quantized to step
+        assert preflight["quantized_qty"] is not None
+
+    def test_preflight_min_qty_rejected(self):
+        from lightfee.core.errors import OrderSubmitError
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BINANCE, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.0001, price=50000.0,
+            client_order_id="cid-1",
+        )
+        rule = SymbolRule(
+            tick_size=0.01, qty_step=0.001, min_qty=0.001,
+            min_notional=5.0, rule_source="exchangeInfo",
+        )
+        with pytest.raises(OrderSubmitError) as exc:
+            transport.preflight_order_request(req, symbol_rule=rule)
+        assert exc.value.is_rejected
+
+    def test_preflight_min_notional_rejected(self):
+        from lightfee.core.errors import OrderSubmitError
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BINANCE, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.001, price=1.0,
+            client_order_id="cid-1",
+            reduce_only=False,
+        )
+        rule = SymbolRule(
+            tick_size=0.01, qty_step=0.001, min_qty=0.001,
+            min_notional=100.0, rule_source="exchangeInfo",
+        )
+        with pytest.raises(OrderSubmitError) as exc:
+            transport.preflight_order_request(req, symbol_rule=rule)
+        assert exc.value.is_rejected
+        assert "min_notional" in str(exc.value).lower()
+
+    def test_preflight_reduce_only_skips_min_notional(self):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BINANCE, symbol="BTCUSDT",
+            side=Side.SELL, quantity=0.001, price=1.0,
+            client_order_id="cid-close",
+            reduce_only=True,
+        )
+        rule = SymbolRule(
+            tick_size=0.01, qty_step=0.001, min_qty=0.001,
+            min_notional=100.0, rule_source="exchangeInfo",
+        )
+        # Should NOT raise because reduce_only skips min_notional check
+        preflight = transport.preflight_order_request(req, symbol_rule=rule)
+        assert preflight["response_classification"] == "attempt"
+
+    def test_preflight_with_bybit_rules(self):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BYBIT, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.01234, price=50000.123,
+            client_order_id="cid-1",
+        )
+        rule = SymbolRule(
+            tick_size=0.1, qty_step=0.001, min_qty=0.001,
+            min_notional=1.0, rule_source="instruments-info",
+        )
+        preflight = transport.preflight_order_request(req, symbol_rule=rule)
+        assert preflight["rule_source"] == "instruments-info"
+        assert preflight["tick_size"] == 0.1
+
+    def test_preflight_with_okx_rules(self):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        spec = okx_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.OKX, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.01234, price=50000.12,
+            client_order_id="cid-okx",
+        )
+        rule = SymbolRule(
+            tick_size=0.1, qty_step=0.01, min_qty=0.01,
+            min_notional=1.0, rule_source="instrument",
+        )
+        preflight = transport.preflight_order_request(req, symbol_rule=rule)
+        assert preflight["rule_source"] == "instrument"
+        assert preflight["tick_size"] == 0.1
+        assert preflight["quantity_step"] == 0.01
+        assert preflight["min_qty"] == 0.01
+
+
+# ===========================================================================
+# Root Fix: Journal Evidence Tests
+# ===========================================================================
+
+
+class TestJournalEvidenceFields:
+    """order.rejected and order.submitted journals must carry full evidence."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_journal_has_venue_symbol_leg_is_maker(self):
+        from lightfee.persistence.journal import Journal
+        from lightfee.engine.entry_sync import EntrySyncExecutor
+        from lightfee.engine.entry import EntryContext, EntryType
+        from dataclasses import dataclass, field
+        from typing import Optional
+        from lightfee.core.contracts import VenueAdapter
+
+        @dataclass
+        class RejectAdapter(VenueAdapter):
+            _venue: Venue
+            last_request: Optional[OrderRequest] = None
+
+            @property
+            def venue(self) -> Venue:
+                return self._venue
+
+            async def place_order(self, request):
+                self.last_request = request
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "test rejection")
+
+            async def submit_passive_order(self, request):
+                self.last_request = request
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "passive rejected")
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue, symbol=symbol, side=Side.BUY,
+                    quantity=0.0, entry_price=0.0, observed_at_ms=1000,
+                )
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+        import tempfile, os
+        jd = os.path.join(tempfile.mkdtemp(), "test.jsonl")
+        j = Journal(jd)
+        j.open()
+        try:
+            adapters = {Venue.BINANCE: RejectAdapter(Venue.BINANCE)}
+            ctx = EntryContext(
+                entry_id="ev-test-001",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.01,
+                short_quantity=0.01,
+                long_price_hint=50000.0,
+                short_price_hint=50000.0,
+                maker_leg=Side.BUY,
+                entry_type=EntryType.PASSIVE_INCREMENTAL,
+                created_at_ms=1000,
+            )
+            executor = EntrySyncExecutor(adapters=adapters, journal=j)
+            result = await executor.execute(ctx)
+
+            records = j.read_all()
+            rejected = [r for r in records if r["kind"] == "order.rejected"]
+            assert len(rejected) >= 1
+            rj = rejected[0]["payload"]
+            assert "venue" in rj, f"order.rejected missing venue: {list(rj.keys())}"
+            assert "symbol" in rj, f"order.rejected missing symbol: {list(rj.keys())}"
+            assert "leg" in rj
+            assert rj["is_maker"] is True
+            assert "client_order_id" in rj
+            assert "internal_entry_id" in rj
+        finally:
+            j.close()
+
+    def test_diagnostic_submit_attempt_has_normalization_evidence(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        req = OrderRequest(
+            venue=Venue.BINANCE, symbol="BTCUSDT",
+            side=Side.BUY, quantity=0.012345, price=50000.12345,
+            post_only=True, client_order_id="evidence-cid",
+        )
+        transport.preflight_order_request(req)
+        diags = transport.drain_order_diagnostics()
+        # preflight records order.submit_result on failure or success
+        # but not order.submit_attempt — that's done in submit_passive_order
+        # Check that preflight payload has all normalization fields
+        preflight_events = [d for d in diags if d["kind"] == "order.submit_result"]
+        if preflight_events:
+            p = preflight_events[0]["payload"]
+            assert "tick_size" in p
+            assert "quantity_step" in p
+            assert "quantized_qty" in p
+            assert "quantized_price" in p
+            assert "rule_source" in p

@@ -258,8 +258,17 @@ class TestV1OrderRequestTifAndReduceOnly:
 
     def test_maker_carries_client_order_id(self, btc_context):
         maker_req, hedge_req = build_entry_orders(btc_context)
-        assert maker_req.client_order_id == f"{btc_context.entry_id}-maker"
-        assert hedge_req.client_order_id == f"{btc_context.entry_id}-hedge"
+        # V2: CID is now hash-based (decoupled from internal entry_id)
+        assert maker_req.client_order_id is not None
+        assert len(maker_req.client_order_id) > 0
+        assert len(maker_req.client_order_id) <= 36  # Binance max
+        assert hedge_req.client_order_id is not None
+        assert len(hedge_req.client_order_id) > 0
+        assert len(hedge_req.client_order_id) <= 32  # OKX max
+        # CID must be deterministic
+        m2, h2 = build_entry_orders(btc_context)
+        assert m2.client_order_id == maker_req.client_order_id
+        assert h2.client_order_id == hedge_req.client_order_id
 
     def test_sell_maker_uses_short_venue(self):
         ctx = EntryContext(
@@ -301,11 +310,15 @@ class TestV1ClientOrderIdIdempotency:
         executor = EntrySyncExecutor(adapters=adapters, journal=journal)
         await executor.execute(taker_ctx)
 
-        # Verify clientOrderId was passed on maker request
+        # Verify clientOrderId was passed on maker request (V2: hash-based CID)
         assert binance_ada.last_request is not None
-        assert binance_ada.last_request.client_order_id == f"{taker_ctx.entry_id}-maker"
+        assert binance_ada.last_request.client_order_id is not None
+        assert len(binance_ada.last_request.client_order_id) > 0
+        assert len(binance_ada.last_request.client_order_id) <= 36
         assert okx_ada.last_request is not None
-        assert okx_ada.last_request.client_order_id == f"{taker_ctx.entry_id}-hedge"
+        assert okx_ada.last_request.client_order_id is not None
+        assert len(okx_ada.last_request.client_order_id) > 0
+        assert len(okx_ada.last_request.client_order_id) <= 32
 
     @pytest.mark.asyncio
     async def test_journal_events_include_client_order_id(self, adapters, journal, taker_ctx):
@@ -324,12 +337,14 @@ class TestV1ClientOrderIdIdempotency:
         records = journal.read_all()
         maker_submitted = [r for r in records if r["kind"] == "order.submitted" and r["payload"].get("leg") == "maker"]
         assert len(maker_submitted) == 1
-        assert maker_submitted[0]["payload"]["client_order_id"] == f"{taker_ctx.entry_id}-maker"
+        assert len(maker_submitted[0]["payload"]["client_order_id"]) > 0
+        assert maker_submitted[0]["payload"].get("internal_entry_id") == taker_ctx.entry_id
 
         completed = [r for r in records if r["kind"] == "entry.opened"]
         assert len(completed) == 1
-        assert completed[0]["payload"]["maker_client_order_id"] == f"{taker_ctx.entry_id}-maker"
-        assert completed[0]["payload"]["hedge_client_order_id"] == f"{taker_ctx.entry_id}-hedge"
+        assert len(completed[0]["payload"]["maker_client_order_id"]) > 0
+        assert len(completed[0]["payload"]["hedge_client_order_id"]) > 0
+        assert completed[0]["payload"].get("internal_entry_id") == taker_ctx.entry_id
 
 
 # ===========================================================================
@@ -365,7 +380,7 @@ class TestV1OrderConfirmation:
         assert result.pending_entry is not None
         assert result.pending_entry.pending_id == btc_context.entry_id
         assert result.pending_entry.uncertain_outcome is True
-        assert result.pending_entry.maker_client_order_id == f"{btc_context.entry_id}-maker"
+        assert len(result.pending_entry.maker_client_order_id) > 0
         assert result.has_uncertainty is True
 
     @pytest.mark.asyncio
@@ -775,5 +790,10 @@ class TestV1ExecuteEntryWrapper:
         )
 
         assert result.open_position is not None
-        assert binance_ada.last_request.client_order_id == "ee1-maker"
-        assert okx_ada.last_request.client_order_id == "ee1-hedge"
+        # V2: hash-based CID, verify non-empty and within venue length limits
+        assert binance_ada.last_request.client_order_id is not None
+        assert len(binance_ada.last_request.client_order_id) > 0
+        assert len(binance_ada.last_request.client_order_id) <= 36
+        assert okx_ada.last_request.client_order_id is not None
+        assert len(okx_ada.last_request.client_order_id) > 0
+        assert len(okx_ada.last_request.client_order_id) <= 32

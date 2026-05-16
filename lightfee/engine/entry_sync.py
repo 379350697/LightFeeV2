@@ -116,6 +116,7 @@ class EntrySyncExecutor:
                 "entry.aborted",
                 {
                     "position_id": ctx.entry_id,
+                    "internal_entry_id": ctx.entry_id,
                     "reason": f"max reposts reached ({current_repost_count}/{self.maker_entry_max_reposts})",
                 },
             )
@@ -136,6 +137,7 @@ class EntrySyncExecutor:
                     "entry.aborted",
                     {
                         "position_id": ctx.entry_id,
+                        "internal_entry_id": ctx.entry_id,
                         "reason": f"zero-fill terminal cooldown expired ({now_ms - zero_fill_since}ms >= {self.pending_entry_zero_fill_terminal_cooldown_ms}ms)",
                     },
                 )
@@ -167,6 +169,7 @@ class EntrySyncExecutor:
         if maker_result["outcome"] == "resting":
             ack = maker_result.get("ack")
             result.state = EntryState.MAKER_RESTING
+            result.route = ExecutionRoute.PASSIVE_INCREMENTAL
             result.pending_entry = self._make_pending_entry(
                 ctx, maker_req, hedge_req, now_ms,
                 outcome="maker_resting",
@@ -188,6 +191,7 @@ class EntrySyncExecutor:
                 "entry.aborted",
                 {
                     "position_id": ctx.entry_id,
+                    "internal_entry_id": ctx.entry_id,
                     "reason": maker_result.get("reason", "maker rejected"),
                     "maker_client_order_id": maker_req.client_order_id,
                     "hedge_client_order_id": hedge_req.client_order_id,
@@ -197,6 +201,7 @@ class EntrySyncExecutor:
                 "entry.aborted_failed_pending_retained",
                 {
                     "position_id": ctx.entry_id,
+                    "internal_entry_id": ctx.entry_id,
                     "pending_entry_id": ctx.entry_id,
                     "outcome": "rejected",
                 },
@@ -372,6 +377,7 @@ class EntrySyncExecutor:
             now_ms, "entry.opened",
             {
                 "position_id": position.position_id,
+                "internal_entry_id": position.position_id,
                 "symbol": position.symbol,
                 "long_venue": position.long_venue.value,
                 "short_venue": position.short_venue.value,
@@ -502,6 +508,7 @@ class EntrySyncExecutor:
             "order.submitted",
             {
                 "position_id": ctx.entry_id,
+                "internal_entry_id": ctx.entry_id,
                 "leg": "maker",
                 "symbol": request.symbol,
                 "venue": request.venue.value,
@@ -524,6 +531,7 @@ class EntrySyncExecutor:
             "order.submitted",
             {
                 "position_id": ctx.entry_id,
+                "internal_entry_id": ctx.entry_id,
                 "leg": "hedge",
                 "symbol": request.symbol,
                 "venue": request.venue.value,
@@ -557,7 +565,10 @@ class EntrySyncExecutor:
                 "order.rejected",
                 {
                     "position_id": position_id,
+                    "internal_entry_id": position_id,
                     "leg": leg,
+                    "venue": request.venue.value,
+                    "symbol": request.symbol,
                     "reason": f"no adapter for {request.venue.value}",
                     "client_order_id": request.client_order_id,
                     "is_maker": is_maker,
@@ -581,6 +592,7 @@ class EntrySyncExecutor:
                     "order.filled",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
                         "venue": fill.venue.value if hasattr(fill.venue, 'value') else str(fill.venue),
                         "symbol": fill.symbol,
@@ -606,7 +618,10 @@ class EntrySyncExecutor:
                     "order.uncertain",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
+                        "venue": request.venue.value,
+                        "symbol": request.symbol,
                         "reason": "zero fill quantity",
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
@@ -626,7 +641,10 @@ class EntrySyncExecutor:
                     "order.rejected",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
+                        "venue": request.venue.value,
+                        "symbol": request.symbol,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
@@ -638,7 +656,10 @@ class EntrySyncExecutor:
                     "order.uncertain",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
+                        "venue": request.venue.value,
+                        "symbol": request.symbol,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
@@ -652,7 +673,10 @@ class EntrySyncExecutor:
                 "order.uncertain",
                 {
                     "position_id": position_id,
+                    "internal_entry_id": position_id,
                     "leg": leg,
+                    "venue": request.venue.value,
+                    "symbol": request.symbol,
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                     "is_maker": is_maker,
@@ -677,13 +701,18 @@ class EntrySyncExecutor:
         """Submit a post_only maker order via submit_passive_order.
 
         Returns ack-based outcomes: resting (ACK received), rejected, or uncertain.
+
+        V2 fix: flushes transport diagnostics so order.submit_attempt and
+        order.submit_result (with normalization evidence) land in the journal.
         """
         try:
             ack = await adapter.submit_passive_order(request)
+            self._flush_adapter_order_diagnostics(adapter)
             self.journal.append(
                 "order.passive_submitted",
                 {
                     "position_id": position_id,
+                    "internal_entry_id": position_id,
                     "leg": leg,
                     "venue": request.venue.value,
                     "symbol": request.symbol,
@@ -691,17 +720,22 @@ class EntrySyncExecutor:
                     "client_order_id": ack.client_order_id,
                     "price": ack.price,
                     "quantity": ack.quantity,
+                    "is_maker": True,
                 },
             )
             return {"outcome": "resting", "ack": ack, "order_id": ack.order_id}
 
         except OrderSubmitError as e:
+            self._flush_adapter_order_diagnostics(adapter)
             if e.is_rejected:
                 self.journal.append(
                     "order.rejected",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
+                        "venue": request.venue.value,
+                        "symbol": request.symbol,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": True,
@@ -713,7 +747,10 @@ class EntrySyncExecutor:
                     "order.uncertain",
                     {
                         "position_id": position_id,
+                        "internal_entry_id": position_id,
                         "leg": leg,
+                        "venue": request.venue.value,
+                        "symbol": request.symbol,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": True,
@@ -722,11 +759,15 @@ class EntrySyncExecutor:
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
+            self._flush_adapter_order_diagnostics(adapter)
             self.journal.append(
                 "order.uncertain",
                 {
                     "position_id": position_id,
+                    "internal_entry_id": position_id,
                     "leg": leg,
+                    "venue": request.venue.value,
+                    "symbol": request.symbol,
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                     "is_maker": True,

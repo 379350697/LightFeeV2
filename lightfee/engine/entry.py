@@ -93,13 +93,18 @@ def build_entry_orders(
 
     V1 semantics:
     - Maker: GTC post-only for passive entries, IOC for taker entries
-    - Hedge: IOC reduce-only=False (hedge is opening, not closing)
-    - Both legs carry clientOrderId for idempotency and reconciliation
+    - Hedge: IOC reduce_only=False (hedge is opening, not closing)
+    - Both legs carry exchange-legal clientOrderId (decoupled from internal entry_id)
+    - Maker reduce_only must be False (maker is the opening leg, not closing)
     """
     from lightfee.core.domain import TimeInForce
+    from lightfee.venues.cid import generate_exchange_cid
 
-    maker_cid = f"{ctx.entry_id}-maker"
-    hedge_cid = f"{ctx.entry_id}-hedge"
+    maker_venue = ctx.long_venue if ctx.maker_leg == Side.BUY else ctx.short_venue
+    hedge_venue = ctx.short_venue if ctx.maker_leg == Side.BUY else ctx.long_venue
+
+    maker_cid = generate_exchange_cid(ctx.entry_id, "m", maker_venue)
+    hedge_cid = generate_exchange_cid(ctx.entry_id, "h", hedge_venue)
     is_passive = ctx.entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK)
 
     if ctx.maker_leg == Side.BUY:

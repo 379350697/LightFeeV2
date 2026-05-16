@@ -445,6 +445,7 @@ class TestPassiveMakerLifecycle:
         assert result.pending_entry is not None
         assert result.pending_entry.maker_order_id == "maker-order-1"
         assert result.state == EntryState.MAKER_RESTING
+        assert result.route == ExecutionRoute.PASSIVE_INCREMENTAL
         journal.close()
 
     @pytest.mark.asyncio
@@ -497,6 +498,8 @@ class TestPassiveMakerLifecycle:
         assert result.pending_entry is not None
         assert result.pending_entry.outcome == "maker_resting"
         assert result.pending_entry.maker_order_id == "maker-ack-only"
+        assert result.state == EntryState.MAKER_RESTING
+        assert result.route == ExecutionRoute.PASSIVE_INCREMENTAL
         assert result.pending_entry.hedge_order_id == ""
 
     @pytest.mark.asyncio

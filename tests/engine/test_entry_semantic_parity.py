@@ -380,3 +380,84 @@ class TestEntryContextFields:
             maker_leg=Side.BUY, entry_type=EntryType.PASSIVE_INCREMENTAL,
         )
         assert ctx.parent_entry_id is None  # starts with no parent
+
+
+class TestRuntimeRecoveryDedupCidMatch:
+    """Runtime recovery dedup must use the same CID generation as build_entry_orders.
+
+    If runtime uses old-style f"{entry_id}-maker"/f"{entry_id}-hedge"
+    while build_entry_orders uses generate_exchange_cid(entry_id, "m"/"h", venue),
+    the dedup index keys won't match the actual on-wire clientOrderId.
+    """
+
+    def test_dedup_cid_matches_build_entry_orders_cid(self):
+        from lightfee.venues.cid import generate_exchange_cid
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.entry import EntryContext, EntryType, build_entry_orders
+
+        entry_id = "entry-1715000000000-BTCUSDT"
+        long_venue = Venue.BINANCE
+        short_venue = Venue.BYBIT
+        maker_leg = Side.BUY
+
+        # CID generation as runtime _dispatch_entry would do it (fixed version)
+        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
+        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
+        dedup_maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
+        dedup_hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
+
+        # CID generation as build_entry_orders does it
+        ctx = EntryContext(
+            entry_id=entry_id,
+            symbol="BTCUSDT",
+            long_venue=long_venue,
+            short_venue=short_venue,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=maker_leg,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_req, hedge_req = build_entry_orders(ctx)
+
+        assert maker_req.client_order_id == dedup_maker_cid, (
+            f"maker CID mismatch: dedup={dedup_maker_cid} vs build={maker_req.client_order_id}"
+        )
+        assert hedge_req.client_order_id == dedup_hedge_cid, (
+            f"hedge CID mismatch: dedup={dedup_hedge_cid} vs build={hedge_req.client_order_id}"
+        )
+
+    def test_dedup_cid_differs_from_old_style(self):
+        """The new hash-based CID must differ from the old f-string form.
+        This proves the fix is non-trivial — old code was wrong."""
+        from lightfee.venues.cid import generate_exchange_cid
+        from lightfee.core.domain import Venue
+
+        entry_id = "entry-1715000000000-BTCUSDT"
+        old_maker = f"{entry_id}-maker"
+        old_hedge = f"{entry_id}-hedge"
+
+        maker_venue = Venue.BINANCE
+        hedge_venue = Venue.BYBIT
+        new_maker = generate_exchange_cid(entry_id, "m", maker_venue)
+        new_hedge = generate_exchange_cid(entry_id, "h", hedge_venue)
+
+        assert new_maker != old_maker
+        assert new_hedge != old_hedge
+        # Hash CIDs should be shorter and hex-only
+        assert len(new_maker) <= 36
+        assert all(c in "0123456789abcdef" for c in new_maker)
+
+    def test_dedup_cid_vary_per_venue(self):
+        """Venues with different max_len produce different-length CIDs."""
+        from lightfee.venues.cid import generate_exchange_cid
+        from lightfee.core.domain import Venue
+
+        entry_id = "entry-1715000000000-BTCUSDT"
+        binance_cid = generate_exchange_cid(entry_id, "m", Venue.BINANCE)  # max 36
+        okx_cid = generate_exchange_cid(entry_id, "m", Venue.OKX)  # max 32
+        # Same hash source → same hex prefix, but OKX truncates to 32 → 16 bytes → 32 hex
+        assert len(okx_cid) == 32
+        assert len(binance_cid) == 36
+        assert okx_cid != binance_cid  # different lengths → different strings

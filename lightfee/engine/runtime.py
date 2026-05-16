@@ -3616,8 +3616,13 @@ class LiveRuntime:
         entry_id = f"entry-{now_ms}-{candidate.symbol}"
 
         # --- V1 recovery dedup: check for duplicate entries after restart ---
-        maker_cid = f"{entry_id}-maker"
-        hedge_cid = f"{entry_id}-hedge"
+        # Must use the same CID generation as build_entry_orders so the
+        # dedup index keys match the actual on-wire clientOrderId.
+        from lightfee.venues.cid import generate_exchange_cid
+        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
+        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
+        maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
+        hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
 
         if is_client_order_id_duplicate(maker_cid, self._recovery_dedup_index):
             self.journal.append(

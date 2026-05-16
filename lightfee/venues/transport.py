@@ -931,10 +931,42 @@ class VenueTransport(MarketDataClient):
             return "perp"
         return ""
 
-    def preflight_order_request(self, request: OrderRequest) -> dict[str, Any]:
+    def preflight_order_request(
+        self, request: OrderRequest, symbol_rule: Any = None,
+    ) -> dict[str, Any]:
+        """Normalize qty/price and validate min notional for an order request.
+
+        When symbol_rule (SymbolRule) is provided, uses those dynamic rules
+        instead of static VenueSpec values.  This allows passive orders to
+        pass through the same normalization path as taker orders.
+        """
         spec = self._spec
-        tick_size = float(spec.price_tick or 0.0)
-        quantity_step = float(spec.quantity_step or 0.0)
+        tick_size = (
+            float(symbol_rule.tick_size)
+            if symbol_rule is not None and symbol_rule.tick_size > 0
+            else float(spec.price_tick or 0.0)
+        )
+        quantity_step = (
+            float(symbol_rule.qty_step)
+            if symbol_rule is not None and symbol_rule.qty_step > 0
+            else float(spec.quantity_step or 0.0)
+        )
+        min_qty = (
+            float(symbol_rule.min_qty)
+            if symbol_rule is not None and symbol_rule.min_qty > 0
+            else float(spec.min_quantity or 0.0)
+        )
+        min_notional = (
+            float(symbol_rule.min_notional)
+            if symbol_rule is not None and symbol_rule.min_notional > 0
+            else float(spec.min_notional or 0.0)
+        )
+        rule_source = (
+            symbol_rule.rule_source
+            if symbol_rule is not None and symbol_rule.rule_source
+            else "spec"
+        )
+
         raw_qty = float(request.quantity)
         raw_price = float(request.price) if request.price is not None else None
         quantized_qty = _floor_to_step(raw_qty, quantity_step) if quantity_step > 0 else raw_qty
@@ -963,22 +995,33 @@ class VenueTransport(MarketDataClient):
             "quantized_qty": quantized_qty,
             "tick_size": tick_size,
             "quantity_step": quantity_step,
+            "min_qty": min_qty,
+            "min_notional": min_notional,
+            "rule_source": rule_source,
         }
         if quantized_qty <= 0 or not math.isfinite(quantized_qty):
             payload["response_classification"] = "precision_rejected"
             payload["reason"] = "quantity_step_rejected"
             self._record_order_diagnostic("order.submit_result", payload)
             raise OrderSubmitError(SubmitFailureClass.REJECTED, "quantity_step_rejected")
+        if quantized_qty < min_qty:
+            payload["response_classification"] = "precision_rejected"
+            payload["reason"] = "min_qty_rejected"
+            self._record_order_diagnostic("order.submit_result", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"min_qty_rejected qty={quantized_qty} min_qty={min_qty}",
+            )
         notional_price = quantized_price if quantized_price is not None else raw_price
         if notional_price is not None and not request.reduce_only:
             notional = abs(quantized_qty * float(notional_price))
-            if notional < spec.min_notional:
+            if notional < min_notional:
                 payload["response_classification"] = "precision_rejected"
                 payload["reason"] = "min_notional_rejected"
                 self._record_order_diagnostic("order.submit_result", payload)
                 raise OrderSubmitError(
                     SubmitFailureClass.REJECTED,
-                    f"min_notional_rejected notional={notional} min_notional={spec.min_notional}",
+                    f"min_notional_rejected notional={notional} min_notional={min_notional}",
                 )
         payload["response_classification"] = "attempt"
         return payload
@@ -2742,8 +2785,17 @@ class VenueTransport(MarketDataClient):
     # ------------------------------------------------------------------
 
     async def submit_passive_order(self, request: OrderRequest) -> "PassiveOrderAck":
-        """Submit a GTC post-only reduce-only maker order. Returns ack, not fill."""
+        """Submit a GTC post-only maker order. Returns ack, not fill.
+
+        V2 root-fix changes:
+        - Preflight/normalization runs before body building (was missing).
+        - Body is venue-specific — no generic fields polluting all exchanges.
+        - reduceOnly is NOT hardcoded; it respects request.reduce_only.
+        - OKX uses sz/clOrdId (not quantity/newClientOrderId).
+        - Diagnostic logging (order.submit_attempt / order.submit_result).
+        """
         from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
         spec = self._spec
         venue_sym = self._venue_symbol(request.symbol)
@@ -2765,71 +2817,292 @@ class VenueTransport(MarketDataClient):
             )
 
         try:
-            body: dict[str, Any] = {
+            # --- Preflight: fetch dynamic symbol rules + normalize ---
+            rules_cache = get_symbol_rules_cache()
+            symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
+
+            try:
+                preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
+            except OrderSubmitError:
+                raise
+            except Exception:
+                preflight = self.preflight_order_request(request)
+
+            quantized_qty = float(preflight["quantized_qty"])
+            quantized_price = preflight["quantized_price"]
+            tick_size = float(preflight.get("tick_size", 0))
+            qty_step = float(preflight.get("quantity_step", 0))
+            min_qty = float(preflight.get("min_qty", 0))
+            min_notional = float(preflight.get("min_notional", 0))
+            rule_source = str(preflight.get("rule_source", "spec"))
+            cid = request.client_order_id or ""
+
+            # --- Build venue-specific body ---
+            body = self._build_passive_order_body(
+                request, venue_sym, quantized_qty, quantized_price, cid,
+            )
+
+            # --- Diagnostic: order.submit_attempt ---
+            attempt_payload = {
+                "venue": spec.venue_id.value,
                 "symbol": venue_sym,
-                "side": request.side.value.upper(),
-                "quantity": str(request.quantity),
-                "reduceOnly": "true",
+                "side": request.side.value,
+                "raw_qty": preflight.get("raw_qty", request.quantity),
+                "raw_price": preflight.get("raw_price", request.price),
+                "normalized_qty": quantized_qty,
+                "normalized_price": quantized_price,
+                "tick_size": tick_size,
+                "qty_step": qty_step,
+                "min_qty": min_qty,
+                "min_notional": min_notional,
+                "rule_source": rule_source,
+                "cid_len": len(cid),
+                "cid_hash": hashlib.sha256(cid.encode()).hexdigest()[:16] if cid else "",
+                "reduce_only": request.reduce_only,
+                "body_field_names": sorted(body.keys()),
+                "post_only": True,
             }
+            self._record_order_diagnostic("order.submit_attempt", attempt_payload)
 
-            if request.client_order_id:
-                body["newClientOrderId"] = request.client_order_id
-
-            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
-                body["type"] = "LIMIT"
-                body["timeInForce"] = "GTX"  # post-only
-                if request.price is not None and request.price > 0:
-                    body["price"] = str(request.price)
-            elif spec.venue_id == Venue.OKX:
-                body["instId"] = venue_sym
-                body["tdMode"] = "cross"
-                body["ordType"] = "post_only"
-                if request.price is not None and request.price > 0:
-                    body["px"] = str(request.price)
-            elif spec.venue_id == Venue.BYBIT:
-                body = _build_bybit_order_body(
-                    request, venue_sym, passive=True,
-                    hedge_mode=self._hedge_mode,
-                )
-            elif spec.venue_id == Venue.BITGET:
-                body["marginCoin"] = "USDT"
-                body["orderType"] = "limit"
-                body["timeInForceValue"] = "post_only"
-                if request.price is not None and request.price > 0:
-                    body["price"] = str(request.price)
-            elif spec.venue_id == Venue.GATE:
-                body["contract"] = venue_sym
-                body["size"] = int(request.quantity)
-                body["price"] = str(request.price) if request.price else "0"
-                body["tif"] = "gtc"
-                body["reduce_only"] = True
-                body["post_only"] = True
-            elif spec.venue_id == Venue.HYPERLIQUID:
-                if request.price is not None and request.price > 0:
-                    body["price"] = str(request.price)
-                body["timeInForce"] = "Gtc"
-                body["postOnly"] = True
-
-            # V1: Binance/Aster use query-only private signing
+            # --- Send request ---
             if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
                 raw = await self._request("POST", spec.order_path, params=body, private=True)
             else:
                 raw = await self._request("POST", spec.order_path, body=body, private=True)
 
-            # V2: venue-specific success guard before parsing
+            # --- Venue-specific success guard ---
             if spec.venue_id == Venue.BYBIT:
                 _require_bybit_success(raw, "bybit passive order failed")
             elif spec.venue_id == Venue.BITGET:
                 _require_bitget_success(raw, "bitget passive order failed")
 
-            return self._parse_passive_order_ack(raw, request, venue_sym, now_ms)
+            # --- Parse ack with venue-specific validation ---
+            ack = self._parse_passive_order_ack(raw, request, venue_sym, now_ms)
+
+            # --- Diagnostic: order.submit_result ---
+            result_payload = {
+                "venue": spec.venue_id.value,
+                "symbol": venue_sym,
+                "side": request.side.value,
+                "normalized_qty": quantized_qty,
+                "normalized_price": quantized_price,
+                "tick_size": tick_size,
+                "qty_step": qty_step,
+                "rule_source": rule_source,
+                "reduce_only": request.reduce_only,
+                "response_code": 0,
+                "response_msg": "ok",
+                "ack_order_id": ack.order_id,
+                "ack_client_order_id": ack.client_order_id,
+                "response_classification": "ack_accepted",
+            }
+            self._record_order_diagnostic("order.submit_result", result_payload)
+            return ack
 
         except TransportError as e:
+            self._record_passive_diagnostic_failure(
+                request, venue_sym, e.status_code, str(e),
+            )
             raise _map_to_submit_error(e.category, str(e))
-        except OrderSubmitError:
+        except OrderSubmitError as e:
+            self._record_passive_diagnostic_failure(
+                request, venue_sym, 0, str(e),
+            )
             raise
         except Exception as e:
+            self._record_passive_diagnostic_failure(
+                request, venue_sym, 0, str(e),
+            )
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
+
+    def _record_passive_diagnostic_failure(
+        self, request: OrderRequest, venue_sym: str,
+        status_code: int, message: str,
+    ) -> None:
+        self._record_order_diagnostic("order.submit_result", {
+            "venue": self._spec.venue_id.value,
+            "symbol": venue_sym,
+            "side": request.side.value,
+            "reduce_only": request.reduce_only,
+            "response_code": status_code,
+            "response_msg": message[:200],
+            "ack_order_id": "",
+            "ack_client_order_id": "",
+            "response_classification": "rejected",
+        })
+
+    # ------------------------------------------------------------------
+    # Venue-specific passive order body builders
+    # ------------------------------------------------------------------
+
+    def _build_passive_order_body(
+        self,
+        request: OrderRequest,
+        venue_sym: str,
+        quantized_qty: float,
+        quantized_price: Any,
+        cid: str,
+    ) -> dict[str, Any]:
+        """Build a venue-specific body for a passive (post-only) maker order.
+
+        NO generic body pollution — every venue gets only its own fields.
+        """
+        spec = self._spec
+
+        if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+            return self._build_binance_aster_passive_body(
+                request, venue_sym, quantized_qty, quantized_price, cid,
+            )
+        elif spec.venue_id == Venue.OKX:
+            return self._build_okx_passive_body(
+                request, venue_sym, quantized_qty, quantized_price, cid,
+            )
+        elif spec.venue_id == Venue.BYBIT:
+            return self._build_bybit_passive_body(
+                request, venue_sym, quantized_qty, quantized_price,
+            )
+        elif spec.venue_id == Venue.BITGET:
+            return self._build_bitget_passive_body(
+                request, venue_sym, quantized_qty, quantized_price, cid,
+            )
+        elif spec.venue_id == Venue.GATE:
+            return self._build_gate_passive_body(
+                request, venue_sym, quantized_qty, quantized_price,
+            )
+        elif spec.venue_id == Venue.HYPERLIQUID:
+            return self._build_hyperliquid_passive_body(
+                request, quantized_qty, quantized_price,
+            )
+        else:
+            # Fallback — should never happen
+            body: dict[str, Any] = {
+                "symbol": venue_sym,
+                "side": request.side.value.upper(),
+                "quantity": _format_decimal(quantized_qty),
+            }
+            if quantized_price is not None and quantized_price > 0:
+                body["price"] = _format_decimal(quantized_price)
+            if cid:
+                body["newClientOrderId"] = cid
+            if request.reduce_only:
+                body["reduceOnly"] = "true"
+            return body
+
+    def _build_binance_aster_passive_body(
+        self, request: OrderRequest, venue_sym: str,
+        quantized_qty: float, quantized_price: Any, cid: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "symbol": venue_sym,
+            "side": request.side.value.upper(),
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "quantity": _format_decimal(quantized_qty),
+        }
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["price"] = _format_decimal(float(quantized_price))
+        if cid:
+            body["newClientOrderId"] = cid
+        if request.reduce_only:
+            body["reduceOnly"] = "true"
+        return body
+
+    def _build_okx_passive_body(
+        self, request: OrderRequest, venue_sym: str,
+        quantized_qty: float, quantized_price: Any, cid: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "instId": venue_sym,
+            "tdMode": "cross",
+            "side": request.side.value.lower(),
+            "ordType": "post_only",
+            "sz": _format_decimal(quantized_qty),
+        }
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["px"] = _format_decimal(float(quantized_price))
+        if cid:
+            body["clOrdId"] = cid
+        return body
+
+    def _build_bybit_passive_body(
+        self, request: OrderRequest, venue_sym: str,
+        quantized_qty: float, quantized_price: Any,
+    ) -> dict[str, Any]:
+        # Reuse the existing Bybit builder with a request that has
+        # normalized qty/price so it produces the correct body.
+        # Then override price with tick-aware _format_decimal —
+        # _format_price uses %.2f which destroys sub-cent precision
+        # for low-tick symbols (e.g. tick=0.0001, price=0.0315 → "0.03").
+        from dataclasses import replace as _replace
+        norm_req = _replace(
+            request,
+            quantity=quantized_qty,
+            price=float(quantized_price) if quantized_price is not None else None,
+        )
+        body = _build_bybit_order_body(
+            norm_req, venue_sym, passive=True,
+            hedge_mode=self._hedge_mode,
+        )
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["price"] = _format_decimal(float(quantized_price))
+        if quantized_qty > 0:
+            body["qty"] = _format_decimal(quantized_qty)
+        return body
+
+    def _build_bitget_passive_body(
+        self, request: OrderRequest, venue_sym: str,
+        quantized_qty: float, quantized_price: Any, cid: str,
+    ) -> dict[str, Any]:
+        # Bitget passive orders are handled by BitgetAdapter which overrides
+        # submit_passive_order.  This is a fallback for direct VenueTransport usage.
+        side = "buy" if request.side == Side.BUY else "sell"
+        body: dict[str, Any] = {
+            "symbol": venue_sym,
+            "productType": "USDT-FUTURES",
+            "marginMode": "crossed",
+            "marginCoin": "USDT",
+            "size": _format_quantity(quantized_qty),
+            "side": side,
+            "orderType": "limit",
+            "force": "post_only",
+            "clientOid": cid,
+        }
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["price"] = _format_price(float(quantized_price))
+        if self._hedge_mode:
+            body["tradeSide"] = "open" if not request.reduce_only else "close"
+        else:
+            body["reduceOnly"] = "YES" if request.reduce_only else "NO"
+        return body
+
+    def _build_gate_passive_body(
+        self, request: OrderRequest, venue_sym: str,
+        quantized_qty: float, quantized_price: Any,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "contract": venue_sym,
+            "size": int(quantized_qty),
+            "tif": "gtc",
+            "post_only": True,
+        }
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["price"] = _format_decimal(float(quantized_price))
+        if request.reduce_only:
+            body["reduce_only"] = True
+        return body
+
+    def _build_hyperliquid_passive_body(
+        self, request: OrderRequest,
+        quantized_qty: float, quantized_price: Any,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "timeInForce": "Gtc",
+            "postOnly": True,
+        }
+        if quantized_price is not None and float(quantized_price) > 0:
+            body["price"] = _format_decimal(float(quantized_price))
+        body["quantity"] = _format_decimal(quantized_qty)
+        return body
 
     def _parse_passive_order_ack(
         self, raw: dict[str, Any], request: OrderRequest, venue_sym: str, now_ms: int,
@@ -2837,6 +3110,56 @@ class VenueTransport(MarketDataClient):
         from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
 
         spec = self._spec
+
+        # --- OKX-specific envelope validation ---
+        if spec.venue_id == Venue.OKX:
+            code = str(raw.get("code", ""))
+            data_raw = raw.get("data", [])
+            if code != "0":
+                msg = raw.get("msg", "")
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"okx passive order rejected: code={code} msg={msg}",
+                )
+            if not isinstance(data_raw, list) or not data_raw:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "okx passive order: empty data array",
+                )
+            order_item = data_raw[0]
+            s_code = str(order_item.get("sCode", ""))
+            if s_code != "0":
+                s_msg = order_item.get("sMsg", "")
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"okx passive order rejected: sCode={s_code} sMsg={s_msg}",
+                )
+            ord_id = str(order_item.get("ordId", ""))
+            cl_ord_id = str(order_item.get("clOrdId", ""))
+            if not ord_id or not cl_ord_id:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"okx passive order accepted but empty identifiers: "
+                    f"ordId={ord_id!r} clOrdId={cl_ord_id!r}",
+                )
+            order_id = ord_id
+            client_order_id = cl_ord_id
+            price = _safe_float(order_item.get("px", request.price or 0))
+            qty = _safe_float(order_item.get("sz", request.quantity))
+            state = PassiveOrderState.OPEN
+            return PassiveOrderAck(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=request.side,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                price=price,
+                quantity=qty,
+                accepted_at_ms=now_ms,
+                state=state,
+            )
+
+        # --- Generic venue parsing ---
         data = raw.get("data", raw)
 
         if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
