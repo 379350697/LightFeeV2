@@ -656,6 +656,18 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
         assert reason == "entry_waiting_for_finalization_window_too_early"
 
+    def test_entry_window_blocks_even_when_local_l2_disabled(self, runtime_with_l2):
+        """V1 finalization window is applied before the local-L2 feature check."""
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_enabled = False
+        rt.config.strategy.entry_window_secs = 300
+        rt.config.strategy.min_scan_minutes_before_funding = 3
+        c = self._make_real_candidate(first_funding_timestamp_ms=610000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+
+        assert reason == "entry_waiting_for_finalization_window_too_early"
+
     def test_min_scan_boundary_expires_finalization_window(self, runtime_with_l2):
         """V1 final selection stops entries inside min_scan_minutes_before_funding."""
         rt = runtime_with_l2
@@ -857,6 +869,90 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         c = self._make_real_candidate()
         reason = runtime_with_l2._entry_local_l2_selection_blocker(c, now_ms=10000)
         assert reason is None
+
+    def test_v1_final_selection_reranks_before_symbol_uniqueness(
+        self, runtime_with_l2,
+    ):
+        """V1 sorts final candidates before keeping only one per symbol."""
+        from collections import Counter
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_enabled = False
+        rt.config.strategy.max_concurrent_positions = 3
+        candidates = [
+            self._make_real_candidate(
+                pair_id="btcusdt:bybit->okx", symbol="BTCUSDT",
+                long_venue="bybit", short_venue="okx",
+                ranking_edge_bps=9.0, worst_case_edge_bps=2.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=100.0,
+            ),
+            self._make_real_candidate(
+                pair_id="ethusdt:binance->okx", symbol="ETHUSDT",
+                long_venue="binance", short_venue="okx",
+                ranking_edge_bps=10.0, worst_case_edge_bps=2.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=100.0,
+            ),
+            self._make_real_candidate(
+                pair_id="btcusdt:binance->okx", symbol="BTCUSDT",
+                long_venue="binance", short_venue="okx",
+                ranking_edge_bps=12.0, worst_case_edge_bps=2.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=100.0,
+            ),
+        ]
+
+        selected = rt._select_entry_candidates(
+            candidates,
+            now_ms=10000,
+            remaining_slots=3,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+        )
+
+        assert [c.pair_id for c in selected] == [
+            "btcusdt:binance->okx",
+            "ethusdt:binance->okx",
+        ]
+
+    def test_v1_final_selection_skips_pending_residual_pair(
+        self, runtime_with_l2,
+    ):
+        """V1 does not select a candidate whose pair has pending residual repair."""
+        from collections import Counter
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_enabled = False
+        rt.state.pending_residual_repairs = [
+            {"pair_id": "btcusdt:binance->okx"},
+        ]
+        candidates = [
+            self._make_real_candidate(
+                pair_id="btcusdt:binance->okx", symbol="BTCUSDT",
+                long_venue="binance", short_venue="okx",
+                ranking_edge_bps=12.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=100.0,
+            ),
+            self._make_real_candidate(
+                pair_id="ethusdt:binance->okx", symbol="ETHUSDT",
+                long_venue="binance", short_venue="okx",
+                ranking_edge_bps=10.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=100.0,
+            ),
+        ]
+
+        selected = rt._select_entry_candidates(
+            candidates,
+            now_ms=10000,
+            remaining_slots=2,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+        )
+
+        assert [c.pair_id for c in selected] == ["ethusdt:binance->okx"]
 
     # ------------------------------------------------------------------
     # RED-LIGHT: V2 snapshot ingress enriches missing candidate fields
@@ -1398,6 +1494,100 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert readiness["primary_pair_ids"] == ["btcusdt:binance->bybit"]
         assert len(readiness["not_ready"]) == 2
         assert readiness["not_ready"][0]["reason"] == "book_missing"
+
+    @pytest.mark.asyncio
+    async def test_scan_activates_l2_only_for_v1_primary_and_shadow_scope(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from lightfee.config.schema import (
+            AppConfig,
+            PersistenceConfig,
+            RuntimeConfig,
+            StrategyConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        now_ms = 10000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms,
+        )
+
+        snapshot_path = tmp_path / "sidecar.json"
+        event_path = tmp_path / "events.jsonl"
+        candidates = []
+        for i in range(5):
+            candidates.append({
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "symbol": f"S{i}USDT",
+                "funding_diff_bps": 20.0 - i,
+                "funding_edge_bps": 20.0 - i,
+                "expected_edge_bps": 10.0,
+                "worst_case_edge_bps": 5.0,
+                "ranking_edge_bps": 20.0 - i,
+                "entry_notional_quote": 30.0,
+                "first_funding_timestamp_ms": 370000,
+            })
+        snapshot_path.write_text(json.dumps({
+            "schema_version": 2,
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {},
+            "candidates": candidates,
+        }))
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(snapshot_path),
+                sidecar_snapshot_max_age_ms=600_000,
+                live_scan_recovery_success_count=1,
+            ),
+            strategy=StrategyConfig(
+                local_l2_enabled=True,
+                local_l2_ws_enabled=False,
+                max_concurrent_positions=2,
+                entry_local_l2_primary_count=2,
+                shadow_entry_opportunity_count=1,
+                entry_window_secs=480,
+                min_scan_minutes_before_funding=0,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(event_path),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+        rt = LiveRuntime(config)
+        rt.state.lifecycle = EngineLifecycle.RUNNING
+        rt.state.risk_mode = GlobalRiskMode.RUNNING
+        rt.entry_executor = object()
+        rt.journal.open()
+
+        activated_symbols = []
+
+        async def record_l2_activation(candidates, now_ms):
+            activated_symbols.extend(c.symbol for c in candidates)
+
+        async def no_sync(now_ms, scan_promoted=False):
+            return None
+
+        monkeypatch.setattr(rt, "_ensure_l2_active_for_candidates", record_l2_activation)
+        monkeypatch.setattr(rt, "_sync_local_l2_data", no_sync)
+
+        await rt.tick()
+        rt.journal.close()
+
+        assert activated_symbols == ["S0USDT", "S1USDT", "S2USDT"]
 
     @pytest.mark.asyncio
     async def test_snapshot_degraded_and_stale_events_include_root_diagnostics(

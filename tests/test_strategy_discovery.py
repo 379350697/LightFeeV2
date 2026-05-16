@@ -120,6 +120,24 @@ class TestDiscovery:
         result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert result[0].ranking_edge_bps == 5.0
 
+    def test_preserves_v1_shortlist_pool_beyond_position_capacity(self):
+        config = StrategyConfig(max_concurrent_positions=2)
+        candidates = [
+            CandidateInput(
+                long_venue="a", short_venue=f"b{i}", symbol=f"S{i}",
+                funding_diff_bps=10, funding_edge_bps=10,
+                expected_edge_bps=5, worst_case_edge_bps=2,
+                ranking_edge_bps=float(10 - i),
+                entry_notional_quote=100.0,
+                first_funding_timestamp_ms=FUNDING_TS_MS,
+            )
+            for i in range(5)
+        ]
+
+        result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
+
+        assert [c.symbol for c in result] == ["S0", "S1", "S2", "S3", "S4"]
+
     def test_skips_blocked_candidates(self):
         config = StrategyConfig(max_concurrent_positions=8)
         candidates = [

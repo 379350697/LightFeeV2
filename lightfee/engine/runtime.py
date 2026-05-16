@@ -840,10 +840,6 @@ class LiveRuntime:
             if not tradeable:
                 self.state.last_scan["no_entry_reason"] = "no_tradeable_candidates"
             if tradeable:
-                # V1: activity_local_l2_symbols() → ensure L2 active for candidate symbols
-                # Only bootstrap L2 for symbols that have actual activity (shortlist/finalist)
-                await self._ensure_l2_active_for_candidates(tradeable, now_ms)
-
                 # V1 market data warmup: funding coverage must meet threshold before entry
                 if hasattr(snapshot, 'funding_lifecycle') and snapshot.funding_lifecycle:
                     funding_warmup_required = getattr(
@@ -883,12 +879,21 @@ class LiveRuntime:
                         "shadow_entry_opportunity_count",
                         getattr(self.config.strategy, "entry_local_l2_shadow_count", 2),
                     )
-                    from lightfee.engine.entry_local_l2 import (
-                        select_tracked_opportunities,
-                        make_candidate_pair_id,
-                    )
+                    from lightfee.engine.entry_local_l2 import select_tracked_opportunities
+
                     tracked = select_tracked_opportunities(
                         tradeable, primary_count, shadow_count,
+                    )
+                    tracked_pair_ids = {t.pair_id for t in tracked}
+                    tracked_candidates = [
+                        candidate for candidate in tradeable
+                        if self._candidate_pair_id(candidate) in tracked_pair_ids
+                    ]
+                    # V1: activity_local_l2_symbols() follows the tracked
+                    # primary+shadow scope, not the whole tradeable shortlist.
+                    await self._ensure_l2_active_for_candidates(
+                        tracked_candidates,
+                        now_ms,
                     )
                     self._tracked_primary_pair_ids = {
                         t.pair_id for t in tracked
@@ -904,7 +909,7 @@ class LiveRuntime:
                 # V1: selected_candidates is a final-entry list, not the raw
                 # shortlist. It excludes candidates still waiting on the final
                 # entry window, primary L2 tracking, or dual-ready books.
-                max_slots = self.config.strategy.max_concurrent_positions
+                max_slots = max(self.config.strategy.max_concurrent_positions, 1)
                 remaining_slots = max(max_slots - len(self.state.open_positions), 0)
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
@@ -947,7 +952,10 @@ class LiveRuntime:
                     tradeable=[],
                     selected_candidate_count=0,
                     dispatched_candidate_count=0,
-                    remaining_slots=self.config.strategy.max_concurrent_positions - len(self.state.open_positions),
+                    remaining_slots=max(
+                        self.config.strategy.max_concurrent_positions,
+                        1,
+                    ) - len(self.state.open_positions),
                     tradeable_selection_blocker_counts=Counter(),
                     candidate_blockers={},
                     now_ms=now_ms,
@@ -3107,6 +3115,44 @@ class LiveRuntime:
             str(getattr(candidate, "short_venue", "")),
         )
 
+    def _candidate_is_tradeable_for_selection(self, candidate) -> bool:
+        if bool(getattr(candidate, "blocked", False)):
+            return False
+        if list(getattr(candidate, "blocked_reasons", []) or []):
+            return False
+        if float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0) <= 0:
+            return False
+        return True
+
+    def _runtime_candidate_selection_score(self, candidate) -> float:
+        ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
+        risk_score = float(
+            getattr(
+                candidate,
+                "runtime_risk_score",
+                getattr(candidate, "selection_risk_score", 0.0),
+            ) or 0.0
+        )
+        return ranking_edge / (1.0 + max(risk_score, 0.0))
+
+    def _candidate_final_selection_sort_key(self, candidate) -> tuple[float, float, float, str]:
+        return (
+            -self._runtime_candidate_selection_score(candidate),
+            -float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
+            -float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0),
+            self._candidate_pair_id(candidate),
+        )
+
+    def _has_pending_residual_pair(self, pair_id: str) -> bool:
+        for task in self.state.pending_residual_repairs:
+            if isinstance(task, dict):
+                task_pair_id = task.get("pair_id", "")
+            else:
+                task_pair_id = getattr(task, "pair_id", "")
+            if str(task_pair_id) == pair_id:
+                return True
+        return False
+
     def _select_entry_candidates(
         self,
         tradeable: list,
@@ -3130,9 +3176,12 @@ class LiveRuntime:
             for pending in self.state.pending_entries.values()
         )
         selected_symbols: set[str] = set()
+        ranked: list = []
         selected: list = []
 
         for candidate in tradeable:
+            if not self._candidate_is_tradeable_for_selection(candidate):
+                continue
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._candidate_pair_id(candidate)
             blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
@@ -3149,7 +3198,16 @@ class LiveRuntime:
                     },
                 )
                 continue
+            ranked.append(candidate)
+
+        ranked.sort(key=self._candidate_final_selection_sort_key)
+
+        for candidate in ranked:
+            symbol = str(getattr(candidate, "symbol", ""))
+            pair_id = self._candidate_pair_id(candidate)
             if symbol in active_symbols or symbol in selected_symbols:
+                continue
+            if self._has_pending_residual_pair(pair_id):
                 continue
             selected.append(candidate)
             selected_symbols.add(symbol)
@@ -3193,9 +3251,7 @@ class LiveRuntime:
         - entry_local_l2_waiting_for_primary_tracking
         - entry_local_l2_waiting_for_dual_ready
         """
-        if not self.config.strategy.local_l2_enabled:
-            return None
-        if self.config.runtime.mode not in ("live", "paper"):
+        if self.config.runtime.mode != "live":
             return None
 
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
@@ -3210,6 +3266,8 @@ class LiveRuntime:
         # V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms
         first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
         if first_funding_ts <= 0:
+            if not self.config.strategy.local_l2_enabled:
+                return None
             return "entry_local_l2_waiting_for_prewarm_window"
         remaining_ms = first_funding_ts - max(now_ms, 0)
         finalization_blocker = self._entry_finalization_window_blocker(
@@ -3218,6 +3276,8 @@ class LiveRuntime:
         )
         if finalization_blocker:
             return finalization_blocker
+        if not self.config.strategy.local_l2_enabled:
+            return None
         prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
         if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
             return "entry_local_l2_waiting_for_prewarm_window"

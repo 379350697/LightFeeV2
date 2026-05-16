@@ -79,7 +79,7 @@ def discover_tradeable_candidates(
         passed.append((c, []))
 
     passed.sort(key=lambda item: item[0].ranking_edge_bps, reverse=True)
-    return [c for c, _ in passed[: config.max_concurrent_positions]]
+    return [c for c, _ in passed]
 
 
 def _is_within_funding_scan_window_ms(config: StrategyConfig, remaining_ms: int) -> bool:
