@@ -916,6 +916,62 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "ethusdt:binance->okx",
         ]
 
+    def test_v1_final_selection_uses_runtime_depth_risk_before_symbol_uniqueness(
+        self, runtime_with_l2,
+    ):
+        """V1 risk-adjusts ranking edge with leg depth risk before symbol dedupe."""
+        from collections import Counter
+
+        from lightfee.sidecar.snapshot import QuoteSnapshot
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_enabled = False
+        candidates = [
+            self._make_real_candidate(
+                pair_id="btcusdt:binance->bybit", symbol="BTCUSDT",
+                long_venue="binance", short_venue="bybit",
+                ranking_edge_bps=12.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=1000.0,
+            ),
+            self._make_real_candidate(
+                pair_id="btcusdt:okx->gate", symbol="BTCUSDT",
+                long_venue="okx", short_venue="gate",
+                ranking_edge_bps=10.0,
+                first_funding_timestamp_ms=250000,
+                entry_notional_quote=1000.0,
+            ),
+        ]
+        quotes = {
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance", symbol="BTCUSDT",
+                bid=99.0, ask=101.0, bid_size=1.0, ask_size=1.0,
+            ),
+            "bybit:BTCUSDT": QuoteSnapshot(
+                venue="bybit", symbol="BTCUSDT",
+                bid=99.0, ask=101.0, bid_size=1.0, ask_size=1.0,
+            ),
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx", symbol="BTCUSDT",
+                bid=99.0, ask=101.0, bid_size=100.0, ask_size=100.0,
+            ),
+            "gate:BTCUSDT": QuoteSnapshot(
+                venue="gate", symbol="BTCUSDT",
+                bid=99.0, ask=101.0, bid_size=100.0, ask_size=100.0,
+            ),
+        }
+
+        selected = rt._select_entry_candidates(
+            candidates,
+            now_ms=10000,
+            remaining_slots=1,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+            market_quotes=quotes,
+        )
+
+        assert [c.pair_id for c in selected] == ["btcusdt:okx->gate"]
+
     def test_v1_final_selection_skips_pending_residual_pair(
         self, runtime_with_l2,
     ):

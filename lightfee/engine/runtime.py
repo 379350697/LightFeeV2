@@ -919,6 +919,7 @@ class LiveRuntime:
                     remaining_slots=remaining_slots,
                     selection_blocker_counts=selection_blocker_counts,
                     candidate_blockers=candidate_blockers,
+                    market_quotes=snapshot.quotes,
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = 0
@@ -926,8 +927,8 @@ class LiveRuntime:
                     if len(self.state.open_positions) >= max_slots:
                         break
                     mid_price = price_hints.get(candidate.symbol, 0.0)
-                    await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
-                    dispatched += 1
+                    if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
+                        dispatched += 1
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
                 if dispatched == 0:
                     reason = (
@@ -3124,20 +3125,97 @@ class LiveRuntime:
             return False
         return True
 
-    def _runtime_candidate_selection_score(self, candidate) -> float:
-        ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
-        risk_score = float(
-            getattr(
-                candidate,
-                "runtime_risk_score",
-                getattr(candidate, "selection_risk_score", 0.0),
-            ) or 0.0
+    def _market_quote_lookup(self, market_quotes) -> dict[tuple[str, str], object]:
+        if not market_quotes:
+            return {}
+        items = market_quotes.items() if hasattr(market_quotes, "items") else enumerate(market_quotes)
+        lookup: dict[tuple[str, str], object] = {}
+        for key, quote in items:
+            if isinstance(key, tuple) and len(key) == 2:
+                venue = str(key[0])
+                symbol = str(key[1])
+            else:
+                venue = str(getattr(quote, "venue", "") or "")
+                symbol = str(getattr(quote, "symbol", "") or "")
+                if (not venue or not symbol) and isinstance(key, str) and ":" in key:
+                    venue, symbol = key.split(":", 1)
+            if venue and symbol:
+                lookup[(venue.lower(), symbol.upper())] = quote
+        return lookup
+
+    def _candidate_quote(
+        self,
+        quote_lookup: dict[tuple[str, str], object],
+        venue: str,
+        symbol: str,
+    ):
+        return quote_lookup.get((str(venue).lower(), str(symbol).upper()))
+
+    def _entry_leg_depth_score(
+        self,
+        candidate,
+        quote_lookup: dict[tuple[str, str], object],
+        *,
+        venue: str,
+        side: str,
+    ) -> float:
+        quote = self._candidate_quote(quote_lookup, venue, str(getattr(candidate, "symbol", "")))
+        if quote is None:
+            return 10.0
+        if side == "buy":
+            price = float(getattr(quote, "ask", 0.0) or 0.0)
+            top_size = float(getattr(quote, "ask_size", 0.0) or 0.0)
+        else:
+            price = float(getattr(quote, "bid", 0.0) or 0.0)
+            top_size = float(getattr(quote, "bid_size", 0.0) or 0.0)
+        if price <= 0.0 or top_size <= 0.0:
+            return 10.0
+        quantity = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0) / price
+        if quantity <= 0.0:
+            return 10.0
+        return quantity / top_size
+
+    def _runtime_candidate_risk_score(
+        self,
+        candidate,
+        quote_lookup: dict[tuple[str, str], object],
+    ) -> float:
+        explicit_risk = getattr(candidate, "runtime_risk_score", None)
+        if explicit_risk is not None:
+            return max(float(explicit_risk or 0.0), 0.0)
+
+        long_depth = self._entry_leg_depth_score(
+            candidate,
+            quote_lookup,
+            venue=str(getattr(candidate, "long_venue", "")),
+            side="buy",
         )
+        short_depth = self._entry_leg_depth_score(
+            candidate,
+            quote_lookup,
+            venue=str(getattr(candidate, "short_venue", "")),
+            side="sell",
+        )
+        depth_risk = max(long_depth, short_depth, 0.0)
+        selection_risk = float(getattr(candidate, "selection_risk_score", 0.0) or 0.0)
+        return max(depth_risk, selection_risk, 0.0)
+
+    def _runtime_candidate_selection_score(
+        self,
+        candidate,
+        quote_lookup: dict[tuple[str, str], object] | None = None,
+    ) -> float:
+        ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
+        risk_score = self._runtime_candidate_risk_score(candidate, quote_lookup or {})
         return ranking_edge / (1.0 + max(risk_score, 0.0))
 
-    def _candidate_final_selection_sort_key(self, candidate) -> tuple[float, float, float, str]:
+    def _candidate_final_selection_sort_key(
+        self,
+        candidate,
+        quote_lookup: dict[tuple[str, str], object] | None = None,
+    ) -> tuple[float, float, float, str]:
         return (
-            -self._runtime_candidate_selection_score(candidate),
+            -self._runtime_candidate_selection_score(candidate, quote_lookup),
             -float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
             -float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0),
             self._candidate_pair_id(candidate),
@@ -3161,6 +3239,7 @@ class LiveRuntime:
         remaining_slots: int,
         selection_blocker_counts: Counter,
         candidate_blockers: dict[str, str],
+        market_quotes=None,
     ) -> list:
         """V1 select_entry_candidates_from_refs parity for the final entry list."""
         target = self._entry_selection_target(remaining_slots)
@@ -3200,7 +3279,13 @@ class LiveRuntime:
                 continue
             ranked.append(candidate)
 
-        ranked.sort(key=self._candidate_final_selection_sort_key)
+        quote_lookup = self._market_quote_lookup(market_quotes)
+        ranked.sort(
+            key=lambda candidate: self._candidate_final_selection_sort_key(
+                candidate,
+                quote_lookup,
+            )
+        )
 
         for candidate in ranked:
             symbol = str(getattr(candidate, "symbol", ""))
@@ -3296,7 +3381,7 @@ class LiveRuntime:
 
         return None
 
-    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> None:
+    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
         V1: entry route/maker-leg/price gate from config and execution planner.
@@ -3342,7 +3427,7 @@ class LiveRuntime:
                         "ts_ms": now_ms,
                     },
                 )
-                return
+                return False
 
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
@@ -3367,7 +3452,7 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return
+            return False
 
         # Resolve venue enums from candidate string fields
         long_venue = Venue.from_str(candidate.long_venue)
@@ -3389,7 +3474,7 @@ class LiveRuntime:
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
                 )
-                return
+                return False
 
         # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
         # but either leg's book is not ready (stale, degraded, cold, etc.)
@@ -3446,7 +3531,7 @@ class LiveRuntime:
                         "ts_ms": now_ms,
                     },
                 )
-                return
+                return False
 
         # V1 entry route planning: derive route and maker leg from execution planner.
         # Strategy config provides min-notional; venue-specific chunk/min-notional
@@ -3477,7 +3562,7 @@ class LiveRuntime:
                     "reason": plan.reason or "planner rejected entry",
                 },
             )
-            return
+            return False
 
         # Map planner route to EntryType
         if route == ExecutionRoute.PASSIVE_INCREMENTAL:
@@ -3508,7 +3593,7 @@ class LiveRuntime:
                     "reason": "duplicate maker clientOrderId in recovery dedup index",
                 },
             )
-            return
+            return False
 
         if is_client_order_id_duplicate(hedge_cid, self._recovery_dedup_index):
             self.journal.append(
@@ -3519,7 +3604,7 @@ class LiveRuntime:
                     "reason": "duplicate hedge clientOrderId in recovery dedup index",
                 },
             )
-            return
+            return False
 
         # Check for existing pending entry on same symbol pair
         if has_pending_entry_for_symbol(
@@ -3535,7 +3620,7 @@ class LiveRuntime:
                     "reason": "pending entry already exists for this symbol pair",
                 },
             )
-            return
+            return False
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -3622,6 +3707,9 @@ class LiveRuntime:
                 "runtime.entry_dispatch_error",
                 {"entry_id": ctx.entry_id, "error": str(e)},
             )
+            return False
+
+        return True
 
         # ------------------------------------------------------------------
     # Passive close recovery (V1: recovery after restart)

@@ -194,3 +194,10 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
     kinds = [record["kind"] for record in records]
     assert "runtime.order_quote_stale_skipped" in kinds
     assert "runtime.entry_skipped_no_quote" in kinds
+    assert runtime.state.last_scan["selected_candidate_count"] == 1
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 0
+    no_entry = [
+        record for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    ]
+    assert no_entry[-1]["payload"]["reason"] == "no_entry_dispatched"
