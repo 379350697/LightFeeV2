@@ -167,6 +167,7 @@ class OrderFillReconciliation:
     client_order_id: Optional[str] = None
     fee_quote: Optional[float] = None
     filled_at_ms: int = 0
+    metadata: Optional[dict] = field(default=None)
 
 
 @dataclass(frozen=True, slots=True)

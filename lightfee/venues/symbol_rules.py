@@ -24,6 +24,7 @@ class SymbolRule:
     qty_step: float
     min_qty: float
     min_notional: float
+    ct_val: float = 0.0  # OKX contract value (ctVal) for base→contract sizing
     rule_source: str = ""  # "exchangeInfo", "instruments-info", "instrument", "spec_fallback"
 
 
@@ -178,6 +179,7 @@ class SymbolRulesCache:
         tick_size = float(item.get("tickSz", 0) or 0)
         lot_sz = float(item.get("lotSz", 0) or 0)
         min_sz = float(item.get("minSz", 0) or 0)
+        ct_val = float(item.get("ctVal", 1) or 1)
 
         spec = transport._spec
         if tick_size <= 0:
@@ -186,6 +188,8 @@ class SymbolRulesCache:
             lot_sz = float(spec.quantity_step or 0.0)
         if min_sz <= 0:
             min_sz = float(spec.min_quantity or 0.0)
+        if ct_val <= 0:
+            ct_val = float(getattr(spec, 'contract_size', 1) or 1)
         min_notional = float(spec.min_notional or 0.0)
 
         return SymbolRule(
@@ -193,6 +197,7 @@ class SymbolRulesCache:
             qty_step=lot_sz,
             min_qty=min_sz,
             min_notional=min_notional,
+            ct_val=ct_val,
             rule_source="instrument",
         )
 

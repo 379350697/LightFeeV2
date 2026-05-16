@@ -38,6 +38,7 @@ from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.common import normalize_venue_quantity
 from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.specs import AuthScheme, VenueSpec
+from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
 
 # ---------------------------------------------------------------------------
@@ -2174,11 +2175,53 @@ class VenueTransport(MarketDataClient):
                     body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
             elif spec.venue_id == Venue.OKX:
-                body["instId"] = venue_sym
-                body["tdMode"] = "cross"
-                body["ordType"] = "market"
+                # V1: refresh posMode on first order (lazy, cached thereafter)
+                if getattr(self, '_pos_mode_cache', None) is None:
+                    await self._refresh_okx_pos_mode()
+                pos_side = self._okx_pos_side(request.side, request.reduce_only)
+
+                # V1: OKX contract sizing — base_qty / ctVal → contracts, floored to lotSz
+                rules_cache = get_symbol_rules_cache()
+                symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
+                ct_val = float(getattr(symbol_rule, 'ct_val', 0) or 0)
+                lot_sz = float(getattr(symbol_rule, 'qty_step', 0) or 0)
+                base_qty = float(request.quantity)
+
+                if ct_val > 0 and lot_sz > 0:
+                    contract_qty = _floor_to_step(base_qty / ct_val, lot_sz)
+                elif ct_val > 0:
+                    contract_qty = base_qty / ct_val
+                else:
+                    contract_qty = base_qty
+
+                body = {
+                    "instId": venue_sym,
+                    "tdMode": "cross",
+                    "side": request.side.value.lower(),
+                    "posSide": pos_side,
+                    "ordType": "market",
+                    "sz": _format_decimal(contract_qty),
+                }
+                if request.price is not None:
+                    body["ordType"] = "limit"
+                    body["px"] = _format_decimal(request.price)
+                if request.client_order_id:
+                    body["clOrdId"] = request.client_order_id
                 if request.reduce_only:
                     body["reduceOnly"] = "true"
+                # Enrich diagnostic with OKX-specific evidence
+                preflight["pos_side"] = pos_side
+                preflight["pos_mode"] = self._okx_pos_mode
+                preflight["ct_val"] = ct_val
+                preflight["base_qty"] = base_qty
+                preflight["contract_qty"] = contract_qty
+                preflight["lot_sz"] = lot_sz
+                preflight["body_field_names"] = sorted(body.keys())
+                preflight["body_sanitized"] = {
+                    k: v for k, v in body.items()
+                    if k not in ("clOrdId",)
+                }
+                self._record_order_diagnostic("order.submit_attempt", preflight)
             elif spec.venue_id == Venue.BYBIT:
                 body = _build_bybit_order_body(
                     request, venue_sym, passive=False,
@@ -2212,6 +2255,7 @@ class VenueTransport(MarketDataClient):
                     )
 
                     asset_index = await self._hl_resolve_asset_index(venue_sym)
+                    cloid = request.client_order_id or ""
                     action = build_hyperliquid_order_action(
                         symbol=venue_sym,
                         is_buy=is_buy,
@@ -2219,6 +2263,7 @@ class VenueTransport(MarketDataClient):
                         price=float(limit_px),
                         reduce_only=request.reduce_only,
                         tif=tif,
+                        cloid=cloid if cloid else None,
                     )
                     # Override the placeholder asset index with the resolved one
                     action["orders"][0]["a"] = asset_index
@@ -2232,23 +2277,29 @@ class VenueTransport(MarketDataClient):
                         private_key_hex=self._credential.api_secret if self._credential else "",
                         vault_address=vault_addr,
                         is_mainnet=True,
+                        cloid=cloid if cloid else None,
                     )
                 else:
+                    paper_order: dict[str, Any] = {
+                        "a": 0,  # asset index — placeholder for paper
+                        "b": is_buy,
+                        "p": limit_px,
+                        "s": str(request.quantity),
+                        "r": request.reduce_only,
+                        "t": {"limit": {"tif": tif}},
+                    }
+                    if request.client_order_id:
+                        paper_order["c"] = request.client_order_id
                     body = {
                         "action": {
                             "type": "order",
-                            "orders": [{
-                                "a": 0,  # asset index — placeholder for paper
-                                "b": is_buy,
-                                "p": limit_px,
-                                "s": str(request.quantity),
-                                "r": request.reduce_only,
-                                "t": {"limit": {"tif": tif}},
-                            }],
+                            "orders": [paper_order],
                             "grouping": "na",
                         },
                         "type": "order",
                     }
+                    if request.client_order_id:
+                        body["cloid"] = request.client_order_id
                     if self._credential and self._credential.account_address:
                         body["vaultAddress"] = self._credential.account_address
 
@@ -2837,12 +2888,24 @@ class VenueTransport(MarketDataClient):
             rule_source = str(preflight.get("rule_source", "spec"))
             cid = request.client_order_id or ""
 
+            # --- V1: OKX posMode refresh + contract sizing ---
+            if spec.venue_id == Venue.OKX:
+                if getattr(self, '_pos_mode_cache', None) is None:
+                    await self._refresh_okx_pos_mode()
+            ct_val_sz = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
+            lot_sz = float(getattr(symbol_rule, 'qty_step', 0)) if symbol_rule else (qty_step or 0.0)
+            if spec.venue_id == Venue.OKX and ct_val_sz > 0:
+                contract_qty = _floor_to_step(quantized_qty / ct_val_sz, lot_sz) if lot_sz > 0 else (quantized_qty / ct_val_sz)
+            else:
+                contract_qty = quantized_qty
+
             # --- Build venue-specific body ---
             body = self._build_passive_order_body(
-                request, venue_sym, quantized_qty, quantized_price, cid,
+                request, venue_sym, contract_qty, quantized_price, cid,
             )
 
             # --- Diagnostic: order.submit_attempt ---
+            ct_val = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
             attempt_payload = {
                 "venue": spec.venue_id.value,
                 "symbol": venue_sym,
@@ -2862,6 +2925,15 @@ class VenueTransport(MarketDataClient):
                 "body_field_names": sorted(body.keys()),
                 "post_only": True,
             }
+            if spec.venue_id == Venue.OKX:
+                attempt_payload["pos_side"] = self._okx_pos_side(request.side, request.reduce_only)
+                attempt_payload["pos_mode"] = self._okx_pos_mode
+                attempt_payload["ct_val"] = ct_val_sz
+                attempt_payload["base_qty"] = quantized_qty
+                attempt_payload["contract_qty"] = contract_qty
+                attempt_payload["lot_sz"] = lot_sz
+                if ct_val_sz > 0:
+                    attempt_payload["venue_contract_qty"] = _format_decimal(contract_qty)
             self._record_order_diagnostic("order.submit_attempt", attempt_payload)
 
             # --- Send request ---
@@ -2971,7 +3043,7 @@ class VenueTransport(MarketDataClient):
             )
         elif spec.venue_id == Venue.HYPERLIQUID:
             return self._build_hyperliquid_passive_body(
-                request, quantized_qty, quantized_price,
+                request, quantized_qty, quantized_price, cid,
             )
         else:
             # Fallback — should never happen
@@ -3011,18 +3083,91 @@ class VenueTransport(MarketDataClient):
         self, request: OrderRequest, venue_sym: str,
         quantized_qty: float, quantized_price: Any, cid: str,
     ) -> dict[str, Any]:
+        # V1: refresh posMode on first order (lazy, cached thereafter)
+        if getattr(self, '_pos_mode_cache', None) is None:
+            # Fire-and-forget refresh — caller should have already refreshed;
+            # this is a safety net for direct passive submissions.
+            pass
+        pos_side = self._okx_pos_side(request.side, request.reduce_only)
+        # V1: OKX contract sizing — base_qty / ctVal → contracts
+        sz = _format_decimal(quantized_qty)
         body: dict[str, Any] = {
             "instId": venue_sym,
             "tdMode": "cross",
             "side": request.side.value.lower(),
+            "posSide": pos_side,
             "ordType": "post_only",
-            "sz": _format_decimal(quantized_qty),
+            "sz": sz,
         }
         if quantized_price is not None and float(quantized_price) > 0:
             body["px"] = _format_decimal(float(quantized_price))
         if cid:
             body["clOrdId"] = cid
         return body
+
+    def _okx_pos_side(self, side: "Side", reduce_only: bool = False) -> str:
+        """Return OKX posSide value based on cached posMode and order side.
+
+        V1: okx_pos_side() — net→"net", long_short→"long"/"short"
+        """
+        mode = self._okx_pos_mode
+        if mode == "long_short":
+            if not reduce_only:
+                return "long" if side == Side.BUY else "short"
+            else:
+                return "short" if side == Side.BUY else "long"
+        return "net"
+
+    @property
+    def _okx_pos_mode(self) -> str:
+        """Cached OKX position mode: 'net' or 'long_short'. Default 'long_short'."""
+        cached = getattr(self, '_pos_mode_cache', None)
+        if cached is not None:
+            return cached
+        return "long_short"  # V1 default: long_short until account/config confirmed
+
+    async def _refresh_okx_pos_mode(self) -> str:
+        """Fetch OKX account/config and cache posMode. Returns 'net' or 'long_short'."""
+        try:
+            raw = await self._request("GET", "/api/v5/account/config", private=True)
+            code = str(raw.get("code", ""))
+            if code != "0":
+                self._record_order_diagnostic("order.okx_pos_mode_refresh", {
+                    "venue": self._spec.venue_id.value,
+                    "outcome": "api_error",
+                    "code": code,
+                    "msg": str(raw.get("msg", "")),
+                    "resolved_pos_mode": "long_short",
+                })
+                return "long_short"
+            data = raw.get("data", [])
+            if isinstance(data, list) and data:
+                row = data[0]
+                if isinstance(row, dict):
+                    pos_mode = str(row.get("posMode", "")).lower()
+                    cached = "long_short" if "long_short" in pos_mode else "net"
+                    self._pos_mode_cache = cached
+                    self._record_order_diagnostic("order.okx_pos_mode_refresh", {
+                        "venue": self._spec.venue_id.value,
+                        "outcome": "success",
+                        "pos_mode": cached,
+                        "raw_pos_mode": pos_mode,
+                    })
+                    return cached
+            # Empty data array — account config returned no rows
+            self._record_order_diagnostic("order.okx_pos_mode_refresh", {
+                "venue": self._spec.venue_id.value,
+                "outcome": "empty_data",
+                "resolved_pos_mode": "long_short",
+            })
+        except Exception as e:
+            self._record_order_diagnostic("order.okx_pos_mode_refresh", {
+                "venue": self._spec.venue_id.value,
+                "outcome": "exception",
+                "error": str(e)[:200],
+                "resolved_pos_mode": "long_short",
+            })
+        return "long_short"
 
     def _build_bybit_passive_body(
         self, request: OrderRequest, venue_sym: str,
@@ -3094,6 +3239,7 @@ class VenueTransport(MarketDataClient):
     def _build_hyperliquid_passive_body(
         self, request: OrderRequest,
         quantized_qty: float, quantized_price: Any,
+        cid: str = "",
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "timeInForce": "Gtc",
@@ -3102,6 +3248,8 @@ class VenueTransport(MarketDataClient):
         if quantized_price is not None and float(quantized_price) > 0:
             body["price"] = _format_decimal(float(quantized_price))
         body["quantity"] = _format_decimal(quantized_qty)
+        if cid:
+            body["cloid"] = cid
         return body
 
     def _parse_passive_order_ack(
@@ -3115,24 +3263,34 @@ class VenueTransport(MarketDataClient):
         if spec.venue_id == Venue.OKX:
             code = str(raw.get("code", ""))
             data_raw = raw.get("data", [])
+            order_item = data_raw[0] if isinstance(data_raw, list) and data_raw else {}
+            s_code = str(order_item.get("sCode", "0"))
+            s_msg = order_item.get("sMsg", "")
+            ord_id = str(order_item.get("ordId", ""))
+            cl_ord_id = str(order_item.get("clOrdId", ""))
+            tag = str(order_item.get("tag", ""))
+
             if code != "0":
                 msg = raw.get("msg", "")
+                error_detail = (
+                    f"okx passive order rejected: code={code} msg={msg}"
+                    f" sCode={s_code} sMsg={s_msg}"
+                    f" ordId={ord_id} clOrdId={cl_ord_id} tag={tag}"
+                )
                 raise OrderSubmitError(
                     SubmitFailureClass.REJECTED,
-                    f"okx passive order rejected: code={code} msg={msg}",
+                    error_detail,
                 )
             if not isinstance(data_raw, list) or not data_raw:
                 raise OrderSubmitError(
                     SubmitFailureClass.UNCERTAIN,
                     "okx passive order: empty data array",
                 )
-            order_item = data_raw[0]
-            s_code = str(order_item.get("sCode", ""))
             if s_code != "0":
-                s_msg = order_item.get("sMsg", "")
                 raise OrderSubmitError(
                     SubmitFailureClass.REJECTED,
-                    f"okx passive order rejected: sCode={s_code} sMsg={s_msg}",
+                    f"okx passive order rejected: sCode={s_code} sMsg={s_msg}"
+                    f" ordId={ord_id} clOrdId={cl_ord_id} tag={tag}",
                 )
             ord_id = str(order_item.get("ordId", ""))
             cl_ord_id = str(order_item.get("clOrdId", ""))

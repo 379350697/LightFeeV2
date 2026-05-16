@@ -139,6 +139,14 @@ class PendingEntry:
     # is the maker (passive) and which is the hedge (aggressive).
     # "long" = maker on long_venue (default), "short" = maker on short_venue.
     maker_leg: str = "long"
+    # --- V1 hedge inflight tracking for idempotency ---
+    # When a hedge order has been submitted but not yet confirmed, this is
+    # set to the hedge client_order_id to prevent duplicate submissions.
+    hedge_inflight: str = ""
+    # --- V1 maker fill price for hedge price hint ---
+    maker_fill_price: float = 0.0
+    # --- V1 hedge fill price for entry position recording ---
+    hedge_fill_price: float = 0.0
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -535,13 +543,23 @@ class EngineState:
                     "created_at_ms": p.created_at_ms,
                     "maker_order_id": p.maker_order_id,
                     "hedge_order_id": p.hedge_order_id,
+                    "maker_client_order_id": p.maker_client_order_id,
+                    "hedge_client_order_id": p.hedge_client_order_id,
                     "maker_leg_filled": p.maker_leg_filled,
                     "hedge_leg_filled": p.hedge_leg_filled,
+                    "deadline_ms": p.deadline_ms,
                     "uncertain_outcome": p.uncertain_outcome,
+                    "reconcile_attempt": p.reconcile_attempt,
+                    "reconcile_next_attempt_ms": p.reconcile_next_attempt_ms,
                     "entry_type": p.entry_type,
                     "maker_price": p.maker_price,
+                    "maker_fill_price": p.maker_fill_price,
+                    "hedge_fill_price": p.hedge_fill_price,
+                    "hedge_inflight": p.hedge_inflight,
                     "long_quantity": p.long_quantity,
                     "short_quantity": p.short_quantity,
+                    "maker_leg": p.maker_leg,
+                    "outcome": p.outcome,
                 }
                 for pid, p in self.pending_entries.items()
             },

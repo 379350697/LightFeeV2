@@ -50,6 +50,33 @@ class PositionReconciliationResult:
 
 
 # ---------------------------------------------------------------------------
+# Fill object compatibility helpers
+# ---------------------------------------------------------------------------
+
+
+def _recon_fill_price(obj) -> float:
+    """Return fill price from either OrderFill (has price) or OrderFillReconciliation (has average_price)."""
+    if obj is None:
+        return 0.0
+    return getattr(obj, "average_price", getattr(obj, "price", 0.0))
+
+
+def _recon_metadata(obj) -> Optional[dict]:
+    """Return metadata from either OrderFillReconciliation or None for OrderFill."""
+    if obj is None:
+        return None
+    return getattr(obj, "metadata", None)
+
+
+def _recon_meta_get(obj, key: str, default: Any = "") -> Any:
+    """Get a key from metadata, safely handling both OrderFill and OrderFillReconciliation."""
+    meta = _recon_metadata(obj)
+    if meta is None:
+        return default
+    return meta.get(key, default)
+
+
+# ---------------------------------------------------------------------------
 # Order reconciler
 # ---------------------------------------------------------------------------
 
@@ -88,6 +115,13 @@ class OrderReconciler:
         order_id: str,
         client_order_id: str,
         status: str,
+        reason: str = "",
+        raw_exchange_status: str = "",
+        fill_qty: float = 0.0,
+        fill_price: float = 0.0,
+        position_qty: float = 0.0,
+        position_side: str = "",
+        hedge_submitted: bool = False,
     ) -> None:
         if venue is None:
             return
@@ -99,8 +133,16 @@ class OrderReconciler:
                 "endpoint": "fetch_order_status",
                 "product_type": "reconciliation",
                 "category": "reconciliation",
-                "client_order_id": client_order_id,
                 "order_id": order_id,
+                "client_order_id": client_order_id,
+                "status": status,
+                "reason": reason,
+                "raw_exchange_status": raw_exchange_status,
+                "fill_qty": fill_qty,
+                "fill_price": fill_price,
+                "position_qty": position_qty,
+                "position_side": position_side,
+                "hedge_submitted": hedge_submitted,
                 "raw_price": None,
                 "raw_qty": None,
                 "quantized_price": None,
@@ -134,49 +176,46 @@ class OrderReconciler:
 
         long_adapter = self._adapter_for(long_venue) if long_venue else None
         short_adapter = self._adapter_for(short_venue) if short_venue else None
+        long_raw_status = ""
+        short_raw_status = ""
 
         if long_adapter is not None:
+            long_recon = None
             if long_order_id:
-                fill = await long_adapter.fetch_order_fill_reconciliation(
+                long_recon = await long_adapter.fetch_order_fill_reconciliation(
                     symbol, long_order_id, long_client_order_id
                 )
-                if fill is not None:
-                    result.long_status = "filled"
-                    result.long_fill = fill
-                else:
-                    result.long_status = "uncertain"
             elif long_client_order_id:
-                # Try clientOrderId lookup when exchange order_id is not available
-                fill = await long_adapter.fetch_order_fill_reconciliation(
+                long_recon = await long_adapter.fetch_order_fill_reconciliation(
                     symbol, "", long_client_order_id
                 )
-                if fill is not None:
-                    result.long_status = "filled"
-                    result.long_fill = fill
-                else:
-                    result.long_status = "uncertain"
+            if long_recon is not None and long_recon.quantity > 0:
+                result.long_status = "filled"
+                result.long_fill = long_recon
+                long_raw_status = _recon_meta_get(long_recon, 'raw_exchange_status', '')
+            else:
+                result.long_status = "uncertain" if long_recon is None else _recon_meta_get(long_recon, 'raw_exchange_status', 'uncertain')
+                long_raw_status = _recon_meta_get(long_recon, 'raw_exchange_status', '') if long_recon is not None else ''
             pos = await long_adapter.fetch_position(symbol)
             result.long_position = pos
 
         if short_adapter is not None:
+            short_recon = None
             if short_order_id:
-                fill = await short_adapter.fetch_order_fill_reconciliation(
+                short_recon = await short_adapter.fetch_order_fill_reconciliation(
                     symbol, short_order_id, short_client_order_id
                 )
-                if fill is not None:
-                    result.short_status = "filled"
-                    result.short_fill = fill
-                else:
-                    result.short_status = "uncertain"
             elif short_client_order_id:
-                fill = await short_adapter.fetch_order_fill_reconciliation(
+                short_recon = await short_adapter.fetch_order_fill_reconciliation(
                     symbol, "", short_client_order_id
                 )
-                if fill is not None:
-                    result.short_status = "filled"
-                    result.short_fill = fill
-                else:
-                    result.short_status = "uncertain"
+            if short_recon is not None and short_recon.quantity > 0:
+                result.short_status = "filled"
+                result.short_fill = short_recon
+                short_raw_status = _recon_meta_get(short_recon, 'raw_exchange_status', '')
+            else:
+                result.short_status = "uncertain" if short_recon is None else _recon_meta_get(short_recon, 'raw_exchange_status', 'uncertain')
+                short_raw_status = _recon_meta_get(short_recon, 'raw_exchange_status', '') if short_recon is not None else ''
             pos = await short_adapter.fetch_position(symbol)
             result.short_position = pos
 
@@ -197,6 +236,11 @@ class OrderReconciler:
             order_id=long_order_id,
             client_order_id=long_client_order_id,
             status=result.long_status,
+            raw_exchange_status=long_raw_status,
+            fill_qty=result.long_fill.quantity if result.long_fill else 0.0,
+            fill_price=_recon_fill_price(result.long_fill),
+            position_qty=result.long_position.quantity if result.long_position else 0.0,
+            position_side=result.long_position.side.value if result.long_position else "",
         )
         self._record_reconcile_result(
             venue=short_venue,
@@ -204,6 +248,11 @@ class OrderReconciler:
             order_id=short_order_id,
             client_order_id=short_client_order_id,
             status=result.short_status,
+            raw_exchange_status=short_raw_status,
+            fill_qty=result.short_fill.quantity if result.short_fill else 0.0,
+            fill_price=_recon_fill_price(result.short_fill),
+            position_qty=result.short_position.quantity if result.short_position else 0.0,
+            position_side=result.short_position.side.value if result.short_position else "",
         )
         return result
 

@@ -8,7 +8,9 @@ from typing import Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import Venue
+from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.errors import OrderSubmitError
+from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
     active_position_poll_interval_ms,
@@ -1665,11 +1667,17 @@ class LiveRuntime:
 
         Rust V1: recovery.rs process_pending_close_reconciliations() with
         exponential backoff (base 30s, max 300s) and hard deadline (10 min).
+
+        V1 parity (live tick hedge drive):
+        After reconciliation resolves maker fills, if the pending entry has
+        a missing hedge quantity > 0 and no inflight hedge, submits the hedge
+        IOC/taker order.  On hedge fill, finalizes the entry → OpenPosition,
+        writes entry.opened/runtime.position_opened, removes pending entry.
         """
         if self.reconciler is None or not self._venue_adapters:
             return
 
-        # --- Process pending entries (uncertain maker/hedge orders) ---
+        # --- Process pending entries: reconcile + drive missing hedge ---
         resolved_entry_ids: list[str] = []
         for entry_id, pending in list(self.state.pending_entries.items()):
             if not pending.uncertain_outcome:
@@ -1681,8 +1689,6 @@ class LiveRuntime:
                 continue
 
             # V1: abandon via live-size probe, not hard deadline.
-            # After 1+ failed attempts, if the entry no longer references an active
-            # position and both venues report ~zero live size → abandon immediately.
             if pending.reconcile_attempt >= 1:
                 abandoned = await self._try_abandon_stale_entry(pending, entry_id)
                 if abandoned:
@@ -1691,6 +1697,8 @@ class LiveRuntime:
 
             pending.reconcile_attempt += 1
             try:
+                # V1: prefer hedge_inflight CID for reconciliation queries
+                hedge_lookup_cid = pending.hedge_inflight or pending.hedge_client_order_id
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -1699,7 +1707,7 @@ class LiveRuntime:
                     long_order_id=pending.maker_order_id,
                     short_order_id=pending.hedge_order_id,
                     long_client_order_id=pending.maker_client_order_id,
-                    short_client_order_id=pending.hedge_client_order_id,
+                    short_client_order_id=hedge_lookup_cid,
                 )
                 self._flush_reconciler_order_diagnostics()
             except Exception as e:
@@ -1711,19 +1719,125 @@ class LiveRuntime:
                 self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
+            # --- V1: write back fill quantities from reconciliation ---
+            prev_maker_filled = pending.maker_leg_filled
+            prev_hedge_filled = pending.hedge_leg_filled
+            maker_filled_updated = False
+            hedge_filled_updated = False
+
+            if result.long_fill is not None and result.long_fill.quantity > 0:
+                if pending.maker_leg == "long":
+                    if result.long_fill.quantity > pending.maker_leg_filled:
+                        pending.maker_leg_filled = result.long_fill.quantity
+                        pending.maker_fill_price = _recon_fill_price(result.long_fill)
+                        maker_filled_updated = True
+                else:
+                    if result.long_fill.quantity > pending.hedge_leg_filled:
+                        pending.hedge_leg_filled = result.long_fill.quantity
+                        pending.hedge_fill_price = _recon_fill_price(result.long_fill)
+                        pending.hedge_order_id = result.long_fill.order_id
+                        hedge_filled_updated = True
+
+            if result.short_fill is not None and result.short_fill.quantity > 0:
+                if pending.maker_leg == "short":
+                    if result.short_fill.quantity > pending.maker_leg_filled:
+                        pending.maker_leg_filled = result.short_fill.quantity
+                        pending.maker_fill_price = _recon_fill_price(result.short_fill)
+                        maker_filled_updated = True
+                else:
+                    if result.short_fill.quantity > pending.hedge_leg_filled:
+                        pending.hedge_leg_filled = result.short_fill.quantity
+                        pending.hedge_fill_price = _recon_fill_price(result.short_fill)
+                        pending.hedge_order_id = result.short_fill.order_id
+                        hedge_filled_updated = True
+
+            # Also update from position snapshots if fill data wasn't available
+            if result.long_position is not None and abs(result.long_position.quantity) > 0:
+                pos_qty = abs(result.long_position.quantity)
+                if pending.maker_leg == "long" and pos_qty > pending.maker_leg_filled:
+                    pending.maker_leg_filled = pos_qty
+                    maker_filled_updated = True
+                elif pending.maker_leg == "short" and pos_qty > pending.hedge_leg_filled:
+                    pending.hedge_leg_filled = pos_qty
+                    hedge_filled_updated = True
+
+            if result.short_position is not None and abs(result.short_position.quantity) > 0:
+                pos_qty = abs(result.short_position.quantity)
+                if pending.maker_leg == "short" and pos_qty > pending.maker_leg_filled:
+                    pending.maker_leg_filled = pos_qty
+                    maker_filled_updated = True
+                elif pending.maker_leg == "long" and pos_qty > pending.hedge_leg_filled:
+                    pending.hedge_leg_filled = pos_qty
+                    hedge_filled_updated = True
+
+            if maker_filled_updated:
+                self.journal.append(
+                    "pending_entry.maker_progress_applied",
+                    {
+                        "entry_id": entry_id,
+                        "prev_maker_filled": prev_maker_filled,
+                        "new_maker_filled": pending.maker_leg_filled,
+                        "maker_fill_price": pending.maker_fill_price,
+                    },
+                )
+
+            if hedge_filled_updated:
+                self.journal.append(
+                    "pending_entry.hedge_progress_applied",
+                    {
+                        "entry_id": entry_id,
+                        "prev_hedge_filled": prev_hedge_filled,
+                        "new_hedge_filled": pending.hedge_leg_filled,
+                        "hedge_fill_price": pending.hedge_fill_price,
+                    },
+                )
+
+            # --- V1: check if both legs are now filled → finalize ---
+            if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                await self._finalize_pending_entry(pending, entry_id, now_ms)
+                resolved_entry_ids.append(entry_id)
+                continue
+
             if result.long_status == "filled" and result.short_status == "filled":
+                await self._finalize_pending_entry(pending, entry_id, now_ms)
                 resolved_entry_ids.append(entry_id)
                 self.journal.append(
                     "reconciliation.entry_resolved",
                     {"entry_id": entry_id, "long_status": result.long_status, "short_status": result.short_status},
                 )
+                continue
             elif result.is_flat:
                 resolved_entry_ids.append(entry_id)
                 self.journal.append(
                     "reconciliation.entry_cleared_flat",
                     {"entry_id": entry_id},
                 )
+                continue
+
+            # --- V1: drive missing hedge on normal tick ---
+            missing = pending.missing_hedge_quantity()
+            if missing > 1e-9:
+                self.journal.append(
+                    "pending_entry.missing_hedge_detected",
+                    {
+                        "entry_id": entry_id,
+                        "missing_hedge_quantity": missing,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "maker_venue": pending.maker_venue().value,
+                        "hedge_venue": pending.hedge_venue().value,
+                    },
+                )
+                hedge_driven = await self._drive_missing_hedge_live(pending, entry_id, now_ms)
+                if hedge_driven:
+                    if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                        await self._finalize_pending_entry(pending, entry_id, now_ms)
+                        resolved_entry_ids.append(entry_id)
+                        continue
+                # Keep entry for next reconciliation cycle
+                self._apply_reconcile_backoff(pending, now_ms)
             else:
+                # No fill progress, no missing hedge — backoff & wait
                 self._apply_reconcile_backoff(pending, now_ms)
 
         for eid in resolved_entry_ids:
@@ -1886,6 +2000,7 @@ class LiveRuntime:
                 continue
 
             try:
+                hedge_lookup_cid = pending.hedge_inflight or pending.hedge_client_order_id
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -1894,7 +2009,7 @@ class LiveRuntime:
                     long_order_id=pending.maker_order_id,
                     short_order_id=pending.hedge_order_id,
                     long_client_order_id=pending.maker_client_order_id,
-                    short_client_order_id=pending.hedge_client_order_id,
+                    short_client_order_id=hedge_lookup_cid,
                 )
                 self._flush_reconciler_order_diagnostics()
             except Exception as e:
@@ -1906,6 +2021,13 @@ class LiveRuntime:
                 continue
 
             if result.long_status == "filled" and result.short_status == "filled":
+                pending.maker_leg_filled = result.long_fill.quantity if result.long_fill else pending.maker_leg_filled
+                pending.hedge_leg_filled = result.short_fill.quantity if result.short_fill else pending.hedge_leg_filled
+                if result.long_fill and _recon_fill_price(result.long_fill) > 0:
+                    pending.maker_fill_price = _recon_fill_price(result.long_fill)
+                if result.short_fill and _recon_fill_price(result.short_fill) > 0:
+                    pending.hedge_fill_price = _recon_fill_price(result.short_fill)
+                await self._finalize_pending_entry(pending, entry_id, now_ms)
                 resolved_ids.append(entry_id)
             elif result.is_flat:
                 resolved_ids.append(entry_id)
@@ -1922,6 +2044,18 @@ class LiveRuntime:
         if self.reconciler is None:
             return
         drain = getattr(self.reconciler, "drain_order_diagnostics", None)
+        if not callable(drain):
+            return
+        for event in drain():
+            kind = event.get("kind", "")
+            payload = event.get("payload", {})
+            if isinstance(kind, str) and isinstance(payload, dict):
+                self.journal.append(kind, payload)
+
+    def _flush_adapter_order_diagnostics(self, adapter) -> None:
+        """Drain order diagnostics from a venue adapter's transport into the journal."""
+        transport = getattr(adapter, "_transport", adapter)
+        drain = getattr(transport, "drain_order_diagnostics", None)
         if not callable(drain):
             return
         for event in drain():
@@ -2483,8 +2617,12 @@ class LiveRuntime:
                 )
                 return False
 
-            # V1: use maker fill price as hedge price hint
-            hedge_price = pending.maker_price if pending.maker_price > 0 else 0.0
+            # V1: use maker fill price as hedge price hint (live fill preferred)
+            hedge_price = pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price
+
+            from lightfee.venues.cid import generate_exchange_cid
+            recovery_cid = generate_exchange_cid(pending.pending_id, "h", hedge_venue)
+            pending.hedge_client_order_id = pending.hedge_client_order_id or recovery_cid
 
             req = OrderRequest(
                 venue=hedge_venue,
@@ -2494,12 +2632,13 @@ class LiveRuntime:
                 price=hedge_price,
                 post_only=False,
                 reduce_only=False,
-                client_order_id=f"{pending.pending_id}-recovery-hedge",
+                client_order_id=recovery_cid,
             )
             fill = await adapter.place_order(req)
             if fill.quantity > 0:
                 pending.hedge_leg_filled += fill.quantity
                 pending.hedge_order_id = fill.order_id
+                pending.hedge_fill_price = fill.price
                 if pending.missing_hedge_quantity() <= 1e-9:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
@@ -2512,6 +2651,246 @@ class LiveRuntime:
                  "error": str(e), "reason": reason},
             )
             return False
+
+    async def _drive_missing_hedge_live(self, pending, entry_id: str, now_ms: int) -> bool:
+        """Submit a hedge IOC/taker order for the missing quantity during normal tick.
+
+        V1: hedge_pending_entry_delta() — called from the normal live tick after
+        reconciliation detects a maker fill but the hedge leg is still missing.
+
+        Idempotency: sets pending.hedge_inflight to the client_order_id before
+        submitting; skips if already inflight.  On success updates
+        hedge_leg_filled and clears inflight.
+
+        Unlike _recover_drive_missing_hedge(), this does NOT gate on FAIL_CLOSED
+        — normal ticks always attempt to complete the entry.
+        """
+        hedge_venue = pending.hedge_venue()
+        adapter = self.get_venue_adapter(hedge_venue)
+        if adapter is None:
+            return False
+
+        missing = pending.missing_hedge_quantity()
+        if missing <= 1e-9:
+            return False
+
+        # Idempotency: skip if a hedge is already inflight
+        if pending.hedge_inflight:
+            return False
+
+        try:
+            from lightfee.core.domain import OrderRequest
+
+            normalized = missing
+            if hasattr(adapter, "normalize_quantity"):
+                normalized = await adapter.normalize_quantity(pending.symbol, missing)
+
+            if normalized <= 1e-9:
+                self.journal.append(
+                    "pending_entry.hedge_quantity_below_min_notional",
+                    {"entry_id": entry_id, "symbol": pending.symbol,
+                     "raw_quantity": missing, "normalized_quantity": normalized},
+                )
+                return False
+
+            hedge_price = pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price
+
+            from lightfee.venues.cid import generate_exchange_cid
+            hedge_cloid = generate_exchange_cid(entry_id, "h", hedge_venue)
+            pending.hedge_client_order_id = hedge_cloid
+            pending.hedge_inflight = hedge_cloid
+
+            self.journal.append(
+                "pending_entry.hedge_submit_attempt",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_side": pending.hedge_side().value,
+                    "hedge_quantity": normalized,
+                    "hedge_price_hint": hedge_price,
+                    "hedge_client_order_id": hedge_cloid,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                },
+            )
+
+            req = OrderRequest(
+                venue=hedge_venue,
+                symbol=pending.symbol,
+                side=pending.hedge_side(),
+                quantity=normalized,
+                price=hedge_price,
+                post_only=False,
+                reduce_only=False,
+                client_order_id=hedge_cloid,
+            )
+            fill = await adapter.place_order(req)
+
+            self._flush_adapter_order_diagnostics(adapter)
+
+            if fill.quantity > 0:
+                pending.hedge_leg_filled += fill.quantity
+                pending.hedge_order_id = fill.order_id
+                pending.hedge_fill_price = fill.price
+                pending.hedge_inflight = ""
+
+                self.journal.append(
+                    "pending_entry.hedge_submit_result",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "outcome": "filled",
+                        "hedge_fill_quantity": fill.quantity,
+                        "hedge_fill_price": fill.price,
+                        "hedge_order_id": fill.order_id,
+                        "hedge_client_order_id": hedge_cloid,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "missing_hedge_remaining": pending.missing_hedge_quantity(),
+                    },
+                )
+
+                if pending.missing_hedge_quantity() <= 1e-9:
+                    pending.uncertain_outcome = False
+                    pending.outcome = "filled"
+                return True
+
+            # Zero fill — hedge order was placed but didn't fill (IOC/taker)
+            pending.hedge_inflight = ""
+            self.journal.append(
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "outcome": "zero_fill",
+                    "hedge_client_order_id": hedge_cloid,
+                    "order_id": getattr(fill, "order_id", ""),
+                },
+            )
+            return False
+
+        except OrderSubmitError as e:
+            # V1: retain inflight on UNCERTAIN so reconciliation can query it;
+            # only clear on REJECTED where we know the order never reached the exchange.
+            submitted_cloid = pending.hedge_inflight
+            if e.is_rejected:
+                pending.hedge_inflight = ""
+            self._flush_adapter_order_diagnostics(adapter)
+            self.journal.append(
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "outcome": "error",
+                    "error": str(e),
+                    "is_rejected": e.is_rejected,
+                    "hedge_client_order_id": submitted_cloid,
+                },
+            )
+            return False
+        except Exception as e:
+            pending.hedge_inflight = ""
+            self._flush_adapter_order_diagnostics(adapter)
+            self.journal.append(
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "outcome": "error",
+                    "error": str(e),
+                },
+            )
+            return False
+
+    async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
+        """Finalize a completed pending entry: build OpenPosition, write entry.opened.
+
+        V1: When both maker and hedge legs are filled, the pending entry is
+        converted into an OpenPosition and recorded durably.
+        """
+        from lightfee.engine.entry import build_open_position, EntryContext, EntryType
+
+        maker_is_long = pending.maker_leg == "long"
+        maker_side = Side.BUY if maker_is_long else Side.SELL
+
+        maker_fill = OrderFill(
+            venue=pending.maker_venue(),
+            symbol=pending.symbol,
+            side=maker_side,
+            quantity=pending.maker_leg_filled,
+            price=pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price,
+            order_id=pending.maker_order_id,
+            filled_at_ms=now_ms,
+        )
+        hedge_fill = OrderFill(
+            venue=pending.hedge_venue(),
+            symbol=pending.symbol,
+            side=pending.hedge_side(),
+            quantity=pending.hedge_leg_filled,
+            price=pending.hedge_fill_price if pending.hedge_fill_price > 0 else pending.maker_fill_price,
+            order_id=pending.hedge_order_id,
+            filled_at_ms=now_ms,
+        )
+
+        ctx = EntryContext(
+            entry_id=entry_id,
+            symbol=pending.symbol,
+            long_venue=pending.long_venue,
+            short_venue=pending.short_venue,
+            long_quantity=pending.target_quantity,
+            short_quantity=pending.target_quantity,
+            long_price_hint=0.0,
+            short_price_hint=0.0,
+            maker_leg=maker_side,
+            entry_type=EntryType(pending.entry_type) if pending.entry_type else EntryType.STANDARD_DUAL_TAKER,
+            created_at_ms=pending.created_at_ms,
+        )
+
+        position = build_open_position(ctx, maker_fill, hedge_fill, now_ms)
+
+        self.state.open_positions[position.position_id] = position
+
+        self.journal.append_critical(
+            now_ms, "entry.opened",
+            {
+                "position_id": position.position_id,
+                "internal_entry_id": position.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "quantity": position.matched_quantity,
+                "long_quantity": position.long_quantity,
+                "short_quantity": position.short_quantity,
+                "long_entry_price": position.long_entry_price,
+                "short_entry_price": position.short_entry_price,
+                "opened_at_ms": position.opened_at_ms,
+                "matched_quantity": position.matched_quantity,
+                "maker_order_id": maker_fill.order_id,
+                "hedge_order_id": hedge_fill.order_id,
+                "maker_client_order_id": pending.maker_client_order_id,
+                "hedge_client_order_id": pending.hedge_client_order_id,
+            },
+        )
+
+        self.journal.append(
+            "pending_entry.pending_entry_finalized",
+            {
+                "entry_id": entry_id,
+                "position_id": position.position_id,
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "maker_fill_price": pending.maker_fill_price,
+                "hedge_fill_price": pending.hedge_fill_price,
+            },
+        )
+
+        self.journal.append(
+            "runtime.position_opened",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+            },
+        )
 
     def _finalize_startup_recovery(self) -> None:
         """Transition lifecycle after startup recovery per V1 semantics.
