@@ -179,6 +179,119 @@ class EntryLocalL2Session:
         }
 
 
+def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
+    """Apply local-L2 book readiness to one entry-L2 leg and return diagnostics."""
+    venue = getattr(leg, "venue", "")
+    symbol = getattr(leg, "symbol", "")
+    if book is None:
+        leg.mark_arming(SessionArmingReason.FIRST_SESSION)
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "ready": False,
+            "reason": "book_missing",
+            "detail": "book not found",
+            "book_status": "missing",
+            "age_ms": None,
+            "observed_at_ms": 0,
+            "sequence": 0,
+        }
+
+    status_value = (
+        book.status.value if hasattr(getattr(book, "status", None), "value")
+        else str(getattr(book, "status", "unknown"))
+    )
+    observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+    sequence = int(getattr(book, "sequence", 0) or 0)
+    age_ms = book.age_ms(now_ms) if hasattr(book, "age_ms") else (
+        now_ms - observed_at_ms if observed_at_ms > 0 else 0
+    )
+    diag = {
+        "venue": str(getattr(book, "venue", venue)),
+        "symbol": str(getattr(book, "symbol", symbol)),
+        "ready": False,
+        "reason": "",
+        "detail": "",
+        "book_status": status_value,
+        "age_ms": age_ms,
+        "observed_at_ms": observed_at_ms,
+        "sequence": sequence,
+    }
+
+    arming_statuses = {"bootstrapping", "cold", "rebuilding", "resume_waiting"}
+    faulted_statuses = {"degraded", "suspended"}
+
+    if status_value in arming_statuses:
+        leg.mark_arming(SessionArmingReason.BOOK_STATUS_TRANSITION)
+        diag["reason"] = f"book_{status_value}"
+        diag["detail"] = f"book_status={status_value}"
+        return diag
+
+    if status_value in faulted_statuses:
+        detail = (
+            str(getattr(book, "fault_reason", "") or "")
+            or str(getattr(book, "last_error", "") or "")
+            or f"book_status={status_value}"
+        )
+        leg.mark_faulted(
+            EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+            detail,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = f"book_{status_value}"
+        diag["detail"] = detail
+        return diag
+
+    if hasattr(book, "has_crossed_book") and book.has_crossed_book():
+        detail = f"best_bid={book.best_bid()} best_ask={book.best_ask()}"
+        leg.mark_faulted(
+            EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK,
+            detail,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = "crossed_or_locked_book"
+        diag["detail"] = detail
+        return diag
+
+    if stale_after_ms > 0 and hasattr(book, "is_stale") and book.is_stale(stale_after_ms, now_ms):
+        detail = f"age_ms={age_ms} stale_after_ms={stale_after_ms}"
+        leg.mark_faulted(
+            EntryLocalL2LegFault.STALE_BOOK,
+            detail,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = "stale_book"
+        diag["detail"] = detail
+        return diag
+
+    runtime_fault = str(getattr(book, "fault_reason", "") or "")
+    if runtime_fault:
+        leg.mark_faulted(
+            EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+            runtime_fault,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = f"book_{status_value}"
+        diag["detail"] = runtime_fault
+        return diag
+
+    if status_value == "hot":
+        leg.mark_ready(observed_at_ms)
+        diag["ready"] = True
+        diag["reason"] = "ready"
+        diag["detail"] = ""
+        return diag
+
+    leg.mark_faulted(
+        EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+        f"book_status={status_value}",
+        seen_at_ms=observed_at_ms,
+    )
+    diag["reason"] = f"book_{status_value}"
+    diag["detail"] = f"book_status={status_value}"
+    return diag
+
+
 # ---------------------------------------------------------------------------
 # Session runtime
 # ---------------------------------------------------------------------------
@@ -199,10 +312,8 @@ class EntryLocalL2SessionRuntime:
     ) -> EntryLocalL2Session:
         """Create or update session legs for a tracked opportunity."""
         session = self.get_or_create_session(opp.pair_id)
-        long_leg = session.ensure_leg(opp.long_venue, opp.symbol)
-        short_leg = session.ensure_leg(opp.short_venue, opp.symbol)
-        long_leg.last_seen_at_ms = now_ms
-        short_leg.last_seen_at_ms = now_ms
+        session.ensure_leg(opp.long_venue, opp.symbol)
+        session.ensure_leg(opp.short_venue, opp.symbol)
         if opp.class_ == TrackedOpportunityClass.PRIMARY:
             session.primary_assigned_at_ms = now_ms
         return session

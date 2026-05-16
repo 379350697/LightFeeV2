@@ -52,6 +52,21 @@ class LiveCredential:
     account_address: str = ""
 
 
+def _missing_hyperliquid_signing_dependencies() -> list[str]:
+    import importlib.util
+
+    required = [
+        ("Crypto.Hash", "pycryptodome"),
+        ("eth_account", "eth-account"),
+        ("msgpack", "msgpack"),
+    ]
+    missing: list[str] = []
+    for module_name, package_name in required:
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(package_name)
+    return missing
+
+
 # ---------------------------------------------------------------------------
 # Error classification
 # ---------------------------------------------------------------------------
@@ -824,6 +839,12 @@ class VenueTransport(MarketDataClient):
             if not credential.wallet_private_key:
                 raise ValueError(
                     f"live mode requires wallet_private_key for {self._spec.venue_id.value}"
+                )
+            missing = _missing_hyperliquid_signing_dependencies()
+            if missing:
+                raise ValueError(
+                    "live mode missing signing dependencies for "
+                    f"{self._spec.venue_id.value}: {', '.join(missing)}"
                 )
             return
         if not credential.api_key:

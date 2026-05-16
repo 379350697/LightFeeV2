@@ -448,6 +448,58 @@ class TestPassiveMakerLifecycle:
         journal.close()
 
     @pytest.mark.asyncio
+    async def test_passive_ack_only_does_not_emit_filled_or_skip_pending_reconcile(self, tmp_path):
+        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.core.domain import PassiveOrderAck
+
+        maker = FakeVenueAdapter(Venue.BINANCE)
+        hedge = FakeVenueAdapter(Venue.OKX)
+        maker.submit_passive_order_outcomes = [
+            PassiveOrderAck(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                order_id="maker-ack-only",
+                client_order_id="entry-ack-maker",
+                price=50000.0,
+                quantity=0.001,
+                accepted_at_ms=1000,
+            )
+        ]
+
+        journal = Journal(tmp_path / "entry_ack_only.jsonl")
+        journal.open()
+        executor = EntrySyncExecutor(
+            adapters={Venue.BINANCE: maker, Venue.OKX: hedge},
+            journal=journal,
+        )
+
+        ctx = EntryContext(
+            entry_id="entry-ack",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.001,
+            short_quantity=0.001,
+            long_price_hint=50000.0,
+            short_price_hint=50000.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+            created_at_ms=1000,
+        )
+        result = await executor.execute(ctx)
+        journal.close()
+
+        kinds = [r["kind"] for r in journal.read_all()]
+        assert "order.passive_submitted" in kinds
+        assert "order.filled" not in kinds
+        assert result.open_position is None
+        assert result.pending_entry is not None
+        assert result.pending_entry.outcome == "maker_resting"
+        assert result.pending_entry.maker_order_id == "maker-ack-only"
+        assert result.pending_entry.hedge_order_id == ""
+
+    @pytest.mark.asyncio
     async def test_taker_order_still_uses_place_order(self):
         maker = FakeVenueAdapter(Venue.BINANCE)
         hedge = FakeVenueAdapter(Venue.OKX)

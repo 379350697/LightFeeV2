@@ -96,6 +96,15 @@ def _next_hour_boundary(now_ms: int) -> int:
     return ((now_ms // hour_ms) + 1) * hour_ms
 
 
+def _funding_timestamp_ms(item: dict[str, Any], *, fallback_ms: int = 0) -> int:
+    """Return the first explicit funding timestamp field, or a venue fallback."""
+    for key in ("nextFundingTime", "fundingTime"):
+        ts_ms = int(_safe_float(item.get(key, 0)))
+        if ts_ms > 0:
+            return ts_ms
+    return fallback_ms
+
+
 # ---------------------------------------------------------------------------
 # MarketDataClient
 # ---------------------------------------------------------------------------
@@ -540,7 +549,7 @@ class MarketDataClient:
                             # V1 parity: update cache
                             cache_key = f"{venue_str}:{venue_sym_to_canon.get(venue_sym, venue_sym)}"
                             rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
-                            ts_ms = int(_safe_float(item.get("nextFundingTime", 0)))
+                            ts_ms = _funding_timestamp_ms(item)
                             if ts_ms > 0:
                                 self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
 
@@ -582,7 +591,7 @@ class MarketDataClient:
                 mark_price=_safe_float(fr.get("markPrice", t.get("markPx", 0))),
                 index_price=_safe_float(fr.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(fr.get("nextFundingTime", 0))),
+                funding_timestamp_ms=_funding_timestamp_ms(fr),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
             )
@@ -617,7 +626,7 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=int(_safe_float(item.get("nextFundingTime", 0))),
+                funding_timestamp_ms=_funding_timestamp_ms(item, fallback_ms=_now_ms()),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
                 open_interest_quote=_safe_float(item.get("openInterestValue", 0)),
             )

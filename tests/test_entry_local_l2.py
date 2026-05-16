@@ -105,6 +105,119 @@ class TestLegSession:
         assert not leg.is_ready(now_ms=16000, stale_after_ms=5000)
 
 
+class TestApplyBookReadinessToLeg:
+    """Book readiness must be the only source that promotes entry-L2 legs."""
+
+    @staticmethod
+    def _book(
+        venue: str = "binance",
+        symbol: str = "BTCUSDT",
+        *,
+        status=None,
+        observed_at_ms: int = 10000,
+        bid: float = 50000.0,
+        ask: float = 50100.0,
+        sequence: int = 7,
+        fault_reason: str = "",
+    ):
+        from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
+
+        book = LocalL2Book(venue=venue, symbol=symbol)
+        book.status = status or L2BookStatus.HOT
+        book.bids = [PriceLevel(price=bid, quantity=1.0)]
+        book.asks = [PriceLevel(price=ask, quantity=1.0)]
+        book.observed_at_ms = observed_at_ms
+        book.sequence = sequence
+        book.fault_reason = fault_reason
+        return book
+
+    def test_missing_book_keeps_leg_arming_with_stable_reason(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = EntryLocalL2LegSession(venue="binance", symbol="BTCUSDT")
+        diag = apply_book_readiness_to_leg(leg, None, now_ms=10000, stale_after_ms=5000)
+
+        assert leg.state == EntryLocalL2LegState.ARMING
+        assert diag == {
+            "venue": "binance",
+            "symbol": "BTCUSDT",
+            "ready": False,
+            "reason": "book_missing",
+            "detail": "book not found",
+            "book_status": "missing",
+            "age_ms": None,
+            "observed_at_ms": 0,
+            "sequence": 0,
+        }
+
+    def test_hot_fresh_non_crossed_book_marks_leg_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = EntryLocalL2LegSession(venue="binance", symbol="BTCUSDT")
+        book = self._book(observed_at_ms=9500, bid=50000.0, ask=50100.0)
+
+        diag = apply_book_readiness_to_leg(leg, book, now_ms=10000, stale_after_ms=1000)
+
+        assert leg.state == EntryLocalL2LegState.READY
+        assert leg.last_seen_at_ms == 9500
+        assert diag["ready"] is True
+        assert diag["reason"] == "ready"
+        assert diag["detail"] == ""
+        assert diag["book_status"] == "hot"
+        assert diag["age_ms"] == 500
+        assert diag["observed_at_ms"] == 9500
+        assert diag["sequence"] == 7
+
+    @pytest.mark.parametrize(
+        "book_factory,expected_reason,expected_state,expected_detail",
+        [
+            (
+                lambda self: self._book(observed_at_ms=4000),
+                "stale_book",
+                EntryLocalL2LegState.FAULTED,
+                "age_ms=6000 stale_after_ms=5000",
+            ),
+            (
+                lambda self: self._book(bid=50100.0, ask=50100.0),
+                "crossed_or_locked_book",
+                EntryLocalL2LegState.FAULTED,
+                "best_bid=50100.0 best_ask=50100.0",
+            ),
+            (
+                lambda self: self._book(
+                    status=pytest.importorskip("lightfee.marketdata.l2").L2BookStatus.DEGRADED,
+                    fault_reason="transport_failure",
+                ),
+                "book_degraded",
+                EntryLocalL2LegState.FAULTED,
+                "transport_failure",
+            ),
+            (
+                lambda self: self._book(
+                    status=pytest.importorskip("lightfee.marketdata.l2").L2BookStatus.BOOTSTRAPPING,
+                ),
+                "book_bootstrapping",
+                EntryLocalL2LegState.ARMING,
+                "book_status=bootstrapping",
+            ),
+        ],
+    )
+    def test_not_ready_books_keep_stable_reason_and_detail(
+        self, book_factory, expected_reason, expected_state, expected_detail,
+    ):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = EntryLocalL2LegSession(venue="binance", symbol="BTCUSDT")
+        diag = apply_book_readiness_to_leg(
+            leg, book_factory(self), now_ms=10000, stale_after_ms=5000,
+        )
+
+        assert leg.state == expected_state
+        assert diag["ready"] is False
+        assert diag["reason"] == expected_reason
+        assert diag["detail"] == expected_detail
+
+
 # ---------------------------------------------------------------------------
 # EntryLocalL2Session
 # ---------------------------------------------------------------------------
@@ -221,6 +334,22 @@ class TestSessionRuntime:
         )
         session = rt.track_opportunity(opp, now_ms=10000)
         assert session.primary_assigned_at_ms == 10000
+
+    def test_track_opportunity_does_not_timestamp_or_mark_legs_ready(self):
+        rt = EntryLocalL2SessionRuntime()
+        opp = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+
+        session = rt.track_opportunity(opp, now_ms=10000)
+
+        assert session.state == EntryLocalL2SessionState.ARMING
+        assert session.legs["binance"].state == EntryLocalL2LegState.ARMING
+        assert session.legs["bybit"].state == EntryLocalL2LegState.ARMING
+        assert session.legs["binance"].last_seen_at_ms == 0
+        assert session.legs["bybit"].last_seen_at_ms == 0
 
     def test_close_session(self):
         rt = EntryLocalL2SessionRuntime()
@@ -916,3 +1045,269 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             f"Silently generating tradeable-looking candidates with ts=0 "
             f"is a data-contract violation."
         )
+
+    def test_hot_fresh_books_refresh_session_and_unblock_selection(self, runtime_with_l2):
+        """HOT/fresh local-L2 books must drive EntryLocalL2Session legs READY."""
+        from lightfee.marketdata.l2 import PriceLevel
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+
+        rt = runtime_with_l2
+        c = self._make_real_candidate(first_funding_timestamp_ms=370000)
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+        rt._tracked_primary_pair_ids.add(pair_id)
+        rt.entry_l2_sessions.track_opportunity(
+            TrackedOpportunity(
+                pair_id=pair_id,
+                symbol=c.symbol,
+                long_venue=c.long_venue,
+                short_venue=c.short_venue,
+                ranking_edge_bps=c.ranking_edge_bps,
+                class_=TrackedOpportunityClass.PRIMARY,
+            ),
+            now_ms=10000,
+        )
+
+        for venue, bid, ask, seq in (
+            ("binance", 50000.0, 50100.0, 10),
+            ("bybit", 49990.0, 50110.0, 11),
+        ):
+            book = rt.local_l2_runtime.ensure_book(venue, c.symbol)
+            book.transition_to_bootstrapping(now_ms=9000)
+            book.apply_snapshot(
+                [PriceLevel(price=bid, quantity=1.0)],
+                [PriceLevel(price=ask, quantity=1.0)],
+                sequence=seq,
+                now_ms=9500,
+            )
+            book.transition_to_hot()
+
+        rt._refresh_entry_l2_session_readiness(now_ms=10000)
+
+        session = rt.entry_l2_sessions.sessions[pair_id]
+        assert session.both_legs_ready(now_ms=10000, stale_after_ms=300_000)
+        assert rt._entry_local_l2_selection_blocker(c, now_ms=10000) is None
+
+    @pytest.mark.parametrize(
+        "mutate_book,expected_reason,expected_detail",
+        [
+            (None, "book_missing", "book not found"),
+            (
+                lambda book: setattr(book, "observed_at_ms", 4000),
+                "stale_book",
+                "age_ms=6000 stale_after_ms=1000",
+            ),
+            (
+                lambda book: book.transition_to_degraded("transport_failure"),
+                "book_degraded",
+                "transport_failure",
+            ),
+            (
+                lambda book: setattr(book.asks[0], "price", book.bids[0].price),
+                "crossed_or_locked_book",
+                "best_bid=50000.0 best_ask=50000.0",
+            ),
+        ],
+    )
+    def test_bad_book_refresh_still_blocks_selection_with_stable_leg_reason(
+        self, runtime_with_l2, mutate_book, expected_reason, expected_detail,
+    ):
+        from lightfee.marketdata.l2 import PriceLevel
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_max_age_ms = 1000
+        c = self._make_real_candidate(first_funding_timestamp_ms=370000)
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+        rt._tracked_primary_pair_ids.add(pair_id)
+        rt.entry_l2_sessions.track_opportunity(
+            TrackedOpportunity(
+                pair_id=pair_id,
+                symbol=c.symbol,
+                long_venue=c.long_venue,
+                short_venue=c.short_venue,
+                ranking_edge_bps=c.ranking_edge_bps,
+                class_=TrackedOpportunityClass.PRIMARY,
+            ),
+            now_ms=10000,
+        )
+
+        healthy = rt.local_l2_runtime.ensure_book("bybit", c.symbol)
+        healthy.transition_to_bootstrapping(now_ms=9000)
+        healthy.apply_snapshot(
+            [PriceLevel(price=49990.0, quantity=1.0)],
+            [PriceLevel(price=50110.0, quantity=1.0)],
+            sequence=11,
+            now_ms=9500,
+        )
+        healthy.transition_to_hot()
+
+        if mutate_book is not None:
+            bad = rt.local_l2_runtime.ensure_book("binance", c.symbol)
+            bad.transition_to_bootstrapping(now_ms=9000)
+            bad.apply_snapshot(
+                [PriceLevel(price=50000.0, quantity=1.0)],
+                [PriceLevel(price=50100.0, quantity=1.0)],
+                sequence=10,
+                now_ms=9500,
+            )
+            bad.transition_to_hot()
+            mutate_book(bad)
+
+        rt.journal.open()
+        rt._refresh_entry_l2_session_readiness(now_ms=10000)
+        rt.journal.close()
+
+        assert (
+            rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+            == "entry_local_l2_waiting_for_dual_ready"
+        )
+        diag = rt._entry_l2_last_leg_diagnostics[(pair_id, "binance")]
+        assert diag["reason"] == expected_reason
+        assert diag["detail"] == expected_detail
+
+    @pytest.mark.asyncio
+    async def test_scan_no_entry_diagnostics_has_local_l2_reason_counts_and_samples(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from lightfee.config.schema import (
+            AppConfig,
+            PersistenceConfig,
+            RuntimeConfig,
+            StrategyConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        now_ms = 10000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms,
+        )
+
+        snapshot_path = tmp_path / "sidecar.json"
+        event_path = tmp_path / "events.jsonl"
+        snapshot_path.write_text(json.dumps({
+            "schema_version": 2,
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {
+                    "venue": "binance",
+                    "symbol": "BTCUSDT",
+                    "bid": 50000,
+                    "ask": 50010,
+                    "funding_rate_bps": 10.0,
+                    "funding_timestamp_ms": 370000,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit",
+                    "symbol": "BTCUSDT",
+                    "bid": 50005,
+                    "ask": 50015,
+                    "funding_rate_bps": -5.0,
+                    "funding_timestamp_ms": 370000,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0,
+                "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0,
+                "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+                "entry_notional_quote": 30.0,
+            }],
+        }))
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(snapshot_path),
+                sidecar_snapshot_max_age_ms=600_000,
+                live_scan_recovery_success_count=1,
+            ),
+            strategy=StrategyConfig(
+                local_l2_enabled=True,
+                local_l2_ws_enabled=False,
+                max_concurrent_positions=2,
+                local_l2_max_age_ms=1000,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(event_path),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+        rt = LiveRuntime(config)
+        rt.state.lifecycle = EngineLifecycle.RUNNING
+        rt.state.risk_mode = GlobalRiskMode.RUNNING
+        rt.entry_executor = object()
+        rt.journal.open()
+
+        await rt.tick()
+        rt.journal.close()
+
+        records = [
+            json.loads(line) for line in event_path.read_text().splitlines()
+            if line.strip()
+        ]
+        no_entry = next(
+            r["payload"] for r in records
+            if r["kind"] == "scan.no_entry_diagnostics"
+        )
+        expected_fields = {
+            "reason",
+            "candidate_count",
+            "tradeable_count",
+            "selected_candidate_count",
+            "remaining_slots",
+            "blocked_reason_counts",
+            "tradeable_selection_blocker_counts",
+            "entry_local_l2_primary_ready_filter_active",
+            "entry_local_l2_primary_not_ready_reason_counts",
+            "entry_local_l2_primary_not_ready_reason_totals",
+            "entry_local_l2_primary_not_ready_detail_samples",
+            "candidates",
+        }
+        assert expected_fields.issubset(no_entry.keys())
+        assert no_entry["reason"] == "entry_local_l2_selection_blocked"
+        assert no_entry["candidate_count"] == 1
+        assert no_entry["tradeable_count"] == 1
+        assert no_entry["selected_candidate_count"] == 0
+        assert no_entry["remaining_slots"] == 2
+        assert no_entry["tradeable_selection_blocker_counts"] == {
+            "entry_local_l2_waiting_for_dual_ready": 1
+        }
+        assert no_entry["entry_local_l2_primary_ready_filter_active"] is True
+        assert no_entry["entry_local_l2_primary_not_ready_reason_counts"] == {
+            "book_missing": 2
+        }
+        assert no_entry["entry_local_l2_primary_not_ready_reason_totals"] == {
+            "book_missing": 2
+        }
+        assert len(no_entry["entry_local_l2_primary_not_ready_detail_samples"]) == 2
+        assert no_entry["entry_local_l2_primary_not_ready_detail_samples"][0]["reason"] == "book_missing"
+        assert no_entry["candidates"][0]["pair_id"] == "btcusdt:binance->bybit"
+
+        readiness = next(
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_local_l2_readiness_diagnostics"
+        )
+        assert readiness["primary_pair_ids"] == ["btcusdt:binance->bybit"]
+        assert len(readiness["not_ready"]) == 2
+        assert readiness["not_ready"][0]["reason"] == "book_missing"

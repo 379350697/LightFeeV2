@@ -18,6 +18,10 @@ from lightfee.strategy.scoring import (
 from lightfee.strategy.transfer_bias import TransferState, evaluate_transfer_bias
 
 
+FUNDING_TS_MS = 600_000
+NOW_IN_SCAN_WINDOW_MS = 0
+
+
 class TestMarketView:
     def test_reference_mid(self):
         long_q = QuoteSnapshot(venue="a", symbol="BTCUSDT", bid=49900, ask=50000)
@@ -89,10 +93,10 @@ class TestDiscovery:
                 funding_diff_bps=10.0, funding_edge_bps=10.0,
                 expected_edge_bps=5.0, worst_case_edge_bps=2.0,
                 ranking_edge_bps=2.5, entry_notional_quote=100.0,
-                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
+                first_funding_timestamp_ms=FUNDING_TS_MS,  # V1 parity: required for tradeable
             )
         ]
-        result = discover_tradeable_candidates(candidates, config, 0)
+        result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert len(result) == 1
 
     def test_ranks_by_ranking_edge_desc(self):
@@ -103,17 +107,17 @@ class TestDiscovery:
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=2.0,
                 entry_notional_quote=100.0,
-                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
+                first_funding_timestamp_ms=FUNDING_TS_MS,  # V1 parity: required for tradeable
             ),
             CandidateInput(
                 long_venue="a", short_venue="c", symbol="X",
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
                 entry_notional_quote=100.0,
-                first_funding_timestamp_ms=1700000000000,  # V1 parity: required for tradeable
+                first_funding_timestamp_ms=FUNDING_TS_MS,  # V1 parity: required for tradeable
             ),
         ]
-        result = discover_tradeable_candidates(candidates, config, 0)
+        result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert result[0].ranking_edge_bps == 5.0
 
     def test_skips_blocked_candidates(self):
@@ -141,7 +145,7 @@ class TestZeroSizeGate:
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
                 entry_notional_quote=0.0,  # V2 fix: zero should be blocked
-                first_funding_timestamp_ms=1700000000000,
+                first_funding_timestamp_ms=FUNDING_TS_MS,
             )
         ]
         result = discover_tradeable_candidates(candidates, config, 0)
@@ -155,10 +159,10 @@ class TestZeroSizeGate:
                 funding_diff_bps=10, funding_edge_bps=10,
                 expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
                 entry_notional_quote=100.0,
-                first_funding_timestamp_ms=1700000000000,
+                first_funding_timestamp_ms=FUNDING_TS_MS,
             )
         ]
-        result = discover_tradeable_candidates(candidates, config, 0)
+        result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert len(result) == 1
 
 

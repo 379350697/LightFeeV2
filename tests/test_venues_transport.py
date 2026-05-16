@@ -1432,6 +1432,32 @@ class TestOrderAckNotFill:
         assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
 
 
+class TestHyperliquidSigningDependencyPreflight:
+    """Live Hyperliquid startup must expose missing signing deps without secrets."""
+
+    def test_missing_eth_account_dependency_is_preflight_visible_and_redacted(self, monkeypatch):
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == "eth_account":
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+        private_key = "0x0123456789abcdefSECRET"
+        cred = LiveCredential(wallet_private_key=private_key)
+
+        with pytest.raises(ValueError) as exc_info:
+            VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        message = str(exc_info.value)
+        assert "missing signing dependencies" in message
+        assert "eth-account" in message
+        assert private_key not in message
+
+
 class TestBitgetRiskHealth:
     """Bitget account risk snapshot parsing (V1: bitget_account_risk_snapshot_from_account_row)."""
 

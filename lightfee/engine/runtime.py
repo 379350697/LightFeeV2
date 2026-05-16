@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
@@ -105,6 +106,11 @@ class LiveRuntime:
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
+        self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
+        self._last_entry_l2_readiness_diag_fingerprint: str = ""
+        self._last_entry_l2_readiness_diag_ts_ms: int = 0
+        self._last_no_entry_diag_fingerprint: str = ""
+        self._last_no_entry_diag_ts_ms: int = 0
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
@@ -700,7 +706,11 @@ class LiveRuntime:
 
         # --- Discover tradeable candidates ---
         # V1 live scan recovery gate: require consecutive fresh snapshots before entry
-        live_scan_recovery_count = getattr(self.config.strategy, 'live_scan_recovery_success_count', 3)
+        live_scan_recovery_count = getattr(
+            self.config.runtime,
+            'live_scan_recovery_success_count',
+            getattr(self.config.strategy, 'live_scan_recovery_success_count', 3),
+        )
         if self._live_scan_success_streak < live_scan_recovery_count:
             self.state.last_scan["no_entry_reason"] = "live_scan_recovery_warmup"
             self.journal.append(
@@ -721,9 +731,6 @@ class LiveRuntime:
                 # V1: activity_local_l2_symbols() → ensure L2 active for candidate symbols
                 # Only bootstrap L2 for symbols that have actual activity (shortlist/finalist)
                 await self._ensure_l2_active_for_candidates(tradeable, now_ms)
-
-                # V1 post-shortlist L2 sync: allows scan-promoted books (scan_promoted=True)
-                await self._sync_local_l2_data(now_ms, scan_promoted=True)
 
                 # V1 market data warmup: funding coverage must meet threshold before entry
                 if hasattr(snapshot, 'funding_lifecycle') and snapshot.funding_lifecycle:
@@ -776,15 +783,22 @@ class LiveRuntime:
                     # Refresh session state for all tracked opportunities
                     for t in tracked:
                         self.entry_l2_sessions.track_opportunity(t, now_ms)
+                    # V1 post-shortlist L2 sync after tracking: local books
+                    # drive session readiness before the selection blocker.
+                    await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                    self._refresh_entry_l2_session_readiness(now_ms)
                 # V1: iterate entire shortlist until slot budget exhausted
                 max_slots = self.config.strategy.max_concurrent_positions
                 dispatched = 0
+                selection_blocker_counts: Counter[str] = Counter()
+                candidate_blockers: dict[str, str] = {}
                 for candidate in tradeable:
                     if len(self.state.open_positions) >= max_slots:
                         break
                     # V2 Task 9: entry local L2 selection blocker (prewarm/dual-ready)
                     l2_blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
                     if l2_blocker:
+                        selection_blocker_counts[l2_blocker] += 1
                         # Compute stable pair_id from symbol+venues if not on candidate
                         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
                         pid = getattr(candidate, "pair_id", "")
@@ -794,6 +808,7 @@ class LiveRuntime:
                                 str(getattr(candidate, "long_venue", "")),
                                 str(getattr(candidate, "short_venue", "")),
                             )
+                        candidate_blockers[pid] = l2_blocker
                         self.journal.append(
                             "runtime.entry_blocked_local_l2_selection",
                             {
@@ -807,6 +822,32 @@ class LiveRuntime:
                     mid_price = price_hints.get(candidate.symbol, 0.0)
                     await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
                     dispatched += 1
+                if dispatched == 0:
+                    reason = (
+                        "entry_local_l2_selection_blocked"
+                        if selection_blocker_counts else "no_entry_dispatched"
+                    )
+                    self._emit_scan_no_entry_diagnostics(
+                        reason=reason,
+                        snapshot=snapshot,
+                        tradeable=tradeable,
+                        selected_candidate_count=dispatched,
+                        remaining_slots=max_slots - len(self.state.open_positions),
+                        tradeable_selection_blocker_counts=selection_blocker_counts,
+                        candidate_blockers=candidate_blockers,
+                        now_ms=now_ms,
+                    )
+            elif can_enter_new_positions(self.state) and self.entry_executor is not None:
+                self._emit_scan_no_entry_diagnostics(
+                    reason="no_tradeable_candidates",
+                    snapshot=snapshot,
+                    tradeable=[],
+                    selected_candidate_count=0,
+                    remaining_slots=self.config.strategy.max_concurrent_positions - len(self.state.open_positions),
+                    tradeable_selection_blocker_counts=Counter(),
+                    candidate_blockers={},
+                    now_ms=now_ms,
+                )
 
     # ------------------------------------------------------------------
     # Risk snapshot runtime cache (V1: fetch_account_risk_with_runtime_cache)
@@ -2599,6 +2640,229 @@ class LiveRuntime:
             return False, "entry_notional_zero_or_negative"
         return True, ""
 
+    def _entry_local_l2_stale_after_ms(self) -> int:
+        return max(
+            int(
+                getattr(
+                    self.config.strategy,
+                    "local_l2_max_age_ms",
+                    getattr(self.config.strategy, "max_liquidity_snapshot_age_ms", 5000),
+                )
+                or 0
+            ),
+            0,
+        )
+
+    def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
+        """Sync entry-local-L2 session legs from local-L2 book readiness."""
+        if not self.config.strategy.local_l2_enabled:
+            return
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        stale_after_ms = self._entry_local_l2_stale_after_ms()
+        for pair_id, session in list(self.entry_l2_sessions.sessions.items()):
+            for leg in session.legs.values():
+                book = self.local_l2_runtime.get_book(leg.venue, leg.symbol)
+                diag = dict(
+                    apply_book_readiness_to_leg(
+                        leg, book, now_ms=now_ms, stale_after_ms=stale_after_ms,
+                    )
+                )
+                diag["pair_id"] = pair_id
+                diag["leg_state"] = leg.state.value if hasattr(leg.state, "value") else str(leg.state)
+                self._entry_l2_last_leg_diagnostics[(pair_id, leg.venue)] = diag
+            session.refresh_state(now_ms, stale_after_ms=stale_after_ms)
+
+        self._maybe_emit_entry_l2_readiness_diagnostics(now_ms)
+
+    def _entry_l2_readiness_diagnostics_payload(self) -> dict:
+        primary_pair_ids = sorted(self._tracked_primary_pair_ids)
+        if primary_pair_ids:
+            pair_ids = primary_pair_ids
+        else:
+            pair_ids = sorted(self.entry_l2_sessions.sessions.keys())
+
+        not_ready: list[dict] = []
+        reason_totals: Counter[str] = Counter()
+        for pair_id in pair_ids:
+            session = self.entry_l2_sessions.sessions.get(pair_id)
+            if session is None:
+                continue
+            for venue in sorted(session.legs.keys()):
+                leg = session.legs[venue]
+                diag = self._entry_l2_last_leg_diagnostics.get((pair_id, venue))
+                if diag is None:
+                    diag = {
+                        "pair_id": pair_id,
+                        "venue": leg.venue,
+                        "symbol": leg.symbol,
+                        "ready": False,
+                        "reason": (
+                            leg.fault.value if getattr(leg, "fault", None) is not None
+                            else (
+                                leg.arming_reason.value
+                                if getattr(leg, "arming_reason", None) is not None
+                                else "not_ready"
+                            )
+                        ),
+                        "detail": getattr(leg, "fault_detail", "") or "",
+                        "book_status": "unknown",
+                        "age_ms": None,
+                        "observed_at_ms": getattr(leg, "last_seen_at_ms", 0),
+                        "sequence": 0,
+                        "leg_state": leg.state.value if hasattr(leg.state, "value") else str(leg.state),
+                    }
+                if diag.get("ready") is True:
+                    continue
+                reason = str(diag.get("reason", "not_ready"))
+                reason_totals[reason] += 1
+                if len(not_ready) < 24:
+                    not_ready.append({
+                        "pair_id": pair_id,
+                        "venue": str(diag.get("venue", leg.venue)),
+                        "symbol": str(diag.get("symbol", leg.symbol)),
+                        "reason": reason,
+                        "detail": str(diag.get("detail", "")),
+                        "book_status": str(diag.get("book_status", "unknown")),
+                        "age_ms": diag.get("age_ms"),
+                        "observed_at_ms": int(diag.get("observed_at_ms", 0) or 0),
+                        "sequence": int(diag.get("sequence", 0) or 0),
+                        "leg_state": str(diag.get("leg_state", "")),
+                    })
+
+        reason_counts = Counter(sample["reason"] for sample in not_ready)
+        return {
+            "primary_pair_ids": primary_pair_ids,
+            "not_ready": not_ready,
+            "reason_counts": dict(sorted(reason_counts.items())),
+            "reason_totals": dict(sorted(reason_totals.items())),
+        }
+
+    @staticmethod
+    def _payload_fingerprint(payload: dict) -> str:
+        import json
+
+        return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+
+    def _maybe_emit_entry_l2_readiness_diagnostics(self, now_ms: int) -> None:
+        if getattr(self.journal, "_file", None) is None:
+            return
+        diag = self._entry_l2_readiness_diagnostics_payload()
+        if not diag["not_ready"]:
+            return
+        payload = {
+            "primary_pair_ids": diag["primary_pair_ids"],
+            "not_ready": diag["not_ready"],
+            "reason_totals": diag["reason_totals"],
+            "ts_ms": now_ms,
+        }
+        fingerprint = self._payload_fingerprint({
+            "primary_pair_ids": payload["primary_pair_ids"],
+            "not_ready": [
+                {
+                    "pair_id": s["pair_id"],
+                    "venue": s["venue"],
+                    "reason": s["reason"],
+                    "detail": s["detail"],
+                    "book_status": s["book_status"],
+                }
+                for s in payload["not_ready"]
+            ],
+        })
+        if (
+            fingerprint == self._last_entry_l2_readiness_diag_fingerprint
+            and now_ms - self._last_entry_l2_readiness_diag_ts_ms < 60_000
+        ):
+            return
+        self._last_entry_l2_readiness_diag_fingerprint = fingerprint
+        self._last_entry_l2_readiness_diag_ts_ms = now_ms
+        self.journal.append("runtime.entry_local_l2_readiness_diagnostics", payload)
+
+    def _emit_scan_no_entry_diagnostics(
+        self,
+        *,
+        reason: str,
+        snapshot,
+        tradeable: list,
+        selected_candidate_count: int,
+        remaining_slots: int,
+        tradeable_selection_blocker_counts: Counter,
+        candidate_blockers: dict[str, str],
+        now_ms: int,
+    ) -> None:
+        if getattr(self.journal, "_file", None) is None:
+            return
+        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+        blocked_reason_counts: Counter[str] = Counter()
+        for candidate in getattr(snapshot, "candidates", []) or []:
+            for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
+                blocked_reason_counts[str(blocked_reason)] += 1
+
+        readiness = self._entry_l2_readiness_diagnostics_payload()
+        candidate_samples = []
+        for candidate in (list(tradeable)[:24]):
+            pair_id = getattr(candidate, "pair_id", "")
+            if not pair_id:
+                pair_id = make_candidate_pair_id(
+                    str(getattr(candidate, "symbol", "")),
+                    str(getattr(candidate, "long_venue", "")),
+                    str(getattr(candidate, "short_venue", "")),
+                )
+            candidate_samples.append({
+                "pair_id": pair_id,
+                "symbol": str(getattr(candidate, "symbol", "")),
+                "long_venue": str(getattr(candidate, "long_venue", "")),
+                "short_venue": str(getattr(candidate, "short_venue", "")),
+                "ranking_edge_bps": float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
+                "blocked_reasons": list(getattr(candidate, "blocked_reasons", []) or [])[:8],
+                "selection_blocker": candidate_blockers.get(pair_id, ""),
+            })
+
+        payload = {
+            "reason": reason,
+            "candidate_count": len(getattr(snapshot, "candidates", []) or []),
+            "tradeable_count": len(tradeable),
+            "selected_candidate_count": selected_candidate_count,
+            "remaining_slots": max(int(remaining_slots), 0),
+            "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
+            "tradeable_selection_blocker_counts": dict(
+                sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
+            ),
+            "entry_local_l2_primary_ready_filter_active": bool(
+                self.config.strategy.local_l2_enabled and self._tracked_primary_pair_ids
+            ),
+            "entry_local_l2_primary_not_ready_reason_counts": readiness["reason_counts"],
+            "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
+            "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
+            "candidates": candidate_samples,
+            "ts_ms": now_ms,
+        }
+        fingerprint = self._payload_fingerprint({
+            "reason": payload["reason"],
+            "candidate_count": payload["candidate_count"],
+            "tradeable_count": payload["tradeable_count"],
+            "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
+            "entry_local_l2_primary_not_ready_reason_totals": payload[
+                "entry_local_l2_primary_not_ready_reason_totals"
+            ],
+            "candidates": [
+                {
+                    "pair_id": c["pair_id"],
+                    "selection_blocker": c["selection_blocker"],
+                }
+                for c in payload["candidates"]
+            ],
+        })
+        if (
+            fingerprint == self._last_no_entry_diag_fingerprint
+            and now_ms - self._last_no_entry_diag_ts_ms < 60_000
+        ):
+            return
+        self._last_no_entry_diag_fingerprint = fingerprint
+        self._last_no_entry_diag_ts_ms = now_ms
+        self.journal.append("scan.no_entry_diagnostics", payload)
+
     # ------------------------------------------------------------------
     # Entry dispatch
     # ------------------------------------------------------------------
@@ -2653,7 +2917,7 @@ class LiveRuntime:
         if session is None:
             return "entry_local_l2_waiting_for_dual_ready"
 
-        if not session.both_legs_ready(now_ms, stale_after_ms=300_000):
+        if not session.both_legs_ready(now_ms, stale_after_ms=self._entry_local_l2_stale_after_ms()):
             return "entry_local_l2_waiting_for_dual_ready"
 
         return None
