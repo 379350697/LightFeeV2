@@ -691,11 +691,17 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "reconcile_next_attempt_ms": p.reconcile_next_attempt_ms,
             "entry_type": p.entry_type,
             "maker_price": p.maker_price,
+            "maker_fill_price": p.maker_fill_price,
+            "hedge_fill_price": p.hedge_fill_price,
+            "hedge_inflight": p.hedge_inflight,
+            "maker_leg": p.maker_leg,
             "long_quantity": p.long_quantity,
             "short_quantity": p.short_quantity,
             "run_id": p.run_id,
             "entry_route": p.entry_route,
             "outcome": p.outcome,
+            "repost_count": p.repost_count,
+            "zero_fill_since_ms": p.zero_fill_since_ms,
         }
         for pid, p in state.pending_entries.items()
     }

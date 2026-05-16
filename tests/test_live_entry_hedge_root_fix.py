@@ -828,6 +828,44 @@ class TestPendingEntryPersistenceRoundtrip:
         assert restored.outcome == "hedge_uncertain"
         assert restored.maker_leg == "long"
 
+    def test_persistent_state_view_includes_new_fields(self):
+        """build_persistent_state_view() must include maker_fill_price,
+        hedge_fill_price, hedge_inflight — not just to_dict()."""
+        from lightfee.engine.state import EngineState, PendingEntry
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        state = EngineState()
+        state.pending_entries["test-view"] = PendingEntry(
+            pending_id="test-view",
+            symbol="CRV-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=1000.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=4000,
+            maker_leg="long",
+            maker_leg_filled=1000.0,
+            maker_fill_price=0.50,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            hedge_inflight="crv-inflight-cid",
+            maker_client_order_id="crv-maker-cid",
+            hedge_client_order_id="crv-hedge-cid",
+            outcome="hedge_uncertain",
+        )
+
+        view = build_persistent_state_view(state)
+        pe = view["pending_entries"]["test-view"]
+        assert pe["maker_fill_price"] == 0.50
+        assert pe["hedge_fill_price"] == 0.0
+        assert pe["hedge_inflight"] == "crv-inflight-cid"
+        assert pe["maker_leg"] == "long"
+        assert pe["maker_client_order_id"] == "crv-maker-cid"
+        assert pe["hedge_client_order_id"] == "crv-hedge-cid"
+        assert pe["outcome"] == "hedge_uncertain"
+
     def test_hedge_fill_price_zero_not_lost_after_roundtrip(self):
         """Zero hedge_fill_price is valid (not yet filled) and must roundtrip as 0.0."""
         from lightfee.engine.recovery import _restore_state_from_snapshot_dict
