@@ -901,41 +901,25 @@ class LiveRuntime:
                     # drive session readiness before the selection blocker.
                     await self._sync_local_l2_data(now_ms, scan_promoted=True)
                     self._refresh_entry_l2_session_readiness(now_ms)
-                # V1: iterate entire shortlist until slot budget exhausted
+                # V1: selected_candidates is a final-entry list, not the raw
+                # shortlist. It excludes candidates still waiting on the final
+                # entry window, primary L2 tracking, or dual-ready books.
                 max_slots = self.config.strategy.max_concurrent_positions
                 remaining_slots = max(max_slots - len(self.state.open_positions), 0)
-                finalists = list(tradeable)
-                self.state.last_scan["selected_candidate_count"] = len(finalists)
-                dispatched = 0
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
+                finalists = self._select_entry_candidates(
+                    tradeable,
+                    now_ms=now_ms,
+                    remaining_slots=remaining_slots,
+                    selection_blocker_counts=selection_blocker_counts,
+                    candidate_blockers=candidate_blockers,
+                )
+                self.state.last_scan["selected_candidate_count"] = len(finalists)
+                dispatched = 0
                 for candidate in finalists:
                     if len(self.state.open_positions) >= max_slots:
                         break
-                    # V2 Task 9: entry local L2 selection blocker (prewarm/dual-ready)
-                    l2_blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
-                    if l2_blocker:
-                        selection_blocker_counts[l2_blocker] += 1
-                        # Compute stable pair_id from symbol+venues if not on candidate
-                        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
-                        pid = getattr(candidate, "pair_id", "")
-                        if not pid:
-                            pid = make_candidate_pair_id(
-                                str(getattr(candidate, "symbol", "")),
-                                str(getattr(candidate, "long_venue", "")),
-                                str(getattr(candidate, "short_venue", "")),
-                            )
-                        candidate_blockers[pid] = l2_blocker
-                        self.journal.append(
-                            "runtime.entry_blocked_local_l2_selection",
-                            {
-                                "symbol": candidate.symbol,
-                                "pair_id": pid,
-                                "reason": l2_blocker,
-                                "ts_ms": now_ms,
-                            },
-                        )
-                        continue
                     mid_price = price_hints.get(candidate.symbol, 0.0)
                     await self._dispatch_entry(candidate, now_ms, price_hint=mid_price)
                     dispatched += 1
@@ -3104,6 +3088,74 @@ class LiveRuntime:
     # ------------------------------------------------------------------
     # Entry dispatch
     # ------------------------------------------------------------------
+
+    def _entry_selection_target(self, remaining_slots: int) -> int:
+        """V1 selection buffer: remaining slots, expanded up to eight candidates."""
+        if remaining_slots <= 0:
+            return 0
+        return min(max(remaining_slots, remaining_slots * 4), 8)
+
+    def _candidate_pair_id(self, candidate) -> str:
+        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+        pair_id = getattr(candidate, "pair_id", "")
+        if pair_id:
+            return str(pair_id)
+        return make_candidate_pair_id(
+            str(getattr(candidate, "symbol", "")),
+            str(getattr(candidate, "long_venue", "")),
+            str(getattr(candidate, "short_venue", "")),
+        )
+
+    def _select_entry_candidates(
+        self,
+        tradeable: list,
+        *,
+        now_ms: int,
+        remaining_slots: int,
+        selection_blocker_counts: Counter,
+        candidate_blockers: dict[str, str],
+    ) -> list:
+        """V1 select_entry_candidates_from_refs parity for the final entry list."""
+        target = self._entry_selection_target(remaining_slots)
+        if target <= 0:
+            return []
+
+        active_symbols = {
+            str(getattr(position, "symbol", ""))
+            for position in self.state.open_positions.values()
+        }
+        active_symbols.update(
+            str(getattr(pending, "symbol", ""))
+            for pending in self.state.pending_entries.values()
+        )
+        selected_symbols: set[str] = set()
+        selected: list = []
+
+        for candidate in tradeable:
+            symbol = str(getattr(candidate, "symbol", ""))
+            pair_id = self._candidate_pair_id(candidate)
+            blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
+            if blocker:
+                selection_blocker_counts[str(blocker)] += 1
+                candidate_blockers[pair_id] = str(blocker)
+                self.journal.append(
+                    "runtime.entry_blocked_local_l2_selection",
+                    {
+                        "symbol": symbol,
+                        "pair_id": pair_id,
+                        "reason": str(blocker),
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+            if symbol in active_symbols or symbol in selected_symbols:
+                continue
+            selected.append(candidate)
+            selected_symbols.add(symbol)
+            if len(selected) >= target:
+                break
+        return selected
 
     def _entry_finalization_window_blocker(
         self,

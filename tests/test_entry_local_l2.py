@@ -1359,8 +1359,13 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert no_entry["reason"] == "entry_local_l2_selection_blocked"
         assert no_entry["candidate_count"] == 1
         assert no_entry["tradeable_count"] == 1
-        assert no_entry["selected_candidate_count"] == 1
+        # V1 parity: shortlist/tradeable candidates are not final selected
+        # candidates until the immediate selection blocker passes.
+        assert no_entry["selected_candidate_count"] == 0
         assert no_entry["dispatched_candidate_count"] == 0
+        assert rt.state.last_scan is not None
+        assert rt.state.last_scan["selected_candidate_count"] == 0
+        assert rt.state.last_scan["dispatched_candidate_count"] == 0
         assert no_entry["remaining_slots"] == 2
         assert no_entry["tradeable_selection_blocker_counts"] == {
             "entry_local_l2_waiting_for_dual_ready": 1
