@@ -569,7 +569,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             runtime=RuntimeConfig(mode="live", sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
                                   sidecar_snapshot_max_age_ms=600_000),
             strategy=StrategyConfig(local_l2_enabled=True, local_l2_ws_enabled=False,
-                                    max_concurrent_positions=2),
+                                    max_concurrent_positions=2,
+                                    entry_window_secs=480,
+                                    min_scan_minutes_before_funding=0),
             persistence=PersistenceConfig(event_log_path=str(tmp_path / "events.jsonl"),
                                           snapshot_path=str(tmp_path / "state.json")),
         )
@@ -627,6 +629,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
     def test_first_funding_ts_outside_prewarm_window_blocked(self, runtime_with_l2):
         """Candidate with first_funding_timestamp_ms too far in future is blocked."""
         rt = runtime_with_l2
+        rt.config.strategy.entry_window_secs = 1200
         # remaining_ms = 1000000 - 10000 = 990000 > prewarm_window(480000)
         c = self._make_real_candidate(first_funding_timestamp_ms=1000000)
 
@@ -640,7 +643,29 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         c = self._make_real_candidate(first_funding_timestamp_ms=5000)
 
         reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
-        assert reason == "entry_local_l2_waiting_for_prewarm_window"
+        assert reason == "entry_finalization_window_expired"
+
+    def test_entry_window_blocks_candidate_before_finalization_window(self, runtime_with_l2):
+        """V1 final selection uses entry_window_secs, not only the L2 prewarm window."""
+        rt = runtime_with_l2
+        rt.config.strategy.entry_window_secs = 300
+        rt.config.strategy.entry_local_l2_prewarm_window_secs = 900
+        rt.config.strategy.min_scan_minutes_before_funding = 3
+        c = self._make_real_candidate(first_funding_timestamp_ms=610000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_waiting_for_finalization_window_too_early"
+
+    def test_min_scan_boundary_expires_finalization_window(self, runtime_with_l2):
+        """V1 final selection stops entries inside min_scan_minutes_before_funding."""
+        rt = runtime_with_l2
+        rt.config.strategy.entry_window_secs = 300
+        rt.config.strategy.entry_local_l2_prewarm_window_secs = 900
+        rt.config.strategy.min_scan_minutes_before_funding = 3
+        c = self._make_real_candidate(first_funding_timestamp_ms=130000)
+
+        reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
+        assert reason == "entry_finalization_window_expired"
 
     # ------------------------------------------------------------------
     # REDLIGHT 2: snapshot dict load drops pair_id and funding timestamps
@@ -1290,6 +1315,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
                 max_concurrent_positions=2,
+                entry_window_secs=480,
                 local_l2_max_age_ms=1000,
             ),
             persistence=PersistenceConfig(
@@ -1439,6 +1465,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 mode="live",
                 sidecar_snapshot_path=str(snapshot_path),
                 sidecar_snapshot_max_age_ms=5000,
+                live_scan_last_good_max_age_ms=5500,
                 live_scan_recovery_success_count=1,
             ),
             strategy=StrategyConfig(local_l2_enabled=False),

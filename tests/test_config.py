@@ -56,6 +56,67 @@ class TestConfigLoading:
 
 
 class TestConfigValidation:
+    def test_strategy_defaults_keep_entry_window_valid(self):
+        strategy = StrategyConfig()
+        assert strategy.entry_window_secs >= strategy.min_scan_minutes_before_funding * 60
+        assert strategy.entry_local_l2_prewarm_window_secs >= (
+            strategy.min_scan_minutes_before_funding * 60
+        )
+
+    def test_v1_rejects_entry_window_shorter_than_min_scan_boundary(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_window_secs = 120
+        config.strategy.min_scan_minutes_before_funding = 3
+        issues = validate_config(config)
+        assert any("entry_window_secs" in i and "min_scan_minutes_before_funding" in i for i in issues)
+
+    def test_v1_rejects_prewarm_window_shorter_than_min_scan_boundary(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_window_secs = 480
+        config.strategy.entry_local_l2_prewarm_window_secs = 120
+        config.strategy.min_scan_minutes_before_funding = 3
+        issues = validate_config(config)
+        assert any(
+            "entry_local_l2_prewarm_window_secs" in i
+            and "min_scan_minutes_before_funding" in i
+            for i in issues
+        )
+
+    def test_v1_rejects_prewarm_window_outside_scan_window(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_window_secs = 300
+        config.strategy.entry_local_l2_prewarm_window_secs = 900
+        config.strategy.max_scan_minutes_before_funding = 10
+        config.strategy.min_scan_minutes_before_funding = 3
+        issues = validate_config(config)
+        assert any(
+            "entry_local_l2_prewarm_window_secs" in i
+            and "max_scan_minutes_before_funding" in i
+            for i in issues
+        )
+
+    def test_v1_rejects_scan_window_with_max_before_min(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.max_scan_minutes_before_funding = 2
+        config.strategy.min_scan_minutes_before_funding = 3
+        issues = validate_config(config)
+        assert any("max_scan_minutes_before_funding" in i for i in issues)
+
+    def test_runtime_last_good_and_startup_guards_must_be_positive(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.runtime.live_scan_last_good_max_age_ms = 0
+        config.runtime.live_startup_phase_timeout_ms = 0
+        config.runtime.max_market_age_ms = 0
+        config.runtime.max_order_quote_age_ms = 0
+        issues = validate_config(config)
+        assert any("live_scan_last_good_max_age_ms" in i for i in issues)
+        assert any("live_startup_phase_timeout_ms" in i for i in issues)
+        assert any("max_market_age_ms" in i for i in issues)
+        assert any("max_order_quote_age_ms" in i for i in issues)
+
+    def test_shadow_entry_opportunity_count_default_is_v1_explicit(self):
+        assert StrategyConfig().shadow_entry_opportunity_count == 2
+
     def test_accepts_sidecar_backed_opportunity_input_mode(self):
         config = AppConfig(symbols=["BTCUSDT"])
         config.runtime.opportunity_input_mode = "sidecar_backed"

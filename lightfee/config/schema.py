@@ -89,7 +89,7 @@ class RuntimeConfig:
 
 @dataclass
 class StrategyConfig:
-    entry_window_secs: int = 180
+    entry_window_secs: int = 300
     entry_local_l2_prewarm_window_secs: int = 480
     post_funding_hold_secs: int = 0
     entry_notional_cap_quote: float = 1000.0
@@ -149,6 +149,7 @@ class StrategyConfig:
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
     entry_local_l2_primary_count: int = 6  # V1 default (V2 was 8 — misaligned)
+    shadow_entry_opportunity_count: int = 2  # V1 default
     maker_entry_max_reposts: int = 2
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False

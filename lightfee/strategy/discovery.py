@@ -93,4 +93,7 @@ def _is_within_funding_scan_window_ms(config: StrategyConfig, remaining_ms: int)
     min_before_ms = config.min_scan_minutes_before_funding * 60_000
     if max_before_ms > 0:
         return remaining_ms <= max_before_ms and remaining_ms >= min_before_ms
-    return True  # no window configured — allow all
+    entry_window_ms = config.entry_window_secs * 1000
+    if entry_window_ms > 0:
+        return remaining_ms <= entry_window_ms and remaining_ms >= min_before_ms
+    return True  # no max or entry window configured — allow all

@@ -148,6 +148,8 @@ def evaluate_snapshot_freshness(
     max_age_ms: int,
     now_ms: int,
     last_good: SidecarSnapshot | None = None,
+    last_good_max_age_ms: int | None = None,
+    market_max_age_ms: int | None = None,
 ) -> SnapshotFreshness:
     """Evaluate snapshot freshness per V1 OpportunityInputDomainState semantics.
 
@@ -161,20 +163,37 @@ def evaluate_snapshot_freshness(
     4. DEGRADED — snapshot exists within max_age but has degraded venues/domains
     5. FRESH — snapshot exists within max_age and has no degradations
     """
+    last_good_limit_ms = (
+        last_good_max_age_ms if last_good_max_age_ms is not None else max_age_ms
+    )
+    market_limit_ms = market_max_age_ms if market_max_age_ms is not None else max_age_ms
+
+    def _within_last_good_window(candidate: SidecarSnapshot | None) -> bool:
+        if candidate is None:
+            return False
+        return now_ms - candidate.published_at_ms <= last_good_limit_ms
+
     if snapshot is None:
         if last_good is not None:
-            last_good_age = now_ms - last_good.published_at_ms
-            if last_good_age <= max_age_ms:
+            if _within_last_good_window(last_good):
                 return SnapshotFreshness.LAST_GOOD_FALLBACK
         return SnapshotFreshness.MISSING
 
     age_ms = now_ms - snapshot.published_at_ms
 
     if age_ms > max_age_ms:
-        if last_good is not None:
-            last_good_age = now_ms - last_good.published_at_ms
-            if last_good_age <= max_age_ms:
-                return SnapshotFreshness.LAST_GOOD_FALLBACK
+        if _within_last_good_window(snapshot) or _within_last_good_window(last_good):
+            return SnapshotFreshness.LAST_GOOD_FALLBACK
+        return SnapshotFreshness.STALE
+
+    market_age_ms = (
+        now_ms - snapshot.market_observed_at_ms
+        if snapshot.market_observed_at_ms > 0
+        else 0
+    )
+    if market_age_ms > market_limit_ms:
+        if _within_last_good_window(snapshot) or _within_last_good_window(last_good):
+            return SnapshotFreshness.LAST_GOOD_FALLBACK
         return SnapshotFreshness.STALE
 
     if snapshot.degraded_venues or snapshot.degraded_domains or snapshot.degraded_symbols:

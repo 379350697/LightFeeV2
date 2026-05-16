@@ -36,11 +36,80 @@ def validate_config(config: AppConfig) -> list[str]:
             f"got: {config.runtime.maker_event_lane_min_wake_interval_ms}"
         )
 
+    if config.runtime.sidecar_snapshot_max_age_ms <= 0:
+        issues.append(
+            f"runtime.sidecar_snapshot_max_age_ms must be > 0, "
+            f"got: {config.runtime.sidecar_snapshot_max_age_ms}"
+        )
+    if config.runtime.live_scan_last_good_max_age_ms <= 0:
+        issues.append(
+            f"runtime.live_scan_last_good_max_age_ms must be > 0, "
+            f"got: {config.runtime.live_scan_last_good_max_age_ms}"
+        )
+    if config.runtime.live_scan_recovery_success_count <= 0:
+        issues.append(
+            f"runtime.live_scan_recovery_success_count must be > 0, "
+            f"got: {config.runtime.live_scan_recovery_success_count}"
+        )
+    if config.runtime.live_startup_phase_timeout_ms <= 0:
+        issues.append(
+            f"runtime.live_startup_phase_timeout_ms must be > 0, "
+            f"got: {config.runtime.live_startup_phase_timeout_ms}"
+        )
+    if config.runtime.max_market_age_ms <= 0:
+        issues.append(
+            f"runtime.max_market_age_ms must be > 0, "
+            f"got: {config.runtime.max_market_age_ms}"
+        )
+    if config.runtime.max_order_quote_age_ms <= 0:
+        issues.append(
+            f"runtime.max_order_quote_age_ms must be > 0, "
+            f"got: {config.runtime.max_order_quote_age_ms}"
+        )
+
     if config.strategy.max_concurrent_positions < 0:
         issues.append("strategy.max_concurrent_positions must be >= 0")
 
     if config.strategy.entry_notional_cap_quote <= 0:
         issues.append("strategy.entry_notional_cap_quote must be > 0")
+
+    if config.strategy.shadow_entry_opportunity_count < 0:
+        issues.append("strategy.shadow_entry_opportunity_count must be >= 0")
+
+    if (
+        config.strategy.max_scan_minutes_before_funding > 0
+        and config.strategy.min_scan_minutes_before_funding > 0
+        and config.strategy.max_scan_minutes_before_funding
+        < config.strategy.min_scan_minutes_before_funding
+    ):
+        issues.append(
+            "strategy.max_scan_minutes_before_funding must be >= "
+            "strategy.min_scan_minutes_before_funding"
+        )
+
+    min_before_secs = config.strategy.min_scan_minutes_before_funding * 60
+    max_before_secs = config.strategy.max_scan_minutes_before_funding * 60
+    if min_before_secs > 0 and config.strategy.entry_window_secs < min_before_secs:
+        issues.append(
+            "strategy.entry_window_secs must be >= "
+            "strategy.min_scan_minutes_before_funding * 60"
+        )
+    if (
+        min_before_secs > 0
+        and config.strategy.entry_local_l2_prewarm_window_secs < min_before_secs
+    ):
+        issues.append(
+            "strategy.entry_local_l2_prewarm_window_secs must be >= "
+            "strategy.min_scan_minutes_before_funding * 60"
+        )
+    if (
+        max_before_secs > 0
+        and config.strategy.entry_local_l2_prewarm_window_secs > max_before_secs
+    ):
+        issues.append(
+            "strategy.entry_local_l2_prewarm_window_secs must be <= "
+            "strategy.max_scan_minutes_before_funding * 60"
+        )
 
     # V1 entry planner constraints (Rust: entry_execution_planner.rs:38,108)
     sr = config.strategy.maker_initial_slice_ratio

@@ -7,6 +7,7 @@ V1 anchors: src/main.rs (build_opportunity_input_provider, startup ordering),
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -140,6 +141,36 @@ class TestOrderedStartupPhases:
             assert prepare_called[0], (
                 "V1 parity violation: prepare_runtime_symbols not called during startup"
             )
+
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_local_l2_startup_phase_obeys_configured_timeout(self, monkeypatch):
+        """V1: live_startup_phase_timeout_ms bounds startup activation phases."""
+        td = tempfile.mkdtemp()
+        try:
+            config = _paper_config(td)
+            config.runtime.live_startup_phase_timeout_ms = 1
+            config.strategy.local_l2_enabled = True
+            runtime = LiveRuntime(config)
+            events: list[str] = []
+
+            async def slow_local_l2_phase(now_ms: int) -> None:
+                await asyncio.sleep(3600)
+
+            def tracking_append(kind: str, payload: dict, flush: bool = False, ts_ms: int | None = None):
+                events.append(kind)
+                return runtime.journal._seq + 1
+
+            monkeypatch.setattr(runtime, "_activate_local_l2_phase", slow_local_l2_phase)
+            monkeypatch.setattr(runtime.journal, "append", tracking_append)
+
+            await asyncio.wait_for(runtime.start(), timeout=0.25)
+
+            assert "runtime.startup_phase_timeout" in events
+            assert "runtime.started" in events
 
         finally:
             import shutil

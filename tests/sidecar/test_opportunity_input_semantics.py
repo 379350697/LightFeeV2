@@ -68,6 +68,61 @@ class TestSnapshotFreshnessStates:
         )
         assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
 
+    def test_current_snapshot_inside_last_good_window_falls_back(self):
+        """V1: stale publish age can remain usable as last-good until last_good_max_age."""
+        now_ms = int(time.time() * 1000)
+        current = SidecarSnapshot(published_at_ms=now_ms - 30000)
+        freshness = evaluate_snapshot_freshness(
+            current,
+            max_age_ms=10000,
+            now_ms=now_ms,
+            last_good_max_age_ms=600000,
+        )
+        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+
+    def test_missing_snapshot_uses_live_scan_last_good_max_age(self):
+        """V1: cached last-good age is governed by live_scan_last_good_max_age_ms."""
+        now_ms = int(time.time() * 1000)
+        last_good = SidecarSnapshot(published_at_ms=now_ms - 500000)
+        freshness = evaluate_snapshot_freshness(
+            None,
+            max_age_ms=10000,
+            now_ms=now_ms,
+            last_good=last_good,
+            last_good_max_age_ms=600000,
+        )
+        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+
+    def test_stale_market_observation_enters_last_good_fallback(self):
+        """V1: fresh file publish with stale market observation is last-good, not fresh."""
+        now_ms = int(time.time() * 1000)
+        snapshot = SidecarSnapshot(
+            published_at_ms=now_ms - 1000,
+            market_observed_at_ms=now_ms - 30000,
+        )
+        freshness = evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=10000,
+            now_ms=now_ms,
+            last_good_max_age_ms=600000,
+        )
+        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+
+    def test_market_max_age_can_be_stricter_than_snapshot_publish_age(self):
+        now_ms = int(time.time() * 1000)
+        snapshot = SidecarSnapshot(
+            published_at_ms=now_ms - 1000,
+            market_observed_at_ms=now_ms - 30000,
+        )
+        freshness = evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=600000,
+            now_ms=now_ms,
+            last_good_max_age_ms=600000,
+            market_max_age_ms=5000,
+        )
+        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+
     def test_degraded_snapshot_with_degraded_venues(self):
         now_ms = int(time.time() * 1000)
         snapshot = SidecarSnapshot(

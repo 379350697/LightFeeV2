@@ -177,6 +177,20 @@ class LiveRuntime:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    async def _run_startup_phase_with_timeout(self, phase: str, coro) -> None:
+        timeout_ms = max(self.config.runtime.live_startup_phase_timeout_ms, 1)
+        try:
+            await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            self.journal.append(
+                "runtime.startup_phase_timeout",
+                {
+                    "phase": phase,
+                    "timeout_ms": timeout_ms,
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
+
     async def start(self) -> None:
         """Booting sequence: phased private→market→local-L2 startup (V1 parity)."""
         self.journal.open()
@@ -278,7 +292,10 @@ class LiveRuntime:
             )
 
         # Phase 5 – Local-L2 startup activation (V1: local-L2 phased activation)
-        await self._activate_local_l2_phase(wall_clock_now_ms())
+        await self._run_startup_phase_with_timeout(
+            "local_l2_activation",
+            self._activate_local_l2_phase(wall_clock_now_ms()),
+        )
 
         # Phase 6 – Recover retained local-L2 state
         await self._restore_local_l2_state()
@@ -682,6 +699,7 @@ class LiveRuntime:
         # --- Load sidecar snapshot ---
         snapshot = load_snapshot(self.config.runtime.sidecar_snapshot_path)
         max_age = self.config.runtime.sidecar_snapshot_max_age_ms
+        last_good_max_age = self.config.runtime.live_scan_last_good_max_age_ms
 
         # V1: evaluate_snapshot_freshness — multi-state freshness evaluation
         freshness = evaluate_snapshot_freshness(
@@ -689,6 +707,8 @@ class LiveRuntime:
             max_age_ms=max_age,
             now_ms=now_ms,
             last_good=self._last_good_snapshot,
+            last_good_max_age_ms=last_good_max_age,
+            market_max_age_ms=self.config.runtime.max_market_age_ms,
         )
         if freshness == SnapshotFreshness.MISSING:
             self._live_scan_success_streak = 0
@@ -696,20 +716,16 @@ class LiveRuntime:
             return
         if freshness == SnapshotFreshness.STALE:
             self._live_scan_success_streak = 0
-            if self._last_good_snapshot is not None:
-                snapshot = self._last_good_snapshot
-                self.journal.append("runtime.snapshot_fallback_last_good", {"ts_ms": now_ms})
-            else:
-                self.journal.append(
-                    "runtime.snapshot_stale",
-                    self._snapshot_health_payload(
-                        snapshot=snapshot,
-                        now_ms=now_ms,
-                        max_age_ms=max_age,
-                        freshness="stale",
-                    ),
-                )
-                return
+            self.journal.append(
+                "runtime.snapshot_stale",
+                self._snapshot_health_payload(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    max_age_ms=max_age,
+                    freshness="stale",
+                ),
+            )
+            return
         if freshness == SnapshotFreshness.DEGRADED:
             # Some venues degraded but can still trade on healthy ones
             self._live_scan_success_streak += 1
@@ -725,9 +741,22 @@ class LiveRuntime:
             )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             # Current snapshot is stale/missing; fall back to last good
-            snapshot = self._last_good_snapshot
+            snapshot = snapshot if snapshot is not None else self._last_good_snapshot
+            if snapshot is None:
+                self._live_scan_success_streak = 0
+                self.journal.append("runtime.snapshot_missing", {"ts_ms": now_ms})
+                return
+            self._last_good_snapshot = snapshot
             self._live_scan_success_streak += 1
-            self.journal.append("runtime.snapshot_fallback_last_good", {"ts_ms": now_ms})
+            self.journal.append(
+                "runtime.snapshot_fallback_last_good",
+                self._snapshot_health_payload(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    max_age_ms=max_age,
+                    freshness="last_good_fallback",
+                ),
+            )
         if freshness == SnapshotFreshness.FRESH:
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
@@ -740,14 +769,48 @@ class LiveRuntime:
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
+        if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
+            reason = "live_scan_revalidate_required:last_good_sidecar"
+            self.state.last_scan["no_entry_reason"] = reason
+            self.journal.append(
+                "runtime.live_scan_revalidate_required",
+                {
+                    "reason": reason,
+                    "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
+                    "edge_buffer_bps": self.config.runtime.live_scan_revalidate_edge_buffer_bps,
+                    "ts_ms": now_ms,
+                },
+            )
+            return
 
         # V1 pre-scan L2 sync: refresh execution-owned books only (scan_promoted=False)
         await self._sync_local_l2_data(now_ms, scan_promoted=False)
 
         # --- Build price lookup from snapshot quotes ---
         price_hints: dict[str, float] = {}
+        stale_order_quote_count = 0
         for quote in snapshot.quotes.values():
+            quote_observed_at_ms = (
+                int(getattr(quote, "observed_at_ms", 0) or 0)
+                or int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
+            )
+            if (
+                quote_observed_at_ms > 0
+                and now_ms - quote_observed_at_ms
+                > self.config.runtime.max_order_quote_age_ms
+            ):
+                stale_order_quote_count += 1
+                continue
             price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0 if quote.bid > 0 and quote.ask > 0 else 0.0
+        if stale_order_quote_count > 0:
+            self.journal.append(
+                "runtime.order_quote_stale_skipped",
+                {
+                    "count": stale_order_quote_count,
+                    "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                    "ts_ms": now_ms,
+                },
+            )
 
         # --- Discover tradeable candidates ---
         # V1 live scan recovery gate: require consecutive fresh snapshots before entry
@@ -812,7 +875,9 @@ class LiveRuntime:
                         self.config.strategy, "entry_local_l2_primary_count", 3,
                     )
                     shadow_count = getattr(
-                        self.config.strategy, "entry_local_l2_shadow_count", 1,
+                        self.config.strategy,
+                        "shadow_entry_opportunity_count",
+                        getattr(self.config.strategy, "entry_local_l2_shadow_count", 2),
                     )
                     from lightfee.engine.entry_local_l2 import (
                         select_tracked_opportunities,
@@ -3026,6 +3091,22 @@ class LiveRuntime:
     # Entry dispatch
     # ------------------------------------------------------------------
 
+    def _entry_finalization_window_blocker(
+        self,
+        first_funding_timestamp_ms: int,
+        now_ms: int,
+    ) -> str | None:
+        """V1 final entry window: entries are allowed in [min_before, entry_window]."""
+        remaining_ms = first_funding_timestamp_ms - max(now_ms, 0)
+        min_before_ms = self.config.strategy.min_scan_minutes_before_funding * 60_000
+        entry_window_ms = self.config.strategy.entry_window_secs * 1000
+
+        if remaining_ms <= 0 or (min_before_ms > 0 and remaining_ms < min_before_ms):
+            return "entry_finalization_window_expired"
+        if entry_window_ms > 0 and remaining_ms > entry_window_ms:
+            return "entry_waiting_for_finalization_window_too_early"
+        return None
+
     def _entry_local_l2_selection_blocker(self, candidate, now_ms: int) -> str | None:
         """V1 entry local L2 selection gate: check prewarm, primary tracking, dual-ready.
 
@@ -3040,6 +3121,8 @@ class LiveRuntime:
           remaining_ms > 0 && remaining_ms <= prewarm_window_secs * 1000
 
         Blocker reasons (V1 stable labels):
+        - entry_waiting_for_finalization_window_too_early
+        - entry_finalization_window_expired
         - entry_local_l2_waiting_for_prewarm_window
         - entry_local_l2_waiting_for_primary_tracking
         - entry_local_l2_waiting_for_dual_ready
@@ -3063,6 +3146,12 @@ class LiveRuntime:
         if first_funding_ts <= 0:
             return "entry_local_l2_waiting_for_prewarm_window"
         remaining_ms = first_funding_ts - max(now_ms, 0)
+        finalization_blocker = self._entry_finalization_window_blocker(
+            first_funding_ts,
+            now_ms,
+        )
+        if finalization_blocker:
+            return finalization_blocker
         prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
         if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
             return "entry_local_l2_waiting_for_prewarm_window"

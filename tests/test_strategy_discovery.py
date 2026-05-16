@@ -133,6 +133,27 @@ class TestDiscovery:
         result = discover_tradeable_candidates(candidates, config, 0)
         assert len(result) == 0
 
+    def test_max_scan_zero_falls_back_to_entry_window(self):
+        config = StrategyConfig(
+            max_scan_minutes_before_funding=0,
+            min_scan_minutes_before_funding=3,
+            entry_window_secs=480,
+            max_concurrent_positions=8,
+            min_funding_edge_bps=0,
+        )
+        candidate = CandidateInput(
+            long_venue="a", short_venue="b", symbol="X",
+            funding_diff_bps=10, funding_edge_bps=10,
+            expected_edge_bps=5, worst_case_edge_bps=2, ranking_edge_bps=5.0,
+            entry_notional_quote=100.0,
+            first_funding_timestamp_ms=600_000,
+        )
+
+        result = discover_tradeable_candidates([candidate], config, 0)
+
+        assert result == []
+        assert BlockReason.OUTSIDE_SCAN_WINDOW.value in candidate.blocked_reasons
+
 
 class TestZeroSizeGate:
     """V2 fix: entry_notional_quote must be non-zero for tradeable candidates."""
