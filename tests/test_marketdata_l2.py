@@ -376,16 +376,16 @@ class TestDeltaApplication:
             sequence=100,
             now_ms=10000,
         )
-        # Delta: insert new bid level at 50100
+        # Delta: insert new bid level inside the spread
         result = book.apply_delta(
-            [PriceLevel(price=50100, quantity=1.0)],
+            [PriceLevel(price=50050, quantity=1.0)],
             [],
             sequence=101,
             previous_sequence=100,
             now_ms=11000,
         )
         assert result.applied
-        assert book.bids[0].price == 50100  # new highest bid
+        assert book.bids[0].price == 50050  # new highest bid
 
     def test_delta_emits_mid_price_event(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
@@ -414,13 +414,13 @@ class TestDeltaApplication:
         )
         # Insert a new best bid — should push out the lowest
         book.apply_delta(
-            [PriceLevel(price=50100, quantity=1.0)],
+            [PriceLevel(price=50050, quantity=1.0)],
             [],
             sequence=101,
             now_ms=11000,
         )
         assert len(book.bids) == 3
-        assert book.bids[0].price == 50100
+        assert book.bids[0].price == 50050
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ class TestSequenceGap:
         assert result.rebuild_required
         assert "sequence_gap" in result.fault_reason
 
-    def test_gap_disabled_when_max_zero(self):
+    def test_gap_strict_when_max_zero(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT", max_sequence_gap=0)
         book.apply_snapshot(
             [PriceLevel(price=50000, quantity=1.0)],
@@ -474,14 +474,16 @@ class TestSequenceGap:
             sequence=100,
             now_ms=10000,
         )
-        # Gap of 1000, but max_sequence_gap=0 disables gap detection
+        # max_sequence_gap=0 means strict continuity.
         result = book.apply_delta(
             [], [],
             sequence=1100,
             previous_sequence=1099,
             now_ms=11000,
         )
-        assert result.applied
+        assert not result.applied
+        assert result.rebuild_required
+        assert "sequence_gap" in result.fault_reason
 
 
 # ---------------------------------------------------------------------------
@@ -600,10 +602,8 @@ class TestBookQueries:
 
     def test_crossed_book_detection(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
-        book.apply_snapshot(
-            [PriceLevel(price=50100, quantity=1.0)],
-            [PriceLevel(price=50000, quantity=1.0)],
-        )
+        book.bids = [PriceLevel(price=50100, quantity=1.0)]
+        book.asks = [PriceLevel(price=50000, quantity=1.0)]
         assert book.has_crossed_book()
 
     def test_crossed_book_false_when_normal(self):

@@ -128,6 +128,7 @@ class LocalL2DataPlane:
         self.max_concurrent_snapshots: int = 4
         self.bootstrap_timeout_ms: int = 15_000  # Overall bootstrap phase timeout
         self.hot_refresh_interval_ms: int = SNAPSHOT_INTERVAL_HOT_MS
+        self.hot_stale_after_ms: int = 300_000
 
     # ------------------------------------------------------------------
     # Bootstrap: initial snapshot population for target books
@@ -168,10 +169,11 @@ class LocalL2DataPlane:
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
 
-            # V1: binance_local_l2_snapshot_is_stale — reject snapshot if sequence <= book's
+            # V1: binance_local_l2_snapshot_is_stale — reject older snapshots. Equal
+            # sequence snapshots can be a valid refresh when the book has not changed.
             book = self._runtime.get_book(venue, symbol)
             if book is not None and update.sequence > 0 and book.last_update_id > 0:
-                if update.sequence <= book.last_update_id:
+                if update.sequence < book.last_update_id:
                     self._journal.append(
                         "runtime.local_l2_snapshot_stale",
                         {"venue": venue, "symbol": symbol,
@@ -193,7 +195,11 @@ class LocalL2DataPlane:
 
             # Mark book HOT after snapshot + buffered replay (V1: complete_bootstrap)
             book = self._runtime.get_book(venue, symbol)
-            if book is not None and book.status == L2BookStatus.BOOTSTRAPPING:
+            if book is not None and book.status in (
+                L2BookStatus.BOOTSTRAPPING,
+                L2BookStatus.REBUILDING,
+                L2BookStatus.DEGRADED,
+            ):
                 book.transition_to_hot()
 
             ss.last_snapshot_ms = now_ms
@@ -472,9 +478,24 @@ class LocalL2DataPlane:
             if dispatched >= self.max_concurrent_snapshots:
                 break
 
-            # V1: only snapshot books that need recovery — HOT books rely on WS deltas
+            # V1: HOT books rely on WS deltas, but stale HOT books must be
+            # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
-                continue
+                stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
+                if stale_after_ms <= 0 or not book.is_stale(stale_after_ms, now_ms):
+                    continue
+                book.transition_to_rebuilding(now_ms)
+                book.fault_reason = "stale_hot_book"
+                self._journal.append(
+                    "runtime.local_l2_hot_stale_rebuild",
+                    {
+                        "venue": key.venue,
+                        "symbol": key.symbol,
+                        "age_ms": book.age_ms(now_ms),
+                        "stale_after_ms": stale_after_ms,
+                        "ts_ms": now_ms,
+                    },
+                )
 
             # V1 dual-phase gating: pre-scan only refreshes execution-owned books
             # (RETAINED or HOT_EXEC); post-shortlist allows scan-promoted books too

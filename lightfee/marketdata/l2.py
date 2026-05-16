@@ -154,7 +154,7 @@ class LocalL2Book:
     stale_age_ms: int = 5_000
 
     # --- Check sequence gaps ---
-    max_sequence_gap: int = 0  # 0 = disabled
+    max_sequence_gap: int = 0  # 0 = strict continuity
 
     # ------------------------------------------------------------------
     # Pure book operations
@@ -171,9 +171,30 @@ class LocalL2Book:
     ) -> LocalL2UpdateResult:
         """Replace entire book with a snapshot. Returns events emitted."""
         depth = max_depth or self.max_depth
-        self.bids = _sort_bids(bids)[:depth] if depth > 0 else _sort_bids(bids)
-        self.asks = _sort_asks(asks)[:depth] if depth > 0 else _sort_asks(asks)
+        next_bids = _sort_bids(bids)[:depth] if depth > 0 else _sort_bids(bids)
+        next_asks = _sort_asks(asks)[:depth] if depth > 0 else _sort_asks(asks)
+        fault = _book_structure_fault(next_bids, next_asks)
+        if fault:
+            return LocalL2UpdateResult(
+                applied=False,
+                events=[
+                    _make_event(
+                        self,
+                        LocalL2EventKind.REBUILD_REQUIRED,
+                        now_ms,
+                        sequence,
+                        detail=fault,
+                    )
+                ],
+                fault_reason=fault,
+                rebuild_required=True,
+            )
+
+        self.bids = next_bids
+        self.asks = next_asks
         self.sequence = sequence
+        if sequence > 0:
+            self.last_update_id = sequence
         self.checksum = checksum
         self.last_snapshot_ms = now_ms
         self.observed_at_ms = now_ms
@@ -199,10 +220,19 @@ class LocalL2Book:
         """Merge delta levels into current book. Zero-qty levels are deleted."""
         prev_seq = previous_sequence or sequence - 1
 
-        # Sequence gap detection
-        if self.sequence > 0 and prev_seq > 0 and prev_seq > self.sequence:
+        # Sequence gap detection. max_sequence_gap=0 means strict continuity.
+        if self.sequence > 0 and prev_seq > 0 and prev_seq != self.sequence:
             gap = prev_seq - self.sequence
-            if self.max_sequence_gap > 0 and gap > self.max_sequence_gap:
+            if gap < 0:
+                return LocalL2UpdateResult(
+                    applied=False,
+                    events=[],
+                    fault_reason=(
+                        f"stale_update prev={self.sequence} incoming_prev={prev_seq}"
+                    ),
+                    rebuild_required=False,
+                )
+            if gap > 0 and (self.max_sequence_gap <= 0 or gap > self.max_sequence_gap):
                 return LocalL2UpdateResult(
                     applied=False,
                     events=[_make_event(self, LocalL2EventKind.SEQUENCE_GAP, now_ms, sequence,
@@ -210,19 +240,42 @@ class LocalL2Book:
                     fault_reason=f"sequence_gap_{gap}",
                     rebuild_required=True,
                 )
-            events = [_make_event(self, LocalL2EventKind.SEQUENCE_GAP, now_ms, sequence,
-                                  detail=f"small_gap={gap}")]
+            if gap > 0:
+                events = [_make_event(self, LocalL2EventKind.SEQUENCE_GAP, now_ms, sequence,
+                                      detail=f"small_gap={gap}")]
+            else:
+                events = []
         else:
             events = []
 
         depth = max_depth or self.max_depth
 
-        # Merge bids: update price if exists and qty>0, delete if qty==0, insert new
-        self.bids = _merge_levels(self.bids, bids, side="bid", max_depth=depth)
-        # Merge asks
-        self.asks = _merge_levels(self.asks, asks, side="ask", max_depth=depth)
+        next_bids = _merge_levels(self.bids, bids, side="bid", max_depth=depth)
+        next_asks = _merge_levels(self.asks, asks, side="ask", max_depth=depth)
+        fault = _book_structure_fault(next_bids, next_asks)
+        if fault:
+            events.append(
+                _make_event(
+                    self,
+                    LocalL2EventKind.REBUILD_REQUIRED,
+                    now_ms,
+                    sequence,
+                    detail=fault,
+                )
+            )
+            return LocalL2UpdateResult(
+                applied=False,
+                events=events,
+                fault_reason=fault,
+                rebuild_required=True,
+            )
+
+        self.bids = next_bids
+        self.asks = next_asks
 
         self.sequence = sequence
+        if sequence > 0:
+            self.last_update_id = sequence
         self.last_delta_ms = now_ms
         self.observed_at_ms = now_ms
 
@@ -252,15 +305,27 @@ class LocalL2Book:
         return LocalL2UpdateResult(applied=True, events=[])
 
     def compute_checksum(self) -> int:
-        """Deterministic CRC32 checksum over top-of-book prices and quantities.
+        """Deterministic signed CRC32 checksum over top book prices and sizes.
 
-        Uses CRC32 (IEEE 802.3 polynomial) — matches OKX book checksum spec.
+        Uses the OKX order-book checksum layout: up to 25 bid/ask levels,
+        alternating bid price:size and ask price:size, returned as signed int32.
         Non-OKX venues should set ChecksumMode.NONE (CRC32 is never silently applied).
         """
         if not self.bids or not self.asks:
             return 0
-        raw = f"{self.bids[0].price}:{self.bids[0].quantity}:{self.asks[0].price}:{self.asks[0].quantity}"
-        return binascii.crc32(raw.encode()) & 0xFFFFFFFF
+        parts: list[str] = []
+        for idx in range(25):
+            if idx < len(self.bids):
+                bid = self.bids[idx]
+                parts.extend([_checksum_number(bid.price), _checksum_number(bid.quantity)])
+            if idx < len(self.asks):
+                ask = self.asks[idx]
+                parts.extend([_checksum_number(ask.price), _checksum_number(ask.quantity)])
+        raw = ":".join(parts)
+        checksum = binascii.crc32(raw.encode()) & 0xFFFFFFFF
+        if checksum >= 2**31:
+            checksum -= 2**32
+        return checksum
 
     def clear_book(self, now_ms: int) -> list[LocalL2Event]:
         """Clear all levels, emit BOOK_CLEARED event."""
@@ -368,7 +433,12 @@ class LocalL2Book:
             self.bootstrap_started_ms = now_ms
 
     def transition_to_hot(self) -> None:
-        if self.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING, L2BookStatus.RESUME_WAITING):
+        if self.status in (
+            L2BookStatus.BOOTSTRAPPING,
+            L2BookStatus.REBUILDING,
+            L2BookStatus.DEGRADED,
+            L2BookStatus.RESUME_WAITING,
+        ):
             self.status = L2BookStatus.HOT
 
     def transition_to_degraded(self, error: str = "") -> None:
@@ -408,6 +478,24 @@ def _sort_bids(levels: list[PriceLevel]) -> list[PriceLevel]:
 
 def _sort_asks(levels: list[PriceLevel]) -> list[PriceLevel]:
     return sorted(levels, key=lambda x: x.price)
+
+
+def _book_structure_fault(bids: list[PriceLevel], asks: list[PriceLevel]) -> str:
+    if not bids or not asks:
+        return ""
+    best_bid = bids[0].price
+    best_ask = asks[0].price
+    if best_bid <= 0 or best_ask <= 0:
+        return f"non_positive_top best_bid={best_bid} best_ask={best_ask}"
+    if best_bid >= best_ask:
+        return f"crossed_or_locked_book best_bid={best_bid} best_ask={best_ask}"
+    return ""
+
+
+def _checksum_number(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return format(value, "f").rstrip("0").rstrip(".")
 
 
 def _merge_levels(

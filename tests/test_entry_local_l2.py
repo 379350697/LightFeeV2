@@ -168,6 +168,19 @@ class TestApplyBookReadinessToLeg:
         assert diag["observed_at_ms"] == 9500
         assert diag["sequence"] == 7
 
+    def test_stale_crossed_book_reports_stale_before_crossed(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = EntryLocalL2LegSession(venue="binance", symbol="BTCUSDT")
+        book = self._book(observed_at_ms=4000, bid=50100.0, ask=50100.0)
+
+        diag = apply_book_readiness_to_leg(leg, book, now_ms=10000, stale_after_ms=5000)
+
+        assert leg.state == EntryLocalL2LegState.FAULTED
+        assert leg.fault == EntryLocalL2LegFault.STALE_BOOK
+        assert diag["reason"] == "stale_book"
+        assert diag["detail"] == "age_ms=6000 stale_after_ms=5000"
+
     @pytest.mark.parametrize(
         "book_factory,expected_reason,expected_state,expected_detail",
         [
@@ -1644,6 +1657,52 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt.journal.close()
 
         assert activated_symbols == ["S0USDT", "S1USDT", "S2USDT"]
+
+    @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_connects_registered_ws_streams(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("background bootstrap is stubbed in this test")
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_ws_enabled = True
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        calls = []
+
+        def start_ws_streams(venue, symbols, adapter=None):
+            calls.append(("start", venue, tuple(symbols), adapter is not None))
+            return len(symbols)
+
+        async def connect_ws_streams():
+            calls.append(("connect",))
+            return 2
+
+        def start_background_bootstrap(**kwargs):
+            calls.append(("bootstrap", kwargs["venue"], tuple(kwargs["symbols"])))
+
+        monkeypatch.setattr(rt.l2_data_plane, "start_ws_streams", start_ws_streams)
+        monkeypatch.setattr(rt.l2_data_plane, "connect_ws_streams", connect_ws_streams)
+        monkeypatch.setattr(
+            rt.l2_data_plane, "start_background_bootstrap", start_background_bootstrap,
+        )
+
+        try:
+            await rt._ensure_l2_active_for_candidates([candidate], now_ms=10000)
+        finally:
+            rt.journal.close()
+
+        assert ("start", "binance", ("BTCUSDT",), True) in calls
+        assert ("start", "bybit", ("BTCUSDT",), True) in calls
+        assert ("connect",) in calls
 
     @pytest.mark.asyncio
     async def test_snapshot_degraded_and_stale_events_include_root_diagnostics(

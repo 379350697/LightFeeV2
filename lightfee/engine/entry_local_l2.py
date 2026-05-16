@@ -242,17 +242,6 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = detail
         return diag
 
-    if hasattr(book, "has_crossed_book") and book.has_crossed_book():
-        detail = f"best_bid={book.best_bid()} best_ask={book.best_ask()}"
-        leg.mark_faulted(
-            EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK,
-            detail,
-            seen_at_ms=observed_at_ms,
-        )
-        diag["reason"] = "crossed_or_locked_book"
-        diag["detail"] = detail
-        return diag
-
     if stale_after_ms > 0 and hasattr(book, "is_stale") and book.is_stale(stale_after_ms, now_ms):
         detail = f"age_ms={age_ms} stale_after_ms={stale_after_ms}"
         leg.mark_faulted(
@@ -261,6 +250,17 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
             seen_at_ms=observed_at_ms,
         )
         diag["reason"] = "stale_book"
+        diag["detail"] = detail
+        return diag
+
+    if hasattr(book, "has_crossed_book") and book.has_crossed_book():
+        detail = f"best_bid={book.best_bid()} best_ask={book.best_ask()}"
+        leg.mark_faulted(
+            EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK,
+            detail,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = "crossed_or_locked_book"
         diag["detail"] = detail
         return diag
 

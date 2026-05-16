@@ -71,7 +71,7 @@ def gate_depth_stream_url() -> str:
 
 def aster_depth_stream_url(symbol: str) -> str:
     """Aster (Binance-compatible) per-symbol depth delta stream."""
-    return f"wss://fstream.aster.exchange/ws/{symbol.lower()}@depth@100ms"
+    return f"wss://fstream.asterdex.com/ws/{symbol.lower()}@depth@100ms"
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,11 @@ class BinanceL2WsClient(LocalL2WsClient):
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("b", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("a", [])],
             sequence=int(raw.get("u", 0)),
-            previous_sequence=int(raw.get("U", 0)) - 1 if raw.get("U") else 0,
+            previous_sequence=(
+                int(raw.get("pu", 0))
+                if raw.get("pu") is not None
+                else int(raw.get("U", 0)) - 1 if raw.get("U") else 0
+            ),
             event_time_ms=int(raw.get("E", 0)),
             received_at_ms=int(time.time() * 1000),
             update_kind=LocalL2UpdateKind.DELTA,
@@ -356,6 +360,7 @@ class OkxL2WsClient(LocalL2WsClient):
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in row.get("bids", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in row.get("asks", [])],
             sequence=int(row.get("seqId", 0)),
+            previous_sequence=int(row.get("prevSeqId", raw.get("prevSeqId", 0))),
             checksum=int(row.get("checksum", -1)),
             event_time_ms=int(row.get("ts", 0)),
             received_at_ms=now_ms,
@@ -382,7 +387,7 @@ class BybitL2WsClient(LocalL2WsClient):
     def build_subscribe_message(self) -> Optional[dict]:
         return {
             "op": "subscribe",
-            "args": [f"orderbook.1.{self.symbol}"],
+            "args": [f"orderbook.50.{self.symbol}"],
         }
 
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
@@ -549,7 +554,11 @@ class AsterL2WsClient(LocalL2WsClient):
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("b", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("a", [])],
             sequence=int(raw.get("u", 0)),
-            previous_sequence=int(raw.get("U", 0)) - 1 if raw.get("U") else 0,
+            previous_sequence=(
+                int(raw.get("pu", 0))
+                if raw.get("pu") is not None
+                else int(raw.get("U", 0)) - 1 if raw.get("U") else 0
+            ),
             event_time_ms=int(raw.get("E", 0)),
             received_at_ms=int(time.time() * 1000),
             update_kind=LocalL2UpdateKind.DELTA,

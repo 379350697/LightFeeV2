@@ -237,8 +237,8 @@ def parse_okx_l2_update(
     asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if float(a[1]) > 0]
 
     seq = int(entry.get("seqId", 0))
-    prev_seq = payload.get("prevSeqId", seq - 1)
-    checksum = entry.get("checksum", 0)
+    prev_seq = int(entry.get("prevSeqId", payload.get("prevSeqId", seq - 1)))
+    checksum = int(entry.get("checksum", 0))
 
     action = payload.get("action", "update")
     kind = LocalL2UpdateKind.SNAPSHOT if action == "snapshot" else LocalL2UpdateKind.DELTA

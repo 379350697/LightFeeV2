@@ -104,6 +104,28 @@ class TestBinanceL2WsClientParsing:
         assert update.asks[0].quantity == 0.5
         _close_data_plane(dp, _)
 
+    def test_parses_pu_as_previous_sequence(self):
+        dp, rt, _ = _make_data_plane()
+        client = BinanceL2WsClient(
+            venue="binance", symbol="BTCUSDT", data_plane=dp,
+        )
+
+        raw = {
+            "e": "depthUpdate",
+            "E": 1715000000000,
+            "s": "BTCUSDT",
+            "U": 1001,
+            "u": 1010,
+            "pu": 1009,
+            "b": [["50000.00", "1.5"]],
+            "a": [["50100.00", "0.5"]],
+        }
+
+        update = client.parse_depth_message(raw)
+        assert update is not None
+        assert update.previous_sequence == 1009
+        _close_data_plane(dp, _)
+
     def test_ignores_non_depth_messages(self):
         dp, rt, _ = _make_data_plane()
         client = BinanceL2WsClient(
@@ -187,6 +209,31 @@ class TestOkxL2WsClientParsing:
         assert update.checksum == 12345
         _close_data_plane(dp, _)
 
+    def test_parses_row_prev_seq_id(self):
+        dp, rt, _ = _make_data_plane()
+        client = OkxL2WsClient(
+            venue="okx", symbol="BTC-USDT-SWAP", data_plane=dp,
+        )
+
+        raw = {
+            "arg": {"channel": "books", "instId": "BTC-USDT-SWAP"},
+            "action": "update",
+            "data": [{
+                "asks": [],
+                "bids": [["50000.00", "0.5", "0", "1"]],
+                "ts": "1715000001000",
+                "checksum": -855196043,
+                "prevSeqId": 80,
+                "seqId": 99,
+            }],
+        }
+
+        update = client.parse_depth_message(raw)
+        assert update is not None
+        assert update.previous_sequence == 80
+        assert update.checksum == -855196043
+        _close_data_plane(dp, _)
+
     def test_ignores_non_books_channel(self):
         dp, rt, _ = _make_data_plane()
         client = OkxL2WsClient(
@@ -198,6 +245,18 @@ class TestOkxL2WsClientParsing:
 
 
 class TestBybitL2WsClientParsing:
+    def test_subscribes_to_level_50_book(self):
+        dp, rt, _ = _make_data_plane()
+        client = BybitL2WsClient(
+            venue="bybit", symbol="BTCUSDT", data_plane=dp,
+        )
+
+        assert client.build_subscribe_message() == {
+            "op": "subscribe",
+            "args": ["orderbook.50.BTCUSDT"],
+        }
+        _close_data_plane(dp, _)
+
     def test_parses_snapshot(self):
         dp, rt, _ = _make_data_plane()
         client = BybitL2WsClient(
@@ -423,6 +482,37 @@ class TestGateL2WsClientParsing:
 
 
 class TestAsterL2WsClientParsing:
+    def test_uses_official_aster_futures_stream_host(self):
+        dp, rt, _ = _make_data_plane()
+        client = AsterL2WsClient(
+            venue="aster", symbol="BTCUSDT", data_plane=dp,
+        )
+
+        assert client.websocket_url() == "wss://fstream.asterdex.com/ws/btcusdt@depth@100ms"
+        _close_data_plane(dp, _)
+
+    def test_parses_pu_as_previous_sequence(self):
+        dp, rt, _ = _make_data_plane()
+        client = AsterL2WsClient(
+            venue="aster", symbol="BTCUSDT", data_plane=dp,
+        )
+
+        raw = {
+            "e": "depthUpdate",
+            "E": 1715000000000,
+            "s": "BTCUSDT",
+            "U": 1001,
+            "u": 1010,
+            "pu": 1009,
+            "b": [["50000.00", "1.5"]],
+            "a": [["50100.00", "0.5"]],
+        }
+
+        update = client.parse_depth_message(raw)
+        assert update is not None
+        assert update.previous_sequence == 1009
+        _close_data_plane(dp, _)
+
     def test_parses_depth_update_delta(self):
         dp, rt, _ = _make_data_plane()
         client = AsterL2WsClient(

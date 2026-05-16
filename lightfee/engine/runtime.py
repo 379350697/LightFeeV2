@@ -101,6 +101,7 @@ class LiveRuntime:
             l2_runtime=self.local_l2_runtime,
             journal=self.journal,
         )
+        self.l2_data_plane.hot_stale_after_ms = self._configured_entry_l2_stale_after_ms(config)
 
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
@@ -539,6 +540,7 @@ class LiveRuntime:
         # Collect (venue, symbol) pairs from candidates that need L2
         # CandidateInput has long_venue/short_venue as str fields (not leg objects)
         needed: dict[str, set[str]] = {}  # venue -> {symbols}
+        stale_after_ms = self._entry_local_l2_stale_after_ms()
         for c in candidates:
             sym = getattr(c, 'symbol', '')
             for ven_str in (getattr(c, 'long_venue', ''), getattr(c, 'short_venue', '')):
@@ -546,10 +548,20 @@ class LiveRuntime:
                     continue
                 # Skip if already active
                 book = self.local_l2_runtime.get_book(ven_str, sym)
-                if book is not None and book.status in (
-                    L2BookStatus.HOT, L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED,
-                ):
-                    continue
+                if book is not None:
+                    if book.status == L2BookStatus.HOT:
+                        stale = book.is_stale(stale_after_ms, now_ms)
+                        crossed = book.has_crossed_book()
+                        if not stale and not crossed:
+                            continue
+                        book.transition_to_rebuilding(now_ms)
+                        book.fault_reason = (
+                            "crossed_or_locked_book"
+                            if crossed and not stale
+                            else "stale_hot_book"
+                        )
+                    elif book.status == L2BookStatus.BOOTSTRAPPING:
+                        continue
                 needed.setdefault(ven_str, set()).add(sym)
 
         if not needed:
@@ -560,6 +572,8 @@ class LiveRuntime:
         )
         from lightfee.marketdata.local_l2_venues import get_venue_rules
 
+        registered_total = 0
+        registered_venues: set[str] = set()
         for ven_str, symbols in needed.items():
             # Limit per venue budget (V1: take(per_venue_budget))
             symbols_list = sorted(symbols)[:per_venue_budget]
@@ -584,8 +598,13 @@ class LiveRuntime:
                 if book.status == L2BookStatus.COLD:
                     book.transition_to_bootstrapping(now_ms)
 
-            # Start WS stream for this venue's new symbols
-            self.l2_data_plane.start_ws_streams(ven_str, symbols_list, adapter=adapter)
+            if getattr(self.config.strategy, 'local_l2_ws_enabled', False):
+                registered = self.l2_data_plane.start_ws_streams(
+                    ven_str, symbols_list, adapter=adapter,
+                )
+                if registered > 0:
+                    registered_total += registered
+                    registered_venues.add(ven_str)
 
             # Start background bootstrap worker
             bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
@@ -598,6 +617,18 @@ class LiveRuntime:
                 batch_size=bs_batch,
                 jitter_ms=bs_jitter,
                 retry_backoff_ms=bs_retry,
+            )
+
+        if registered_total > 0:
+            connected = await self.l2_data_plane.connect_ws_streams()
+            self.journal.append(
+                "runtime.local_l2_dynamic_ws_started",
+                {
+                    "registered_stream_count": registered_total,
+                    "connected_stream_count": connected,
+                    "venues": sorted(registered_venues),
+                    "ts_ms": wall_clock_now_ms(),
+                },
             )
 
     async def _restore_local_l2_state(self) -> None:
@@ -2772,12 +2803,16 @@ class LiveRuntime:
         return True, ""
 
     def _entry_local_l2_stale_after_ms(self) -> int:
+        return self._configured_entry_l2_stale_after_ms(self.config)
+
+    @staticmethod
+    def _configured_entry_l2_stale_after_ms(config) -> int:
         for field_name in (
             "entry_local_l2_book_stale_after_ms",
             "local_l2_quiet_book_grace_ms",
             "local_l2_max_age_ms",
         ):
-            value = int(getattr(self.config.strategy, field_name, 0) or 0)
+            value = int(getattr(config.strategy, field_name, 0) or 0)
             if value > 0:
                 return value
         return 300_000

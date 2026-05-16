@@ -157,6 +157,47 @@ class TestSequenceGapDetection:
         assert result.applied is True
         assert result.rebuild_required is False
 
+    def test_zero_sequence_gap_tolerance_requires_continuity(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.max_sequence_gap = 0
+        book.sequence = 100
+
+        result = book.apply_delta(
+            [PriceLevel(50000.0, 1.0)],
+            [PriceLevel(50001.0, 1.0)],
+            sequence=111,
+            previous_sequence=110,
+            now_ms=2000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert "sequence_gap" in result.fault_reason
+
+    def test_stale_delta_is_ignored_without_mutating_book(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.max_sequence_gap = 0
+        book.apply_snapshot(
+            [PriceLevel(50000.0, 1.0)],
+            [PriceLevel(50100.0, 1.0)],
+            sequence=100,
+            now_ms=10000,
+        )
+
+        result = book.apply_delta(
+            [PriceLevel(50050.0, 1.0)],
+            [],
+            sequence=99,
+            previous_sequence=98,
+            now_ms=11000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is False
+        assert result.fault_reason == "stale_update prev=100 incoming_prev=98"
+        assert book.sequence == 100
+        assert book.best_bid() == 50000.0
+
     def test_no_gap_when_zero_sequence(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.sequence = 0  # Fresh book, no sequence tracking
@@ -169,6 +210,77 @@ class TestSequenceGapDetection:
         )
 
         assert result.applied is True
+
+    def test_crossed_snapshot_is_rejected_without_polluting_existing_book(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1000,
+        )
+
+        result = book.apply_snapshot(
+            [PriceLevel(102.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=8,
+            now_ms=2000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert "crossed_or_locked_book" in result.fault_reason
+        assert book.sequence == 7
+        assert book.best_bid() == 100.0
+        assert book.best_ask() == 101.0
+
+    def test_crossed_delta_is_rejected_atomically_and_preserves_sequence(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1000,
+        )
+
+        result = book.apply_delta(
+            [PriceLevel(102.0, 1.0)],
+            [],
+            sequence=8,
+            previous_sequence=7,
+            now_ms=2000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert "crossed_or_locked_book" in result.fault_reason
+        assert book.sequence == 7
+        assert book.observed_at_ms == 1000
+        assert book.best_bid() == 100.0
+        assert book.best_ask() == 101.0
+
+    def test_valid_atomic_batch_that_temporarily_touches_top_does_not_rebuild(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1000,
+        )
+
+        result = book.apply_delta(
+            [PriceLevel(101.0, 1.0)],
+            [PriceLevel(101.0, 0.0), PriceLevel(102.0, 1.0)],
+            sequence=8,
+            previous_sequence=7,
+            now_ms=2000,
+        )
+
+        assert result.applied is True
+        assert result.rebuild_required is False
+        assert book.sequence == 8
+        assert book.best_bid() == 101.0
+        assert book.best_ask() == 102.0
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +322,17 @@ class TestChecksumVerification:
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         result = book.verify_checksum(expected=0, now_ms=2000)
         assert len(result.events) == 0
+
+    def test_okx_checksum_uses_first_25_levels_and_signed_int32(self):
+        book = LocalL2Book(venue="okx", symbol="BTC-USDT-SWAP")
+        book.apply_snapshot(
+            [PriceLevel(3366.1, 7), PriceLevel(3366, 6)],
+            [PriceLevel(3366.8, 9), PriceLevel(3368, 8)],
+            sequence=1,
+            now_ms=1000,
+        )
+
+        assert book.compute_checksum() == -1881014294
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +497,48 @@ class TestMarketSnapshotDiagnostics:
         assert ss.max_consecutive_failures == 5
         assert ss.last_snapshot_ms == 0
         assert ss.snapshot_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshots_rebuilds_stale_hot_book(self):
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(110.0, 1.0)],
+                    asks=[PriceLevel(111.0, 1.0)],
+                    sequence=8,
+                    event_time_ms=8000,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        rt = LocalL2Runtime()
+        journal = type("Journal", (), {"append": lambda self, kind, payload: None})()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.hot_stale_after_ms = 5000
+
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1000,
+        )
+        book.transition_to_bootstrapping(1000)
+        book.transition_to_hot()
+
+        dispatched = await dp.sync_snapshots(
+            {Venue.BINANCE: Adapter()},
+            now_ms=8000,
+            scan_promoted=True,
+        )
+
+        assert dispatched == 1
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 8
+        assert book.best_bid() == 110.0
 
     def test_degraded_transition_preserves_error(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")

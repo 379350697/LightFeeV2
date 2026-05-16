@@ -157,16 +157,12 @@ class LocalL2Runtime:
         # Venue rules: checksum verification after apply
         from lightfee.marketdata.local_l2_venues import get_venue_rules
         rules = get_venue_rules(update.venue)
-        if rules.should_verify_checksum() and update.checksum > 0:
+        if rules.should_verify_checksum() and update.checksum != 0:
             checksum_result = book.verify_checksum(update.checksum, now_ms)
             result.events.extend(checksum_result.events)
             if checksum_result.fault_reason:
+                checksum_result.rebuild_required = True
                 result = checksum_result
-                self.handle_runtime_failure(
-                    update.venue, update.symbol,
-                    RuntimeFaultKind.CHECKSUM_MISMATCH,
-                    checksum_result.fault_reason, now_ms,
-                )
 
         for event in result.events:
             self._enqueue_event(event)
