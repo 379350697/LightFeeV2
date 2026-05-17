@@ -21,6 +21,7 @@ from lightfee.engine.bootstrap import (
 )
 from lightfee.engine.lifecycle import (
     can_enter_new_positions,
+    enter_fail_closed,
     set_lifecycle,
     transition_to_reconciling,
     transition_to_running,
@@ -37,7 +38,7 @@ from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
 )
-from lightfee.engine.state import EngineState
+from lightfee.engine.state import EngineState, HedgeInflight
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -1718,7 +1719,7 @@ class LiveRuntime:
             pending.reconcile_attempt += 1
             try:
                 # V1: prefer hedge_inflight CID for reconciliation queries
-                hedge_lookup_cid = pending.hedge_inflight or pending.hedge_client_order_id
+                hedge_lookup_cid = pending.hedge_inflight.client_order_id if pending.hedge_inflight else pending.hedge_client_order_id
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -1835,8 +1836,79 @@ class LiveRuntime:
                 continue
 
             # --- Clear stale hedge inflight after negative evidence ---
-            if pending.hedge_inflight:
+            if pending.hedge_inflight is not None:
                 self._try_clear_stale_hedge_inflight(pending, entry_id, result, now_ms)
+
+            # --- V1: hedge deadline check ---
+            # If inflight hedge has exceeded its hard deadline, abort fail-closed
+            # before attempting another hedge submit.
+            if pending.hedge_inflight is not None:
+                deadline = self._pending_entry_hedge_deadline_decision(pending, now_ms)
+                if deadline.get("hard_breached"):
+                    self.journal.append(
+                        "pending_entry.hedge_deadline_breached",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "hedge_venue": pending.hedge_venue().value,
+                            "hedge_elapsed_ms": pending.hedge_inflight.elapsed_ms(now_ms),
+                            "deadline_ms": deadline["hard_deadline_ms"],
+                            "attempt": pending.hedge_inflight.attempt,
+                        },
+                    )
+                    removed = await self._abort_pending_entry_fail_closed(
+                        pending, entry_id,
+                        "entry hedge deadline breached during reconciliation",
+                    )
+                    if removed:
+                        resolved_entry_ids.append(entry_id)
+                    continue
+
+            # --- V1: terminalization budget check ---
+            # Entries past their hard ceiling must go through cleanup/abort,
+            # never direct pop.  min-notional residuals (repair_state set) past
+            # hard ceiling also go through cleanup — they must not hang forever.
+            budget = self._pending_entry_terminalization_budget(pending, now_ms)
+            if budget is not None and budget.get("hard_ceiling_reached"):
+                if pending.repair_state:
+                    self.journal.append(
+                        "pending_entry.min_notional_hard_ceiling_cleanup",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "repair_state": pending.repair_state,
+                            "final_reason": budget["final_reason"],
+                            "lifetime_ms": budget["lifetime_ms"],
+                        },
+                    )
+                if not pending.has_any_fill():
+                    # Zero-fill entry past hard ceiling → live-size probe
+                    # before popping to verify no residual exists.
+                    abandoned = await self._try_abandon_stale_entry(pending, entry_id)
+                    if abandoned:
+                        resolved_entry_ids.append(entry_id)
+                        continue
+                    # Probe failed → abort (with cleanup) per V1
+                removed = await self._abort_pending_entry(
+                    pending, entry_id, budget["final_reason"]
+                )
+                if removed:
+                    resolved_entry_ids.append(entry_id)
+                continue
+            if budget is not None and budget.get("force_terminal_reached"):
+                # Zero-fill entry past force_terminal threshold → safe to
+                # pop directly (no real exposure on either leg).
+                self.journal.append(
+                    "pending_entry.force_terminalized",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": budget["final_reason"],
+                        "lifetime_ms": budget["lifetime_ms"],
+                    },
+                )
+                resolved_entry_ids.append(entry_id)
+                continue
 
             # --- V1: drive missing hedge on normal tick ---
             missing = pending.missing_hedge_quantity()
@@ -1975,14 +2047,14 @@ class LiveRuntime:
         try:
             if long_adapter is not None:
                 pos = await long_adapter.fetch_position(pending.symbol)
-                long_zero = pos.quantity <= 0.0
+                long_zero = pos is None or abs(pos.quantity) <= 1e-9
         except Exception:
             long_zero = False  # can't probe → assume not zero
 
         try:
             if short_adapter is not None:
                 pos = await short_adapter.fetch_position(pending.symbol)
-                short_zero = pos.quantity <= 0.0
+                short_zero = pos is None or abs(pos.quantity) <= 1e-9
         except Exception:
             short_zero = False
 
@@ -2032,20 +2104,279 @@ class LiveRuntime:
 
         if order_absent and fills_zero and position_zero:
             old_inflight = pending.hedge_inflight
-            pending.hedge_inflight = ""
+            pending.hedge_inflight = None
             self.journal.append(
                 "pending_entry.hedge_inflight_cleared",
                 {
                     "entry_id": entry_id,
                     "symbol": pending.symbol,
                     "hedge_venue": hedge_venue.value,
-                    "old_hedge_inflight": old_inflight,
+                    "old_hedge_inflight": old_inflight.client_order_id if old_inflight else "",
                     "hedge_status": hedge_status,
                     "hedge_fill_quantity": hedge_fill_qty,
                     "hedge_position_quantity": hedge_pos_qty,
                     "ts_ms": now_ms,
                 },
             )
+
+    # ------------------------------------------------------------------
+    # V1 parity: hedge deadline, terminalization budget, abort/cleanup
+    # ------------------------------------------------------------------
+
+    def _pending_entry_hedge_deadline_decision(
+        self, pending, now_ms: int
+    ) -> dict:
+        """V1: pending_entry_hedge_deadline_decision + adaptive_hedge_deadline_status.
+
+        Returns dict with:
+          - hard_breached: bool — elapsed >= hard_deadline_ms
+          - soft_breached: bool — elapsed >= soft_deadline_ms
+          - hard_deadline_ms: int — effective hard deadline
+          - soft_deadline_ms: int — effective soft deadline
+          - hedge_elapsed_ms: int — time since hedge submission
+        """
+        if pending.hedge_inflight is None:
+            return {
+                "hard_breached": False,
+                "soft_breached": False,
+                "hard_deadline_ms": 0,
+                "soft_deadline_ms": 0,
+                "hedge_elapsed_ms": 0,
+            }
+
+        hedge_elapsed_ms = pending.hedge_inflight.elapsed_ms(now_ms)
+        strategy = self.config.strategy
+        base_deadline_ms = getattr(strategy, "maker_hedge_deadline_ms", 800)
+        soft_deadline_ms = base_deadline_ms // 2
+        hard_deadline_ms = base_deadline_ms
+
+        # V1: legacy inflight (submitted_at_ms=0) has no timestamp — fall back
+        # to entry lifetime as a conservative proxy so old production pending
+        # entries eventually get a deadline decision instead of blocking
+        # hedge drive indefinitely.
+        if pending.hedge_inflight.submitted_at_ms <= 0:
+            entry_lifetime = pending.compute_lifetime_ms(now_ms)
+            if entry_lifetime >= getattr(strategy, "pending_entry_hard_ceiling_ms", 120000):
+                hedge_elapsed_ms = entry_lifetime
+
+        # Adaptive: if hedge has execution progress (partial fill) or quote is
+        # not fresh, extend deadlines.  V1 uses adaptive_hedge_deadline_status().
+        has_progress = pending.hedge_leg_filled > 1e-9
+
+        if has_progress:
+            hard_deadline_ms = base_deadline_ms * 2
+
+        hard_breached = hedge_elapsed_ms >= hard_deadline_ms
+        soft_breached = hedge_elapsed_ms >= soft_deadline_ms
+
+        return {
+            "hard_breached": hard_breached,
+            "soft_breached": soft_breached,
+            "hard_deadline_ms": hard_deadline_ms,
+            "soft_deadline_ms": soft_deadline_ms,
+            "hedge_elapsed_ms": hedge_elapsed_ms,
+        }
+
+    def _pending_entry_terminalization_budget(
+        self, pending, now_ms: int
+    ) -> dict | None:
+        """V1: pending_entry_terminalization_budget_from_input.
+
+        Returns None if no budget is active, else dict with:
+          - hard_ceiling_reached: bool
+          - force_terminal_reached: bool
+          - final_reason: str
+          - lifetime_ms: int
+        """
+        strategy = self.config.strategy
+        hard_ceiling_ms = getattr(strategy, "pending_entry_hard_ceiling_ms", 120000)
+        force_terminal_after_ms = getattr(strategy, "pending_entry_force_terminal_after_ms", 60000)
+
+        lifetime_ms = pending.compute_lifetime_ms(now_ms)
+
+        hard_ceiling_reached = lifetime_ms >= hard_ceiling_ms
+        force_terminal_reached = (
+            lifetime_ms >= force_terminal_after_ms
+            and (not pending.has_any_fill() or pending.missing_hedge_quantity() <= 1e-9)
+        )
+
+        has_inflight = pending.hedge_inflight is not None
+        if has_inflight and not hard_ceiling_reached:
+            # V1: inflight hedge blocks terminalization until hard ceiling
+            return None
+
+        if not hard_ceiling_reached and not force_terminal_reached:
+            return None
+
+        final_reason = (
+            "pending_entry_max_lifetime_exhausted"
+            if hard_ceiling_reached
+            else "pending_entry_zero_fill_lifetime_exhausted"
+        )
+
+        return {
+            "hard_ceiling_reached": hard_ceiling_reached,
+            "force_terminal_reached": force_terminal_reached,
+            "final_reason": final_reason,
+            "lifetime_ms": lifetime_ms,
+        }
+
+    async def _abort_pending_entry_fail_closed(
+        self, pending, entry_id: str, reason: str
+    ) -> bool:
+        """V1: abort_pending_entry_fail_closed — enter fail_closed, then abort.
+
+        entry_sync.rs:2448-2456
+
+        Returns True if pending was removed, False if retained (cleanup failed).
+        """
+        enter_fail_closed(self.state)
+        return await self._abort_pending_entry(pending, entry_id, reason)
+
+    async def _abort_pending_entry(
+        self, pending, entry_id: str, reason: str
+    ) -> bool:
+        """V1: abort_pending_entry — cleanup maker & hedge exposure, then remove.
+
+        entry_sync.rs:4612-4708
+
+        Two-tier exposure cleanup:
+        1. cleanup_failed_leg_exposure for both maker and hedge legs
+        2. If cleanup fails, compensation_hard_stop for both legs
+        3. If hard stop also fails, enter fail_closed and retain pending
+        4. On success, remove pending and emit entry.aborted
+
+        Returns True if pending was removed, False if retained (cleanup failed).
+        """
+        maker_venue = pending.maker_venue()
+        hedge_venue = pending.hedge_venue()
+        symbol = pending.symbol
+
+        # Tier 1: cleanup/flatten residual exposure on both legs
+        maker_cleaned = await self._cleanup_failed_leg_exposure(
+            maker_venue, symbol, entry_id, "maker"
+        )
+        hedge_cleaned = await self._cleanup_failed_leg_exposure(
+            hedge_venue, symbol, entry_id, "hedge"
+        )
+
+        # V1: None (adapter missing) means uncertain — treat as failure
+        if maker_cleaned is not True or hedge_cleaned is not True:
+            # Tier 2: compensation hard stop (market order to flatten at any price)
+            maker_stopped = await self._cleanup_failed_leg_exposure(
+                maker_venue, symbol, entry_id, "maker_hard_stop"
+            )
+            hedge_stopped = await self._cleanup_failed_leg_exposure(
+                hedge_venue, symbol, entry_id, "hedge_hard_stop"
+            )
+
+            if maker_stopped is not True or hedge_stopped is not True:
+                # Tier 3: cleanup failed → fail_closed, retain pending
+                enter_fail_closed(self.state)
+                self.state.last_error = reason
+                self.journal.append(
+                    "entry.abort_failed_pending_retained",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": symbol,
+                        "reason": reason,
+                        "maker_cleaned": maker_cleaned,
+                        "hedge_cleaned": hedge_cleaned,
+                        "maker_hard_stop": maker_stopped,
+                        "hedge_hard_stop": hedge_stopped,
+                    },
+                )
+                return False
+
+        # Success: remove pending entry
+        self.state.pending_entries.pop(entry_id, None)
+        self.state.last_error = reason
+        self.journal.append(
+            "entry.aborted",
+            {
+                "entry_id": entry_id,
+                "symbol": symbol,
+                "reason": reason,
+                "maker_quantity": pending.maker_leg_filled,
+                "hedge_quantity": pending.hedge_leg_filled,
+            },
+        )
+        return True
+
+    async def _cleanup_failed_leg_exposure(
+        self, venue, symbol: str, entry_id: str, stage: str
+    ) -> bool | None:
+        """V1: cleanup_failed_leg_exposure — flatten residual position on one venue.
+
+        entry.rs:4101-4144
+
+        Returns:
+          True: position was flattened (or was already zero)
+          False: cleanup failed (position remains or can't verify)
+          None: no adapter available (caller treats as uncertain — not success)
+        """
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return None
+
+        try:
+            pos = await adapter.fetch_position(symbol)
+        except Exception:
+            return False  # can't verify — assume position exists
+
+        if pos is None or abs(pos.quantity) <= 1e-9:
+            return True  # Already flat
+
+        # V1: direction is based on position.side, NOT signed quantity.
+        # V2 PositionSnapshot.quantity is always abs(size); side carries direction.
+        # side=BUY (long) → cleanup SELL; side=SELL (short) → cleanup BUY
+        cleanup_side = pos.side.opposite()
+
+        self.journal.append(
+            "entry.cleanup_leg_exposure",
+            {
+                "entry_id": entry_id,
+                "stage": stage,
+                "venue": venue.value,
+                "symbol": symbol,
+                "size": pos.quantity,
+                "side": pos.side.value,
+                "cleanup_side": cleanup_side.value,
+            },
+        )
+
+        try:
+            from lightfee.core.domain import OrderRequest
+
+            req = OrderRequest(
+                venue=venue,
+                symbol=symbol,
+                side=cleanup_side,
+                quantity=abs(pos.quantity),
+                price=0.0,  # market order
+                post_only=False,
+                reduce_only=True,  # V1: cleanup always reduce-only
+            )
+            fill = await adapter.place_order(req)
+            self._flush_adapter_order_diagnostics(adapter)
+
+            # V1: cleanup success needs EITHER fill covering target qty
+            # OR verified-flat position after partial fill.
+            target_qty = abs(pos.quantity)
+            if fill.quantity >= target_qty - 1e-9:
+                return True
+
+            # Partial fill — re-fetch position to verify true flatness
+            try:
+                verify_pos = await adapter.fetch_position(symbol)
+                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                    return True  # Position flat despite partial fill
+            except Exception:
+                pass
+
+            return False  # Position not flat after cleanup
+        except Exception:
+            return False
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
         """Force-reconcile pending entries ignoring backoff windows.
@@ -2064,7 +2395,7 @@ class LiveRuntime:
                 continue
 
             try:
-                hedge_lookup_cid = pending.hedge_inflight or pending.hedge_client_order_id
+                hedge_lookup_cid = pending.hedge_inflight.client_order_id if pending.hedge_inflight else pending.hedge_client_order_id
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -2184,33 +2515,16 @@ class LiveRuntime:
             if not pending.startup_recovery_ready():
                 continue
 
-            # --- Step 3: Terminalization budget ---
-            # V1: pending_entry_terminalization_budget_from_input
-            has_inflight = pending.uncertain_outcome and bool(pending.maker_order_id)
-            hard_ceiling_reached = lifetime_ms >= hard_ceiling_ms
-            force_terminal_reached = (
-                lifetime_ms >= force_terminal_after_ms
-                and (not pending.has_any_fill() or pending.missing_hedge_quantity() <= 1e-9)
-            )
-
-            if has_inflight and not hard_ceiling_reached:
-                # V1: inflight hedge blocks terminalization until hard ceiling
-                pending.reconcile_attempt += 1
-                self._apply_reconcile_backoff(pending, now_ms)
-                continue
-
-            budget_active = hard_ceiling_reached or force_terminal_reached
-            if not budget_active:
+            # --- Step 3: Terminalization budget (shared helper) ---
+            budget = self._pending_entry_terminalization_budget(pending, now_ms)
+            if budget is None:
                 # Below terminalization thresholds — re-poll, don't force
                 pending.reconcile_attempt += 1
                 self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
-            final_reason = (
-                "pending_entry_max_lifetime_exhausted"
-                if hard_ceiling_reached
-                else "pending_entry_zero_fill_lifetime_exhausted"
-            )
+            hard_ceiling_reached = budget["hard_ceiling_reached"]
+            final_reason = budget["final_reason"]
 
             # --- Step 4: Handle terminalization ---
             # V1: force_terminalize_pending_entry_if_budget_exhausted
@@ -2222,37 +2536,24 @@ class LiveRuntime:
                     pending, entry_id, final_reason
                 )
                 if hard_ceiling_reached and not cancel_issued:
-                    # V1: hard ceiling + cancel failed → abort immediately
-                    self.journal.append(
-                        "recovery.pending_entry_hard_ceiling_aborted",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "reason": final_reason,
-                            "detail": "cancel_failed_or_not_issued",
-                            "lifetime_ms": lifetime_ms,
-                        },
-                    )
-                    self.state.pending_entries.pop(entry_id, None)
+                    # V1: hard ceiling + cancel failed → abort (with cleanup)
+                    await self._abort_pending_entry(pending, entry_id, final_reason)
                     continue
                 if cancel_issued:
                     # V1: cancel was issued
                     if hard_ceiling_reached:
                         if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
                             # Balanced fill → finalize even on hard ceiling
+                            await self._finalize_pending_entry(pending, entry_id, now_ms)
+                            self.state.pending_entries.pop(entry_id, None)
                             self.journal.append(
                                 "recovery.pending_entry_finalized",
                                 {"entry_id": entry_id, "symbol": pending.symbol,
                                  "reason": "cancel_completed_entry_balanced"},
                             )
                         else:
-                            # Has fills with missing hedge or no fills → abort
-                            self.journal.append(
-                                "recovery.pending_entry_hard_ceiling_aborted",
-                                {"entry_id": entry_id, "symbol": pending.symbol,
-                                 "reason": final_reason, "detail": "cancel_issued_hard_ceiling"},
-                            )
-                        self.state.pending_entries.pop(entry_id, None)
+                            # Has fills with missing hedge or no fills → abort (with cleanup)
+                            await self._abort_pending_entry(pending, entry_id, final_reason)
                         continue
                     # Cancel issued but below hard ceiling → keep for progress poll
                     pending.reconcile_attempt += 1
@@ -2273,18 +2574,17 @@ class LiveRuntime:
                     )
                     if fallback_ok:
                         continue
-                # Abort immediately — zero fills, no recovery possible
-                self.journal.append(
-                    "recovery.pending_entry_aborted",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "reason": final_reason,
-                        "lifetime_ms": lifetime_ms,
-                        "hard_ceiling_ms": hard_ceiling_ms,
-                    },
-                )
-                self.state.pending_entries.pop(entry_id, None)
+                # Zero fills — live-size probe first to verify no exchange residual.
+                # V1: zero local fills doesn't guarantee zero exchange exposure.
+                # Must attempt cleanup/flatten before removing pending.
+                abandoned = await self._try_abandon_stale_entry(pending, entry_id)
+                if abandoned:
+                    self.state.pending_entries.pop(entry_id, None)
+                    continue  # Both venues flat → safe to clear
+                removed = await self._abort_pending_entry(pending, entry_id, final_reason)
+                if removed:
+                    continue  # Cleanup succeeded → pending removed
+                # Cleanup failed → fail_closed, pending retained
                 continue
 
             # --- 4c: Has fills + missing hedge → try to drive hedge ---
@@ -2294,16 +2594,7 @@ class LiveRuntime:
                     # When fallback_when_tradeable is false (default), skip tradeability
                     # check and go straight to abort on hard ceiling
                     if hard_ceiling_reached:
-                        self.journal.append(
-                            "recovery.pending_entry_hard_ceiling_aborted",
-                            {
-                                "entry_id": entry_id,
-                                "symbol": pending.symbol,
-                                "reason": final_reason,
-                                "lifetime_ms": lifetime_ms,
-                            },
-                        )
-                        self.state.pending_entries.pop(entry_id, None)
+                        await self._abort_pending_entry(pending, entry_id, final_reason)
                         continue
 
                 hedge_driven = await self._recover_drive_missing_hedge(
@@ -2312,6 +2603,8 @@ class LiveRuntime:
                 if hedge_driven:
                     # V1: if hedge completes the entry → finalize immediately
                     if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                        await self._finalize_pending_entry(pending, entry_id, now_ms)
+                        self.state.pending_entries.pop(entry_id, None)
                         self.journal.append(
                             "recovery.pending_entry_finalized",
                             {
@@ -2320,7 +2613,6 @@ class LiveRuntime:
                                 "reason": "recovery_hedge_completed_entry",
                             },
                         )
-                        self.state.pending_entries.pop(entry_id, None)
                         continue
 
                     # Hedge submitted but entry not yet complete — keep for reconciliation
@@ -2338,21 +2630,14 @@ class LiveRuntime:
                     continue
 
                 if hard_ceiling_reached:
-                    # Hard ceiling with unresolved hedge → abort
-                    self.journal.append(
-                        "recovery.pending_entry_hard_ceiling_aborted",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "reason": final_reason,
-                            "lifetime_ms": lifetime_ms,
-                        },
-                    )
-                    self.state.pending_entries.pop(entry_id, None)
+                    # Hard ceiling with unresolved hedge → abort (with cleanup)
+                    await self._abort_pending_entry(pending, entry_id, final_reason)
                     continue
 
             # --- 4d: Fully filled → finalize ---
             if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                await self._finalize_pending_entry(pending, entry_id, now_ms)
+                self.state.pending_entries.pop(entry_id, None)
                 self.journal.append(
                     "recovery.pending_entry_finalized",
                     {
@@ -2361,21 +2646,11 @@ class LiveRuntime:
                         "reason": final_reason,
                     },
                 )
-                self.state.pending_entries.pop(entry_id, None)
                 continue
 
-            # --- 4e: Fallback — still pending and hard ceiling reached → abort ---
+            # --- 4e: Fallback — still pending and hard ceiling reached → abort (with cleanup) ---
             if hard_ceiling_reached:
-                self.journal.append(
-                    "recovery.pending_entry_hard_ceiling_aborted",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "reason": "pending_entry_max_lifetime_exhausted",
-                        "lifetime_ms": lifetime_ms,
-                    },
-                )
-                self.state.pending_entries.pop(entry_id, None)
+                await self._abort_pending_entry(pending, entry_id, final_reason)
                 continue
 
             pending.reconcile_attempt += 1
@@ -2739,7 +3014,7 @@ class LiveRuntime:
             return False
 
         # Idempotency: skip if a hedge is already inflight
-        if pending.hedge_inflight:
+        if pending.hedge_inflight is not None:
             # Do not retry while inflight; reconciliation will clear it
             # after order/fills/position prove no hedge exists.
             return False
@@ -2788,7 +3063,14 @@ class LiveRuntime:
             from lightfee.venues.cid import generate_exchange_cid
             hedge_cloid = generate_exchange_cid(entry_id, "h", hedge_venue)
             pending.hedge_client_order_id = hedge_cloid
-            pending.hedge_inflight = hedge_cloid
+            pending.hedge_inflight = HedgeInflight(
+                client_order_id=hedge_cloid,
+                venue=hedge_venue,
+                side=pending.hedge_side(),
+                quantity=normalized,
+                attempt=0,
+                submitted_at_ms=now_ms,
+            )
 
             self.journal.append(
                 "pending_entry.hedge_submit_attempt",
@@ -2823,7 +3105,7 @@ class LiveRuntime:
                 pending.hedge_leg_filled += fill.quantity
                 pending.hedge_order_id = fill.order_id
                 pending.hedge_fill_price = fill.price
-                pending.hedge_inflight = ""
+                pending.hedge_inflight = None
 
                 self.journal.append(
                     "pending_entry.hedge_submit_result",
@@ -2846,7 +3128,7 @@ class LiveRuntime:
                 return True
 
             # Zero fill — hedge order was placed but didn't fill (IOC/taker)
-            pending.hedge_inflight = ""
+            pending.hedge_inflight = None
             self.journal.append(
                 "pending_entry.hedge_submit_result",
                 {
@@ -2862,9 +3144,9 @@ class LiveRuntime:
         except OrderSubmitError as e:
             # V1: retain inflight on UNCERTAIN so reconciliation can query it;
             # only clear on REJECTED where we know the order never reached the exchange.
-            submitted_cloid = pending.hedge_inflight
+            submitted_inflight = pending.hedge_inflight
             if e.is_rejected:
-                pending.hedge_inflight = ""
+                pending.hedge_inflight = None
             self._flush_adapter_order_diagnostics(adapter)
             self.journal.append(
                 "pending_entry.hedge_submit_result",
@@ -2874,12 +3156,12 @@ class LiveRuntime:
                     "outcome": "error",
                     "error": str(e),
                     "is_rejected": e.is_rejected,
-                    "hedge_client_order_id": submitted_cloid,
+                    "hedge_client_order_id": submitted_inflight.client_order_id if submitted_inflight else "",
                 },
             )
             return False
         except Exception as e:
-            pending.hedge_inflight = ""
+            pending.hedge_inflight = None
             self._flush_adapter_order_diagnostics(adapter)
             self.journal.append(
                 "pending_entry.hedge_submit_result",

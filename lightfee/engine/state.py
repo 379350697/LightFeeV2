@@ -91,6 +91,53 @@ class OpenPosition:
 
 
 @dataclass
+class HedgeInflight:
+    """V1 PendingInflightHedge — metadata for an in-flight hedge order.
+
+    V1: crates/lightfee-engine/src/lib.rs:569-578
+    Fields: client_order_id, venue, side, quantity, attempt, submitted_at_ms,
+    soft_deadline_logged.
+    """
+
+    client_order_id: str
+    venue: "Venue"
+    side: "Side"
+    quantity: float
+    attempt: int = 0
+    submitted_at_ms: int = 0
+    soft_deadline_logged: bool = False
+
+    def elapsed_ms(self, now_ms: int) -> int:
+        """Wall-clock ms since the hedge was submitted."""
+        if self.submitted_at_ms <= 0:
+            return 0
+        return max(0, now_ms - self.submitted_at_ms)
+
+    def to_dict(self) -> dict:
+        return {
+            "client_order_id": self.client_order_id,
+            "venue": self.venue.value,
+            "side": self.side.value,
+            "quantity": self.quantity,
+            "attempt": self.attempt,
+            "submitted_at_ms": self.submitted_at_ms,
+            "soft_deadline_logged": self.soft_deadline_logged,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HedgeInflight":
+        return cls(
+            client_order_id=str(d.get("client_order_id", "")),
+            venue=Venue(str(d.get("venue", ""))),
+            side=Side(str(d.get("side", ""))),
+            quantity=float(d.get("quantity", 0)),
+            attempt=int(d.get("attempt", 0)),
+            submitted_at_ms=int(d.get("submitted_at_ms", 0)),
+            soft_deadline_logged=bool(d.get("soft_deadline_logged", False)),
+        )
+
+
+@dataclass
 class PendingEntry:
     pending_id: str
     symbol: str
@@ -139,10 +186,11 @@ class PendingEntry:
     # is the maker (passive) and which is the hedge (aggressive).
     # "long" = maker on long_venue (default), "short" = maker on short_venue.
     maker_leg: str = "long"
-    # --- V1 hedge inflight tracking for idempotency ---
-    # When a hedge order has been submitted but not yet confirmed, this is
-    # set to the hedge client_order_id to prevent duplicate submissions.
-    hedge_inflight: str = ""
+    # --- V1 hedge inflight tracking for idempotency (CONTRACT HEDGE-INFLIGHT-001) ---
+    # V1: PendingInflightHedge — struct with client_order_id, venue, side,
+    # quantity, attempt, submitted_at_ms, soft_deadline_logged.
+    # Migrated from plain str; None means no inflight hedge.
+    hedge_inflight: HedgeInflight | None = None
     # --- V1 maker fill price for hedge price hint ---
     maker_fill_price: float = 0.0
     # --- V1 hedge fill price for entry position recording ---
@@ -150,6 +198,21 @@ class PendingEntry:
     # --- Terminal repair state for unresolvable residuals ---
     # Values: "" (active), "hedge_residual_below_min_notional" (terminal)
     repair_state: str = ""
+
+    def __post_init__(self) -> None:
+        """Migrate legacy string hedge_inflight to HedgeInflight | None."""
+        if isinstance(self.hedge_inflight, str):
+            if self.hedge_inflight:
+                self.hedge_inflight = HedgeInflight(
+                    client_order_id=self.hedge_inflight,
+                    venue=self.hedge_venue(),
+                    side=self.hedge_side(),
+                    quantity=0.0,
+                    attempt=0,
+                    submitted_at_ms=0,  # legacy: no timestamp
+                )
+            else:
+                self.hedge_inflight = None
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -189,6 +252,7 @@ class PendingEntry:
             self.uncertain_outcome
             or self.maker_completed()
             or self.missing_hedge_quantity() > 1e-9
+            or self.hedge_inflight is not None
         )
 
     def compute_lifetime_ms(self, now_ms: int) -> int:
@@ -558,7 +622,7 @@ class EngineState:
                     "maker_price": p.maker_price,
                     "maker_fill_price": p.maker_fill_price,
                     "hedge_fill_price": p.hedge_fill_price,
-                    "hedge_inflight": p.hedge_inflight,
+                    "hedge_inflight": p.hedge_inflight.to_dict() if p.hedge_inflight else "",
                     "repair_state": p.repair_state,
                     "long_quantity": p.long_quantity,
                     "short_quantity": p.short_quantity,

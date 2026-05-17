@@ -18,6 +18,7 @@ from lightfee.engine.state import (
     ActiveMakerLeg,
     CloseLegRecord,
     EngineState,
+    HedgeInflight,
     OpenPosition,
     OperatorControlState,
     PassiveExecutionPhase,
@@ -28,6 +29,7 @@ from lightfee.engine.state import (
     PendingPassiveLegFill,
     RecoveryWorkSnapshot,
 )
+from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -276,6 +278,30 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
     }
 
 
+def _restore_hedge_inflight(raw) -> HedgeInflight | None:
+    """Restore HedgeInflight from old string or new dict format.
+
+    Backward compat: old states stored hedge_inflight as a plain string (CID).
+    New format stores a dict with V1 PendingInflightHedge fields.
+    Empty string or None → None.
+    Non-empty string (legacy) → HedgeInflight with submitted_at_ms=0 (skip deadline).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return HedgeInflight.from_dict(raw)
+    if isinstance(raw, str) and raw:
+        return HedgeInflight(
+            client_order_id=raw,
+            venue=Venue.BYBIT,  # unknown for legacy, derived at call site
+            side=Side.BUY,
+            quantity=0.0,
+            attempt=0,
+            submitted_at_ms=0,  # legacy: no timestamp, skip deadline
+        )
+    return None
+
+
 def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     """Restore EngineState fields from a snapshot dict (without journal replay)."""
     state = EngineState()
@@ -379,7 +405,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     maker_price=float(pdata.get("maker_price", 0)),
                     maker_fill_price=float(pdata.get("maker_fill_price", 0)),
                     hedge_fill_price=float(pdata.get("hedge_fill_price", 0)),
-                    hedge_inflight=str(pdata.get("hedge_inflight", "")),
+                    hedge_inflight=_restore_hedge_inflight(pdata.get("hedge_inflight", "")),
                     repair_state=str(pdata.get("repair_state", "")),
                     long_quantity=float(pdata.get("long_quantity", 0)),
                     short_quantity=float(pdata.get("short_quantity", 0)),
@@ -694,7 +720,7 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "maker_price": p.maker_price,
             "maker_fill_price": p.maker_fill_price,
             "hedge_fill_price": p.hedge_fill_price,
-            "hedge_inflight": p.hedge_inflight,
+            "hedge_inflight": p.hedge_inflight.to_dict() if p.hedge_inflight else "",
             "repair_state": p.repair_state,
             "maker_leg": p.maker_leg,
             "long_quantity": p.long_quantity,
