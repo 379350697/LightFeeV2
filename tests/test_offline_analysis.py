@@ -890,3 +890,88 @@ class TestDryRunAuditRedLight:
             "RED-LIGHT FAIL: audit script must be tracked by git "
             "(currently untracked/new file)"
         )
+
+
+# ===========================================================================
+# Production blocker analyzer: windowed classification and fixture tests
+# ===========================================================================
+
+
+class TestProductionBlockerAnalyzer:
+    """Tests for the production blocker analyzer with windowed classification."""
+
+    @staticmethod
+    def _fixture_path():
+        return Path(__file__).parent / "fixtures" / "journals" / "production_entry_l2_pending_reconcile_20260517.jsonl"
+
+    def test_analyzer_returns_all_windows(self):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        result = analyze_event_file(
+            self._fixture_path(),
+            now_ms=1778989200000,
+            windows=["last_2h", "last_24h", "run_window"],
+        )
+
+        assert "windows" in result
+        assert "last_2h" in result["windows"]
+        assert "last_24h" in result["windows"]
+        assert "run_window" in result["windows"]
+        win_2h = result["windows"]["last_2h"]
+        assert win_2h["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_primary_tracking"] == 1
+        assert win_2h["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_dual_ready"] == 1
+
+    def test_analyzer_classifies_blockers(self):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        result = analyze_event_file(
+            self._fixture_path(),
+            now_ms=1778989200000,
+            windows=["last_2h", "last_24h", "run_window"],
+        )
+
+        classification = result["classification"]
+        assert classification["entry_local_l2_waiting_for_primary_tracking"] == "current_new_high_frequency"
+        assert classification["entry_local_l2_waiting_for_dual_ready"] == "current_new_high_frequency"
+
+    def test_analyzer_detects_min_notional_residual(self):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        result = analyze_event_file(
+            self._fixture_path(),
+            now_ms=1778989200000,
+            windows=["last_2h", "last_24h", "run_window"],
+        )
+
+        win_2h = result["windows"]["last_2h"]
+        pending = win_2h.get("pending_entry_counts", {})
+        assert "pending_entry.hedge_submit_result:min_notional_rejected" in pending
+        assert pending["pending_entry.hedge_submit_result:min_notional_rejected"] == 1
+
+    def test_analyzer_has_classification_for_exchange_residual(self):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        result = analyze_event_file(
+            self._fixture_path(),
+            now_ms=1778989200000,
+            windows=["last_2h", "last_24h", "run_window"],
+        )
+
+        classification = result["classification"]
+        assert classification["pending_entry.hedge_submit_result:min_notional_rejected"] == "exchange_rule_residual"
+
+    def test_production_blocker_analyzer_classifies_l2_and_pending_residuals(self):
+        """Plan-specified test: verify the exact expected classification."""
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        result = analyze_event_file(
+            self._fixture_path(),
+            now_ms=1778989200000,
+        )
+
+        assert result["windows"]["last_2h"]["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_primary_tracking"] == 1
+        assert result["windows"]["last_2h"]["entry_l2_blocker_counts"]["entry_local_l2_waiting_for_dual_ready"] == 1
+        assert result["windows"]["last_2h"]["pending_entry_counts"]["pending_entry.hedge_submit_result:min_notional_rejected"] == 1
+        assert result["classification"]["entry_local_l2_waiting_for_primary_tracking"] == "current_new_high_frequency"
+        assert result["classification"]["entry_local_l2_waiting_for_dual_ready"] == "current_new_high_frequency"
+        assert result["classification"]["pending_entry.hedge_submit_result:min_notional_rejected"] == "exchange_rule_residual"

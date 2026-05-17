@@ -114,6 +114,7 @@ class LiveRuntime:
         self._last_entry_l2_readiness_diag_ts_ms: int = 0
         self._last_no_entry_diag_fingerprint: str = ""
         self._last_no_entry_diag_ts_ms: int = 0
+        self._last_no_entry_diagnostics: dict | None = None
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
@@ -146,6 +147,21 @@ class LiveRuntime:
 
     def get_venue_adapters(self) -> dict[Venue, VenueAdapter]:
         return dict(self._venue_adapters)
+
+    def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
+        """Return the minimum notional value for a venue/symbol pair.
+
+        Used to prevent infinite retry of hedge orders that are below the
+        venue's minimum trade notional (e.g., Hyperliquid $10 MinTradeNtl).
+        """
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return 0.0
+        transport = getattr(adapter, "_transport", adapter)
+        spec = getattr(transport, "_spec", None)
+        if spec is not None:
+            return float(getattr(spec, "min_notional", 0.0) or 0.0)
+        return 0.0
 
     def _emit_startup_order_path_preflight(self) -> None:
         """Emit sanitized startup visibility for order signing/dependency readiness."""
@@ -944,6 +960,7 @@ class LiveRuntime:
                 # entry window, primary L2 tracking, or dual-ready books.
                 max_slots = max(self.config.strategy.max_concurrent_positions, 1)
                 remaining_slots = max(max_slots - len(self.state.open_positions), 0)
+                admission_blocker_counts: Counter[str] = Counter()
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
                 finalists = self._select_entry_candidates(
@@ -953,6 +970,7 @@ class LiveRuntime:
                     selection_blocker_counts=selection_blocker_counts,
                     candidate_blockers=candidate_blockers,
                     market_quotes=snapshot.quotes,
+                    admission_blocker_counts=admission_blocker_counts,
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = 0
@@ -966,7 +984,8 @@ class LiveRuntime:
                 if dispatched == 0:
                     reason = (
                         "entry_local_l2_selection_blocked"
-                        if selection_blocker_counts else "no_entry_dispatched"
+                        if selection_blocker_counts or admission_blocker_counts
+                        else "no_entry_dispatched"
                     )
                     self._emit_scan_no_entry_diagnostics(
                         reason=reason,
@@ -978,6 +997,7 @@ class LiveRuntime:
                         tradeable_selection_blocker_counts=selection_blocker_counts,
                         candidate_blockers=candidate_blockers,
                         now_ms=now_ms,
+                        admission_blocker_counts=admission_blocker_counts,
                     )
             elif can_enter_new_positions(self.state) and self.entry_executor is not None:
                 self._emit_scan_no_entry_diagnostics(
@@ -1814,6 +1834,10 @@ class LiveRuntime:
                 )
                 continue
 
+            # --- Clear stale hedge inflight after negative evidence ---
+            if pending.hedge_inflight:
+                self._try_clear_stale_hedge_inflight(pending, entry_id, result, now_ms)
+
             # --- V1: drive missing hedge on normal tick ---
             missing = pending.missing_hedge_quantity()
             if missing > 1e-9:
@@ -1972,6 +1996,7 @@ class LiveRuntime:
         return False
 
     @staticmethod
+    @staticmethod
     def _apply_reconcile_backoff(pending, now_ms: int) -> None:
         """Apply exponential backoff to a PendingEntry or PendingClose.
 
@@ -1982,6 +2007,45 @@ class LiveRuntime:
             LiveRuntime._RECONCILE_RETRY_MAX_MS,
         )
         pending.reconcile_next_attempt_ms = now_ms + backoff
+
+    def _try_clear_stale_hedge_inflight(self, pending, entry_id: str, result, now_ms: int) -> None:
+        """Clear hedge_inflight when order/fills/position all prove no hedge.
+
+        Safety: only clears inflight after ALL three evidence sources
+        (order status, fills, position) confirm the hedge order does not
+        exist on the exchange. This prevents duplicate hedge exposure.
+        """
+        hedge_venue = pending.hedge_venue()
+        is_long_hedge = pending.maker_leg != "long"
+        is_short_hedge = pending.maker_leg != "short"
+
+        hedge_status = result.short_status if is_short_hedge else result.long_status
+        hedge_fill_obj = result.short_fill if is_short_hedge else result.long_fill
+        hedge_pos_obj = result.short_position if is_short_hedge else result.long_position
+
+        hedge_fill_qty = hedge_fill_obj.quantity if hedge_fill_obj is not None else 0.0
+        hedge_pos_qty = abs(hedge_pos_obj.quantity) if hedge_pos_obj is not None else 0.0
+
+        order_absent = hedge_status in ("missing", "canceled", "rejected", "unknown", "not_found")
+        fills_zero = hedge_fill_qty <= 1e-9
+        position_zero = hedge_pos_qty <= 1e-9
+
+        if order_absent and fills_zero and position_zero:
+            old_inflight = pending.hedge_inflight
+            pending.hedge_inflight = ""
+            self.journal.append(
+                "pending_entry.hedge_inflight_cleared",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "hedge_venue": hedge_venue.value,
+                    "old_hedge_inflight": old_inflight,
+                    "hedge_status": hedge_status,
+                    "hedge_fill_quantity": hedge_fill_qty,
+                    "hedge_position_quantity": hedge_pos_qty,
+                    "ts_ms": now_ms,
+                },
+            )
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
         """Force-reconcile pending entries ignoring backoff windows.
@@ -2676,6 +2740,12 @@ class LiveRuntime:
 
         # Idempotency: skip if a hedge is already inflight
         if pending.hedge_inflight:
+            # Do not retry while inflight; reconciliation will clear it
+            # after order/fills/position prove no hedge exists.
+            return False
+
+        # Terminal: do not drive hedge from a residual repair state
+        if pending.repair_state:
             return False
 
         try:
@@ -2694,6 +2764,26 @@ class LiveRuntime:
                 return False
 
             hedge_price = pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price
+
+            # Terminal policy: compute notional and check against venue min_notional
+            hedge_notional = abs(normalized * hedge_price)
+            min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
+            if min_notional > 0 and hedge_notional < min_notional:
+                pending.repair_state = "hedge_residual_below_min_notional"
+                self.journal.append(
+                    "pending_entry.hedge_residual_below_min_notional",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_notional": hedge_notional,
+                        "hedge_min_notional": min_notional,
+                        "missing_quantity": missing,
+                        "normalized_quantity": normalized,
+                        "hedge_price": hedge_price,
+                    },
+                )
+                return False
 
             from lightfee.venues.cid import generate_exchange_cid
             hedge_cloid = generate_exchange_cid(entry_id, "h", hedge_venue)
@@ -3415,6 +3505,7 @@ class LiveRuntime:
         tradeable_selection_blocker_counts: Counter,
         candidate_blockers: dict[str, str],
         now_ms: int,
+        admission_blocker_counts: Counter | None = None,
     ) -> None:
         if getattr(self.journal, "_file", None) is None:
             return
@@ -3454,6 +3545,19 @@ class LiveRuntime:
             if "liquidity" in reason_key or reason_key.startswith("execution_"):
                 execution_liquidity_blocked_counts[str(reason_key)] += int(count)
 
+        admission_counts = admission_blocker_counts if admission_blocker_counts is not None else {}
+        not_primary_tracked = int(
+            admission_counts.get("entry_local_l2_waiting_for_primary_tracking", 0)
+        )
+        primary_tracked_not_ready = sum(
+            int(v) for k, v in tradeable_selection_blocker_counts.items()
+            if k not in {"entry_local_l2_waiting_for_primary_tracking"}
+        )
+        selection_bucket_counts = {
+            "not_primary_tracked": not_primary_tracked,
+            "primary_tracked_not_ready": primary_tracked_not_ready,
+        }
+
         payload = {
             "reason": reason,
             "candidate_count": len(getattr(snapshot, "candidates", []) or []),
@@ -3472,6 +3576,7 @@ class LiveRuntime:
             "tradeable_selection_blocker_counts": dict(
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
             ),
+            "selection_bucket_counts": selection_bucket_counts,
             "entry_local_l2_primary_ready_filter_active": bool(
                 self.config.strategy.local_l2_enabled and self._tracked_primary_pair_ids
             ),
@@ -3506,6 +3611,7 @@ class LiveRuntime:
             return
         self._last_no_entry_diag_fingerprint = fingerprint
         self._last_no_entry_diag_ts_ms = now_ms
+        self._last_no_entry_diagnostics = payload
         self.journal.append("scan.no_entry_diagnostics", payload)
 
     # ------------------------------------------------------------------
@@ -3654,11 +3760,14 @@ class LiveRuntime:
         selection_blocker_counts: Counter,
         candidate_blockers: dict[str, str],
         market_quotes=None,
+        admission_blocker_counts: Counter | None = None,
     ) -> list:
         """V1 select_entry_candidates_from_refs parity for the final entry list."""
         target = self._entry_selection_target(remaining_slots)
         if target <= 0:
             return []
+
+        admission_reasons = {"entry_local_l2_waiting_for_primary_tracking"}
 
         active_symbols = {
             str(getattr(position, "symbol", ""))
@@ -3679,14 +3788,20 @@ class LiveRuntime:
             pair_id = self._candidate_pair_id(candidate)
             blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
             if blocker:
-                selection_blocker_counts[str(blocker)] += 1
-                candidate_blockers[pair_id] = str(blocker)
+                blocker_str = str(blocker)
+                # Admission buckets (not primary tracked) vs readiness failures
+                if blocker_str in admission_reasons:
+                    if admission_blocker_counts is not None:
+                        admission_blocker_counts[blocker_str] += 1
+                else:
+                    selection_blocker_counts[blocker_str] += 1
+                candidate_blockers[pair_id] = blocker_str
                 self.journal.append(
                     "runtime.entry_blocked_local_l2_selection",
                     {
                         "symbol": symbol,
                         "pair_id": pair_id,
-                        "reason": str(blocker),
+                        "reason": blocker_str,
                         "ts_ms": now_ms,
                     },
                 )

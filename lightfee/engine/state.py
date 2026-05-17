@@ -147,6 +147,9 @@ class PendingEntry:
     maker_fill_price: float = 0.0
     # --- V1 hedge fill price for entry position recording ---
     hedge_fill_price: float = 0.0
+    # --- Terminal repair state for unresolvable residuals ---
+    # Values: "" (active), "hedge_residual_below_min_notional" (terminal)
+    repair_state: str = ""
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -556,6 +559,7 @@ class EngineState:
                     "maker_fill_price": p.maker_fill_price,
                     "hedge_fill_price": p.hedge_fill_price,
                     "hedge_inflight": p.hedge_inflight,
+                    "repair_state": p.repair_state,
                     "long_quantity": p.long_quantity,
                     "short_quantity": p.short_quantity,
                     "maker_leg": p.maker_leg,

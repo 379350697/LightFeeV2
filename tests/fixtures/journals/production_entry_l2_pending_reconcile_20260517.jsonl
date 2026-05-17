@@ -1,0 +1,6 @@
+{"ts_ms":1778985600000,"kind":"runtime.entry_blocked_local_l2_selection","payload":{"reason":"entry_local_l2_waiting_for_primary_tracking","pair_id":"polyxusdt:bybit->hyperliquid","symbol":"POLYXUSDT"}}
+{"ts_ms":1778985601000,"kind":"runtime.entry_blocked_local_l2_selection","payload":{"reason":"entry_local_l2_waiting_for_dual_ready","pair_id":"chipusdt:binance->aster","symbol":"CHIPUSDT"}}
+{"ts_ms":1778985602000,"kind":"runtime.entry_local_l2_readiness_diagnostics","payload":{"entry_local_l2_primary_not_ready_reason_totals":{"book_bootstrapping":13,"book_rebuilding":1},"detail_samples":[{"pair_id":"chipusdt:binance->aster","venue":"aster","symbol":"CHIPUSDT","reason":"book_bootstrapping","book_status":"BOOTSTRAPPING"}]}}
+{"ts_ms":1778985603000,"kind":"pending_entry.missing_hedge_detected","payload":{"entry_id":"entry-sample-STABLEUSDT","symbol":"STABLEUSDT","hedge_venue":"hyperliquid","missing_quantity":650.0}}
+{"ts_ms":1778985604000,"kind":"pending_entry.hedge_submit_result","payload":{"entry_id":"entry-sample-STABLEUSDT","symbol":"STABLEUSDT","venue":"hyperliquid","outcome":"rejected","reason":"min_notional_rejected","notional":3.12,"min_notional":10.0}}
+{"ts_ms":1778985605000,"kind":"order.reconcile_result","payload":{"entry_id":"entry-sample-POLYXUSDT","symbol":"POLYXUSDT","venue":"hyperliquid","outcome":"uncertain"}}

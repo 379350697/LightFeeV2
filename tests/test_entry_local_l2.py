@@ -162,7 +162,7 @@ class TestApplyBookReadinessToLeg:
         assert leg.last_seen_at_ms == 9500
         assert diag["ready"] is True
         assert diag["reason"] == "ready"
-        assert diag["detail"] == ""
+        assert diag["detail"] == "local_l2_book_hot_fresh"
         assert diag["book_status"] == "hot"
         assert diag["age_ms"] == 500
         assert diag["observed_at_ms"] == 9500
@@ -1819,3 +1819,279 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert degraded["top_degraded_symbols"] == ["BTCUSDT"]
         assert "liquidity" in degraded["stale_degraded_domains"]
         assert "snapshot_publish_stale" in stale["stale_degraded_domains"]
+
+
+# ===========================================================================
+# Primary tracking admission vs local-L2 readiness failure separation
+# ===========================================================================
+
+
+class TestPrimaryTrackingAdmission:
+    """V1 parity: not_primary_tracked is an admission bucket, not a readiness
+    failure. Only primary-tracked candidates should contribute to dual_ready /
+    readiness blocker counts."""
+
+    @staticmethod
+    def _make_config(mode="live", local_l2_enabled=True, journal_path=None):
+        from pathlib import Path as _Path
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        import tempfile
+        td = tempfile.mkdtemp()
+        return AppConfig(
+            runtime=RuntimeConfig(
+                mode=mode,
+                poll_interval_ms=100,
+                sidecar_snapshot_path=str(_Path(td) / "sidecar.json"),
+                sidecar_snapshot_max_age_ms=600_000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                max_concurrent_positions=2,
+                local_l2_enabled=local_l2_enabled,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=journal_path or str(_Path(td) / "events.jsonl"),
+                snapshot_path=str(_Path(td) / "state.json"),
+            ),
+            venues=[],
+            symbols=["POLYXUSDT", "BANANAUSDT"],
+        )
+
+    @staticmethod
+    def _make_candidate(symbol, long_venue, short_venue, pair_id,
+                        first_funding_timestamp_ms=0):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            pair_id=pair_id,
+            first_funding_timestamp_ms=first_funding_timestamp_ms,
+            ranking_edge_bps=10.0,
+            entry_notional_quote=500.0,
+        )
+
+    def test_untracked_candidate_gets_primary_tracking_blocker(self, tmp_path):
+        """Candidate not in primary set returns admission blocker, not readiness."""
+        from lightfee.engine.runtime import LiveRuntime
+
+        journal = tmp_path / "events.jsonl"
+        config = self._make_config(mode="live", journal_path=str(journal))
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        rt._tracked_primary_pair_ids = {"polyxusdt:bybit->hyperliquid"}
+
+        now_ms = 1778985600000
+        # remaining_ms = 300_000 exactly matches min_before_ms and entry_window_ms
+        funding_ts = now_ms + 300_000
+
+        # Untracked candidate
+        untracked = self._make_candidate(
+            "BANANAUSDT", "bybit", "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=funding_ts,
+        )
+
+        blocker = rt._entry_local_l2_selection_blocker(untracked, now_ms=now_ms)
+        assert blocker == "entry_local_l2_waiting_for_primary_tracking"
+
+        # Tracked candidate (but no session → dual_ready blocker)
+        tracked = self._make_candidate(
+            "POLYXUSDT", "bybit", "hyperliquid",
+            "polyxusdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=funding_ts,
+        )
+
+        blocker2 = rt._entry_local_l2_selection_blocker(tracked, now_ms=now_ms)
+        assert blocker2 == "entry_local_l2_waiting_for_dual_ready"
+        rt.journal.close()
+
+    def test_select_entry_candidates_separates_admission_from_readiness(self, tmp_path):
+        """Select candidates counts primary_tracking separately from readiness."""
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+
+        journal = tmp_path / "events.jsonl"
+        config = self._make_config(mode="live", journal_path=str(journal))
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        rt._tracked_primary_pair_ids = {"polyxusdt:bybit->hyperliquid"}
+
+        now_ms = 1778985600000
+        funding_ts = now_ms + 300_000
+
+        untracked = self._make_candidate(
+            "BANANAUSDT", "bybit", "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=funding_ts,
+        )
+        tracked = self._make_candidate(
+            "POLYXUSDT", "bybit", "hyperliquid",
+            "polyxusdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=funding_ts,
+        )
+
+        admission: Counter = Counter()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        selected = rt._select_entry_candidates(
+            [untracked, tracked],
+            now_ms=now_ms,
+            remaining_slots=2,
+            selection_blocker_counts=selection,
+            candidate_blockers=blockers,
+            admission_blocker_counts=admission,
+        )
+
+        assert len(selected) == 0  # neither was ready
+        assert admission.get("entry_local_l2_waiting_for_primary_tracking", 0) == 1
+        # The tracked candidate is blocked by dual_ready (readiness failure)
+        assert selection.get("entry_local_l2_waiting_for_dual_ready", 0) == 1
+        rt.journal.close()
+
+
+# ===========================================================================
+# Dual-ready book state reason taxonomy
+# ===========================================================================
+
+
+class TestBookReadinessReasonTaxonomy:
+    """V1 parity: every not-ready reason must be precise; 'book_hot' must
+    never appear as a not-ready reason."""
+
+    @staticmethod
+    def _make_book(status="hot", bid=1.0, ask=1.1, observed_at_ms=1778985600000,
+                   fault_reason="", sequence=1):
+        from types import SimpleNamespace
+
+        class BookStatus:
+            def __init__(self, value):
+                self.value = value
+
+        book = SimpleNamespace(
+            venue="binance",
+            symbol="CHIPUSDT",
+            status=BookStatus(status),
+            observed_at_ms=observed_at_ms,
+            sequence=sequence,
+            fault_reason=fault_reason,
+        )
+        book.best_bid = lambda: bid
+        book.best_ask = lambda: ask
+        book.has_crossed_book = lambda: bid > 0 and ask > 0 and bid >= ask
+        book.is_stale = lambda max_age_ms, now_ms: (now_ms - observed_at_ms) > max_age_ms
+        book.age_ms = lambda now_ms: now_ms - observed_at_ms if observed_at_ms > 0 else 0
+        return book
+
+    def _make_leg(self, venue="binance", symbol="CHIPUSDT"):
+        return EntryLocalL2LegSession(venue=venue, symbol=symbol)
+
+    def test_bootstrapping_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="bootstrapping")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "book_bootstrapping"
+        assert result["reason"] != "book_hot"
+
+    def test_rebuilding_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="rebuilding")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "book_rebuilding"
+        assert result["reason"] != "book_hot"
+
+    def test_hot_but_stale_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="hot", observed_at_ms=1778985000000)  # 600s ago
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "stale_book"
+        assert result["reason"] != "book_hot"
+
+    def test_hot_but_crossed_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="hot", bid=1.1, ask=1.0)  # crossed
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "crossed_or_locked_book"
+        assert result["reason"] != "book_hot"
+
+    def test_hot_and_fresh_is_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="hot", bid=1.0, ask=1.1, observed_at_ms=1778985600000)
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is True
+        assert result["reason"] == "ready"
+        assert result["detail"] == "local_l2_book_hot_fresh"
+        assert result["reason"] != "book_hot"
+
+    @pytest.mark.parametrize(
+        ("book_status", "bid", "ask", "observed_at_ms", "expected_reason"),
+        [
+            ("bootstrapping", 1.0, 1.1, 1778985600000, "book_bootstrapping"),
+            ("rebuilding", 1.0, 1.1, 1778985600000, "book_rebuilding"),
+            ("hot", 1.0, 1.1, 1778985000000, "stale_book"),
+            ("hot", 1.1, 1.0, 1778985600000, "crossed_or_locked_book"),
+        ],
+    )
+    def test_entry_l2_not_ready_reasons_are_specific(
+        self, book_status, bid, ask, observed_at_ms, expected_reason,
+    ):
+        """Plan-specified parametrized test: each book state maps to a precise reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(
+            status=book_status, bid=bid, ask=ask, observed_at_ms=observed_at_ms,
+        )
+
+        result = apply_book_readiness_to_leg(
+            leg, book, now_ms=1778985600000, stale_after_ms=300_000,
+        )
+
+        assert result["ready"] is False
+        assert result["reason"] == expected_reason
+        assert result["reason"] != "book_hot"
+
+    def test_hot_empty_bid_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="hot", bid=0.0, ask=1.1, observed_at_ms=1778985600000)
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "book_empty_side"
+        assert result["reason"] != "book_hot"
+
+    def test_hot_missing_timestamp_is_not_ready(self):
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="hot", observed_at_ms=0)
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["ready"] is False
+        assert result["reason"] == "book_timestamp_missing"
+        assert result["reason"] != "book_hot"

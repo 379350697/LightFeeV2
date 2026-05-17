@@ -242,6 +242,17 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = detail
         return diag
 
+    # Timestamp missing is a distinct reason from stale
+    if observed_at_ms <= 0:
+        leg.mark_faulted(
+            EntryLocalL2LegFault.STALE_BOOK,
+            "book_timestamp_missing",
+            seen_at_ms=0,
+        )
+        diag["reason"] = "book_timestamp_missing"
+        diag["detail"] = "book_timestamp_missing"
+        return diag
+
     if stale_after_ms > 0 and hasattr(book, "is_stale") and book.is_stale(stale_after_ms, now_ms):
         detail = f"age_ms={age_ms} stale_after_ms={stale_after_ms}"
         leg.mark_faulted(
@@ -276,10 +287,23 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         return diag
 
     if status_value == "hot":
+        # HOT book must have non-empty bid/ask
+        bid = book.best_bid() if hasattr(book, "best_bid") else 1.0
+        ask = book.best_ask() if hasattr(book, "best_ask") else 1.0
+        if bid <= 0 or ask <= 0:
+            side = "bid" if bid <= 0 else "ask"
+            leg.mark_faulted(
+                EntryLocalL2LegFault.STALE_BOOK,
+                f"book_empty_side_{side}",
+                seen_at_ms=observed_at_ms,
+            )
+            diag["reason"] = "book_empty_side"
+            diag["detail"] = f"book_empty_side_{side}"
+            return diag
         leg.mark_ready(observed_at_ms)
         diag["ready"] = True
         diag["reason"] = "ready"
-        diag["detail"] = ""
+        diag["detail"] = "local_l2_book_hot_fresh"
         return diag
 
     leg.mark_faulted(
