@@ -524,3 +524,118 @@ class TestDataPlaneSync:
 
         assert dispatched == 0  # HOT book within refresh interval
         assert l2_adapter.call_count == 0
+
+
+# ===========================================================================
+# V1 parity: handle_runtime_failure sets book.fault_reason (DP-2)
+# ===========================================================================
+
+
+class TestHandleRuntimeFailureFaultReason:
+    """V1: every fault event carries a specific fault detail.
+    V2: handle_runtime_failure must set book.fault_reason for all fault types."""
+
+    def test_sequence_gap_sets_fault_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=10000)
+        book.transition_to_hot()
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=10000,
+        )
+
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.SEQUENCE_GAP,
+            "gap=20 prev=100 incoming_prev=120",
+            now_ms=11000,
+        )
+
+        assert book.fault_reason != "", (
+            "SEQUENCE_GAP must set book.fault_reason, got empty string"
+        )
+        assert "gap" in book.fault_reason, (
+            f"fault_reason must carry gap detail, got {book.fault_reason!r}"
+        )
+
+    def test_checksum_mismatch_sets_fault_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("okx", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=10000)
+        book.transition_to_hot()
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=10000,
+        )
+
+        rt.handle_runtime_failure(
+            "okx", "BTCUSDT",
+            RuntimeFaultKind.CHECKSUM_MISMATCH,
+            "checksum_mismatch expected=12345 actual=67890",
+            now_ms=11000,
+        )
+
+        assert "checksum" in book.fault_reason.lower(), (
+            f"CHECKSUM_MISMATCH must set book.fault_reason, got {book.fault_reason!r}"
+        )
+
+    def test_transport_failure_sets_fault_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.TRANSPORT_FAILURE,
+            "connection reset",
+            now_ms=11000,
+        )
+
+        assert book.fault_reason != "", (
+            "TRANSPORT_FAILURE must set book.fault_reason"
+        )
+
+    def test_quote_age_triggered_sets_fault_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=10000)
+        book.transition_to_hot()
+
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.QUOTE_AGE_TRIGGERED,
+            "age=7000ms",
+            now_ms=11000,
+        )
+
+        assert book.status == L2BookStatus.DEGRADED
+        assert book.fault_reason != "", (
+            "QUOTE_AGE_TRIGGERED must set book.fault_reason via degrade"
+        )
+
+    def test_fault_reason_preserved_across_multiple_failures(self):
+        """Last fault wins — most recent failure reason is kept."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=10000)
+        book.transition_to_hot()
+
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.SEQUENCE_GAP,
+            "first_gap", now_ms=11000,
+        )
+        first = book.fault_reason
+        assert first != ""
+
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.TRANSPORT_FAILURE,
+            "second_fault", now_ms=12000,
+        )
+        assert book.fault_reason != first, (
+            "most recent fault should update fault_reason"
+        )
+        assert "second_fault" in book.fault_reason

@@ -333,11 +333,20 @@ class LocalL2DataPlane:
                 buf.clear()
                 book.sequence = 0
                 book.last_update_id = 0
+                book.fault_reason = "pre_snapshot_buffer_overflow"
                 book.transition_to_rebuilding(now_ms)
                 self._runtime.handle_runtime_failure(
                     update.venue, update.symbol,
                     RuntimeFaultKind.SEQUENCE_GAP,
                     "pre_snapshot_buffer_overflow", now_ms,
+                )
+                self._journal.append(
+                    "runtime.local_l2_buffer_overflow_rebuild",
+                    self._rebuild_evidence(
+                        venue=update.venue, symbol=update.symbol,
+                        rebuild_trigger="pre_snapshot_buffer_overflow",
+                        buffered_count=_PRE_SNAPSHOT_BUFFER_CAP,
+                    ),
                 )
                 return []
             gen = self._current_stream_generation(update.venue, update.symbol)
@@ -400,6 +409,7 @@ class LocalL2DataPlane:
             # No overlap — gap between snapshot and buffered updates
             book.sequence = 0
             book.last_update_id = 0
+            book.fault_reason = "buffered_replay_snapshot_boundary: no overlapping update"
             book.transition_to_rebuilding(int(time.time() * 1000))
             self._runtime.handle_runtime_failure(
                 venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
@@ -419,6 +429,9 @@ class LocalL2DataPlane:
                 if bu.update.previous_sequence > 0 and bu.update.previous_sequence != previous_sequence:
                     book.sequence = 0
                     book.last_update_id = 0
+                    book.fault_reason = (
+                        f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}"
+                    )
                     book.transition_to_rebuilding(int(time.time() * 1000))
                     self._runtime.handle_runtime_failure(
                         venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
@@ -429,6 +442,9 @@ class LocalL2DataPlane:
                 # First replay: gap between snapshot and first buffered
                 book.sequence = 0
                 book.last_update_id = 0
+                book.fault_reason = (
+                    f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}"
+                )
                 book.transition_to_rebuilding(int(time.time() * 1000))
                 self._runtime.handle_runtime_failure(
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
@@ -443,6 +459,7 @@ class LocalL2DataPlane:
             except Exception:
                 book.sequence = 0
                 book.last_update_id = 0
+                book.fault_reason = f"buffered_replay_apply_failed at index {i}"
                 book.transition_to_rebuilding(int(time.time() * 1000))
                 self._runtime.handle_runtime_failure(
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
@@ -484,8 +501,8 @@ class LocalL2DataPlane:
                 stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
                 if stale_after_ms <= 0 or not book.is_stale(stale_after_ms, now_ms):
                     continue
-                book.transition_to_rebuilding(now_ms)
                 book.fault_reason = "stale_hot_book"
+                book.transition_to_rebuilding(now_ms)
                 self._journal.append(
                     "runtime.local_l2_hot_stale_rebuild",
                     {
@@ -832,6 +849,40 @@ class LocalL2DataPlane:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
+
+    def _rebuild_evidence(
+        self, *, venue: str, symbol: str,
+        rebuild_trigger: str = "",
+        buffered_count: int = 0,
+        replayed_count: int = 0,
+    ) -> dict:
+        """Build a structured evidence payload for rebuild/transition logging.
+
+        Fields match the required evidence schema: venue, symbol,
+        observed_at_ms, sequence, bid/ask counts, top prices, and
+        rebuild trigger metadata.
+        """
+        book = self._runtime.get_book(venue, symbol)
+        obs_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+        seq = int(getattr(book, "sequence", 0) or 0)
+        bid_count = len(getattr(book, "bids", []) or [])
+        ask_count = len(getattr(book, "asks", []) or [])
+        top_bid = book.best_bid() if hasattr(book, "best_bid") else 0.0
+        top_ask = book.best_ask() if hasattr(book, "best_ask") else 0.0
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "status_before": str(getattr(book, "status", "unknown")) if book else "missing",
+            "observed_at_ms": obs_ms,
+            "sequence": seq,
+            "bid_count": bid_count,
+            "ask_count": ask_count,
+            "top_bid": top_bid,
+            "top_ask": top_ask,
+            "rebuild_trigger": rebuild_trigger,
+            "buffered_count": buffered_count,
+            "replayed_count": replayed_count,
+        }
 
     def diagnostics_snapshot(self) -> dict:
         """Return a diagnostics view of the data plane."""

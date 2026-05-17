@@ -300,21 +300,31 @@ class LocalL2Runtime:
     def handle_runtime_failure(
         self, venue: str, symbol: str, fault: RuntimeFaultKind, detail: str, now_ms: int
     ) -> None:
-        """Record a runtime fault and update book status + metrics."""
+        """Record a runtime fault and update book status + metrics.
+
+        V1 parity: every fault event carries a specific fault detail that
+        must be written to book.fault_reason so diagnostics and entry
+        session arming can derive the correct arming_reason.
+        """
         book = self.ensure_book(venue, symbol)
 
         if fault == RuntimeFaultKind.RATE_LIMITED:
             self.metrics.runtime_rate_limited_total += 1
+            book.fault_reason = f"rate_limited: {detail}"
         elif fault == RuntimeFaultKind.TRANSPORT_FAILURE:
             self.metrics.runtime_transport_failure_total += 1
+            book.fault_reason = f"transport_failure: {detail}"
         elif fault == RuntimeFaultKind.CHECKSUM_MISMATCH:
             self.metrics.rebuild_total += 1
+            book.fault_reason = f"checksum_mismatch: {detail}"
         elif fault == RuntimeFaultKind.SEQUENCE_GAP:
             self.metrics.rebuild_total += 1
+            book.fault_reason = f"sequence_gap: {detail}"
         elif fault == RuntimeFaultKind.QUOTE_AGE_TRIGGERED:
             book.transition_to_degraded(f"quote_age: {detail}")
         elif fault == RuntimeFaultKind.RESUME_EXPIRED:
             self.metrics.resume_expired_total += 1
+            book.fault_reason = f"resume_expired: {detail}"
         elif fault == RuntimeFaultKind.BUDGET_SUSPENDED:
             self.metrics.budget_suspended_total += 1
             book.transition_to_suspended("budget")

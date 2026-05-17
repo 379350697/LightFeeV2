@@ -179,6 +179,51 @@ class EntryLocalL2Session:
         }
 
 
+def _derive_arming_reason_from_book(book, status_value: str) -> SessionArmingReason:
+    """Derive a specific arming reason from the book's fault context.
+
+    V1 parity: ensure_candidate() maps prior leg fault → arming_reason:
+      - StaleBook          → StaleBookRecovery
+      - GateObuGap / OkxPrevSeqMismatch / OkxChecksumMismatch → SequenceGap
+      - HyperliquidDisconnect → TransportFaultRecovery
+      - CrossedOrLockedBook → BookStatusTransition
+      - None               → FirstSession
+
+    V2 derives from book.fault_reason keywords because the entry session
+    leg doesn't carry V1's EntryLocalL2LegFault enum at this layer.
+    """
+    fault = str(getattr(book, "fault_reason", "") or "").lower()
+
+    # COLD book with no prior fault → first session
+    if status_value == "cold" and not fault:
+        return SessionArmingReason.FIRST_SESSION
+
+    if not fault:
+        # No fault context at all — first time arming
+        if status_value == "cold":
+            return SessionArmingReason.FIRST_SESSION
+        return SessionArmingReason.BOOK_STATUS_TRANSITION
+
+    # Stale-related faults → StaleBookRecovery
+    # V1: QuoteAgeTriggered, IdleTimeout, ResumeWindowExpired → StaleBook → StaleBookRecovery
+    if any(kw in fault for kw in ("stale", "quote_age", "idle", "resume")):
+        return SessionArmingReason.STALE_BOOK_RECOVERY
+
+    # Sequence/checksum faults → SequenceGap
+    if any(kw in fault for kw in ("sequence_gap", "checksum", "prev_seq", "obu_gap", "previous_link_mismatch")):
+        return SessionArmingReason.SEQUENCE_GAP
+
+    # Transport/connection faults → TransportFaultRecovery
+    if any(kw in fault for kw in ("transport", "connection", "disconnect", "stream", "timeout", "snapshot_bootstrap")):
+        return SessionArmingReason.TRANSPORT_FAULT_RECOVERY
+
+    # Crossed/locked book or other book structure faults → BookStatusTransition
+    if any(kw in fault for kw in ("crossed", "locked", "non_positive", "buffer_overflow")):
+        return SessionArmingReason.BOOK_STATUS_TRANSITION
+
+    return SessionArmingReason.BOOK_STATUS_TRANSITION
+
+
 def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
     """Apply local-L2 book readiness to one entry-L2 leg and return diagnostics."""
     venue = getattr(leg, "venue", "")
@@ -222,9 +267,17 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
     faulted_statuses = {"degraded", "suspended"}
 
     if status_value in arming_statuses:
-        leg.mark_arming(SessionArmingReason.BOOK_STATUS_TRANSITION)
+        # V1 parity: derive specific arming_reason from book's prior fault
+        # context, mirroring V1 ensure_candidate() fault→arming_reason mapping.
+        arming_reason = _derive_arming_reason_from_book(book, status_value)
+        leg.mark_arming(arming_reason)
+        fault_ctx = str(getattr(book, "fault_reason", "") or "")
         diag["reason"] = f"book_{status_value}"
-        diag["detail"] = f"book_status={status_value}"
+        diag["detail"] = (
+            f"book_status={status_value}"
+            if not fault_ctx
+            else f"book_status={status_value}:{fault_ctx}"
+        )
         return diag
 
     if status_value in faulted_statuses:

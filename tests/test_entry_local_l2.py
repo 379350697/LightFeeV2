@@ -2144,3 +2144,255 @@ class TestBookReadinessReasonTaxonomy:
 
         assert result["reason"] != "book_hot"
         assert result["reason"] == "stale_book"
+
+
+# ===========================================================================
+# V1 parity: specific arming_reason from book context (DP-1)
+# ===========================================================================
+
+
+class TestArmingReasonFromBookContext:
+    """V1 ensure_candidate() maps prior fault → specific arming_reason.
+    V2 apply_book_readiness_to_leg must derive reason from book.fault_reason."""
+
+    @staticmethod
+    def _make_book(status="bootstrapping", bid=1.0, ask=1.1, observed_at_ms=1778985600000,
+                   fault_reason="", sequence=1):
+        from types import SimpleNamespace
+
+        class BookStatus:
+            def __init__(self, value):
+                self.value = value
+
+        book = SimpleNamespace(
+            venue="binance",
+            symbol="CHIPUSDT",
+            status=BookStatus(status),
+            observed_at_ms=observed_at_ms,
+            sequence=sequence,
+            fault_reason=fault_reason,
+        )
+        book.best_bid = lambda: bid
+        book.best_ask = lambda: ask
+        book.has_crossed_book = lambda: bid > 0 and ask > 0 and bid >= ask
+        book.is_stale = lambda max_age_ms, now_ms: (now_ms - observed_at_ms) > max_age_ms
+        book.age_ms = lambda now_ms: now_ms - observed_at_ms if observed_at_ms > 0 else 0
+        return book
+
+    def _make_leg(self, venue="binance", symbol="CHIPUSDT"):
+        return EntryLocalL2LegSession(venue=venue, symbol=symbol)
+
+    def test_bootstrapping_with_stale_fault_gives_stale_recovery_reason(self):
+        """V1: StaleBook fault → StaleBookRecovery arming_reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="bootstrapping", fault_reason="stale_hot_book")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_bootstrapping"
+        assert leg.arming_reason == SessionArmingReason.STALE_BOOK_RECOVERY, (
+            f"stale fault should derive STALE_BOOK_RECOVERY, got {leg.arming_reason}"
+        )
+
+    def test_bootstrapping_with_sequence_gap_fault_gives_sequence_gap_reason(self):
+        """V1: GateObuGap/OkxPrevSeqMismatch → SequenceGap arming_reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="bootstrapping", fault_reason="sequence_gap_5")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_bootstrapping"
+        assert leg.arming_reason == SessionArmingReason.SEQUENCE_GAP, (
+            f"sequence_gap fault should derive SEQUENCE_GAP, got {leg.arming_reason}"
+        )
+
+    def test_bootstrapping_with_checksum_fault_gives_sequence_gap_reason(self):
+        """V1: OkxChecksumMismatch → SequenceGap arming_reason (checksum is a sequence fault)."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="rebuilding", fault_reason="checksum_mismatch expected=123 actual=456")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_rebuilding"
+        assert leg.arming_reason == SessionArmingReason.SEQUENCE_GAP, (
+            f"checksum fault should derive SEQUENCE_GAP, got {leg.arming_reason}"
+        )
+
+    def test_bootstrapping_with_transport_fault_gives_transport_recovery_reason(self):
+        """V1: HyperliquidDisconnect → TransportFaultRecovery arming_reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="bootstrapping", fault_reason="snapshot_bootstrap: connection timeout")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_bootstrapping"
+        assert leg.arming_reason == SessionArmingReason.TRANSPORT_FAULT_RECOVERY, (
+            f"transport fault should derive TRANSPORT_FAULT_RECOVERY, got {leg.arming_reason}"
+        )
+
+    def test_bootstrapping_without_fault_gives_book_status_transition(self):
+        """V1: No prior fault → BookStatusTransition (or FirstSession) arming_reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="bootstrapping", fault_reason="")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_bootstrapping"
+        assert leg.arming_reason == SessionArmingReason.BOOK_STATUS_TRANSITION, (
+            f"no fault should keep BOOK_STATUS_TRANSITION, got {leg.arming_reason}"
+        )
+
+    def test_rebuilding_preserves_fault_reason_in_detail(self):
+        """REBUILDING books must carry the fault_reason in diagnostics detail."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="rebuilding", fault_reason="pre_snapshot_buffer_overflow")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_rebuilding"
+        assert "pre_snapshot_buffer_overflow" in result["detail"], (
+            f"detail must carry fault_reason, got {result['detail']}"
+        )
+
+    def test_cold_book_arming_reason_is_first_session(self):
+        """COLD book (never seen) → FIRST_SESSION arming_reason."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(status="cold", observed_at_ms=0, fault_reason="")
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] == "book_cold"
+        assert leg.arming_reason == SessionArmingReason.FIRST_SESSION, (
+            f"cold book should derive FIRST_SESSION, got {leg.arming_reason}"
+        )
+
+
+# ===========================================================================
+# V1 parity: REBUILDING→BOOTSTRAPPING→readiness 完整闭环 (real path)
+# ===========================================================================
+
+
+class TestRebuildingToBootstrappingReadinessRealPath:
+    """V1 ensure_candidate() fault→arming 的完整闭环：REBUILDING+fault 的书
+    在 transition_to_bootstrapping() 后，apply_book_readiness_to_leg 必须
+    保留 fault_reason 并推导出正确的 arming_reason。
+
+    阻断问题：transition_to_bootstrapping() 曾无条件清空 fault_reason=""，
+    导致 sequence_gap/checksum/transport 原因被丢弃，arming_reason 回到
+    BOOK_STATUS_TRANSITION。
+    """
+
+    @staticmethod
+    def _make_book(status="rebuilding", bid=1.0, ask=1.1,
+                   observed_at_ms=1778985600000, fault_reason="",
+                   sequence=1):
+        from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
+
+        book = LocalL2Book(venue="binance", symbol="CHIPUSDT")
+        book.bids = [PriceLevel(price=bid, quantity=1.0)]
+        book.asks = [PriceLevel(price=ask, quantity=1.0)]
+        book.observed_at_ms = observed_at_ms
+        book.sequence = sequence
+        book.fault_reason = fault_reason
+        # Set status via internal field (bypass transition for test setup)
+        book.status = getattr(L2BookStatus, status.upper()) if isinstance(status, str) else status
+        return book
+
+    def _make_leg(self, venue="binance", symbol="CHIPUSDT"):
+        return EntryLocalL2LegSession(venue=venue, symbol=symbol)
+
+    def _run_real_path(self, fault_reason: str, expected_arming: SessionArmingReason,
+                       now_ms: int = 1778985600000, stale_after_ms: int = 300_000):
+        """Simulate the real path: book with fault → transition_to_bootstrapping
+        → apply_book_readiness_to_leg. Verify arming_reason is NOT lost."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        book = self._make_book(status="rebuilding", fault_reason=fault_reason)
+        # Real path: bootstrap worker calls transition_to_bootstrapping
+        book.transition_to_bootstrapping(now_ms=now_ms)
+        assert book.status.value == "bootstrapping"
+
+        leg = self._make_leg()
+        diag = apply_book_readiness_to_leg(leg, book, now_ms=now_ms,
+                                           stale_after_ms=stale_after_ms)
+
+        assert diag["reason"] == "book_bootstrapping", (
+            f"reason should be book_bootstrapping, got {diag['reason']}"
+        )
+        assert leg.arming_reason == expected_arming, (
+            f"fault_reason={fault_reason!r} → expected arming={expected_arming.value}, "
+            f"got {leg.arming_reason.value if leg.arming_reason else None}. "
+            f"diag.detail={diag['detail']!r}"
+        )
+        # Detail must carry the fault context, NOT just bare "book_status=bootstrapping"
+        assert fault_reason in diag["detail"], (
+            f"diag.detail must contain fault_reason={fault_reason!r}, "
+            f"got {diag['detail']!r}"
+        )
+        return diag
+
+    def test_sequence_gap_survives_bootstrapping_real_path(self):
+        """REBUILDING(sequence_gap) → BOOTSTRAPPING → SEQUENCE_GAP arming."""
+        self._run_real_path("sequence_gap: gap=5 prev=100 incoming_prev=105",
+                            SessionArmingReason.SEQUENCE_GAP)
+
+    def test_checksum_mismatch_survives_bootstrapping_real_path(self):
+        """REBUILDING(checksum) → BOOTSTRAPPING → SEQUENCE_GAP arming."""
+        self._run_real_path("checksum_mismatch: expected=123 actual=456",
+                            SessionArmingReason.SEQUENCE_GAP)
+
+    def test_transport_failure_survives_bootstrapping_real_path(self):
+        """REBUILDING(transport) → BOOTSTRAPPING → TRANSPORT_FAULT_RECOVERY."""
+        self._run_real_path("transport_failure: connection reset",
+                            SessionArmingReason.TRANSPORT_FAULT_RECOVERY)
+
+    def test_stale_hot_book_survives_bootstrapping_real_path(self):
+        """REBUILDING(stale_hot_book) → BOOTSTRAPPING → STALE_BOOK_RECOVERY."""
+        self._run_real_path("stale_hot_book",
+                            SessionArmingReason.STALE_BOOK_RECOVERY)
+
+    def test_pre_snapshot_buffer_overflow_survives_bootstrapping_real_path(self):
+        """REBUILDING(buffer_overflow) → BOOTSTRAPPING → BOOK_STATUS_TRANSITION."""
+        self._run_real_path("pre_snapshot_buffer_overflow",
+                            SessionArmingReason.BOOK_STATUS_TRANSITION)
+
+    def test_hot_clears_fault_reason_after_successful_bootstrap_real_path(self):
+        """Full recovery: REBUILDING → BOOTSTRAPPING → HOT — fault cleared at HOT."""
+        book = self._make_book(status="rebuilding",
+                               fault_reason="sequence_gap: gap=5")
+        book.transition_to_bootstrapping(now_ms=1778985600000)
+        assert book.fault_reason == "sequence_gap: gap=5", (
+            "fault_reason must survive bootstrapping"
+        )
+        # Simulate successful snapshot + bootstrap_book completing
+        book.transition_to_hot()
+        assert book.status.value == "hot"
+        assert book.fault_reason == "", (
+            "fault_reason must be cleared at HOT — book has recovered"
+        )
+
+    def test_cold_no_fault_bootstrapping_no_false_arming_real_path(self):
+        """COLD→BOOTSTRAPPING (no prior fault) → FIRST_SESSION or BOOK_STATUS_TRANSITION."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        book = self._make_book(status="cold", fault_reason="")
+        book.transition_to_bootstrapping(now_ms=1778985600000)
+        assert book.fault_reason == "", "no fault to begin with"
+
+        leg = self._make_leg()
+        diag = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000,
+                                           stale_after_ms=300_000)
+        assert diag["reason"] == "book_bootstrapping"
+        # COLD→BOOTSTRAPPING with no prior fault: either FIRST_SESSION or
+        # BOOK_STATUS_TRANSITION is acceptable (V1: first session has no prior fault)
+        assert leg.arming_reason in (SessionArmingReason.FIRST_SESSION,
+                                     SessionArmingReason.BOOK_STATUS_TRANSITION), (
+            f"got {leg.arming_reason}"
+        )

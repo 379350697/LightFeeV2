@@ -50,17 +50,24 @@ class TestL2StateMachine:
     def test_transition_to_hot_clears_stale_fault_reason(self):
         """CL-002-B regression: transition_to_hot must clear fault_reason.
         V1 parity: mark_leg_ready() clears fault; a healthy HOT book must
-        not carry a prior fault_reason like 'stale_hot_book'."""
+        not carry a prior fault_reason like 'stale_hot_book'.
+
+        BOOTSTRAPPING preserves fault_reason so apply_book_readiness_to_leg
+        can derive the correct arming_reason (V1 ensure_candidate fault→arming).
+        Only successful HOT clears it — the book has recovered.
+        """
         book = LocalL2Book(venue="okx", symbol="RLSUSDT", status=L2BookStatus.REBUILDING)
         book.fault_reason = "stale_hot_book"
         book.transition_to_bootstrapping(now_ms=5000)
-        assert book.fault_reason == "", (
-            "transition_to_bootstrapping must clear stale fault"
+        # fault_reason is preserved through bootstrapping for arming_reason derivation
+        assert book.fault_reason == "stale_hot_book", (
+            "transition_to_bootstrapping must preserve fault_reason for "
+            "arming_reason derivation (V1 ensure_candidate fault→arming)"
         )
         book.transition_to_hot()
         assert book.status == L2BookStatus.HOT
         assert book.fault_reason == "", (
-            "transition_to_hot must clear any leftover fault_reason"
+            "transition_to_hot must clear fault_reason — book has recovered"
         )
 
     def test_transition_to_hot_from_degraded_clears_fault(self):
@@ -941,3 +948,120 @@ class TestExecutionLiquidityFromBook:
         snap = execution_liquidity_from_local_l2(book, max_depth=3, max_age_ms=5000, now_ms=12000)
         assert len(snap.bids) == 3
         assert len(snap.asks) == 3
+
+
+# ===========================================================================
+# V1 parity: transition_to_rebuilding sets fault_reason (DP-3)
+# ===========================================================================
+
+
+class TestRebuildFaultReason:
+    """V1: every rebuild/sequence-gap event carries a specific fault detail.
+    V2: transition_to_rebuilding must record why the rebuild was triggered."""
+
+    def test_transition_to_rebuilding_preserves_fault_reason_when_set(self):
+        """When fault_reason is set before transition_to_rebuilding, it is preserved."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.HOT)
+        book.fault_reason = "sequence_gap_20"
+        book.transition_to_rebuilding(now_ms=10000)
+        assert book.status == L2BookStatus.REBUILDING
+        assert book.fault_reason == "sequence_gap_20", (
+            "transition_to_rebuilding must preserve explicitly-set fault_reason"
+        )
+
+    def test_transition_to_rebuilding_from_hot_requires_explicit_trigger(self):
+        """HOT→REBUILDING without a fault_reason should still work but evidence
+        must be provided by the caller setting fault_reason first."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.HOT)
+        book.transition_to_rebuilding(now_ms=10000)
+        assert book.status == L2BookStatus.REBUILDING
+        # fault_reason may be empty if caller didn't set it — this is the caller's
+        # responsibility. The transition itself is legal.
+
+    def test_transition_to_rebuilding_from_bootstrapping_keeps_context(self):
+        """BOOTSTRAPPING→REBUILDING keeps any existing fault context."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.BOOTSTRAPPING)
+        book.fault_reason = "snapshot_bootstrap: connection timeout"
+        book.transition_to_rebuilding(now_ms=10000)
+        assert book.status == L2BookStatus.REBUILDING
+        assert "connection timeout" in book.fault_reason
+
+
+# ===========================================================================
+# V1 parity: observed_at_ms preserved through state transitions (DP-5)
+# ===========================================================================
+
+
+class TestObservedAtMsPreservation:
+    """V1: observed_at_ms is preserved across all lifecycle events.
+    V2: transition_to_bootstrapping/rebuilding must not reset observed_at_ms."""
+
+    def test_observed_at_ms_survives_transition_to_bootstrapping(self):
+        """observed_at_ms set by snapshot must survive transition_to_bootstrapping."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=50000,
+        )
+        assert book.observed_at_ms == 50000
+        book.transition_to_bootstrapping(now_ms=60000)
+        assert book.observed_at_ms == 50000, (
+            "transition_to_bootstrapping must not reset observed_at_ms"
+        )
+
+    def test_observed_at_ms_survives_transition_to_rebuilding(self):
+        """observed_at_ms must survive transition_to_rebuilding."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.HOT)
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=50000,
+        )
+        assert book.observed_at_ms == 50000
+        book.fault_reason = "sequence_gap_5"
+        book.transition_to_rebuilding(now_ms=60000)
+        assert book.status == L2BookStatus.REBUILDING
+        assert book.observed_at_ms == 50000, (
+            "transition_to_rebuilding must not reset observed_at_ms"
+        )
+
+    def test_observed_at_ms_zero_until_first_snapshot(self):
+        """Book starts with observed_at_ms=0, set by first snapshot/delta."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        assert book.observed_at_ms == 0
+        book.transition_to_bootstrapping(now_ms=10000)
+        assert book.observed_at_ms == 0, "still 0 before first data"
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=1, now_ms=15000,
+        )
+        assert book.observed_at_ms == 15000, "set by first snapshot"
+
+    def test_delta_updates_observed_at_ms(self):
+        """Each delta update refreshes observed_at_ms."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=100, now_ms=10000,
+        )
+        assert book.observed_at_ms == 10000
+        book.apply_delta(
+            [PriceLevel(price=50050, quantity=1.0)], [],
+            sequence=101, previous_sequence=100, now_ms=15000,
+        )
+        assert book.observed_at_ms == 15000, "delta must update observed_at_ms"
+
+    def test_snapshot_with_event_time_zero_uses_given_now_ms(self):
+        """When event_time_ms=0, the caller's now_ms is used as observed_at_ms."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=1.0)],
+            [PriceLevel(price=50100, quantity=1.0)],
+            sequence=1, now_ms=0,
+        )
+        assert book.observed_at_ms == 0, (
+            "when now_ms=0, observed_at_ms=0 — caller must pass exchange time"
+        )

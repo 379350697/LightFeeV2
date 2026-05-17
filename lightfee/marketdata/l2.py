@@ -431,7 +431,10 @@ class LocalL2Book:
         if self.status in (L2BookStatus.COLD, L2BookStatus.REBUILDING, L2BookStatus.RESUME_WAITING):
             self.status = L2BookStatus.BOOTSTRAPPING
             self.bootstrap_started_ms = now_ms
-            self.fault_reason = ""
+            # V1 parity: fault_reason is preserved through BOOTSTRAPPING so
+            # apply_book_readiness_to_leg can derive the correct arming_reason
+            # (e.g., sequence_gap → SEQUENCE_GAP, stale → STALE_BOOK_RECOVERY).
+            # fault_reason is cleared only on successful transition_to_hot().
 
     def transition_to_hot(self) -> None:
         if self.status in (
