@@ -47,6 +47,31 @@ class TestL2StateMachine:
         assert book.status == L2BookStatus.HOT
         assert book.degrade_count == 0
 
+    def test_transition_to_hot_clears_stale_fault_reason(self):
+        """CL-002-B regression: transition_to_hot must clear fault_reason.
+        V1 parity: mark_leg_ready() clears fault; a healthy HOT book must
+        not carry a prior fault_reason like 'stale_hot_book'."""
+        book = LocalL2Book(venue="okx", symbol="RLSUSDT", status=L2BookStatus.REBUILDING)
+        book.fault_reason = "stale_hot_book"
+        book.transition_to_bootstrapping(now_ms=5000)
+        assert book.fault_reason == "", (
+            "transition_to_bootstrapping must clear stale fault"
+        )
+        book.transition_to_hot()
+        assert book.status == L2BookStatus.HOT
+        assert book.fault_reason == "", (
+            "transition_to_hot must clear any leftover fault_reason"
+        )
+
+    def test_transition_to_hot_from_degraded_clears_fault(self):
+        """DEGRADED→HOT transition must clear fault_reason set by degradation."""
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.transition_to_degraded("connection timeout")
+        assert book.fault_reason == "connection timeout"
+        book.transition_to_hot()
+        assert book.status == L2BookStatus.HOT
+        assert book.fault_reason == ""
+
     def test_hot_to_degraded(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.HOT)
         book.transition_to_degraded(error="stream disconnected")

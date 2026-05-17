@@ -2095,3 +2095,52 @@ class TestBookReadinessReasonTaxonomy:
         assert result["ready"] is False
         assert result["reason"] == "book_timestamp_missing"
         assert result["reason"] != "book_hot"
+
+    def test_hot_with_stale_fault_is_not_book_hot(self):
+        """Regression CL-002-B: HOT book with leftover stale_hot_book fault_reason
+        must report the true readiness state, never 'book_hot'.
+
+        Production recurrence: book transitions stale→rebuilding→bootstrapping→hot
+        but fault_reason="stale_hot_book" survives, making apply_book_readiness_to_leg
+        report reason="book_hot" even though the book is healthy.  V1 mark_leg_ready
+        always clears fault; V2 transition_to_hot must clear fault_reason.
+        """
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(
+            status="hot",
+            bid=1.0,
+            ask=1.1,
+            observed_at_ms=1778985600000,
+            fault_reason="stale_hot_book",
+        )
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] != "book_hot", (
+            f"book_hot must never be a not-ready reason; got reason={result['reason']} "
+            f"detail={result['detail']}"
+        )
+        assert result["ready"] is True, (
+            f"HOT+fresh+non-empty+uncrossed book must be ready; got reason={result['reason']}"
+        )
+        assert result["reason"] == "ready"
+        assert result["detail"] == "local_l2_book_hot_fresh"
+
+    def test_hot_with_stale_fault_but_stale_is_caught(self):
+        """HOT book with stale_hot_book fault that IS actually stale must report
+        stale_book, not book_hot."""
+        from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
+
+        leg = self._make_leg()
+        book = self._make_book(
+            status="hot",
+            bid=1.0,
+            ask=1.1,
+            observed_at_ms=1778985000000,  # 600s old
+            fault_reason="stale_hot_book",
+        )
+        result = apply_book_readiness_to_leg(leg, book, now_ms=1778985600000, stale_after_ms=300_000)
+
+        assert result["reason"] != "book_hot"
+        assert result["reason"] == "stale_book"

@@ -275,19 +275,10 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = detail
         return diag
 
-    runtime_fault = str(getattr(book, "fault_reason", "") or "")
-    if runtime_fault:
-        leg.mark_faulted(
-            EntryLocalL2LegFault.RUNTIME_SUSPENDED,
-            runtime_fault,
-            seen_at_ms=observed_at_ms,
-        )
-        diag["reason"] = f"book_{status_value}"
-        diag["detail"] = runtime_fault
-        return diag
-
     if status_value == "hot":
-        # HOT book must have non-empty bid/ask
+        # HOT book — readiness determined by bid/ask and timestamp (already
+        # checked above).  V1 parity: a healthy HOT book must clear any prior
+        # fault; fault_reason is only meaningful for non-HOT statuses.
         bid = book.best_bid() if hasattr(book, "best_bid") else 1.0
         ask = book.best_ask() if hasattr(book, "best_ask") else 1.0
         if bid <= 0 or ask <= 0:
@@ -304,6 +295,17 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["ready"] = True
         diag["reason"] = "ready"
         diag["detail"] = "local_l2_book_hot_fresh"
+        return diag
+
+    runtime_fault = str(getattr(book, "fault_reason", "") or "")
+    if runtime_fault:
+        leg.mark_faulted(
+            EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+            runtime_fault,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = f"book_{status_value}"
+        diag["detail"] = runtime_fault
         return diag
 
     leg.mark_faulted(

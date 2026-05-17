@@ -431,6 +431,7 @@ class LocalL2Book:
         if self.status in (L2BookStatus.COLD, L2BookStatus.REBUILDING, L2BookStatus.RESUME_WAITING):
             self.status = L2BookStatus.BOOTSTRAPPING
             self.bootstrap_started_ms = now_ms
+            self.fault_reason = ""
 
     def transition_to_hot(self) -> None:
         if self.status in (
@@ -440,6 +441,7 @@ class LocalL2Book:
             L2BookStatus.RESUME_WAITING,
         ):
             self.status = L2BookStatus.HOT
+            self.fault_reason = ""
 
     def transition_to_degraded(self, error: str = "") -> None:
         self.status = L2BookStatus.DEGRADED
