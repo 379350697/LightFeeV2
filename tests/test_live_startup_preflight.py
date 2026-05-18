@@ -25,6 +25,7 @@ from lightfee.engine.bootstrap import (
 )
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_uncertain_error
 
@@ -455,6 +456,30 @@ class TestRuntimePreflight:
             assert binance.last_request.client_order_id
             assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
             assert runtime.state.recovery_blocked_reason is None
+
+    @pytest.mark.asyncio
+    async def test_startup_clears_stale_blocked_reason_when_snapshot_is_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "recovery_blocked_reason": "live_position_mismatch_flatten_failed",
+                "recovery_blocked_at_ms": 1234,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+            })
+
+            runtime = LiveRuntime(config, venue_adapters={})
+            await runtime.start()
+            await runtime.stop()
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
 
     @pytest.mark.asyncio
     async def test_startup_flattens_size_mismatched_live_exchange_positions(self):

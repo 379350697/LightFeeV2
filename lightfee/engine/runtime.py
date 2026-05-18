@@ -248,10 +248,21 @@ class LiveRuntime:
         # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
 
+        classified_recovery_state = classify_startup_recovery_state(self.state)
+        if (
+            self.state.recovery_blocked_reason
+            and classified_recovery_state == "clean"
+            and self.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+            and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+        ):
+            from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+            clear_risk_mode_for_recovery(self.state)
+            classified_recovery_state = "clean"
+
         recovery_class = (
             "blocked"
             if self.state.recovery_blocked_reason
-            else classify_startup_recovery_state(self.state)
+            else classified_recovery_state
         )
 
         if recovery_class == "clean":
