@@ -56,6 +56,16 @@ class _RejectingAdapter(VenueAdapter):
         return PositionSnapshot(venue=self._venue, symbol=symbol, quantity=0.0)
 
 
+class _UncertainAdapter(_RejectingAdapter):
+    """Adapter that always returns uncertain submit errors."""
+
+    async def place_order(self, request: OrderRequest) -> OrderFill:
+        raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, "test timeout")
+
+    async def submit_passive_order(self, request: OrderRequest):
+        raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, "test timeout")
+
+
 class _FakeFillAdapter(VenueAdapter):
     """Adapter that always reports a successful fill."""
 
@@ -118,10 +128,9 @@ class TestMakerEntryMaxReposts:
                 planned_route=ExecutionRoute.PASSIVE_INCREMENTAL,
             )
             result = await executor.execute(ctx)
-            # First attempt is allowed — maker rejected → FAILED with pending entry
+            # First attempt is allowed; deterministic maker rejected is terminal in V1.
             assert result.state == EntryState.FAILED
-            assert result.pending_entry is not None
-            assert result.pending_entry.repost_count == 1
+            assert result.pending_entry is None
         finally:
             journal.close()
 
@@ -152,7 +161,7 @@ class TestMakerEntryMaxReposts:
             result = await executor.execute(ctx)
             # Should not be blocked by repost limit (0 = unlimited)
             assert result.state == EntryState.FAILED
-            assert result.pending_entry is not None
+            assert result.pending_entry is None
         finally:
             journal.close()
 
@@ -427,15 +436,29 @@ class TestRepostCountTracking:
 
     @pytest.mark.asyncio
     async def test_repost_count_increments_on_reentry(self):
-        """After a rejected execution creates a pending entry, the next execution
-        via the same entry_id should get a repost_count increment."""
+        """After an uncertain execution creates a pending entry, reentry increments repost_count."""
         journal_path = Path(tempfile.mkdtemp()) / "test.jsonl"
         journal = Journal(journal_path)
         journal.open()
         try:
+            existing_pending = PendingEntry(
+                pending_id="incr-test-001",
+                symbol="BTCUSDT",
+                long_venue=Venue.BYBIT,
+                short_venue=Venue.BYBIT,
+                target_quantity=1.0,
+                long_side=Side.BUY,
+                short_side=Side.SELL,
+                created_at_ms=1000,
+                repost_count=1,
+                zero_fill_since_ms=1000,
+                maker_leg_filled=0.0,
+                hedge_leg_filled=0.0,
+            )
             executor = EntrySyncExecutor(
-                adapters={Venue.BYBIT: _RejectingAdapter(Venue.BYBIT)},
+                adapters={Venue.BYBIT: _UncertainAdapter(Venue.BYBIT)},
                 journal=journal,
+                state={"pending_entries": {"incr-test-001": existing_pending}},
                 config_overrides={"maker_entry_max_reposts": 10},
             )
             ctx = EntryContext(
@@ -452,8 +475,8 @@ class TestRepostCountTracking:
                 planned_route=ExecutionRoute.PASSIVE_INCREMENTAL,
             )
             result = await executor.execute(ctx)
-            assert result.state == EntryState.FAILED
+            assert result.state in (EntryState.FAILED, EntryState.FAILED_WITH_RESIDUAL)
             assert result.pending_entry is not None
-            assert result.pending_entry.repost_count == 1
+            assert result.pending_entry.repost_count == 2
         finally:
             journal.close()

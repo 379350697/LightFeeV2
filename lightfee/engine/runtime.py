@@ -984,9 +984,11 @@ class LiveRuntime:
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
                 if dispatched == 0:
                     reason = (
-                        "entry_local_l2_selection_blocked"
-                        if selection_blocker_counts or admission_blocker_counts
-                        else "no_entry_dispatched"
+                        self._v1_tradeable_no_entry_reason(
+                            selection_blocker_counts,
+                            admission_blocker_counts,
+                        )
+                        or "no_entry_dispatched"
                     )
                     self._emit_scan_no_entry_diagnostics(
                         reason=reason,
@@ -1701,6 +1703,31 @@ class LiveRuntime:
         # --- Process pending entries: reconcile + drive missing hedge ---
         resolved_entry_ids: list[str] = []
         for entry_id, pending in list(self.state.pending_entries.items()):
+            if getattr(pending, "outcome", "") == "rejected":
+                if not pending.has_any_fill():
+                    self.journal.append(
+                        "reconciliation.rejected_pending_cleared",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": "maker rejected is terminal in V1",
+                        },
+                    )
+                    resolved_entry_ids.append(entry_id)
+                    continue
+                self.journal.append(
+                    "reconciliation.rejected_pending_retained_with_fill",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "reason": "rejected pending contains fill evidence; manual recovery required",
+                    },
+                )
+                self._apply_reconcile_backoff(pending, now_ms)
+                continue
+
             if not pending.uncertain_outcome:
                 resolved_entry_ids.append(entry_id)
                 continue
@@ -3775,6 +3802,40 @@ class LiveRuntime:
         self._last_entry_l2_readiness_diag_ts_ms = now_ms
         self.journal.append("runtime.entry_local_l2_readiness_diagnostics", payload)
 
+    @staticmethod
+    def _v1_tradeable_no_entry_reason(
+        selection_blocker_counts: Counter,
+        admission_blocker_counts: Counter | None = None,
+    ) -> str | None:
+        blocker_counts: Counter[str] = Counter()
+        for key, value in selection_blocker_counts.items():
+            count = int(value)
+            if count > 0:
+                blocker_counts[str(key)] += count
+        if admission_blocker_counts is not None:
+            for key, value in admission_blocker_counts.items():
+                count = int(value)
+                if count > 0:
+                    blocker_counts[str(key)] += count
+
+        blockers = {key for key, count in blocker_counts.items() if count > 0}
+        if not blockers:
+            return None
+        if blockers == {"entry_waiting_for_finalization_window_too_early"}:
+            return "tradeable_candidates_waiting_for_entry_finalization_window_too_early"
+        if blockers == {"entry_finalization_window_expired"}:
+            return "tradeable_candidates_expired_after_entry_finalization_window"
+        if blockers <= {
+            "entry_waiting_for_finalization_window_too_early",
+            "entry_finalization_window_expired",
+        }:
+            return "tradeable_candidates_outside_entry_finalization_window"
+        if blockers == {"entry_local_l2_waiting_for_prewarm_window"}:
+            return "tradeable_candidates_waiting_for_entry_local_l2_prewarm_window"
+        if blockers == {"entry_local_l2_waiting_for_dual_ready"}:
+            return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
+        return "tradeable_candidates_blocked_by_entry_local_l2_readiness"
+
     def _emit_scan_no_entry_diagnostics(
         self,
         *,
@@ -4504,6 +4565,18 @@ class LiveRuntime:
                     {"position_id": result.open_position.position_id},
                 )
             if result.pending_entry is not None:
+                if getattr(result.pending_entry, "outcome", "") == "rejected":
+                    self.journal.append(
+                        "runtime.rejected_pending_suppressed",
+                        {
+                            "pending_id": result.pending_entry.pending_id,
+                            "symbol": result.pending_entry.symbol,
+                            "route": result.route.value,
+                            "state": result.state.value,
+                            "reason": "maker rejected is terminal in V1",
+                        },
+                    )
+                    return True
                 # Track pending entry for reconciliation
                 self.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
                 self._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id

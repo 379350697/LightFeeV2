@@ -181,12 +181,6 @@ class EntrySyncExecutor:
         if maker_result["outcome"] == "rejected":
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
-            result.pending_entry = self._make_pending_entry(
-                ctx, maker_req, hedge_req, now_ms,
-                outcome="rejected",
-                maker_order_id="",
-                hedge_order_id="",
-            )
             self.journal.append(
                 "entry.aborted",
                 {
@@ -195,15 +189,6 @@ class EntrySyncExecutor:
                     "reason": maker_result.get("reason", "maker rejected"),
                     "maker_client_order_id": maker_req.client_order_id,
                     "hedge_client_order_id": hedge_req.client_order_id,
-                },
-            )
-            self.journal.append(
-                "entry.aborted_failed_pending_retained",
-                {
-                    "position_id": ctx.entry_id,
-                    "internal_entry_id": ctx.entry_id,
-                    "pending_entry_id": ctx.entry_id,
-                    "outcome": "rejected",
                 },
             )
             return result
@@ -483,7 +468,7 @@ class EntrySyncExecutor:
             hedge_client_order_id=hedge_req.client_order_id or "",
             maker_leg_filled=maker_filled_total,
             hedge_leg_filled=hedge_filled_total,
-            uncertain_outcome=(outcome != "filled"),
+            uncertain_outcome=(outcome not in {"filled", "rejected"}),
             entry_type=ctx.entry_type.value,
             maker_price=maker_req.price or 0.0,
             long_quantity=ctx.long_quantity,

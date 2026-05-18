@@ -14,7 +14,10 @@ import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import OrderFill, OrderRequest, PositionSnapshot, Side, Venue
-from lightfee.engine.entry_sync import EntrySyncExecutor
+from lightfee.engine.entry import EntryState
+from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
+from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.reconciliation import OrderReconciler
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import EngineState, PendingEntry
 from lightfee.persistence.journal import Journal
@@ -314,6 +317,98 @@ class TestPlannerDispatchIntegration:
         records = runtime.journal.read_all()
         kinds = [r["kind"] for r in records]
         assert "runtime.entry_dispatched" in kinds
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_does_not_register_rejected_pending(self, config, tmp_journal):
+        """V1: deterministic maker rejection is terminal, not pending exposure."""
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class RejectedPendingExecutor:
+            async def execute(self, ctx):
+                return EntryExecutionResult(
+                    route=ExecutionRoute.REJECTED,
+                    state=EntryState.FAILED,
+                    pending_entry=PendingEntry(
+                        pending_id=ctx.entry_id,
+                        symbol=ctx.symbol,
+                        long_venue=ctx.long_venue,
+                        short_venue=ctx.short_venue,
+                        target_quantity=ctx.long_quantity,
+                        long_side=Side.BUY,
+                        short_side=Side.SELL,
+                        created_at_ms=ctx.created_at_ms,
+                        maker_client_order_id="maker-rejected-cid",
+                        hedge_client_order_id="hedge-unused-cid",
+                        outcome="rejected",
+                        uncertain_outcome=True,
+                    ),
+                )
+
+        runtime.entry_executor = RejectedPendingExecutor()
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+        )
+
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+
+        assert runtime.state.pending_entries == {}
+        records = runtime.journal.read_all()
+        kinds = [r["kind"] for r in records]
+        assert "runtime.entry_dispatched" in kinds
+        assert "runtime.pending_entry_registered" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_reconcile_clears_zero_fill_rejected_pending_without_position_progress(
+        self, config, tmp_journal
+    ):
+        """V1: rejected submit errors are terminal and cannot hydrate exposure."""
+        binance = FakeVenueAdapter(Venue.BINANCE, default_position_qty=371.0)
+        okx = FakeVenueAdapter(Venue.OKX)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.reconciler = OrderReconciler(adapters)
+        runtime.state.pending_entries["entry-rejected"] = PendingEntry(
+            pending_id="entry-rejected",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_client_order_id="maker-rejected-cid",
+            hedge_client_order_id="hedge-unused-cid",
+            outcome="rejected",
+            uncertain_outcome=True,
+            maker_leg="long",
+        )
+
+        await runtime._reconcile_pending_state(5000)
+
+        assert "entry-rejected" not in runtime.state.pending_entries
+        records = runtime.journal.read_all()
+        kinds = [r["kind"] for r in records]
+        assert "pending_entry.maker_progress_applied" not in kinds
+        assert "pending_entry.missing_hedge_detected" not in kinds
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_rejects_below_min_notional(self, config, tmp_journal):

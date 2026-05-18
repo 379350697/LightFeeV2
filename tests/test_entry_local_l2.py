@@ -1521,7 +1521,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "candidates",
         }
         assert expected_fields.issubset(no_entry.keys())
-        assert no_entry["reason"] == "entry_local_l2_selection_blocked"
+        assert no_entry["reason"] == "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
         assert no_entry["candidate_count"] == 1
         assert no_entry["tradeable_count"] == 1
         # V1 parity: shortlist/tradeable candidates are not final selected
@@ -1563,6 +1563,129 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert readiness["primary_pair_ids"] == ["btcusdt:binance->bybit"]
         assert len(readiness["not_ready"]) == 2
         assert readiness["not_ready"][0]["reason"] == "book_missing"
+
+    @pytest.mark.asyncio
+    async def test_scan_no_entry_reason_uses_v1_finalization_window_before_local_l2(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from lightfee.config.schema import (
+            AppConfig,
+            PersistenceConfig,
+            RuntimeConfig,
+            StrategyConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        now_ms = 10000
+        funding_ts = now_ms + 900_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms,
+        )
+
+        snapshot_path = tmp_path / "sidecar.json"
+        event_path = tmp_path / "events.jsonl"
+        snapshot_path.write_text(json.dumps({
+            "schema_version": 2,
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms,
+            "funding_lifecycle": [],
+            "market_lifecycle": [],
+            "transfer_lifecycle": [],
+            "liquidity_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": {
+                "binance:BTCUSDT": {
+                    "venue": "binance",
+                    "symbol": "BTCUSDT",
+                    "bid": 50000,
+                    "ask": 50010,
+                    "funding_rate_bps": 10.0,
+                    "funding_timestamp_ms": funding_ts,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit",
+                    "symbol": "BTCUSDT",
+                    "bid": 50005,
+                    "ask": 50015,
+                    "funding_rate_bps": -5.0,
+                    "funding_timestamp_ms": funding_ts,
+                },
+            },
+            "candidates": [{
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "symbol": "BTCUSDT",
+                "funding_diff_bps": 15.0,
+                "funding_edge_bps": 15.0,
+                "expected_edge_bps": 15.0,
+                "worst_case_edge_bps": 10.0,
+                "ranking_edge_bps": 15.0,
+                "entry_notional_quote": 30.0,
+            }],
+        }))
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(snapshot_path),
+                sidecar_snapshot_max_age_ms=600_000,
+                live_scan_recovery_success_count=1,
+            ),
+            strategy=StrategyConfig(
+                local_l2_enabled=True,
+                local_l2_ws_enabled=False,
+                max_concurrent_positions=2,
+                entry_window_secs=480,
+                local_l2_max_age_ms=1000,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(event_path),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+        rt = LiveRuntime(config)
+        rt.state.lifecycle = EngineLifecycle.RUNNING
+        rt.state.risk_mode = GlobalRiskMode.RUNNING
+        rt.entry_executor = object()
+        rt.journal.open()
+
+        await rt.tick()
+        rt.journal.close()
+
+        records = [
+            json.loads(line) for line in event_path.read_text().splitlines()
+            if line.strip()
+        ]
+        no_entry = next(
+            r["payload"] for r in records
+            if r["kind"] == "scan.no_entry_diagnostics"
+        )
+        assert no_entry["tradeable_count"] == 1
+        assert no_entry["selected_candidate_count"] == 0
+        assert no_entry["reason"] == (
+            "tradeable_candidates_waiting_for_entry_finalization_window_too_early"
+        )
+        assert no_entry["tradeable_selection_blocker_counts"] == {
+            "entry_waiting_for_finalization_window_too_early": 1
+        }
+        assert no_entry["candidates"][0]["pair_id"] == "btcusdt:binance->bybit"
+        assert no_entry["entry_candidate_blocked_counts"] == {}
+        assert no_entry["execution_liquidity_blocked_counts"] == {}
+        assert no_entry["entry_final_gate_blocked_counts"] == {
+            "entry_waiting_for_finalization_window_too_early": 1
+        }
+        assert no_entry["candidates"][0]["rank"] == 1
+        assert no_entry["candidates"][0]["remaining_ms"] == 900000
+        assert no_entry["candidates"][0]["primary_tracked"] is True
+        assert no_entry["candidates"][0]["selection_blocker"] == (
+            "entry_waiting_for_finalization_window_too_early"
+        )
+        assert "blocked_reasons" in no_entry["candidates"][0]
 
     @pytest.mark.asyncio
     async def test_scan_activates_l2_only_for_v1_primary_and_shadow_scope(

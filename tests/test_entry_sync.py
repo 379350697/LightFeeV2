@@ -198,8 +198,11 @@ class TestEntrySyncMakerReject:
         assert result.state == EntryState.FAILED
         assert result.open_position is None
         assert result.residual_task is None
+        assert result.pending_entry is None
         # Hedge venue must NOT have been called
         assert okx_ada.place_order_call_count == 0
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "entry.aborted_failed_pending_retained" not in kinds
 
     @pytest.mark.asyncio
     async def test_maker_uncertain_marks_pending(self, adapters, journal, btc_context):
