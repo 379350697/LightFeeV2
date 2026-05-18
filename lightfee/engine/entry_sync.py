@@ -929,8 +929,24 @@ async def drive_pending_entry_hedge(
         )
         try:
             await adapter.cancel_order(cancel_req)
-        except Exception:
-            pass  # Best-effort cancel; proceed to re-submit
+        except Exception as e:
+            journal.append(
+                "entry.hedge_drive_cancel_replace_cancel_failed",
+                {
+                    "entry_id": entry_id,
+                    "action": "cancel_replace",
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "order_id": maker_order_id,
+                    "error": str(e),
+                    "reason": "replacement_not_submitted_to_avoid_double_maker",
+                },
+            )
+            return HedgeDriveResult(
+                action="cancel_replace",
+                outcome="uncertain",
+                detail=f"cancel failed before replacement: {e}",
+            )
 
         new_req = OrderRequest(
             venue=maker_venue,

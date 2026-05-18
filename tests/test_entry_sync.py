@@ -25,6 +25,7 @@ from lightfee.engine.entry import (
 from lightfee.engine.entry_sync import (
     EntryExecutionResult,
     EntrySyncExecutor,
+    drive_pending_entry_hedge,
     execute_entry,
 )
 from lightfee.engine.execution_planner import ExecutionRoute
@@ -214,6 +215,61 @@ class TestEntrySyncMakerReject:
 
         assert result.state in (EntryState.FAILED, EntryState.FAILED_WITH_RESIDUAL)
         assert result.has_uncertainty is True
+
+
+class TestPendingEntryHedgeDrive:
+    @pytest.mark.asyncio
+    async def test_cancel_replace_does_not_submit_new_maker_when_cancel_fails(self, journal):
+        """V1 parity: cancel-replace must not double-post when cancel is unconfirmed.
+
+        Rust V1 `cancel_pending_entry_passive_order()` propagates cancel failure
+        and keeps the pending entry in reconciliation; it does not submit a
+        replacement maker order while the old maker may still be live.
+        """
+
+        class CancelFailingAdapter(_FakeAdapter):
+            async def cancel_order(self, request):
+                self.last_request = request
+                raise RuntimeError("cancel timeout")
+
+        maker = CancelFailingAdapter(Venue.BINANCE)
+        pending = PendingEntry(
+            pending_id="pe-cancel-fail",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            maker_order_id="old-maker-1",
+            maker_client_order_id="old-maker-cid",
+            maker_price=50000.0,
+            created_at_ms=1000,
+        )
+
+        result = await drive_pending_entry_hedge(
+            entry_id=pending.pending_id,
+            pending=pending,
+            new_price=50050.0,
+            old_price=50000.0,
+            action="cancel_replace",
+            now_ms=2000,
+            adapters={Venue.BINANCE: maker},
+            journal=journal,
+            maker_leg=Side.BUY,
+            symbol=pending.symbol,
+            long_venue=pending.long_venue,
+            short_venue=pending.short_venue,
+        )
+
+        assert result.outcome == "uncertain"
+        assert "cancel failed" in result.detail
+        assert maker.place_order_call_count == 0
+        assert pending.maker_order_id == "old-maker-1"
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "entry.hedge_drive_cancel_replace_cancel_failed" in kinds
 
 
 # ---------------------------------------------------------------------------
