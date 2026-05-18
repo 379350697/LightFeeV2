@@ -2911,6 +2911,62 @@ class TestBitgetOrderBody:
         assert seen_body["reduceOnly"] == "YES"
         assert "tradeSide" not in seen_body
 
+    @pytest.mark.asyncio
+    async def test_bitget_classic_order_mode_probe_overrides_position_payload_mode(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        calls: list[tuple[str, str]] = []
+        seen_body: dict = {}
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            calls.append((method, path))
+            if path == "/api/v2/mix/position/single-position":
+                return {
+                    "code": "00000",
+                    "data": [{
+                        "symbol": "KSMUSDT",
+                        "total": "2.9",
+                        "holdSide": "short",
+                        "averageOpenPrice": "5.545",
+                        "holdMode": "hedge_mode",
+                    }],
+                }
+            if path == "/api/v2/mix/account/account":
+                return {"code": "00000", "data": {"posMode": "one_way_mode"}}
+            if path == "/api/v2/mix/order/place-order":
+                seen_body.update(body or {})
+                return {
+                    "code": "00000",
+                    "data": {"orderId": "bitget-close-short-002", "clientOid": "close-short"},
+                }
+            return {"code": "00000", "data": {}}
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._transport._request = fake_request
+        adapter._transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BITGET, symbol=sym, side=req.side,
+            quantity=req.quantity, price=5.55, order_id="bitget-close-short-002",
+        )
+
+        await adapter.fetch_position("KSMUSDT")
+        await adapter.place_order(OrderRequest(
+            venue=Venue.BITGET,
+            symbol="KSMUSDT",
+            side=Side.BUY,
+            quantity=2.9,
+            reduce_only=True,
+            client_order_id="close-short",
+        ))
+
+        assert ("GET", "/api/v2/mix/account/account") in calls
+        assert seen_body["side"] == "buy"
+        assert seen_body["reduceOnly"] == "YES"
+        assert "tradeSide" not in seen_body
+
 
 # ---------------------------------------------------------------------------
 # Task 5: Restore Official Aster Endpoints

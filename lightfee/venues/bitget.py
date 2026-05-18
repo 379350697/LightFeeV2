@@ -293,9 +293,6 @@ class BitgetAdapter(VenueAdapter):
             raw = await self._transport._request(
                 "GET", "/api/v2/mix/position/single-position", params=params, private=True
             )
-            parsed_mode = _extract_position_hedge_mode(raw)
-            if parsed_mode is not None:
-                self._position_hedge_mode = parsed_mode
         else:
             params = {
                 "symbol": venue_sym,
