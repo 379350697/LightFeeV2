@@ -180,7 +180,7 @@ class BitgetAdapter(VenueAdapter):
             raw = await self._transport._request(
                 "GET",
                 "/api/v3/position/current-position",
-                params={"productType": "USDT-FUTURES"},
+                params={"category": "USDT-FUTURES"},
                 private=True,
             )
             if _payload_indicates_classic(raw):

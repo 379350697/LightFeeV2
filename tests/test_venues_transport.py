@@ -572,6 +572,37 @@ class TestBitgetProfileDetection:
         assert adapter.account_profile is not None
 
     @pytest.mark.asyncio
+    async def test_live_uta_probe_uses_official_category_param(self):
+        from lightfee.venues.bitget import BitgetAccountProfile, BitgetAdapter
+
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            if "/api/v3/position/current-position" in str(request.url):
+                params = dict(request.url.params)
+                seen_params.append(params)
+                return httpx.Response(200, json={"code": "00000", "data": []})
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        try:
+            profile = await adapter.detect_profile()
+        finally:
+            await adapter._transport.close()
+
+        assert profile == BitgetAccountProfile.UTA
+        assert seen_params
+        assert seen_params[0]["category"] == "USDT-FUTURES"
+        assert "productType" not in seen_params[0]
+
+    @pytest.mark.asyncio
     async def test_classic_mode_error_detection(self):
         from lightfee.venues.bitget import _is_classic_mode_error
         # Bitget error codes that indicate classic account
