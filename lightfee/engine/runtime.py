@@ -1346,6 +1346,12 @@ class LiveRuntime:
                 manager._ops_bucket_tokens = float(d["ops_bucket_tokens"])
             if d.get("cooldown_until_ms") is not None:
                 manager._cooldown_until_ms = d["cooldown_until_ms"]
+            # V1: restore refill anchor so next _refill_ops_bucket() does not
+            # reset tokens to capacity (passive_order_manager.rs:341)
+            if d.get("ops_bucket_last_refill_at_ms") is not None:
+                manager._ops_bucket_last_refill_at_ms = d["ops_bucket_last_refill_at_ms"]
+            if d.get("last_action_at_ms") is not None:
+                manager._last_action_at_ms = d["last_action_at_ms"]
             price = float(d.get("maker_price", 0.0))
             restored[entry_id] = (manager, price)
         if restored:
@@ -2077,8 +2083,11 @@ class LiveRuntime:
                     wake_reasons.add(e.wake_reason)
 
             try:
-                # V1: consume ops token BEFORE submitting (token bucket rate limiting)
+                # V1: consume ops token BEFORE submitting (token bucket rate limiting).
+                # AMEND = 1 token. CANCEL_REPLACE = 2 tokens (cancel + submit).
                 manager.note_operation(now_ms)
+                if action == "cancel_replace":
+                    manager.note_operation(now_ms)
                 result = await self._reprice_passive_maker_l2(
                     pending, mid, stored_price, action, now_ms, entry_id,
                 )

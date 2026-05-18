@@ -45,6 +45,14 @@ def execute_operator_command(
         state.risk_mode = new_risk
         state.lifecycle = new_lifecycle
 
+        # V1: operator-requested mode latch prevents auto-clear on clean restart.
+        # clear_stale_fail_closed_if_recovery_clean() checks this to preserve
+        # operator-intended FAIL_CLOSED across restarts (state.rs:476-487).
+        if command == OperatorCommand.FAIL_CLOSED:
+            state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+        elif command == OperatorCommand.RESUME_IF_SAFE and new_risk == GlobalRiskMode.RUNNING:
+            state.operator.requested_mode = None
+
     messages = {
         OperatorCommand.PAUSE_ENTRY: "Entries paused",
         OperatorCommand.REDUCE_ONLY: "Entered reduce-only mode",

@@ -281,3 +281,80 @@ class TestPassiveOrderManagerProductionPath:
         restored._consecutive_failures = d["consecutive_failures"]
         assert restored.consecutive_failures == manager.consecutive_failures
         assert restored.cooldown_until_ms == manager.cooldown_until_ms
+
+    def test_cancel_replace_consumes_two_tokens(self):
+        """C-R8: CANCEL_REPLACE needs 2 ops tokens (cancel + submit).
+        decide() gates at <2.0; runtime must call note_operation() twice."""
+        profile = _profile(ops_bucket_capacity=8.0, ops_bucket_refill_per_sec=0.0)
+        manager = PassiveOrderManager(profile)
+
+        # The decide() call should return CANCEL_REPLACE (large deviation, amend unsupported)
+        decision = manager.decide(
+            _buy_input(current_price=90.0, supports_amend=False),
+            2000,
+        )
+        assert decision.kind == PassiveOrderManagerDecisionType.CANCEL_REPLACE
+
+        # Runtime must consume 2 tokens for cancel_replace
+        initial = manager.ops_bucket_tokens
+        manager.note_operation(2000)  # cancel token
+        manager.note_operation(2000)  # submit token
+        assert manager.ops_bucket_tokens == initial - 2.0, (
+            f"CANCEL_REPLACE must consume 2 tokens, got {initial - manager.ops_bucket_tokens}"
+        )
+
+    def test_cancel_replace_gated_at_less_than_two_tokens(self):
+        """C-R8: With <2 tokens available, decide() returns OPS_BUDGET_EXCEEDED
+        for cancel_replace even though 1 token would suffice for amend."""
+        profile = _profile(ops_bucket_capacity=8.0, ops_bucket_refill_per_sec=0.0)
+        manager = PassiveOrderManager(profile)
+
+        # Consume 7 tokens, leaving ~1
+        for i in range(7):
+            manager.note_operation(1000)
+
+        # Only 1 token left — cancel_replace needs 2 → OPS_BUDGET_EXCEEDED
+        decision = manager.decide(
+            _buy_input(current_price=90.0, supports_amend=False),
+            2000,
+        )
+        assert decision.kind == PassiveOrderManagerDecisionType.HOLD
+        assert decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED, (
+            "Only 1 token left: cancel_replace needs 2 → must rate-limit"
+        )
+
+    def test_restore_preserves_refill_anchor(self):
+        """C-R8: Restoring manager must set _ops_bucket_last_refill_at_ms
+        so the next _refill_ops_bucket() does NOT reset tokens to capacity."""
+        profile = _profile(ops_bucket_capacity=8.0, ops_bucket_refill_per_sec=0.0)
+        manager = PassiveOrderManager(profile)
+
+        # Consume some tokens and write runtime_dict
+        manager.note_operation(1000)
+        manager.note_operation(1000)
+        d = manager.runtime_dict()
+
+        original_tokens = manager.ops_bucket_tokens
+
+        # Restore: MUST set refill anchor
+        restored = PassiveOrderManager(profile)
+        restored._ops_bucket_tokens = float(d["ops_bucket_tokens"])
+        restored._ops_bucket_last_refill_at_ms = d["ops_bucket_last_refill_at_ms"]
+        restored._last_action_at_ms = d["last_action_at_ms"]
+
+        # Now call decide() — refill should NOT reset to capacity
+        # because _ops_bucket_last_refill_at_ms is set
+        decision = restored.decide(
+            _buy_input(current_price=110.0, resting_since_ms=5000),
+            5000,
+        )
+        # After decide(), tokens should NOT be at capacity (refill anchor was set)
+        assert restored.ops_bucket_tokens < profile.ops_bucket_capacity, (
+            f"Restored manager must NOT reset tokens to capacity on first decide(); "
+            f"got {restored.ops_bucket_tokens}, capacity={profile.ops_bucket_capacity}"
+        )
+        # Should be close to original (same as before restore, since refill_per_sec=0)
+        assert abs(restored.ops_bucket_tokens - original_tokens) <= 1.0, (
+            f"Tokens drifted too far: restored={restored.ops_bucket_tokens}, "
+            f"original={original_tokens}"
+        )

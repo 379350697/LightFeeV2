@@ -608,6 +608,90 @@ class TestOperatorCommandsV1Semantics:
         ops_records = [r for r in records if r.get("kind") == "ops.command_applied"]
         assert len(ops_records) >= 1, "Must have ops.command_applied in journal"
 
+    def test_fail_closed_operator_latch_blocks_auto_clear(self):
+        """C-R3: Operator FAIL_CLOSED sets requested_mode latch; clean restart
+        must NOT auto-clear it (clear_stale_fail_closed_if_recovery_clean
+        checks operator.requested_mode)."""
+        from lightfee.engine.recovery import clear_stale_fail_closed_if_recovery_clean
+        from lightfee.engine.state import EngineState
+        from lightfee.ops.commands import execute_operator_command
+        from lightfee.persistence.journal import Journal
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+        from lightfee.risk.operator import OperatorCommand
+
+        tmp = tempfile.mkdtemp()
+        journal_path = Path(tmp) / "journal.jsonl"
+        journal = Journal(journal_path)
+        journal.open()
+
+        state = EngineState()
+        state.lifecycle = EngineLifecycle.RUNNING
+        state.risk_mode = GlobalRiskMode.RUNNING
+
+        new_risk, new_lifecycle, msg = execute_operator_command(
+            OperatorCommand.FAIL_CLOSED,
+            state.risk_mode, state.lifecycle,
+            journal=journal, state=state,
+        )
+        journal.close()
+
+        # After command: state must have operator.requested_mode == FAIL_CLOSED
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED, (
+            "C-R3: operator FAIL_CLOSED must set requested_mode latch"
+        )
+
+        # Simulate clean restart: clear_stale_fail_closed_if_recovery_clean
+        # must NOT clear fail_closed because operator requested it
+        was_cleared = clear_stale_fail_closed_if_recovery_clean(state, None)
+        assert not was_cleared, (
+            "C-R3: operator-requested fail_closed must NOT be auto-cleared on clean restart"
+        )
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED, (
+            "C-R3: risk_mode must stay FAIL_CLOSED after blocked auto-clear"
+        )
+
+    def test_resume_if_safe_clears_operator_latch(self):
+        """C-R3: Successful RESUME_IF_SAFE clears operator.requested_mode latch.
+
+        V1 RESUME_IF_SAFE only transitions to RUNNING when lifecycle is
+        already RUNNING (clears ENTRY_PAUSED/REDUCE_ONLY risk). When it
+        succeeds, the operator latch must also be cleared."""
+        from lightfee.engine.state import EngineState
+        from lightfee.ops.commands import execute_operator_command
+        from lightfee.persistence.journal import Journal
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+        from lightfee.risk.operator import OperatorCommand
+
+        tmp = tempfile.mkdtemp()
+        journal_path = Path(tmp) / "journal.jsonl"
+        journal = Journal(journal_path)
+        journal.open()
+
+        # Scenario: operator previously fail-closed, then manually returned
+        # lifecycle to RUNNING (e.g. via recovery). RESUME_IF_SAFE should
+        # clear the stale requested_mode latch.
+        state = EngineState()
+        state.lifecycle = EngineLifecycle.RUNNING
+        state.risk_mode = GlobalRiskMode.ENTRY_PAUSED
+        state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+
+        new_risk, new_lifecycle, msg = execute_operator_command(
+            OperatorCommand.RESUME_IF_SAFE,
+            state.risk_mode, state.lifecycle,
+            has_blocking_recovery=False,
+            journal=journal, state=state,
+        )
+        journal.close()
+
+        assert new_risk == GlobalRiskMode.RUNNING, (
+            f"RESUME_IF_SAFE should restore RUNNING, got {new_risk}"
+        )
+        assert state.operator.requested_mode is None, (
+            "C-R3: successful RESUME_IF_SAFE must clear operator.requested_mode"
+        )
+
     def test_old_snapshot_fail_closed_lifecycle_migrates(self):
         """C-R1: Old snapshot with lifecycle='fail_closed' is migrated to RISK_ONLY.
         Runtime never produces lifecycle='fail_closed'."""

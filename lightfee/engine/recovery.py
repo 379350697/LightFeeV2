@@ -698,6 +698,13 @@ def _apply_journal_replay_to_state(
                     state.lifecycle = EngineLifecycle(str(new_lifecycle))
                 except ValueError:
                     pass
+            # V1: restore operator latch so clean restart preserves operator-intended
+            # fail_closed (clear_stale_fail_closed_if_recovery_clean checks this)
+            cmd = payload.get("command", "")
+            if cmd == "fail_closed":
+                state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+            elif cmd == "resume_if_safe" and new_risk == "running":
+                state.operator.requested_mode = None
 
 
 def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
