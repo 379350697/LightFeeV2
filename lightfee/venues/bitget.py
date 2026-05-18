@@ -78,6 +78,34 @@ def _parse_position_hedge_mode(payload: dict) -> bool:
     return _extract_position_hedge_mode(payload) or False
 
 
+_BITGET_ORDER_DIAGNOSTIC_KEYS = (
+    "category",
+    "symbol",
+    "productType",
+    "marginMode",
+    "marginCoin",
+    "qty",
+    "size",
+    "side",
+    "orderType",
+    "force",
+    "timeInForce",
+    "price",
+    "tradeSide",
+    "posSide",
+    "reduceOnly",
+    "clientOid",
+)
+
+
+def _bitget_order_body_diagnostic(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: body[key]
+        for key in _BITGET_ORDER_DIAGNOSTIC_KEYS
+        if key in body
+    }
+
+
 def _parse_bitget_risk_from_rowlike(raw: dict, now_ms: int):
     """Parse an AccountRiskSnapshot from a Bitget account assets response.
 
@@ -332,6 +360,7 @@ class BitgetAdapter(VenueAdapter):
         if self._mode != "live":
             return await self._transport.place_order(request)
 
+        attempt_payload: dict[str, Any] | None = None
         try:
             from lightfee.venues.transport import (
                 _build_bitget_order_request,
@@ -351,15 +380,63 @@ class BitgetAdapter(VenueAdapter):
                 profile=profile.value,
                 hedge_mode=hedge_mode,
             )
+            attempt_payload = {
+                "venue": Venue.BITGET.value,
+                "symbol": venue_sym,
+                "side": request.side.value,
+                "reduce_only": request.reduce_only,
+                "raw_qty": request.quantity,
+                "client_order_id": request.client_order_id or "",
+                "endpoint": req_path,
+                "account_profile": profile.value,
+                "hedge_mode": hedge_mode,
+                "body_sanitized": _bitget_order_body_diagnostic(body),
+                "response_classification": "attempt",
+            }
+            self._transport._record_order_diagnostic(
+                "order.submit_attempt", attempt_payload
+            )
             raw = await self._transport._request("POST", req_path, body=body, private=True)
 
             _require_bitget_success(raw, "bitget order failed")
-            return self._transport._parse_order_fill(raw, request, venue_sym, now_ms)
+            fill = self._transport._parse_order_fill(raw, request, venue_sym, now_ms)
+            result_payload = dict(attempt_payload)
+            result_payload["response_code"] = 0
+            result_payload["response_msg"] = "ok"
+            result_payload["order_id"] = fill.order_id
+            result_payload["ack_client_order_id"] = (
+                fill.client_order_id or request.client_order_id or ""
+            )
+            result_payload["response_classification"] = "filled"
+            self._transport._record_order_diagnostic(
+                "order.submit_result", result_payload
+            )
+            return fill
         except TransportError as e:
+            if attempt_payload is not None:
+                result_payload = dict(attempt_payload)
+                result_payload["response_code"] = e.status_code
+                result_payload["response_msg"] = (e.body or str(e))[:500]
+                result_payload["response_classification"] = (
+                    "rejected"
+                    if e.category == TransportErrorCategory.REQUEST_REJECTED
+                    else "uncertain"
+                )
+                self._transport._record_order_diagnostic(
+                    "order.submit_result", result_payload
+                )
             if e.category == TransportErrorCategory.REQUEST_REJECTED:
                 raise OrderSubmitError(SubmitFailureClass.REJECTED, str(e)) from e
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e)) from e
-        except OrderSubmitError:
+        except OrderSubmitError as e:
+            if attempt_payload is not None:
+                result_payload = dict(attempt_payload)
+                result_payload["response_code"] = 0
+                result_payload["response_msg"] = str(e)[:500]
+                result_payload["response_classification"] = e.class_.value
+                self._transport._record_order_diagnostic(
+                    "order.submit_result", result_payload
+                )
             raise
         except Exception as e:
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e)) from e

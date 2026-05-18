@@ -897,6 +897,10 @@ class LiveRuntime:
             return True
 
         cleanup_side = live_position.side.opposite()
+        from lightfee.venues.cid import generate_exchange_cid
+        cleanup_client_order_id = generate_exchange_cid(
+            f"{position_id}:{stage}:{symbol}", "c", venue
+        )
         self.journal.append(
             "runtime.position_drift_flatten_leg",
             {
@@ -907,6 +911,7 @@ class LiveRuntime:
                 "live_side": live_position.side.value,
                 "quantity": quantity,
                 "cleanup_side": cleanup_side.value,
+                "cleanup_client_order_id": cleanup_client_order_id,
             },
         )
 
@@ -921,6 +926,7 @@ class LiveRuntime:
                 price=None,
                 post_only=False,
                 reduce_only=True,
+                client_order_id=cleanup_client_order_id,
             )
             fill = await adapter.place_order(req)
             self._flush_adapter_order_diagnostics(adapter)
@@ -2944,6 +2950,10 @@ class LiveRuntime:
         # V2 PositionSnapshot.quantity is always abs(size); side carries direction.
         # side=BUY (long) → cleanup SELL; side=SELL (short) → cleanup BUY
         cleanup_side = pos.side.opposite()
+        from lightfee.venues.cid import generate_exchange_cid
+        cleanup_client_order_id = generate_exchange_cid(
+            f"{entry_id}:{stage}:{symbol}", "c", venue
+        )
 
         self.journal.append(
             "entry.cleanup_leg_exposure",
@@ -2955,6 +2965,7 @@ class LiveRuntime:
                 "size": pos.quantity,
                 "side": pos.side.value,
                 "cleanup_side": cleanup_side.value,
+                "cleanup_client_order_id": cleanup_client_order_id,
             },
         )
 
@@ -2969,6 +2980,7 @@ class LiveRuntime:
                 price=None,
                 post_only=False,
                 reduce_only=True,  # V1: cleanup always reduce-only
+                client_order_id=cleanup_client_order_id,
             )
             fill = await adapter.place_order(req)
             self._flush_adapter_order_diagnostics(adapter)

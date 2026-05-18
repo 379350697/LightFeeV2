@@ -1840,6 +1840,7 @@ class TestRealPathAbortCleanupDeadline:
         assert req.side == Side.SELL  # long position → sell to flatten
         assert req.reduce_only is True  # V1: cleanup always reduce-only
         assert req.venue == Venue.HYPERLIQUID
+        assert req.client_order_id
 
     @pytest.mark.asyncio
     async def test_cleanup_failed_leg_exposure_short_position(self, tmp_path):
@@ -1877,6 +1878,7 @@ class TestRealPathAbortCleanupDeadline:
         assert req.quantity == 100.0
         assert req.side == Side.BUY  # SELL position → BUY to flatten
         assert req.reduce_only is True
+        assert req.client_order_id
 
     @pytest.mark.asyncio
     async def test_cleanup_failed_leg_exposure_zero_returns_true(self, tmp_path):

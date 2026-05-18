@@ -2967,6 +2967,65 @@ class TestBitgetOrderBody:
         assert seen_body["reduceOnly"] == "YES"
         assert "tradeSide" not in seen_body
 
+    @pytest.mark.asyncio
+    async def test_bitget_live_place_order_records_attempt_and_rejection_diagnostics(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        seen_body: dict = {}
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            if path == "/api/v2/mix/account/account":
+                return {"code": "00000", "data": {"posMode": "one_way_mode"}}
+            if path == "/api/v2/mix/order/place-order":
+                seen_body.update(body or {})
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    'HTTP 400: {"code":"40786","msg":"Duplicate clientOid"}',
+                    status_code=400,
+                    body='{"code":"40786","msg":"Duplicate clientOid"}',
+                )
+            return {"code": "00000", "data": {}}
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="key-secret", api_secret="sign-secret", api_passphrase="pass-secret"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._transport._request = fake_request
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await adapter.place_order(OrderRequest(
+                venue=Venue.BITGET,
+                symbol="KSMUSDT",
+                side=Side.BUY,
+                quantity=2.9,
+                reduce_only=True,
+                client_order_id="close-short",
+            ))
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert seen_body["side"] == "buy"
+        events = adapter._transport.order_diagnostics
+        assert [event["kind"] for event in events] == [
+            "order.submit_attempt",
+            "order.submit_result",
+        ]
+        attempt = events[0]["payload"]
+        assert attempt["venue"] == "bitget"
+        assert attempt["endpoint"] == "/api/v2/mix/order/place-order"
+        assert attempt["account_profile"] == "classic"
+        assert attempt["hedge_mode"] is False
+        assert attempt["body_sanitized"]["side"] == "buy"
+        assert attempt["body_sanitized"]["reduceOnly"] == "YES"
+        result = events[1]["payload"]
+        assert result["response_code"] == 400
+        assert result["response_classification"] == "rejected"
+        assert "Duplicate clientOid" in result["response_msg"]
+        serialized = json.dumps(events)
+        assert "key-secret" not in serialized
+        assert "sign-secret" not in serialized
+        assert "pass-secret" not in serialized
+
 
 # ---------------------------------------------------------------------------
 # Task 5: Restore Official Aster Endpoints
