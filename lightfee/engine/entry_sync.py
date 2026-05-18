@@ -917,18 +917,46 @@ async def drive_pending_entry_hedge(
 
     elif action == "cancel_replace":
         # Cancel existing + submit new maker at new_price
-        cancel_req = OrderRequest(
-            venue=maker_venue,
-            symbol=symbol,
-            side=maker_leg,
-            quantity=0.0,  # cancel
-            price=0.0,
-            post_only=False,
-            order_id=maker_order_id,
-            reduce_only=False,
-        )
+        # V1: cancel_order (entry_sync.rs:2401-2445) → cancel_pending_entry_passive_order
+        # V2: uses cancel_passive_order which goes through transport.cancel_passive_order
         try:
-            await adapter.cancel_order(cancel_req)
+            await adapter.cancel_passive_order(
+                symbol=symbol,
+                order_id=maker_order_id,
+                client_order_id=getattr(pending, 'maker_client_order_id', None) or None,
+            )
+        except NotImplementedError:
+            # Adapter doesn't support cancel_passive_order → try legacy cancel_order
+            cancel_req = OrderRequest(
+                venue=maker_venue,
+                symbol=symbol,
+                side=maker_leg,
+                quantity=0.0,
+                price=0.0,
+                post_only=False,
+                order_id=maker_order_id,
+                reduce_only=False,
+            )
+            try:
+                await adapter.cancel_order(cancel_req)
+            except Exception as e2:
+                journal.append(
+                    "entry.hedge_drive_cancel_replace_cancel_failed",
+                    {
+                        "entry_id": entry_id,
+                        "action": "cancel_replace",
+                        "old_price": old_price,
+                        "new_price": new_price,
+                        "order_id": maker_order_id,
+                        "error": str(e2),
+                        "reason": "replacement_not_submitted_to_avoid_double_maker",
+                    },
+                )
+                return HedgeDriveResult(
+                    action="cancel_replace",
+                    outcome="uncertain",
+                    detail=f"cancel failed before replacement: {e2}",
+                )
         except Exception as e:
             journal.append(
                 "entry.hedge_drive_cancel_replace_cancel_failed",
@@ -957,20 +985,17 @@ async def drive_pending_entry_hedge(
             post_only=post_only,
             reduce_only=False,
         )
+        # V1: replacement maker is always post_only → submit_passive_order (ACK-based)
         try:
-            fill = await adapter.place_order(new_req)
-            if fill.quantity > 0:
-                journal.append(
-                    "entry.hedge_drive_cancel_replace",
-                    {"entry_id": entry_id, "action": "cancel_replace",
-                     "old_price": old_price, "new_price": new_price,
-                     "order_id": fill.order_id},
-                )
-                return HedgeDriveResult(action="cancel_replace", outcome="applied",
-                                       order_id=fill.order_id, new_price=new_price)
-            else:
-                return HedgeDriveResult(action="cancel_replace", outcome="uncertain",
-                                       detail="new order ack-only after cancel")
+            ack = await adapter.submit_passive_order(new_req)
+            journal.append(
+                "entry.hedge_drive_cancel_replace",
+                {"entry_id": entry_id, "action": "cancel_replace",
+                 "old_price": old_price, "new_price": new_price,
+                 "order_id": ack.order_id},
+            )
+            return HedgeDriveResult(action="cancel_replace", outcome="applied",
+                                   order_id=ack.order_id, new_price=new_price)
         except OrderSubmitError as e:
             if e.is_rejected:
                 return HedgeDriveResult(action="cancel_replace", outcome="rejected",

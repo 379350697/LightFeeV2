@@ -883,6 +883,64 @@ def _normalize_symbol(sym: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# V1 parity: cancel absent-order detection helpers
+# ---------------------------------------------------------------------------
+
+
+def _cancel_response_indicates_absent_order(raw: dict[str, Any], venue_id: "Venue") -> bool:
+    """Check if a successful cancel HTTP response means the order was already absent.
+
+    V1: bitget_payload_indicates_absent_order — codes 40109/43001.
+    Returns True when the exchange confirms the order doesn't exist (already filled,
+    canceled, expired). In that case cancel is effectively complete.
+    """
+    if venue_id == Venue.BITGET:
+        code = str(raw.get("code", ""))
+        if code in ("40109", "43001"):
+            return True
+    if venue_id == Venue.OKX:
+        data = raw.get("data", [])
+        if isinstance(data, list) and data:
+            item = data[0] if data else {}
+            s_code = str(item.get("sCode", "0"))
+            s_msg = str(item.get("sMsg", "")).lower()
+            if s_code in ("1", "2", "51400", "51603"):
+                return True
+            if "order does not exist" in s_msg or "order not found" in s_msg:
+                return True
+    return False
+
+
+def _cancel_error_indicates_absent_order(
+    body: str, status_code: int, venue_id: "Venue",
+) -> bool:
+    """Check if an HTTP error from cancel means the order was already absent.
+
+    V1: bitget_error_indicates_absent_order catches codes 40109/43001 in error chain.
+    Other venues have equivalent "order not found" signatures.
+    """
+    msg = body.lower()
+    if venue_id == Venue.BITGET:
+        if 'code=40109' in msg or 'code=43001' in msg:
+            return True
+        if '"code":"40109"' in msg or '"code":"43001"' in msg:
+            return True
+    if venue_id in (Venue.BINANCE, Venue.ASTER):
+        if '-2011' in body or 'unknown order' in msg:
+            return True
+    if venue_id == Venue.OKX:
+        if 'order does not exist' in msg:
+            return True
+    if venue_id == Venue.BYBIT:
+        if 'order not found' in msg or '170001' in body or '170130' in body:
+            return True
+    if venue_id == Venue.GATE:
+        if 'order_not_found' in msg or 'ORDER_NOT_FOUND' in body:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
 
@@ -3739,7 +3797,11 @@ class VenueTransport(MarketDataClient):
     async def cancel_passive_order(
         self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
     ) -> "PassiveOrderAck":
-        """Cancel a resting passive order."""
+        """Cancel a resting passive order.
+
+        V1 parity: treats "order not found" as success — order already absent
+        from exchange is effectively canceled. Returns CANCELED ack in that case.
+        """
         from lightfee.core.domain import PassiveOrderAck, PassiveOrderState, Side
 
         spec = self._spec
@@ -3811,6 +3873,21 @@ class VenueTransport(MarketDataClient):
                 )
 
             raw = await self._request("DELETE", spec.order_path, params=params, private=True)
+
+            # V1: successful HTTP response may still indicate order was already absent
+            if _cancel_response_indicates_absent_order(raw, spec.venue_id):
+                return PassiveOrderAck(
+                    venue=spec.venue_id,
+                    symbol=venue_sym,
+                    side=Side.BUY,
+                    order_id=order_id,
+                    client_order_id=client_order_id or "",
+                    price=0.0,
+                    quantity=0.0,
+                    accepted_at_ms=now_ms,
+                    state=PassiveOrderState.CANCELED,
+                )
+
             return self._parse_passive_order_ack(
                 raw,
                 OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=Side.BUY,
@@ -3818,7 +3895,24 @@ class VenueTransport(MarketDataClient):
                 venue_sym, now_ms,
             )
 
-        except TransportError:
+        except TransportError as e:
+            # V1: HTTP error from cancel may mean the order is already absent
+            if _cancel_error_indicates_absent_order(
+                getattr(e, 'body', '') or str(e),
+                getattr(e, 'status_code', 0),
+                spec.venue_id,
+            ):
+                return PassiveOrderAck(
+                    venue=spec.venue_id,
+                    symbol=venue_sym,
+                    side=Side.BUY,
+                    order_id=order_id,
+                    client_order_id=client_order_id or "",
+                    price=0.0,
+                    quantity=0.0,
+                    accepted_at_ms=now_ms,
+                    state=PassiveOrderState.CANCELED,
+                )
             raise
         except Exception as e:
             raise TransportError(

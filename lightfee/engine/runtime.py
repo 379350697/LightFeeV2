@@ -3643,17 +3643,11 @@ class LiveRuntime:
             return False
 
         try:
-            from lightfee.core.domain import OrderRequest
-            cancel_req = OrderRequest(
-                venue=maker_venue,
+            await adapter.cancel_passive_order(
                 symbol=pending.symbol,
-                side=pending.maker_side(),
-                quantity=pending.target_quantity,
-                price=0.0,
                 order_id=pending.maker_order_id,
-                client_order_id=pending.maker_client_order_id or "",
+                client_order_id=pending.maker_client_order_id or None,
             )
-            await adapter.cancel_order(cancel_req)
             pending._cancel_requested = True
             pending.reconcile_next_attempt_ms = (
                 now_ms + self._RECONCILE_RETRY_BASE_MS

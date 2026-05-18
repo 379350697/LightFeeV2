@@ -4885,3 +4885,342 @@ class TestJournalEvidenceFields:
             assert "quantized_qty" in p
             assert "quantized_price" in p
             assert "rule_source" in p
+
+
+# ===========================================================================
+# V1 Parity: Cancel absent-order detection (C2)
+# ===========================================================================
+
+
+class TestCancelAbsentOrderDetection:
+    """V1: cancel order returns Ok(()) when order is already absent."""
+
+    def test_bitget_absent_order_response_code_40109(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+        assert _cancel_response_indicates_absent_order(
+            {"code": "40109", "msg": "order does not exist"}, Venue.BITGET
+        )
+
+    def test_bitget_absent_order_response_code_43001(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+        assert _cancel_response_indicates_absent_order(
+            {"code": "43001", "msg": "order not found"}, Venue.BITGET
+        )
+
+    def test_bitget_normal_response_not_absent(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+        assert not _cancel_response_indicates_absent_order(
+            {"code": "00000", "msg": "success"}, Venue.BITGET
+        )
+
+    def test_okx_absent_order_sCode_1(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+        assert _cancel_response_indicates_absent_order(
+            {"code": "0", "data": [{"sCode": "1", "sMsg": "order does not exist"}]},
+            Venue.OKX,
+        )
+
+    def test_okx_normal_sCode_not_absent(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+        assert not _cancel_response_indicates_absent_order(
+            {"code": "0", "data": [{"sCode": "0", "sMsg": ""}]}, Venue.OKX
+        )
+
+    def test_bitget_error_absent_order_40109(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert _cancel_error_indicates_absent_order(
+            '{"code":"40109","msg":"order does not exist"}', 400, Venue.BITGET
+        )
+
+    def test_bitget_error_absent_order_43001(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert _cancel_error_indicates_absent_order(
+            "error code=43001 order not found", 400, Venue.BITGET
+        )
+
+    def test_binance_unknown_order_minus_2011(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert _cancel_error_indicates_absent_order(
+            '{"code":-2011,"msg":"Unknown order sent."}', 400, Venue.BINANCE
+        )
+
+    def test_bybit_order_not_found(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert _cancel_error_indicates_absent_order(
+            '{"retCode":170001,"retMsg":"order not found"}', 400, Venue.BYBIT
+        )
+
+    def test_gate_order_not_found(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert _cancel_error_indicates_absent_order(
+            '{"label":"ORDER_NOT_FOUND","message":"order not found"}', 400, Venue.GATE
+        )
+
+    def test_normal_error_not_absent(self):
+        from lightfee.venues.transport import _cancel_error_indicates_absent_order
+        assert not _cancel_error_indicates_absent_order(
+            "rate limit exceeded", 429, Venue.BITGET
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_passive_order_returns_canceled_on_absent_response(self):
+        """V1 parity: successful HTTP response with absent-order code → CANCELED ack."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import PassiveOrderState
+
+        transport = VenueTransport(bitget_spec(), mode="paper")
+        transport.mode = "live"
+
+        async def fake_request(*args, **kwargs):
+            return {"code": "40109", "msg": "order does not exist"}
+
+        transport._request = fake_request
+        transport._build_signed_request_async = AsyncMock(
+            return_value=("", {}, b"")
+        )
+
+        ack = await transport.cancel_passive_order(
+            symbol="BTCUSDT", order_id="123456",
+        )
+        assert ack.state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_cancel_passive_order_returns_canceled_on_transport_error_absent(self):
+        """V1 parity: TransportError with absent-order body → CANCELED ack."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import PassiveOrderState
+
+        transport = VenueTransport(bitget_spec(), mode="paper")
+        transport.mode = "live"
+
+        async def fake_request(*args, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "order not found",
+                status_code=400,
+                body='{"code":"40109","msg":"order does not exist"}',
+            )
+
+        transport._request = fake_request
+        transport._build_signed_request_async = AsyncMock(
+            return_value=("", {}, b"")
+        )
+
+        ack = await transport.cancel_passive_order(
+            symbol="BTCUSDT", order_id="123456",
+        )
+        assert ack.state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_cancel_passive_order_raises_on_real_error(self):
+        """Non-absent TransportError must still raise (not silently return CANCELED)."""
+        from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(bitget_spec(), mode="paper")
+        transport.mode = "live"
+
+        async def fake_request(*args, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "network timeout",
+                status_code=500,
+                body="Internal Server Error",
+            )
+
+        transport._request = fake_request
+        transport._build_signed_request_async = AsyncMock(
+            return_value=("", {}, b"")
+        )
+
+        with pytest.raises(TransportError):
+            await transport.cancel_passive_order(
+                symbol="BTCUSDT", order_id="123456",
+            )
+
+
+# ===========================================================================
+# V1 Parity: drive_pending_entry_hedge cancel_replace uses passive methods (C1/H1)
+# ===========================================================================
+
+
+class TestDrivePendingEntryHedgeCancelReplace:
+    """V1: cancel-replace must use cancel_passive_order + submit_passive_order."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_replace_uses_cancel_passive_order_not_cancel_order(self):
+        """V1: cancel must go through cancel_passive_order which handles absent-order."""
+        from lightfee.engine.entry_sync import drive_pending_entry_hedge, HedgeDriveResult
+        from lightfee.persistence.journal import Journal
+        from lightfee.core.contracts import VenueAdapter
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
+        from dataclasses import dataclass
+
+        journal = Journal("/tmp/test_drive_hedge_cancel.journal")
+        journal.open()
+
+        @dataclass
+        class TestAdapter(VenueAdapter):
+            _venue: Venue = Venue.BYBIT
+            cancel_called: bool = False
+            submit_called: bool = False
+            cancel_order_called: bool = False
+
+            @property
+            def venue(self) -> Venue:
+                return self._venue
+
+            async def place_order(self, request):
+                from lightfee.core.domain import OrderFill
+                return OrderFill(
+                    venue=self._venue, symbol=request.symbol,
+                    side=request.side, quantity=0.0, price=0.0,
+                )
+
+            async def submit_passive_order(self, request):
+                self.submit_called = True
+                return PassiveOrderAck(
+                    venue=self._venue, symbol=request.symbol,
+                    side=request.side, order_id="new-123",
+                    client_order_id=request.client_order_id or "cid-123",
+                    price=request.price or 0.0, quantity=request.quantity,
+                    accepted_at_ms=0, state=PassiveOrderState.OPEN,
+                )
+
+            async def cancel_passive_order(self, symbol, order_id, client_order_id=None):
+                self.cancel_called = True
+                return PassiveOrderAck(
+                    venue=self._venue, symbol=symbol,
+                    side=Side.BUY, order_id=order_id,
+                    client_order_id=client_order_id or "",
+                    price=0.0, quantity=0.0, accepted_at_ms=0,
+                    state=PassiveOrderState.CANCELED,
+                )
+
+            async def cancel_order(self, request):
+                self.cancel_order_called = True
+                raise NotImplementedError("should not be called")
+
+            async def fetch_position(self, symbol):
+                from lightfee.core.domain import PositionSnapshot
+                return PositionSnapshot(
+                    venue=self._venue, symbol=symbol,
+                    side=Side.BUY, quantity=0.0, entry_price=0.0,
+                    observed_at_ms=0,
+                )
+
+        from dataclasses import dataclass as dcl
+        @dcl
+        class FakePending:
+            maker_order_id: str = "old-456"
+            maker_client_order_id: str = "cid-456"
+            long_quantity: float = 0.1
+            target_quantity: float = 0.1
+
+        pending = FakePending()
+        adapter = TestAdapter()
+        adapters = {Venue.BYBIT: adapter}
+
+        result = await drive_pending_entry_hedge(
+            entry_id="test-entry-1",
+            pending=pending,
+            new_price=50100.0,
+            old_price=50000.0,
+            action="cancel_replace",
+            now_ms=0,
+            adapters=adapters,
+            journal=journal,
+            maker_leg=Side.BUY,
+            symbol="BTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.OKX,
+            quantity=0.1,
+        )
+
+        assert adapter.cancel_called, "cancel_passive_order must be called"
+        assert adapter.submit_called, "submit_passive_order must be called for replacement"
+        assert not adapter.cancel_order_called, "cancel_order (NotImplementedError) must NOT be called"
+        assert result.action == "cancel_replace"
+        assert result.outcome == "applied"
+
+    @pytest.mark.asyncio
+    async def test_cancel_replace_blocks_replacement_when_cancel_fails(self):
+        """V1: cancel failure must block replacement (no double maker)."""
+        from lightfee.engine.entry_sync import drive_pending_entry_hedge, HedgeDriveResult
+        from lightfee.persistence.journal import Journal
+        from lightfee.core.contracts import VenueAdapter
+        from dataclasses import dataclass
+
+        journal = Journal("/tmp/test_drive_hedge_block.journal")
+        journal.open()
+
+        @dataclass
+        class FailingCancelAdapter(VenueAdapter):
+            _venue: Venue = Venue.BYBIT
+
+            @property
+            def venue(self) -> Venue:
+                return self._venue
+
+            async def place_order(self, request):
+                from lightfee.core.domain import OrderFill
+                return OrderFill(
+                    venue=self._venue, symbol=request.symbol,
+                    side=request.side, quantity=0.0, price=0.0,
+                )
+
+            async def submit_passive_order(self, request):
+                raise AssertionError("must not submit replacement after cancel failure")
+
+            async def cancel_passive_order(self, symbol, order_id, client_order_id=None):
+                raise TransportError(
+                    TransportErrorCategory.TRANSPORT_FAILURE,
+                    "network timeout",
+                    status_code=500,
+                )
+
+            async def fetch_position(self, symbol):
+                from lightfee.core.domain import PositionSnapshot
+                return PositionSnapshot(
+                    venue=self._venue, symbol=symbol,
+                    side=Side.BUY, quantity=0.0, entry_price=0.0,
+                    observed_at_ms=0,
+                )
+
+        from dataclasses import dataclass as dcl
+        @dcl
+        class FakePending:
+            maker_order_id: str = "old-789"
+            maker_client_order_id: str = "cid-789"
+            long_quantity: float = 0.1
+            target_quantity: float = 0.1
+
+        pending = FakePending()
+        adapter = FailingCancelAdapter()
+        adapters = {Venue.BYBIT: adapter}
+
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        result = await drive_pending_entry_hedge(
+            entry_id="test-entry-2",
+            pending=pending,
+            new_price=50200.0,
+            old_price=50100.0,
+            action="cancel_replace",
+            now_ms=0,
+            adapters=adapters,
+            journal=journal,
+            maker_leg=Side.BUY,
+            symbol="BTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.OKX,
+            quantity=0.1,
+        )
+
+        assert result.outcome == "uncertain", (
+            "cancel failure must return uncertain, replacement must NOT be submitted"
+        )
+        assert "cancel failed before replacement" in result.detail.lower() or \
+            "cancel" in result.detail.lower()
