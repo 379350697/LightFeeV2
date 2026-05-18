@@ -59,6 +59,12 @@ class _BufferedUpdate:
     update: LocalL2Update
 
 
+@dataclass
+class _BufferedReplayResult:
+    replayed: int = 0
+    ok: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Snapshot state per book
 # ---------------------------------------------------------------------------
@@ -183,15 +189,45 @@ class LocalL2DataPlane:
                     await asyncio.sleep(0.25)
                     return False
 
-            self._runtime.record_update(update, now_ms)
+            apply_result = self._runtime.record_update_result(update, now_ms)
+            if not apply_result.applied or apply_result.rebuild_required:
+                ss.consecutive_failures += 1
+                ss.last_error = apply_result.fault_reason or "snapshot_apply_failed"
+                self._journal.append(
+                    "runtime.local_l2_snapshot_error",
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "error": ss.last_error,
+                        "category": "snapshot_apply_failed",
+                    },
+                )
+                return False
 
             # Replay buffered WS updates accumulated during bootstrap gap (V1 parity)
-            replayed = self._replay_buffered_updates(venue, symbol)
-            if replayed > 0:
+            replay = self._replay_buffered_updates(venue, symbol)
+            if replay.replayed > 0:
                 self._journal.append(
                     "runtime.local_l2_buffered_replay",
-                    {"venue": venue, "symbol": symbol, "replayed": replayed},
+                    {"venue": venue, "symbol": symbol, "replayed": replay.replayed},
                 )
+            if not replay.ok:
+                book = self._runtime.get_book(venue, symbol)
+                ss.consecutive_failures += 1
+                ss.last_error = (
+                    book.fault_reason if book is not None and book.fault_reason
+                    else "buffered_replay_failed"
+                )
+                self._journal.append(
+                    "runtime.local_l2_snapshot_error",
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "error": ss.last_error,
+                        "category": "buffered_replay_failed",
+                    },
+                )
+                return False
 
             # Mark book HOT after snapshot + buffered replay (V1: complete_bootstrap)
             book = self._runtime.get_book(venue, symbol)
@@ -356,27 +392,32 @@ class LocalL2DataPlane:
         # If there are leftover buffered updates (edge case: book became HOT while
         # buffered updates were still pending), replay them first.
         if book is not None and self._pre_snapshot_buffers.get(key):
-            self._replay_buffered_updates(update.venue, update.symbol)
+            replay = self._replay_buffered_updates(update.venue, update.symbol)
+            if not replay.ok:
+                return []
 
         return self._runtime.record_update(update, now_ms)
 
-    def _replay_buffered_updates(self, venue: str, symbol: str) -> int:
+    def _replay_buffered_updates(
+        self, venue: str, symbol: str,
+    ) -> _BufferedReplayResult:
         """Replay buffered WS updates accumulated during bootstrap gap.
 
         V1: replay_binance_buffered_local_l2_depth_updates_for_instance()
         - Filters out updates from old stream generations
         - Skips updates already covered by the snapshot (sequence <= book.sequence)
         - Detects sequence gaps that require a rebuild
-        - Returns number of updates replayed (0 if buffer empty or all filtered)
+        - Returns replay count plus ok=false when replay failure must keep the
+          book out of HOT
         """
         key = f"{venue}:{symbol}"
         buf = self._pre_snapshot_buffers.pop(key, None)
         if not buf:
-            return 0
+            return _BufferedReplayResult()
 
         book = self._runtime.get_book(venue, symbol)
         if book is None:
-            return 0
+            return _BufferedReplayResult()
 
         current_gen = self._current_stream_generation(venue, symbol)
         previous_sequence = book.sequence  # snapshot's sequence
@@ -387,13 +428,13 @@ class LocalL2DataPlane:
             b for b in buf if b.generation == current_gen
         ]
         if not filtered:
-            return 0
+            return _BufferedReplayResult()
 
         # Drop updates already covered by the snapshot (V1: final_update_id <= previous_sequence)
         while filtered and filtered[0].update.sequence <= previous_sequence:
             filtered.pop(0)
         if not filtered:
-            return 0
+            return _BufferedReplayResult()
 
         # Find first update that bridges snapshot to live stream
         # V1: first_update_id <= expected <= final_update_id
@@ -415,7 +456,7 @@ class LocalL2DataPlane:
                 venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                 "buffered_replay_snapshot_boundary: no overlapping update", 0,
             )
-            return 0
+            return _BufferedReplayResult(ok=False)
 
         # Replay from overlap point with continuity check
         # V1: buffered_updates.into_iter().skip(start_index).enumerate()
@@ -437,7 +478,7 @@ class LocalL2DataPlane:
                         venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                         f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}", 0,
                     )
-                    return replayed
+                    return _BufferedReplayResult(replayed=replayed, ok=False)
             elif bu.update.previous_sequence > 0 and expected < bu.update.previous_sequence + 1:
                 # First replay: gap between snapshot and first buffered
                 book.sequence = 0
@@ -450,12 +491,24 @@ class LocalL2DataPlane:
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                     f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}", 0,
                 )
-                return replayed
+                return _BufferedReplayResult(replayed=replayed, ok=False)
 
             try:
-                self._runtime.record_update(bu.update, bu.observed_at_ms)
-                previous_sequence = bu.update.sequence
-                replayed += 1
+                replay_result = self._runtime.record_update_result(
+                    bu.update, bu.observed_at_ms,
+                )
+                if replay_result.rebuild_required:
+                    book.sequence = 0
+                    book.last_update_id = 0
+                    book.fault_reason = (
+                        replay_result.fault_reason
+                        or f"buffered_replay_apply_failed at index {i}"
+                    )
+                    book.transition_to_rebuilding(int(time.time() * 1000))
+                    return _BufferedReplayResult(replayed=replayed, ok=False)
+                if replay_result.applied:
+                    previous_sequence = bu.update.sequence
+                    replayed += 1
             except Exception:
                 book.sequence = 0
                 book.last_update_id = 0
@@ -465,9 +518,9 @@ class LocalL2DataPlane:
                     venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
                     f"buffered_replay_apply_failed at index {i}", 0,
                 )
-                return replayed
+                return _BufferedReplayResult(replayed=replayed, ok=False)
 
-        return replayed
+        return _BufferedReplayResult(replayed=replayed)
 
     # ------------------------------------------------------------------
     # Sync: periodic snapshot refresh for books without WS streaming

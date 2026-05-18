@@ -486,8 +486,10 @@ def _sort_asks(levels: list[PriceLevel]) -> list[PriceLevel]:
 
 
 def _book_structure_fault(bids: list[PriceLevel], asks: list[PriceLevel]) -> str:
-    if not bids or not asks:
-        return ""
+    if not bids:
+        return "book_empty_side_bid"
+    if not asks:
+        return "book_empty_side_ask"
     best_bid = bids[0].price
     best_ask = asks[0].price
     if best_bid <= 0 or best_ask <= 0:

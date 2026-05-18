@@ -334,9 +334,19 @@ class TestRuntimeMetrics:
 class MockL2Adapter:
     """Minimal mock adapter that returns canned L2 snapshot data via fetch_l2_snapshot()."""
 
-    def __init__(self, venue_name: str = "binance", should_fail: bool = False):
+    def __init__(
+        self,
+        venue_name: str = "binance",
+        should_fail: bool = False,
+        bids: list[PriceLevel] | None = None,
+        asks: list[PriceLevel] | None = None,
+        sequence: int = 1,
+    ):
         self.venue_name = venue_name
         self.should_fail = should_fail
+        self.bids = bids
+        self.asks = asks
+        self.sequence = sequence
         self.call_count = 0
         self.last_symbol: str = ""
         self.last_depth: int = 0
@@ -354,9 +364,9 @@ class MockL2Adapter:
         return LocalL2Update(
             venue=self.venue_name,
             symbol=symbol,
-            bids=[PriceLevel(price=49900.0, quantity=1.0)],
-            asks=[PriceLevel(price=50100.0, quantity=1.0)],
-            sequence=1,
+            bids=self.bids if self.bids is not None else [PriceLevel(price=49900.0, quantity=1.0)],
+            asks=self.asks if self.asks is not None else [PriceLevel(price=50100.0, quantity=1.0)],
+            sequence=self.sequence,
             event_time_ms=1000,
             received_at_ms=1000,
             update_kind=LocalL2UpdateKind.SNAPSHOT,
@@ -387,6 +397,69 @@ class TestDataPlaneBootstrap:
         assert book.best_bid() == 49900.0
         assert book.best_ask() == 50100.0
         assert book.sequence == 1
+
+    def test_bootstrap_rejects_invalid_snapshot_without_marking_hot(self):
+        from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
+        from lightfee.persistence.journal import Journal
+
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1000)
+        import tempfile, os as _os
+        jpath = _os.path.join(tempfile.mkdtemp(), "test.journal")
+        journal = Journal(jpath)
+        journal.open()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+
+        adapter = MockL2Adapter(
+            "binance",
+            bids=[],
+            asks=[PriceLevel(price=50100.0, quantity=1.0)],
+        )
+        import asyncio
+        success = asyncio.run(
+            dp.bootstrap_book("binance", "BTCUSDT", adapter, depth=50, now_ms=1000)
+        )
+
+        assert not success
+        assert book.status == L2BookStatus.REBUILDING
+        assert "book_empty_side_bid" in book.fault_reason
+        assert book.observed_at_ms == 0
+
+    def test_bootstrap_replay_failure_does_not_complete_hot(self):
+        from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
+        from lightfee.persistence.journal import Journal
+
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1000)
+        import tempfile, os as _os
+        jpath = _os.path.join(tempfile.mkdtemp(), "test.journal")
+        journal = Journal(jpath)
+        journal.open()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(price=50050.0, quantity=1.0)],
+                asks=[],
+                sequence=3,
+                previous_sequence=2,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1001,
+        )
+
+        adapter = MockL2Adapter("binance", sequence=1)
+        import asyncio
+        success = asyncio.run(
+            dp.bootstrap_book("binance", "BTCUSDT", adapter, depth=50, now_ms=2000)
+        )
+
+        assert not success
+        assert book.status == L2BookStatus.REBUILDING
+        assert "buffered_replay_snapshot_boundary" in book.fault_reason
 
     def test_bootstrap_failure_updates_runtime_fault(self):
         from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane

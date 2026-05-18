@@ -4139,15 +4139,19 @@ class LiveRuntime:
                 else:
                     selection_blocker_counts[blocker_str] += 1
                 candidate_blockers[pair_id] = blocker_str
-                self.journal.append(
-                    "runtime.entry_blocked_local_l2_selection",
-                    {
-                        "symbol": symbol,
-                        "pair_id": pair_id,
-                        "reason": blocker_str,
-                        "ts_ms": now_ms,
-                    },
-                )
+                if blocker_str not in {
+                    "entry_waiting_for_finalization_window_too_early",
+                    "entry_finalization_window_expired",
+                }:
+                    self.journal.append(
+                        "runtime.entry_blocked_local_l2_selection",
+                        {
+                            "symbol": symbol,
+                            "pair_id": pair_id,
+                            "reason": blocker_str,
+                            "ts_ms": now_ms,
+                        },
+                    )
                 continue
             ranked.append(candidate)
 

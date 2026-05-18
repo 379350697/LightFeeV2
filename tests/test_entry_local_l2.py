@@ -1686,6 +1686,10 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "entry_waiting_for_finalization_window_too_early"
         )
         assert "blocked_reasons" in no_entry["candidates"][0]
+        assert [
+            r for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ] == []
 
     @pytest.mark.asyncio
     async def test_scan_activates_l2_only_for_v1_primary_and_shadow_scope(

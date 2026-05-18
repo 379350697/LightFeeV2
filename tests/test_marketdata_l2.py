@@ -344,10 +344,12 @@ class TestSnapshotApplication:
         assert len(book.bids) == 2
         assert len(book.asks) == 2
 
-    def test_snapshot_empty_lists(self):
+    def test_snapshot_empty_lists_rejected_like_v1(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         result = book.apply_snapshot([], [], now_ms=10000)
-        assert result.applied
+        assert not result.applied
+        assert result.rebuild_required
+        assert "book_empty_side" in result.fault_reason
         assert len(book.bids) == 0
         assert len(book.asks) == 0
 
@@ -399,6 +401,29 @@ class TestDeltaApplication:
         prices = [lvl.price for lvl in book.bids]
         assert 50000 not in prices
         assert 49900 in prices
+
+    def test_delta_deleting_last_bid_is_rejected_like_v1(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50000, quantity=2.0)],
+            [PriceLevel(price=50100, quantity=1.5)],
+            sequence=100,
+            now_ms=10000,
+        )
+
+        result = book.apply_delta(
+            [PriceLevel(price=50000, quantity=0.0)],
+            [],
+            sequence=101,
+            previous_sequence=100,
+            now_ms=11000,
+        )
+
+        assert not result.applied
+        assert result.rebuild_required
+        assert "book_empty_side_bid" in result.fault_reason
+        assert book.sequence == 100
+        assert book.best_bid() == 50000
 
     def test_delta_inserts_new_level(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
@@ -671,14 +696,14 @@ class TestBookQueries:
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.apply_snapshot(
             [PriceLevel(price=50000 - i * 100, quantity=1.0) for i in range(5)],
-            [],
+            [PriceLevel(price=50100, quantity=1.0)],
         )
         assert len(book.depth_bid(3)) == 3
 
     def test_depth_ask(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.apply_snapshot(
-            [],
+            [PriceLevel(price=50000, quantity=1.0)],
             [PriceLevel(price=50100 + i * 100, quantity=1.0) for i in range(5)],
         )
         assert len(book.depth_ask(3)) == 3
@@ -687,7 +712,7 @@ class TestBookQueries:
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.apply_snapshot(
             [PriceLevel(price=50000, quantity=2.0), PriceLevel(price=49900, quantity=3.0)],
-            [],
+            [PriceLevel(price=50100, quantity=1.0)],
         )
         total = book.cumulative_bid_quantity(from_price=49950)
         assert total == 2.0  # only 50000 >= 49950
@@ -695,7 +720,7 @@ class TestBookQueries:
     def test_cumulative_ask_quantity(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.apply_snapshot(
-            [],
+            [PriceLevel(price=50000, quantity=1.0)],
             [PriceLevel(price=50100, quantity=2.0), PriceLevel(price=50200, quantity=3.0)],
         )
         total = book.cumulative_ask_quantity(to_price=50150)

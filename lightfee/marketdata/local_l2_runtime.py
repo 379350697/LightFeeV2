@@ -28,6 +28,7 @@ from lightfee.marketdata.l2 import (
     LocalL2EventKind,
     LocalL2Update,
     LocalL2UpdateKind,
+    LocalL2UpdateResult,
 )
 
 
@@ -146,6 +147,11 @@ class LocalL2Runtime:
     def record_update(
         self, update: LocalL2Update, now_ms: int
     ) -> list[LocalL2Event]:
+        return self.record_update_result(update, now_ms).events
+
+    def record_update_result(
+        self, update: LocalL2Update, now_ms: int
+    ) -> LocalL2UpdateResult:
         """Apply a raw L2 update to the matching book, applying venue rules.
 
         Venue-specific checksum verification and sequence gap thresholds are
@@ -177,7 +183,7 @@ class LocalL2Runtime:
                 result.fault_reason or "rebuild_required", now_ms,
             )
 
-        return result.events
+        return result
 
     def _apply_update(
         self, book: LocalL2Book, update: LocalL2Update, now_ms: int
