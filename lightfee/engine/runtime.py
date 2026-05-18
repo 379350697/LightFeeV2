@@ -918,7 +918,7 @@ class LiveRuntime:
                 symbol=symbol,
                 side=cleanup_side,
                 quantity=abs(quantity),
-                price=0.0,
+                price=None,
                 post_only=False,
                 reduce_only=True,
             )
@@ -2966,7 +2966,7 @@ class LiveRuntime:
                 symbol=symbol,
                 side=cleanup_side,
                 quantity=abs(pos.quantity),
-                price=0.0,  # market order
+                price=None,
                 post_only=False,
                 reduce_only=True,  # V1: cleanup always reduce-only
             )

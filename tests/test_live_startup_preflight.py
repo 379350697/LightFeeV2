@@ -451,6 +451,7 @@ class TestRuntimePreflight:
             assert binance.last_request.reduce_only is True
             assert binance.last_request.side == Side.SELL
             assert binance.last_request.quantity == pytest.approx(0.05)
+            assert binance.last_request.price is None
             assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
             assert runtime.state.recovery_blocked_reason is None
 
@@ -503,6 +504,8 @@ class TestRuntimePreflight:
             assert okx.last_request.reduce_only is True
             assert binance.last_request.side == Side.SELL
             assert okx.last_request.side == Side.BUY
+            assert binance.last_request.price is None
+            assert okx.last_request.price is None
             assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
 
     @pytest.mark.asyncio
@@ -592,6 +595,7 @@ class TestRuntimePreflight:
             assert binance.last_request.reduce_only is True
             assert binance.last_request.side == Side.SELL
             assert binance.last_request.quantity == pytest.approx(0.02)
+            assert binance.last_request.price is None
             assert okx.place_order_call_count == 0
 
     @pytest.mark.asyncio
