@@ -65,3 +65,5 @@ def clear_risk_mode_for_recovery(state: EngineState) -> None:
     """
     state.risk_mode = GlobalRiskMode.RUNNING
     state.lifecycle = EngineLifecycle.RUNNING
+    state.recovery_blocked_reason = None
+    state.recovery_blocked_at_ms = 0

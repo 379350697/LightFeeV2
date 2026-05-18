@@ -7,6 +7,7 @@ import pytest
 
 from lightfee.engine.lifecycle import (
     can_enter_new_positions,
+    clear_risk_mode_for_recovery,
     enter_fail_closed,
     set_global_risk_mode,
     set_lifecycle,
@@ -63,6 +64,19 @@ class TestLifecycle:
 
         state.risk_mode = GlobalRiskMode.ENTRY_PAUSED
         assert not can_enter_new_positions(state)
+
+    def test_clear_risk_mode_for_recovery_clears_blocked_reason(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "live_position_mismatch_flatten_failed"
+        state.recovery_blocked_at_ms = 1234
+
+        clear_risk_mode_for_recovery(state)
+
+        assert state.lifecycle == EngineLifecycle.RUNNING
+        assert state.risk_mode == GlobalRiskMode.RUNNING
+        assert state.recovery_blocked_reason is None
+        assert state.recovery_blocked_at_ms == 0
 
 
 class TestRecovery:
