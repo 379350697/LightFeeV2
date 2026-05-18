@@ -2459,6 +2459,22 @@ class LiveRuntime:
                 )
                 continue
             elif result.is_flat:
+                if not self._pending_entry_flat_clear_has_terminal_maker_evidence(
+                    pending, result
+                ):
+                    self.journal.append(
+                        "reconciliation.entry_flat_unresolved_maker_retained",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "maker_status": self._pending_entry_reconcile_maker_status(
+                                pending, result
+                            ),
+                            "reason": "flat_position_without_terminal_maker_order_evidence",
+                        },
+                    )
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    continue
                 resolved_entry_ids.append(entry_id)
                 self.journal.append(
                     "reconciliation.entry_cleared_flat",
@@ -2527,6 +2543,20 @@ class LiveRuntime:
                     resolved_entry_ids.append(entry_id)
                 continue
             if budget is not None and budget.get("force_terminal_reached"):
+                if await self._pending_entry_has_unresolved_maker_order(
+                    pending, entry_id
+                ):
+                    self.journal.append(
+                        "pending_entry.force_terminal_retained_unresolved_maker",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": budget["final_reason"],
+                            "lifetime_ms": budget["lifetime_ms"],
+                        },
+                    )
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    continue
                 # Zero-fill entry past force_terminal threshold → safe to
                 # pop directly (no real exposure on either leg).
                 self.journal.append(
@@ -2690,6 +2720,16 @@ class LiveRuntime:
             short_zero = False
 
         if long_zero and short_zero:
+            if await self._pending_entry_has_unresolved_maker_order(pending, entry_id):
+                self.journal.append(
+                    "reconciliation.entry_abandon_retained_unresolved_maker",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": "both_venues_zero_but_maker_order_not_terminal",
+                    },
+                )
+                return False
             self.journal.append(
                 "reconciliation.entry_abandoned_flat",
                 {"entry_id": entry_id, "reason": "both_venues_zero"},
@@ -2710,6 +2750,90 @@ class LiveRuntime:
             LiveRuntime._RECONCILE_RETRY_MAX_MS,
         )
         pending.reconcile_next_attempt_ms = now_ms + backoff
+
+    @staticmethod
+    def _pending_entry_reconcile_maker_status(pending, result) -> str:
+        if getattr(pending, "maker_leg", "long") == "long":
+            return str(getattr(result, "long_status", "") or "").lower()
+        return str(getattr(result, "short_status", "") or "").lower()
+
+    @staticmethod
+    def _order_status_is_terminal_no_fill(status: str) -> bool:
+        normalized = str(status or "").lower()
+        return normalized in {
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+            "not_found",
+            "missing",
+            "notfound",
+            "not_found_or_closed",
+        }
+
+    @staticmethod
+    def _pending_entry_has_maker_order_reference(pending) -> bool:
+        return bool(
+            getattr(pending, "maker_order_id", "")
+            or getattr(pending, "maker_client_order_id", "")
+        )
+
+    def _pending_entry_flat_clear_has_terminal_maker_evidence(self, pending, result) -> bool:
+        if not self._pending_entry_has_maker_order_reference(pending):
+            return True
+        maker_status = self._pending_entry_reconcile_maker_status(pending, result)
+        return self._order_status_is_terminal_no_fill(maker_status)
+
+    async def _pending_entry_has_unresolved_maker_order(
+        self, pending, entry_id: str
+    ) -> bool:
+        if not self._pending_entry_has_maker_order_reference(pending):
+            return False
+        if pending.maker_completed():
+            return False
+
+        adapter = self.get_venue_adapter(pending.maker_venue())
+        if adapter is None:
+            return True
+
+        try:
+            progress = await adapter.query_passive_order_progress(
+                symbol=pending.symbol,
+                order_id=getattr(pending, "maker_order_id", "") or "",
+                client_order_id=getattr(pending, "maker_client_order_id", "") or None,
+            )
+        except Exception as e:
+            self.journal.append(
+                "pending_entry.maker_terminal_evidence_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": pending.maker_venue().value,
+                    "error": str(e),
+                },
+            )
+            return True
+
+        if progress is None:
+            self.journal.append(
+                "pending_entry.maker_terminal_evidence_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": pending.maker_venue().value,
+                    "reason": "passive_order_progress_none",
+                },
+            )
+            return True
+
+        if getattr(progress, "cumulative_quantity", 0.0) > 1e-9:
+            return True
+        state = getattr(progress, "state", None)
+        if state is not None and hasattr(state, "is_terminal"):
+            if getattr(state, "value", "") == "filled":
+                return True
+            return not state.is_terminal()
+        return True
 
     def _try_clear_stale_hedge_inflight(self, pending, entry_id: str, result, now_ms: int) -> None:
         """Clear hedge_inflight when order/fills/position all prove no hedge.
@@ -3069,6 +3193,21 @@ class LiveRuntime:
                 await self._finalize_pending_entry(pending, entry_id, now_ms)
                 resolved_ids.append(entry_id)
             elif result.is_flat:
+                if not self._pending_entry_flat_clear_has_terminal_maker_evidence(
+                    pending, result
+                ):
+                    self.journal.append(
+                        "recovery.force_reconcile_flat_unresolved_maker_retained",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "maker_status": self._pending_entry_reconcile_maker_status(
+                                pending, result
+                            ),
+                            "reason": "flat_position_without_terminal_maker_order_evidence",
+                        },
+                    )
+                    continue
                 resolved_ids.append(entry_id)
 
         for eid in resolved_ids:

@@ -12,6 +12,8 @@ from lightfee.core.domain import (
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
+    PassiveOrderProgress,
+    PassiveOrderState,
     PositionSnapshot,
     Side,
     Venue,
@@ -1693,8 +1695,11 @@ class _FakeVenueAdapter:
         self.position: PositionSnapshot | None = None
         self.place_order_fill: OrderFill | None = None
         self.place_order_raises: Exception | None = None
+        self.passive_progress: PassiveOrderProgress | None = None
+        self.query_passive_progress_raises: Exception | None = None
         self._place_order_calls: list[OrderRequest] = []
         self._fetch_position_calls: list[str] = []
+        self._query_passive_progress_calls: list[tuple[str, str, str | None]] = []
 
     @property
     def venue(self) -> Venue:
@@ -1720,6 +1725,17 @@ class _FakeVenueAdapter:
 
     async def cancel_order(self, request: OrderRequest) -> None:
         pass
+
+    async def query_passive_order_progress(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> PassiveOrderProgress | None:
+        self._query_passive_progress_calls.append((symbol, order_id, client_order_id))
+        if self.query_passive_progress_raises is not None:
+            raise self.query_passive_progress_raises
+        return self.passive_progress
 
     async def fetch_all_positions(self) -> Optional[list[PositionSnapshot]]:
         return None
@@ -1762,6 +1778,164 @@ class TestRealPathAbortCleanupDeadline:
     """Real-path tests that call LiveRuntime._abort_pending_entry,
     _abort_pending_entry_fail_closed, _cleanup_failed_leg_exposure,
     and _reconcile_pending_state directly — not simulated state changes."""
+
+    @pytest.mark.asyncio
+    async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):
+        """Flat positions are not enough to clear a pending maker order.
+
+        Production root cause: maker_resting entries were popped after both
+        venues reported zero position while the maker order was still uncertain.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        runtime._venue_adapters[Venue.OKX] = _FakeVenueAdapter(Venue.OKX)
+        runtime._venue_adapters[Venue.HYPERLIQUID] = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-flat-unsafe",
+            symbol="BIOUSDT",
+            long_status="uncertain",
+            short_status="uncertain",
+            is_flat=True,
+        )
+
+        pending = PendingEntry(
+            pending_id="entry-flat-unsafe",
+            symbol="BIOUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=630.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(now_ms=2000)
+
+        assert pending.pending_id in runtime.state.pending_entries
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "reconciliation.entry_flat_unresolved_maker_retained" in kinds
+        assert "reconciliation.entry_cleared_flat" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_keeps_open_maker_order(self, tmp_path):
+        """A zero-position probe cannot abandon a pending entry while the
+        maker order is still open on the book."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.OKX)
+        maker.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BIOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.OKX,
+            symbol="BIOUSDT",
+            side=Side.BUY,
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.OPEN,
+            observed_at_ms=2000,
+        )
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BIOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.OKX] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+        pending = PendingEntry(
+            pending_id="entry-open-maker",
+            symbol="BIOUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=630.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        assert maker._query_passive_progress_calls == [
+            ("BIOUSDT", "maker-oid", "maker-cid")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_allows_terminal_maker_order(self, tmp_path):
+        """Canceled/rejected/expired maker order plus zero positions is safe
+        terminal evidence for stale zero-fill pending entries."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.OKX)
+        maker.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BIOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.OKX,
+            symbol="BIOUSDT",
+            side=Side.BUY,
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=2000,
+        )
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BIOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.OKX] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+        pending = PendingEntry(
+            pending_id="entry-canceled-maker",
+            symbol="BIOUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=630.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is True
 
     # ── Bug 1: _abort_pending_entry_fail_closed enter_fail_closed no NameError ──
 
