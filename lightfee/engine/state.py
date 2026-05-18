@@ -554,6 +554,10 @@ class EngineState:
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,
             "passive_order_manager_states": self.passive_order_manager_states,
+            "operator": {
+                "requested_mode": self.operator.requested_mode.value if self.operator.requested_mode else None,
+                "pending_reconcile": self.operator.pending_reconcile,
+            },
             "open_positions": {
                 pid: {
                     "position_id": pos.position_id,
