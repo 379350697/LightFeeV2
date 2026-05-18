@@ -16,7 +16,7 @@ from lightfee.core.domain import (
     Side,
     Venue,
 )
-from lightfee.core.errors import OrderSubmitError
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.reconciliation import PositionReconciliationResult
 from lightfee.engine.state import PendingEntry
 from lightfee.venues.hyperliquid import HyperliquidAdapter
@@ -1934,6 +1934,59 @@ class TestRealPathAbortCleanupDeadline:
         )
 
         assert result is False  # Cleanup failed — position remains
+
+    @pytest.mark.asyncio
+    async def test_cleanup_uncertain_submit_flushes_diagnostics_and_verifies_flat(self, tmp_path):
+        """ACK-uncertain cleanup must still drain diagnostics and accept verified flatness."""
+
+        class DiagnosticTransport:
+            def __init__(self):
+                self.drained = False
+
+            def drain_order_diagnostics(self):
+                self.drained = True
+                return [{
+                    "kind": "order.submit_result",
+                    "payload": {
+                        "venue": "bybit",
+                        "response_classification": "ack_accepted",
+                    },
+                }]
+
+        class UncertainThenFlatAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.positions = [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="0GUSDT",
+                        side=Side.BUY,
+                        quantity=47.8,
+                        entry_price=0.5014,
+                        observed_at_ms=1000,
+                    ),
+                    None,
+                ]
+                self._transport = DiagnosticTransport()
+
+            async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
+                self._fetch_position_calls.append(symbol)
+                return self.positions.pop(0)
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = UncertainThenFlatAdapter()
+        fake.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN, "ack accepted"
+        )
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "0GUSDT", "entry-uncertain-cleanup", "hedge"
+        )
+
+        assert result is True
+        assert fake._transport.drained is True
+        assert fake._fetch_position_calls == ["0GUSDT", "0GUSDT"]
 
     # ── Bug 3: _abort_pending_entry returns bool; resolved pop conditional ──
 

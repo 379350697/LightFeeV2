@@ -932,6 +932,7 @@ class LiveRuntime:
             self._flush_adapter_order_diagnostics(adapter)
             return fill.quantity >= abs(quantity) - 1e-9
         except Exception:
+            self._flush_adapter_order_diagnostics(adapter)
             return False
 
     async def _activate_local_l2_phase(self, now_ms: int) -> None:
@@ -3001,6 +3002,13 @@ class LiveRuntime:
 
             return False  # Position not flat after cleanup
         except Exception:
+            self._flush_adapter_order_diagnostics(adapter)
+            try:
+                verify_pos = await adapter.fetch_position(symbol)
+                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                    return True
+            except Exception:
+                pass
             return False
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
