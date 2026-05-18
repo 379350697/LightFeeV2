@@ -55,6 +55,29 @@ def _payload_indicates_classic(payload: dict) -> bool:
     return False
 
 
+def _extract_position_hedge_mode(payload: dict) -> Optional[bool]:
+    """Extract Bitget one-way vs hedge position mode when the payload exposes it."""
+    data: Any = payload.get("data", payload) if isinstance(payload, dict) else {}
+    row: Any = data
+    if isinstance(data, list):
+        row = data[0] if data else {}
+    if not isinstance(row, dict):
+        return None
+    if "posMode" not in row and "holdMode" not in row:
+        return None
+    raw_mode = str(row.get("posMode", row.get("holdMode", "")))
+    return "hedge" in raw_mode.strip().lower()
+
+
+def _parse_position_hedge_mode(payload: dict) -> bool:
+    """Parse Bitget one-way vs hedge position mode.
+
+    V1 defaults missing/unknown mode to one-way; only explicit hedge-like
+    values enable tradeSide/posSide hedge semantics.
+    """
+    return _extract_position_hedge_mode(payload) or False
+
+
 def _parse_bitget_risk_from_rowlike(raw: dict, now_ms: int):
     """Parse an AccountRiskSnapshot from a Bitget account assets response.
 
@@ -139,6 +162,7 @@ class BitgetAdapter(VenueAdapter):
         self._mode = mode
         self._profile: Optional[BitgetAccountProfile] = None
         self._profile_locked: bool = False
+        self._position_hedge_mode: Optional[bool] = None
 
     @property
     def venue(self) -> Venue:
@@ -157,6 +181,33 @@ class BitgetAdapter(VenueAdapter):
     @property
     def account_profile(self) -> Optional[BitgetAccountProfile]:
         return self._profile
+
+    async def detect_position_hedge_mode(self, symbol: str) -> bool:
+        """Detect Bitget position mode for classic futures accounts.
+
+        V1: GET /api/v2/mix/account/account and parse posMode/holdMode.
+        Classic one-way close orders use reduceOnly; hedge close orders use
+        tradeSide/posSide. Sending the wrong family is rejected by Bitget.
+        """
+        if self._position_hedge_mode is not None:
+            return self._position_hedge_mode
+        if self._mode != "live":
+            self._position_hedge_mode = True
+            return self._position_hedge_mode
+
+        venue_sym = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            "/api/v2/mix/account/account",
+            params={
+                "symbol": venue_sym,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT",
+            },
+            private=True,
+        )
+        self._position_hedge_mode = _parse_position_hedge_mode(raw)
+        return self._position_hedge_mode
 
     async def detect_profile(self) -> BitgetAccountProfile:
         """Detect account profile (UTA vs Classic) via a lightweight probe.
@@ -242,6 +293,9 @@ class BitgetAdapter(VenueAdapter):
             raw = await self._transport._request(
                 "GET", "/api/v2/mix/position/single-position", params=params, private=True
             )
+            parsed_mode = _extract_position_hedge_mode(raw)
+            if parsed_mode is not None:
+                self._position_hedge_mode = parsed_mode
         else:
             params = {
                 "symbol": venue_sym,
@@ -290,12 +344,15 @@ class BitgetAdapter(VenueAdapter):
             profile = await self.detect_profile()
             venue_sym = self._transport._venue_symbol(request.symbol)
             now_ms = int(__import__("time").time() * 1000)
+            hedge_mode = self._transport._hedge_mode
+            if profile == BitgetAccountProfile.CLASSIC:
+                hedge_mode = await self.detect_position_hedge_mode(request.symbol)
 
             req_path, body = _build_bitget_order_request(
                 request, venue_sym,
                 passive=False,
                 profile=profile.value,
-                hedge_mode=self._transport._hedge_mode,
+                hedge_mode=hedge_mode,
             )
             raw = await self._transport._request("POST", req_path, body=body, private=True)
 
@@ -326,12 +383,15 @@ class BitgetAdapter(VenueAdapter):
             profile = await self.detect_profile()
             venue_sym = self._transport._venue_symbol(request.symbol)
             now_ms = int(__import__("time").time() * 1000)
+            hedge_mode = self._transport._hedge_mode
+            if profile == BitgetAccountProfile.CLASSIC:
+                hedge_mode = await self.detect_position_hedge_mode(request.symbol)
 
             req_path, body = _build_bitget_order_request(
                 request, venue_sym,
                 passive=True,
                 profile=profile.value,
-                hedge_mode=self._transport._hedge_mode,
+                hedge_mode=hedge_mode,
             )
             raw = await self._transport._request("POST", req_path, body=body, private=True)
 

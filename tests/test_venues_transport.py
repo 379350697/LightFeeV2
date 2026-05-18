@@ -2708,6 +2708,8 @@ class TestBitgetOrderBody:
         seen: dict = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v2/mix/account/account":
+                return httpx.Response(200, json={"code": "00000", "data": {"posMode": "hedge_mode"}})
             seen["path"] = request.url.path
             seen["body"] = _json.loads(request.content.decode())
             return httpx.Response(200, json=_fixture("bitget/classic_place_order_ack_only.json"))
@@ -2862,6 +2864,52 @@ class TestBitgetOrderBody:
 
         assert body["side"] == "sell"
         assert body["posSide"] == "long"
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_one_way_reduce_only_buy_uses_reduce_only_not_trade_side(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        calls: list[tuple[str, str]] = []
+        seen_body: dict = {}
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            calls.append((method, path))
+            if path == "/api/v2/mix/account/account":
+                return {"code": "00000", "data": {"posMode": "one_way_mode"}}
+            if path == "/api/v2/mix/order/place-order":
+                seen_body.update(body or {})
+                return {
+                    "code": "00000",
+                    "data": {"orderId": "bitget-close-short-001", "clientOid": "close-short"},
+                }
+            return {"code": "00000", "data": {}}
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._transport._request = fake_request
+        adapter._transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BITGET, symbol=sym, side=req.side,
+            quantity=req.quantity, price=5.55, order_id="bitget-close-short-001",
+        )
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="KSMUSDT",
+            side=Side.BUY,
+            quantity=2.9,
+            reduce_only=True,
+            client_order_id="close-short",
+        )
+
+        await adapter.place_order(req)
+
+        assert ("GET", "/api/v2/mix/account/account") in calls
+        assert seen_body["side"] == "buy"
+        assert seen_body["reduceOnly"] == "YES"
+        assert "tradeSide" not in seen_body
 
 
 # ---------------------------------------------------------------------------
