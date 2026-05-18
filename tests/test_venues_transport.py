@@ -2631,6 +2631,66 @@ class TestBybitOrderBody:
         assert seen_body["positionIdx"] == 2  # Sell in hedge mode
         assert "quantity" not in seen_body
 
+    @pytest.mark.asyncio
+    async def test_bybit_reduce_only_sell_closes_long_position_idx(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bybit/place_order_ack_only.json"))
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.002,
+            reduce_only=True,
+            client_order_id="lfv2-close-long-001",
+        )
+
+        from lightfee.core.domain import OrderFill
+        transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BYBIT, symbol=sym, side=req.side,
+            quantity=req.quantity, price=50000.0, order_id="123",
+        )
+        await transport.place_order(req)
+
+        assert seen_body["side"] == "Sell"
+        assert seen_body["reduceOnly"] is True
+        assert seen_body["positionIdx"] == 1  # V1: Sell reduce-only closes long
+
+    @pytest.mark.asyncio
+    async def test_bybit_reduce_only_buy_closes_short_position_idx(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bybit/place_order_ack_only.json"))
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.002,
+            reduce_only=True,
+            client_order_id="lfv2-close-short-001",
+        )
+
+        from lightfee.core.domain import OrderFill
+        transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BYBIT, symbol=sym, side=req.side,
+            quantity=req.quantity, price=50000.0, order_id="123",
+        )
+        await transport.place_order(req)
+
+        assert seen_body["side"] == "Buy"
+        assert seen_body["reduceOnly"] is True
+        assert seen_body["positionIdx"] == 2  # V1: Buy reduce-only closes short
+
 
 # ---------------------------------------------------------------------------
 # Task 4: Fix Bitget Classic/UTA Order Builders
@@ -2721,6 +2781,87 @@ class TestBitgetOrderBody:
         assert seen["body"]["timeInForce"] == "post_only"
         assert seen["body"]["clientOid"] == "lfv2-entry-maker-001"
         assert "quantity" not in seen["body"]
+
+    def test_bitget_classic_hedge_reduce_only_buy_closes_short_with_sell_side(self):
+        from lightfee.venues.transport import _build_bitget_order_request
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="KSMUSDT",
+            side=Side.BUY,
+            quantity=2.9,
+            reduce_only=True,
+            client_order_id="lfv2-close-short-001",
+        )
+
+        path, body = _build_bitget_order_request(
+            req, "KSMUSDT", passive=False, profile="classic", hedge_mode=True,
+        )
+
+        assert path == "/api/v2/mix/order/place-order"
+        assert body["orderType"] == "market"
+        assert body["side"] == "sell"  # V1: hedge close-short uses close + sell
+        assert body["tradeSide"] == "close"
+        assert "reduceOnly" not in body
+
+    def test_bitget_classic_hedge_reduce_only_sell_closes_long_with_buy_side(self):
+        from lightfee.venues.transport import _build_bitget_order_request
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.001,
+            reduce_only=True,
+            client_order_id="lfv2-close-long-001",
+        )
+
+        _, body = _build_bitget_order_request(
+            req, "BTCUSDT", passive=False, profile="classic", hedge_mode=True,
+        )
+
+        assert body["side"] == "buy"  # V1: hedge close-long uses close + buy
+        assert body["tradeSide"] == "close"
+
+    def test_bitget_uta_hedge_reduce_only_buy_uses_short_pos_side(self):
+        from lightfee.venues.transport import _build_bitget_order_request
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="KSMUSDT",
+            side=Side.BUY,
+            quantity=2.9,
+            reduce_only=True,
+            client_order_id="lfv2-uta-close-short-001",
+        )
+
+        path, body = _build_bitget_order_request(
+            req, "KSMUSDT", passive=False, profile="uta", hedge_mode=True,
+        )
+
+        assert path == "/api/v3/trade/place-order"
+        assert body["side"] == "buy"
+        assert body["posSide"] == "short"
+        assert "reduceOnly" not in body
+
+    def test_bitget_uta_hedge_reduce_only_sell_uses_long_pos_side(self):
+        from lightfee.venues.transport import _build_bitget_order_request
+
+        req = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.001,
+            reduce_only=True,
+            client_order_id="lfv2-uta-close-long-001",
+        )
+
+        _, body = _build_bitget_order_request(
+            req, "BTCUSDT", passive=False, profile="uta", hedge_mode=True,
+        )
+
+        assert body["side"] == "sell"
+        assert body["posSide"] == "long"
 
 
 # ---------------------------------------------------------------------------
@@ -4058,6 +4199,82 @@ class TestPassiveBodyBuilders:
 
         assert body["post_only"] is True
         assert "reduce_only" not in body  # not hardcoded when false
+
+    @pytest.mark.asyncio
+    async def test_gate_reduce_only_sell_uses_signed_negative_market_size(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(
+                200,
+                json={"id": "gate-close-long-001", "status": "closed", "size": -69, "price": "0"},
+            )
+
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.GATE,
+            symbol="SKYAIUSDT",
+            side=Side.SELL,
+            quantity=69,
+            reduce_only=True,
+            client_order_id="lfv2-gate-close-long-001",
+        )
+
+        await transport.place_order(req)
+
+        assert seen_body["contract"] == "SKYAI_USDT"
+        assert seen_body["size"] == -69
+        assert seen_body["price"] == "0"
+        assert seen_body["tif"] == "ioc"
+        assert seen_body["reduce_only"] is True
+        assert "symbol" not in seen_body
+        assert "side" not in seen_body
+        assert "quantity" not in seen_body
+
+    @pytest.mark.asyncio
+    async def test_gate_reduce_only_buy_uses_signed_positive_market_size(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(
+                200,
+                json={"id": "gate-close-short-001", "status": "closed", "size": 11, "price": "0"},
+            )
+
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.GATE,
+            symbol="INJUSDT",
+            side=Side.BUY,
+            quantity=11,
+            reduce_only=True,
+            client_order_id="lfv2-gate-close-short-001",
+        )
+
+        await transport.place_order(req)
+
+        assert seen_body["contract"] == "INJ_USDT"
+        assert seen_body["size"] == 11
+        assert seen_body["price"] == "0"
+        assert seen_body["tif"] == "ioc"
+        assert seen_body["reduce_only"] is True
+        assert "symbol" not in seen_body
+        assert "side" not in seen_body
+        assert "quantity" not in seen_body
 
     def test_bybit_passive_price_preserves_tick_precision(self):
         """Bybit passive body price must preserve tick-aware precision.

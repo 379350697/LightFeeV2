@@ -202,6 +202,8 @@ def _bybit_side(side: Side) -> str:
 def _bybit_position_idx(request: "OrderRequest", *, hedge_mode: bool) -> int:
     if not hedge_mode:
         return 0
+    if request.reduce_only:
+        return 1 if request.side == Side.SELL else 2
     return 1 if request.side == Side.BUY else 2
 
 
@@ -251,6 +253,9 @@ def _build_bitget_order_request(
     Returns (request_path, body_dict).
     """
     side = "buy" if request.side == Side.BUY else "sell"
+    classic_side = side
+    if hedge_mode and request.reduce_only:
+        classic_side = "sell" if request.side == Side.BUY else "buy"
     if profile == "uta":
         body: dict[str, Any] = {
             "category": "USDT-FUTURES",
@@ -264,7 +269,10 @@ def _build_bitget_order_request(
             body["timeInForce"] = "post_only" if passive else "ioc"
             body["price"] = _format_price(request.price or 0.0)
         if hedge_mode:
-            body["posSide"] = "long" if request.side == Side.BUY else "short"
+            if request.reduce_only:
+                body["posSide"] = "short" if request.side == Side.BUY else "long"
+            else:
+                body["posSide"] = "long" if request.side == Side.BUY else "short"
         else:
             body["reduceOnly"] = "yes" if request.reduce_only else "no"
         return "/api/v3/trade/place-order", body
@@ -276,7 +284,7 @@ def _build_bitget_order_request(
         "marginMode": "crossed",
         "marginCoin": "USDT",
         "size": _format_quantity(request.quantity),
-        "side": side,
+        "side": classic_side,
         "orderType": "limit" if (passive or request.price is not None) else "market",
         "force": "post_only" if passive else "ioc",
         "clientOid": request.client_order_id or "",
@@ -2332,12 +2340,17 @@ class VenueTransport(MarketDataClient):
                 if request.reduce_only:
                     body["reduceOnly"] = "true"
             elif spec.venue_id == Venue.GATE:
-                body["contract"] = venue_sym
-                body["size"] = int(request.quantity)
+                signed_size = int(request.quantity)
+                if request.side == Side.SELL:
+                    signed_size = -signed_size
+                body = {
+                    "contract": venue_sym,
+                    "size": signed_size,
+                    "price": _format_decimal(request.price) if request.price is not None else "0",
+                    "tif": "gtc" if request.price is not None else "ioc",
+                }
                 if request.reduce_only:
                     body["reduce_only"] = True
-                if request.price is not None:
-                    body["price"] = _format_decimal(request.price)
             elif spec.venue_id == Venue.HYPERLIQUID:
                 is_buy = request.side == Side.BUY
                 tif = "Gtc" if request.price else "Ioc"
