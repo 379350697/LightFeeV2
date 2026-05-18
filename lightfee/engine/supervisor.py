@@ -67,6 +67,22 @@ class Supervisor:
                 new_mode = GlobalRiskMode.ENTRY_PAUSED
 
         old_mode = self.state.risk_mode
+
+        # V1: fail_closed_latch_can_clear — auto-recover from FAIL_CLOSED when
+        # health has recovered and no blocking conditions remain (state.rs:476-487)
+        if old_mode == GlobalRiskMode.FAIL_CLOSED and new_mode != GlobalRiskMode.FAIL_CLOSED:
+            if self._fail_closed_can_clear():
+                self.state.lifecycle = EngineLifecycle.RUNNING
+                self.state.last_error = None
+                self.journal.append(
+                    "risk.fail_closed_auto_resumed",
+                    {
+                        "from_mode": old_mode.value,
+                        "to_mode": new_mode.value,
+                        "min_health_ratio": health.min_health_ratio,
+                    },
+                )
+
         if new_mode != old_mode:
             self.state.risk_mode = new_mode
             self.journal.append(
@@ -78,7 +94,7 @@ class Supervisor:
                 },
             )
             if new_mode == GlobalRiskMode.FAIL_CLOSED:
-                self.state.lifecycle = EngineLifecycle.FAIL_CLOSED
+                self.state.lifecycle = EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
                 self.journal.append(
                     "risk.fail_closed_entered",
                     {"min_health_ratio": health.min_health_ratio},
@@ -89,6 +105,23 @@ class Supervisor:
                 self.journal.append("risk.entry_pause_cleared", {})
 
         return new_mode
+
+    def _fail_closed_can_clear(self) -> bool:
+        """V1 fail_closed_latch_can_clear (state.rs:476-483).
+
+        Returns True when FAIL_CLOSED can be safely auto-recovered:
+        - No recovery block reason
+        - No open positions that need risk protection
+        """
+        if self.state.recovery_blocked_reason:
+            return False
+        # V1: positions that triggered fail_closed must be resolved
+        for pos in self.state.open_positions.values():
+            if pos.last_risk_reason and "fail_closed" in pos.last_risk_reason:
+                return False
+            if pos.single_side_protection_triggered:
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Per-position risk supervision
@@ -345,7 +378,7 @@ class Supervisor:
         position.single_side_protection_triggered = True
 
         # Enter fail-closed after protection
-        self.state.lifecycle = EngineLifecycle.FAIL_CLOSED
+        self.state.lifecycle = EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
         self.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
         self.journal.append(
             "risk.fail_closed_entered",
@@ -377,7 +410,7 @@ class Supervisor:
         position.last_risk_action_at_ms = now_ms
         position.last_risk_reason = plan.reason
 
-        self.state.lifecycle = EngineLifecycle.FAIL_CLOSED
+        self.state.lifecycle = EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
         self.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
         self.journal.append(
             "risk.fail_closed_entered",

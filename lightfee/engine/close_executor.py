@@ -20,11 +20,40 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.exit import CloseExecution
+from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
 from lightfee.engine.state import CloseLegRecord, OpenPosition, PendingClose
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
+
+
+# ---------------------------------------------------------------------------
+# V1 compensation constants (entry.rs:23-24)
+# ---------------------------------------------------------------------------
+
+_MAX_EMERGENCY_FLATTEN_ATTEMPTS = 3
+_COMPENSATION_HARD_STOP_DELAY_MS = 750
+
+
+def order_error_may_have_created_exposure(error: Exception) -> bool:
+    """V1 order_error_may_have_created_exposure (entry.rs:494).
+
+    Returns True when the error's SubmitFailureClass is UNCERTAIN,
+    meaning the order may have been partially or fully executed
+    on the exchange before the error was observed.
+    """
+    if isinstance(error, OrderSubmitError):
+        return error.is_uncertain
+    return False
+
+
+class CompensationFailedError(Exception):
+    """Raised when close compensation flatten fails on all venues.
+
+    V1: enter_fail_closed + persist_state + return Err(...)
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +514,38 @@ class CloseExecutor:
             elif short_result["outcome"] == "uncertain":
                 any_short_uncertain = True
                 chunk_short_order_ids.append(short_result.get("order_id", ""))
+                # V1: compensate_failed_full_close for short leg uncertain errors
+                if reason:
+                    chunk_short_cids.append(short_cid)
+                    self.journal.append(
+                        "exit.close_chunk_submitted",
+                        {
+                            "position_id": position.position_id,
+                            "chunk_index": chunk_idx,
+                            "total_chunks": total_chunks,
+                            "chunk_quantity": chunk_qty,
+                            "short_client_order_id": short_cid,
+                            "long_client_order_id": "",
+                            "short_outcome": "uncertain_compensating",
+                            "long_outcome": "not_submitted",
+                        },
+                    )
+                    try:
+                        await self.compensate_failed_full_close(
+                            position, reason,
+                            f"exit_short_chunk_{chunk_idx}",
+                            position.short_venue,
+                            OrderSubmitError(
+                                SubmitFailureClass.UNCERTAIN,
+                                short_result.get("reason", "close leg uncertain"),
+                            ),
+                            short_legs, long_legs, state,
+                        )
+                        break  # compensation succeeded, exit chunk loop
+                    except CompensationFailedError:
+                        return build_close_execution_from_legs(
+                            position, total_chunks, short_legs, long_legs,
+                        )
 
             long_req = OrderRequest(
                 venue=position.long_venue, symbol=position.symbol,
@@ -506,6 +567,72 @@ class CloseExecutor:
             elif long_result["outcome"] == "uncertain":
                 any_long_uncertain = True
                 chunk_long_order_ids.append(long_result.get("order_id", ""))
+                # V1: compensate for long leg uncertain errors
+                if reason:
+                    chunk_short_cids.append(short_cid)
+                    chunk_long_cids.append(long_cid)
+                    self.journal.append(
+                        "exit.close_chunk_submitted",
+                        {
+                            "position_id": position.position_id,
+                            "chunk_index": chunk_idx,
+                            "total_chunks": total_chunks,
+                            "chunk_quantity": chunk_qty,
+                            "short_client_order_id": short_cid,
+                            "long_client_order_id": long_cid,
+                            "short_outcome": short_result["outcome"],
+                            "long_outcome": "uncertain_compensating",
+                        },
+                    )
+                    try:
+                        await self.compensate_failed_full_close(
+                            position, reason,
+                            f"exit_long_chunk_{chunk_idx}",
+                            position.long_venue,
+                            OrderSubmitError(
+                                SubmitFailureClass.UNCERTAIN,
+                                long_result.get("reason", "close leg uncertain"),
+                            ),
+                            short_legs, long_legs, state,
+                        )
+                        break
+                    except CompensationFailedError:
+                        return build_close_execution_from_legs(
+                            position, total_chunks, short_legs, long_legs,
+                        )
+            elif long_result["outcome"] == "rejected" and reason:
+                # V1: long leg rejected after short may have filled → compensate
+                chunk_short_cids.append(short_cid)
+                chunk_long_cids.append(long_cid)
+                self.journal.append(
+                    "exit.close_chunk_submitted",
+                    {
+                        "position_id": position.position_id,
+                        "chunk_index": chunk_idx,
+                        "total_chunks": total_chunks,
+                        "chunk_quantity": chunk_qty,
+                        "short_client_order_id": short_cid,
+                        "long_client_order_id": long_cid,
+                        "short_outcome": short_result["outcome"],
+                        "long_outcome": "rejected_compensating",
+                    },
+                )
+                try:
+                    await self.compensate_failed_full_close(
+                        position, reason,
+                        f"exit_long_chunk_{chunk_idx}",
+                        position.long_venue,
+                        OrderSubmitError(
+                            SubmitFailureClass.REJECTED,
+                            long_result.get("reason", "close leg rejected"),
+                        ),
+                        short_legs, long_legs, state,
+                    )
+                    break
+                except CompensationFailedError:
+                    return build_close_execution_from_legs(
+                        position, total_chunks, short_legs, long_legs,
+                    )
 
             chunk_short_cids.append(short_cid)
             chunk_long_cids.append(long_cid)
@@ -528,6 +655,7 @@ class CloseExecutor:
             if chunk_idx < total_chunks - 1 and self.config.close_chunk_min_interval_ms > 0:
                 delay_s = self.config.close_chunk_min_interval_ms / 1000.0
                 await asyncio.sleep(delay_s)
+
 
         # Aggregate PnL across all chunks
         close = build_close_execution_from_legs(
@@ -553,6 +681,19 @@ class CloseExecutor:
                     "chunk_count": total_chunks,
                 },
             )
+            # V1: replace_pending_residual_repair_for_origin (exit.rs:5078-5084)
+            # Write the residual repair task into state so it is periodically retried
+            if state is not None:
+                # Remove any existing task for the same (position_id, pair_id, origin)
+                residual_dict = _residual_task_to_dict(residual)
+                state.pending_residual_repairs = [
+                    t for t in state.pending_residual_repairs
+                    if not (isinstance(t, dict)
+                            and t.get("position_id") == residual.position_id
+                            and t.get("pair_id") == residual.pair_id
+                            and t.get("origin") == residual_dict["origin"])
+                ]
+                state.pending_residual_repairs.append(residual_dict)
 
         # Write back to EngineState when available
         if state is not None:
@@ -703,6 +844,20 @@ class CloseExecutor:
                     "net_quote": close.net_quote,
                 },
             )
+        else:
+            # V1: dust pause — when remaining is below dust, mark last_risk_action
+            # to prevent immediate re-close (exit.rs:3093-3171)
+            _DUST_QUANTITY_THRESHOLD = 1e-8
+            if position.matched_quantity < _DUST_QUANTITY_THRESHOLD:
+                position.last_risk_action_at_ms = now_ms  # reuse as dust pause sentinel
+                self.journal.append(
+                    "exit.close_dust_paused",
+                    {
+                        "position_id": position.position_id,
+                        "remaining_quantity": position.matched_quantity,
+                        "ts_ms": now_ms,
+                    },
+                )
 
     async def _submit_close_leg(
         self,
@@ -817,20 +972,37 @@ class CloseExecutor:
                 return result
 
             if result["outcome"] == "rejected":
-                # Check for terminal reduce-only success (venue flat)
+                # V1: check for terminal reduce-only success (venue already flat)
+                # Primary: string-based detection for known exchange patterns
                 reason = result.get("reason", "")
-                if "position closed" in reason.lower() or "empty position" in reason.lower():
-                    self.journal.append(
-                        "order.filled",
-                        {
-                            "position_id": position_id,
-                            "leg": leg,
-                            "reason": "terminal_reduce_only",
-                            "client_order_id": request.client_order_id,
-                            "attempt": attempt,
-                        },
-                    )
-                    return {"outcome": "filled", "fill": OrderFill(
+                terminal_patterns = (
+                    "position closed", "empty position", "position does not exist",
+                    "order_not_found", "reduce_only", "no position",
+                    "insufficient position", "position not found",
+                )
+                if any(p in reason.lower() for p in terminal_patterns):
+                    # V1: verify by fetching exchange position
+                    is_flat = False
+                    try:
+                        adapter = self.adapters.get(request.venue)
+                        if adapter is not None:
+                            current_pos = await adapter.fetch_position(request.symbol)
+                            is_flat = current_pos is not None and abs(current_pos.quantity) <= 1e-9
+                    except Exception:
+                        pass
+                    if is_flat or any(p in reason.lower() for p in ("position closed", "empty position", "order_not_found")):
+                        self.journal.append(
+                            "order.filled",
+                            {
+                                "position_id": position_id,
+                                "leg": leg,
+                                "reason": "terminal_reduce_only",
+                                "exchange_verified_flat": is_flat,
+                                "client_order_id": request.client_order_id,
+                                "attempt": attempt,
+                            },
+                        )
+                        return {"outcome": "filled", "fill": OrderFill(
                         venue=request.venue, symbol=request.symbol,
                         side=request.side, quantity=0.0, price=0.0,
                         order_id="terminal-flat",
@@ -853,6 +1025,250 @@ class CloseExecutor:
                 await asyncio.sleep(backoff_ms / 1000.0)
 
         return {"outcome": "uncertain", "fill": None, "order_id": ""}
+
+    # ------------------------------------------------------------------
+    # V1 compensate_failed_full_close (exit.rs:1482-1601)
+    # ------------------------------------------------------------------
+
+    async def compensate_failed_full_close(
+        self,
+        position: OpenPosition,
+        close_reason: str,
+        failed_stage: str,
+        failed_venue: Venue,
+        error: Exception,
+        short_legs: list[CloseExecutionLeg],
+        long_legs: list[CloseExecutionLeg],
+        state: Any | None = None,
+    ) -> None:
+        """V1 compensate_failed_full_close (exit.rs:1482-1601).
+
+        After a close leg fails with exposure-creating error, fetch exchange
+        positions and flatten residual. Falls back to hard-stop flattening.
+        If all venues fail, enters FAIL_CLOSED and raises CompensationFailedError.
+        """
+        residual_positions: list[dict[str, Any]] = []
+        compensated_venues: list[str] = []
+
+        for venue, compensate_stage in [
+            (position.short_venue, "exit_compensate_short"),
+            (position.long_venue, "exit_compensate_long"),
+        ]:
+            adapter = self.adapters.get(venue)
+            if adapter is None:
+                continue
+
+            try:
+                pos = await adapter.fetch_position(position.symbol)
+            except Exception as fetch_err:
+                self.journal.append(
+                    "exit.compensation_fetch_failed",
+                    {
+                        "position_id": position.position_id,
+                        "venue": venue.value,
+                        "error": str(fetch_err),
+                    },
+                )
+                continue
+
+            if pos is None or abs(pos.quantity) <= 1e-9:
+                continue
+
+            residual_positions.append({
+                "venue": venue.value,
+                "size": pos.quantity,
+                "observed_at_ms": pos.observed_at_ms,
+            })
+
+            # V1: side from signed position size
+            # V2: PositionSnapshot.quantity is abs, side carries direction
+            cleanup_side = pos.side.opposite()
+            quantity = abs(pos.quantity)
+
+            # Tier 1: flatten with retries
+            fill_result = await self._flatten_close_leg_with_retries(
+                venue, position.symbol, quantity, cleanup_side,
+                position.position_id, compensate_stage,
+            )
+
+            if fill_result is None:
+                # Tier 2: compensation hard stop
+                fill_result = await self._compensation_hard_stop_close_leg(
+                    venue, position.symbol, position.position_id,
+                    compensate_stage,
+                )
+
+            if fill_result is None:
+                # Both tiers failed → FAIL_CLOSED
+                if state is not None:
+                    enter_fail_closed(state)
+                    state.last_error = (
+                        f"close compensation failed for {position.position_id}"
+                        f" on {venue.value}"
+                    )
+                self.journal.append_critical(
+                    wall_clock_now_ms(),
+                    "execution.compensation_failed",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "phase": "close",
+                        "reason": close_reason,
+                        "failed_stage": failed_stage,
+                        "failed_venue": failed_venue.value,
+                        "error": str(error),
+                        "compensation_venue": venue.value,
+                    },
+                )
+                raise CompensationFailedError(
+                    f"close compensation failed for {position.position_id}"
+                    f" on {venue.value}"
+                )
+
+            # Compensation succeeded — record the fill leg
+            fill, client_order_id, submit_ms = fill_result
+            compensated_venues.append(venue.value)
+            leg = CloseExecutionLeg(
+                fill=fill,
+                client_order_id=client_order_id,
+                submit_started_at_ms=submit_ms,
+            )
+            if venue == position.short_venue:
+                short_legs.append(leg)
+            else:
+                long_legs.append(leg)
+
+        self.journal.append(
+            "exit.compensated",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "reason": close_reason,
+                "failed_stage": failed_stage,
+                "failed_venue": failed_venue.value,
+                "error": str(error),
+                "residual_positions": residual_positions,
+                "compensated_venues": compensated_venues,
+            },
+        )
+
+    async def _compensate_close_leg_exposure(
+        self, venue: Venue, symbol: str, quantity: float,
+        side: Side, position_id: str, stage: str,
+    ) -> tuple[OrderFill, str, int] | None:
+        """Single-shot reduce-only close for compensation flatten.
+
+        Returns (fill, client_order_id, submit_started_at_ms) or None.
+        """
+        from lightfee.venues.cid import generate_exchange_cid
+
+        adapter = self.adapters.get(venue)
+        if adapter is None:
+            return None
+
+        client_order_id = generate_exchange_cid(
+            f"{position_id}:{stage}:{symbol}", "c", venue,
+        )
+        submit_ms = wall_clock_now_ms()
+
+        req = OrderRequest(
+            venue=venue, symbol=symbol, side=side,
+            quantity=quantity, reduce_only=True, post_only=False,
+            client_order_id=client_order_id,
+        )
+
+        try:
+            fill = await adapter.place_order(req)
+        except Exception:
+            # Order may have created exposure — check if position is now flat
+            try:
+                verify_pos = await adapter.fetch_position(symbol)
+                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                    return None  # Already flat, no fill to record
+            except Exception:
+                pass
+            return None
+
+        if fill.quantity >= quantity - 1e-9:
+            return (fill, client_order_id, submit_ms)
+
+        # Partial fill — re-verify flatness
+        try:
+            verify_pos = await adapter.fetch_position(symbol)
+            if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                return (fill, client_order_id, submit_ms)  # Flat despite partial fill
+        except Exception:
+            pass
+
+        return None  # Position not flat after partial fill
+
+    async def _flatten_close_leg_with_retries(
+        self, venue: Venue, symbol: str, quantity: float,
+        side: Side, position_id: str, stage: str,
+    ) -> tuple[OrderFill, str, int] | None:
+        """V1 flatten_single_leg_with_retries_collect (entry.rs:2711-2801).
+
+        Retries flatten up to _MAX_EMERGENCY_FLATTEN_ATTEMPTS, re-fetching
+        position between attempts.
+        """
+        adapter = self.adapters.get(venue)
+        if adapter is None:
+            return None
+
+        retry_quantity = quantity
+        retry_side = side
+
+        for attempt in range(1, _MAX_EMERGENCY_FLATTEN_ATTEMPTS + 1):
+            result = await self._compensate_close_leg_exposure(
+                venue, symbol, retry_quantity, retry_side,
+                position_id, f"{stage}_attempt_{attempt}",
+            )
+            if result is not None:
+                return result
+
+            if attempt < _MAX_EMERGENCY_FLATTEN_ATTEMPTS:
+                # Re-fetch position for next retry
+                try:
+                    pos = await adapter.fetch_position(symbol)
+                except Exception:
+                    continue
+
+                if pos is None or abs(pos.quantity) <= 1e-9:
+                    return None  # Already flat
+
+                retry_quantity = abs(pos.quantity)
+                retry_side = pos.side.opposite()
+
+        return None
+
+    async def _compensation_hard_stop_close_leg(
+        self, venue: Venue, symbol: str, position_id: str, stage: str,
+    ) -> tuple[OrderFill, str, int] | None:
+        """V1 compensation_hard_stop_failed_leg_exposure_collect (entry.rs:2828-2909).
+
+        Delay, re-fetch position, then single-shot flatten.
+        """
+        await asyncio.sleep(_COMPENSATION_HARD_STOP_DELAY_MS / 1000.0)
+
+        adapter = self.adapters.get(venue)
+        if adapter is None:
+            return None
+
+        try:
+            pos = await adapter.fetch_position(symbol)
+        except Exception:
+            return None
+
+        if pos is None or abs(pos.quantity) <= 1e-9:
+            return None  # Already flat
+
+        cleanup_side = pos.side.opposite()
+        quantity = abs(pos.quantity)
+
+        return await self._compensate_close_leg_exposure(
+            venue, symbol, quantity, cleanup_side,
+            position_id, f"{stage}_hard_stop",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -879,4 +1295,25 @@ def build_exit_pnl_attribution(
         "entry_fee_quote": entry_fee,
         "exit_fee_quote": exit_fee,
         "net_quote": net,
+    }
+
+
+def _residual_task_to_dict(task: ResidualExposureTask) -> dict[str, Any]:
+    """V1: convert ResidualExposureTask to dict for state.pending_residual_repairs.
+
+    The runtime expects dicts (runtime.py:4146), so we serialize the dataclass
+    to a dict with V1-compatible field names.
+    """
+    return {
+        "position_id": task.position_id,
+        "pair_id": task.pair_id,
+        "symbol": task.symbol,
+        "origin": task.origin.value if hasattr(task.origin, 'value') else str(task.origin),
+        "repair_venue": task.exposure_venue.value,
+        "repair_side": task.exposure_side.value,
+        "repair_quantity": task.exposure_quantity,
+        "deadline_ms": task.deadline_ms,
+        "created_at_ms": task.created_at_ms,
+        "retry_count": task.retry_count,
+        "last_attempt_at_ms": task.last_attempt_at_ms,
     }

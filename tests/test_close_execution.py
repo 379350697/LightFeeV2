@@ -815,4 +815,279 @@ class FakeVenueAdapter:
         return None
 
 
+# ---------------------------------------------------------------------------
+# V1 compensate_failed_full_close (C-R6) tests
+# ---------------------------------------------------------------------------
+
+
+class FakeCompensationAdapter:
+    """Adapter that returns a position with residual for compensation tests."""
+
+    def __init__(self, venue: Venue, position_qty: float = 0.0,
+                 fill_price: float = 50000.0, side: Side = Side.BUY,
+                 place_succeeds: bool = True):
+        self._venue = venue
+        self.position = PositionSnapshot(
+            venue=venue, symbol="BTCUSDT", side=side,
+            quantity=position_qty, entry_price=fill_price, observed_at_ms=1000,
+        )
+        self.fill_price = fill_price
+        self._place_succeeds = place_succeeds
+        self.place_order_calls: list = []
+        self.fetch_position_calls: list = []
+
+    @property
+    def venue(self) -> Venue:
+        return self._venue
+
+    async def place_order(self, request):
+        self.place_order_calls.append(request)
+        if not self._place_succeeds:
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, "simulated failure")
+        return OrderFill(
+            venue=self._venue, symbol=request.symbol, side=request.side,
+            quantity=request.quantity, price=self.fill_price,
+            order_id=f"comp-{len(self.place_order_calls)}",
+            filled_at_ms=1000,
+        )
+
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_calls.append(symbol)
+        return self.position
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+        return None
+
+    async def normalize_quantity(self, symbol, quantity):
+        return quantity
+
+
+class TestCompensateFailedFullClose:
+    """C-R6: compensate_failed_full_close (V1 exit.rs:1482-1601)."""
+
+    @pytest.mark.asyncio
+    async def test_compensate_flat_position_noop(self):
+        """When exchange position is flat, compensation is a no-op."""
+        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.state import EngineState
+
+        short_adapter = FakeCompensationAdapter(
+            Venue.OKX, position_qty=0.0,  # Already flat
+        )
+        long_adapter = FakeCompensationAdapter(
+            Venue.BINANCE, position_qty=0.0,  # Already flat
+        )
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        await executor.compensate_failed_full_close(
+            pos, "profit_take", "exit_short_chunk_0",
+            pos.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs, long_legs, state,
+        )
+
+        # Position was flat → no place_order calls, no legs added
+        assert short_adapter.place_order_calls == []
+        assert long_adapter.place_order_calls == []
+        assert len(short_legs) == 0
+        assert len(long_legs) == 0
+        # Should have journaled exit.compensated with empty compensation
+        events = journal.read_all()
+        assert any("exit.compensated" == r.get("kind", "") for r in events)
+
+    @pytest.mark.asyncio
+    async def test_compensate_flattens_residual(self):
+        """When exchange has residual position, compensation flattens it."""
+        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.state import EngineState
+
+        # Short venue has 0.01 residual (SELL side = short → cleanup BUY)
+        short_adapter = FakeCompensationAdapter(
+            Venue.OKX, position_qty=0.01, side=Side.SELL,
+        )
+        # Long venue has 0.005 residual (BUY side = long → cleanup SELL)
+        long_adapter = FakeCompensationAdapter(
+            Venue.BINANCE, position_qty=0.005, side=Side.BUY,
+        )
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        await executor.compensate_failed_full_close(
+            pos, "hard_stop", "exit_short_chunk_0",
+            pos.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs, long_legs, state,
+        )
+
+        # Short adapter should have placed a BUY (cleanup short = buy to flatten)
+        assert len(short_adapter.place_order_calls) == 1
+        assert short_adapter.place_order_calls[0].side == Side.BUY
+        assert short_adapter.place_order_calls[0].quantity == 0.01
+        # Long adapter should have placed a SELL (cleanup long = sell to flatten)
+        assert len(long_adapter.place_order_calls) == 1
+        assert long_adapter.place_order_calls[0].side == Side.SELL
+        assert long_adapter.place_order_calls[0].quantity == 0.005
+        # Legs should be added
+        assert len(short_legs) == 1
+        assert len(long_legs) == 1
+
+    @pytest.mark.asyncio
+    async def test_compensate_flatten_fails_hard_stop_succeeds(self):
+        """Tier 1 flatten fails → Tier 2 hard stop succeeds."""
+        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.state import EngineState
+
+        # Short adapter: place_order fails first 3 times (max retries), then re-fetch still shows position
+        # but hard stop will succeed because we bump the mock after retries
+        short_pos = PositionSnapshot(
+            venue=Venue.OKX, symbol="BTCUSDT", side=Side.SELL,
+            quantity=0.01, entry_price=50000.0, observed_at_ms=1000,
+        )
+        short_adapter = _RetryThenSucceedAdapter(Venue.OKX, short_pos, fail_count=3)
+
+        long_adapter = FakeCompensationAdapter(
+            Venue.BINANCE, position_qty=0.0,  # Already flat
+        )
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        await executor.compensate_failed_full_close(
+            pos, "hard_stop", "exit_short_chunk_0",
+            pos.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs, long_legs, state,
+        )
+
+        # Should have succeeded via hard stop
+        assert short_adapter.hard_stop_called
+        assert len(short_legs) == 1
+
+    @pytest.mark.asyncio
+    async def test_compensate_all_tiers_fail_enter_fail_closed(self):
+        """When both flatten and hard stop fail, enter FAIL_CLOSED."""
+        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.state import EngineState
+        from lightfee.risk.modes import GlobalRiskMode
+
+        # Both adapters fail all place_order calls
+        short_adapter = FakeCompensationAdapter(
+            Venue.OKX, position_qty=0.01, side=Side.SELL, place_succeeds=False,
+        )
+        long_adapter = FakeCompensationAdapter(
+            Venue.BINANCE, position_qty=0.005, side=Side.BUY, place_succeeds=False,
+        )
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        with pytest.raises(CompensationFailedError):
+            await executor.compensate_failed_full_close(
+                pos, "hard_stop", "exit_short_chunk_0",
+                pos.short_venue,
+                OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+                short_legs, long_legs, state,
+            )
+
+        # State should be in FAIL_CLOSED
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.last_error is not None
+        assert "compensation failed" in state.last_error.lower()
+
+    def test_order_error_may_have_created_exposure(self):
+        """UNCERTAIN errors indicate possible exposure; REJECTED do not."""
+        from lightfee.engine.close_executor import order_error_may_have_created_exposure
+
+        assert order_error_may_have_created_exposure(
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout")
+        ) is True
+
+        assert order_error_may_have_created_exposure(
+            OrderSubmitError(SubmitFailureClass.REJECTED, "invalid")
+        ) is False
+
+        # Non-OrderSubmitError returns False
+        assert order_error_may_have_created_exposure(RuntimeError("generic")) is False
+
+
+class _RetryThenSucceedAdapter:
+    """Adapter that fails N place_order calls then succeeds, used for hard stop testing."""
+
+    def __init__(self, venue: Venue, position: PositionSnapshot,
+                 fail_count: int = 3):
+        self._venue = venue
+        self.position = position
+        self._fail_count = fail_count
+        self._call_count = 0
+        self.hard_stop_called = False
+        self.place_order_calls: list = []
+        self.fetch_position_calls: list = []
+
+    @property
+    def venue(self) -> Venue:
+        return self._venue
+
+    async def place_order(self, request):
+        self.place_order_calls.append(request)
+        self._call_count += 1
+        if self._call_count <= self._fail_count:
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, f"fail {self._call_count}")
+        # Subsequent calls (hard stop) succeed
+        self.hard_stop_called = True
+        return OrderFill(
+            venue=self._venue, symbol=request.symbol, side=request.side,
+            quantity=request.quantity, price=50000.0,
+            order_id=f"hs-{self._call_count}",
+            filled_at_ms=1000,
+        )
+
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_calls.append(symbol)
+        # Always show position — hard stop needs to see residual
+        return self.position
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+        return None
+
+    async def normalize_quantity(self, symbol, quantity):
+        return quantity
 from lightfee.core.domain import PositionSnapshot

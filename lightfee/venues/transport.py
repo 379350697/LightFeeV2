@@ -713,10 +713,11 @@ def _parse_binance_like_position(raw: dict[str, Any], symbol: str, now_ms: int,
     )
 
 
-def _parse_gate_position(raw: dict[str, Any], symbol: str, now_ms: int) -> "PositionSnapshot":
+def _parse_gate_position(raw: dict[str, Any], symbol: str, now_ms: int, *, contract_size: float = 1.0) -> "PositionSnapshot":
     """Parse Gate.io position (flat dict or list).
 
     Gate: {"contract":"BTCUSDT","size":"-1","entry_price":"50000"}
+    V1: size is in contracts; multiply by contract_size for base quantity (gate.rs:2325-2328)
     """
     rows = raw if isinstance(raw, list) else [raw]
     net = 0.0
@@ -726,7 +727,7 @@ def _parse_gate_position(raw: dict[str, Any], symbol: str, now_ms: int) -> "Posi
             continue
         if row.get("contract") and row.get("contract") != symbol:
             continue
-        size = _safe_float(row.get("size"), default=0.0)
+        size = _safe_float(row.get("size"), default=0.0) * contract_size
         net += size
         entry_price = _safe_float(row.get("entry_price"), default=entry_price)
     return PositionSnapshot(
@@ -908,6 +909,17 @@ def _cancel_response_indicates_absent_order(raw: dict[str, Any], venue_id: "Venu
                 return True
             if "order does not exist" in s_msg or "order not found" in s_msg:
                 return True
+    if venue_id == Venue.BYBIT:
+        # V1: bybit_cancel_order_missing_is_terminal(ret_code=110001)
+        # Bybit returns 200 with retCode=110001 when order doesn't exist
+        ret_code = raw.get("retCode", raw.get("ret_code", 0))
+        if str(ret_code) == "110001":
+            return True
+        result = raw.get("result", raw.get("data", {}))
+        if isinstance(result, dict):
+            ret_code = result.get("retCode", result.get("ret_code", 0))
+            if str(ret_code) == "110001":
+                return True
     return False
 
 
@@ -932,7 +944,8 @@ def _cancel_error_indicates_absent_order(
         if 'order does not exist' in msg:
             return True
     if venue_id == Venue.BYBIT:
-        if 'order not found' in msg or '170001' in body or '170130' in body:
+        # V1: bybit_cancel_order_missing_is_terminal (bybit.rs:4012-4017)
+        if 'order not found' in msg or '110001' in body or '170130' in body:
             return True
     if venue_id == Venue.GATE:
         if 'order_not_found' in msg or 'ORDER_NOT_FOUND' in body:
@@ -2085,7 +2098,7 @@ class VenueTransport(MarketDataClient):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
         if spec.venue_id == Venue.GATE:
-            result = _parse_gate_position(raw, venue_sym, now_ms)
+            result = _parse_gate_position(raw, venue_sym, now_ms, contract_size=spec.contract_size)
             if result.quantity > 0 or not isinstance(raw, dict):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
@@ -3630,7 +3643,13 @@ class VenueTransport(MarketDataClient):
                 if order_id:
                     params["order_id"] = order_id
             elif spec.venue_id == Venue.HYPERLIQUID:
-                # Hyperliquid doesn't have an order query; return None
+                # V1: query Hyperliquid info API for order status (hyperliquid.rs:2033-2130)
+                result = await self._query_hyperliquid_order(spec, venue_sym, order_id, client_order_id, now_ms)
+                if result is not None:
+                    raw, is_list = result
+                    if is_list:
+                        return self._parse_hl_order_list(raw, spec, venue_sym, order_id, client_order_id, now_ms)
+                    return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
                 return None
 
             raw = await self._request("GET", spec.order_path, params=params, private=True)
@@ -3679,18 +3698,22 @@ class VenueTransport(MarketDataClient):
                                data.get("updateTimestamp", data.get("cTime", now_ms)))))
 
         status_str = str(data.get("status", data.get("state", data.get("ordStatus", "")))).upper()
-        if status_str in ("NEW", "OPEN", "UNTRI", "ACTIVE", "UNTRIGGERED"):
+        if status_str in ("NEW", "OPEN", "UNTRI", "ACTIVE", "UNTRIGGERED", "NEW_ORDER", "TRIGGERED"):
             state = PassiveOrderState.OPEN
-        elif status_str in ("PARTIALLY_FILLED", "PARTIAL"):
+        elif status_str in ("PARTIALLY_FILLED", "PARTIAL", "PARTIALLY_CANCELED"):
             state = PassiveOrderState.PARTIALLY_FILLED
-        elif status_str in ("FILLED", "CLOSED", "FINISHED"):
+        elif status_str in ("FILLED", "CLOSED", "FINISHED", "COMPLETED", "DONE"):
             state = PassiveOrderState.FILLED
-        elif status_str in ("CANCELED", "CANCELLED"):
+        elif status_str in ("CANCELED", "CANCELLED", "TERMINATED"):
             state = PassiveOrderState.CANCELED
         elif status_str in ("REJECTED"):
             state = PassiveOrderState.REJECTED
         elif status_str in ("EXPIRED"):
-            state = PassiveOrderState.EXPIRED
+            # V1: expired orders are terminal like Canceled (bitget.rs:3780)
+            state = PassiveOrderState.CANCELED
+        elif status_str == "LIVE":
+            # V1 OKX: "live" → cum > 0 → PartiallyFilled else Resting (okx.rs:5716-5722)
+            state = PassiveOrderState.PARTIALLY_FILLED if cum_qty > 0 else PassiveOrderState.OPEN
         else:
             return None
 
@@ -3860,6 +3883,20 @@ class VenueTransport(MarketDataClient):
                     },
                 }
                 raw = await self._request("POST", spec.order_path, body=body, private=True)
+                # V1: check HL cancel response (hyperliquid.rs cancel path)
+                # Response: {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [...]}}}
+                status = str(raw.get("status", "")).lower()
+                response_data = raw.get("response", raw)
+                if isinstance(response_data, dict):
+                    data = response_data.get("data", {})
+                    if isinstance(data, dict):
+                        statuses = data.get("statuses", [])
+                        if isinstance(statuses, list) and statuses:
+                            cancel_status = str(statuses[0]).lower()
+                            if cancel_status == "success":
+                                status = "ok"
+                if status != "ok":
+                    raise TransportError(f"Hyperliquid cancel rejected: {raw}")
                 return PassiveOrderAck(
                     venue=spec.venue_id,
                     symbol=venue_sym,
@@ -3987,3 +4024,99 @@ class VenueTransport(MarketDataClient):
                 f"Hyperliquid asset '{asset_name}' not found in metadata universe"
             )
         return self._hl_meta_cache[asset_name]
+
+    async def _query_hyperliquid_order(
+        self, spec, symbol: str, order_id: str, client_order_id: str | None, now_ms: int,
+    ):
+        """V1: query Hyperliquid info API for order status (hyperliquid.rs:2033-2130)."""
+        if self._credential is None or not self._credential.account_address:
+            return None
+        if order_id:
+            try:
+                oid = int(order_id)
+                raw = await self._request(
+                    "POST", "/info",
+                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "oid": oid},
+                    private=False,
+                )
+                if raw is not None:
+                    return (raw, False)
+            except (ValueError, Exception):
+                pass
+        if client_order_id:
+            try:
+                raw = await self._request(
+                    "POST", "/info",
+                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "cloid": client_order_id},
+                    private=False,
+                )
+                if raw is not None:
+                    return (raw, False)
+            except Exception:
+                pass
+        try:
+            raw = await self._request(
+                "POST", "/info",
+                body={"type": "historicalOrders", "user": self._credential.account_address if self._credential else ""},
+                private=False,
+            )
+            if raw is not None:
+                return (raw, True)
+        except Exception:
+            pass
+        return None
+
+    def _parse_hl_order_list(
+        self, raw, spec, symbol: str, order_id: str,
+        client_order_id: str | None, now_ms: int,
+    ):
+        """Parse Hyperliquid historicalOrders response for matching order."""
+        from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side
+        orders = raw if isinstance(raw, list) else raw.get("historicalOrders", raw.get("orders", []))
+        for entry in (orders if isinstance(orders, list) else []):
+            if not isinstance(entry, dict):
+                continue
+            entry_oid = str(entry.get("oid", ""))
+            entry_cloid = str(entry.get("cloid", ""))
+            if order_id and entry_oid != order_id:
+                continue
+            if client_order_id and entry_cloid != client_order_id:
+                continue
+            status = str(entry.get("status", "")).lower()
+            side_raw = str(entry.get("side", "")).upper()
+            side = Side.BUY if side_raw == "B" else Side.SELL
+            orig_sz = float(entry.get("origSz", 0))
+            sz = float(entry.get("sz", orig_sz))
+            total_sz = float(entry.get("totalSz", sz))
+            limit_px = float(entry.get("limitPx", 0))
+            avg_px = float(entry.get("avgPx", 0))
+            oid = str(entry.get("oid", ""))
+            if status == "filled":
+                return PassiveOrderProgress(
+                    venue=spec.venue_id, symbol=symbol, side=side,
+                    order_id=oid, client_order_id=entry_cloid,
+                    cumulative_quantity=total_sz,
+                    average_price=avg_px if avg_px > 0 else limit_px,
+                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    state=PassiveOrderState.FILLED, observed_at_ms=now_ms,
+                )
+            if status in ("open", "resting", "triggered"):
+                return PassiveOrderProgress(
+                    venue=spec.venue_id, symbol=symbol, side=side,
+                    order_id=oid, client_order_id=entry_cloid,
+                    cumulative_quantity=orig_sz - sz,
+                    average_price=limit_px,
+                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    state=PassiveOrderState.OPEN, observed_at_ms=now_ms,
+                )
+            if status in ("canceled", "rejected"):
+                return PassiveOrderProgress(
+                    venue=spec.venue_id, symbol=symbol, side=side,
+                    order_id=oid, client_order_id=entry_cloid,
+                    cumulative_quantity=orig_sz - sz,
+                    average_price=0.0,
+                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    state=PassiveOrderState.CANCELED if status == "canceled" else PassiveOrderState.REJECTED,
+                    observed_at_ms=now_ms,
+                )
+        return None

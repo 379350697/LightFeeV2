@@ -40,8 +40,13 @@ class EngineMode(Enum):
 
 
 def derive_engine_mode(lifecycle: EngineLifecycle, risk: GlobalRiskMode) -> EngineMode:
-    """Derive synchronized engine mode from lifecycle + risk mode."""
-    if lifecycle == EngineLifecycle.FAIL_CLOSED or risk == GlobalRiskMode.FAIL_CLOSED:
+    """Derive synchronized engine mode from lifecycle + risk mode.
+
+    V1: FailClosed = RISK_ONLY lifecycle + FAIL_CLOSED risk mode.
+    The FAIL_CLOSED lifecycle check is retained for backward compat
+    with pre-C-R1 persisted states (normalize_engine_state migrates them).
+    """
+    if risk == GlobalRiskMode.FAIL_CLOSED or lifecycle.value == "fail_closed":
         return EngineMode.FAIL_CLOSED
     if lifecycle in (EngineLifecycle.BOOTING, EngineLifecycle.RECONCILING, EngineLifecycle.RISK_ONLY):
         return EngineMode.RECOVERING

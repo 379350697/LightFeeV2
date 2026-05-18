@@ -129,7 +129,7 @@ class TestGlobalRiskModeUpdate:
         new_mode = supervisor.update_global_risk_mode({"binance": 1.0, "okx": 5.0})
         assert new_mode == GlobalRiskMode.FAIL_CLOSED
         assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-        assert state.lifecycle == EngineLifecycle.FAIL_CLOSED
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
 
     def test_healthy_returns_running(self):
         config = _make_config()
@@ -364,7 +364,7 @@ class TestExecuteRiskPlan:
 
         assert pos.single_side_protection_triggered
         assert pos.last_risk_reason == "test_death"
-        assert state.lifecycle == EngineLifecycle.FAIL_CLOSED
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
         assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
 
     def test_execute_fail_closed_enters_fail_closed(self):
@@ -381,7 +381,7 @@ class TestExecuteRiskPlan:
         supervisor._execute_fail_closed(pos, plan, 5000)
 
         assert pos.last_risk_reason == "death_line_health_breach"
-        assert state.lifecycle == EngineLifecycle.FAIL_CLOSED
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
         assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
 
 

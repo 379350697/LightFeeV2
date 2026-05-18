@@ -1875,6 +1875,10 @@ class LiveRuntime:
         """Local-L2 parity maker-event lane: sync runtime, drain events, drive hedges."""
         # Sync local-L2 runtime
         events = self.local_l2_runtime.sync(now_ms)
+        # V1: event-driven session refresh — L2 events may have changed book readiness
+        # (entry_local_l2_sessions.rs:275-297 → BookUpdated → mark_leg_ready etc.)
+        if events:
+            self._refresh_entry_l2_session_readiness(now_ms)
 
         # Build set of (venue, symbol) that matter to pending entries
         pending_venues_symbols: set[tuple[str, str]] = set()
@@ -1906,6 +1910,7 @@ class LiveRuntime:
             return
 
         strategy = self.config.strategy
+        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
 
@@ -1930,36 +1935,78 @@ class LiveRuntime:
 
             long_mid = long_book.mid_price() if long_book else 0.0
             short_mid = short_book.mid_price() if short_book else 0.0
-            mid = long_mid if long_mid > 0 else short_mid
+            # V1: use the maker venue's mid price, not a single-leg fallback
+            # post_only_entry_reprice_price_hint takes from working_market (entry_sync.rs:1475-1481)
+            maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
+            maker_mid = long_mid if maker_venue == pending.long_venue else short_mid
+            mid = maker_mid
             if mid <= 0:
                 continue
 
-            # Cooldown check
-            est = self._maker_event_state.get(entry_id, {})
-            last_reprice_ms = est.get("last_reprice_ms", 0)
-            cooldown_ms = strategy.passive_failure_cooldown_ms
-            if last_reprice_ms > 0 and (now_ms - last_reprice_ms) < cooldown_ms:
+            # Cooldown and ops budget check via V1 PassiveOrderManager
+            from lightfee.engine.passive_order_manager import (
+                PassiveOrderManager,
+                PassiveOrderManagerProfile,
+                PassiveOrderDecisionInput,
+                PassiveOrderManagerDecisionType,
+                PassiveSkipReason,
+            )
+            maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
+            stored = self._maker_event_state.get(entry_id)
+            if isinstance(stored, tuple) and len(stored) == 2:
+                manager, stored_price = stored
+            else:
+                # Fresh state or legacy dict — create new manager
+                profile = PassiveOrderManagerProfile(
+                    max_consecutive_failures=strategy.passive_max_consecutive_failures,
+                    failure_cooldown_ms=strategy.passive_failure_cooldown_ms,
+                    reprice_threshold_bps=reprice_threshold_bps,
+                    cancel_replace_threshold_bps=cancel_replace_threshold_bps,
+                )
+                manager = PassiveOrderManager(profile)
+                stored_price = stored.get("maker_price", 0.0) if isinstance(stored, dict) else 0.0
+                if isinstance(stored, dict) and stored.get("consecutive_failures", 0) > 0:
+                    for _ in range(stored.get("consecutive_failures", 0)):
+                        manager.note_failure(stored.get("last_reprice_ms", now_ms))
+
+            # Check if venue supports amend
+            adapter = self._venue_adapters.get(maker_venue)
+            supports_amend = (
+                adapter is not None
+                and hasattr(adapter, 'amend_order')
+                and not getattr(adapter, '_amend_unsupported', False)
+            )
+
+            decision_input = PassiveOrderDecisionInput(
+                tick_size=0.1,  # V1: venue-specific tick size
+                target_price=mid,
+                current_price=stored_price if stored_price > 0 else None,
+                target_quantity=getattr(pending, 'long_quantity', 0) or 0,
+                supports_amend=supports_amend,
+            )
+            decision = manager.decide(decision_input, now_ms)
+
+            # First-seen: store initial price without reprice action
+            if decision.kind == PassiveOrderManagerDecisionType.PLACE:
+                self._maker_event_state[entry_id] = (manager, mid)
                 continue
 
-            # Consecutive failures check
-            failures = est.get("consecutive_failures", 0)
-            if failures >= strategy.passive_max_consecutive_failures:
+            if decision.kind == PassiveOrderManagerDecisionType.COOLDOWN:
+                continue
+            if decision.kind == PassiveOrderManagerDecisionType.HOLD:
+                if decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED:
+                    self.journal.append(
+                        "execution.passive_ops_rate_limited",
+                        {"entry_id": entry_id, "reason": "ops_budget_exceeded",
+                         "ts_ms": now_ms},
+                    )
                 continue
 
-            stored_price = est.get("maker_price", 0.0)
-            if stored_price <= 0:
-                self._maker_event_state[entry_id] = {
-                    "maker_price": mid,
-                    "last_reprice_ms": now_ms,
-                    "consecutive_failures": 0,
-                }
-                continue
-
-            price_move_bps = abs(mid - stored_price) / stored_price * 10000
-            if price_move_bps >= cancel_replace_threshold_bps:
-                action = "cancel_replace"
-            elif price_move_bps >= reprice_threshold_bps:
+            # Determine action from decision
+            if decision.kind == PassiveOrderManagerDecisionType.AMEND:
                 action = "reprice"
+            elif decision.kind == PassiveOrderManagerDecisionType.CANCEL_REPLACE:
+                action = "cancel_replace"
             else:
                 continue
 
@@ -1980,12 +2027,9 @@ class LiveRuntime:
                 result = await self._reprice_passive_maker_l2(
                     pending, mid, stored_price, action, now_ms, entry_id,
                 )
-                # Update runtime tracker
-                self._maker_event_state[entry_id] = {
-                    "maker_price": mid,
-                    "last_reprice_ms": now_ms,
-                    "consecutive_failures": 0,
-                }
+                # Update PassiveOrderManager runtime tracker
+                manager.note_success(now_ms)
+                self._maker_event_state[entry_id] = (manager, mid)
                 # Write back to authoritative PendingEntry state
                 pe = self.state.pending_entries.get(entry_id)
                 if pe is not None:
@@ -1994,11 +2038,8 @@ class LiveRuntime:
                         pe.maker_order_id = result.order_id
                 woke_positions += 1
             except Exception as e:
-                self._maker_event_state[entry_id] = {
-                    "maker_price": stored_price,
-                    "last_reprice_ms": now_ms,
-                    "consecutive_failures": failures + 1,
-                }
+                manager.note_failure(now_ms)
+                self._maker_event_state[entry_id] = (manager, stored_price)
                 self.journal.append(
                     "runtime.maker_event_reprice_error",
                     {"entry_id": entry_id, "action": action, "error": str(e)},

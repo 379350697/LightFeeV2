@@ -828,6 +828,22 @@ class HedgeDriveResult:
     new_price: float = 0.0
 
 
+def _adapter_supports_amend(adapter) -> bool:
+    """V1 passive_order_supports_amend (entry_sync.rs:1534).
+
+    Returns True if the adapter explicitly implements amend_order (the subclass
+    overrides VenueAdapter.amend_order rather than inheriting the default
+    NotImplementedError stub).
+    """
+    if adapter is None:
+        return False
+    # Check if amend_order is overridden in the adapter's class (not just inherited)
+    cls = type(adapter)
+    if 'amend_order' not in cls.__dict__:
+        return False
+    return True
+
+
 async def drive_pending_entry_hedge(
     entry_id: str,
     pending,
@@ -880,6 +896,16 @@ async def drive_pending_entry_hedge(
     post_only = True  # V1: passive maker orders are always post-only
 
     if action == "reprice" and maker_order_id:
+        # V1: passive_order_supports_amend check (entry_sync.rs:1534)
+        if not _adapter_supports_amend(adapter):
+            journal.append(
+                "entry.hedge_drive_amend_unsupported",
+                {"entry_id": entry_id, "venue": maker_venue.value,
+                 "action": "reprice", "reason": "amend_unsupported_by_venue"},
+            )
+            return HedgeDriveResult(action="reprice", outcome="rejected",
+                                   detail="amend not supported by venue, use cancel_replace instead")
+
         # Amend existing maker order price
         amend_req = OrderRequest(
             venue=maker_venue,

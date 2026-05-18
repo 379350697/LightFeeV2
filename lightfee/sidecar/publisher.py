@@ -14,7 +14,9 @@ def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
     """Write snapshot atomically: temp file, flush, replace."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mktemp(dir=str(target.parent), prefix=".snapshot-"))
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".snapshot-")
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         data = _snapshot_to_dict(snapshot)
         content = json.dumps(data, ensure_ascii=False, indent=2)

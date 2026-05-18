@@ -17,7 +17,9 @@ class SnapshotStore:
 
     def write(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = Path(tempfile.mktemp(dir=str(self.path.parent), prefix=".snapshot-"))
+        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=".snapshot-")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
         try:
             content = json.dumps(data, ensure_ascii=False, indent=2)
             with open(tmp_path, "w") as f:

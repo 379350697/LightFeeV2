@@ -290,7 +290,16 @@ class TestEntryLocalL2Session:
         session.refresh_state(now_ms=12000, stale_after_ms=5000)
         assert session.state == EntryLocalL2SessionState.ARMING
 
+    def test_refresh_state_faulted_when_any_leg_faulted(self):
+        """V1: ANY leg FAULTED → session FAULTED (entry_local_l2_sessions.rs:286-291)."""
+        session = EntryLocalL2Session(pair_id="p1")
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=10000)
+        session.ensure_leg("bybit", "BTCUSDT").mark_faulted(EntryLocalL2LegFault.STALE_BOOK)
+        session.refresh_state(now_ms=12000, stale_after_ms=5000)
+        assert session.state == EntryLocalL2SessionState.FAULTED
+
     def test_refresh_state_faulted_when_all_faulted(self):
+        """All legs faulted → session FAULTED (same V1 path)."""
         session = EntryLocalL2Session(pair_id="p1")
         session.ensure_leg("binance", "BTCUSDT").mark_faulted(EntryLocalL2LegFault.STALE_BOOK)
         session.ensure_leg("bybit", "BTCUSDT").mark_faulted(EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK)
@@ -388,8 +397,9 @@ class TestHoldWindow:
             primary_assigned_at_ms=10000, now_ms=11000, primary_min_hold_ms=0,
         )
 
-    def test_allows_when_assigned_none(self):
-        assert primary_hold_window_allows_replacement(
+    def test_blocks_when_never_assigned(self):
+        """V1: primary never assigned (0 sentinel) → no primary to replace."""
+        assert not primary_hold_window_allows_replacement(
             primary_assigned_at_ms=0, now_ms=11000, primary_min_hold_ms=90000,
         )
 

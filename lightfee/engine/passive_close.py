@@ -1346,6 +1346,24 @@ class PassiveCloseExecutor:
         position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
         position.current_net_quote += close.net_quote
 
+        # V1: detect residual from asymmetric fills (exit.rs:4903-4917)
+        from lightfee.engine.close_executor import split_close_fill_residual
+        now_ms = int(time.time() * 1000)
+        residual = split_close_fill_residual(
+            position, long_closed, short_closed, now_ms, now_ms + 30000,
+        )
+        if residual:
+            from lightfee.engine.close_executor import _residual_task_to_dict
+            state.pending_residual_repairs.append(_residual_task_to_dict(residual))
+            self._journal.append(
+                "exit.passive_close_residual_detected",
+                {
+                    "position_id": pending.position_id,
+                    "exposure_quantity": residual.exposure_quantity,
+                    "exposure_venue": residual.exposure_venue.value,
+                },
+            )
+
         # If fully closed, remove from open positions
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(pending.position_id, None)

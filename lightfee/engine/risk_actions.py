@@ -179,19 +179,38 @@ def evaluate_venue_health(
     supports_risk_health: bool = True,
     risk_snapshot: Optional[AccountRiskSnapshot] = None,
     recent_order_health_risk_score: float = 0.0,
+    supports_private_health: bool = False,
+    private_connection_healthy: Optional[bool] = None,
+    private_position_confirmed: bool = True,
 ) -> VenueHealthView:
     """V1 evaluate_venue_health (health.rs line 60): per-venue health.
 
     Applies:
-    1. Order health risk score thresholds (>= 0.75 ReduceOnly, >= 0.4 PauseEntry)
-    2. Unsupported/missing/stale snapshot policy via unsupported_risk_snapshot_behavior
-    3. Health ratio thresholds (death, delever, warning lines)
+    1. Private-stream health checks (V1 health.rs:75-91):
+       - Private WS unhealthy → FailClosed
+       - Private position unconfirmed → ReduceOnly
+    2. Order health risk score thresholds (>= 0.75 ReduceOnly, >= 0.4 PauseEntry)
+    3. Unsupported/missing/stale snapshot policy via unsupported_risk_snapshot_behavior
+    4. Health ratio thresholds (death, delever, warning lines)
     """
     view = VenueHealthView(
         venue=venue,
         action=VenueHealthAction.NORMAL,
         order_health_risk_score=recent_order_health_risk_score,
     )
+
+    # V1: Private-stream health — highest priority (health.rs:75-91)
+    if supports_private_health:
+        if private_connection_healthy is False:
+            view.action = VenueHealthAction.FAIL_CLOSED
+            view.degraded = True
+            view.reasons.append("private_stream_unhealthy")
+            return view
+
+        if private_connection_healthy is not None and not private_position_confirmed:
+            view.action = view.action.max(VenueHealthAction.REDUCE_ONLY)
+            view.degraded = True
+            view.reasons.append("private_position_unconfirmed")
 
     # Order health risk score
     if recent_order_health_risk_score >= 0.75:
@@ -449,6 +468,23 @@ def build_risk_execution_plan(
         if requested_quantity <= 0:
             return None
 
+        # V1: delever_sizing_plan.blocked_reason → escalate (risk.rs:1541-1555)
+        # When liquidity is insufficient for delever, escalate to protection/fail_closed
+        blocked_reason = _check_delever_liquidity_blocked(
+            position, requested_quantity, strategy,
+        )
+        if blocked_reason is not None:
+            if strategy.death_single_side_protection_enabled:
+                return RiskExecutionPlan(
+                    kind=RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION,
+                    reason=blocked_reason,
+                )
+            else:
+                return RiskExecutionPlan(
+                    kind=RiskExecutionPlanKind.FAIL_CLOSED,
+                    reason=blocked_reason,
+                )
+
         return RiskExecutionPlan(
             kind=RiskExecutionPlanKind.DELEVER,
             reason="risk_delever",
@@ -456,4 +492,24 @@ def build_risk_execution_plan(
             adjusted_quantity=requested_quantity,
         )
 
+    return None
+
+
+def _check_delever_liquidity_blocked(
+    position: OpenPosition, requested_quantity: float, strategy: StrategyConfig,
+) -> str | None:
+    """V1: check if delever is blocked by insufficient liquidity (risk.rs:1541-1555).
+
+    Returns a blocked reason string if liquidity is insufficient, or None if
+    the delever can proceed.
+    """
+    # If the position quantity is below any reasonable minimum, treat as blocked
+    if requested_quantity < 1e-9:
+        return "delever_blocked_zero_quantity"
+    # V1: check if we have a recent blocked_reason on the position
+    if position.blocked_reasons and any(
+        "liquidity" in r.lower() or "blocked" in r.lower()
+        for r in position.blocked_reasons
+    ):
+        return f"delever_blocked_liquidity:{position.blocked_reasons[0]}"
     return None

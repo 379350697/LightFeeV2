@@ -213,6 +213,48 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         settlement_half_closed_quantity=float(data.get("settlement_half_closed_quantity", 0)),
         settlement_half_closed_at_ms=int(data.get("settlement_half_closed_at_ms", 0)),
         exit_reason=data.get("exit_reason"),
+        # H-R5: 13 previously-missing fields
+        last_risk_action_at_ms=int(data.get("last_risk_action_at_ms", 0)),
+        risk_delever_step_count=int(data.get("risk_delever_step_count", 0)),
+        last_risk_reason=data.get("last_risk_reason"),
+        single_side_protection_triggered=bool(data.get("single_side_protection_triggered", False)),
+        funding_timestamp_ms=int(data.get("funding_timestamp_ms", 0)),
+        exit_after_first_stage=bool(data.get("exit_after_first_stage", False)),
+        opportunity_type=data.get("opportunity_type", "aligned"),
+        second_stage_enabled_at_entry=bool(data.get("second_stage_enabled_at_entry", False)),
+        second_funding_timestamp_ms=int(data.get("second_funding_timestamp_ms", 0)),
+        second_stage_funding_captured=bool(data.get("second_stage_funding_captured", False)),
+        second_stage_funding_quote=float(data.get("second_stage_funding_quote", 0)),
+        long_fill=_deserialize_order_fill(data.get("long_fill")),
+        short_fill=_deserialize_order_fill(data.get("short_fill")),
+    )
+
+
+def _deserialize_order_fill(data: dict[str, Any] | None) -> "OrderFill | None":
+    """Deserialize an OrderFill from dict."""
+    if data is None or not isinstance(data, dict):
+        return None
+    from lightfee.core.domain import OrderFill as OF, Side as OFSide, Venue as OFVenue
+    venue_str = data.get("venue", "binance")
+    side_str = data.get("side", "buy")
+    try:
+        venue = OFVenue.from_str(venue_str) if hasattr(OFVenue, 'from_str') else OFVenue.BINANCE
+    except (ValueError, AttributeError):
+        venue = OFVenue.BINANCE
+    try:
+        side = OFSide.from_str(side_str) if hasattr(OFSide, 'from_str') else OFSide.BUY
+    except (ValueError, AttributeError):
+        side = OFSide.BUY
+    return OF(
+        venue=venue,
+        symbol=str(data.get("symbol", "")),
+        side=side,
+        quantity=float(data.get("quantity", 0)),
+        price=float(data.get("price", 0)),
+        order_id=str(data.get("order_id", "")),
+        client_order_id=data.get("client_order_id"),
+        fee_quote=float(data.get("fee_quote", 0)) if data.get("fee_quote") is not None else None,
+        filled_at_ms=int(data.get("filled_at_ms", 0)),
     )
 
 
@@ -233,7 +275,7 @@ def _restore_close_leg_records(data: list[dict[str, Any]]) -> list[CloseLegRecor
 
 
 def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
-    """Serialize an OpenPosition for snapshot storage."""
+    """Serialize an OpenPosition for snapshot storage (all 53 fields)."""
     return {
         "position_id": pos.position_id,
         "symbol": pos.symbol,
@@ -275,6 +317,37 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "settlement_half_closed_quantity": pos.settlement_half_closed_quantity,
         "settlement_half_closed_at_ms": pos.settlement_half_closed_at_ms,
         "exit_reason": pos.exit_reason,
+        # H-R5: 13 previously-missing fields
+        "last_risk_action_at_ms": pos.last_risk_action_at_ms,
+        "risk_delever_step_count": pos.risk_delever_step_count,
+        "last_risk_reason": pos.last_risk_reason,
+        "single_side_protection_triggered": pos.single_side_protection_triggered,
+        "funding_timestamp_ms": pos.funding_timestamp_ms,
+        "exit_after_first_stage": pos.exit_after_first_stage,
+        "opportunity_type": pos.opportunity_type,
+        "second_stage_enabled_at_entry": pos.second_stage_enabled_at_entry,
+        "second_funding_timestamp_ms": pos.second_funding_timestamp_ms,
+        "second_stage_funding_captured": pos.second_stage_funding_captured,
+        "second_stage_funding_quote": pos.second_stage_funding_quote,
+        "long_fill": _serialize_order_fill(pos.long_fill) if pos.long_fill else None,
+        "short_fill": _serialize_order_fill(pos.short_fill) if pos.short_fill else None,
+    }
+
+
+def _serialize_order_fill(fill) -> dict[str, Any] | None:
+    """Serialize an OrderFill to a dict."""
+    if fill is None:
+        return None
+    return {
+        "venue": fill.venue.value if hasattr(fill.venue, 'value') else str(fill.venue),
+        "symbol": fill.symbol,
+        "side": fill.side.value if hasattr(fill.side, 'value') else str(fill.side),
+        "quantity": fill.quantity,
+        "price": fill.price,
+        "order_id": fill.order_id,
+        "client_order_id": fill.client_order_id,
+        "fee_quote": fill.fee_quote,
+        "filled_at_ms": fill.filled_at_ms,
     }
 
 
@@ -523,10 +596,13 @@ def _apply_journal_replay_to_state(
 ) -> None:
     """Replay journal records against an already-restored EngineState.
 
+    V1: replay_journal_records (journal.py:289-397).
     Processes events that happened AFTER the snapshot was written:
     - entry.opened / recovery.live_detected → add position
+    - entry.pending_registered / entry.hedge_submitted → recreate pending entry
     - exit.closed / recovery.flat → remove position
     - exit.partial_closed → reduce matched_quantity
+    - exit.pending_close_registered → recreate pending close
     - runtime.lifecycle_changed / risk_mode_changed → update modes
     """
     for record in records:
@@ -538,11 +614,42 @@ def _apply_journal_replay_to_state(
             if pid and pid not in state.open_positions:
                 state.open_positions[pid] = _deserialize_open_position(payload)
 
+        # V1: entry.pending_registered — recreate pending entry from journal
+        elif kind == "entry.pending_registered":
+            pid = payload.get("position_id", "")
+            if pid and pid not in state.pending_entries:
+                pe = _restore_pending_entry_from_journal(payload)
+                if pe is not None:
+                    state.pending_entries[pid] = pe
+
         elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
             pid = payload.get("position_id", "")
             if pid:
                 state.open_positions.pop(pid, None)
                 state.pending_closes.pop(pid, None)
+
+        # V1: exit.pending_close_registered — recreate pending close from journal
+        elif kind == "exit.pending_close_registered":
+            close_id = payload.get("close_id", "")
+            pid = payload.get("position_id", "")
+            if close_id and close_id not in state.pending_closes:
+                from lightfee.engine.state import PendingClose
+                state.pending_closes[close_id] = PendingClose(
+                    close_id=close_id,
+                    position_id=pid,
+                    reason=payload.get("reason", "recovery_replay"),
+                    created_at_ms=int(payload.get("created_at_ms", 0)),
+                    long_order_id=payload.get("long_order_id", ""),
+                    short_order_id=payload.get("short_order_id", ""),
+                    long_client_order_id=payload.get("long_client_order_id", ""),
+                    short_client_order_id=payload.get("short_client_order_id", ""),
+                    long_closed=float(payload.get("long_closed", 0)),
+                    short_closed=float(payload.get("short_closed", 0)),
+                    long_uncertain=bool(payload.get("long_uncertain", False)),
+                    short_uncertain=bool(payload.get("short_uncertain", True)),
+                    chunk_index=int(payload.get("chunk_index", 0)),
+                    total_chunks=int(payload.get("chunk_count", payload.get("total_chunks", 1))),
+                )
 
         elif kind == "exit.partial_closed":
             pid = payload.get("position_id", "")
@@ -570,6 +677,56 @@ def _apply_journal_replay_to_state(
                     state.risk_mode = GlobalRiskMode(str(to_val))
                 except ValueError:
                     pass
+
+
+def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
+    """V1: restore PendingEntry from journal replay payload."""
+    try:
+        from lightfee.engine.state import PendingEntry, HedgeInflight
+        maker_venue_str = payload.get("maker_venue", payload.get("long_venue", "binance"))
+        hedge_venue_str = payload.get("hedge_venue", payload.get("short_venue", "okx"))
+        try:
+            maker_venue = Venue.from_str(maker_venue_str) if hasattr(Venue, 'from_str') else Venue.BINANCE
+        except (ValueError, AttributeError):
+            maker_venue = Venue.BINANCE
+        try:
+            hedge_venue = Venue.from_str(hedge_venue_str) if hasattr(Venue, 'from_str') else Venue.OKX
+        except (ValueError, AttributeError):
+            hedge_venue = Venue.OKX
+
+        hedge_inflight = None
+        hi_data = payload.get("hedge_inflight")
+        if isinstance(hi_data, dict):
+            hedge_inflight = HedgeInflight(
+                client_order_id=hi_data.get("client_order_id", ""),
+                venue=hedge_venue,
+                side=Side.BUY if hi_data.get("side", "buy") == "buy" else Side.SELL,
+                quantity=float(hi_data.get("quantity", 0)),
+                attempt=int(hi_data.get("attempt", 0)),
+                submitted_at_ms=int(hi_data.get("submitted_at_ms", 0)),
+            )
+
+        return PendingEntry(
+            entry_id=payload.get("position_id", payload.get("entry_id", "")),
+            symbol=payload.get("symbol", ""),
+            maker_venue=maker_venue,
+            hedge_venue=hedge_venue,
+            long_venue=maker_venue if maker_venue_str != hedge_venue_str else Venue.BINANCE,
+            short_venue=hedge_venue,
+            long_quantity=float(payload.get("target_quantity", payload.get("long_quantity", 0))),
+            short_quantity=float(payload.get("target_quantity", payload.get("short_quantity", 0))),
+            maker_price=float(payload.get("maker_price", 0)),
+            maker_order_id=payload.get("maker_order_id", ""),
+            maker_client_order_id=payload.get("maker_client_order_id", ""),
+            hedge_order_id=payload.get("hedge_order_id", ""),
+            hedge_client_order_id=payload.get("hedge_client_order_id", ""),
+            hedge_inflight=hedge_inflight,
+            maker_leg_filled=float(payload.get("maker_leg_filled", 0)),
+            hedge_leg_filled=float(payload.get("hedge_leg_filled", 0)),
+            uncertain_outcome=bool(payload.get("uncertain_outcome", False)),
+        )
+    except Exception:
+        return None
 
 
 def recover_from_snapshot(
@@ -975,6 +1132,13 @@ def normalize_engine_state(state: EngineState) -> None:
     positions, migrates dust residuals, fixes timestamp defaults.
     Performs 12+ repair operations matching V1 semantics.
     """
+    # 0. V1 parity: migrate stale FAIL_CLOSED lifecycle → RISK_ONLY
+    #    V1 has no FAIL_CLOSED lifecycle variant; FailClosed = RISK_ONLY + FAIL_CLOSED risk
+    if state.lifecycle.value == "fail_closed":  # type: ignore[attr-defined]
+        from lightfee.risk.modes import EngineLifecycle
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+
     # 1. Timestamp repair: backfill zero funding_timestamp_ms
     for pos in state.open_positions.values():
         if pos.funding_timestamp_ms == 0:
@@ -1096,6 +1260,19 @@ def normalize_engine_state(state: EngineState) -> None:
             pc.reconcile_next_attempt_ms = pc.created_at_ms
     for cid in bad_close_ids:
         state.pending_closes.pop(cid, None)
+
+    # 11. Sort open positions by position_id (V1: deterministic ordering)
+    state.open_positions = dict(sorted(state.open_positions.items()))
+
+    # 12. Peak net quote repair: ensure peak >= current
+    for pos in state.open_positions.values():
+        if pos.peak_net_quote < pos.current_net_quote:
+            pos.peak_net_quote = pos.current_net_quote
+
+    # 13. Opportunity type default: ensure valid value
+    for pos in state.open_positions.values():
+        if not pos.opportunity_type:
+            pos.opportunity_type = "aligned"
 
 
 # ---------------------------------------------------------------------------

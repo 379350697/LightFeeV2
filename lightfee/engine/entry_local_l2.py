@@ -159,11 +159,8 @@ class EntryLocalL2Session:
         if self.both_legs_ready(now_ms, stale_after_ms):
             self.state = EntryLocalL2SessionState.READY
         elif any(leg.state == EntryLocalL2LegState.FAULTED for leg in self.legs.values()):
-            # All legs faulted → session fault; some legs arming/ready → stay arming
-            if all(leg.state == EntryLocalL2LegState.FAULTED for leg in self.legs.values()):
-                self.state = EntryLocalL2SessionState.FAULTED
-            else:
-                self.state = EntryLocalL2SessionState.ARMING
+            # V1: ANY leg faulted → session FAULTED (entry_local_l2_sessions.rs:286-291)
+            self.state = EntryLocalL2SessionState.FAULTED
         else:
             self.state = EntryLocalL2SessionState.ARMING
 
@@ -214,7 +211,7 @@ def _derive_arming_reason_from_book(book, status_value: str) -> SessionArmingRea
         return SessionArmingReason.SEQUENCE_GAP
 
     # Transport/connection faults → TransportFaultRecovery
-    if any(kw in fault for kw in ("transport", "connection", "disconnect", "stream", "timeout", "snapshot_bootstrap")):
+    if any(kw in fault for kw in ("transport", "connection", "disconnect", "stream", "timeout", "snapshot_bootstrap", "suspended", "runtime")):
         return SessionArmingReason.TRANSPORT_FAULT_RECOVERY
 
     # Crossed/locked book or other book structure faults → BookStatusTransition
@@ -306,7 +303,12 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = "book_timestamp_missing"
         return diag
 
-    if stale_after_ms > 0 and hasattr(book, "is_stale") and book.is_stale(stale_after_ms, now_ms):
+    # V1: staleness check — use age_ms if is_stale not available
+    is_stale_fn = getattr(book, "is_stale", None)
+    if stale_after_ms > 0 and (
+        (callable(is_stale_fn) and is_stale_fn(stale_after_ms, now_ms))
+        or (not callable(is_stale_fn) and age_ms > stale_after_ms)
+    ):
         detail = f"age_ms={age_ms} stale_after_ms={stale_after_ms}"
         leg.mark_faulted(
             EntryLocalL2LegFault.STALE_BOOK,
@@ -317,8 +319,16 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = detail
         return diag
 
-    if hasattr(book, "has_crossed_book") and book.has_crossed_book():
-        detail = f"best_bid={book.best_bid()} best_ask={book.best_ask()}"
+    # V1: crossed book detection — fall back to bid/ask comparison
+    has_crossed_fn = getattr(book, "has_crossed_book", None)
+    is_crossed = has_crossed_fn() if callable(has_crossed_fn) else False
+    if not is_crossed:
+        # Fallback: check bid/ask directly
+        bid = getattr(book, "best_bid", lambda: 0.0)()
+        ask = getattr(book, "best_ask", lambda: float("inf"))()
+        is_crossed = bid > ask > 0
+    if is_crossed:
+        detail = f"best_bid={getattr(book, 'best_bid', lambda: 0.0)()} best_ask={getattr(book, 'best_ask', lambda: 0.0)()}"
         leg.mark_faulted(
             EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK,
             detail,
@@ -332,8 +342,10 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         # HOT book — readiness determined by bid/ask and timestamp (already
         # checked above).  V1 parity: a healthy HOT book must clear any prior
         # fault; fault_reason is only meaningful for non-HOT statuses.
-        bid = book.best_bid() if hasattr(book, "best_bid") else 1.0
-        ask = book.best_ask() if hasattr(book, "best_ask") else 1.0
+        bid_fn = getattr(book, "best_bid", None)
+        ask_fn = getattr(book, "best_ask", None)
+        bid = bid_fn() if callable(bid_fn) else 1.0
+        ask = ask_fn() if callable(ask_fn) else 1.0
         if bid <= 0 or ask <= 0:
             side = "bid" if bid <= 0 else "ask"
             leg.mark_faulted(
@@ -457,10 +469,15 @@ def select_tracked_opportunities(
 def primary_hold_window_allows_replacement(
     primary_assigned_at_ms: int, now_ms: int, primary_min_hold_ms: int
 ) -> bool:
+    """V1 primary_hold_window_allows_replacement (entry_local_l2.rs:93-97).
+
+    When primary_assigned_at_ms is 0 (never assigned), the primary doesn't
+    exist to be replaced — prevent promotion.
+    """
     if primary_min_hold_ms <= 0:
         return True
     if primary_assigned_at_ms <= 0:
-        return True
+        return False  # V1: never assigned → no primary to replace
     return (now_ms - primary_assigned_at_ms) >= primary_min_hold_ms
 
 
@@ -471,7 +488,17 @@ def shadow_promotion_is_eligible(
     now_ms: int,
     primary_min_hold_ms: int,
     shadow_promotion_score_delta_bps: float,
+    primary_executing: bool = False,
+    shadow_ready: bool = True,
 ) -> bool:
+    """V1 shadow_promotion_is_eligible (entry_local_l2.rs:99-115).
+
+    Rejects promotion when:
+    - primary is currently executing (would lose local-L2 tracking)
+    - shadow is not ready (book not yet hot)
+    """
+    if primary_executing or not shadow_ready:
+        return False
     score_delta = shadow.ranking_edge_bps - primary.ranking_edge_bps
     return (
         score_delta >= shadow_promotion_score_delta_bps
