@@ -819,6 +819,53 @@ def _parse_generic_position(
     )
 
 
+def _venue_position_rows(raw: Any, venue: Venue) -> list[dict[str, Any]]:
+    if venue in (Venue.BINANCE, Venue.ASTER, Venue.GATE):
+        rows = raw if isinstance(raw, list) else raw.get("data", []) if isinstance(raw, dict) else []
+    elif venue == Venue.BYBIT:
+        rows = ((raw.get("result") or {}).get("list") or []) if isinstance(raw, dict) else []
+    elif venue == Venue.BITGET:
+        data = raw.get("data", []) if isinstance(raw, dict) else []
+        rows = data if isinstance(data, list) else data.get("list", []) if isinstance(data, dict) else []
+    elif venue == Venue.OKX:
+        data = raw.get("data", []) if isinstance(raw, dict) else []
+        rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    elif venue == Venue.HYPERLIQUID:
+        rows = raw.get("assetPositions", []) if isinstance(raw, dict) else []
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _position_row_symbol(row: dict[str, Any], venue: Venue) -> str:
+    if venue == Venue.OKX:
+        return str(row.get("instId", ""))
+    if venue == Venue.GATE:
+        return str(row.get("contract", ""))
+    if venue == Venue.HYPERLIQUID:
+        pos_data = row.get("position", {}) if isinstance(row, dict) else {}
+        return str(pos_data.get("coin", ""))
+    return str(row.get("symbol", ""))
+
+
+def _canonical_position_symbol(spec: VenueSpec, venue_symbol: str) -> str:
+    if spec.symbol_from_venue is not None:
+        return spec.symbol_from_venue(venue_symbol)
+    return venue_symbol
+
+
+def _position_row_parse_payload(row: dict[str, Any], venue: Venue) -> Any:
+    if venue == Venue.BYBIT:
+        return {"retCode": 0, "result": {"list": [row]}}
+    if venue == Venue.BITGET:
+        return {"code": "00000", "data": [row]}
+    if venue == Venue.OKX:
+        return {"data": [row]}
+    if venue == Venue.HYPERLIQUID:
+        return {"assetPositions": [row]}
+    return [row]
+
+
 def _normalize_symbol(sym: str) -> str:
     """Normalize a symbol string for comparison."""
     return str(sym or "").strip().upper()
@@ -1847,6 +1894,38 @@ class VenueTransport(MarketDataClient):
     # Position fetch
     # ------------------------------------------------------------------
 
+    async def fetch_all_positions(self) -> list[PositionSnapshot]:
+        spec = self._spec
+        now_ms = int(time.time() * 1000)
+
+        if self.mode == "paper":
+            return []
+
+        try:
+            if spec.venue_id == Venue.HYPERLIQUID:
+                body = {
+                    "type": "clearinghouseState",
+                    "user": self._credential.account_address if self._credential else "",
+                }
+                raw = await self._request("POST", spec.position_path, body=body, private=True)
+            else:
+                params: dict[str, Any] = {}
+                if spec.venue_id == Venue.BYBIT:
+                    params["category"] = "linear"
+                    params["settleCoin"] = "USDT"
+                elif spec.venue_id == Venue.BITGET:
+                    params["productType"] = "USDT-FUTURES"
+                    params["marginCoin"] = "USDT"
+                raw = await self._request("GET", spec.position_path, params=params, private=True)
+            return self._parse_all_positions(raw, now_ms)
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"position fetch all failed: {e}",
+            )
+
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         spec = self._spec
         venue_sym = self._venue_symbol(symbol)
@@ -1886,6 +1965,22 @@ class VenueTransport(MarketDataClient):
                 TransportErrorCategory.TRANSPORT_FAILURE,
                 f"position fetch failed: {e}",
             )
+
+    def _parse_all_positions(self, raw: Any, now_ms: int) -> list[PositionSnapshot]:
+        spec = self._spec
+        positions: list[PositionSnapshot] = []
+        for row in _venue_position_rows(raw, spec.venue_id):
+            venue_symbol = _position_row_symbol(row, spec.venue_id)
+            if not venue_symbol:
+                continue
+            payload = _position_row_parse_payload(row, spec.venue_id)
+            pos = self._parse_position(payload, venue_symbol, now_ms)
+            if abs(pos.quantity) <= 1e-9:
+                continue
+            positions.append(
+                replace(pos, symbol=_canonical_position_symbol(spec, venue_symbol))
+            )
+        return positions
 
     def _parse_position(
         self, raw: dict[str, Any], symbol: str, now_ms: int

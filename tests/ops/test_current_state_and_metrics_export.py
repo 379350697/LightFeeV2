@@ -121,6 +121,27 @@ class TestCurrentStateExportV1Semantics:
         finally:
             os.unlink(path)
 
+    def test_export_includes_recovery_blocked_reason_when_present(self):
+        """Current-state must expose active recovery blocks for ops health."""
+        state = EngineState(
+            lifecycle=EngineLifecycle.RISK_ONLY,
+            risk_mode=GlobalRiskMode.FAIL_CLOSED,
+        )
+        state.recovery_blocked_reason = "unpaired_live_positions_detected"
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            _export_current_state_snapshot(state, path)
+            with open(path) as f:
+                data = json.load(f)
+
+            assert data["recovery_blocked_reason"] == "unpaired_live_positions_detected"
+
+        finally:
+            os.unlink(path)
+
     def test_export_includes_open_position_details(self):
         """V1: each open position exports position_id, symbol, long_venue, short_venue, quantity."""
         from lightfee.core.domain import Venue

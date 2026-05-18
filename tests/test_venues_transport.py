@@ -2362,6 +2362,147 @@ class TestBybitPositionListShape:
         assert pos.quantity == 0.0
 
 
+class TestFetchAllPositions:
+    """V1-style private recovery should be able to scan all venue positions."""
+
+    @pytest.mark.asyncio
+    async def test_binance_fetch_all_positions_parses_multiple_nonzero_symbols(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/fapi/v2/positionRisk"
+            assert "symbol" not in dict(request.url.params)
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionSide": "LONG",
+                        "positionAmt": "0.02",
+                        "entryPrice": "65000.0",
+                    },
+                    {
+                        "symbol": "ETHUSDT",
+                        "positionSide": "SHORT",
+                        "positionAmt": "0.5",
+                        "entryPrice": "3100.0",
+                    },
+                    {
+                        "symbol": "XRPUSDT",
+                        "positionSide": "BOTH",
+                        "positionAmt": "0",
+                        "entryPrice": "0",
+                    },
+                ],
+            )
+
+        transport = _make_live_transport(Venue.BINANCE, handler)
+
+        positions = await transport.fetch_all_positions()
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 0.02),
+            ("ETHUSDT", Side.SELL, 0.5),
+        ]
+
+    def test_parse_all_positions_okx_canonicalizes_symbols(self):
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        raw = {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "2",
+                    "avgPx": "65000.0",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "1.5",
+                    "avgPx": "3100.0",
+                },
+                {
+                    "instId": "XRP-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "0",
+                    "avgPx": "0",
+                },
+            ],
+        }
+
+        positions = transport._parse_all_positions(raw, now_ms=1000)
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 2.0),
+            ("ETHUSDT", Side.SELL, 1.5),
+        ]
+
+    def test_parse_all_positions_bybit_result_list(self):
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        raw = {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {"symbol": "BTCUSDT", "side": "Buy", "size": "0.02", "avgPrice": "65000"},
+                    {"symbol": "ETHUSDT", "side": "Sell", "size": "0.5", "avgPrice": "3100"},
+                ]
+            },
+        }
+
+        positions = transport._parse_all_positions(raw, now_ms=1000)
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 0.02),
+            ("ETHUSDT", Side.SELL, 0.5),
+        ]
+
+    def test_parse_all_positions_bitget_data_list(self):
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000",
+            "data": [
+                {"symbol": "BTCUSDT", "holdSide": "long", "total": "0.02", "openPriceAvg": "65000"},
+                {"symbol": "ETHUSDT", "holdSide": "short", "total": "0.5", "openPriceAvg": "3100"},
+            ],
+        }
+
+        positions = transport._parse_all_positions(raw, now_ms=1000)
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 0.02),
+            ("ETHUSDT", Side.SELL, 0.5),
+        ]
+
+    def test_parse_all_positions_gate_contract_list(self):
+        transport = VenueTransport(spec=gate_spec(), mode="paper")
+        raw = [
+            {"contract": "BTC_USDT", "size": "2", "entry_price": "65000"},
+            {"contract": "ETH_USDT", "size": "-3", "entry_price": "3100"},
+        ]
+
+        positions = transport._parse_all_positions(raw, now_ms=1000)
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 2.0),
+            ("ETHUSDT", Side.SELL, 3.0),
+        ]
+
+    def test_parse_all_positions_hyperliquid_asset_positions(self):
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="paper")
+        raw = {
+            "assetPositions": [
+                {"position": {"coin": "BTC", "szi": "0.02", "entryPx": "65000"}},
+                {"position": {"coin": "ETH", "szi": "-0.5", "entryPx": "3100"}},
+            ]
+        }
+
+        positions = transport._parse_all_positions(raw, now_ms=1000)
+
+        assert [(p.symbol, p.side, p.quantity) for p in positions] == [
+            ("BTCUSDT", Side.BUY, 0.02),
+            ("ETHUSDT", Side.SELL, 0.5),
+        ]
+
+
 class TestVenueSuccessGuards:
     """Task 2 Step 2: venue success guard functions."""
 
@@ -3249,6 +3390,97 @@ class TestBitgetAdapterHttpRedLight:
         assert result.fee_quote is not None and result.fee_quote == pytest.approx(0.1), (
             f"RED-LIGHT: fee should be 0.1 (sum of feeDetail fees), got {result.fee_quote}"
         )
+
+    @pytest.mark.anyio
+    async def test_bitget_uta_fetch_position_uses_official_category_param(self):
+        from lightfee.venues.bitget import BitgetAccountProfile, BitgetAdapter
+        from lightfee.venues.transport import LiveCredential
+
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            if "/api/v3/position/current-position" in str(request.url):
+                params = dict(request.url.params)
+                seen_params.append(params)
+                return httpx.Response(200, json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "holdSide": "long",
+                            "total": "0.5",
+                            "openPriceAvg": "51000",
+                        },
+                    ],
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        try:
+            result = await adapter.fetch_position("BTCUSDT")
+        finally:
+            await adapter._transport.close()
+
+        assert result.quantity == pytest.approx(0.5)
+        assert seen_params
+        assert seen_params[0]["category"] == "USDT-FUTURES"
+        assert seen_params[0]["symbol"] == "BTCUSDT"
+        assert "productType" not in seen_params[0]
+
+    @pytest.mark.anyio
+    async def test_bitget_uta_fetch_all_positions_uses_official_category_param(self):
+        from lightfee.venues.bitget import BitgetAccountProfile, BitgetAdapter
+        from lightfee.venues.transport import LiveCredential
+
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            if "/api/v3/position/current-position" in str(request.url):
+                params = dict(request.url.params)
+                seen_params.append(params)
+                return httpx.Response(200, json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "holdSide": "short",
+                            "total": "0.25",
+                            "openPriceAvg": "52000",
+                        },
+                    ],
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.UTA
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        try:
+            result = await adapter.fetch_all_positions()
+        finally:
+            await adapter._transport.close()
+
+        assert len(result) == 1
+        assert result[0].quantity == pytest.approx(0.25)
+        assert result[0].side == Side.SELL
+        assert seen_params
+        assert seen_params[0]["category"] == "USDT-FUTURES"
+        assert "productType" not in seen_params[0]
 
     @pytest.mark.anyio
     async def test_redlight_bitget_nonzero_code_raises(self):

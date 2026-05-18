@@ -245,7 +245,7 @@ class BitgetAdapter(VenueAdapter):
         else:
             params = {
                 "symbol": venue_sym,
-                "productType": "USDT-FUTURES",
+                "category": "USDT-FUTURES",
             }
             raw = await self._transport._request(
                 "GET", "/api/v3/position/current-position", params=params, private=True
@@ -253,6 +253,29 @@ class BitgetAdapter(VenueAdapter):
 
         now_ms = int(__import__("time").time() * 1000)
         return self._transport._parse_position(raw, venue_sym, now_ms)
+
+    async def fetch_all_positions(self) -> list[PositionSnapshot]:
+        if self._mode != "live":
+            return await self._transport.fetch_all_positions()
+
+        profile = await self.detect_profile()
+        if profile == BitgetAccountProfile.CLASSIC:
+            raw = await self._transport._request(
+                "GET",
+                "/api/v2/mix/position/all-position",
+                params={"productType": "USDT-FUTURES", "marginCoin": "USDT"},
+                private=True,
+            )
+        else:
+            raw = await self._transport._request(
+                "GET",
+                "/api/v3/position/current-position",
+                params={"category": "USDT-FUTURES"},
+                private=True,
+            )
+
+        now_ms = int(__import__("time").time() * 1000)
+        return self._transport._parse_all_positions(raw, now_ms)
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._mode != "live":

@@ -8,7 +8,7 @@ from typing import Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
@@ -38,7 +38,7 @@ from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
 )
-from lightfee.engine.state import EngineState, HedgeInflight
+from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -116,6 +116,8 @@ class LiveRuntime:
         self._last_no_entry_diag_fingerprint: str = ""
         self._last_no_entry_diag_ts_ms: int = 0
         self._last_no_entry_diagnostics: dict | None = None
+        self._last_private_position_probe_ms: int = 0
+        self._last_position_drift_check_ms: int = 0
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
@@ -228,7 +230,7 @@ class LiveRuntime:
         self._emit_startup_order_path_preflight()
 
         # Phase 2 – Resolve runtime symbols (daily-universe integration point)
-        await prepare_runtime_symbols(self.config)
+        symbol_info = await prepare_runtime_symbols(self.config)
 
         # Phase 3 – Recover or start fresh
         self.state = recover_from_snapshot(self.snapshot_store, self.journal)
@@ -238,11 +240,19 @@ class LiveRuntime:
 
         # Build recovery dedup index from recovered pending state
         self._recovery_dedup_index = build_recovery_dedup_index(self.state)
+        await self._recover_startup_live_positions(
+            self._startup_position_probe_symbols(symbol_info),
+            wall_clock_now_ms(),
+        )
 
         # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
 
-        recovery_class = classify_startup_recovery_state(self.state)
+        recovery_class = (
+            "blocked"
+            if self.state.recovery_blocked_reason
+            else classify_startup_recovery_state(self.state)
+        )
 
         if recovery_class == "clean":
             set_lifecycle(self.state, EngineLifecycle.RUNNING)
@@ -345,6 +355,578 @@ class LiveRuntime:
             },
             flush=True,
         )
+
+    def _startup_position_probe_symbols(self, symbol_info: object) -> list[str]:
+        """Symbols to probe for live startup position recovery."""
+        symbols: list[str] = []
+        if isinstance(symbol_info, dict):
+            raw = symbol_info.get("resolved_symbols") or []
+            symbols.extend(str(s) for s in raw if str(s))
+        symbols.extend(str(s) for s in getattr(self.config, "symbols", []) if str(s))
+
+        for pos in self.state.open_positions.values():
+            if pos.symbol:
+                symbols.append(pos.symbol)
+        for pending in self.state.pending_entries.values():
+            if pending.symbol:
+                symbols.append(pending.symbol)
+
+        seen: set[str] = set()
+        result: list[str] = []
+        for symbol in symbols:
+            if symbol not in seen:
+                seen.add(symbol)
+                result.append(symbol)
+        return result
+
+    async def _recover_startup_live_positions(
+        self,
+        symbols: list[str],
+        now_ms: int,
+        *,
+        source: str = "startup_live_position_probe",
+    ) -> None:
+        """Detect balanced exchange positions that local snapshot/journal missed."""
+        if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
+            return
+        if not symbols or not self._venue_adapters:
+            return
+        if (
+            self.state.open_positions
+            or self.state.pending_entries
+            or self.state.pending_closes
+            or self.state.pending_passive_closes
+        ):
+            return
+
+        snapshots = await self._fetch_startup_live_position_snapshots(symbols)
+        if not snapshots:
+            return
+
+        created, recovered_indices = self._hydrate_balanced_startup_live_positions(
+            snapshots, now_ms, source=source
+        )
+        mismatches = [
+            item for idx, item in enumerate(snapshots)
+            if idx not in recovered_indices
+        ]
+        if mismatches:
+            flattened = await self._flatten_startup_live_position_mismatches(
+                mismatches, now_ms, source=source
+            )
+            if not flattened:
+                self._block_unpaired_startup_live_positions(
+                    mismatches,
+                    now_ms,
+                    source=source,
+                    recovered_open_positions=created,
+                    reason="live_position_mismatch_flatten_failed",
+                )
+                return
+        if created or mismatches:
+            self.journal.append(
+                "recovery.live_position_probe_complete",
+                {
+                    "detected_positions": len(snapshots),
+                    "recovered_open_positions": created,
+                    "mismatch_positions": len(mismatches),
+                    "ts_ms": now_ms,
+                },
+            )
+
+    def _block_unpaired_startup_live_positions(
+        self,
+        snapshots: list[tuple[str, PositionSnapshot]],
+        now_ms: int,
+        *,
+        source: str,
+        recovered_open_positions: int,
+        reason: str = "unpaired_live_positions_detected",
+    ) -> None:
+        enter_fail_closed(self.state)
+        self.state.recovery_blocked_reason = reason
+        self.state.recovery_blocked_at_ms = now_ms
+        self.state.last_error = "live exchange position mismatch cleanup failed"
+        self.journal.append(
+            "recovery.blocked",
+            {
+                "reason": self.state.recovery_blocked_reason,
+                "source": source,
+                "detected_positions": len(snapshots),
+                "recovered_open_positions": recovered_open_positions,
+                "positions": [
+                    {
+                        "requested_symbol": requested_symbol,
+                        "venue": pos.venue.value,
+                        "symbol": pos.symbol,
+                        "side": pos.side.value,
+                        "quantity": pos.quantity,
+                        "entry_price": pos.entry_price,
+                    }
+                    for requested_symbol, pos in snapshots
+                ],
+                "ts_ms": now_ms,
+            },
+        )
+
+    async def _flatten_startup_live_position_mismatches(
+        self,
+        snapshots: list[tuple[str, PositionSnapshot]],
+        now_ms: int,
+        *,
+        source: str,
+    ) -> bool:
+        flattened: list[dict[str, object]] = []
+        failed: list[dict[str, object]] = []
+        for requested_symbol, pos in snapshots:
+            if abs(pos.quantity) <= 1e-9:
+                continue
+            ok = await self._cleanup_failed_leg_exposure(
+                pos.venue,
+                requested_symbol,
+                f"live-recovery:{source}:{requested_symbol}:{pos.venue.value}",
+                "live_recovery_mismatch",
+            )
+            payload = {
+                "requested_symbol": requested_symbol,
+                "venue": pos.venue.value,
+                "symbol": pos.symbol,
+                "side": pos.side.value,
+                "quantity": pos.quantity,
+                "entry_price": pos.entry_price,
+            }
+            if ok is True:
+                flattened.append(payload)
+            else:
+                payload["cleanup_result"] = ok
+                failed.append(payload)
+
+        if failed:
+            self.journal.append(
+                "recovery.live_mismatch_flatten_failed",
+                {
+                    "source": source,
+                    "flattened_positions": flattened,
+                    "failed_positions": failed,
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
+        self.journal.append(
+            "recovery.live_mismatch_flattened",
+            {
+                "source": source,
+                "positions": flattened,
+                "ts_ms": now_ms,
+            },
+        )
+        return True
+
+    async def _maybe_recover_clean_live_positions(self, now_ms: int) -> None:
+        """Probe private positions when the runtime would otherwise look clean."""
+        if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
+            return
+        if (
+            self.state.open_positions
+            or self.state.pending_entries
+            or self.state.pending_closes
+        ):
+            return
+
+        interval_ms = max(self.config.runtime.private_position_max_age_ms, 1)
+        if (
+            self._last_private_position_probe_ms > 0
+            and now_ms < self._last_private_position_probe_ms + interval_ms
+        ):
+            return
+
+        self._last_private_position_probe_ms = now_ms
+        await self._recover_startup_live_positions(
+            self._startup_position_probe_symbols({}),
+            now_ms,
+            source="runtime_live_position_probe",
+        )
+
+    async def _fetch_startup_live_position_snapshots(
+        self, symbols: list[str]
+    ) -> list[tuple[str, PositionSnapshot]]:
+        timeout_s = max(self.config.runtime.live_recovery_rest_probe_timeout_ms, 1) / 1000.0
+        semaphore = asyncio.Semaphore(8)
+        probe_symbols = {str(symbol) for symbol in symbols}
+
+        def is_active_probe_position(pos: PositionSnapshot) -> bool:
+            return (
+                abs(getattr(pos, "quantity", 0.0)) > 1e-9
+                and str(getattr(pos, "symbol", "")) in probe_symbols
+            )
+
+        async def fetch_all_for_venue(venue: Venue, adapter: VenueAdapter):
+            async with semaphore:
+                try:
+                    positions = await asyncio.wait_for(
+                        adapter.fetch_all_positions(),
+                        timeout=timeout_s,
+                    )
+                except Exception as e:
+                    self.journal.append(
+                        "recovery.live_position_bulk_probe_error",
+                        {
+                            "venue": venue.value,
+                            "error": str(e),
+                        },
+                    )
+                    return (venue, None)
+                if positions is None:
+                    return (venue, None)
+                return (
+                    venue,
+                    [
+                        (pos.symbol, pos)
+                        for pos in positions
+                        if is_active_probe_position(pos)
+                    ],
+                )
+
+        async def fetch_one(venue: Venue, adapter: VenueAdapter, symbol: str):
+            async with semaphore:
+                try:
+                    pos = await asyncio.wait_for(
+                        adapter.fetch_position(symbol),
+                        timeout=timeout_s,
+                    )
+                    return (symbol, pos)
+                except Exception as e:
+                    self.journal.append(
+                        "recovery.live_position_probe_error",
+                        {
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "error": str(e),
+                        },
+                    )
+                    return None
+
+        bulk_results = await asyncio.gather(
+            *[
+                fetch_all_for_venue(venue, adapter)
+                for venue, adapter in self._venue_adapters.items()
+            ]
+        )
+        snapshots: list[tuple[str, PositionSnapshot]] = []
+        fallback_venues: set[Venue] = set()
+        for venue, positions in bulk_results:
+            if positions is None:
+                fallback_venues.add(venue)
+            else:
+                snapshots.extend(positions)
+
+        tasks = [
+            fetch_one(venue, adapter, symbol)
+            for symbol in symbols
+            for venue, adapter in self._venue_adapters.items()
+            if venue in fallback_venues
+        ]
+        results = await asyncio.gather(*tasks) if tasks else []
+        snapshots.extend(
+            item for item in results
+            if item is not None and abs(getattr(item[1], "quantity", 0.0)) > 1e-9
+        )
+        return snapshots
+
+    def _hydrate_balanced_startup_live_positions(
+        self,
+        snapshots: list[tuple[str, PositionSnapshot]],
+        now_ms: int,
+        *,
+        source: str,
+    ) -> tuple[int, set[int]]:
+        by_symbol: dict[str, list[tuple[int, PositionSnapshot]]] = {}
+        for idx, (requested_symbol, pos) in enumerate(snapshots):
+            by_symbol.setdefault(requested_symbol, []).append((idx, pos))
+
+        created = 0
+        recovered_indices: set[int] = set()
+        for symbol, indexed_positions in by_symbol.items():
+            active = [
+                (idx, p) for idx, p in indexed_positions
+                if abs(p.quantity) > 1e-9
+            ]
+            if len(active) != 2:
+                continue
+
+            (idx_a, pos_a), (idx_b, pos_b) = active
+            if pos_a.venue == pos_b.venue or pos_a.side == pos_b.side:
+                continue
+            if abs(abs(pos_a.quantity) - abs(pos_b.quantity)) > 1e-9:
+                continue
+
+            if pos_a.side == Side.BUY:
+                long_idx, long_pos = idx_a, pos_a
+                short_idx, short_pos = idx_b, pos_b
+            else:
+                long_idx, long_pos = idx_b, pos_b
+                short_idx, short_pos = idx_a, pos_a
+
+            if self._has_open_position_pair(symbol, long_pos.venue, short_pos.venue):
+                recovered_indices.update({long_idx, short_idx})
+                continue
+
+            position_id = (
+                f"live-recovered:{symbol}:"
+                f"{long_pos.venue.value}->{short_pos.venue.value}"
+            )
+            matched_quantity = abs(long_pos.quantity)
+            position = OpenPosition(
+                position_id=position_id,
+                symbol=symbol,
+                long_venue=long_pos.venue,
+                short_venue=short_pos.venue,
+                long_quantity=abs(long_pos.quantity),
+                short_quantity=abs(short_pos.quantity),
+                long_entry_price=long_pos.entry_price,
+                short_entry_price=short_pos.entry_price,
+                opened_at_ms=now_ms,
+                matched_quantity=matched_quantity,
+                opportunity_hint_source=source,
+            )
+            self.state.open_positions[position_id] = position
+            recovered_indices.update({long_idx, short_idx})
+            self.journal.append(
+                "recovery.live_detected",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "quantity": position.matched_quantity,
+                    "long_quantity": position.long_quantity,
+                    "short_quantity": position.short_quantity,
+                    "long_entry_price": position.long_entry_price,
+                    "short_entry_price": position.short_entry_price,
+                    "opened_at_ms": position.opened_at_ms,
+                    "matched_quantity": position.matched_quantity,
+                    "opportunity_hint_source": position.opportunity_hint_source,
+                    "source": source,
+                    "ts_ms": now_ms,
+                },
+            )
+            created += 1
+
+        return created, recovered_indices
+
+    def _has_open_position_pair(
+        self, symbol: str, long_venue: Venue, short_venue: Venue
+    ) -> bool:
+        return any(
+            pos.symbol == symbol
+            and pos.long_venue == long_venue
+            and pos.short_venue == short_venue
+            for pos in self.state.open_positions.values()
+        )
+
+    async def _maybe_check_active_position_drift(self, now_ms: int) -> None:
+        if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
+            return
+        if not self.state.open_positions:
+            return
+
+        interval_ms = max(self.config.runtime.private_position_max_age_ms, 1)
+        if (
+            self._last_position_drift_check_ms > 0
+            and now_ms < self._last_position_drift_check_ms + interval_ms
+        ):
+            return
+        self._last_position_drift_check_ms = now_ms
+
+        for position in list(self.state.open_positions.values()):
+            if position.position_id in self.state.pending_passive_closes:
+                continue
+            if any(
+                pending.position_id == position.position_id
+                for pending in self.state.pending_closes.values()
+            ):
+                continue
+
+            long_adapter = self.get_venue_adapter(position.long_venue)
+            short_adapter = self.get_venue_adapter(position.short_venue)
+            if long_adapter is None or short_adapter is None:
+                continue
+
+            try:
+                long_pos = await long_adapter.fetch_position(position.symbol)
+                short_pos = await short_adapter.fetch_position(position.symbol)
+            except Exception as e:
+                self.journal.append(
+                    "runtime.position_drift_probe_error",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "error": str(e),
+                    },
+                )
+                continue
+
+            expected_long = abs(position.long_quantity or position.matched_quantity)
+            expected_short = abs(position.short_quantity or position.matched_quantity)
+            long_valid_qty = (
+                abs(long_pos.quantity)
+                if long_pos.side == Side.BUY and abs(long_pos.quantity) > 1e-9
+                else 0.0
+            )
+            short_valid_qty = (
+                abs(short_pos.quantity)
+                if short_pos.side == Side.SELL and abs(short_pos.quantity) > 1e-9
+                else 0.0
+            )
+
+            if (
+                abs(long_valid_qty - expected_long) <= 1e-9
+                and abs(short_valid_qty - expected_short) <= 1e-9
+            ):
+                continue
+
+            balanced_quantity = min(long_valid_qty, short_valid_qty)
+            self.journal.append(
+                "runtime.position_drift_detected",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "expected_long_quantity": expected_long,
+                    "expected_short_quantity": expected_short,
+                    "actual_long_side": long_pos.side.value,
+                    "actual_long_quantity": long_pos.quantity,
+                    "actual_short_side": short_pos.side.value,
+                    "actual_short_quantity": short_pos.quantity,
+                    "balanced_quantity": balanced_quantity,
+                    "ts_ms": now_ms,
+                },
+            )
+
+            long_excess = (
+                abs(long_pos.quantity) - balanced_quantity
+                if abs(long_pos.quantity) > 1e-9
+                else 0.0
+            )
+            short_excess = (
+                abs(short_pos.quantity) - balanced_quantity
+                if abs(short_pos.quantity) > 1e-9
+                else 0.0
+            )
+            long_ok = True
+            short_ok = True
+            if long_excess > 1e-9:
+                long_ok = await self._flatten_live_position_leg_quantity(
+                    position.long_venue,
+                    position.symbol,
+                    long_pos,
+                    long_excess,
+                    position.position_id,
+                    "runtime_drift_flatten_long",
+                )
+            if short_excess > 1e-9:
+                short_ok = await self._flatten_live_position_leg_quantity(
+                    position.short_venue,
+                    position.symbol,
+                    short_pos,
+                    short_excess,
+                    position.position_id,
+                    "runtime_drift_flatten_short",
+                )
+
+            if long_ok is not True or short_ok is not True:
+                enter_fail_closed(self.state)
+                self.state.recovery_blocked_reason = "position_drift_correction_failed"
+                self.state.recovery_blocked_at_ms = now_ms
+                self.state.last_error = "position drift correction failed"
+                self.journal.append(
+                    "runtime.position_drift_correction_failed",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "long_flatten_result": long_ok,
+                        "short_flatten_result": short_ok,
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+
+            if balanced_quantity <= 1e-9:
+                self.state.open_positions.pop(position.position_id, None)
+                self.journal.append(
+                    "recovery.flat",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "source": "runtime_position_drift",
+                        "ts_ms": now_ms,
+                    },
+                )
+            else:
+                current = self.state.open_positions.get(position.position_id)
+                if current is not None:
+                    current.long_quantity = balanced_quantity
+                    current.short_quantity = balanced_quantity
+                    current.matched_quantity = balanced_quantity
+                self.journal.append(
+                    "runtime.position_drift_corrected",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "new_quantity": balanced_quantity,
+                        "ts_ms": now_ms,
+                    },
+                )
+            self.snapshot_store.write(self.state.to_dict())
+
+    async def _flatten_live_position_leg_quantity(
+        self,
+        venue: Venue,
+        symbol: str,
+        live_position: PositionSnapshot,
+        quantity: float,
+        position_id: str,
+        stage: str,
+    ) -> bool | None:
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return None
+        if quantity <= 1e-9:
+            return True
+
+        cleanup_side = live_position.side.opposite()
+        self.journal.append(
+            "runtime.position_drift_flatten_leg",
+            {
+                "position_id": position_id,
+                "stage": stage,
+                "venue": venue.value,
+                "symbol": symbol,
+                "live_side": live_position.side.value,
+                "quantity": quantity,
+                "cleanup_side": cleanup_side.value,
+            },
+        )
+
+        try:
+            from lightfee.core.domain import OrderRequest
+
+            req = OrderRequest(
+                venue=venue,
+                symbol=symbol,
+                side=cleanup_side,
+                quantity=abs(quantity),
+                price=0.0,
+                post_only=False,
+                reduce_only=True,
+            )
+            fill = await adapter.place_order(req)
+            self._flush_adapter_order_diagnostics(adapter)
+            return fill.quantity >= abs(quantity) - 1e-9
+        except Exception:
+            return False
 
     async def _activate_local_l2_phase(self, now_ms: int) -> None:
         """Phase 5: Activate local-L2 books — WS streams first, then background bootstrap.
@@ -1115,6 +1697,10 @@ class LiveRuntime:
             "runtime.active_position_tick",
             {"position_count": len(self.state.open_positions), "ts_ms": now_ms},
         )
+
+        await self._maybe_check_active_position_drift(now_ms)
+        if not self.state.open_positions:
+            return
 
         # --- Per-position risk supervision ---
         for position in list(self.state.open_positions.values()):
@@ -3432,6 +4018,9 @@ class LiveRuntime:
 
         # Reconciliation of pending/uncertain outcomes
         await self._reconcile_pending_state(now_ms)
+
+        # Detect false-clean state where exchanges hold positions but V2 missed them.
+        await self._maybe_recover_clean_live_positions(now_ms)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(

@@ -75,6 +75,9 @@ class VenueAdapter(ABC):
         )
 
     async def fetch_all_positions(self) -> Optional[list[PositionSnapshot]]:
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, "fetch_all_positions"):
+            return await transport.fetch_all_positions()
         return None
 
     async def fetch_account_balance_snapshot(self) -> Optional[AccountBalanceSnapshot]:

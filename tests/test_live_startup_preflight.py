@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
-from lightfee.core.domain import Venue
+from lightfee.core.domain import PositionSnapshot, Side, Venue
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
     active_position_poll_interval_ms,
@@ -24,8 +24,9 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.risk.modes import EngineLifecycle
-from tests.fake_adapters import FakeVenueAdapter
+from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+from tests.fake_adapters import FakeVenueAdapter, make_uncertain_error
 
 
 def make_test_config(temp_dir: str) -> AppConfig:
@@ -219,6 +220,411 @@ class TestRuntimePreflight:
             assert "secret" not in json.dumps(preflight)
 
             assert runtime.journal._file is None
+
+    @pytest.mark.asyncio
+    async def test_startup_recovers_balanced_live_exchange_positions(self):
+        """Startup must not report zero positions when exchanges already hold a pair."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.02,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000000000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTC-USDT-SWAP",
+                    side=Side.SELL,
+                    quantity=0.02,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000000000,
+                )
+            ]
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 1
+            pos = next(iter(runtime.state.open_positions.values()))
+            assert pos.symbol == "BTCUSDT"
+            assert pos.long_venue == Venue.BINANCE
+            assert pos.short_venue == Venue.OKX
+            assert pos.matched_quantity == pytest.approx(0.02)
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            assert any(r["kind"] == "recovery.live_detected" for r in records)
+
+    @pytest.mark.asyncio
+    async def test_startup_recovers_balanced_positions_from_bulk_private_scan(self):
+        """V1 first scans all private positions instead of relying only on symbol probes."""
+
+        class BulkOnlyAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue, positions: list[PositionSnapshot]):
+                super().__init__(venue)
+                self.positions = positions
+                self.fetch_all_positions_call_count = 0
+
+            async def fetch_all_positions(self) -> list[PositionSnapshot]:
+                self.fetch_all_positions_call_count += 1
+                return list(self.positions)
+
+            async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                raise AssertionError("runtime should prefer fetch_all_positions")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = BulkOnlyAdapter(
+                Venue.BINANCE,
+                [
+                    PositionSnapshot(
+                        venue=Venue.BINANCE,
+                        symbol="BTCUSDT",
+                        side=Side.BUY,
+                        quantity=0.02,
+                        entry_price=65000.0,
+                        observed_at_ms=1700000000000,
+                    )
+                ],
+            )
+            okx = BulkOnlyAdapter(
+                Venue.OKX,
+                [
+                    PositionSnapshot(
+                        venue=Venue.OKX,
+                        symbol="BTCUSDT",
+                        side=Side.SELL,
+                        quantity=0.02,
+                        entry_price=65010.0,
+                        observed_at_ms=1700000000000,
+                    )
+                ],
+            )
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert binance.fetch_all_positions_call_count == 1
+            assert okx.fetch_all_positions_call_count == 1
+            assert len(runtime.state.open_positions) == 1
+
+    @pytest.mark.asyncio
+    async def test_startup_probe_symbols_include_static_config_when_resolved_subset(self):
+        """Recovery must still probe configured symbols that drop out of a daily universe."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["BTCUSDT", "ETHUSDT"]
+            runtime = LiveRuntime(config)
+
+            symbols = runtime._startup_position_probe_symbols(
+                {"resolved_symbols": ["BTCUSDT"]}
+            )
+
+            assert symbols == ["BTCUSDT", "ETHUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_live_position_probe_skips_when_local_recovery_work_exists(self):
+        """Pending recovery work owns its live legs; flat live discovery must not race it."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+            runtime.state.pending_entries["pending-1"] = PendingEntry(
+                pending_id="pending-1",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                target_quantity=0.05,
+                long_side=Side.BUY,
+                short_side=Side.SELL,
+                created_at_ms=1700000000000,
+            )
+
+            await runtime._recover_startup_live_positions(["BTCUSDT"], 1700000010000)
+
+            assert binance.fetch_position_call_count == 0
+            assert binance.place_order_call_count == 0
+            assert len(runtime.state.open_positions) == 0
+
+    @pytest.mark.asyncio
+    async def test_housekeeping_recovers_balanced_live_positions_after_start(self):
+        """A running clean state must not stay false-clean after live positions appear."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+
+            await runtime.start()
+            assert len(runtime.state.open_positions) == 0
+
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.03,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000005000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTC-USDT-SWAP",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65015.0,
+                    observed_at_ms=1700000005000,
+                )
+            ]
+
+            await runtime._post_tick_housekeeping(1700000005000)
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 1
+            pos = next(iter(runtime.state.open_positions.values()))
+            assert pos.symbol == "BTCUSDT"
+            assert pos.matched_quantity == pytest.approx(0.03)
+
+    @pytest.mark.asyncio
+    async def test_startup_flattens_unpaired_live_exchange_position(self):
+        """Unpaired live exposure should be reduce-only flattened, not shown as clean."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            binance.default_position_side = Side.BUY
+            binance.default_position_qty = 0.05
+
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 0
+            assert binance.place_order_call_count == 1
+            assert binance.last_request is not None
+            assert binance.last_request.reduce_only is True
+            assert binance.last_request.side == Side.SELL
+            assert binance.last_request.quantity == pytest.approx(0.05)
+            assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason is None
+
+    @pytest.mark.asyncio
+    async def test_startup_flattens_size_mismatched_live_exchange_positions(self):
+        """A long/short pair with unequal size is mismatch exposure, not recovery."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTC-USDT-SWAP",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            binance.default_position_side = Side.BUY
+            binance.default_position_qty = 0.05
+            okx.default_position_side = Side.SELL
+            okx.default_position_qty = 0.03
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 0
+            assert binance.place_order_call_count == 1
+            assert okx.place_order_call_count == 1
+            assert binance.last_request is not None
+            assert okx.last_request is not None
+            assert binance.last_request.reduce_only is True
+            assert okx.last_request.reduce_only is True
+            assert binance.last_request.side == Side.SELL
+            assert okx.last_request.side == Side.BUY
+            assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+
+    @pytest.mark.asyncio
+    async def test_startup_blocks_unpaired_live_exchange_position_when_flatten_fails(self):
+        """If mismatch flattening fails, V2 must fail closed with visible reason."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            binance.default_position_side = Side.BUY
+            binance.default_position_qty = 0.05
+            binance.place_order_outcomes = [make_uncertain_error("cleanup timeout")]
+
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 0
+            assert binance.place_order_call_count == 1
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == "live_position_mismatch_flatten_failed"
+
+    @pytest.mark.asyncio
+    async def test_active_position_drift_flattens_excess_leg_and_updates_quantity(self):
+        """Active positions must be reconciled against live leg size drift."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+            await runtime.start()
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            runtime.state.open_positions["pos-1"] = OpenPosition(
+                position_id="pos-1",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.05,
+                short_quantity=0.05,
+                long_entry_price=65000.0,
+                short_entry_price=65010.0,
+                opened_at_ms=1700000000000,
+                matched_quantity=0.05,
+            )
+
+            await runtime.tick_active_positions()
+            await runtime.stop()
+
+            pos = runtime.state.open_positions["pos-1"]
+            assert pos.matched_quantity == pytest.approx(0.03)
+            assert pos.long_quantity == pytest.approx(0.03)
+            assert pos.short_quantity == pytest.approx(0.03)
+            assert binance.place_order_call_count == 1
+            assert binance.last_request is not None
+            assert binance.last_request.reduce_only is True
+            assert binance.last_request.side == Side.SELL
+            assert binance.last_request.quantity == pytest.approx(0.02)
+            assert okx.place_order_call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_active_position_drift_removes_position_when_exchange_flat(self):
+        """If both live legs are flat, V2 must not keep showing an open position."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+            await runtime.start()
+            runtime.state.open_positions["pos-1"] = OpenPosition(
+                position_id="pos-1",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.05,
+                short_quantity=0.05,
+                long_entry_price=65000.0,
+                short_entry_price=65010.0,
+                opened_at_ms=1700000000000,
+                matched_quantity=0.05,
+            )
+
+            await runtime.tick_active_positions()
+            await runtime.stop()
+
+            assert "pos-1" not in runtime.state.open_positions
+            assert binance.place_order_call_count == 0
+            assert okx.place_order_call_count == 0
 
     @pytest.mark.asyncio
     async def test_venue_adapters_accessible(self):
