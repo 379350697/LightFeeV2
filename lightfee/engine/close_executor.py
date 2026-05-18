@@ -1099,7 +1099,33 @@ class CloseExecutor:
                 )
 
             if fill_result is None:
-                # Both tiers failed → FAIL_CLOSED
+                # Both tiers failed — re-verify exchange position before FAIL_CLOSED.
+                # V1: compensate_failed_full_close (exit.rs:1482-1601) only enters
+                # fail_closed when there is confirmed residual exposure. If the
+                # exchange reports flat (position already closed by another
+                # mechanism), treat as success — do NOT enter fail_closed.
+                exchange_flat = False
+                try:
+                    verify_pos = await adapter.fetch_position(position.symbol)
+                    exchange_flat = verify_pos is None or abs(verify_pos.quantity) <= 1e-9
+                except Exception:
+                    pass
+
+                if exchange_flat:
+                    self.journal.append(
+                        "exit.compensation_already_flat",
+                        {
+                            "position_id": position.position_id,
+                            "symbol": position.symbol,
+                            "venue": venue.value,
+                            "reason": close_reason,
+                            "failed_stage": failed_stage,
+                        },
+                    )
+                    compensated_venues.append(venue.value)
+                    continue
+
+                # Confirmed residual exposure → FAIL_CLOSED
                 if state is not None:
                     enter_fail_closed(state)
                     state.last_error = (

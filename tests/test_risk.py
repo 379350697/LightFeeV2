@@ -28,8 +28,9 @@ class TestEngineMode:
     def test_derive_running(self):
         assert derive_engine_mode(EngineLifecycle.RUNNING, GlobalRiskMode.RUNNING) == EngineMode.RUNNING
 
-    def test_derive_fail_closed_from_lifecycle(self):
-        assert derive_engine_mode(EngineLifecycle.FAIL_CLOSED, GlobalRiskMode.RUNNING) == EngineMode.FAIL_CLOSED
+    def test_derive_fail_closed_from_risk_only_lifecycle(self):
+        """V1: FailClosed = RISK_ONLY lifecycle + FAIL_CLOSED risk mode."""
+        assert derive_engine_mode(EngineLifecycle.RISK_ONLY, GlobalRiskMode.FAIL_CLOSED) == EngineMode.FAIL_CLOSED
 
     def test_derive_fail_closed_from_risk(self):
         assert derive_engine_mode(EngineLifecycle.RUNNING, GlobalRiskMode.FAIL_CLOSED) == EngineMode.FAIL_CLOSED

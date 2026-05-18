@@ -118,14 +118,14 @@ class TestRecoveryBlockResume:
 
     def test_fail_closed_not_safe(self):
         state = EngineState(
-            lifecycle=EngineLifecycle.FAIL_CLOSED,
+            lifecycle=EngineLifecycle.RISK_ONLY,
             risk_mode=GlobalRiskMode.FAIL_CLOSED,
         )
         assert not is_safe_to_resume(state)
 
     def test_fail_closed_operator_override_not_safe(self):
         state = EngineState(
-            lifecycle=EngineLifecycle.FAIL_CLOSED,
+            lifecycle=EngineLifecycle.RISK_ONLY,
             risk_mode=GlobalRiskMode.FAIL_CLOSED,
         )
         state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED

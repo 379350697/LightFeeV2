@@ -85,8 +85,10 @@ class LiveRuntime:
         self._risk_snapshot_cache: dict[Venue, dict] = {}
 
         # V1 maker-event lane state
-        #   Tracks pending passive maker entries with last known price for repricing
-        self._maker_event_state: dict[str, dict] = {}  # entry_id -> {maker_price, last_reprice_ms, consecutive_failures}
+        #   Tracks pending passive maker entries with last known price for repricing.
+        #   Values are either dicts (sidecar path) or (PassiveOrderManager, float) tuples
+        #   (local-L2 parity path).
+        self._maker_event_state: dict[str, object] = {}  # entry_id -> dict | (manager, price)
         self._last_maker_event_ms: int = 0
 
         # V1 local-L2 runtime (data-plane: book, assignment, events, metrics)
@@ -234,6 +236,7 @@ class LiveRuntime:
 
         # Phase 3 – Recover or start fresh
         self.state = recover_from_snapshot(self.snapshot_store, self.journal)
+        self._restore_passive_order_manager_states()
         self.state.run_id = self.journal.run_id
         if self.state.started_at_ms == 0:
             self.state.started_at_ms = wall_clock_now_ms()
@@ -890,6 +893,7 @@ class LiveRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+            self._sync_passive_order_manager_states()
             self.snapshot_store.write(self.state.to_dict())
 
     async def _flatten_live_position_leg_quantity(
@@ -1298,6 +1302,55 @@ class LiveRuntime:
             elif book.status in (L2BookStatus.COLD,):
                 book.status = L2BookStatus.RESUME_WAITING
 
+    def _sync_passive_order_manager_states(self) -> None:
+        """Write _maker_event_state manager runtime dicts to EngineState for snapshot."""
+        from lightfee.engine.passive_order_manager import PassiveOrderManager
+        states: dict[str, dict] = {}
+        for entry_id, stored in self._maker_event_state.items():
+            if isinstance(stored, tuple) and len(stored) == 2:
+                manager, price = stored
+                if isinstance(manager, PassiveOrderManager):
+                    d = manager.runtime_dict()
+                    d["maker_price"] = price
+                    states[entry_id] = d
+                else:
+                    states[entry_id] = {"maker_price": price}
+            elif isinstance(stored, dict):
+                states[entry_id] = dict(stored)
+        self.state.passive_order_manager_states = states
+
+    def _restore_passive_order_manager_states(self) -> None:
+        """Restore PassiveOrderManager states from EngineState after snapshot recovery."""
+        from lightfee.engine.passive_order_manager import (
+            PassiveOrderManager,
+            PassiveOrderManagerProfile,
+        )
+        profile = PassiveOrderManagerProfile(
+            max_consecutive_failures=self.config.strategy.passive_max_consecutive_failures,
+            failure_cooldown_ms=self.config.strategy.passive_failure_cooldown_ms,
+            reprice_threshold_bps=self.config.strategy.passive_reprice_threshold_bps,
+            cancel_replace_threshold_bps=self.config.strategy.passive_cancel_replace_threshold_bps,
+        )
+        restored: dict[str, object] = {}
+        for entry_id, d in self.state.passive_order_manager_states.items():
+            if not isinstance(d, dict):
+                continue
+            manager = PassiveOrderManager(profile)
+            # Restore runtime state fields
+            if d.get("consecutive_failures", 0) > 0:
+                last_action = d.get("last_action_at_ms")
+                if last_action is not None:
+                    for _ in range(min(d.get("consecutive_failures", 0), profile.max_consecutive_failures)):
+                        manager.note_failure(last_action)
+            if d.get("ops_bucket_tokens") is not None:
+                manager._ops_bucket_tokens = float(d["ops_bucket_tokens"])
+            if d.get("cooldown_until_ms") is not None:
+                manager._cooldown_until_ms = d["cooldown_until_ms"]
+            price = float(d.get("maker_price", 0.0))
+            restored[entry_id] = (manager, price)
+        if restored:
+            self._maker_event_state.update(restored)
+
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
         self._running = False
@@ -1324,6 +1377,7 @@ class LiveRuntime:
 
         # Final state snapshot
         if self.state:
+            self._sync_passive_order_manager_states()
             self.snapshot_store.write(self.state.to_dict())
 
         # Final current-state export
@@ -1969,13 +2023,12 @@ class LiveRuntime:
                     for _ in range(stored.get("consecutive_failures", 0)):
                         manager.note_failure(stored.get("last_reprice_ms", now_ms))
 
-            # Check if venue supports amend
+            # Check if venue supports amend (V1: passive_order_supports_amend)
+            # Must check __dict__ for override, not hasattr which returns True
+            # for the base class NotImplementedError stub.
+            from lightfee.engine.entry_sync import _adapter_supports_amend
             adapter = self._venue_adapters.get(maker_venue)
-            supports_amend = (
-                adapter is not None
-                and hasattr(adapter, 'amend_order')
-                and not getattr(adapter, '_amend_unsupported', False)
-            )
+            supports_amend = _adapter_supports_amend(adapter)
 
             decision_input = PassiveOrderDecisionInput(
                 tick_size=0.1,  # V1: venue-specific tick size
@@ -2024,6 +2077,8 @@ class LiveRuntime:
                     wake_reasons.add(e.wake_reason)
 
             try:
+                # V1: consume ops token BEFORE submitting (token bucket rate limiting)
+                manager.note_operation(now_ms)
                 result = await self._reprice_passive_maker_l2(
                     pending, mid, stored_price, action, now_ms, entry_id,
                 )
@@ -2313,6 +2368,7 @@ class LiveRuntime:
             self._snapshot_local_l2_state()
 
             # --- Persist state snapshot ---
+            self._sync_passive_order_manager_states()
             self.snapshot_store.write(self.state.to_dict())
 
             # --- Sleep until next poll ---
@@ -4330,7 +4386,7 @@ class LiveRuntime:
 
     def _gate_reduce_only(self, candidate) -> tuple[bool, str]:
         """Block new entry when lifecycle/risk mode is reduce-only or fail-closed."""
-        if self.state.lifecycle in (EngineLifecycle.RISK_ONLY, EngineLifecycle.FAIL_CLOSED):
+        if self.state.lifecycle == EngineLifecycle.RISK_ONLY:
             return False, f"lifecycle_{self.state.lifecycle.value}"
         if self.state.risk_mode.value in ("reduce_only", "fail_closed"):
             return False, f"risk_mode_{self.state.risk_mode.value}"

@@ -547,6 +547,118 @@ class TestOperatorCommandsV1Semantics:
             f"V1: RESUME_IF_SAFE should restore RUNNING, got {new_risk}"
         )
 
+    def test_fail_closed_persists_and_restart_shows_risk_only(self):
+        """C-R3: Operator fail-closed persists to snapshot and journal,
+        and restart shows RISK_ONLY + FAIL_CLOSED (not FAIL_CLOSED lifecycle)."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+        from lightfee.engine.state import EngineState
+        from lightfee.ops.commands import execute_operator_command
+        from lightfee.persistence.journal import Journal
+        from lightfee.persistence.snapshot_store import SnapshotStore
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+        from lightfee.risk.operator import OperatorCommand
+
+        tmp = tempfile.mkdtemp()
+        snap_path = Path(tmp) / "snapshot.json"
+        journal_path = Path(tmp) / "journal.jsonl"
+
+        # 1. Write initial empty snapshot
+        store = SnapshotStore(snap_path)
+        state = EngineState()
+        state.lifecycle = EngineLifecycle.RUNNING
+        state.risk_mode = GlobalRiskMode.RUNNING
+        from lightfee.engine.recovery import build_persistent_state_view
+        store.write(build_persistent_state_view(state))
+
+        # 2. Apply fail-closed operator command with real journal + state
+        journal = Journal(journal_path)
+        journal.open()
+        new_risk, new_lifecycle, msg = execute_operator_command(
+            OperatorCommand.FAIL_CLOSED,
+            state.risk_mode, state.lifecycle,
+            journal=journal, state=state,
+        )
+        store.write(build_persistent_state_view(state))
+        journal.close()
+
+        # Verify in-memory state
+        assert new_risk == GlobalRiskMode.FAIL_CLOSED
+        assert new_lifecycle == EngineLifecycle.RISK_ONLY  # V1: NOT fail_closed lifecycle
+
+        # 3. Restart: reload from snapshot + journal → should keep RISK_ONLY + FAIL_CLOSED
+        store2 = SnapshotStore(snap_path)
+        snap2 = store2.read()
+        assert snap2 is not None
+        state2 = _restore_state_from_snapshot_dict(snap2)
+        journal2 = Journal(journal_path)
+        journal2.open()
+        from lightfee.engine.recovery import recover_from_snapshot
+        state2 = recover_from_snapshot(store2, journal2)
+        journal2.close()
+
+        assert state2.risk_mode == GlobalRiskMode.FAIL_CLOSED, (
+            f"Restart must retain FAIL_CLOSED risk mode, got {state2.risk_mode}"
+        )
+        assert state2.lifecycle == EngineLifecycle.RISK_ONLY, (
+            f"Restart must show RISK_ONLY lifecycle (V1: never fail_closed), got {state2.lifecycle}"
+        )
+
+        # 4. Verify journal has the ops.command_applied critical event
+        records = journal2.read_all()
+        ops_records = [r for r in records if r.get("kind") == "ops.command_applied"]
+        assert len(ops_records) >= 1, "Must have ops.command_applied in journal"
+
+    def test_old_snapshot_fail_closed_lifecycle_migrates(self):
+        """C-R1: Old snapshot with lifecycle='fail_closed' is migrated to RISK_ONLY.
+        Runtime never produces lifecycle='fail_closed'."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        # Simulate an old snapshot with the removed FAIL_CLOSED lifecycle string
+        snap = {
+            "lifecycle": "fail_closed",
+            "risk_mode": "fail_closed",
+            "run_id": "test",
+            "started_at_ms": 1000,
+        }
+        state = _restore_state_from_snapshot_dict(snap)
+
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY, (
+            f"Old 'fail_closed' lifecycle must migrate to RISK_ONLY, got {state.lifecycle}"
+        )
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED, (
+            "risk_mode should stay FAIL_CLOSED"
+        )
+
+        # Verify that Runtime never generates fail_closed lifecycle
+        from lightfee.risk.modes import EngineMode, derive_engine_mode
+        mode = derive_engine_mode(state.lifecycle, state.risk_mode)
+        assert mode == EngineMode.FAIL_CLOSED
+
+    def test_supports_amend_override_detection(self):
+        """C-R8: supports_amend checks __dict__ for override, not hasattr.
+        Base class amend_order that raises NotImplementedError must return False."""
+        from lightfee.engine.entry_sync import _adapter_supports_amend
+
+        class BaseAdapter:
+            def amend_order(self, req):
+                raise NotImplementedError
+
+        class RealAdapter(BaseAdapter):
+            def amend_order(self, req):
+                return req  # Actually overrides
+
+        base = BaseAdapter()
+        real = RealAdapter()
+
+        assert not _adapter_supports_amend(base), (
+            "Base class with NotImplementedError must NOT report supports_amend"
+        )
+        assert _adapter_supports_amend(real), (
+            "Real override must report supports_amend"
+        )
+        assert not _adapter_supports_amend(None), "None adapter must return False"
+
 
 class TestCurrentStateExportPath:
     """V1: current-state path derivation from snapshot path."""

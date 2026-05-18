@@ -6,13 +6,21 @@ from enum import Enum
 
 
 class EngineLifecycle(Enum):
-    """Engine lifecycle state (Rust: EngineLifecycle)."""
+    """Engine lifecycle state (Rust: EngineLifecycle).
+
+    V1 has exactly 4 variants. FailClosed is expressed as
+    RISK_ONLY lifecycle + FAIL_CLOSED GlobalRiskMode, NOT as a
+    separate lifecycle variant.
+
+    Legacy snapshots with lifecycle="fail_closed" are migrated to
+    RISK_ONLY by _restore_state_from_snapshot_dict and
+    normalize_engine_state.
+    """
 
     BOOTING = "booting"
     RECONCILING = "reconciling"
     RISK_ONLY = "risk_only"
     RUNNING = "running"
-    FAIL_CLOSED = "fail_closed"
 
 
 class GlobalRiskMode(Enum):

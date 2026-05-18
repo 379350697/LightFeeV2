@@ -380,10 +380,16 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state = EngineState()
 
     lifecycle_str = snap.get("lifecycle", "booting")
-    try:
-        state.lifecycle = EngineLifecycle(lifecycle_str)
-    except ValueError:
-        state.lifecycle = EngineLifecycle.BOOTING
+    # V1: migrate stale FAIL_CLOSED lifecycle → RISK_ONLY
+    # EngineLifecycle has no FAIL_CLOSED variant; FailClosed =
+    # RISK_ONLY + FAIL_CLOSED GlobalRiskMode
+    if lifecycle_str == "fail_closed":
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+    else:
+        try:
+            state.lifecycle = EngineLifecycle(lifecycle_str)
+        except ValueError:
+            state.lifecycle = EngineLifecycle.BOOTING
 
     risk_str = snap.get("risk_mode", "running")
     try:
@@ -406,6 +412,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.transfer_truth = snap.get("transfer_truth", {})
     state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
     state.pending_close_reconciliations = snap.get("pending_close_reconciliations", [])
+    state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
 
     # Restore operator control state
     op = snap.get("operator", {})
@@ -675,6 +682,20 @@ def _apply_journal_replay_to_state(
             if to_val:
                 try:
                     state.risk_mode = GlobalRiskMode(str(to_val))
+                except ValueError:
+                    pass
+
+        elif kind == "ops.command_applied":
+            new_risk = payload.get("new_risk")
+            new_lifecycle = payload.get("new_lifecycle")
+            if new_risk:
+                try:
+                    state.risk_mode = GlobalRiskMode(str(new_risk))
+                except ValueError:
+                    pass
+            if new_lifecycle:
+                try:
+                    state.lifecycle = EngineLifecycle(str(new_lifecycle))
                 except ValueError:
                     pass
 
@@ -1050,7 +1071,7 @@ def is_safe_to_resume(state: EngineState) -> bool:
 
     Rust V1: state_is_safe_to_resume() — no lifecycle-blocking recovery work.
     """
-    if state.lifecycle == EngineLifecycle.FAIL_CLOSED:
+    if state.lifecycle == EngineLifecycle.RISK_ONLY and state.risk_mode == GlobalRiskMode.FAIL_CLOSED:
         return False
     if state.risk_mode == GlobalRiskMode.FAIL_CLOSED:
         # Operator override can keep fail_closed

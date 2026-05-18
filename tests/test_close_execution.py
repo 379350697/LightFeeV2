@@ -1048,6 +1048,81 @@ class TestCompensateFailedFullClose:
         # Non-OrderSubmitError returns False
         assert order_error_may_have_created_exposure(RuntimeError("generic")) is False
 
+    @pytest.mark.asyncio
+    async def test_compensate_all_tiers_fail_but_exchange_flat_no_fail_closed(self):
+        """C-R6: Both tiers fail but exchange confirms flat → no FAIL_CLOSED.
+
+        V1 compensate_failed_full_close (exit.rs:1482-1601) distinguishes
+        "compensation failed" from "already flat". When the exchange reports
+        flat after compensation attempts, treat as success — do NOT enter
+        FAIL_CLOSED.
+        """
+        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.state import EngineState
+        from lightfee.risk.modes import GlobalRiskMode
+
+        # Adapter where place_order always fails but fetch_position eventually
+        # returns flat (simulating external close/cancel that flattened the
+        # position between attempts).
+        class FlatAfterFailAdapter:
+            def __init__(self, venue):
+                self._venue = venue
+                self.place_order_calls = 0
+                self.fetch_position_calls = 0
+                self._flat_after = 6  # Return flat after 6 fetch_position calls
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                self.place_order_calls += 1
+                raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, "simulated failure")
+
+            async def fetch_position(self, symbol):
+                self.fetch_position_calls += 1
+                if self.fetch_position_calls >= self._flat_after:
+                    return None  # Flat
+                return PositionSnapshot(
+                    venue=self._venue, symbol=symbol, side=Side.SELL,
+                    quantity=0.01, entry_price=50000.0, observed_at_ms=1000,
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return None
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+        short_adapter = FlatAfterFailAdapter(Venue.OKX)
+        long_adapter = FlatAfterFailAdapter(Venue.BINANCE)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        # Should NOT raise — exchange confirmed flat, no FAIL_CLOSED
+        await executor.compensate_failed_full_close(
+            pos, "hard_stop", "exit_short_chunk_0",
+            pos.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs, long_legs, state,
+        )
+
+        # State should NOT be in FAIL_CLOSED (exchange confirmed flat)
+        assert state.risk_mode != GlobalRiskMode.FAIL_CLOSED, (
+            "C-R6: exchange confirmed flat should NOT enter FAIL_CLOSED"
+        )
+        assert state.lifecycle != "fail_closed"
+
 
 class _RetryThenSucceedAdapter:
     """Adapter that fails N place_order calls then succeeds, used for hard stop testing."""

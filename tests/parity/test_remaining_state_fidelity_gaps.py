@@ -353,7 +353,8 @@ class TestRecoverySemantics:
         assert is_safe_to_resume(state) is True
 
     def test_is_safe_to_resume_fail_closed(self):
-        state = EngineState(lifecycle=EngineLifecycle.FAIL_CLOSED)
+        state = EngineState(lifecycle=EngineLifecycle.RISK_ONLY)
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
         assert is_safe_to_resume(state) is False
 
     def test_has_lifecycle_blocking_work(self):

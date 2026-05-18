@@ -523,6 +523,9 @@ class EngineState:
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
     local_l2_session_snapshot: list[dict] = field(default_factory=list)
     last_scan: dict | None = None
+    # --- V1 PassiveOrderManager runtime state persistence ---
+    # Maps entry_id -> PassiveOrderManager.runtime_dict()
+    passive_order_manager_states: dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -550,6 +553,7 @@ class EngineState:
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,
+            "passive_order_manager_states": self.passive_order_manager_states,
             "open_positions": {
                 pid: {
                     "position_id": pos.position_id,

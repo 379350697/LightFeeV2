@@ -197,3 +197,87 @@ class TestPassiveOrderManagerHelpers:
         assert "cooldown_until_ms" in d
         # consecutive_failures is 0 after successful operations
         assert d["consecutive_failures"] == 0
+
+
+class TestPassiveOrderManagerProductionPath:
+    """C-R8: Production-path tests for PassiveOrderManager ops budget and repricing."""
+
+    def test_continuous_reprice_consumes_tokens(self):
+        """C-R8: Each reprice consumes an ops token. After exhausting,
+        further actions are rate-limited (OPS_BUDGET_EXCEEDED)."""
+        profile = _profile(ops_bucket_capacity=8.0, ops_bucket_refill_per_sec=1.0)
+        manager = PassiveOrderManager(profile)
+
+        # Simulate 8 consecutive note_operation calls (as the runtime does
+        # before each amend/cancel_replace)
+        for i in range(8):
+            manager.note_operation(1000 + i * 100)
+
+        # After 8 ops, bucket should be near-empty
+        # Wait 100ms → refill ~0.1 tokens (1.0/sec * 0.1s = 0.1)
+        decision = manager.decide(_buy_input(current_price=90.0), 1900)
+        assert decision.kind == PassiveOrderManagerDecisionType.HOLD
+        assert decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED, (
+            "After exhausting token bucket, ops must be rate-limited"
+        )
+
+    def test_reprice_consumes_token_before_call(self):
+        """C-R8: note_operation() is called BEFORE the amend/cancel_replace,
+        consuming a token so subsequent decide() calls see reduced budget."""
+        profile = _profile(ops_bucket_capacity=8.0, ops_bucket_refill_per_sec=0.0)
+        manager = PassiveOrderManager(profile)
+
+        initial_tokens = manager.ops_bucket_tokens
+
+        # Simulate 1 note_operation (as called by the maker-event lane)
+        manager.note_operation(1000)
+        assert manager.ops_bucket_tokens == initial_tokens - 1.0, (
+            f"note_operation must consume exactly 1 token, got {manager.ops_bucket_tokens}"
+        )
+
+        # Another note_operation
+        manager.note_operation(1000)
+        assert manager.ops_bucket_tokens == initial_tokens - 2.0
+
+    def test_unamended_adapter_directly_cancel_replaces(self):
+        """C-R8: When supports_amend=False, PassiveOrderManager returns
+        CANCEL_REPLACE with AMEND_UNSUPPORTED reason, not AMEND."""
+        manager = PassiveOrderManager(_profile())
+        decision = manager.decide(
+            _buy_input(current_price=90.0, supports_amend=False),
+            2000,
+        )
+        assert decision.kind == PassiveOrderManagerDecisionType.CANCEL_REPLACE
+        assert decision.replace_reason == PassiveReplaceReason.AMEND_UNSUPPORTED, (
+            "Unsupported amend must produce CANCEL_REPLACE, not attempt amend"
+        )
+
+    def test_runtime_dict_serialization_roundtrip(self):
+        """C-R8: runtime_dict() can be used to persist/restore manager state."""
+        from lightfee.engine.passive_order_manager import PassiveOrderManagerProfile
+
+        profile = _profile(ops_bucket_refill_per_sec=0.0)
+        manager = PassiveOrderManager(profile)
+        manager.note_operation(1000)
+        manager.note_operation(1000)
+        manager.note_failure(1000)
+
+        d = manager.runtime_dict()
+
+        # Restore from serialized state
+        restored = PassiveOrderManager(profile)
+        # Verify serialized state is present
+        assert d["ops_bucket_tokens"] < profile.ops_bucket_capacity, (
+            f"After 2 note_operations, tokens should be below capacity"
+        )
+        assert d["consecutive_failures"] == 1
+        assert d["cooldown_until_ms"] is None
+
+        # Restore token state
+        restored._ops_bucket_tokens = float(d["ops_bucket_tokens"])
+        assert abs(restored.ops_bucket_tokens - manager.ops_bucket_tokens) < 0.001
+
+        # Restore consecutive failures
+        restored._consecutive_failures = d["consecutive_failures"]
+        assert restored.consecutive_failures == manager.consecutive_failures
+        assert restored.cooldown_until_ms == manager.cooldown_until_ms

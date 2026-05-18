@@ -837,10 +837,23 @@ def _adapter_supports_amend(adapter) -> bool:
     """
     if adapter is None:
         return False
-    # Check if amend_order is overridden in the adapter's class (not just inherited)
+    # Is amend_order defined directly on this class (not just inherited)?
     cls = type(adapter)
-    if 'amend_order' not in cls.__dict__:
+    method = cls.__dict__.get('amend_order')
+    if method is None:
         return False
+    # V1: If the implementation only raises NotImplementedError (like the
+    # VenueAdapter base), treat as unsupported.
+    try:
+        import inspect
+        source = inspect.getsource(method)
+        body = [l.strip() for l in source.split('\n')[1:]
+                if l.strip() and not l.strip().startswith('"""')
+                and not l.strip().startswith('#')]
+        if len(body) == 1 and ('raise NotImplementedError' in body[0] or body[0] == '...'):
+            return False
+    except (OSError, TypeError):
+        pass
     return True
 
 
