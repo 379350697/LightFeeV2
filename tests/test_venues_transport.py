@@ -1508,9 +1508,90 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert payload["tick_size"] == spec.price_tick
         assert payload["quantity_step"] == spec.quantity_step
         assert payload["response_classification"] == "attempt"
+        assert payload["body_sanitized"]["qty"] == "0.007"
+        assert payload["body_sanitized"]["price"] == "50000.12"
+        assert payload["body_sanitized"]["positionIdx"] in (0, 1, 2)
+        assert "orderLinkId" not in payload["body_sanitized"]
         serialized = json.dumps(events)
         assert "sign-secret" not in serialized
         assert "key-secret" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_okx_reduce_only_uses_contract_position_quantity_without_ctval_conversion(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        spec = okx_spec()
+        transport = VenueTransport(
+            spec=spec,
+            mode="live",
+            credential=LiveCredential(api_key="okx-key", api_secret="okx-secret", api_passphrase="okx-pass"),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {
+                "code": "0",
+                "data": [{"ordId": "okx_ack_1", "clOrdId": "okx-close-stable", "sCode": "0"}],
+            }
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.OKX,
+            symbol="STABLEUSDT",
+            side=Side.SELL,
+            quantity=78.0,
+            reduce_only=True,
+            client_order_id="okx-close-stable",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.place_order(req)
+
+        assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert sent[-1]["path"] == spec.order_path
+        assert sent[-1]["body"]["instId"] == "STABLE-USDT-SWAP"
+        assert sent[-1]["body"]["reduceOnly"] == "true"
+        assert sent[-1]["body"]["sz"] == "78"
+        attempt = next(e["payload"] for e in transport.order_diagnostics if e["kind"] == "order.submit_attempt")
+        assert attempt["ct_val"] == 100.0
+        assert attempt["base_qty"] == 78.0
+        assert attempt["contract_qty"] == 78.0
+        assert attempt["body_sanitized"]["sz"] == "78"
+
+    def test_bybit_preflight_preserves_exact_step_quantity_without_float_slip(self):
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        preflight = transport.preflight_order_request(
+            OrderRequest(
+                venue=Venue.BYBIT,
+                symbol="0GUSDT",
+                side=Side.SELL,
+                quantity=47.8,
+                price=0.5014,
+                reduce_only=True,
+                client_order_id="bybit-close-0g",
+            )
+        )
+
+        assert preflight["quantity_step"] == 0.001
+        assert preflight["quantized_qty"] == 47.8
 
     @pytest.mark.parametrize(
         "spec_fn,raw_qty,price,expected_qty",
@@ -2324,6 +2405,13 @@ class TestExchangeErrorEnvelopes:
             await transport.place_order(req)
         assert exc.value.class_ == SubmitFailureClass.REJECTED
         assert "110003" in str(exc.value)
+        assert [event["kind"] for event in transport.order_diagnostics] == [
+            "order.submit_attempt",
+            "order.submit_result",
+        ]
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "rejected"
+        assert "110003" in result["response_msg"]
 
     @pytest.mark.asyncio
     async def test_bitget_code_reject_maps_to_rejected(self):

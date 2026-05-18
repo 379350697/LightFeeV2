@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 from typing import Any, Optional
 
@@ -71,9 +71,12 @@ def _missing_hyperliquid_signing_dependencies() -> list[str]:
 
 
 def _floor_to_step(value: float, step: float) -> float:
-    if step <= 0 or not math.isfinite(value):
+    if step <= 0 or not math.isfinite(value) or not math.isfinite(step):
         return value
-    return math.floor((value / step) + 1e-12) * step
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    steps = (value_dec / step_dec).to_integral_value(rounding=ROUND_FLOOR)
+    return float(steps * step_dec)
 
 
 def _ceil_to_step(value: float, step: float) -> float:
@@ -2251,9 +2254,11 @@ class VenueTransport(MarketDataClient):
                 filled_at_ms=now_ms,
             )
 
+        preflight: dict[str, Any] | None = None
+        result_recorded = False
+
         try:
             preflight = self.preflight_order_request(request)
-            self._record_order_diagnostic("order.submit_attempt", preflight)
             request = replace(
                 request,
                 quantity=float(preflight["quantized_qty"]),
@@ -2283,19 +2288,30 @@ class VenueTransport(MarketDataClient):
                     await self._refresh_okx_pos_mode()
                 pos_side = self._okx_pos_side(request.side, request.reduce_only)
 
-                # V1: OKX contract sizing — base_qty / ctVal → contracts, floored to lotSz
+                # V1: OKX opening orders use base_qty / ctVal -> contracts. Reduce-only
+                # cleanup receives position size from OKX, which is already contract units.
                 rules_cache = get_symbol_rules_cache()
                 symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
                 ct_val = float(getattr(symbol_rule, 'ct_val', 0) or 0)
                 lot_sz = float(getattr(symbol_rule, 'qty_step', 0) or 0)
                 base_qty = float(request.quantity)
 
-                if ct_val > 0 and lot_sz > 0:
+                if request.reduce_only:
+                    contract_qty = (
+                        _floor_to_step(base_qty, lot_sz)
+                        if lot_sz > 0
+                        else base_qty
+                    )
+                    quantity_units = "contracts"
+                elif ct_val > 0 and lot_sz > 0:
                     contract_qty = _floor_to_step(base_qty / ct_val, lot_sz)
+                    quantity_units = "base_to_contracts"
                 elif ct_val > 0:
                     contract_qty = base_qty / ct_val
+                    quantity_units = "base_to_contracts"
                 else:
                     contract_qty = base_qty
+                    quantity_units = "base"
 
                 body = {
                     "instId": venue_sym,
@@ -2318,13 +2334,13 @@ class VenueTransport(MarketDataClient):
                 preflight["ct_val"] = ct_val
                 preflight["base_qty"] = base_qty
                 preflight["contract_qty"] = contract_qty
+                preflight["quantity_units"] = quantity_units
                 preflight["lot_sz"] = lot_sz
                 preflight["body_field_names"] = sorted(body.keys())
                 preflight["body_sanitized"] = {
                     k: v for k, v in body.items()
                     if k not in ("clOrdId",)
                 }
-                self._record_order_diagnostic("order.submit_attempt", preflight)
             elif spec.venue_id == Venue.BYBIT:
                 body = _build_bybit_order_body(
                     request, venue_sym, passive=False,
@@ -2411,6 +2427,21 @@ class VenueTransport(MarketDataClient):
                     if self._credential and self._credential.account_address:
                         body["vaultAddress"] = self._credential.account_address
 
+            if "body_field_names" not in preflight:
+                preflight["body_field_names"] = sorted(body.keys())
+            if "body_sanitized" not in preflight:
+                preflight["body_sanitized"] = {
+                    k: v for k, v in body.items()
+                    if k not in (
+                        "clOrdId",
+                        "orderLinkId",
+                        "newClientOrderId",
+                        "clientOrderId",
+                        "cloid",
+                    )
+                }
+            self._record_order_diagnostic("order.submit_attempt", preflight)
+
             # V1: Binance/Aster use query-only private signing (order fields in query, not body)
             if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
                 raw = await self._request("POST", spec.order_path, params=body, private=True)
@@ -2435,19 +2466,41 @@ class VenueTransport(MarketDataClient):
                     else exc.class_.value
                 )
                 self._record_order_diagnostic("order.submit_result", result_payload)
+                result_recorded = True
                 raise
             result_payload = dict(preflight)
             result_payload["order_id"] = fill.order_id
             result_payload["client_order_id"] = fill.client_order_id or request.client_order_id or ""
             result_payload["response_classification"] = "filled"
             self._record_order_diagnostic("order.submit_result", result_payload)
+            result_recorded = True
             return fill
 
         except TransportError as e:
-            if e.category == TransportErrorCategory.REQUEST_REJECTED:
-                raise _map_to_submit_error(e.category, str(e))
+            if preflight is not None and not result_recorded:
+                result_payload = dict(preflight)
+                result_payload["response_code"] = e.status_code
+                result_payload["response_msg"] = str(e)[:500]
+                result_payload["response_body"] = e.body[:1000]
+                result_payload["response_classification"] = (
+                    "rejected"
+                    if e.category in (
+                        TransportErrorCategory.AUTH_FAILURE,
+                        TransportErrorCategory.AUTHORIZATION_FAILURE,
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                        TransportErrorCategory.NORMALIZATION_FAILURE,
+                    )
+                    else "uncertain"
+                )
+                self._record_order_diagnostic("order.submit_result", result_payload)
             raise _map_to_submit_error(e.category, str(e))
-        except OrderSubmitError:
+        except OrderSubmitError as e:
+            if preflight is not None and not result_recorded:
+                result_payload = dict(preflight)
+                result_payload["response_classification"] = e.class_.value
+                result_payload["response_msg"] = str(e)[:500]
+                self._record_order_diagnostic("order.submit_result", result_payload)
             raise
         except Exception as e:
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
