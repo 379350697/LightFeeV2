@@ -543,7 +543,7 @@ def start_binance_private_ws(transport, symbols: list[str]) -> None:
         return
 
     api_key = credential.api_key
-    base_url = transport._spec.rest_url.rstrip("/")
+    base_url = transport._spec.private_base_url.rstrip("/")
     ws_base_url = _binance_ws_base_url(base_url)
     private_state = transport._private_ws_state
 

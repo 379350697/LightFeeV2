@@ -531,7 +531,7 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
     api_key = credential.api_key
     api_secret = credential.api_secret
     api_passphrase = credential.api_passphrase or ""
-    base_url = transport._spec.rest_url.rstrip("/")
+    base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _okx_private_ws_url(base_url)
     private_state = transport._private_ws_state
 

@@ -265,7 +265,7 @@ def start_bitget_private_ws(transport, symbols: list[str]) -> None:
     if not symbols:
         return
 
-    base_url = transport._spec.rest_url.rstrip("/")
+    base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _bitget_private_ws_url(base_url)
     private_state = transport._private_ws_state
     symbol_map = {transport._venue_symbol(s): s for s in symbols}
