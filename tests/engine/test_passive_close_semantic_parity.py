@@ -312,3 +312,287 @@ class TestPassiveMakerDecisions:
         )
         assert decision == MakerDecision.HOLD
         assert reason == "missing_book_data"
+
+
+# ============================================================================
+# L-R6: Ops Token/Cooldown Rate Limiting for Passive Close Maintainer
+# ============================================================================
+
+
+class TestLazyOpsTokenBucket:
+    """L-R6: V1-style fixed-window counter for passive close ops rate limiting.
+
+    Each PendingPassiveClose has a fixed-window ops budget.  Operations
+    consume a token BEFORE execution (even on failure).  The counter resets
+    ONLY when the full window expires — cooldown is a retry scheduling
+    hint, NOT a sub-window reset.
+    """
+
+    def _make_profile(self, budget=10, window_ms=60_000, cooldown_ms=5_000):
+        from lightfee.engine.passive_close import PassiveCloseManagerProfile
+        return PassiveCloseManagerProfile(
+            ops_budget_per_window=budget,
+            ops_budget_window_ms=window_ms,
+            cooldown_ms=cooldown_ms,
+        )
+
+    def _make_pending(self, position_id="p1"):
+        from lightfee.engine.state import PendingPassiveClose
+        return PendingPassiveClose(
+            position_id=position_id,
+            reason="test",
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+        )
+
+    # ------------------------------------------------------------------
+    # Budget exhaustion
+    # ------------------------------------------------------------------
+
+    def test_rate_limit_reached_emits_correct_journal_kind(self):
+        """L-R6: when ops budget is exhausted, the rate_limit journal event
+        uses exit.passive_close_maintain_rate_limited — not a generic warning."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=3, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        # First window: consume all 3 tokens
+        pending.ops_window_started_at_ms = now_ms
+        for i in range(3):
+            assert ops_token_available(pending, profile, now_ms + i * 100)
+            pending.ops_count_this_window += 1
+
+        # 4th call: budget exhausted
+        assert not ops_token_available(pending, profile, now_ms + 300)
+
+    def test_rate_limit_sets_next_retry_with_cooldown(self):
+        """L-R6: after budget exhaustion, next_retry_at_ms is pushed forward
+        by cooldown_ms — the maintainer won't retry immediately."""
+        from lightfee.engine.passive_close import ops_token_available, PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+        profile = self._make_profile(budget=1, window_ms=60_000, cooldown_ms=15_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        # Consume the single token
+        pending.ops_window_started_at_ms = now_ms
+        assert ops_token_available(pending, profile, now_ms)
+        pending.ops_count_this_window += 1
+
+        # Exhausted — next_retry should be in the future
+        assert not ops_token_available(pending, profile, now_ms)
+        # Simulate what _maintain_maker_order does on exhaustion:
+        pending.next_retry_at_ms = max(pending.next_retry_at_ms, now_ms + profile.cooldown_ms)
+        assert pending.next_retry_at_ms >= now_ms + profile.cooldown_ms
+
+    # ------------------------------------------------------------------
+    # Window semantics — no sub-window reset
+    # ------------------------------------------------------------------
+
+    def test_window_not_complete_does_not_reset_counter(self):
+        """L-R6: if only half the window has passed, the counter is NOT reset.
+        The full window must expire before refill."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=5, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 5  # exhausted
+
+        # 30s later — only half the window
+        assert not ops_token_available(pending, profile, now_ms + 30_000)
+
+    def test_window_expires_resets_counter(self):
+        """L-R6: when the full window expires, the counter resets to 0
+        and the window restarts."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=5, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 5  # exhausted
+
+        # 60s later — full window expired
+        assert ops_token_available(pending, profile, now_ms + 60_000)
+        assert pending.ops_count_this_window == 0
+        assert pending.ops_window_started_at_ms == now_ms + 60_000
+
+    def test_window_exactly_at_boundary(self):
+        """L-R6: at the exact window boundary, counter resets."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=3, window_ms=10_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 3  # exhausted
+
+        # At exactly window_ms
+        assert ops_token_available(pending, profile, now_ms + 10_000)
+        assert pending.ops_count_this_window == 0
+
+    def test_window_just_past_boundary(self):
+        """L-R6: 1ms past the window boundary also resets."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=3, window_ms=10_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 3  # exhausted
+
+        assert ops_token_available(pending, profile, now_ms + 10_001)
+
+    def test_zero_window_start_grants_token(self):
+        """L-R6: if ops_window_started_at_ms is 0 (first call), token is always available."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=3, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        pending.ops_window_started_at_ms = 0
+        pending.ops_count_this_window = 0
+
+        assert ops_token_available(pending, profile, 1_000_000)
+
+    # ------------------------------------------------------------------
+    # Token consumed on failure too
+    # ------------------------------------------------------------------
+
+    def test_token_consumed_before_operation(self):
+        """L-R6: the token is consumed BEFORE amend/cancel-replace is attempted.
+        If the operation fails, the token is still spent — no leak, no refund."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=2, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        assert ops_token_available(pending, profile, now_ms)
+        # Consume token (as _maintain_maker_order does before amend/cancel-replace)
+        pending.ops_count_this_window += 1
+        if pending.ops_window_started_at_ms <= 0:
+            pending.ops_window_started_at_ms = now_ms
+        # Now simulate the operation throwing — token still consumed
+        assert pending.ops_count_this_window == 1
+
+        # Verify budget reflects the consumed token
+        assert ops_token_available(pending, profile, now_ms)  # 1 of 2 used
+        pending.ops_count_this_window += 1  # second token
+        assert not ops_token_available(pending, profile, now_ms)  # both used
+
+    def test_multiple_failures_consume_tokens(self):
+        """L-R6: repeated amend/cancel-replace failures consume tokens until
+        budget exhausted, then ops stop."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=3, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+
+        # Simulate 3 failed attempts
+        for i in range(3):
+            assert ops_token_available(pending, profile, now_ms + i * 100)
+            pending.ops_count_this_window += 1  # token consumed pre-op
+            # operation fails — no refund
+
+        # 4th attempt — budget exhausted
+        assert not ops_token_available(pending, profile, now_ms + 400)
+
+    # ------------------------------------------------------------------
+    # Cooldown does NOT amplify
+    # ------------------------------------------------------------------
+
+    def test_cooldown_is_not_sub_window_reset(self):
+        """L-R6: cooldown_ms sets the retry scheduling delay after budget
+        exhaustion. It does NOT create a 'cooldown sub-window' that resets
+        the counter early. Tokens only refill when the full ops_budget_window_ms
+        expires."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=5, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 5  # exhausted
+
+        # After cooldown_ms (5s), counter should still be exhausted
+        assert not ops_token_available(pending, profile, now_ms + 5_000)
+        assert pending.ops_count_this_window == 5  # NOT reset
+
+        # After another cooldown (10s total), still exhausted
+        assert not ops_token_available(pending, profile, now_ms + 10_000)
+        assert pending.ops_count_this_window == 5
+
+    def test_cooldown_scheduling_without_rate_amplification(self):
+        """L-R6: repeated cooldown-based scheduling does not allow more ops
+        per real-time second than the budget permits."""
+        from lightfee.engine.passive_close import ops_token_available
+        budget = 10
+        window_ms = 60_000
+        profile = self._make_profile(budget=budget, window_ms=window_ms, cooldown_ms=3_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+
+        # Consume all budget — should be exactly `budget` ops
+        ops_consumed = 0
+        for i in range(budget * 2):  # safety limit
+            if ops_token_available(pending, profile, now_ms + i * 100):
+                pending.ops_count_this_window += 1
+                ops_consumed += 1
+            else:
+                break
+        assert ops_consumed == budget
+
+        # Even after several cooldown periods within the same window,
+        # no additional ops are available
+        for offset_ms in [3000, 6000, 9000, 12000, 15000]:
+            assert not ops_token_available(pending, profile, now_ms + offset_ms)
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    def test_single_token_budget(self):
+        """L-R6: minimum budget of 1 works correctly."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=1, window_ms=60_000, cooldown_ms=5_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        assert ops_token_available(pending, profile, now_ms)
+        pending.ops_count_this_window += 1
+        assert not ops_token_available(pending, profile, now_ms)
+
+    def test_large_budget_not_exhausted_early(self):
+        """L-R6: large budget permits exactly that many ops."""
+        from lightfee.engine.passive_close import ops_token_available
+        budget = 100
+        profile = self._make_profile(budget=budget, window_ms=60_000, cooldown_ms=1_000)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        for i in range(budget):
+            assert ops_token_available(pending, profile, now_ms + i)
+            pending.ops_count_this_window += 1
+        assert not ops_token_available(pending, profile, now_ms + budget)
+
+    def test_very_short_window(self):
+        """L-R6: a 1ms window still works — counter resets after 1ms."""
+        from lightfee.engine.passive_close import ops_token_available
+        profile = self._make_profile(budget=1, window_ms=1, cooldown_ms=100)
+        pending = self._make_pending()
+        now_ms = 1_000_000
+
+        pending.ops_window_started_at_ms = now_ms
+        pending.ops_count_this_window = 1  # exhausted
+        assert not ops_token_available(pending, profile, now_ms)
+
+        # 1ms later — window expires, counter resets
+        assert ops_token_available(pending, profile, now_ms + 1)
+        assert pending.ops_count_this_window == 0

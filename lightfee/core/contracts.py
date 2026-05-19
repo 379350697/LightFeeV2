@@ -204,7 +204,12 @@ class VenueAdapter(ABC):
 
         Returns a ConnectionHealth object or None if not available.
         Used by supervisor to determine if private stream is healthy.
+
+        Delegates to transport if available, otherwise returns None.
         """
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'cached_private_connection_health'):
+            return transport.cached_private_connection_health()
         return None
 
     def cached_position(self, symbol: str):
@@ -212,7 +217,12 @@ class VenueAdapter(ABC):
 
         Returns a PositionSnapshot or None if not cached.
         Used by supervisor to verify private position confirmation.
+
+        Delegates to transport if available, otherwise returns None.
         """
+        transport = getattr(self, '_transport', None)
+        if transport is not None and hasattr(transport, 'cached_position'):
+            return transport.cached_position(symbol)
         return None
 
     # --- V1 contract completeness: Passive progress ---

@@ -279,13 +279,21 @@ class TestC2SupervisorProductionPath:
             journal.close()
 
     def test_paper_adapter_private_health_defaults_to_false(self):
-        """Paper mode adapters should default supports_private_health=False."""
+        """Paper mode adapters: supports_private_health=False gates supervisor.
+        cached_private_connection_health() returns a ConnectionHealth (V1:
+        the object always exists, but supports_private_health controls
+        whether supervisor reads it). cached_position() returns None when
+        no positions have been fetched."""
         from lightfee.venues.binance import BinanceAdapter
+        from lightfee.marketdata.resilience import ConnectionHealth
 
         a = BinanceAdapter(mode="paper")
         assert a.supports_private_health is False
         assert a.supports_risk_health is False
-        assert a.cached_private_connection_health() is None
+        # V1: ConnectionHealth always exists — the gating is via supports_private_health
+        health = a.cached_private_connection_health()
+        assert isinstance(health, ConnectionHealth)
+        assert not health.is_unhealthy()  # starts healthy
         assert a.cached_position("BTC-USDT") is None
 
     def test_supports_risk_health_is_property_not_method(self):

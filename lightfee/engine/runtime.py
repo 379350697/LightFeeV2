@@ -4291,9 +4291,16 @@ class LiveRuntime:
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
         # Risk-line supervision — V1: refresh_venue_health_supervisor + recompute_global_risk_mode
-        self.supervisor.supervise(now_ms, self.state.venue_health, self._venue_adapters)
-        # V1: share risk snapshot cache with supervisor for venue health evaluation
-        self.supervisor._risk_snapshot_cache = self._risk_snapshot_cache
+        # CRITICAL: risk_snapshot_cache must be injected BEFORE supervise() so
+        # _collect_venue_health_views() sees current-tick AccountRiskSnapshot data.
+        # If the cache is stale/empty, supervisor misdiagnoses risk_snapshot_unavailable
+        # and enters fail-closed despite healthy venues.
+        self.supervisor.supervise(
+            now_ms,
+            self.state.venue_health,
+            adapters=self._venue_adapters,
+            risk_snapshot_cache=self._risk_snapshot_cache,
+        )
 
         # Reconciliation of pending/uncertain outcomes
         await self._reconcile_pending_state(now_ms)

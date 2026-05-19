@@ -42,6 +42,10 @@ class GateAdapter(VenueAdapter):
         # does not provide reliable margin/equity data for risk evaluation.
         return False
 
+    @property
+    def supports_private_health(self) -> bool:
+        return self._mode == "live"
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 

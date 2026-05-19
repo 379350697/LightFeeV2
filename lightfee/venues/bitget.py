@@ -202,6 +202,10 @@ class BitgetAdapter(VenueAdapter):
         # does not provide reliable margin/equity data for risk evaluation.
         return False
 
+    @property
+    def supports_private_health(self) -> bool:
+        return self._transport.mode == "live"
+
     # ------------------------------------------------------------------
     # Profile detection
     # ------------------------------------------------------------------

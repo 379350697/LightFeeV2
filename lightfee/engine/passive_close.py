@@ -147,6 +147,30 @@ class HedgeDeltaResult:
 # ---------------------------------------------------------------------------
 
 
+def ops_token_available(
+    pending: PendingPassiveClose, profile: PassiveCloseManagerProfile, now_ms: int
+) -> bool:
+    """V1: ops token bucket check for passive close maintenance.
+
+    Simple fixed-window counter: resets only when the full window expires.
+    Cooldown_ms determines the retry delay after budget exhaustion, NOT
+    a sub-window counter reset.
+
+    Extracted as a module-level function for testability; the class method
+    _ops_token_available delegates to this.
+    """
+    window_ms = profile.ops_budget_window_ms
+    if pending.ops_window_started_at_ms <= 0:
+        return True
+    elapsed = now_ms - pending.ops_window_started_at_ms
+    if elapsed >= window_ms:
+        # Full window expired — reset counter
+        pending.ops_count_this_window = 0
+        pending.ops_window_started_at_ms = now_ms
+        return True
+    return pending.ops_count_this_window < profile.ops_budget_per_window
+
+
 class PassiveCloseExecutor:
     """V1 passive close executor: maker+taker close with GTC post-only maker leg.
 
@@ -202,22 +226,8 @@ class PassiveCloseExecutor:
     def _ops_token_available(
         self, pending: PendingPassiveClose, profile: PassiveCloseManagerProfile, now_ms: int
     ) -> bool:
-        """V1: ops token bucket check for passive close maintenance.
-
-        Simple fixed-window counter: resets only when the full window expires.
-        Cooldown_ms determines the retry delay after budget exhaustion, NOT
-        a sub-window counter reset.
-        """
-        window_ms = profile.ops_budget_window_ms
-        if pending.ops_window_started_at_ms <= 0:
-            return True
-        elapsed = now_ms - pending.ops_window_started_at_ms
-        if elapsed >= window_ms:
-            # Full window expired — reset counter
-            pending.ops_count_this_window = 0
-            pending.ops_window_started_at_ms = now_ms
-            return True
-        return pending.ops_count_this_window < profile.ops_budget_per_window
+        """V1: ops token bucket check for passive close maintenance."""
+        return ops_token_available(pending, profile, now_ms)
 
     # ------------------------------------------------------------------
     # Start

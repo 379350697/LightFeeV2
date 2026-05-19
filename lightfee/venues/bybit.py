@@ -39,6 +39,10 @@ class BybitAdapter(VenueAdapter):
     def supports_risk_health(self) -> bool:
         return self._transport.mode == "live"
 
+    @property
+    def supports_private_health(self) -> bool:
+        return self._transport.mode == "live"
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 

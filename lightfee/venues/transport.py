@@ -35,6 +35,7 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.venues.common import normalize_venue_quantity
 from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.specs import AuthScheme, VenueSpec
@@ -977,8 +978,55 @@ class VenueTransport(MarketDataClient):
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
         self._order_diagnostics: list[dict[str, Any]] = []
 
+        # V1: private WebSocket connection health tracking.
+        # Updated externally by the private WS connection manager via
+        # record_private_ws_success() / record_private_ws_failure().
+        # Default: healthy (V1 starts healthy, becomes unhealthy after N failures).
+        self._private_ws_health = ConnectionHealth()
+
+        # V1: position cache populated by fetch_position() / fetch_all_positions()
+        # Map of symbol → (PositionSnapshot, cached_at_ms)
+        self._position_cache: dict[str, tuple[PositionSnapshot, int]] = {}
+
         if mode == "live":
             self._validate_live_credentials(credential)
+
+    # ------------------------------------------------------------------
+    # V1: private WebSocket health (updated by external WS connection manager)
+    # ------------------------------------------------------------------
+
+    def cached_private_connection_health(self) -> Optional[ConnectionHealth]:
+        """V1: return private WS connection health for supervisor evaluation.
+
+        Returns the ConnectionHealth object tracking the private stream.
+        The external private WS manager calls record_private_ws_success/failure
+        to keep this current.
+        """
+        return self._private_ws_health
+
+    def record_private_ws_success(self, now_ms: int) -> None:
+        """V1: called by private WS connection on successful message/connect."""
+        self._private_ws_health.record_success(now_ms)
+
+    def record_private_ws_failure(self, now_ms: int, error: str, unhealthy_after: int = 5) -> None:
+        """V1: called by private WS connection on failure/disconnect."""
+        self._private_ws_health.record_failure(now_ms, unhealthy_after, error)
+
+    def cached_position(self, symbol: str) -> Optional[PositionSnapshot]:
+        """V1: return cached position for a symbol (from fetch_position or private stream).
+
+        Returns None if no cached position or cache is stale.
+        Used by supervisor to verify private position confirmation.
+        """
+        entry = self._position_cache.get(symbol)
+        if entry is None:
+            return None
+        snapshot, cached_at_ms = entry
+        # Cache TTL: positions are refreshed every tick (~1-2s), keep 30s
+        now_ms = int(time.time() * 1000)
+        if (now_ms - cached_at_ms) > 30_000:
+            return None
+        return snapshot
 
     # ------------------------------------------------------------------
     # Credential validation
@@ -1999,7 +2047,11 @@ class VenueTransport(MarketDataClient):
                     params["productType"] = "USDT-FUTURES"
                     params["marginCoin"] = "USDT"
                 raw = await self._request("GET", spec.position_path, params=params, private=True)
-            return self._parse_all_positions(raw, now_ms)
+            positions = self._parse_all_positions(raw, now_ms)
+            # Populate position cache for supervisor private position confirmation
+            for pos in positions:
+                self._position_cache[pos.symbol] = (pos, now_ms)
+            return positions
         except TransportError:
             raise
         except Exception as e:
@@ -2014,7 +2066,7 @@ class VenueTransport(MarketDataClient):
         now_ms = int(time.time() * 1000)
 
         if self.mode == "paper":
-            return PositionSnapshot(
+            snapshot = PositionSnapshot(
                 venue=spec.venue_id,
                 symbol=venue_sym,
                 side=Side.BUY,
@@ -2022,6 +2074,8 @@ class VenueTransport(MarketDataClient):
                 entry_price=0.0,
                 observed_at_ms=now_ms,
             )
+            self._position_cache[symbol] = (snapshot, now_ms)
+            return snapshot
 
         try:
             params: dict[str, Any] = {}
@@ -2036,10 +2090,14 @@ class VenueTransport(MarketDataClient):
             elif spec.venue_id == Venue.HYPERLIQUID:
                 body = {"type": "clearinghouseState", "user": self._credential.account_address if self._credential else ""}
                 raw = await self._request("POST", spec.position_path, body=body, private=True)
-                return self._parse_position(raw, venue_sym, now_ms)
+                snapshot = self._parse_position(raw, venue_sym, now_ms)
+                self._position_cache[symbol] = (snapshot, now_ms)
+                return snapshot
 
             raw = await self._request("GET", spec.position_path, params=params, private=True)
-            return self._parse_position(raw, venue_sym, now_ms)
+            snapshot = self._parse_position(raw, venue_sym, now_ms)
+            self._position_cache[symbol] = (snapshot, now_ms)
+            return snapshot
         except TransportError:
             raise
         except Exception as e:

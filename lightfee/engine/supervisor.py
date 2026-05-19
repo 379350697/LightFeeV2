@@ -631,17 +631,26 @@ class Supervisor:
         now_ms: int,
         venue_health_ratios: dict[str, float],
         adapters: Optional[dict[Venue, VenueAdapter]] = None,
+        risk_snapshot_cache: Optional[dict[Venue, dict]] = None,
     ) -> None:
         """Run supervision tick: evaluate global risk, update mode, log conditions.
 
         V1: refresh_venue_health_supervisor + recompute_global_risk_mode.
         Collects per-venue health views (including private-stream health),
         aggregates them into global risk mode via V1's supervisor_action_mode.
+
+        risk_snapshot_cache is the runtime's per-venue AccountRiskSnapshot cache,
+        populated during the current tick BEFORE this call.  Must be injected
+        before _collect_venue_health_views so the supervisor sees fresh data.
         """
         strategy = self.config.strategy
 
         if not strategy.risk_monitor_enabled:
             return
+
+        # V1: sync risk snapshot cache from runtime BEFORE health evaluation
+        if risk_snapshot_cache is not None:
+            self._risk_snapshot_cache = risk_snapshot_cache
 
         # V1: Collect per-venue health views including private-stream health
         venue_health_views: Optional[dict[Venue, VenueHealthView]] = None
