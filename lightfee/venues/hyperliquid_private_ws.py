@@ -43,7 +43,7 @@ async def _hyperliquid_hydrate(transport, private_state, symbol_map: dict[str, s
             "POST",
             "/info",
             private=False,
-            json={
+            body={
                 "type": "clearinghouseState",
                 "user": account_address,
             },
