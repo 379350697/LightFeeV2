@@ -61,6 +61,14 @@ def backoff_delay(initial_ms: int, max_ms: int, failures: int) -> int:
     return min(initial_ms * (1 << shift), max_ms)
 
 
+def compute_backoff_ms(initial_ms: int, max_ms: int, failures: int) -> int:
+    """V1 failure_backoff_delay_ms() — exp backoff with jitter for private WS reconnects."""
+    if failures <= 0:
+        return 0
+    base = backoff_delay(initial_ms, max_ms, failures)
+    return _jitter_delay(base, failures, 0x55AA)
+
+
 # ---------------------------------------------------------------------------
 # Connection health
 # ---------------------------------------------------------------------------

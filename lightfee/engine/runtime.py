@@ -81,6 +81,11 @@ class LiveRuntime:
         # V1 rate-limit reload tracking
         self._last_rate_limit_reload_ms: int = 0
 
+        # V1 private WS tracking: each venue gets workers started once.
+        # Tracked per venue to handle reconfiguration gracefully.
+        self._private_ws_started: set[Venue] = set()
+        self._private_ws_symbols: dict[Venue, set[str]] = {}
+
         # V1 per-venue risk snapshot runtime cache
         #   key: venue → {fetched_at_ms, result: OK(Optional[ARS]) | Err(str)}
         self._risk_snapshot_cache: dict[Venue, dict] = {}
@@ -1364,6 +1369,17 @@ class LiveRuntime:
 
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
         await self.l2_data_plane.stop_ws_streams()
+
+        # V1: stop private WS workers before adapter shutdown
+        for venue, adapter in list(self._venue_adapters.items()):
+            if getattr(adapter, 'supports_private_health', False):
+                transport = getattr(adapter, '_transport', None)
+                if transport is not None:
+                    transport.stop_private_ws()
+                    self.journal.append(
+                        "runtime.private_ws_stopped",
+                        {"venue": venue.value},
+                    )
 
         # V1 parity: per-adapter shutdown (cancels workers, flushes state)
         for venue, adapter in list(self._venue_adapters.items()):
@@ -4288,8 +4304,85 @@ class LiveRuntime:
     # Housekeeping
     # ------------------------------------------------------------------
 
+    def _ensure_private_ws_started(self, now_ms: int) -> None:
+        """V1: start private WS workers for live adapters when credentials/symbols ready.
+
+        Called each tick until all live adapters with private health support have
+        workers running. Tracked symbol changes trigger worker replacement.
+        Idempotent: skips venues that already have workers for the same symbol set.
+        """
+        if self.config.runtime.mode == "paper":
+            return
+
+        tracked_symbols = self._current_tracked_private_symbols()
+        for venue, adapter in self._venue_adapters.items():
+            if not getattr(adapter, 'supports_private_health', False):
+                continue
+
+            transport = getattr(adapter, '_transport', None)
+            if transport is None:
+                continue
+
+            symbols = tracked_symbols.get(venue, set())
+            prev_symbols = self._private_ws_symbols.get(venue, set())
+
+            # Start if never started or symbols changed
+            if venue not in self._private_ws_started or symbols != prev_symbols:
+                if symbols != prev_symbols and venue in self._private_ws_started:
+                    # V1: worker replacement on symbol change
+                    transport.stop_private_ws()
+
+                transport.start_private_ws(list(symbols))
+                self._private_ws_started.add(venue)
+                self._private_ws_symbols[venue] = set(symbols)
+                self.journal.append(
+                    "runtime.private_ws_started",
+                    {
+                        "venue": venue.value,
+                        "symbol_count": len(symbols),
+                    },
+                )
+
+    def _current_tracked_private_symbols(self) -> dict[Venue, set[str]]:
+        """Collect symbols that need private WS tracking from current state.
+
+        V1: symbols from primary tracked entry pairs, open positions, and
+        pending passive closes.
+        """
+        result: dict[Venue, set[str]] = {}
+
+        # from open positions — use long/short venue + symbol if present
+        for pos in self.state.open_positions.values():
+            sym = getattr(pos, 'symbol', '')
+            long_v = getattr(pos, 'long_venue', None)
+            short_v = getattr(pos, 'short_venue', None)
+            if sym:
+                if long_v is not None and isinstance(long_v, Venue):
+                    result.setdefault(long_v, set()).add(sym)
+                if short_v is not None and isinstance(short_v, Venue):
+                    result.setdefault(short_v, set()).add(sym)
+
+        # from tracked entry pairs (V1: symbols tracked for entry)
+        for pair_id in getattr(self, '_tracked_primary_pair_ids', set()):
+            parts = pair_id.split("|")
+            if len(parts) >= 3:
+                sym = parts[0]
+                try:
+                    long_v = Venue(parts[1])
+                    short_v = Venue(parts[2])
+                except ValueError:
+                    continue
+                if sym:
+                    result.setdefault(long_v, set()).add(sym)
+                    result.setdefault(short_v, set()).add(sym)
+
+        return result
+
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
+        # V1: ensure private WS workers are running for live adapters
+        self._ensure_private_ws_started(now_ms)
+
         # Risk-line supervision — V1: refresh_venue_health_supervisor + recompute_global_risk_mode
         # CRITICAL: risk_snapshot_cache must be injected BEFORE supervise() so
         # _collect_venue_health_views() sees current-tick AccountRiskSnapshot data.

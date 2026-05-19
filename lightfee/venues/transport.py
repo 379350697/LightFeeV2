@@ -35,6 +35,15 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.marketdata.private_ws import (
+    CumulativeOrderProgress,
+    PrivateOrderUpdate,
+    PrivateWsState,
+    enrich_fill_from_private,
+    lookup_or_wait_private_order,
+    lookup_or_wait_private_order_progress,
+    merge_passive_progress_sources,
+)
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.venues.common import normalize_venue_quantity
 from lightfee.venues.market_data import MarketDataClient
@@ -979,14 +988,17 @@ class VenueTransport(MarketDataClient):
         self._order_diagnostics: list[dict[str, Any]] = []
 
         # V1: private WebSocket connection health tracking.
-        # Updated externally by the private WS connection manager via
-        # record_private_ws_success() / record_private_ws_failure().
-        # Default: healthy (V1 starts healthy, becomes unhealthy after N failures).
+        # The private WS state owns the canonical health object; setup below.
         self._private_ws_health = ConnectionHealth()
 
         # V1: position cache populated by fetch_position() / fetch_all_positions()
         # Map of symbol → (PositionSnapshot, cached_at_ms)
         self._position_cache: dict[str, tuple[PositionSnapshot, int]] = {}
+
+        # V1: shared private WS state — order/position caches, health, workers.
+        # Each venue transport owns one PrivateWsState. Workers update this
+        # directly via record_order/update_position/record_connection_*.
+        self._private_ws_state = PrivateWsState()
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -1007,23 +1019,37 @@ class VenueTransport(MarketDataClient):
     def record_private_ws_success(self, now_ms: int) -> None:
         """V1: called by private WS connection on successful message/connect."""
         self._private_ws_health.record_success(now_ms)
+        self._private_ws_state.record_connection_success(now_ms)
 
     def record_private_ws_failure(self, now_ms: int, error: str, unhealthy_after: int = 5) -> None:
         """V1: called by private WS connection on failure/disconnect."""
         self._private_ws_health.record_failure(now_ms, unhealthy_after, error)
+        self._private_ws_state.record_connection_failure(now_ms, unhealthy_after, error)
 
     def cached_position(self, symbol: str) -> Optional[PositionSnapshot]:
         """V1: return cached position for a symbol (from fetch_position or private stream).
 
+        Checks private WS state first (authoritative push), then REST cache as fallback.
         Returns None if no cached position or cache is stale.
-        Used by supervisor to verify private position confirmation.
         """
+        # Private WS push is authoritative
+        now_ms = int(time.time() * 1000)
+        private_pos = self._private_ws_state.position_if_fresh(symbol, 30_000, now_ms)
+        if private_pos is not None:
+            return PositionSnapshot(
+                venue=self._spec.venue_id,
+                symbol=private_pos.symbol,
+                side=Side.BUY if private_pos.size >= 0 else Side.SELL,
+                quantity=abs(private_pos.size),
+                entry_price=0.0,
+                observed_at_ms=private_pos.updated_at_ms,
+            )
+
+        # REST fallback
         entry = self._position_cache.get(symbol)
         if entry is None:
             return None
         snapshot, cached_at_ms = entry
-        # Cache TTL: positions are refreshed every tick (~1-2s), keep 30s
-        now_ms = int(time.time() * 1000)
         if (now_ms - cached_at_ms) > 30_000:
             return None
         return snapshot
@@ -1063,6 +1089,129 @@ class VenueTransport(MarketDataClient):
             raise ValueError(
                 f"live mode requires passphrase for {self._spec.venue_id.value}"
             )
+
+    # ------------------------------------------------------------------
+    # Private WS state access
+    # ------------------------------------------------------------------
+
+    @property
+    def private_ws_state(self) -> PrivateWsState:
+        """V1: the shared PrivateWsState for this venue transport."""
+        return self._private_ws_state
+
+    # ------------------------------------------------------------------
+    # Private WS lifecycle (called by runtime)
+    # ------------------------------------------------------------------
+
+    def start_private_ws(self, symbols: list[str]) -> None:
+        """Start private WS worker(s) for tracked symbols.
+
+        Dispatches to the venue-specific private WS worker.
+        Each venue handles auth/subscribe/heartbeat/reconnect independently.
+        The worker must call record_private_ws_success/failure on real paths.
+        """
+        venue = self._spec.venue_id
+        if venue == Venue.BINANCE:
+            self._start_binance_private_ws(symbols)
+        elif venue == Venue.ASTER:
+            self._start_aster_private_ws(symbols)
+        elif venue == Venue.OKX:
+            self._start_okx_private_ws(symbols)
+        elif venue == Venue.BYBIT:
+            self._start_bybit_private_ws(symbols)
+        elif venue == Venue.BITGET:
+            self._start_bitget_private_ws(symbols)
+        elif venue == Venue.GATE:
+            self._start_gate_private_ws(symbols)
+        elif venue == Venue.HYPERLIQUID:
+            self._start_hyperliquid_private_ws(symbols)
+
+    def stop_private_ws(self) -> None:
+        """Stop all private WS workers for this venue."""
+        self._private_ws_state.abort_workers()
+
+    def private_ws_worker_count(self) -> int:
+        """V1: number of active private WS workers for this venue."""
+        return self._private_ws_state.worker_count()
+
+    # ------------------------------------------------------------------
+    # Private WS venue-specific starters (stubs — implemented in venue modules)
+    # ------------------------------------------------------------------
+
+    def _start_binance_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.binance_private_ws import start_binance_private_ws
+        start_binance_private_ws(self, symbols)
+
+    def _start_aster_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.aster_private_ws import start_aster_private_ws
+        start_aster_private_ws(self, symbols)
+
+    def _start_okx_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.okx_private_ws import start_okx_private_ws
+        start_okx_private_ws(self, symbols)
+
+    def _start_bybit_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.bybit_private_ws import start_bybit_private_ws
+        start_bybit_private_ws(self, symbols)
+
+    def _start_bitget_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.bitget_private_ws import start_bitget_private_ws
+        start_bitget_private_ws(self, symbols)
+
+    def _start_gate_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.gate_private_ws import start_gate_private_ws
+        start_gate_private_ws(self, symbols)
+
+    def _start_hyperliquid_private_ws(self, symbols: list[str]) -> None:
+        from lightfee.venues.hyperliquid_private_ws import start_hyperliquid_private_ws
+        start_hyperliquid_private_ws(self, symbols)
+
+    # ------------------------------------------------------------------
+    # Private fill / progress delegation (private-first, REST fallback)
+    # ------------------------------------------------------------------
+
+    def private_order_progress(
+        self,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        max_age_ms: int = 0,
+    ) -> Optional[CumulativeOrderProgress]:
+        """V1: get order progress from private state cache."""
+        now_ms = int(time.time() * 1000)
+        return self._private_ws_state.order_progress_if_fresh(
+            client_order_id=client_order_id,
+            order_id=order_id,
+            max_age_ms=max_age_ms,
+            wall_clock_now_ms=now_ms,
+        )
+
+    async def lookup_or_wait_private_order(
+        self,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        wait_ms: int = 0,
+    ) -> Optional[PrivateOrderUpdate]:
+        """V1: lookup or wait for a private order update."""
+        return await lookup_or_wait_private_order(
+            self._private_ws_state,
+            client_order_id=client_order_id,
+            order_id=order_id,
+            wait_ms=wait_ms,
+        )
+
+    async def lookup_or_wait_private_order_progress(
+        self,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        wait_ms: int = 0,
+    ) -> Optional[CumulativeOrderProgress]:
+        """V1: lookup or wait for private order progress."""
+        return await lookup_or_wait_private_order_progress(
+            self._private_ws_state,
+            client_order_id=client_order_id,
+            order_id=order_id,
+            wait_ms=wait_ms,
+        )
 
     @property
     def order_diagnostics(self) -> list[dict[str, Any]]:
@@ -3660,7 +3809,10 @@ class VenueTransport(MarketDataClient):
     async def query_passive_order_progress(
         self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
     ) -> Optional["PassiveOrderProgress"]:
-        """Query cumulative progress for a resting passive order."""
+        """Query cumulative progress for a resting passive order.
+
+        V1 private-first: check private WS state before REST query.
+        """
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
 
         spec = self._spec
@@ -3669,6 +3821,27 @@ class VenueTransport(MarketDataClient):
 
         if self.mode == "paper":
             return None
+
+        # Private WS first
+        private_progress = self.private_order_progress(
+            client_order_id=client_order_id,
+            order_id=order_id,
+            max_age_ms=15_000,
+        )
+        if private_progress is not None and private_progress.cumulative_quantity > 0:
+            return PassiveOrderProgress(
+                venue=spec.venue_id,
+                symbol=symbol,
+                side=Side.BUY,
+                order_id=private_progress.order_id or order_id,
+                client_order_id=private_progress.client_order_id or client_order_id or "",
+                cumulative_quantity=private_progress.cumulative_quantity,
+                average_price=private_progress.average_price or 0.0,
+                fee_quote=private_progress.fee_quote or 0.0,
+                last_fill_time_ms=private_progress.last_fill_at_ms or 0,
+                state=private_progress.state or PassiveOrderState.UNKNOWN,
+                observed_at_ms=now_ms,
+            )
 
         try:
             params: dict[str, Any] = {}
