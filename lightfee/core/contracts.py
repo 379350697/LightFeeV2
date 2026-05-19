@@ -147,6 +147,16 @@ class VenueAdapter(ABC):
         """
         return False
 
+    @property
+    def supports_private_health(self) -> bool:
+        """Whether this venue adapter can provide private-stream health data.
+
+        V1: Private health requires a working private WebSocket connection
+        and position caching. Default is False — overridden by adapters
+        that support it.
+        """
+        return False
+
     async def fetch_account_risk_snapshot(self) -> Optional[AccountRiskSnapshot]:
         """Fetch an account risk snapshot for risk health evaluation.
 
@@ -188,6 +198,22 @@ class VenueAdapter(ABC):
     def cached_private_health(self) -> Optional[dict]:
         """V1: explicitly cached copy for fail-closed scenarios."""
         return self.private_health
+
+    def cached_private_connection_health(self):
+        """V1: cached private WebSocket connection health.
+
+        Returns a ConnectionHealth object or None if not available.
+        Used by supervisor to determine if private stream is healthy.
+        """
+        return None
+
+    def cached_position(self, symbol: str):
+        """V1: cached position data from private stream for a symbol.
+
+        Returns a PositionSnapshot or None if not cached.
+        Used by supervisor to verify private position confirmation.
+        """
+        return None
 
     # --- V1 contract completeness: Passive progress ---
 

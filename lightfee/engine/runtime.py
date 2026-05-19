@@ -37,6 +37,7 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
     has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
+    build_persistent_state_view,
 )
 from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
 from lightfee.engine.supervisor import Supervisor
@@ -894,7 +895,7 @@ class LiveRuntime:
                     },
                 )
             self._sync_passive_order_manager_states()
-            self.snapshot_store.write(self.state.to_dict())
+            self.snapshot_store.write(build_persistent_state_view(self.state))
 
     async def _flatten_live_position_leg_quantity(
         self,
@@ -1384,7 +1385,7 @@ class LiveRuntime:
         # Final state snapshot
         if self.state:
             self._sync_passive_order_manager_states()
-            self.snapshot_store.write(self.state.to_dict())
+            self.snapshot_store.write(build_persistent_state_view(self.state))
 
         # Final current-state export
         now_ms = wall_clock_now_ms()
@@ -1616,6 +1617,12 @@ class LiveRuntime:
                     # drive session readiness before the selection blocker.
                     await self._sync_local_l2_data(now_ms, scan_promoted=True)
                     self._refresh_entry_l2_session_readiness(now_ms)
+                    # V1: shadow promotion — best shadow replaces worst primary
+                    # when score delta, hold window, execution guard, and readiness
+                    # all pass (execution_core/engine.rs:2643-2719)
+                    self._apply_shadow_promotion_if_eligible(
+                        tracked, now_ms,
+                    )
                 # V1: selected_candidates is a final-entry list, not the raw
                 # shortlist. It excludes candidates still waiting on the final
                 # entry window, primary L2 tracking, or dual-ready books.
@@ -2378,7 +2385,7 @@ class LiveRuntime:
 
             # --- Persist state snapshot ---
             self._sync_passive_order_manager_states()
-            self.snapshot_store.write(self.state.to_dict())
+            self.snapshot_store.write(build_persistent_state_view(self.state))
 
             # --- Sleep until next poll ---
             active_poll_ms = active_position_poll_interval_ms(
@@ -4283,8 +4290,10 @@ class LiveRuntime:
 
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
-        # Risk-line supervision
-        self.supervisor.supervise(now_ms, self.state.venue_health)
+        # Risk-line supervision — V1: refresh_venue_health_supervisor + recompute_global_risk_mode
+        self.supervisor.supervise(now_ms, self.state.venue_health, self._venue_adapters)
+        # V1: share risk snapshot cache with supervisor for venue health evaluation
+        self.supervisor._risk_snapshot_cache = self._risk_snapshot_cache
 
         # Reconciliation of pending/uncertain outcomes
         await self._reconcile_pending_state(now_ms)
@@ -4950,6 +4959,117 @@ class LiveRuntime:
             else:
                 task_pair_id = getattr(task, "pair_id", "")
             if str(task_pair_id) == pair_id:
+                return True
+        return False
+
+    def _apply_shadow_promotion_if_eligible(
+        self, tracked: list, now_ms: int,
+    ) -> None:
+        """V1: shadow_promotion swap — best shadow replaces worst primary.
+
+        Rejects promotion when primary is executing, shadow not ready,
+        score delta insufficient, or hold window not elapsed.
+        Logs primary_hold_blocked when score qualifies but hold blocks.
+        (execution_core/engine.rs:2643-2719)
+        """
+        if not tracked:
+            return
+
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunityClass,
+            primary_hold_window_allows_replacement,
+            shadow_promotion_is_eligible,
+        )
+
+        tracked_lookup = {t.pair_id: t for t in tracked}
+        primaries = [t for t in tracked if t.class_ == TrackedOpportunityClass.PRIMARY]
+        shadows = [t for t in tracked if t.class_ == TrackedOpportunityClass.SHADOW]
+
+        if not primaries or not shadows:
+            return
+
+        score_delta_bps = getattr(
+            self.config.strategy,
+            "shadow_promotion_score_delta_bps",
+            5.0,
+        )
+        primary_min_hold_ms = getattr(
+            self.config.strategy, "primary_min_hold_ms", 30_000,
+        )
+
+        best_shadow = max(shadows, key=lambda t: t.ranking_edge_bps)
+        worst_primary = min(primaries, key=lambda t: t.ranking_edge_bps)
+
+        primary_session = self.entry_l2_sessions.sessions.get(worst_primary.pair_id)
+        primary_assigned_at = (
+            primary_session.primary_assigned_at_ms if primary_session else 0
+        )
+
+        shadow_session = self.entry_l2_sessions.sessions.get(best_shadow.pair_id)
+        shadow_ready = (
+            shadow_session.state.value == "ready" if shadow_session else False
+        )
+        primary_executing = self._tracked_pair_is_executing(worst_primary.pair_id)
+
+        hold_allows = primary_hold_window_allows_replacement(
+            primary_assigned_at, now_ms, primary_min_hold_ms)
+
+        eligible = shadow_promotion_is_eligible(
+            primary=worst_primary,
+            shadow=best_shadow,
+            primary_assigned_at_ms=primary_assigned_at,
+            now_ms=now_ms,
+            primary_min_hold_ms=primary_min_hold_ms,
+            shadow_promotion_score_delta_bps=score_delta_bps,
+            primary_executing=primary_executing,
+            shadow_ready=shadow_ready,
+        )
+
+        if eligible:
+            if worst_primary.pair_id in self._tracked_primary_pair_ids:
+                self._tracked_primary_pair_ids.discard(worst_primary.pair_id)
+            self._tracked_primary_pair_ids.add(best_shadow.pair_id)
+            best_shadow.class_ = TrackedOpportunityClass.PRIMARY
+            worst_primary.class_ = TrackedOpportunityClass.SHADOW
+            if shadow_session:
+                shadow_session.shadow_promoted_at_ms = now_ms
+            self.journal.append(
+                "runtime.entry_local_l2_primary_changed",
+                {
+                    "promoted_pair_id": best_shadow.pair_id,
+                    "demoted_pair_id": worst_primary.pair_id,
+                    "reason": "shadow_promotion",
+                    "ts_ms": now_ms,
+                },
+            )
+        else:
+            score_delta = best_shadow.ranking_edge_bps - worst_primary.ranking_edge_bps
+            if score_delta >= score_delta_bps and not hold_allows:
+                self.journal.append(
+                    "runtime.entry_local_l2_shadow_blocked",
+                    {
+                        "shadow_pair_id": best_shadow.pair_id,
+                        "primary_pair_id": worst_primary.pair_id,
+                        "reason": "primary_hold_window",
+                        "ts_ms": now_ms,
+                    },
+                )
+
+    def _tracked_pair_is_executing(self, pair_id: str) -> bool:
+        """Check if a tracked pair has a pending entry currently executing.
+
+        V1: tracked_entry_local_l2_is_executing (engine.rs).
+        """
+        parts = pair_id.split(":", 2)
+        if len(parts) < 3:
+            return False
+        long_v, short_v, symbol = parts[0], parts[1], parts[2]
+        for pending in self.state.pending_entries.values():
+            if (
+                pending.symbol == symbol
+                and pending.long_venue.value == long_v
+                and pending.short_venue.value == short_v
+            ):
                 return True
         return False
 

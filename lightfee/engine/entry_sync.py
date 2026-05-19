@@ -857,6 +857,24 @@ def _adapter_supports_amend(adapter) -> bool:
     return True
 
 
+def _flush_adapter_diagnostics(adapter, journal) -> None:
+    """Flush transport order diagnostics into the journal.
+
+    V1: after every adapter order operation, drain transport diagnostics
+    so order.submit_attempt, order.submit_result, and normalization evidence
+    land in the journal observability stream.
+    """
+    transport = getattr(adapter, "_transport", adapter)
+    drain = getattr(transport, "drain_order_diagnostics", None)
+    if not callable(drain):
+        return
+    for event in drain():
+        kind = event.get("kind", "")
+        payload = event.get("payload", {})
+        if isinstance(kind, str) and isinstance(payload, dict):
+            journal.append(kind, payload)
+
+
 async def drive_pending_entry_hedge(
     entry_id: str,
     pending,
@@ -932,6 +950,7 @@ async def drive_pending_entry_hedge(
         )
         try:
             fill = await adapter.amend_order(amend_req)
+            _flush_adapter_diagnostics(adapter, journal)
             if fill.quantity > 0:
                 journal.append(
                     "entry.hedge_drive_reprice",
@@ -964,6 +983,7 @@ async def drive_pending_entry_hedge(
                 order_id=maker_order_id,
                 client_order_id=getattr(pending, 'maker_client_order_id', None) or None,
             )
+            _flush_adapter_diagnostics(adapter, journal)
         except NotImplementedError:
             # Adapter doesn't support cancel_passive_order → try legacy cancel_order
             cancel_req = OrderRequest(
@@ -978,6 +998,7 @@ async def drive_pending_entry_hedge(
             )
             try:
                 await adapter.cancel_order(cancel_req)
+                _flush_adapter_diagnostics(adapter, journal)
             except Exception as e2:
                 journal.append(
                     "entry.hedge_drive_cancel_replace_cancel_failed",
@@ -1027,6 +1048,7 @@ async def drive_pending_entry_hedge(
         # V1: replacement maker is always post_only → submit_passive_order (ACK-based)
         try:
             ack = await adapter.submit_passive_order(new_req)
+            _flush_adapter_diagnostics(adapter, journal)
             journal.append(
                 "entry.hedge_drive_cancel_replace",
                 {"entry_id": entry_id, "action": "cancel_replace",

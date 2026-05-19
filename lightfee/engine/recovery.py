@@ -784,18 +784,21 @@ def recover_from_snapshot(
     if journal_records:
         _apply_journal_replay_to_state(state, journal_records)
 
-    for pid in snapshot_position_ids:
-        if pid in state.open_positions:
-            pos = state.open_positions[pid]
-            _try_emit_recovery(journal, "recovery.live_detected", {
-                "position_id": pid,
-                "symbol": pos.symbol,
-                "long_venue": pos.long_venue.value if hasattr(pos.long_venue, 'value') else str(pos.long_venue),
-                "short_venue": pos.short_venue.value if hasattr(pos.short_venue, 'value') else str(pos.short_venue),
-                "quantity": pos.matched_quantity,
-                "long_quantity": pos.long_quantity,
-                "short_quantity": pos.short_quantity,
-            })
+    # Emit recovery.live_detected for ALL open positions after replay:
+    # - positions from snapshot that survived replay
+    # - positions newly created by journal replay (entry.opened events)
+    for pid, pos in state.open_positions.items():
+        source = "snapshot" if pid in snapshot_position_ids else "journal_replay"
+        _try_emit_recovery(journal, "recovery.live_detected", {
+            "position_id": pid,
+            "symbol": pos.symbol,
+            "long_venue": pos.long_venue.value if hasattr(pos.long_venue, 'value') else str(pos.long_venue),
+            "short_venue": pos.short_venue.value if hasattr(pos.short_venue, 'value') else str(pos.short_venue),
+            "quantity": pos.matched_quantity,
+            "long_quantity": pos.long_quantity,
+            "short_quantity": pos.short_quantity,
+            "source": source,
+        })
 
     # Remove positions that became flat after journal replay (were in snapshot but closed in journal)
     for pid in snapshot_position_ids:

@@ -89,10 +89,11 @@ class Journal:
         """Scan journal records matching given event kinds.
 
         Rust V1: scan_records_matching_kinds() in journal_bridge.rs.
-        Filters records by kind during read — more efficient than reading
-        all records and filtering post-hoc for offline replay.
+        Uses stream_records() to avoid materializing the entire journal
+        in memory before filtering.
         """
-        return [r for r in self.read_all() if r.get("kind", "") in kinds]
+        kind_set = set(kinds)
+        return [r for r in self.stream_records() if r.get("kind", "") in kind_set]
 
     def read_all(self) -> list[dict[str, Any]]:
         """Read all journal records. Returns list of parsed dicts."""

@@ -397,6 +397,9 @@ class PendingPassiveClose:
     next_retry_at_ms: int = 0
     multi_phase_started_at_ms: int = 0
     created_cycle: int = 0
+    # V1: ops token bucket rate limiting for passive close maintenance
+    ops_count_this_window: int = 0
+    ops_window_started_at_ms: int = 0
 
     def current_chunk_quantity(self) -> float:
         if self.active_chunk_index < len(self.chunk_quantities):

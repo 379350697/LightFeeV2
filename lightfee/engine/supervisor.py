@@ -11,13 +11,19 @@ from __future__ import annotations
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
+from lightfee.core.contracts import VenueAdapter
+from lightfee.core.domain import Venue
 from lightfee.engine.close_executor import CloseExecutor
 from lightfee.engine.risk_actions import (
+    AccountRiskSnapshot,
     PositionRiskView,
     RiskExecutionPlan,
     RiskExecutionPlanKind,
+    VenueHealthAction,
+    VenueHealthView,
     build_risk_execution_plan,
     evaluate_position_risk,
+    evaluate_venue_health,
 )
 from lightfee.engine.state import EngineState, OpenPosition
 from lightfee.persistence.journal import Journal
@@ -43,19 +49,205 @@ class Supervisor:
         self.state = state
         self.journal = journal
         self.close_executor = close_executor
+        # V1: current_venue_health_views (risk.rs)
+        self._venue_health_views: dict[Venue, VenueHealthView] = {}
+        # V1: per-venue risk snapshot cache (set by runtime before each tick)
+        self._risk_snapshot_cache: dict[Venue, dict] = {}
 
     # ------------------------------------------------------------------
     # Per-venue health → global risk mode
     # ------------------------------------------------------------------
 
-    def update_global_risk_mode(self, venue_health_ratios: dict[str, float]) -> GlobalRiskMode:
-        """Recompute global risk mode from venue health and risk view signals.
+    def _supervisor_action_mode(self, action: VenueHealthAction) -> GlobalRiskMode:
+        """Map VenueHealthAction to GlobalRiskMode with per-line config gating.
 
-        V1: recompute_global_risk_mode aggregates all venue health views.
+        V1: supervisor_action_mode (state.rs:443-473).
         """
         strategy = self.config.strategy
-        health = evaluate_risk_health(venue_health_ratios, strategy)
+        if action == VenueHealthAction.NORMAL:
+            return GlobalRiskMode.RUNNING
+        elif action == VenueHealthAction.PAUSE_ENTRY:
+            if strategy.warning_line_enabled:
+                return GlobalRiskMode.ENTRY_PAUSED
+            return GlobalRiskMode.RUNNING
+        elif action == VenueHealthAction.REDUCE_ONLY:
+            if strategy.delever_line_enabled:
+                return GlobalRiskMode.REDUCE_ONLY
+            elif strategy.warning_line_enabled:
+                return GlobalRiskMode.ENTRY_PAUSED
+            return GlobalRiskMode.RUNNING
+        elif action == VenueHealthAction.FAIL_CLOSED:
+            if strategy.death_line_enabled:
+                return GlobalRiskMode.FAIL_CLOSED
+            elif strategy.delever_line_enabled:
+                return GlobalRiskMode.REDUCE_ONLY
+            elif strategy.warning_line_enabled:
+                return GlobalRiskMode.ENTRY_PAUSED
+            return GlobalRiskMode.RUNNING
+        return GlobalRiskMode.RUNNING
 
+    def _collect_venue_health_views(
+        self,
+        now_ms: int,
+        adapters: dict[Venue, VenueAdapter],
+    ) -> dict[Venue, VenueHealthView]:
+        """Evaluate per-venue health including private-stream health.
+
+        V1: refresh_venue_health_supervisor (risk.rs:151-255).
+        Iterates supervised venues, fetches risk snapshots & private health,
+        calls evaluate_venue_health(), detects transitions.
+        """
+        views: dict[Venue, VenueHealthView] = {}
+        strategy = self.config.strategy
+
+        if not strategy.risk_monitor_enabled:
+            return views
+
+        supervised = self._supervised_venues()
+        for venue in supervised:
+            adapter = adapters.get(venue)
+            if adapter is None:
+                continue
+
+            # Risk snapshot
+            risk_snapshot = self._fetch_risk_snapshot_for_venue(venue, adapter, now_ms)
+
+            # Private health
+            supports_private = adapter.supports_private_health
+            private_conn_healthy: Optional[bool] = None
+            private_pos_confirmed: bool = True
+
+            if supports_private:
+                # V1: adapter.cached_private_connection_health()
+                conn_health = adapter.cached_private_connection_health()
+                if conn_health is not None:
+                    private_conn_healthy = not conn_health.is_unhealthy()
+                # Position confirmation: for each active position on this venue,
+                # check if private stream has cached position data
+                active_on_venue = [
+                    pos for pos in self.state.open_positions.values()
+                    if pos.long_venue == venue or pos.short_venue == venue
+                ]
+                if active_on_venue:
+                    private_pos_confirmed = all(
+                        self._venue_private_position_confirmed(venue, pos.symbol, adapter)
+                        for pos in active_on_venue
+                    )
+
+            view = evaluate_venue_health(
+                strategy=strategy,
+                venue=venue,
+                now_ms=now_ms,
+                supports_risk_health=adapter.supports_risk_health,
+                risk_snapshot=risk_snapshot,
+                supports_private_health=supports_private,
+                private_connection_healthy=private_conn_healthy,
+                private_position_confirmed=private_pos_confirmed,
+            )
+
+            # V1: detect transition to private_stream_unhealthy
+            previous = self._venue_health_views.get(venue)
+            private_became_unhealthy = (
+                (previous is None or "private_stream_unhealthy" not in previous.reasons)
+                and "private_stream_unhealthy" in view.reasons
+            )
+            if private_became_unhealthy:
+                self.journal.append(
+                    "risk.ws_disconnect",
+                    {"venue": venue.value, "reasons": view.reasons, "ts_ms": now_ms},
+                )
+
+            if previous is None or previous.action != view.action or set(previous.reasons) != set(view.reasons):
+                self.journal.append(
+                    "venue.health_changed",
+                    {
+                        "venue": venue.value,
+                        "action": view.action.value,
+                        "health_ratio": view.health_ratio,
+                        "degraded": view.degraded,
+                        "reasons": view.reasons,
+                        "order_health_risk_score": view.order_health_risk_score,
+                    },
+                )
+
+            views[venue] = view
+
+        self._venue_health_views = views
+        return views
+
+    def _supervised_venues(self) -> set[Venue]:
+        """Collect unique venues from open positions and pending reconciliations.
+
+        V1: supervised_venues (risk.rs:257-268).
+        """
+        venues: set[Venue] = set()
+        for pos in self.state.open_positions.values():
+            venues.add(pos.long_venue)
+            venues.add(pos.short_venue)
+        for rec in self.state.pending_close_reconciliations:
+            venues.add(rec.get("position_snapshot", {}).get("long_venue", Venue.BINANCE))
+            venues.add(rec.get("position_snapshot", {}).get("short_venue", Venue.BINANCE))
+        return venues
+
+    def _fetch_risk_snapshot_for_venue(
+        self, venue: Venue, adapter: VenueAdapter, now_ms: int
+    ) -> Optional[AccountRiskSnapshot]:
+        """Fetch account risk snapshot from the runtime cache.
+
+        V1: fetch_account_risk_with_runtime_cache (risk.rs:169-188).
+        The runtime populates self._risk_snapshot_cache before each supervision tick.
+        """
+        if not adapter.supports_risk_health:
+            return None
+        entry = self._risk_snapshot_cache.get(venue)
+        if entry is None:
+            return None
+        result = entry.get("result")
+        if result is None:
+            return None
+        if isinstance(result, AccountRiskSnapshot):
+            return result
+        # result may be an error string (V1 Err variant) — treat as None
+        return None
+
+    def _venue_private_position_confirmed(
+        self, venue: Venue, symbol: str, adapter: VenueAdapter
+    ) -> bool:
+        """Check if private stream has confirmed a position for this venue+symbol.
+
+        V1: venue_private_position_confirmed (execution_core/engine.rs:4829-4843).
+        - No private health support → skip check (True)
+        - No cached connection health → not yet connected, skip check (True)
+        - Connection unhealthy → not confirmed (False)
+        - Connection healthy + cached position → confirmed (True)
+        - Connection healthy + no cached position → not confirmed (False)
+        """
+        if not adapter.supports_private_health:
+            return True
+        conn_health = adapter.cached_private_connection_health()
+        if conn_health is None:
+            # V1: no cached health → private stream never connected / not yet available
+            return True
+        if conn_health.is_unhealthy():
+            return False
+        cached_pos = adapter.cached_position(symbol)
+        return cached_pos is not None
+
+    def update_global_risk_mode(
+        self,
+        venue_health_ratios: dict[str, float],
+        venue_health_views: Optional[dict[Venue, VenueHealthView]] = None,
+    ) -> GlobalRiskMode:
+        """Recompute global risk mode from venue health views and risk ratios.
+
+        V1: derive_global_risk_mode (state.rs:398-441) + recompute_global_risk_mode.
+        Aggregates per-venue VenueHealthView actions via supervisor_action_mode(),
+        taking the max across all venues.
+        """
+        strategy = self.config.strategy
+
+        # V1: Start from health-ratio-based evaluation as baseline
+        health = evaluate_risk_health(venue_health_ratios, strategy)
         new_mode = GlobalRiskMode.RUNNING
 
         if health.death_condition and strategy.death_line_enabled:
@@ -65,6 +257,16 @@ class Supervisor:
         elif health.warning_condition and strategy.warning_line_enabled:
             if strategy.warning_pause_new_entries_enabled:
                 new_mode = GlobalRiskMode.ENTRY_PAUSED
+
+        # V1: Aggregate per-venue health views — each venue's health action
+        # maps to a candidate GlobalRiskMode, take the max
+        if venue_health_views and strategy.risk_monitor_enabled:
+            for view in venue_health_views.values():
+                candidate = self._supervisor_action_mode(view.action)
+                if candidate.at_least(new_mode) and candidate != new_mode:
+                    new_mode = candidate
+                    reason = view.reasons[0] if view.reasons else f"venue_health:{view.venue.value}"
+                    self.state.global_risk_reason = reason
 
         old_mode = self.state.risk_mode
 
@@ -428,20 +630,26 @@ class Supervisor:
         self,
         now_ms: int,
         venue_health_ratios: dict[str, float],
+        adapters: Optional[dict[Venue, VenueAdapter]] = None,
     ) -> None:
         """Run supervision tick: evaluate global risk, update mode, log conditions.
 
-        Per-position risk plans are built via supervise_position() and executed
-        via execute_risk_plan() — these are called separately so the runtime
-        can control async execution order.
+        V1: refresh_venue_health_supervisor + recompute_global_risk_mode.
+        Collects per-venue health views (including private-stream health),
+        aggregates them into global risk mode via V1's supervisor_action_mode.
         """
         strategy = self.config.strategy
 
         if not strategy.risk_monitor_enabled:
             return
 
-        # Update global risk mode from aggregate health
-        self.update_global_risk_mode(venue_health_ratios)
+        # V1: Collect per-venue health views including private-stream health
+        venue_health_views: Optional[dict[Venue, VenueHealthView]] = None
+        if adapters:
+            venue_health_views = self._collect_venue_health_views(now_ms, adapters)
+
+        # Update global risk mode from aggregate health + venue health views
+        self.update_global_risk_mode(venue_health_ratios, venue_health_views)
 
         # Log risk line triggers (informational — real actions happen per-position)
         health = evaluate_risk_health(venue_health_ratios, strategy)

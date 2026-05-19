@@ -199,6 +199,26 @@ class PassiveCloseExecutor:
     def _profile(self, venue: Venue) -> PassiveCloseManagerProfile:
         return PassiveCloseManagerProfile()
 
+    def _ops_token_available(
+        self, pending: PendingPassiveClose, profile: PassiveCloseManagerProfile, now_ms: int
+    ) -> bool:
+        """V1: ops token bucket check for passive close maintenance.
+
+        Simple fixed-window counter: resets only when the full window expires.
+        Cooldown_ms determines the retry delay after budget exhaustion, NOT
+        a sub-window counter reset.
+        """
+        window_ms = profile.ops_budget_window_ms
+        if pending.ops_window_started_at_ms <= 0:
+            return True
+        elapsed = now_ms - pending.ops_window_started_at_ms
+        if elapsed >= window_ms:
+            # Full window expired — reset counter
+            pending.ops_count_this_window = 0
+            pending.ops_window_started_at_ms = now_ms
+            return True
+        return pending.ops_count_this_window < profile.ops_budget_per_window
+
     # ------------------------------------------------------------------
     # Start
     # ------------------------------------------------------------------
@@ -1012,6 +1032,28 @@ class PassiveCloseExecutor:
 
         if price_distance_bps < profile.amend_threshold_bps:
             return  # hold: within amend threshold
+
+        # V1: ops token bucket rate limiting before any amend or cancel-replace
+        if not self._ops_token_available(pending, profile, now_ms):
+            self._journal.append(
+                "exit.passive_close_maintain_rate_limited",
+                {
+                    "position_id": pid,
+                    "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "ops_count": pending.ops_count_this_window,
+                    "ops_budget": profile.ops_budget_per_window,
+                    "reason": "ops_token_exhausted",
+                },
+            )
+            pending.next_retry_at_ms = max(pending.next_retry_at_ms, now_ms + profile.cooldown_ms)
+            return
+
+        # Consume ops token BEFORE the operation — every attempt counts
+        # against the budget, whether it succeeds or fails.
+        pending.ops_count_this_window += 1
+        if pending.ops_window_started_at_ms <= 0:
+            pending.ops_window_started_at_ms = now_ms
 
         # Decide amend vs cancel-replace
         if price_distance_bps < profile.cancel_replace_threshold_bps:
