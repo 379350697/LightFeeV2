@@ -137,12 +137,14 @@ def _parse_okx_order_data(
     row: dict[str, Any],
     symbol_map: dict[str, str],
     private_state,
+    ct_val_map: dict[str, float],
 ) -> None:
-    """V1 OKX orders channel handler."""
+    """V1 OKX orders channel handler — ctVal conversion contracts→base."""
     venue_symbol = row.get("instId", "")
     symbol = symbol_map.get(venue_symbol)
     if symbol is None:
         return
+    ct_val = ct_val_map.get(venue_symbol, 1.0)
 
     order_id = str(row.get("ordId", ""))
     client_order_id = row.get("clOrdId", "")
@@ -151,12 +153,12 @@ def _parse_okx_order_data(
     else:
         client_order_id = None
 
-    # V1: accFillSz / fillSz for cumulative filled
+    # V1: accFillSz / fillSz for cumulative filled (in contracts)
     acc_fill = row.get("accFillSz")
     if acc_fill is None or acc_fill == "":
         acc_fill = row.get("fillSz", "0")
     filled_contracts = float(acc_fill or 0)
-    filled_qty = abs(filled_contracts)
+    filled_qty = abs(filled_contracts) * ct_val
 
     # V1: avgPx > fillPx
     avg_px_str = (
@@ -210,8 +212,12 @@ def _parse_okx_position_data(
     rows: list[dict[str, Any]],
     symbol_map: dict[str, str],
     private_state,
+    ct_val_map: dict[str, float],
 ) -> None:
-    """V1 OKX positions channel handler — net position aggregation."""
+    """V1 OKX positions channel handler — net position aggregation.
+
+    Contracts→base conversion via ctVal (V1: positions_by_symbol * ct_val).
+    """
     net_positions: dict[str, float] = {}
     updated_at_ms = _now_ms()
     for row in rows:
@@ -219,6 +225,7 @@ def _parse_okx_position_data(
         symbol = symbol_map.get(venue_symbol)
         if symbol is None:
             continue
+        ct_val = ct_val_map.get(venue_symbol, 1.0)
 
         # V1: use uTime from first row
         ts_str = row.get("uTime") or row.get("cTime")
@@ -238,7 +245,8 @@ def _parse_okx_position_data(
         else:
             signed = contracts
 
-        net_positions[symbol] = net_positions.get(symbol, 0.0) + signed
+        # V1: convert contracts to base quantity
+        net_positions[symbol] = net_positions.get(symbol, 0.0) + signed * ct_val
 
     loop = asyncio.get_running_loop()
     for symbol, size in net_positions.items():
@@ -251,6 +259,7 @@ def handle_okx_private_message(
     subscribe_messages: list[str],
     raw: str,
     subscribed: bool = False,
+    ct_val_map: Optional[dict[str, float]] = None,
 ) -> tuple[Optional[list[str]], bool]:
     """V1 handle_okx_private_message() — returns subscribe payloads if needed.
 
@@ -292,9 +301,9 @@ def handle_okx_private_message(
     if channel == "orders":
         for row in data:
             if isinstance(row, dict):
-                _parse_okx_order_data(row, symbol_map, private_state)
+                _parse_okx_order_data(row, symbol_map, private_state, ct_val_map or {})
     elif channel == "positions":
-        _parse_okx_position_data(data, symbol_map, private_state)
+        _parse_okx_position_data(data, symbol_map, private_state, ct_val_map or {})
 
     return None, subscribed
 
@@ -330,6 +339,7 @@ async def _okx_private_ws_loop(
     unhealthy_after_failures: int,
     reconnect_initial_ms: int,
     reconnect_max_ms: int,
+    ct_val_map: Optional[dict[str, float]] = None,
 ) -> None:
     """V1 OKX private WS loop — connect, login, subscribe, message + watchdog loop."""
     from lightfee.marketdata.resilience import compute_backoff_ms
@@ -456,6 +466,7 @@ async def _okx_private_ws_loop(
                     subscribe_messages,
                     message,
                     subscribed,
+                    ct_val_map,
                 )
 
                 if to_send:
@@ -486,6 +497,29 @@ async def _okx_private_ws_loop(
         await asyncio.sleep(delay / 1000.0)
 
 
+def _build_okx_ct_val_map(transport, symbol_map: dict[str, str]) -> dict[str, float]:
+    """V1: build ct_val map from contract metadata — vendor_sym → ct_val.
+
+    V1 okx_ct_val_map_from_cached_metadata() (okx.rs:5791-5805):
+    - metadata is keyed by canonical symbol, but may also be keyed by vendor sym
+    - priority: canonical symbol lookup first, vendor key fallback
+    - every inst_id defaults to ct_val=1.0
+    """
+    ct_val_map: dict[str, float] = {}
+    metadata = getattr(transport, '_symbol_metadata', {}) or {}
+    for vendor_sym, canonical_sym in symbol_map.items():
+        # V1: priority lookup by canonical symbol, vendor fallback
+        meta = metadata.get(canonical_sym) or metadata.get(vendor_sym) or {}
+        ct_val = float(meta.get('ct_val', 0) or 0)
+        if ct_val > 0:
+            ct_val_map[vendor_sym] = ct_val
+    # V1: every inst_id defaults to 1.0
+    for vendor_sym in symbol_map:
+        if vendor_sym not in ct_val_map:
+            ct_val_map[vendor_sym] = 1.0
+    return ct_val_map
+
+
 def start_okx_private_ws(transport, symbols: list[str]) -> None:
     """V1 start_private_ws() for OKX."""
     credential = transport._credential
@@ -502,6 +536,7 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
     private_state = transport._private_ws_state
 
     symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    ct_val_map = _build_okx_ct_val_map(transport, symbol_map)
 
     task = asyncio.create_task(
         _okx_private_ws_loop(
@@ -515,6 +550,7 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
             unhealthy_after_failures=5,
             reconnect_initial_ms=1_000,
             reconnect_max_ms=60_000,
+            ct_val_map=ct_val_map,
         )
     )
     private_state.push_worker(task)

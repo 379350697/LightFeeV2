@@ -2926,10 +2926,14 @@ class LiveRuntime:
             return True
 
         try:
+            maker_side = getattr(pending, 'maker_side', None)
+            if callable(maker_side):
+                maker_side = maker_side()
             progress = await adapter.query_passive_order_progress(
                 symbol=pending.symbol,
                 order_id=getattr(pending, "maker_order_id", "") or "",
                 client_order_id=getattr(pending, "maker_client_order_id", "") or None,
+                side=maker_side if isinstance(maker_side, Side) else None,
             )
         except Exception as e:
             self.journal.append(
@@ -4326,6 +4330,21 @@ class LiveRuntime:
             symbols = tracked_symbols.get(venue, set())
             prev_symbols = self._private_ws_symbols.get(venue, set())
 
+            # V1: empty symbols → stop any existing workers, clear tracking
+            if not symbols:
+                if prev_symbols:
+                    transport.stop_private_ws()
+                    self._private_ws_started.discard(venue)
+                    self._private_ws_symbols.pop(venue, None)
+                    self.journal.append(
+                        "runtime.private_ws_stopped",
+                        {
+                            "venue": venue.value,
+                            "reason": "no tracked symbols",
+                        },
+                    )
+                continue
+
             # Start if never started or symbols changed
             if venue not in self._private_ws_started or symbols != prev_symbols:
                 if symbols != prev_symbols and venue in self._private_ws_started:
@@ -4363,18 +4382,69 @@ class LiveRuntime:
                     result.setdefault(short_v, set()).add(sym)
 
         # from tracked entry pairs (V1: symbols tracked for entry)
+        # pair_id format: "{symbol.lower()}:{long_venue}->{short_venue}"
+        # (see entry_local_l2.py:make_candidate_pair_id)
+        # IMPORTANT: make_candidate_pair_id() lowercases the symbol for stable
+        # identity, so we must canonicalize it back to V2 internal uppercase
+        # (e.g. "ethusdt" → "ETHUSDT") before passing to venue private WS.
         for pair_id in getattr(self, '_tracked_primary_pair_ids', set()):
-            parts = pair_id.split("|")
-            if len(parts) >= 3:
-                sym = parts[0]
+            if not pair_id:
+                continue
+            # Try canonical format first: "sym:long->short"
+            sym = ""
+            long_v = None
+            short_v = None
+            if "->" in pair_id:
                 try:
-                    long_v = Venue(parts[1])
-                    short_v = Venue(parts[2])
-                except ValueError:
-                    continue
-                if sym:
+                    before_arrow, short_str = pair_id.rsplit("->", 1)
+                    sym, long_str = before_arrow.split(":", 1)
+                    sym = sym.upper()  # canonical V2 symbol (was lowercased by make_candidate_pair_id)
+                    long_v = Venue(long_str)
+                    short_v = Venue(short_str)
+                except (ValueError, KeyError):
+                    pass
+            # Fallback: pipe-delimited format (backward compat / tests)
+            if long_v is None:
+                parts = pair_id.split("|")
+                if len(parts) >= 3:
+                    sym = parts[0].upper()  # canonical V2 symbol
+                    try:
+                        long_v = Venue(parts[1])
+                        short_v = Venue(parts[2])
+                    except ValueError:
+                        continue
+            if long_v is not None and short_v is not None and sym:
+                result.setdefault(long_v, set()).add(sym)
+                result.setdefault(short_v, set()).add(sym)
+
+        # from pending entries (entries being executed that haven't opened yet)
+        for entry in getattr(self.state, 'pending_entries', {}).values():
+            sym = getattr(entry, 'symbol', '')
+            long_v = getattr(entry, 'long_venue', None)
+            short_v = getattr(entry, 'short_venue', None)
+            if sym:
+                if long_v is not None and isinstance(long_v, Venue):
                     result.setdefault(long_v, set()).add(sym)
+                if short_v is not None and isinstance(short_v, Venue):
                     result.setdefault(short_v, set()).add(sym)
+
+        # from pending passive closes (maker legs need private WS for progress)
+        for pclose in getattr(self.state, 'pending_passive_closes', {}).values():
+            pos = getattr(pclose, 'position_snapshot', None)
+            # V1: when position_snapshot is not set, try to resolve from open_positions
+            if pos is None:
+                pid = getattr(pclose, 'position_id', '')
+                if pid:
+                    pos = self.state.open_positions.get(pid)
+            if pos is not None:
+                sym = getattr(pos, 'symbol', '')
+                long_v = getattr(pos, 'long_venue', None)
+                short_v = getattr(pos, 'short_venue', None)
+                if sym:
+                    if long_v is not None and isinstance(long_v, Venue):
+                        result.setdefault(long_v, set()).add(sym)
+                    if short_v is not None and isinstance(short_v, Venue):
+                        result.setdefault(short_v, set()).add(sym)
 
         return result
 

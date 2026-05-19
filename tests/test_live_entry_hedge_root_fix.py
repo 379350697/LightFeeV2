@@ -1731,6 +1731,7 @@ class _FakeVenueAdapter:
         symbol: str,
         order_id: str,
         client_order_id: str | None = None,
+        side = None,
     ) -> PassiveOrderProgress | None:
         self._query_passive_progress_calls.append((symbol, order_id, client_order_id))
         if self.query_passive_progress_raises is not None:

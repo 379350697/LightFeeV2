@@ -3808,10 +3808,14 @@ class VenueTransport(MarketDataClient):
 
     async def query_passive_order_progress(
         self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
+        side: "Side | None" = None,
     ) -> Optional["PassiveOrderProgress"]:
         """Query cumulative progress for a resting passive order.
 
         V1 private-first: check private WS state before REST query.
+        Private updates are authoritative even with zero fill when they carry
+        terminal state (CANCELED, REJECTED, EXPIRED). Side is best-effort
+        from caller context; falls back to BUY when unknown.
         """
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
 
@@ -3828,11 +3832,17 @@ class VenueTransport(MarketDataClient):
             order_id=order_id,
             max_age_ms=15_000,
         )
-        if private_progress is not None and private_progress.cumulative_quantity > 0:
+        if private_progress is not None:
+            # V1: return private progress regardless of fill quantity.
+            # Terminal states (CANCELED/REJECTED/EXPIRED) with 0 fill are
+            # authoritative evidence the maker order is done.
+            # OPEN with 0 fill confirms the private WS sees the order.
+            # REST is only a fallback when private data is absent or stale.
+            resolved_side = side or Side.BUY
             return PassiveOrderProgress(
                 venue=spec.venue_id,
                 symbol=symbol,
-                side=Side.BUY,
+                side=resolved_side,
                 order_id=private_progress.order_id or order_id,
                 client_order_id=private_progress.client_order_id or client_order_id or "",
                 cumulative_quantity=private_progress.cumulative_quantity,

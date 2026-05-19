@@ -22,6 +22,7 @@ from lightfee.core.domain import (
     PassiveOrderProgress,
     PerpLiquiditySnapshot,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
 )
@@ -361,12 +362,14 @@ class VenueAdapter(ABC):
         symbol: str,
         order_id: str,
         client_order_id: Optional[str] = None,
+        side: "Side | None" = None,
     ) -> Optional[PassiveOrderProgress]:
         """Query cumulative progress for a resting passive order."""
         transport = getattr(self, '_transport', None)
         if transport is not None and hasattr(transport, 'query_passive_order_progress'):
             return await transport.query_passive_order_progress(
                 symbol=symbol, order_id=order_id, client_order_id=client_order_id,
+                side=side,
             )
         raise NotImplementedError(
             f"query_passive_order_progress not implemented for {self.venue.value}"

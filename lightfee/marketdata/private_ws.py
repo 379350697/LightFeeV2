@@ -681,3 +681,86 @@ def merge_passive_progress_sources(
     """
     candidates = [c for c in [reconciliation, rest, private] if c is not None]
     return resolve_cumulative_order_progress(candidates)
+
+
+# ---------------------------------------------------------------------------
+# PrivateWsClientState / PrivateWsEvent / PrivateWsEventKind (test compatibility)
+#
+# These are lightweight compatibility types used by tests/test_ws_resilience.py
+# to exercise private-stream health and fill buffering without a full WS worker.
+# They are NOT used in production — production uses PrivateWsState + venue workers.
+# ---------------------------------------------------------------------------
+
+from enum import Enum
+
+
+class PrivateWsEventKind(Enum):
+    """Event kind discriminator for private WS events (test compatibility)."""
+    ORDER_ACK = "order_ack"
+    ORDER_FILL = "order_fill"
+    ORDER_CANCEL = "order_cancel"
+    ORDER_REJECT = "order_reject"
+    POSITION_UPDATE = "position_update"
+
+
+@dataclass
+class PrivateWsEvent:
+    """Single private WS event (test + reconciliation compatibility)."""
+    venue: Venue = Venue.BINANCE
+    kind: PrivateWsEventKind = PrivateWsEventKind.ORDER_FILL
+    symbol: str = ""
+    order_id: str = ""
+    client_order_id: Optional[str] = None
+    side: Side = Side.BUY
+    quantity: float = 0.0
+    price: float = 0.0
+    fee_quote: float = 0.0
+    observed_at_ms: int = 0
+
+    def to_order_fill(self) -> Optional[OrderFill]:
+        """Convert to OrderFill; returns None for non-fill events."""
+        if self.kind != PrivateWsEventKind.ORDER_FILL:
+            return None
+        if self.quantity <= 0:
+            return None
+        return OrderFill(
+            venue=self.venue,
+            symbol=self.symbol,
+            side=self.side,
+            quantity=self.quantity,
+            price=self.price,
+            fee_quote=self.fee_quote,
+            order_id=self.order_id,
+            filled_at_ms=self.observed_at_ms,
+        )
+
+
+class PrivateWsClientState:
+    """Per-venue private WS client state (test + reconciliation compatibility).
+
+    Owns a WsStreamState for health tracking and a pending reconciliation
+    buffer for fill events that need to be matched against open order state.
+    """
+
+    def __init__(self, venue: Venue = Venue.BINANCE) -> None:
+        from lightfee.marketdata.ws import WsStreamState
+        self.venue = venue
+        self.stream = WsStreamState()
+        self.position_confirmed: bool = False
+        self.last_position_update_ms: int = 0
+        self.pending_reconciliation: list[PrivateWsEvent] = []
+
+    def on_position_confirmed(self, now_ms: int) -> None:
+        self.position_confirmed = True
+        self.last_position_update_ms = now_ms
+
+    def on_fill_event(self, event: PrivateWsEvent) -> None:
+        self.pending_reconciliation.append(event)
+
+    def drain_reconciliation_events(self) -> list[PrivateWsEvent]:
+        events = self.pending_reconciliation[:]
+        self.pending_reconciliation.clear()
+        return events
+
+    def is_healthy(self) -> bool:
+        return self.stream.is_healthy()

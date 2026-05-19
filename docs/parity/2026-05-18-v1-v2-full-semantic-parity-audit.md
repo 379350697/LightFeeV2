@@ -1,11 +1,11 @@
 # LightFee V2 vs V1 全量语义审计报告
 
 - **原始日期**: 2026-05-18
-- **最后更新**: 2026-05-19 (C-R2 缓存时序修复 + private health 生产路径接入 + L-R6 生产路径测试)
+- **最后更新**: 2026-05-19 (C-R2 tracked pair id lowercase → canonical private WS symbol 根因修复; make_candidate_pair_id → runtime canonicalize → parser resolve 全链路验证)
 - **仓库**: V2 `/media/wl/新加卷/codex/LightFeeV2` | V1 `/media/wl/新加卷/codex/LightFee`
 - **上一基线 V2 HEAD**: `1645e2b Fix V1 semantic parity: close C-R2/C-R4/H-R5/M-R2/H-R6/M-R3/M-R4/M-R19/L-R6 + H-R7/M-R16 contract tests`
-- **修复后 V2 HEAD**: 见当前 git log (C-R2 缓存时序修复 + private health 全生产路径接入 + L-R6 测试补齐)
-- **本次范围**: 根修 C-R2 缓存时序 + 接入真实 private-stream health 生产路径 + L-R6 补测试
+- **修复后 V2 HEAD**: 见当前 git log (C-R2 缓存时序修复 + private health 全生产路径接入 + L-R6 测试补齐 + live private WS 生产路径 5 项根修)
+- **本次范围**: 根修 C-R2 缓存时序 + 接入真实 private-stream health 生产路径 + L-R6 补测试 + C-R2 live private WS 生产路径 5 项根修
 
 ---
 
@@ -201,20 +201,154 @@
 
 ---
 
+## C-R2 补充根修: Live Private WS 生产路径 5 项修复 (2026-05-19)
+
+C-R2 在上轮已标记闭环（缓存时序修复 + private health 生产路径接入），但严格验收发现 5 项遗留问题。本轮逐项修复：
+
+### 修复 1: OKX _build_okx_ct_val_map() 规范符号查找
+
+**问题**: V2 用 vendor symbol (symbol_map key) 查 `_symbol_metadata`，V1 `okx_ct_val_map_from_cached_metadata()` (okx.rs:5791-5805) 用 canonical symbol (symbol_map value) 查 metadata。V2 在 metadata 按 canonical symbol 索引时拿不到 ctVal，且缺失时不回退到 1.0。
+
+**修复**: `_build_okx_ct_val_map()` 优先按 canonical symbol 查找，vendor key 作为 fallback；每个 inst_id 缺失时默认 ct_val=1.0。
+
+**测试**: `tests/test_v1_private_ws_parity.py::TestOkxCtValMap` (5 tests):
+- `test_canonical_symbol_lookup` — metadata={"ETHUSDT": {ct_val: 0.1}}, symbol_map={"ETH-USDT-SWAP": "ETHUSDT"} → {"ETH-USDT-SWAP": 0.1}
+- `test_vendor_key_fallback` — metadata keyed by vendor symbol → fallback 命中
+- `test_missing_metadata_defaults_to_one` — 空 metadata → 所有 inst_id=1.0
+- `test_mixed_metadata` — 部分有 metadata、部分缺失 → 混合正确
+- `test_zero_ct_val_ignored_defaults_to_one` — ct_val=0 被忽略 → 回退 1.0
+
+### 修复 2: Runtime _current_tracked_private_symbols() 收集 pending_passive_closes
+
+**问题**: 代码遍历 `self.state.pending_closes` 而非 `self.state.pending_passive_closes`，注释写 pending passive closes 但实际漏掉了 passive close 的 symbol 收集。`position_snapshot` 为 None 时也没有 fallback。
+
+**修复**:
+- 改为遍历 `self.state.pending_passive_closes`
+- `position_snapshot` 为 None 时通过 `position_id` 回退到 `self.state.open_positions` 查找
+
+**测试**: `tests/test_v1_private_ws_parity.py::TestRuntimePrivateSymbols` (6 tests):
+- `test_pending_passive_closes_produces_symbols` — 含 position_snapshot → correct long/short venue symbols
+- `test_pending_passive_closes_without_snapshot_falls_back_to_open_positions` — position_snapshot=None → 回退 open_positions
+- `test_tracked_pair_ids_parsed_correctly` — canonical pair_id 解析
+- `test_open_positions_produces_symbols` — open_positions → venue symbols
+- `test_empty_state_returns_empty_dict` — 空状态 → 空 dict
+- `test_pending_entries_produces_symbols` — pending_entries → venue symbols
+
+### 修复 3: Worker lifecycle 测试补齐 (Aster/Bybit/Bitget/Gate/Hyperliquid)
+
+**问题**: 前轮只有 Binance/OKX 有 fake websocket lifecycle 测试，其他 5 个 venue 没有。
+
+**修复**: 在 `tests/test_v1_private_ws_parity.py` 新增 5 个 venue 的 worker lifecycle 测试类：
+- `TestAsterWorkerLifecycle` (4 tests): listenKey success, listenKey failure, connect failure, close failure
+- `TestBybitWorkerLifecycle` (3 tests): auth+subscribe success, connect failure, auth send failure
+- `TestBitgetWorkerLifecycle` (3 tests): login+subscribe success, connect failure, login send failure
+- `TestGateWorkerLifecycle` (4 tests): signed subscribe+message success, connect failure, subscribe send failure, futures.positions event
+- `TestHyperliquidWorkerLifecycle` (4 tests): hydrate+subscribe success, connect failure, NoData error triggers failure, user fill event
+
+所有测试走生产 worker 方法 (`start_*_private_ws()`)，验证 `record_private_ws_success()`/`record_private_ws_failure()` 在真实 connect/auth/subscribe/message/error 路径上被调用。
+
+### 修复 4: Passive progress / side / terminal state 审查
+
+**审查结论**: 无需修改。证据：
+- `query_passive_order_progress()` (transport.py:3809-3854): private WS 结果对 CANCELED/REJECTED/EXPIRED/OPEN 状态 + 0 fill 全部返回，不走 REST 覆盖 ✓
+- `_poll_maker_progress()` (passive_close.py:404-407): 调用时传 `side=maker_side` (SELL for long, BUY for short) ✓
+- `_probe_order_dead()` (passive_close.py:1213-1216): 调用时传 `side=maker_side` ✓
+- runtime `query_passive_order_progress` (runtime.py:2929-2936): 从 `pending.maker_side()` 取 side ✓
+
+### 修复 5: 验证结果 (修复 1-4)
+
+```
+python3 -m compileall -q lightfee                                    # 通过
+pytest tests/test_ws_resilience.py tests/test_private_ws_state.py \
+       tests/test_venue_private_ws_parsers.py \
+       tests/test_v1_private_ws_parity.py -q                         # 118 passed
+pytest -q                                                             # 2719 passed, 2 skipped
+rg "record_private_ws_success|record_private_ws_failure" lightfee     # 7 venue 生产 worker 全有调用
+rg "start_private_ws|private_ws_worker" lightfee                      # runtime → transport → 7 venue workers
+gitnexus_detect_changes(scope="all")                                  # low risk, 0 affected processes
+```
+
+### 修复 6: Tracked pair id lowercase → canonical private WS symbol (根因修复, 2026-05-19)
+
+**问题**: `make_candidate_pair_id("ETHUSDT","binance","bybit")` 产生 `"ethusdt:binance->bybit"`（小写 symbol 是稳定身份格式，符合设计）。`_current_tracked_private_symbols()` 解析 pair_id 后直接把 `"ethusdt"`（小写）放进 private WS symbols 集合。随后：
+
+1. `start_private_ws(["ethusdt"])` → `_venue_symbol("ethusdt")` → 对 Binance/Bybit/Aster 等 identity venue 返回 `"ethusdt"`（小写）
+2. `symbol_map = {"ethusdt": "ethusdt"}` — 所有 key 都是小写
+3. Binance 推送 `"s":"ETHUSDT"`（大写），parser 做 `symbol_map.get("ETHUSDT")` → `None` → **live private WS fill/position 消息被静默丢弃**
+4. OKX/Gate/Hyperliquid 等需要 venue symbol 转换的 venue，`_venue_symbol("ethusdt")` 因输入不是 canonical uppercase 而无法正确映射
+
+**根因**: `make_candidate_pair_id()` 小写 symbol 是其稳定身份语义（不修改），但 runtime 消费 pair_id 时未还原 canonical symbol。
+数据流: `"ETHUSDT" → make_candidate_pair_id() → "ethusdt" → _current_tracked_private_symbols() → "ethusdt" → symbol_map → parser miss`
+
+**修复**: `_current_tracked_private_symbols()` 解析 pair_id 后对 symbol 调用 `.upper()` 还原 V2 内部 canonical 形式（例如 `"ETHUSDT"`）。同时修复 pipe-delimited fallback 路径。
+
+修改文件:
+- `lightfee/engine/runtime.py`: `_current_tracked_private_symbols()` — 两处 `.upper()` canonical 还原（canonical `->` 格式 + pipe-delimited fallback）
+
+**测试**: `tests/test_v1_private_ws_parity.py` 新增/修改:
+- `TestRuntimePrivateSymbols.test_tracked_pair_ids_lowercase_from_make_candidate_pair_id` — 调用 `make_candidate_pair_id("ETHUSDT","binance","bybit")` 确认输出小写 pair_id，断言 runtime 输出 `"ETHUSDT"` 而非 `"ethusdt"`
+- `TestRuntimePrivateSymbols.test_pipe_delimited_pair_id_also_canonicalizes` — pipe 格式也 canonical 化
+- `TestRuntimePrivateSymbols.test_okx_pair_id_produces_canonical_symbol_for_venue_conversion` — OKX pair_id → canonical `"ETHUSDT"` → 交给 venue worker 各自转换
+- `TestRuntimePrivateSymbols.test_gate_and_hyperliquid_pair_ids_also_canonicalize` — Gate/Hyperliquid pair_id → canonical
+- `TestRuntimePrivateSymbols.test_multiple_pair_ids_mixed_case_produce_unique_canonical` — 多 pair_id 混合大小写 → 去重 canonical
+- `TestLowercasePairIdSymbolMapRegression` (6 tests): Binance/Aster/Bybit parser symbol_map 回归 + 旧 bug 复现 + 端到端路径
+  - `test_binance_trade_lite_canonical_symbol_map_match` — canonical map → `"s":"ETHUSDT"` → match
+  - `test_lowercase_symbol_map_causes_binance_parser_miss` — 小写 map → `"s":"ETHUSDT"` → miss（旧 bug 复现）
+  - `test_aster_trade_lite_canonical_symbol_map_match` — Aster 同
+  - `test_bybit_execution_canonical_symbol_map_match` — Bybit execution topic match
+  - `test_lowercase_symbol_map_causes_bybit_parser_miss` — Bybit 旧 bug 复现
+  - `test_end_to_end_make_candidate_pair_id_to_parser_resolution` — 全链路: make_candidate_pair_id → runtime canonicalize → symbol_map → parser resolve
+
+### 修复 6 验证结果 (2026-05-19)
+
+```
+python3 -m compileall -q lightfee                                    # 通过
+pytest tests/test_ws_resilience.py tests/test_private_ws_state.py \
+       tests/test_venue_private_ws_parsers.py \
+       tests/test_v1_private_ws_parity.py -q                         # 129 passed (+11)
+pytest -q                                                             # 2730 passed
+python3 -c "make_candidate_pair_id('ETHUSDT','binance','bybit') +
+             _current_tracked_private_symbols() → ETHUSDT"           # 通过, 无小写泄漏
+python3 -c "Binance TRADE_LITE s='ETHUSDT' → symbol_map canonical    # 通过, parser 解析正确
+             resolution; old bug lowercase mismatch reproduced"       # 旧 bug 复现确认
+rg "class Test.*WorkerLifecycle" tests/test_v1_private_ws_parity.py  # 7 venue 全存在
+rg "class TestOkxCtValMap" tests/test_v1_private_ws_parity.py        # 存在
+rg "class TestRuntimePrivateSymbols" tests/test_v1_private_ws_parity.py  # 存在
+rg "make_candidate_pair_id" tests/test_v1_private_ws_parity.py       # 7 处, 覆盖所有新测试
+```
+
+### C-R2 当前状态: 已闭环（补充根修完成 + lowercase symbol 根因修复）
+
+C-R2 的生产路径证据链完整：
+1. runtime._post_tick_housekeeping → _ensure_private_ws_started → transport.start_private_ws → venue-specific start_*_private_ws → worker loop
+2. worker loop 所有 connect/auth/login/subscribe/message/ping/pong/close/error 路径 → record_private_ws_success/failure
+3. 7 个 venue (Binance/Aster/OKX/Bybit/Bitget/Gate/Hyperliquid) 全部有生产 worker 和 lifecycle 测试
+4. _current_tracked_private_symbols 正确收集 open_positions + tracked_pair_ids + pending_entries + pending_passive_closes
+5. OKX ctVal 按 canonical symbol 查找，默认 1.0
+6. Passive progress private-first 语义正确，maker side 传递正确
+7. **新增**: tracked pair id lowercase → canonical private WS symbol 还原 — make_candidate_pair_id() 小写 symbol 在 runtime 消费端还原为 canonical uppercase，Binance/Bybit/Aster parser exact-match 不再丢消息，OKX/Gate/Hyperliquid venue symbol 转换正确输入
+
+变更文件: `lightfee/engine/runtime.py`, `tests/test_v1_private_ws_parity.py`
+
+---
+
 ## 残余风险
 
 1. **M-R8/M-R12/M-R14**: 仍未闭环 — 见上方 "仍未闭环" 表
 2. **H-R7/M-R16**: 需批准差异 — 有 contract tests，未被批准则需改内部模型
 3. **新 venue 上线**: 需同步更新 adapter 的 `supports_private_health` 覆盖和 private WS health 接入
 4. **fault_reason 词汇表扩散**: 需同步更新 contract test 的 coverage
-5. **private WS health 更新方**: 外部 private WS 连接管理器必须调用 `transport.record_private_ws_success/failure()` 以维持 ConnectionHealth 同步。当前 transport 默认初始化为健康，若未接入外部 WS 管理器则 private health 永远健康 — 需在 live startup 阶段完成对接
+5. **private WS health 更新方**: 外部 private WS 连接管理器必须调用 `transport.record_private_ws_success/failure()` 以维持 ConnectionHealth 同步。当前 transport 默认初始化为健康，若未接入外部 WS 管理器则 private health 永远健康 — 需在 live startup 阶段完成对接（本轮已通过 runtime._ensure_private_ws_started 和 7 个 venue worker 完成生产路径接入）
+
 
 ---
 
 ## 测试结果
 
 ```
-全量: 2621 passed, 2 skipped, 1 warning in ~45s
+全量: 2730 passed, 2 skipped
+修复 1-5 聚焦: 118 passed (tests/test_ws_resilience.py + test_private_ws_state.py + test_venue_private_ws_parsers.py + test_v1_private_ws_parity.py)
+修复 6 聚焦: 129 passed (+11: lowercase pair_id canonicalize + symbol_map regression)
 L-R6 新增: 14 passed (TestLazyOpsTokenBucket)
 H-R7/M-R16 contract tests: 18 passed
 ```

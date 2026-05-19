@@ -92,7 +92,146 @@ async def _close_binance_listen_key(
 
 
 # ---------------------------------------------------------------------------
-# Binance private message parser
+# Binance private message parser — V1 futures events (primary path)
+# ---------------------------------------------------------------------------
+
+
+def _parse_binance_trade_lite(
+    event: dict[str, Any],
+    private_state,
+    symbol_map: dict[str, str],
+) -> None:
+    """V1 TRADE_LITE handler — per-trade fill notifications (futures)."""
+    venue_symbol = event.get("s", "")
+    symbol = symbol_map.get(venue_symbol)
+    if symbol is None:
+        return
+
+    raw_order_id = event.get("i")
+    if raw_order_id is not None:
+        order_id = str(raw_order_id).strip('"')
+    else:
+        order_id = ""
+
+    client_order_id = event.get("c")
+    if isinstance(client_order_id, str) and client_order_id:
+        pass
+    else:
+        client_order_id = None
+
+    # V1: filled quantity from "l" (last filled qty)
+    raw_l = event.get("l")
+    filled_qty = float(raw_l or 0) if raw_l is not None else 0.0
+
+    # V1: average price from "L" (last filled price)
+    raw_L = event.get("L")
+    avg_price: Optional[float] = None
+    if raw_L is not None and raw_L != "0":
+        try:
+            avg_price = float(raw_L)
+        except (ValueError, TypeError):
+            pass
+
+    # V1: timestamp: T (trade time) first, fallback to E (event time)
+    updated_at_ms = int(
+        event.get("T") or event.get("E") or _now_ms())
+
+    update = PrivateOrderUpdate(
+        symbol=symbol,
+        order_id=order_id,
+        client_order_id=client_order_id,
+        filled_quantity=filled_qty,
+        average_price=avg_price,
+        fee_quote=None,
+        state=None,
+        updated_at_ms=updated_at_ms,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(private_state.record_order(update))
+    except RuntimeError:
+        pass
+
+
+def _parse_binance_order_trade_update(
+    event: dict[str, Any],
+    private_state,
+    symbol_map: dict[str, str],
+) -> None:
+    """V1 ORDER_TRADE_UPDATE handler — order life cycle updates (futures)."""
+    order = event.get("o")
+    if not isinstance(order, dict):
+        return
+
+    venue_symbol = order.get("s", "")
+    symbol = symbol_map.get(venue_symbol)
+    if symbol is None:
+        return
+
+    raw_order_id = order.get("i")
+    if raw_order_id is not None:
+        order_id = str(raw_order_id).strip('"')
+    else:
+        order_id = ""
+
+    client_order_id = order.get("c")
+    if isinstance(client_order_id, str) and client_order_id:
+        pass
+    else:
+        client_order_id = None
+
+    # V1: cumulative filled quantity "z"
+    raw_z = order.get("z")
+    filled_qty = float(raw_z or 0) if raw_z is not None else 0.0
+
+    # V1: average price from "ap"
+    raw_ap = order.get("ap")
+    avg_price: Optional[float] = None
+    if raw_ap is not None and raw_ap != "0":
+        try:
+            avg_price = float(raw_ap)
+        except (ValueError, TypeError):
+            pass
+
+    # V1: fee quote from commission asset + amount
+    fee_quote: Optional[float] = None
+    commission_asset = order.get("N")
+    commission = order.get("n")
+    if (commission_asset in ("USDT", "USDC")) and commission:
+        try:
+            f = float(commission)
+            if f > 0:
+                fee_quote = f
+        except (ValueError, TypeError):
+            pass
+
+    # V1: timestamp: T (transaction time), fallback to E (event time)
+    ts_val = order.get("T") or event.get("E")
+    updated_at_ms: int = _now_ms()
+    if ts_val is not None:
+        try:
+            updated_at_ms = int(ts_val)
+        except (ValueError, TypeError):
+            pass
+
+    update = PrivateOrderUpdate(
+        symbol=symbol,
+        order_id=order_id,
+        client_order_id=client_order_id,
+        filled_quantity=filled_qty,
+        average_price=avg_price,
+        fee_quote=fee_quote,
+        state=None,
+        updated_at_ms=updated_at_ms,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(private_state.record_order(update))
+    except RuntimeError:
+        pass
+
+
+# Backward-compat spot-style parsers (also used by some endpoints)
 # ---------------------------------------------------------------------------
 
 
@@ -187,7 +326,12 @@ def handle_binance_private_message(
     symbol_map: dict[str, str],
     raw: str,
 ) -> None:
-    """V1 handle_binance_private_message() — dispatch user data stream events."""
+    """V1 handle_binance_private_message() — dispatch user data stream events.
+
+    V1 futures semantics: TRADE_LITE, ORDER_TRADE_UPDATE, ACCOUNT_UPDATE.
+    Also handles spot-style executionReport/outboundAccountPosition for backward
+    compatibility with cross-venue tests.
+    """
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -195,13 +339,18 @@ def handle_binance_private_message(
 
     event_type = payload.get("e", "")
 
-    if event_type == "executionReport":
+    # V1 futures events (primary path for Binance USDⓈ-M futures)
+    if event_type == "TRADE_LITE":
+        _parse_binance_trade_lite(payload, private_state, symbol_map)
+    elif event_type == "ORDER_TRADE_UPDATE":
+        _parse_binance_order_trade_update(payload, private_state, symbol_map)
+    elif event_type == "ACCOUNT_UPDATE":
+        _parse_binance_account_update(payload, private_state, symbol_map)
+    # Backward-compat spot-style events (also valid on some endpoints)
+    elif event_type == "executionReport":
         _parse_binance_execution_report(payload, private_state, symbol_map)
     elif event_type == "outboundAccountPosition":
         _parse_binance_account_position(payload, private_state, symbol_map)
-    # ACCOUNT_UPDATE event (balance and position updates)
-    elif event_type == "ACCOUNT_UPDATE":
-        _parse_binance_account_update(payload, private_state, symbol_map)
     # listenKeyExpired — handle as informational
     elif event_type == "listenKeyExpired":
         logger.warning("binance listenKey expired")

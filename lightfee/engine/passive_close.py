@@ -403,6 +403,7 @@ class PassiveCloseExecutor:
             # Poll progress
             progress = await self._poll_maker_progress(
                 adapter, position.symbol, maker_order_id, maker_client_id,
+                side=maker_side,
             )
 
             # Apply progress to pending state
@@ -748,6 +749,7 @@ class PassiveCloseExecutor:
         symbol: str,
         order_id: str,
         client_order_id: str,
+        side: Side = Side.BUY,
     ) -> Optional[PassiveOrderProgress]:
         """Query cumulative progress for a resting passive order."""
         try:
@@ -755,6 +757,7 @@ class PassiveCloseExecutor:
                 symbol=symbol,
                 order_id=order_id,
                 client_order_id=client_order_id,
+                side=side,
             )
         except NotImplementedError:
             # Fallback: adapter doesn't support passive progress query
@@ -1209,6 +1212,7 @@ class PassiveCloseExecutor:
             # Only submit the new order if old order is confirmed dead.
             old_dead = await self._probe_order_dead(
                 adapter, position.symbol, old_order_id, old_client_id,
+                side=maker_side,
             )
             if not old_dead:
                 self._journal.append(
@@ -1649,6 +1653,7 @@ class PassiveCloseExecutor:
         symbol: str,
         order_id: str,
         client_order_id: str,
+        side: Side = Side.BUY,
     ) -> bool:
         """Check whether a passive order is confirmed dead (canceled/filled/expired/rejected).
 
@@ -1661,6 +1666,7 @@ class PassiveCloseExecutor:
                 symbol=symbol,
                 order_id=order_id,
                 client_order_id=client_order_id,
+                side=side,
             )
         except Exception:
             # Cannot query — fail-closed: treat as alive to avoid double-order risk
