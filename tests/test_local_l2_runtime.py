@@ -461,6 +461,43 @@ class TestDataPlaneBootstrap:
         assert book.status == L2BookStatus.REBUILDING
         assert "buffered_replay_snapshot_boundary" in book.fault_reason
 
+    def test_external_snapshot_during_bootstrap_applies_and_completes_hot(self):
+        """Bybit/OKX/Bitget/Gate/Hyperliquid snapshots reset the local book.
+
+        They must not sit behind the pre-snapshot delta buffer, otherwise a
+        valid exchange snapshot can never complete bootstrap.
+        """
+        from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
+        from lightfee.persistence.journal import Journal
+
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1000)
+        import tempfile, os as _os
+        jpath = _os.path.join(tempfile.mkdtemp(), "test.journal")
+        journal = Journal(jpath)
+        journal.open()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+
+        events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="bybit",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(price=49900.0, quantity=1.0)],
+                asks=[PriceLevel(price=50100.0, quantity=1.0)],
+                sequence=100,
+                event_time_ms=2000,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=2001,
+        )
+
+        assert events
+        assert book.status == L2BookStatus.HOT
+        assert book.best_bid() == 49900.0
+        assert book.best_ask() == 50100.0
+        assert book.sequence == 100
+
     def test_bootstrap_failure_updates_runtime_fault(self):
         from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
         from lightfee.persistence.journal import Journal

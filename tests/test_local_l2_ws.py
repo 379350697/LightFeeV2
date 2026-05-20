@@ -324,6 +324,8 @@ class TestBitgetL2WsClientParsing:
                 "asks": [["50100.00", "1.0"], ["50200.00", "0.5"]],
                 "bids": [["50000.00", "2.0"], ["49900.00", "1.5"]],
                 "ts": "1715000000000",
+                "seq": 123,
+                "pseq": 0,
                 "checksum": 98765,
             }],
         }
@@ -333,7 +335,9 @@ class TestBitgetL2WsClientParsing:
         assert update.venue == "bitget"
         assert update.symbol == "BTCUSDT"
         assert update.update_kind == LocalL2UpdateKind.SNAPSHOT
-        assert update.sequence == 98765
+        assert update.sequence == 123
+        assert update.previous_sequence == 0
+        assert update.checksum == 98765
         assert len(update.bids) == 2
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 2.0
@@ -352,6 +356,8 @@ class TestBitgetL2WsClientParsing:
                 "asks": [["50100.00", "0"]],
                 "bids": [],
                 "ts": "1715000001000",
+                "seq": 124,
+                "pseq": 123,
                 "checksum": 98766,
             }],
         }
@@ -359,7 +365,9 @@ class TestBitgetL2WsClientParsing:
         update = client.parse_depth_message(raw)
         assert update is not None
         assert update.update_kind == LocalL2UpdateKind.DELTA
-        assert update.sequence == 98766
+        assert update.sequence == 124
+        assert update.previous_sequence == 123
+        assert update.checksum == 98766
         assert len(update.asks) == 1
         assert update.asks[0].price == 50100.0
         assert update.asks[0].quantity == 0  # deletion

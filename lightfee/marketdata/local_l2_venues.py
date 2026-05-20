@@ -261,22 +261,28 @@ def parse_bybit_l2_update(
 ) -> LocalL2Update:
     """Parse Bybit orderbook snapshot/delta into LocalL2Update.
 
-    Bybit format (WS orderbook.200):
+    Bybit format (REST /v5/market/orderbook or WS orderbook.200):
+      {"retCode": 0, "result": {"s": "BTCUSDT", "b": [...], "a": [...],
+                                "u": 123, "seq": 456, "ts": 1234567890}}
       {"topic": "orderbook.200.BTCUSDT", "type": "snapshot"/"delta",
        "data": {"s": "BTCUSDT", "b": [["50000", "1.0"]], "a": [["50100", "1.5"]],
                 "u": 123, "seq": 123, "ts": 1234567890}}
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
-    data = payload.get("data", payload)
+    data = payload.get("result") or payload.get("data", payload)
     bids_raw = data.get("b", data.get("bids", []))
     asks_raw = data.get("a", data.get("asks", []))
 
     bids = [PriceLevel(price=float(b[0]), quantity=float(b[1])) for b in bids_raw if float(b[1]) > 0]
     asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if float(a[1]) > 0]
 
-    seq = int(data.get("seq", data.get("u", 0)))
-    kind = LocalL2UpdateKind.SNAPSHOT if payload.get("type") == "snapshot" else LocalL2UpdateKind.DELTA
+    seq = int(data.get("u", data.get("seq", 0)))
+    kind = (
+        LocalL2UpdateKind.SNAPSHOT
+        if "result" in payload or payload.get("type") == "snapshot"
+        else LocalL2UpdateKind.DELTA
+    )
 
     return LocalL2Update(
         venue=venue, symbol=symbol or data.get("s", ""),
@@ -299,7 +305,7 @@ def parse_bitget_l2_update(
     Bitget WS format:
       {"action": "snapshot"/"update", "arg": {"instId": "BTCUSDT"},
        "data": [{"bids": [["50000", "1.0"]], "asks": [["50100", "1.5"]],
-                 "seqId": 123, "ts": "1234567890"}]}
+                 "seq": 123, "pseq": 122, "checksum": 0, "ts": "1234567890"}]}
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
@@ -325,20 +331,23 @@ def parse_bitget_l2_update(
         raise ValueError("Bitget L2 update: missing data array")
     entry = data[0] if isinstance(data, list) else data
 
-    bids_raw = entry.get("bids", [])
-    asks_raw = entry.get("asks", [])
+    bids_raw = entry.get("bids", entry.get("b", []))
+    asks_raw = entry.get("asks", entry.get("a", []))
 
     bids = [PriceLevel(price=float(b[0]), quantity=float(b[1])) for b in bids_raw if float(b[1]) > 0]
     asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if float(a[1]) > 0]
 
-    seq = int(entry.get("seqId", 0))
+    seq = int(entry.get("seq", entry.get("seqId", 0)) or 0)
+    prev_seq = int(entry.get("pseq", entry.get("prevSeqId", 0)) or 0)
+    checksum = int(entry.get("checksum", 0) or 0)
     action = payload.get("action", "update")
     kind = LocalL2UpdateKind.SNAPSHOT if action == "snapshot" else LocalL2UpdateKind.DELTA
 
     return LocalL2Update(
         venue=venue, symbol=symbol or payload.get("arg", {}).get("instId", ""),
         bids=bids, asks=asks,
-        sequence=seq, previous_sequence=payload.get("prevSeqId", seq - 1),
+        sequence=seq, previous_sequence=prev_seq,
+        checksum=checksum,
         event_time_ms=int(entry.get("ts", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )

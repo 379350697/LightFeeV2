@@ -357,6 +357,18 @@ class LocalL2DataPlane:
         key = f"{update.venue}:{update.symbol}"
         book = self._runtime.get_book(update.venue, update.symbol)
 
+        # Official venue semantics: WS/REST snapshots are authoritative book
+        # resets.  Do not park them behind the pre-snapshot delta buffer; Bybit,
+        # OKX, Bitget, Gate, and Hyperliquid all use snapshots to establish or
+        # re-establish the local book.
+        if update.update_kind == LocalL2UpdateKind.SNAPSHOT:
+            self._pre_snapshot_buffers.pop(key, None)
+            result = self._runtime.record_update_result(update, now_ms)
+            book = self._runtime.get_book(update.venue, update.symbol)
+            if result.applied and not result.rebuild_required and book is not None:
+                book.transition_to_hot()
+            return result.events
+
         # Buffer delta updates during bootstrap/rebuild gap
         # V1: handle_binance_local_l2_ws_message_for_instance lines 4423-4435
         if book is not None and book.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):

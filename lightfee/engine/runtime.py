@@ -568,6 +568,52 @@ class LiveRuntime:
             source="runtime_live_position_probe",
         )
 
+    async def _position_probe_symbols_for_venue(
+        self, venue: Venue, adapter: VenueAdapter, symbols: list[str],
+    ) -> list[str]:
+        """Filter fallback single-position probes through a venue symbol catalog."""
+        ensure_loaded = getattr(adapter, "ensure_supported_symbols_loaded", None)
+        if callable(ensure_loaded):
+            try:
+                maybe_coro = ensure_loaded()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception:
+                pass
+
+        try:
+            supported_raw = adapter.supported_symbols()
+        except Exception:
+            supported_raw = []
+        supported = {str(symbol) for symbol in supported_raw if str(symbol)}
+        if not supported:
+            return symbols
+
+        transport = getattr(adapter, "_transport", None)
+        to_venue_symbol = getattr(transport, "_venue_symbol", None)
+
+        filtered: list[str] = []
+        for symbol in symbols:
+            venue_symbol = str(symbol)
+            if callable(to_venue_symbol):
+                try:
+                    venue_symbol = str(to_venue_symbol(symbol))
+                except Exception:
+                    venue_symbol = str(symbol)
+            if str(symbol) in supported or venue_symbol in supported:
+                filtered.append(symbol)
+            else:
+                if getattr(self.journal, "_file", None) is not None:
+                    self.journal.append(
+                        "recovery.live_position_probe_symbol_skipped",
+                        {
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "reason": "unsupported_symbol",
+                        },
+                    )
+        return filtered
+
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
     ) -> list[tuple[str, PositionSnapshot]]:
@@ -641,11 +687,19 @@ class LiveRuntime:
             else:
                 snapshots.extend(positions)
 
+        fallback_probe_symbols: dict[Venue, list[str]] = {}
+        for venue, adapter in self._venue_adapters.items():
+            if venue not in fallback_venues:
+                continue
+            fallback_probe_symbols[venue] = await self._position_probe_symbols_for_venue(
+                venue, adapter, symbols,
+            )
+
         tasks = [
             fetch_one(venue, adapter, symbol)
-            for symbol in symbols
             for venue, adapter in self._venue_adapters.items()
-            if venue in fallback_venues
+            if venue in fallback_probe_symbols
+            for symbol in fallback_probe_symbols[venue]
         ]
         results = await asyncio.gather(*tasks) if tasks else []
         snapshots.extend(

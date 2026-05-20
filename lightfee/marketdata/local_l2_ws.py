@@ -419,8 +419,8 @@ class BybitL2WsClient(LocalL2WsClient):
 
 # Bitget depth channel:
 # Subscribe: {"op":"subscribe","args":[{"instType":"USDT-FUTURES","channel":"books","instId":"BTCUSDT"}]}
-# Snapshot:  {"action":"snapshot","arg":{...},"data":[{"asks":[[p,q]],"bids":[[p,q]],"ts":"...","checksum":...}]}
-# Delta:     {"action":"update","arg":{...},"data":[{"asks":[[p,q]],"bids":[[p,q]],"ts":"...","checksum":...}]}
+# Snapshot:  {"action":"snapshot","arg":{...},"data":[{"asks":[[p,q]],"bids":[[p,q]],"seq":123,"pseq":0,"checksum":...}]}
+# Delta:     {"action":"update","arg":{...},"data":[{"asks":[[p,q]],"bids":[[p,q]],"seq":124,"pseq":123,"checksum":...}]}
 
 @dataclass
 class BitgetL2WsClient(LocalL2WsClient):
@@ -456,12 +456,19 @@ class BitgetL2WsClient(LocalL2WsClient):
 
         kind = LocalL2UpdateKind.SNAPSHOT if action == "snapshot" else LocalL2UpdateKind.DELTA
 
+        bids_raw = row.get("bids", row.get("b", []))
+        asks_raw = row.get("asks", row.get("a", []))
+        sequence = int(row.get("seq", row.get("seqId", 0)) or 0)
+        previous_sequence = int(row.get("pseq", row.get("prevSeqId", 0)) or 0)
+
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
-            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in row.get("bids", [])],
-            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in row.get("asks", [])],
-            sequence=int(row.get("checksum", 0)),
+            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in bids_raw],
+            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in asks_raw],
+            sequence=sequence,
+            previous_sequence=previous_sequence,
+            checksum=int(row.get("checksum", 0) or 0),
             event_time_ms=int(row.get("ts", 0)),
             received_at_ms=now_ms,
             update_kind=kind,

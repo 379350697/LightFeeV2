@@ -379,6 +379,86 @@ class TestRuntimePreflight:
             assert len(runtime.state.open_positions) == 0
 
     @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_filters_unsupported_venue_symbols(self):
+        """Fallback single-position probes must not ask a venue for delisted symbols."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+
+            snapshots = await runtime._fetch_startup_live_position_snapshots(
+                ["BTCUSDT", "DELISTEDUSDT"]
+            )
+
+            assert snapshots == []
+            assert bitget.fetch_position_symbols == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_loads_symbol_catalog_before_filtering(self):
+        """A lazy venue catalog must be loaded before fallback per-symbol probes."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class LazySupportedAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.loaded = False
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = LazySupportedAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+
+            await runtime._fetch_startup_live_position_snapshots(
+                ["BTCUSDT", "DELISTEDUSDT"]
+            )
+
+            assert bitget.loaded is True
+            assert bitget.fetch_position_symbols == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
     async def test_housekeeping_recovers_balanced_live_positions_after_start(self):
         """A running clean state must not stay false-clean after live positions appear."""
         with tempfile.TemporaryDirectory() as td:

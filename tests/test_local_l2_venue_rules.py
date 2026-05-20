@@ -278,6 +278,32 @@ class TestParseBybitL2Update:
         assert update.event_time_ms == 1680000000000
         assert len(update.bids) == 2
 
+    def test_parse_rest_result_snapshot(self):
+        from lightfee.marketdata.local_l2_venues import parse_bybit_l2_update
+        payload = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "s": "BTCUSDT",
+                "b": [["65485.47", "47.081829"]],
+                "a": [["65557.7", "16.606555"]],
+                "ts": 1716863719031,
+                "u": 230704,
+                "seq": 1432604333,
+                "cts": 1716863718905,
+            },
+            "time": 1716863719382,
+        }
+
+        update = parse_bybit_l2_update(payload, now_ms=9000)
+
+        assert update.update_kind.value == "snapshot"
+        assert update.symbol == "BTCUSDT"
+        assert update.sequence == 230704
+        assert update.event_time_ms == 1716863719031
+        assert update.bids[0].price == 65485.47
+        assert update.asks[0].price == 65557.7
+
     def test_parse_delta(self):
         from lightfee.marketdata.local_l2_venues import parse_bybit_l2_update
         payload = {
@@ -320,7 +346,9 @@ class TestParseBitgetL2Update:
             "data": [{
                 "bids": [["50000.00", "1.500"], ["49900.00", "2.000"]],
                 "asks": [["50100.00", "1.200"]],
-                "seqId": 789,
+                "seq": 789,
+                "pseq": 0,
+                "checksum": 12345,
                 "ts": "1680000000000",
             }],
         }
@@ -329,6 +357,8 @@ class TestParseBitgetL2Update:
         assert update.venue == "bitget"
         assert update.symbol == "BTCUSDT"
         assert update.sequence == 789
+        assert update.previous_sequence == 0
+        assert update.checksum == 12345
         assert len(update.bids) == 2
 
     def test_parse_delta(self):
@@ -339,7 +369,8 @@ class TestParseBitgetL2Update:
             "data": [{
                 "bids": [["2000.00", "5.000"]],
                 "asks": [],
-                "seqId": 790,
+                "seq": 790,
+                "pseq": 789,
                 "ts": "1680000001000",
             }],
         }
@@ -347,6 +378,7 @@ class TestParseBitgetL2Update:
         assert update.update_kind.value == "delta"
         assert update.symbol == "ETHUSDT"
         assert update.sequence == 790
+        assert update.previous_sequence == 789
 
     def test_missing_data_raises(self):
         from lightfee.marketdata.local_l2_venues import parse_bitget_l2_update

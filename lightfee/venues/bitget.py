@@ -206,6 +206,16 @@ class BitgetAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return the loaded Bitget contract catalog symbols, if available."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        return sorted(str(symbol) for symbol in metadata.keys())
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate Bitget contract metadata when startup recovery needs it."""
+        if not self._transport._symbol_metadata:
+            await self._load_symbol_metadata()
+
     # ------------------------------------------------------------------
     # Profile detection
     # ------------------------------------------------------------------

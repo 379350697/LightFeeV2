@@ -3270,6 +3270,43 @@ class TestBitgetAdapterL2MetadataGuard:
     primary integration point.
     """
 
+    def test_supported_symbols_reflect_loaded_contract_metadata(self):
+        """Position recovery uses this catalog to avoid probing removed symbols."""
+        from lightfee.venues.bitget import BitgetAdapter
+
+        adapter = BitgetAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({
+            "BTCUSDT": {"sizeMultiplier": "0.001"},
+            "ETHUSDT": {"sizeMultiplier": "0.001"},
+        })
+
+        assert adapter.supported_symbols() == ["BTCUSDT", "ETHUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_fetches_contract_catalog(self):
+        """Startup recovery can load Bitget's catalog before per-symbol probes."""
+        from lightfee.venues.bitget import BitgetAdapter
+
+        adapter = BitgetAdapter(mode="paper")
+
+        async def mock_request(method, path, **kwargs):
+            if "contracts" in path:
+                return {
+                    "code": "00000", "msg": "success",
+                    "data": [
+                        {"symbol": "BTCUSDT", "sizeMultiplier": "0.001",
+                         "minTradeNum": "1", "pricePlace": "2", "volumePlace": "0",
+                         "symbolName": "BTCUSDT"},
+                    ],
+                }
+            return {}
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert adapter.supported_symbols() == ["BTCUSDT"]
+
     @pytest.mark.asyncio
     async def test_adapter_unsupported_symbol_raises_no_http_orderbook_call(self):
         """BitgetAdapter.fetch_l2_snapshot with unsupported symbol must raise
