@@ -497,6 +497,171 @@ class PrivateWsState:
 
 
 # ---------------------------------------------------------------------------
+# Merge passive progress sources (V1 merge_passive_progress_sources)
+# ---------------------------------------------------------------------------
+
+
+def resolve_cumulative_order_progress(
+    sources: list[CumulativeOrderProgress],
+) -> Optional[CumulativeOrderProgress]:
+    """V1 resolve_cumulative_order_progress (ports.rs:147).
+
+    Priority: highest cumulative_quantity wins. Within that tier:
+    reconciliation > REST detail > private WS.
+    Identity fields (order_id, client_order_id) come from the
+    highest-quantity sources; fall back to any source.
+    """
+    if not sources:
+        return None
+
+    # Find max cumulative quantity
+    cumulative_qty = 0.0
+    for s in sources:
+        qty = s.cumulative_quantity if _is_finite(s.cumulative_quantity) else 0.0
+        if qty > cumulative_qty:
+            cumulative_qty = qty
+
+    # Select sources at or near the max (within tolerance)
+    if cumulative_qty > 0.0:
+        tolerance = max(cumulative_qty * 1e-9, 1e-12)
+        highest = [
+            s for s in sources
+            if abs(max(s.cumulative_quantity, 0.0) - cumulative_qty) <= tolerance
+        ]
+        if not highest:
+            highest = sources
+    else:
+        highest = sources
+
+    # Identity fields: prefer highest-quantity sources, then any source
+    def _first_from(sources_list, field):
+        for s in sources_list:
+            val = getattr(s, field, None)
+            if val is not None and val != "" and val != 0:
+                return val
+        return None
+
+    order_id = _first_from(highest, "order_id") or _first_from(sources, "order_id")
+    client_order_id = _first_from(highest, "client_order_id") or _first_from(sources, "client_order_id")
+
+    # Price: from highest-quantity sources
+    avg_price = None
+    for s in highest:
+        p = s.average_price
+        if p is not None and p > 0.0 and _is_finite(p):
+            avg_price = p
+            break
+    if avg_price is None:
+        for s in sources:
+            p = s.average_price
+            if p is not None and p > 0.0 and _is_finite(p):
+                avg_price = p
+                break
+
+    # Fee: from highest-quantity sources
+    fee = None
+    for s in highest:
+        f = s.fee_quote
+        if f is not None and f >= 0.0 and _is_finite(f):
+            fee = f
+            break
+
+    # Timestamps: V1 max() within highest-quantity sources, fallback to all sources
+    # (ports.rs:242-260 — filter_map + max on highest, or_else max on all)
+    last_fill_at_ms = None
+    for s in highest:
+        t = s.last_fill_at_ms
+        if t is not None and t > 0 and (last_fill_at_ms is None or t > last_fill_at_ms):
+            last_fill_at_ms = t
+    if last_fill_at_ms is None:
+        for s in sources:
+            t = s.last_fill_at_ms
+            if t is not None and t > 0 and (last_fill_at_ms is None or t > last_fill_at_ms):
+                last_fill_at_ms = t
+
+    # State: from highest-quantity source that has one, fallback to all sources
+    # V1: find_map on highest, or_else find_map on all sources (ports.rs:236-240)
+    state = None
+    for s in highest:
+        if s.state is not None:
+            state = s.state
+            break
+    if state is None:
+        for s in sources:
+            if s.state is not None:
+                state = s.state
+                break
+
+    # Updated at: V1 max() within highest-quantity sources, fallback to all sources
+    # (ports.rs:242-250)
+    updated_at_ms = None
+    for s in highest:
+        t = s.updated_at_ms
+        if t is not None and (updated_at_ms is None or t > updated_at_ms):
+            updated_at_ms = t
+    if updated_at_ms is None:
+        for s in sources:
+            t = s.updated_at_ms
+            if t is not None and (updated_at_ms is None or t > updated_at_ms):
+                updated_at_ms = t
+
+    return CumulativeOrderProgress(
+        order_id=order_id,
+        client_order_id=client_order_id,
+        cumulative_quantity=cumulative_qty,
+        average_price=avg_price,
+        fee_quote=fee,
+        state=state,
+        updated_at_ms=updated_at_ms,
+        last_fill_at_ms=last_fill_at_ms,
+        source="reconciliation" if any(s.source == "reconciliation" for s in highest)
+        else "rest_snapshot" if any(s.source == "rest_snapshot" for s in highest)
+        else "private_ws",
+    )
+
+
+def merge_passive_progress_sources(
+    detail_progress: CumulativeOrderProgress,
+    reconciliation,
+    private_progress: Optional[CumulativeOrderProgress],
+) -> CumulativeOrderProgress:
+    """V1 merge_passive_progress_sources (passive_progress.rs:6).
+
+    Merge priority: reconciliation > REST detail > private WS.
+    """
+    recon_progress = None
+    if reconciliation is not None:
+        recon_progress = CumulativeOrderProgress.from_reconciliation(reconciliation)
+    all_sources = []
+    if recon_progress is not None:
+        all_sources.append(recon_progress)
+    all_sources.append(detail_progress)
+    if private_progress is not None:
+        all_sources.append(private_progress)
+    return resolve_cumulative_order_progress(all_sources) or detail_progress
+
+
+def should_fetch_passive_reconciliation(
+    detail_progress: CumulativeOrderProgress,
+    private_progress: Optional[CumulativeOrderProgress] = None,
+) -> bool:
+    """V1 should_fetch_passive_reconciliation (passive_progress.rs:47).
+
+    Fetch reconciliation when any source has fill quantity or order identity.
+    """
+    if detail_progress.cumulative_quantity > 0.0:
+        return True
+    if detail_progress.order_id is not None or detail_progress.client_order_id is not None:
+        return True
+    if private_progress is not None:
+        if private_progress.cumulative_quantity > 0.0:
+            return True
+        if private_progress.order_id is not None or private_progress.client_order_id is not None:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Fill enrichment (V1 enrich_fill_from_private)
 # ---------------------------------------------------------------------------
 
@@ -630,57 +795,6 @@ async def _lookup_or_wait_private_order_where(
         result = _lookup()
         if result is not None:
             return result
-
-
-# ---------------------------------------------------------------------------
-# resolve_cumulative_order_progress (V1 exact port)
-# ---------------------------------------------------------------------------
-
-
-def resolve_cumulative_order_progress(
-    candidates: list[CumulativeOrderProgress],
-) -> Optional[CumulativeOrderProgress]:
-    """V1 resolve_cumulative_order_progress() — pick highest-qty, prefer priority.
-
-    Priority order (V1 tagged-enum equivalence):
-      reconciliation (0) > rest_snapshot (1) > private_ws (2).
-    Among same priority, highest cumulative_quantity wins.
-    """
-    if not candidates:
-        return None
-
-    _PRIORITY = {"reconciliation": 0, "rest_snapshot": 1, "private_ws": 2}
-
-    def _priority(c: CumulativeOrderProgress) -> int:
-        return _PRIORITY.get(c.source, 2)
-
-    best = candidates[0]
-    for c in candidates[1:]:
-        p_best = _priority(best)
-        p_c = _priority(c)
-        if p_c < p_best:
-            best = c
-        elif p_c == p_best and c.cumulative_quantity > best.cumulative_quantity:
-            best = c
-    return best
-
-
-# ---------------------------------------------------------------------------
-# V1 passive progress merge helper
-# ---------------------------------------------------------------------------
-
-
-def merge_passive_progress_sources(
-    private: Optional[CumulativeOrderProgress],
-    rest: Optional[CumulativeOrderProgress],
-    reconciliation: Optional[CumulativeOrderProgress] = None,
-) -> Optional[CumulativeOrderProgress]:
-    """V1 merge_passive_progress_sources() — private-first, REST fallback.
-
-    Returns the best progress snapshot, preferring private WS data when fresh.
-    """
-    candidates = [c for c in [reconciliation, rest, private] if c is not None]
-    return resolve_cumulative_order_progress(candidates)
 
 
 # ---------------------------------------------------------------------------

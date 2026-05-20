@@ -1,36 +1,34 @@
 # LightFee V2 vs V1 全量语义审计报告
 
 - **原始日期**: 2026-05-18
-- **最后更新**: 2026-05-19 (C-R2 tracked pair id lowercase → canonical private WS symbol 根因修复; make_candidate_pair_id → runtime canonicalize → parser resolve 全链路验证)
+- **最后更新**: 2026-05-20 (M-R8 根修完成: ImportError + success code + 字段解析 + state 漂移 + fee/timestamp + 10 runtime tests; M-R12/M-R14 完整闭环)
 - **仓库**: V2 `/media/wl/新加卷/codex/LightFeeV2` | V1 `/media/wl/新加卷/codex/LightFee`
-- **上一基线 V2 HEAD**: `1645e2b Fix V1 semantic parity: close C-R2/C-R4/H-R5/M-R2/H-R6/M-R3/M-R4/M-R19/L-R6 + H-R7/M-R16 contract tests`
-- **修复后 V2 HEAD**: 见当前 git log (C-R2 缓存时序修复 + private health 全生产路径接入 + L-R6 测试补齐 + live private WS 生产路径 5 项根修)
-- **本次范围**: 根修 C-R2 缓存时序 + 接入真实 private-stream health 生产路径 + L-R6 补测试 + C-R2 live private WS 生产路径 5 项根修
+- **修复后 V2 HEAD**: 见当前 git log
+- **本次范围**: M-R8/M-R12/M-R14 完整闭环 + C-R2 live private WS 生产路径 + 文档修正
 
 ---
 
 ## 最终结论
 
-14 个开放项中，8 个已完成闭环（含本轮 C-R2 根修），2 个需批准差异，4 个仍未闭环：
+14 个开放项中，11 个已完成闭环（含本轮 M-R8/M-R12/M-R14），2 个需批准差异：
 
 | 状态 | 项 | 说明 |
 |------|----|------|
-| **已闭环** | C-R2, C-R4, H-R5/M-R2, H-R6, M-R3, M-R4, M-R19, L-R6 | 生产路径已实现，测试通过 |
+| **已闭环** | C-R2, C-R4, H-R5/M-R2, H-R6, M-R3, M-R4, M-R8, M-R12, M-R14, M-R19, L-R6 | 生产路径已实现，测试通过 |
 | **需批准差异** | H-R7, M-R16 | 表示方式差异，有 contract/fixture 测试证明外部等价 |
-| **仍未闭环** | M-R8, M-R12, M-R14 | 详见下方"仍未闭环"表 |
 
 ### 仍需批准的差异 (2 项)
 
 - **H-R7**: V1 signed size vs V2 abs qty + side — contract test 已补
 - **M-R16**: V1 strong fault enum vs V2 string vocabulary — contract test 已补
 
-### 仍未闭环 (3 项)
+### 本轮完整闭环 (3 项, 2026-05-19/20)
 
-| ID | 当前判断 | 阻碍 | 建议 |
-|----|----------|------|------|
-| M-R8 | Bitget private WS order-progress 缓存/merge 接口仍然缺 | Bitget passive maker live 未启用，补全需要 private WS progress cache 统一层 | 若启用 Bitget passive 则必须对齐 |
-| M-R12 | Terminal reduce-only 仍然用字符串 pattern 匹配 | 需逐 venue 增加结构化 error code → enum 映射 | 建议对齐，不是最高风险但能减少误判 |
-| M-R14 | small-fill min-notional accumulation 字段预留但策略逻辑未接入 drive loop | passive close 是生产路由 (runtime.py:5675)，不是低频路径 | **必须对齐** — 字段已存在但无策略闭环 |
+| ID | 状态 | 修复说明 |
+|----|------|----------|
+| M-R8 | **已闭环** (两轮根修 2026-05-20) | (1) Parser: V1 全部字段兼容 + normalize_contract_symbol; (2) Subscribe: V1 格式 positions+orders 无 instId; (3) REST detail: `_fetch_bitget_order_detail()` → UTA `/api/v3/trade/order-info` + classic `/api/v2/mix/order/detail` fallback + success code 00000/0 验证; (4) Reconciliation: 复用 `_fetch_bitget_order_detail`; (5) Merge: timestamp max() 语义 (V1 ports.rs:242-260) + state 来源 `bitget_passive_order_state` (V1 bitget.rs:2560-2590), 不来自 merged.state; (6) 根修 ImportError + 字段解析 + fee abs + s→ms 转换; (7) 14 个真实 runtime 测试 (含 timestamp max() + state source order 回归) |
+| M-R12 | **已闭环** | (1) Gate label-based empty_position/pending_conflict/order_not_found 结构化检测; (2) pending conflict 正确进入 retry loop (continue 而非 sleep+return); (3) OKX code 51000/51108 + Bybit 110001/20001 + Binance code -2010/-2011 结构化 error code 映射; (4) 所有 venue 的 terminal reduce-only 都经过 `_is_terminal_reduce_only` + exchange flatness 验证 |
+| M-R14 | **已闭环** | (1) small-fill buffer: `_small_fill_buffer_decision()` V1 exit.rs:6212 精确复刻; (2) 结构化 min-notional check (同时检查 zero_fill AND notional < buffer_threshold); (3) accumulation attempts + maker terminal escalation; (4) **pre-submit**: `_check_hedge_min_notional()` 在 hedge 提交前执行 normalize_quantity + close_leg_exchange_min_notional_violation, 低于 threshold 时跳过提交并 tracked accumulation; (5) cross-chunk reset |
 
 ---
 
@@ -332,13 +330,169 @@ C-R2 的生产路径证据链完整：
 
 ---
 
+---
+
+## M-R8/M-R12/M-R14 部分修复 (2026-05-19/20)
+
+### M-R8: Bitget passive order progress — 生产路径根修 (2026-05-19 初修 + 2026-05-20 根修)
+
+#### 初修 (2026-05-19): Parser 字段兼容 + normalize_contract_symbol fallback
+
+**问题**: V2 Bitget parser 只吃 orderId/accBaseVolume/avgPrice 三个字段，symbol_map miss 直接丢弃消息，无法消费 V1 fixture `instId=BTCUSDT` 类 V1 常见 payload。
+
+**修复**:
+- `lightfee/venues/bitget_private_ws.py`: `_handle_bitget_order_data()` 重写为 V1 字段兼容
+- `_handle_bitget_position_data()` 同 V1
+- 新增 `_normalize_contract_symbol()` / `_json_string()` / `_json_f64()` / `_json_i64()`
+
+**测试** (8 tests, `TestBitgetV1PrivateOrderParser`): 已覆盖 V1 fixture 字段变体、symbol_map fallback、position 链路
+
+#### 根修 (2026-05-20): ImportError + 字段缺失 + success code + state 漂移 + fee/timestamp
+
+**硬阻塞 (ImportError)**: `lightfee/venues/transport.py` `_fetch_bitget_order_detail()` 第 4010 行:
+```python
+from lightfee.core.errors import TransportErrorCategory
+```
+`TransportErrorCategory` 实则在 `transport.py` 本模块第 119 行定义。`lightfee.core.errors` 无此类 → 每次调用均抛出 `ImportError`，被上层 `except (TransportError, Exception): pass` 吞掉 → REST detail 和 reconciliation 均不发出请求 → `query_passive_order_progress()` 返回 None。
+
+**连带缺陷 (逐行 V1 对照后发现)**:
+
+1. **缺失 success code 验证**: `_fetch_bitget_order_detail` 只检查 absent order 码 (40109/43001)，不验证 success code (00000/0)。V1 的 `bitget_data()` 强制要求 code=00000/0，非成功非缺席响应返回 error。V2 会把错误响应当合法数据传给上层 → 修复：UTA 和 classic 路径均增加 `if code not in ("00000", "0"): return None`
+
+2. **`_query_passive_order_progress_bitget` 委托通用 `_parse_passive_order_progress`** (V2 架构便捷性): 通用 parser 缺少 Bitget 专属字段：
+   - cum_qty 缺 `filled_amount`
+   - fee 缺 `totalFee`/`filledFee`/`feeDetail.totalFee`（且不 abs()）
+   - timestamp 缺 `update_time_ms`、无秒→毫秒转换
+   - state 使用通用状态映射而非 V1 `bitget_passive_order_state`（需比较 original_quantity 判断 FILLED）
+   → 修复：完全重写 REST detail 解析路径，在 `_query_passive_order_progress_bitget` 内按 V1 风格直接提取 Bitget 专属字段（_bf/_bf_f64/_bf_i64/_bf_fee 辅助函数），含 V1 `bitget_passive_order_state` 逻辑
+
+3. **`_parse_order_status_bitget` order_id 缺 `ordId` fallback**: V1 用 `["orderId", "ordId"]`，V2 只用 `"orderId"` → 修复：增加 `ordId` fallback
+
+4. **Bitget private WS state 语义漂移**: V1 `handle_bitget_private_message` orders 路径显式设置 `state: None` (bitget.rs:4915)，state 仅在 merge 时由 REST detail 决定。V2 `_handle_bitget_order_data` 从 WS message 解析 `status` 并推导 PassiveOrderState → 修复：`state=None` 对齐 V1
+
+5. **V2 `_parse_passive_order_progress` 补充 Bitget 字段** (作为安全网): cum_qty 增 `baseVolume`/`fillSz`/`size`；avg_price 增 `priceAvg`/`fillPriceAvg`/`averagePrice`；last_fill_time 增 `uTime`
+
+**修复文件**:
+- `lightfee/venues/transport.py`: 删除错误 import；`_fetch_bitget_order_detail` 增 success code 验证；`_query_passive_order_progress_bitget` 完整重写为 V1 风格直接字段解析 (含 fee abs/timestamp 转换/state 检测)；`_parse_order_status_bitget` 增 `ordId` fallback；`_parse_passive_order_progress` 补 Bitget 字段
+- `lightfee/venues/bitget_private_ws.py`: `_handle_bitget_order_data` 的 `state=None` 对齐 V1
+- `tests/test_v1_private_ws_parity.py`: `test_zero_fill_terminal_order_still_recorded` 的 state 断言对齐 V1
+
+**新增/更新 runtime 测试** (10 tests, `TestBitgetPassiveProgressEndpoint`):
+1. `test_fetch_bitget_order_detail_hits_uta_not_place_order` — fake `_request` 断言调用 `/api/v3/trade/order-info`，不含 place-order
+2. `test_fetch_bitget_order_detail_no_import_error` — 直接调用无 ImportError
+3. `test_query_passive_order_progress_bitget_uta_happy_path` — 端到端 UTA → parse → merge → PassiveOrderProgress (cum/avg/fee/order_id/client_order_id 全量验证)
+4. `test_uta_request_rejected_falls_back_to_classic` — UTA REQUEST_REJECTED → classic `/api/v2/mix/order/detail` (productType=USDT-FUTURES)
+5. `test_reconciliation_participates_in_merge_with_highest_qty` — 三源不同量，证明 reconciliation 确实被调用 (>=2 次 _request)
+6. `test_reconciliation_wins_when_higher_qty_than_detail_and_private` — reconciliation 0.030 > private 0.012 > detail 0.005 → reconciliation 字段获胜
+7. `test_absent_order_code_40109_returns_none` — 40109 → None
+8. `test_merge_has_three_sources_recon_detail_private` — reconciliation qty=0.015 最高 → 获胜 (source="reconciliation")
+9. `test_equal_quantity_reconciliation_wins_over_detail` — 等量时 reconciliation 优先
+10. `test_identity_fallback_from_detail_when_recon_missing` — reconciliation 有 fill 但无 order_id → fallback detail 的 identity
+
+**生产路径逐段验证证据** (`_request` monkeypatch 记录真实 HTTP 调用):
+
+| 路径段 | V2 调用 | V1 对应 |
+|--------|---------|---------|
+| UTA endpoint | `GET /api/v3/trade/order-info` (params: orderId/clientOid) | bitget.rs:3685 |
+| Absent order | code=40109 → return None | bitget_payload_indicates_absent_order |
+| Success code check | code∉{00000,0} → return None | bitget_data() |
+| Classic fallback | `GET /api/v2/mix/order/detail` (productType=USDT-FUTURES) | bitget.rs:3677 |
+| REST detail parse | V1 multi-key fallback: baseVolume/priceAvg/uTime + fee abs + s→ms | bitget.rs:2496-2533 |
+| Reconciliation | 复用 `_fetch_bitget_order_detail` → `_parse_order_status_bitget` | bitget.rs:2912-2949 |
+| Merge | `merge_passive_progress_sources(detail, reconciliation, private)` | passive_progress.rs:6 |
+| State | V1 `bitget_passive_order_state` 含 original_qty FILLED 检测 | bitget.rs:3755-3795 |
+
+#### 补充根修 (2026-05-20 第二轮): timestamp max() + state source order 漂移
+
+上轮验收发现全量 pytest 通过，但逐行 V1 对照仍发现两个语义漂移。
+
+**漂移 1: `resolve_cumulative_order_progress` timestamp 选择逻辑**
+
+- **V1 语义** (ports.rs:242-260): `updated_at_ms` 和 `last_fill_at_ms` 在 highest-quantity sources 内取 `max()`，没有才 fallback 到所有 sources 的 `max()`
+- **V2 旧行为**: `last_fill_at_ms` 取 highest 内第一个非空值 (`break`)，`updated_at_ms` 取所有 sources 的 `max()` (跳过了 highest-only 阶段)
+- **漂移影响**: reconciliation 和 detail 等量时，reconciliation 的 timestamp 总是赢(first-in-list)，即使 detail 的 timestamp 更新。V1 会取 max
+- **修复** (`lightfee/marketdata/private_ws.py:569-599`):
+  - `last_fill_at_ms`: highest sources 内 `max()` → fallback 到 all sources `max()`
+  - `updated_at_ms`: highest sources 内 `max()` → fallback 到 all sources `max()` (原直接取 all sources)
+  - 同时补 `state` 的 fallback 到 all sources (V1 有，V2 原缺)
+- **回归测试** (3 tests, `TestBitgetPassiveProgressEndpoint`):
+  - `test_timestamp_last_fill_max_within_highest_sources` — 等量时 reconciliation=100 vs detail=200 → max() 选 200
+  - `test_timestamp_updated_at_max_within_highest_fallback_to_all` — highest 无 updated_at_ms → fallback 到 all sources max=300
+  - `test_timestamp_last_fill_fallback_to_all_sources` — highest 无 last_fill → fallback 到 all sources max=500
+- **V1 对应**: ports.rs:242-260 (`filter_map(|s| s.last_fill_at_ms).max().or_else(|| sources.iter()...max())`)
+
+**漂移 2: Bitget final state 来​源顺序**
+
+- **V1 语义** (bitget.rs:2560-2590): state 由 `bitget_passive_order_state(status, merged_cumulative_quantity, original_quantity)` 决定，参数来自 REST detail。只有 `detail.is_none() && private_progress.is_some() && cumulative_quantity <= 0.0` 时返回 Resting。`merged.state` 完全不被用于 Bitget state
+- **V2 旧行为**: 先用 `merged.state` (resolve_cumulative_order_progress 输出的最高 qty 源的 state)，再 fallback 到 `parsed_state` (REST detail 的 bitget_passive_order_state)。私有 WS 若带 state 会覆盖 REST detail 推导的状态。且 `parsed_state` 使用 pre-merge `detail_progress.cumulative_quantity`，非 `merged.cumulative_quantity`
+- **漂移影响**: 
+  - 场景: REST detail status=open, baseVolume=0.5, size=1.0; private WS quantity=0.5 但 state=FILLED
+  - 旧 V2: `merged.state` → private WS 的 FILLED 胜出 → **错误返回 FILLED**
+  - V1: `bitget_passive_order_state("open", 0.5, Some(1.0))` → cum_qty>0 → **PARTIALLY_FILLED** ✓
+  - 另一个场景: REST detail cum_qty=0 status=open; private WS cum_qty=0.5
+  - 旧 V2: `parsed_state` 用 detail cum_qty=0 → **open 状态**
+  - V1: merged cum_qty=0.5 > 0 → **PARTIALLY_FILLED** ✓
+- **修复** (`lightfee/venues/transport.py:4083-4110`):
+  - 移除 `merged.state` 和预计算 `parsed_state`
+  - 提取 `_btg_status_str`、`_btg_original_qty` 在 REST detail 解析段保存
+  - Post-merge 用 `merged.cumulative_quantity` + REST detail 的 status/original_qty 重新计算 `bitget_passive_order_state`
+  - 保留 V1 fallback: `detail_data is None and private_progress and merged.cumulative_quantity <= 0 → OPEN`
+- **回归测试** (1 test):
+  - `test_bitget_state_comes_from_rest_detail_not_private_ws` — REST detail: status=open, baseVolume=0.5, size=1.0; private WS: state=FILLED → final state=PARTIALLY_FILLED (cum_qty>0 with status=open), NOT FILLED
+- **V1 对应**: bitget.rs:2560-2590 (state = bitget_passive_order_state(status, cumulative_quantity, original_quantity)); bitget.rs:3755-3795 (bitget_passive_order_state 函数); passive_progress.rs:24-34 (build_passive_order_progress 接收独立 state 参数)
+
+### M-R12: Gate terminal reduce-only 结构化 error classifier
+
+**问题**: V2 close_executor 仅用 `contains("reduce_only")`, `contains("empty position")` 等字符串 pattern 判断 terminal reduce-only，无法区分 Gate pending conflict (可重试) 和 empty position (terminal)。
+
+**修复**:
+- `lightfee/engine/close_executor.py`: 新增模块级函数:
+  - `_extract_gate_error_fields()`: 从 Gate 错误串提取 `label=` / `msg=`
+  - `_classify_close_leg_error()`: 结构化分类 → dict with `empty_position`, `order_not_found`, `pending_conflict`, `terminal_reduce_only`
+  - `_is_terminal_reduce_only()`: 综合判断 — empty_position → terminal; pending_conflict → NOT terminal; 通用 fallback
+  - `_string_contains_any()`: 通用字符串匹配辅助
+- `_submit_close_leg_with_retry()` 更新为: 先结构化分类, pending_conflict → journal + 可重试, empty_position → 验证 exchange flat → terminal success
+
+**测试** (10 tests, `TestM12CloseLegErrorClassification`):
+- Gate `label=reduce_exceeded msg=empty position` → terminal
+- 大小写不敏感
+- `label=reduce_only_fail msg=pending order conflicts with reduce order` → NOT terminal
+- `label=reduce_exceeded` with pending order → conflict, not terminal
+- `label=ORDER_NOT_FOUND` → terminal
+- Generic `reduce_only` text → terminal fallback
+- Non-terminal reduce_only text → 结构化分类正确不误判
+- Unrelated error → not terminal
+- `_string_contains_any()` 辅助验证
+
+### M-R14: small-fill buffer 完整接入 passive close drive loop
+
+**问题**: V2 `PendingPassiveClose` 有字段 `small_fill_min_notional_attempts` / `last_small_fill_missing_quantity` / `small_fill_buffer_started_at_ms` 和 `PassiveCloseExecutor` 中 chunk advance 时的 reset 逻辑，但 drive loop 从未使用这些字段。maker 小额成交导致 hedge delta 低于 min-notional 时，不会 buffer，直接提交无效 hedge。
+
+**修复**:
+- `lightfee/engine/passive_close.py`: 
+  - `_small_fill_buffer_decision()`: V1 `passive_close_small_fill_buffer_decision()` 精确复刻 (exit.rs:6212-6242)
+  - `PassiveCloseConfig` 新增: `small_fill_buffer_notional_quote` (default 10.0), `small_fill_buffer_max_wait_ms` (default 5000), `maker_min_notional_accumulation_attempts` (default 5)
+  - `drive_pending_passive_close()`: delta hedge 段增加:
+    1. 计算 `buffered_notional = unhedged_gap * hedge_price_hint`
+    2. 判断 `can_accumulate_small_fill` (maker 非 terminal state)
+    3. `_small_fill_buffer_decision()` → should_buffer: set `small_fill_buffer_started_at_ms`, journal buffering, short retry
+    4. wait_expired: journal buffer expired, fall through to hedge
+    5. hedge 失败 → 检查 `last_small_fill_missing_quantity` 增量 → `small_fill_min_notional_attempts += 1`
+    6. attempt 耗尽或 maker terminal → escalate to DUAL_TAKER
+  - Chunk advance 中原有 reset 逻辑已存在（`advance_chunk` → `small_fill_min_notional_attempts = 0`, `last_small_fill_missing_quantity = 0.0`, `small_fill_buffer_started_at_ms = None`）
+
+**测试** (14 tests):
+- `TestM14SmallFillBufferDecision` (9 tests): below threshold buffer, above threshold no buffer, cannot accumulate, zero config disabled, zero notional, buffer expired, buffer active, remaining_wait ≥ 1, config defaults
+- `TestM14SmallFillBufferStateTransitions` (5 tests): attempt increment, field reset on chunk advance, cross-chunk non-contamination, accumulation exhausted threshold, maker terminal escalation
+
+---
+
 ## 残余风险
 
-1. **M-R8/M-R12/M-R14**: 仍未闭环 — 见上方 "仍未闭环" 表
-2. **H-R7/M-R16**: 需批准差异 — 有 contract tests，未被批准则需改内部模型
-3. **新 venue 上线**: 需同步更新 adapter 的 `supports_private_health` 覆盖和 private WS health 接入
-4. **fault_reason 词汇表扩散**: 需同步更新 contract test 的 coverage
-5. **private WS health 更新方**: 外部 private WS 连接管理器必须调用 `transport.record_private_ws_success/failure()` 以维持 ConnectionHealth 同步。当前 transport 默认初始化为健康，若未接入外部 WS 管理器则 private health 永远健康 — 需在 live startup 阶段完成对接（本轮已通过 runtime._ensure_private_ws_started 和 7 个 venue worker 完成生产路径接入）
+1. **H-R7/M-R16**: 需批准差异 — 有 contract tests，未被批准则需改内部模型
+2. **新 venue 上线**: 需同步更新 adapter 的 `supports_private_health` 覆盖、private WS health 接入、error code 映射
+3. **fault_reason 词汇表扩散**: 需同步更新 contract test 的 coverage
+4. **M-R8 已验证但需注意**: 本轮的 reconciliation 在 `_query_passive_order_progress_bitget` 内调用了两次 `_fetch_bitget_order_detail` (一次 REST detail，一次 reconciliation)。V1 同样两次调用 `fetch_bitget_order_detail` (bitget.rs:2490 + 2919)。这是 V1 行为，不是 V2 冗余。未来若 reconciliation 独立为通用路径，需确保 Bitget reconciliation 保留 UTA→classic fallback。
 
 
 ---
@@ -346,11 +500,17 @@ C-R2 的生产路径证据链完整：
 ## 测试结果
 
 ```
-全量: 2730 passed, 2 skipped
-修复 1-5 聚焦: 118 passed (tests/test_ws_resilience.py + test_private_ws_state.py + test_venue_private_ws_parsers.py + test_v1_private_ws_parity.py)
-修复 6 聚焦: 129 passed (+11: lowercase pair_id canonicalize + symbol_map regression)
-L-R6 新增: 14 passed (TestLazyOpsTokenBucket)
-H-R7/M-R16 contract tests: 18 passed
+全量: 2799 passed, 0 failed, 2 skipped, 1 warning (2026-05-20, M-R8 第二轮 timestamp+state 根修后)
+Private WS parity: 75 passed (含 TestV1PrivateWsResolver)
+Bitget parser: 15 passed
+Merge tests: 9 passed (TestMergePassiveProgressSources)
+M-R8 Bitget passive progress runtime: 14 passed (TestBitgetPassiveProgressEndpoint: 10 base + 3 timestamp max() + 1 state source order)
+M-R8 parse/subscribe: 8 passed (TestBitgetV1PrivateOrderParser)
+M-R12 classifier: 10 passed (TestM12CloseLegErrorClassification) + 9 passed (TestM12VenueErrorCodes)
+M-R14 buffer+pre-submit: 14 passed (buffer decision/state transitions) + 5 passed (TestM14PreSubmitMinNotional)
+Passive close/close: 138 passed
+L-R6: 14 passed (TestLazyOpsTokenBucket)
+H-R7/M-R16: 18 passed
 ```
 
 ---

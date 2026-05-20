@@ -56,12 +56,57 @@ def _bitget_passive_order_state(status: str) -> Optional[PassiveOrderState]:
     return None
 
 
-def _build_bitget_subscribe(inst_type: str, symbols: list[str]) -> str:
+def _build_bitget_subscribe(inst_type: str) -> str:
+    """V1 build_bitget_subscribe: subscribe to positions + orders channels.
+
+    V1 bitget.rs:4871 — no per-symbol instId in subscribe args.
+    """
     return json.dumps({
         "op": "subscribe",
-        "args": [{"instType": inst_type, "channel": "orders", "instId": s} for s in symbols]
-        + [{"instType": inst_type, "channel": "positions", "instId": s} for s in symbols],
+        "args": [
+            {"instType": inst_type, "channel": "positions"},
+            {"instType": inst_type, "channel": "orders"},
+        ],
     })
+
+
+def _normalize_contract_symbol(raw: str) -> str:
+    """V1 normalize_contract_symbol: strip, uppercase, remove _ and -."""
+    return raw.strip().upper().replace("_", "").replace("-", "")
+
+
+def _json_string(row: dict[str, Any], keys: list[str]) -> str:
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            return str(v)
+    return ""
+
+
+def _json_f64(row: dict[str, Any], keys: list[str]) -> Optional[float]:
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _json_i64(row: dict[str, Any], keys: list[str]) -> Optional[int]:
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            try:
+                val = int(v)
+                # V1: auto-convert second-precision timestamps to ms
+                if val < 10_000_000_000:
+                    return val * 1000
+                return val
+            except (ValueError, TypeError):
+                continue
+    return None
 
 
 def _handle_bitget_order_data(
@@ -69,32 +114,55 @@ def _handle_bitget_order_data(
     symbol_map: dict[str, str],
     private_state,
 ) -> None:
+    """V1 handle_bitget_private_message orders path.
+
+    V1 field compatibility:
+    - orderId: ordId/orderId
+    - clientOid: clientOid/clOrdId
+    - filledQty: baseVolume/filledQty/fillQty/size
+    - avgPrice: priceAvg/fillPriceAvg/averagePrice/avgPrice
+    - fee: fee/totalFee/filledFee (abs)
+    - timestamp: uTime/cTime/updateTime (auto ms conversion)
+    """
     loop = asyncio.get_running_loop()
     for row in data:
-        venue_symbol = row.get("instId", "")
+        venue_symbol = (
+            row.get("instId") or row.get("symbol") or ""
+        )
+        if isinstance(venue_symbol, str):
+            venue_symbol = venue_symbol.strip()
         symbol = symbol_map.get(venue_symbol)
         if symbol is None:
-            continue
-        order_id = str(row.get("orderId", ""))
-        client_id = row.get("clientOid", "")
-        filled_qty = float(row.get("accBaseVolume", row.get("fillSz", 0)) or 0)
-        avg_price = float(row.get("avgPrice", row.get("fillPx", 0)) or 0)
-        fee_quote = None
-        fee_val = row.get("fee", "")
-        fee_ccy = row.get("feeCcy", "")
-        if fee_val and fee_ccy in ("USDT", "USDC"):
-            fee_quote = abs(float(fee_val))
-        status = row.get("status", "")
-        state = _bitget_passive_order_state(status)
-        ts = int(row.get("uTime", row.get("cTime", _now_ms())))
+            # V1 fallback: normalize_contract_symbol when symbol_map miss
+            symbol = _normalize_contract_symbol(venue_symbol)
+            if not symbol:
+                continue
+        order_id = _json_string(row, ["ordId", "orderId"])
+        client_id = _json_string(row, ["clientOid", "clOrdId"])
+        filled_qty = _json_f64(row, ["accBaseVolume", "baseVolume", "filledQty", "fillQty", "fillSz", "size"]) or 0.0
+        avg_price = _json_f64(row, ["priceAvg", "fillPriceAvg", "averagePrice", "avgPrice"])
+        fee_quote = _json_f64(row, ["fee", "totalFee", "filledFee"])
+        if fee_quote is not None:
+            fee_quote = abs(fee_quote)
+        else:
+            # V1: also try feeDetail.totalFee
+            fee_detail = row.get("feeDetail")
+            if isinstance(fee_detail, dict):
+                fee_quote = _json_f64(fee_detail, ["totalFee"])
+                if fee_quote is not None:
+                    fee_quote = abs(fee_quote)
+        # V1: handle_bitget_private_message explicitly sets state=None for
+        # Bitget orders (bitget.rs:4915). State is resolved later via REST
+        # detail during merge, not from WS push which may carry stale status.
+        ts = _json_i64(row, ["uTime", "cTime", "updateTime"]) or _now_ms()
         update = PrivateOrderUpdate(
             symbol=symbol,
             order_id=order_id,
             client_order_id=client_id if client_id else None,
             filled_quantity=filled_qty,
-            average_price=avg_price if avg_price > 0 else None,
+            average_price=avg_price if avg_price is not None and avg_price > 0 else None,
             fee_quote=fee_quote,
-            state=state,
+            state=None,
             updated_at_ms=ts,
         )
         loop.create_task(private_state.record_order(update))
@@ -105,16 +173,34 @@ def _handle_bitget_position_data(
     symbol_map: dict[str, str],
     private_state,
 ) -> None:
+    """V1 handle_bitget_private_message positions path.
+
+    V1 field compatibility:
+    - size: total/available/holdVolume/size (abs)
+    - holdSide: holdSide/posSide/hold_mode → signed
+    - timestamp: uTime/cTime/updateTime
+    """
     loop = asyncio.get_running_loop()
     for row in data:
-        venue_symbol = row.get("instId", "")
+        venue_symbol = (
+            row.get("instId") or row.get("symbol") or ""
+        )
+        if isinstance(venue_symbol, str):
+            venue_symbol = venue_symbol.strip()
         symbol = symbol_map.get(venue_symbol)
         if symbol is None:
-            continue
-        size = float(row.get("available", row.get("total", 0)) or 0)
-        pos_side = row.get("posSide", "")
-        signed = size if pos_side == "long" else -size
-        ts = int(row.get("uTime", _now_ms()))
+            symbol = _normalize_contract_symbol(venue_symbol)
+            if not symbol:
+                continue
+        raw_size = abs(_json_f64(row, ["total", "available", "holdVolume", "size"]) or 0.0)
+        hold_side = _json_string(row, ["holdSide", "posSide", "hold_mode"]).lower()
+        if hold_side in ("long", "buy"):
+            signed = raw_size
+        elif hold_side in ("short", "sell"):
+            signed = -raw_size
+        else:
+            signed = raw_size
+        ts = _json_i64(row, ["uTime", "cTime", "updateTime"]) or _now_ms()
         loop.create_task(private_state.update_position(symbol, signed, ts))
 
 
@@ -133,10 +219,9 @@ def handle_bitget_private_message(
     event = payload.get("event", "")
     code = str(payload.get("code", "0"))
 
-    # Login ack → subscribe
+    # Login ack → subscribe (V1: positions + orders, no per-symbol instId)
     if event == "login" and code == "0":
-        inst_ids = list(symbol_map.keys())
-        return _build_bitget_subscribe("USDT-FUTURES", inst_ids), True
+        return _build_bitget_subscribe("USDT-FUTURES"), True
 
     if event == "subscribe":
         return None, subscribed

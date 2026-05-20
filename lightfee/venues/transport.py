@@ -3221,7 +3221,9 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             return None
 
-        order_id = str(data.get("orderId", ""))
+        # V1: json_string(&row, &["orderId", "ordId"]).unwrap_or_else(|| order_id.to_string())
+        # Note: caller provides fallback order_id
+        order_id = str(data.get("orderId", data.get("ordId", "")))
         client_id = str(data.get("clientOid", ""))
         # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, filled_amount, size
         cum_qty = _safe_float(
@@ -3812,10 +3814,10 @@ class VenueTransport(MarketDataClient):
     ) -> Optional["PassiveOrderProgress"]:
         """Query cumulative progress for a resting passive order.
 
-        V1 private-first: check private WS state before REST query.
-        Private updates are authoritative even with zero fill when they carry
-        terminal state (CANCELED, REJECTED, EXPIRED). Side is best-effort
-        from caller context; falls back to BUY when unknown.
+        V1 semantics:
+        - Bitget: REST detail + private progress + reconciliation → merge
+          (V1 bitget.rs:2483 fetch_passive_order_progress).
+        - Other venues: private-first with REST fallback.
         """
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
 
@@ -3826,18 +3828,19 @@ class VenueTransport(MarketDataClient):
         if self.mode == "paper":
             return None
 
-        # Private WS first
+        # Bitget: full V1 REST+private+reconciliation merge
+        if spec.venue_id == Venue.BITGET:
+            return await self._query_passive_order_progress_bitget(
+                symbol, venue_sym, order_id, client_order_id, side, now_ms,
+            )
+
+        # Other venues: private-first, REST fallback
         private_progress = self.private_order_progress(
             client_order_id=client_order_id,
             order_id=order_id,
             max_age_ms=15_000,
         )
         if private_progress is not None:
-            # V1: return private progress regardless of fill quantity.
-            # Terminal states (CANCELED/REJECTED/EXPIRED) with 0 fill are
-            # authoritative evidence the maker order is done.
-            # OPEN with 0 fill confirms the private WS sees the order.
-            # REST is only a fallback when private data is absent or stale.
             resolved_side = side or Side.BUY
             return PassiveOrderProgress(
                 venue=spec.venue_id,
@@ -3874,17 +3877,10 @@ class VenueTransport(MarketDataClient):
                     params["orderId"] = order_id
                 elif client_order_id:
                     params["orderLinkId"] = client_order_id
-            elif spec.venue_id == Venue.BITGET:
-                params["symbol"] = venue_sym
-                if order_id:
-                    params["orderId"] = order_id
-                elif client_order_id:
-                    params["clientOid"] = client_order_id
             elif spec.venue_id == Venue.GATE:
                 if order_id:
                     params["order_id"] = order_id
             elif spec.venue_id == Venue.HYPERLIQUID:
-                # V1: query Hyperliquid info API for order status (hyperliquid.rs:2033-2130)
                 result = await self._query_hyperliquid_order(spec, venue_sym, order_id, client_order_id, now_ms)
                 if result is not None:
                     raw, is_list = result
@@ -3899,6 +3895,290 @@ class VenueTransport(MarketDataClient):
         except TransportError:
             return None
         except Exception:
+            return None
+
+    async def _query_passive_order_progress_bitget(
+        self, symbol: str, venue_sym: str, order_id: str,
+        client_order_id: Optional[str], side: "Side | None", now_ms: int,
+    ) -> Optional["PassiveOrderProgress"]:
+        """V1 Bitget fetch_passive_order_progress (bitget.rs:2483-2562).
+
+        Full merge: REST order detail + private WS progress + reconciliation.
+        Priority: reconciliation > REST detail > private WS.
+
+        Bitget REST detail is parsed DIRECTLY from the raw response using
+        V1 multi-key fallbacks (NOT through generic _parse_passive_order_progress
+        which lacks Bitget-specific field names for fee/timestamp/quantity).
+        """
+        from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side as DomainSide
+        from lightfee.marketdata.private_ws import (
+            CumulativeOrderProgress,
+            merge_passive_progress_sources,
+            should_fetch_passive_reconciliation,
+        )
+
+        spec = self._spec
+        detail_data: Optional[dict[str, Any]] = None
+        detail_progress: Optional[CumulativeOrderProgress] = None
+        # V1: original_quantity + status extracted from REST detail for state detection
+        # (bitget.rs:2576-2583). State is computed AFTER merge using merged cumulative_quantity.
+        _btg_original_qty: float = 0.0
+        _btg_status_str: str = ""
+
+        # 1. Fetch REST order detail (V1: fetch_bitget_order_detail → parse fields)
+        try:
+            if order_id or client_order_id:
+                raw = await self._fetch_bitget_order_detail(
+                    venue_sym, order_id, client_order_id,
+                )
+                if raw is not None:
+                    # V1: bitget_data() — extract "data" field, verify code success
+                    data = raw.get("data", raw)
+                    if isinstance(data, list):
+                        data = data[0] if data else {}
+                    if isinstance(data, dict) and data:
+                        detail_data = data
+        except (TransportError, Exception):
+            pass
+
+        if detail_data is not None:
+            # V1: directly extract fields from detail row with multi-key fallback
+            # (bitget.rs:2496-2533, json_string / json_f64 / json_i64 per-field)
+            def _bf(keys, default=""):
+                """Bitget field: first non-empty string value from key list."""
+                for k in keys:
+                    v = detail_data.get(k)
+                    if v is not None and str(v).strip():
+                        return str(v)
+                return default
+
+            def _bf_f64(keys, default=0.0):
+                for k in keys:
+                    v = detail_data.get(k)
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if fv > 0.0 and __import__('math').isfinite(fv):
+                                return fv
+                        except (TypeError, ValueError):
+                            continue
+                return default
+
+            def _bf_i64(keys, default=0):
+                for k in keys:
+                    v = detail_data.get(k)
+                    if v is not None:
+                        try:
+                            iv = int(v)
+                            if iv > 0:
+                                # V1: seconds → ms conversion (bitget.rs:2533)
+                                return iv if iv >= 10_000_000_000 else iv * 1000
+                        except (TypeError, ValueError):
+                            continue
+                return default
+
+            # Fee: V1 json_f64(row, &["fee","totalFee","filledFee"])
+            #      .or_else(|| row.get("feeDetail").and_then(|v| json_f64(v, &["totalFee"]).map(f64::abs)))
+            def _bf_fee():
+                for k in ("fee", "totalFee", "filledFee"):
+                    v = detail_data.get(k)
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if __import__('math').isfinite(fv):
+                                return abs(fv)
+                        except (TypeError, ValueError):
+                            continue
+                fd = detail_data.get("feeDetail")
+                if isinstance(fd, dict):
+                    tf = fd.get("totalFee")
+                    if tf is not None:
+                        try:
+                            return abs(float(tf))
+                        except (TypeError, ValueError):
+                            pass
+                elif isinstance(fd, list):
+                    fee_sum = 0.0
+                    for entry in fd:
+                        if isinstance(entry, dict):
+                            try:
+                                fee_sum += abs(float(entry.get("fee", "0")))
+                            except (TypeError, ValueError):
+                                pass
+                    if fee_sum > 0:
+                        return fee_sum
+                return 0.0
+
+            # V1: save status + original_quantity for post-merge state detection
+            # State is computed AFTER merge using merged.cumulative_quantity
+            # (bitget.rs:2560-2590)
+            _btg_original_qty = _bf_f64(["size", "qty", "baseSize", "amount"])
+            _btg_status_str = _bf(["state", "status", "orderStatus", "ordStatus"]).lower()
+
+            detail_progress = CumulativeOrderProgress.from_position_snapshot(
+                order_id=_bf(["orderId", "ordId"]) or order_id,
+                client_order_id=_bf(["clientOid"]) or client_order_id,
+                cumulative_quantity=_bf_f64([
+                    "baseVolume", "filledQty", "fillQty", "filled_amount", "size",
+                ]),
+                average_price=_bf_f64([
+                    "priceAvg", "fillPriceAvg", "averagePrice", "avgPrice",
+                ]) or None,
+                fee_quote=_bf_fee() or None,
+                updated_at_ms=_bf_i64([
+                    "updateTime", "update_time_ms", "cTime", "uTime",
+                ]) or now_ms,
+            )
+
+        if detail_progress is None:
+            detail_progress = CumulativeOrderProgress()
+
+        # 2. Look up private WS progress (V1: lookup_or_wait_private_order_progress)
+        private_progress = self.private_order_progress(
+            client_order_id=client_order_id,
+            order_id=order_id,
+            max_age_ms=15_000,
+        )
+
+        # 3. Fetch reconciliation (V1: fetch_order_fill_reconciliation →
+        #    fetch_bitget_order_detail → parse as OrderFillReconciliation)
+        reconciliation = None
+        if should_fetch_passive_reconciliation(detail_progress, private_progress):
+            try:
+                recon_raw = await self._fetch_bitget_order_detail(
+                    venue_sym, order_id, client_order_id,
+                )
+                if recon_raw is not None:
+                    recon = self._parse_order_status_bitget(
+                        recon_raw, venue_sym, now_ms,
+                    )
+                    if recon is not None and recon.quantity > 0:
+                        reconciliation = recon
+            except Exception:
+                pass
+
+        # 4. Merge all sources: highest qty wins; tied qty → recon > detail > private
+        merged = merge_passive_progress_sources(
+            detail_progress, reconciliation, private_progress,
+        )
+
+        # 5. Determine state (V1: bitget_passive_order_state, bitget.rs:2560-2590)
+        # State ALWAYS from REST detail status + merged cumulative_quantity.
+        # Never from merged.state (which could carry private WS or reconciliation state).
+        # V1: if detail.is_none() && private_progress.is_some() && cumulative_quantity <= 0.0
+        #     → Resting; else → bitget_passive_order_state(status, merged_qty, original_qty)
+        if detail_data is None and private_progress is not None \
+                and merged.cumulative_quantity <= 0.0:
+            state = PassiveOrderState.OPEN  # V1: Resting
+        else:
+            merged_qty = merged.cumulative_quantity
+            is_filled = (
+                _btg_original_qty > 0.0
+                and merged_qty + 1e-9 >= _btg_original_qty
+            )
+            if _btg_status_str in ("filled", "closed", "completed", "done", "success") \
+                    or is_filled:
+                state = PassiveOrderState.FILLED
+            elif _btg_status_str in (
+                "partial_filled", "partial_fill", "partially_filled",
+                "partial", "partial filled",
+            ) or merged_qty > 0.0:
+                state = PassiveOrderState.PARTIALLY_FILLED
+            elif _btg_status_str in ("canceled", "cancelled", "cancel", "expired", "terminated"):
+                state = PassiveOrderState.CANCELED
+            elif _btg_status_str in ("rejected", "reject", "failed", "invalid"):
+                state = PassiveOrderState.REJECTED
+            elif _btg_status_str in ("open", "live", "resting", "new", "pending", "triggered"):
+                state = PassiveOrderState.OPEN
+            else:
+                # V1: bitget_passive_order_state returns Unknown for unrecognized
+                # status regardless of quantity (bitget.rs:3795)
+                state = PassiveOrderState.UNKNOWN
+
+        # 6. V1: detail None + private None + 0 fill → None
+        if detail_data is None and private_progress is None and merged.cumulative_quantity <= 0.0:
+            return None
+
+        # 7. Side from detail or caller fallback (V1: bitget.rs:2565-2574)
+        resolved_side: "DomainSide" = side or DomainSide.BUY
+        if detail_data is not None:
+            side_str = str(detail_data.get("side", "")).lower()
+            if side_str == "buy":
+                resolved_side = DomainSide.BUY
+            elif side_str == "sell":
+                resolved_side = DomainSide.SELL
+
+        return PassiveOrderProgress(
+            venue=spec.venue_id,
+            symbol=symbol,
+            side=resolved_side,
+            order_id=merged.order_id or order_id,
+            client_order_id=merged.client_order_id or client_order_id or "",
+            cumulative_quantity=merged.cumulative_quantity,
+            average_price=merged.average_price or 0.0,
+            fee_quote=merged.fee_quote or 0.0,
+            last_fill_time_ms=merged.last_fill_at_ms or 0,
+            state=state,
+            observed_at_ms=now_ms,
+        )
+
+    async def _fetch_bitget_order_detail(
+        self, venue_sym: str, order_id: str, client_order_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        """V1 fetch_bitget_order_detail (bitget.rs:3651-3730).
+
+        Tries UTA endpoint first (/api/v3/trade/order-info), then falls back
+        to classic (/api/v2/mix/order/detail) on classic-account error.
+        """
+        # Build query params: orderId or clientOid
+        query_params: dict[str, Any] = {}
+        if order_id and order_id != "bitget-unknown":
+            query_params["orderId"] = order_id
+        elif client_order_id:
+            query_params["clientOid"] = client_order_id
+        else:
+            return None
+
+        # Try UTA first (V1: account_profile == Uta or unknown)
+        try:
+            raw = await self._request(
+                "GET", "/api/v3/trade/order-info", params=query_params, private=True,
+            )
+            code = str(raw.get("code", ""))
+            # V1: bitget_payload_indicates_absent_order — code 40109/43001
+            if code in ("40109", "43001"):
+                return None
+            # V1: bitget_data() — code must be 00000 or 0 for success
+            if code not in ("00000", "0"):
+                return None
+            return raw
+        except TransportError as e:
+            if e.category == TransportErrorCategory.REQUEST_REJECTED:
+                pass  # May be classic account — fall through
+            else:
+                return None
+        except Exception:
+            pass
+
+        # Fallback: classic endpoint (V1: account_profile == Classic, or UTA rejected)
+        # requires productType + symbol (bitget.rs:4803-4823)
+        classic_params: dict[str, Any] = {
+            "productType": "USDT-FUTURES",
+            "symbol": venue_sym,
+        }
+        classic_params.update(query_params)
+
+        try:
+            raw = await self._request(
+                "GET", "/api/v2/mix/order/detail", params=classic_params, private=True,
+            )
+            code = str(raw.get("code", ""))
+            if code in ("40109", "43001"):
+                return None
+            if code not in ("00000", "0"):
+                return None
+            return raw
+        except (TransportError, Exception):
             return None
 
     def _parse_passive_order_progress(
@@ -3931,12 +4211,16 @@ class VenueTransport(MarketDataClient):
 
         cum_qty = float(data.get("cumQty", data.get("executedQty",
                       data.get("filledSize", data.get("filledQty",
-                      data.get("filled_total", data.get("accFillSz", data.get("cumExecQty", 0))))))))
-        avg_price = float(data.get("avgPrice", data.get("avgPx", data.get("price", 0))))
+                      data.get("baseVolume", data.get("filled_total", data.get("accFillSz",
+                      data.get("fillSz", data.get("cumExecQty", data.get("size", 0)))))))))))
+        avg_price = float(data.get("avgPrice", data.get("priceAvg",
+                         data.get("fillPriceAvg", data.get("averagePrice",
+                         data.get("avgPx", data.get("price", 0)))))))
 
         fee_quote = float(data.get("commission", data.get("fee", 0)))
         last_fill_time = int(data.get("updateTime", data.get("updatedTime",
-                               data.get("updateTimestamp", data.get("cTime", now_ms)))))
+                               data.get("updateTimestamp", data.get("cTime",
+                               data.get("uTime", now_ms))))))
 
         status_str = str(data.get("status", data.get("state", data.get("ordStatus", "")))).upper()
         if status_str in ("NEW", "OPEN", "UNTRI", "ACTIVE", "UNTRIGGERED", "NEW_ORDER", "TRIGGERED"):
