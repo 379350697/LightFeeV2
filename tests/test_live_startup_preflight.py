@@ -542,6 +542,59 @@ class TestRuntimePreflight:
             assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
 
     @pytest.mark.asyncio
+    async def test_local_l2_snapshot_restore_filters_unsupported_venue_symbols(self):
+        """Persisted full-book snapshots must not resurrect non-trading contracts."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.local_l2_enabled = True
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.loaded = False
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            binance = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+            runtime.state.local_l2_books_snapshot = [
+                {
+                    "venue": "binance",
+                    "symbol": "BTCUSDT",
+                    "status": "hot",
+                    "pool": "dropped",
+                    "sequence": 10,
+                    "last_update_id": 10,
+                    "bids": [{"price": 50000.0, "quantity": 1.0}],
+                    "asks": [{"price": 50100.0, "quantity": 1.0}],
+                },
+                {
+                    "venue": "binance",
+                    "symbol": "SYSUSDT",
+                    "status": "rebuilding",
+                    "pool": "dropped",
+                    "sequence": 0,
+                    "last_update_id": 0,
+                    "bids": [],
+                    "asks": [],
+                },
+            ]
+
+            runtime.journal.open()
+            try:
+                await runtime._restore_local_l2_state()
+            finally:
+                runtime.journal.close()
+
+            assert binance.loaded is True
+            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is not None
+            assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
+
+    @pytest.mark.asyncio
     async def test_housekeeping_recovers_balanced_live_positions_after_start(self):
         """A running clean state must not stay false-clean after live positions appear."""
         with tempfile.TemporaryDirectory() as td:

@@ -1395,10 +1395,51 @@ class LiveRuntime:
         snap = getattr(self.state, "local_l2_books_snapshot", None)
         if not snap:
             return
+        allowed_pairs: set[tuple[str, str]] = set()
+        if self.config.runtime.mode != "paper":
+            from lightfee.core.domain import Venue as VenueEnum
+
+            venue_symbols: dict[str, list[str]] = {}
+            for entry in snap:
+                venue = entry.get("venue", "")
+                symbol = entry.get("symbol", "")
+                if venue and symbol:
+                    venue_symbols.setdefault(venue, []).append(symbol)
+
+            for venue_str, symbols in venue_symbols.items():
+                try:
+                    venue_enum = VenueEnum.from_str(venue_str)
+                    adapter = (
+                        self.get_venue_adapter(venue_enum)
+                        if venue_enum in self._venue_adapters
+                        else None
+                    )
+                except (ValueError, KeyError):
+                    adapter = None
+                    venue_enum = None
+                if adapter is None or venue_enum is None:
+                    allowed_pairs.update((venue_str, symbol) for symbol in symbols)
+                    continue
+                filtered_symbols = await self._filter_symbols_supported_by_venue(
+                    venue_enum,
+                    adapter,
+                    sorted(set(symbols)),
+                    skip_event_kind="runtime.local_l2_symbol_skipped",
+                )
+                allowed_pairs.update((venue_str, symbol) for symbol in filtered_symbols)
+        else:
+            allowed_pairs = {
+                (entry.get("venue", ""), entry.get("symbol", ""))
+                for entry in snap
+                if entry.get("venue", "") and entry.get("symbol", "")
+            }
+
         for entry in snap:
             venue = entry.get("venue", "")
             symbol = entry.get("symbol", "")
             if not venue or not symbol:
+                continue
+            if (venue, symbol) not in allowed_pairs:
                 continue
             book = self.local_l2_runtime.ensure_book(venue, symbol)
             book.last_update_id = entry.get("last_update_id", 0)
