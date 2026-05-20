@@ -4682,6 +4682,11 @@ class LiveRuntime:
 
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
+        # V1 latch parity: a fail-closed state with no operator override,
+        # no recovery block, and no recovery work is stale even after live
+        # entry/recovery cleanup, not only during startup snapshot recovery.
+        clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
+
         # V1: ensure private WS workers are running for live adapters
         self._ensure_private_ws_started(now_ms)
 

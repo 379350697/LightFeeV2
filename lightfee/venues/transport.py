@@ -2553,13 +2553,23 @@ class VenueTransport(MarketDataClient):
             }
 
             if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+                fapi_hedge_mode = await self._refresh_fapi_position_mode()
                 body["type"] = "MARKET"
-                if request.reduce_only:
+                if fapi_hedge_mode:
+                    body["positionSide"] = self._fapi_position_side(
+                        request.side, request.reduce_only
+                    )
+                elif request.reduce_only:
                     body["reduceOnly"] = "true"
                 if request.price is not None:
                     body["type"] = "LIMIT"
                     body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
+                preflight["position_mode"] = (
+                    "hedge" if fapi_hedge_mode else "one_way"
+                )
+                if "positionSide" in body:
+                    preflight["position_side"] = body["positionSide"]
             elif spec.venue_id == Venue.OKX:
                 # V1: refresh posMode on first order (lazy, cached thereafter)
                 if getattr(self, '_pos_mode_cache', None) is None:
@@ -3336,6 +3346,8 @@ class VenueTransport(MarketDataClient):
             if spec.venue_id == Venue.OKX:
                 if getattr(self, '_pos_mode_cache', None) is None:
                     await self._refresh_okx_pos_mode()
+            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                await self._refresh_fapi_position_mode()
             ct_val_sz = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
             lot_sz = float(getattr(symbol_rule, 'qty_step', 0)) if symbol_rule else (qty_step or 0.0)
             if spec.venue_id == Venue.OKX and ct_val_sz > 0:
@@ -3378,6 +3390,12 @@ class VenueTransport(MarketDataClient):
                 attempt_payload["lot_sz"] = lot_sz
                 if ct_val_sz > 0:
                     attempt_payload["venue_contract_qty"] = _format_decimal(contract_qty)
+            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                attempt_payload["position_mode"] = (
+                    "hedge" if self._fapi_position_hedge_mode else "one_way"
+                )
+                if "positionSide" in body:
+                    attempt_payload["position_side"] = body["positionSide"]
             self._record_order_diagnostic("order.submit_attempt", attempt_payload)
 
             # --- Send request ---
@@ -3519,7 +3537,11 @@ class VenueTransport(MarketDataClient):
             body["price"] = _format_decimal(float(quantized_price))
         if cid:
             body["newClientOrderId"] = cid
-        if request.reduce_only:
+        if self._fapi_position_hedge_mode:
+            body["positionSide"] = self._fapi_position_side(
+                request.side, request.reduce_only
+            )
+        elif request.reduce_only:
             body["reduceOnly"] = "true"
         return body
 
@@ -3561,6 +3583,45 @@ class VenueTransport(MarketDataClient):
             else:
                 return "short" if side == Side.BUY else "long"
         return "net"
+
+    def _fapi_position_side(self, side: "Side", reduce_only: bool = False) -> str:
+        """Return Binance/Aster Hedge Mode positionSide for the order intent."""
+        if not reduce_only:
+            return "LONG" if side == Side.BUY else "SHORT"
+        return "SHORT" if side == Side.BUY else "LONG"
+
+    @property
+    def _fapi_position_hedge_mode(self) -> bool:
+        """Cached Binance/Aster Futures position mode. Unknown defaults to one-way."""
+        return bool(getattr(self, "_fapi_position_hedge_mode_cache", False))
+
+    async def _refresh_fapi_position_mode(self) -> bool:
+        """Fetch Binance/Aster Futures position mode and cache Hedge vs One-way."""
+        if self._spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
+            return False
+        cached = getattr(self, "_fapi_position_hedge_mode_cache", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            raw = await self._request("GET", "/fapi/v1/positionSide/dual", private=True)
+            value = raw.get("dualSidePosition")
+            hedge_mode = value is True or str(value).lower() == "true"
+            self._fapi_position_hedge_mode_cache = hedge_mode
+            self._record_order_diagnostic("order.fapi_position_mode_refresh", {
+                "venue": self._spec.venue_id.value,
+                "outcome": "success",
+                "position_mode": "hedge" if hedge_mode else "one_way",
+                "raw_dual_side_position": value,
+            })
+            return hedge_mode
+        except Exception as e:
+            self._record_order_diagnostic("order.fapi_position_mode_refresh", {
+                "venue": self._spec.venue_id.value,
+                "outcome": "exception",
+                "error": str(e)[:200],
+                "resolved_position_mode": "one_way",
+            })
+            return False
 
     @property
     def _okx_pos_mode(self) -> str:
@@ -4437,10 +4498,41 @@ class VenueTransport(MarketDataClient):
                     state=PassiveOrderState.CANCELED,
                 )
 
-            raw = await self._request("DELETE", spec.order_path, params=params, private=True)
+            if spec.venue_id == Venue.BYBIT:
+                # Bybit V5 has a dedicated asynchronous cancel endpoint.
+                # Reusing order_path (/v5/order/create) with DELETE returns
+                # HTTP 404 and can incorrectly escalate recovery to fail-closed.
+                raw = await self._request(
+                    "POST", "/v5/order/cancel", body=params, private=True
+                )
+            else:
+                raw = await self._request(
+                    "DELETE", spec.order_path, params=params, private=True
+                )
 
             # V1: successful HTTP response may still indicate order was already absent
             if _cancel_response_indicates_absent_order(raw, spec.venue_id):
+                return PassiveOrderAck(
+                    venue=spec.venue_id,
+                    symbol=venue_sym,
+                    side=Side.BUY,
+                    order_id=order_id,
+                    client_order_id=client_order_id or "",
+                    price=0.0,
+                    quantity=0.0,
+                    accepted_at_ms=now_ms,
+                    state=PassiveOrderState.CANCELED,
+                )
+            if spec.venue_id == Venue.BYBIT:
+                ret_code = int(raw.get("retCode", 0) or 0)
+                if ret_code != 0:
+                    raise TransportError(
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        "bybit cancel passive order failed: "
+                        f"retCode={raw.get('retCode')} retMsg={raw.get('retMsg', '')}",
+                        status_code=400,
+                        body=json.dumps(raw, ensure_ascii=False),
+                    )
                 return PassiveOrderAck(
                     venue=spec.venue_id,
                     symbol=venue_sym,

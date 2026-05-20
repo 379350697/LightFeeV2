@@ -2400,6 +2400,76 @@ class TestAckOnlyResponses:
     and return PassiveOrderAck in submit_passive_order."""
 
     @pytest.mark.asyncio
+    async def test_binance_place_order_refreshes_hedge_mode_position_side(self):
+        transport = VenueTransport(binance_spec(), mode="paper")
+        transport.mode = "live"
+        calls = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if path == "/fapi/v1/positionSide/dual":
+                return {"dualSidePosition": True}
+            return {
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "status": "FILLED",
+                "executedQty": "0.01",
+                "avgPrice": "50000",
+                "orderId": 123456,
+            }
+
+        transport._request = fake_request
+
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+        )
+        fill = await transport.place_order(req)
+
+        order_call = [call for call in calls if call[1] == "/fapi/v1/order"][0]
+        params = order_call[2]["params"]
+        assert fill.order_id == "123456"
+        assert params["positionSide"] == "LONG"
+        assert "reduceOnly" not in params
+
+    @pytest.mark.asyncio
+    async def test_binance_place_order_one_way_omits_position_side(self):
+        transport = VenueTransport(binance_spec(), mode="paper")
+        transport.mode = "live"
+        calls = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if path == "/fapi/v1/positionSide/dual":
+                return {"dualSidePosition": False}
+            return {
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "status": "FILLED",
+                "executedQty": "0.01",
+                "avgPrice": "50000",
+                "orderId": 123457,
+            }
+
+        transport._request = fake_request
+
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.01,
+            reduce_only=True,
+        )
+        await transport.place_order(req)
+
+        order_call = [call for call in calls if call[1] == "/fapi/v1/order"][0]
+        params = order_call[2]["params"]
+        assert "positionSide" not in params
+        assert params["reduceOnly"] == "true"
+
+    @pytest.mark.asyncio
     async def test_bybit_ack_only_place_order_is_uncertain_but_passive_submit_is_ack(self):
         transport = _make_live_transport_with_mock_response(
             Venue.BYBIT, "bybit/place_order_ack_only.json"
@@ -4567,6 +4637,25 @@ class TestPassiveBodyBuilders:
 
         assert body["reduceOnly"] == "true"
 
+    def test_binance_passive_body_hedge_mode_uses_position_side(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        transport._fapi_position_hedge_mode_cache = True
+        req = self._make_passive_req(Venue.BINANCE, reduce_only=False)
+        body = transport._build_passive_order_body(req, "BTCUSDT", 0.01, 50000.0, req.client_order_id or "")
+
+        assert body["positionSide"] == "LONG"
+        assert "reduceOnly" not in body
+
+    def test_binance_reduce_only_hedge_position_side_mapping(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+
+        assert transport._fapi_position_side(Side.BUY, reduce_only=False) == "LONG"
+        assert transport._fapi_position_side(Side.SELL, reduce_only=False) == "SHORT"
+        assert transport._fapi_position_side(Side.BUY, reduce_only=True) == "SHORT"
+        assert transport._fapi_position_side(Side.SELL, reduce_only=True) == "LONG"
+
     def test_aster_passive_body_same_as_binance(self):
         spec = aster_spec()
         transport = VenueTransport(spec=spec, mode="paper")
@@ -5197,6 +5286,43 @@ class TestCancelAbsentOrderDetection:
             symbol="BTCUSDT", order_id="123456",
         )
         assert ack.state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_bybit_cancel_passive_order_uses_cancel_endpoint(self):
+        """Bybit V5 cancel is POST /v5/order/cancel, not DELETE /v5/order/create."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+        from lightfee.core.domain import PassiveOrderState
+
+        transport = VenueTransport(bybit_spec(), mode="paper")
+        transport.mode = "live"
+        seen = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["kwargs"] = kwargs
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {"orderId": "oid-1", "orderLinkId": "cid-1"},
+            }
+
+        transport._request = fake_request
+        transport._build_signed_request_async = AsyncMock(
+            return_value=("", {}, b"")
+        )
+
+        ack = await transport.cancel_passive_order(
+            symbol="BTCUSDT", order_id="oid-1", client_order_id="cid-1",
+        )
+
+        assert ack.state == PassiveOrderState.CANCELED
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/v5/order/cancel"
+        assert seen["kwargs"]["body"]["category"] == "linear"
+        assert seen["kwargs"]["body"]["symbol"] == "BTCUSDT"
+        assert seen["kwargs"]["body"]["orderId"] == "oid-1"
 
     @pytest.mark.asyncio
     async def test_cancel_passive_order_raises_on_real_error(self):

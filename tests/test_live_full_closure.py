@@ -246,6 +246,32 @@ class TestLiveFullClosure:
             # Should not crash (metrics export is gated by env var)
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
 
+    @pytest.mark.asyncio
+    async def test_housekeeping_clears_clean_fail_closed_after_live_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.open_positions.clear()
+            runtime.state.pending_entries.clear()
+            runtime.state.pending_closes.clear()
+            runtime.state.pending_passive_closes.clear()
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.operator.requested_mode = None
+
+            await runtime._post_tick_housekeeping(5000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            records = runtime.journal.read_all()
+            assert any(
+                r.get("kind") == "runtime.stale_fail_closed_cleared"
+                for r in records
+            )
+
 
 # ---------------------------------------------------------------------------
 # Preflight and startup validation tests

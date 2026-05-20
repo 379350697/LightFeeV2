@@ -361,6 +361,8 @@ class TestBinanceOrderRequestShape:
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured_url.append(str(request.url))
+            if request.url.path.endswith("/positionSide/dual"):
+                return httpx.Response(200, json={"dualSidePosition": False})
             return httpx.Response(200, json=fixture)
 
         mock = httpx.MockTransport(handler)
@@ -374,8 +376,10 @@ class TestBinanceOrderRequestShape:
             req = OrderRequest(venue=Venue.BINANCE, symbol="BTCUSDT",
                               side=Side.BUY, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 1
-            url = captured_url[0]
+            assert len(captured_url) == 2
+            assert "/fapi/v1/positionSide/dual" in captured_url[0]
+            url = captured_url[1]
+            assert "/fapi/v1/order" in url
             assert "timestamp=" in url, f"Missing timestamp in URL: {url}"
             assert "signature=" in url, f"Missing signature in URL: {url}"
         finally:
@@ -392,6 +396,8 @@ class TestAsterOrderRequestShape:
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured_url.append(str(request.url))
+            if request.url.path.endswith("/positionSide/dual"):
+                return httpx.Response(200, json={"dualSidePosition": False})
             return httpx.Response(200, json=fixture)
 
         mock = httpx.MockTransport(handler)
@@ -405,8 +411,10 @@ class TestAsterOrderRequestShape:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
                               side=Side.SELL, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 1
-            url = captured_url[0]
+            assert len(captured_url) == 2
+            assert "/fapi/v1/positionSide/dual" in captured_url[0]
+            url = captured_url[1]
+            assert "/fapi/v1/order" in url
             assert "timestamp=" in url, f"Missing timestamp in URL: {url}"
             assert "signature=" in url, f"Missing signature in URL: {url}"
         finally:
