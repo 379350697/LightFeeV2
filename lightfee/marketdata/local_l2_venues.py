@@ -198,14 +198,14 @@ def parse_binance_l2_update(
     bids = [PriceLevel(price=float(b[0]), quantity=float(b[1])) for b in bids_raw if float(b[1]) > 0]
     asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if float(a[1]) > 0]
 
-    kind = LocalL2UpdateKind.SNAPSHOT if "lastUpdateId" in payload and seq > 0 and not payload.get("E") \
-           else LocalL2UpdateKind.DELTA
+    is_rest_snapshot = "lastUpdateId" in payload and "U" not in payload and "u" not in payload
+    kind = LocalL2UpdateKind.SNAPSHOT if is_rest_snapshot else LocalL2UpdateKind.DELTA
 
     return LocalL2Update(
         venue=venue, symbol=symbol or payload.get("s", "").upper(),
         bids=bids, asks=asks,
         sequence=seq, previous_sequence=payload.get("pu", seq - 1),
-        event_time_ms=payload.get("E", now_ms), received_at_ms=now_ms,
+        event_time_ms=payload.get("T", payload.get("E", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )
 
@@ -240,8 +240,12 @@ def parse_okx_l2_update(
     prev_seq = int(entry.get("prevSeqId", payload.get("prevSeqId", seq - 1)))
     checksum = int(entry.get("checksum", 0))
 
-    action = payload.get("action", "update")
-    kind = LocalL2UpdateKind.SNAPSHOT if action == "snapshot" else LocalL2UpdateKind.DELTA
+    action = payload.get("action")
+    kind = (
+        LocalL2UpdateKind.SNAPSHOT
+        if action == "snapshot" or action is None
+        else LocalL2UpdateKind.DELTA
+    )
 
     inst = symbol or payload.get("arg", {}).get("instId", "")
     ts = int(entry.get("ts", now_ms))

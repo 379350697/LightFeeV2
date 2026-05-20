@@ -175,6 +175,24 @@ class TestParseBinanceL2Update:
         assert update.asks[0].price == 50100.0
         assert update.asks[0].quantity == 1.2
 
+    def test_parse_futures_rest_snapshot_with_event_time(self):
+        from lightfee.marketdata.local_l2_venues import parse_binance_l2_update
+        payload = {
+            "lastUpdateId": 10590967390405,
+            "E": 1779291555834,
+            "T": 1779291555829,
+            "bids": [["0.0530800", "7496"]],
+            "asks": [["0.0530900", "5739"]],
+        }
+
+        update = parse_binance_l2_update(payload, symbol="CHIPUSDT", now_ms=9000)
+
+        assert update.update_kind.value == "snapshot"
+        assert update.sequence == 10590967390405
+        assert update.event_time_ms == 1779291555829
+        assert update.bids[0].price == 0.05308
+        assert update.asks[0].price == 0.05309
+
     def test_parse_delta(self):
         from lightfee.marketdata.local_l2_venues import parse_binance_l2_update
         payload = {
@@ -229,6 +247,28 @@ class TestParseOKXL2Update:
         assert update.event_time_ms == 1680000000000
         assert len(update.bids) == 2
         assert len(update.asks) == 1
+
+    def test_parse_rest_books_snapshot_without_action(self):
+        from lightfee.marketdata.local_l2_venues import parse_okx_l2_update
+        payload = {
+            "code": "0",
+            "msg": "",
+            "data": [{
+                "asks": [["0.05323", "12", "0", "1"]],
+                "bids": [["0.05322", "10", "0", "1"]],
+                "ts": "1779291559750",
+                "seqId": 1111796950,
+            }],
+        }
+
+        update = parse_okx_l2_update(payload, symbol="CHIP-USDT-SWAP", now_ms=9000)
+
+        assert update.update_kind.value == "snapshot"
+        assert update.symbol == "CHIP-USDT-SWAP"
+        assert update.sequence == 1111796950
+        assert update.event_time_ms == 1779291559750
+        assert update.bids[0].price == 0.05322
+        assert update.asks[0].price == 0.05323
 
     def test_parse_delta(self):
         from lightfee.marketdata.local_l2_venues import parse_okx_l2_update
