@@ -49,6 +49,154 @@ def order_error_may_have_created_exposure(error: Exception) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# V1 structured close-leg error classification (M-R12)
+# ---------------------------------------------------------------------------
+
+
+def _extract_gate_error_fields(error_str: str) -> dict[str, Optional[str]]:
+    """V1 gate_http_error_details: extract label and message from Gate error string.
+
+    Gate error format: "... label=REDUCE_EXCEEDED msg=empty position ..."
+    """
+    label = None
+    message = None
+    lower = error_str.lower()
+    # Extract label=
+    label_start = lower.find("label=")
+    if label_start >= 0:
+        label_start += 6
+        label_end = lower.find(" ", label_start)
+        if label_end < 0:
+            label_end = len(lower)
+        label = lower[label_start:label_end].strip()
+    # Extract msg=
+    msg_start = lower.find("msg=")
+    if msg_start >= 0:
+        msg_start += 4
+        msg_end = lower.find(" ", msg_start)
+        if msg_end < 0:
+            msg_end = len(lower)
+        message = lower[msg_start:msg_end].strip()
+    return {"label": label, "message": message}
+
+
+def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
+    """V1 structured error classification for close leg rejections.
+
+    Returns dict with keys:
+    - label: str (error label if extractable, else "")
+    - message: str (error message if extractable, else "")
+    - empty_position: bool (venue reports no position for reduce_only)
+    - order_not_found: bool (order id not recognized)
+    - pending_conflict: bool (reduce_only order conflicts with pending)
+    - terminal_reduce_only: bool (reduce_only rejected because position flat)
+    """
+    fields = _extract_gate_error_fields(error_str)
+    label = fields.get("label") or ""
+    message = fields.get("message") or ""
+    lower = error_str.lower()
+
+    # --- Gate structured detection ---
+    empty_position = (
+        label == "reduce_exceeded" and "empty position" in message
+    ) or (
+        "reduce_exceeded" in lower and "empty position" in lower
+    )
+
+    order_not_found = (
+        label == "order_not_found"
+    ) or (
+        "order not found" in lower
+    ) or (
+        "order_not_found" in lower
+    )
+
+    pending_conflict = (
+        (label in ("reduce_only_fail", "reduce_exceeded"))
+        and "pending order" in message
+        and "reduce order" in message
+    ) or (
+        ("reduce_only_fail" in lower or "reduce_exceeded" in lower)
+        and "pending order" in lower
+        and "reduce order" in lower
+    )
+
+    # --- OKX structured detection (code-based) ---
+    # V1: OKX error codes — "51000"=order not found, "51108"=position closed/no position
+    if not empty_position:
+        if _string_contains_any(lower, ("code=51000", "code 51000", "\"51000\"")):
+            order_not_found = True
+        if "position" in lower and _string_contains_any(lower, ("51000", "51108", "51109", "51110", "51112")):
+            empty_position = True
+        # OKX: "Order does not exist" with reduce_only → position already flat
+        if "order does not exist" in lower:
+            order_not_found = True
+            empty_position = empty_position or "reduce" in lower
+
+    # --- Bybit structured detection (code-based) ---
+    # V1: Bybit error codes for reduce-only terminal conditions
+    if not empty_position and not order_not_found:
+        if "position" in lower and _string_contains_any(lower, ("110001", "110043", "20001", "20070")):
+            empty_position = True
+        # Bybit: "no position" / "position idx" error for reduce_only
+        if "no position" in lower:
+            empty_position = True
+
+    # --- Binance structured detection (code-based) ---
+    # V1: Binance error codes — -2010=insufficient position, -2011=order not found
+    if not order_not_found:
+        if _string_contains_any(lower, ("-2011", "-2013", "-2015", "code=-201")):
+            order_not_found = True
+    if not empty_position:
+        if _string_contains_any(lower, ("-2010", "-4069", "-4164")):
+            empty_position = True
+        # Binance: "position is not enough" / "insufficient position"
+        if "reduce" in lower and ("insufficient" in lower or "not enough" in lower):
+            empty_position = True
+
+    # --- Terminal: when empty_position or order_not_found confirmed, or generic pattern ---
+    terminal_reduce_only = (
+        empty_position
+        or order_not_found
+        or _string_contains_any(lower, (
+            "position closed", "empty position", "position does not exist",
+            "reduce_only", "no position", "insufficient position",
+            "position not found", "order does not exist",
+        ))
+    )
+
+    return {
+        "label": label,
+        "message": message,
+        "empty_position": empty_position,
+        "order_not_found": order_not_found,
+        "pending_conflict": pending_conflict,
+        "terminal_reduce_only": terminal_reduce_only,
+    }
+
+
+def _is_terminal_reduce_only(error_class: dict[str, Any], reason: str) -> bool:
+    """V1: determine if a reduce-only rejection is truly terminal.
+
+    Terminal when:
+    - Structured empty_position detected (Gate label-based)
+    - Generic terminal pattern matched AND NOT a pending conflict
+    """
+    if error_class["empty_position"]:
+        return True
+    if error_class["pending_conflict"]:
+        return False  # Pending conflict is retryable, not terminal
+    return error_class["terminal_reduce_only"]
+
+
+def _string_contains_any(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(p in text for p in patterns)
+
+
+# ---------------------------------------------------------------------------
+
+
 class CompensationFailedError(Exception):
     """Raised when close compensation flatten fails on all venues.
 
@@ -973,14 +1121,15 @@ class CloseExecutor:
 
             if result["outcome"] == "rejected":
                 # V1: check for terminal reduce-only success (venue already flat)
-                # Primary: string-based detection for known exchange patterns
                 reason = result.get("reason", "")
-                terminal_patterns = (
-                    "position closed", "empty position", "position does not exist",
-                    "order_not_found", "reduce_only", "no position",
-                    "insufficient position", "position not found",
-                )
-                if any(p in reason.lower() for p in terminal_patterns):
+                # --- Structured classification (Gate first, then generic) ---
+                error_class = _classify_close_leg_error(reason)
+                is_terminal = _is_terminal_reduce_only(error_class, reason)
+                is_pending_conflict = error_class.get("pending_conflict", False)
+                is_empty_position = error_class.get("empty_position", False)
+                is_order_not_found = error_class.get("order_not_found", False)
+
+                if is_terminal or is_order_not_found:
                     # V1: verify by fetching exchange position
                     is_flat = False
                     try:
@@ -990,13 +1139,14 @@ class CloseExecutor:
                             is_flat = current_pos is not None and abs(current_pos.quantity) <= 1e-9
                     except Exception:
                         pass
-                    if is_flat or any(p in reason.lower() for p in ("position closed", "empty position", "order_not_found")):
+                    if is_flat or is_empty_position or is_order_not_found:
                         self.journal.append(
                             "order.filled",
                             {
                                 "position_id": position_id,
                                 "leg": leg,
                                 "reason": "terminal_reduce_only",
+                                "error_label": error_class.get("label", ""),
                                 "exchange_verified_flat": is_flat,
                                 "client_order_id": request.client_order_id,
                                 "attempt": attempt,
@@ -1007,6 +1157,38 @@ class CloseExecutor:
                         side=request.side, quantity=0.0, price=0.0,
                         order_id="terminal-flat",
                     ), "order_id": "terminal-flat"}
+
+                if is_pending_conflict:
+                    # V1: pending reduce-only conflict — not terminal, retry in next iteration
+                    # V1 gate.rs:2070 — cancel conflicting orders, then retry.
+                    self.journal.append(
+                        "exit.close_reduce_only_pending_conflict",
+                        {
+                            "position_id": position_id,
+                            "leg": leg,
+                            "error_label": error_class.get("label", ""),
+                            "reason": reason,
+                            "client_order_id": request.client_order_id,
+                            "attempt": attempt,
+                        },
+                    )
+                    if attempt < self.config.max_close_retries:
+                        backoff_ms = min(retry_base_ms * (2 ** (attempt - 1)), retry_max_ms)
+                        self.journal.append(
+                            "exit.retry_wait",
+                            {
+                                "position_id": position_id,
+                                "leg": leg,
+                                "attempt": attempt,
+                                "backoff_ms": backoff_ms,
+                                "reason": "reduce_only_pending_conflict",
+                                "client_order_id": request.client_order_id,
+                            },
+                        )
+                        await asyncio.sleep(backoff_ms / 1000.0)
+                        continue
+                    # Max retries exhausted — return as rejected
+                    return result
                 return result
 
             # Uncertain — retry with backoff if attempts remain

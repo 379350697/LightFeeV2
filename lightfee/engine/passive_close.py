@@ -33,6 +33,7 @@ from lightfee.core.domain import (
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
     build_close_execution_from_legs,
+    close_leg_exchange_min_notional_violation,
     compute_close_chunks,
 )
 from lightfee.engine.exit import CloseExecution
@@ -57,6 +58,8 @@ from lightfee.venues.specs import get_spec
 PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS = 10
 PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS = 3_000
 PASSIVE_CLOSE_SMALL_FILL_BUFFER_MS = 2_000
+PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE = 10.0
+PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS = 5_000
 PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES = 3
 PASSIVE_CLOSE_MAX_MANAGER_FAILURES = 3
 PASSIVE_CLOSE_MANAGER_COOLDOWN_MS = 30_000
@@ -117,6 +120,9 @@ class PassiveCloseConfig:
     progress_poll_interval_ms: int = PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
     progress_retry_window_ms: int = PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
     small_fill_buffer_ms: int = PASSIVE_CLOSE_SMALL_FILL_BUFFER_MS
+    small_fill_buffer_notional_quote: float = PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE
+    small_fill_buffer_max_wait_ms: int = PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS
+    maker_min_notional_accumulation_attempts: int = 5
     maker_cycle_retry_delays_ms: list[int] = field(default_factory=lambda: [500, 2_000, 5_000, 15_000])
     max_slippage_bps: Optional[float] = None
     default_tick_size: float = 0.01
@@ -198,6 +204,9 @@ class PassiveCloseExecutor:
             progress_poll_interval_ms=overrides.get("progress_poll_interval_ms", PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS),
             progress_retry_window_ms=overrides.get("progress_retry_window_ms", PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS),
             small_fill_buffer_ms=overrides.get("small_fill_buffer_ms", PASSIVE_CLOSE_SMALL_FILL_BUFFER_MS),
+            small_fill_buffer_notional_quote=overrides.get("small_fill_buffer_notional_quote", PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE),
+            small_fill_buffer_max_wait_ms=overrides.get("small_fill_buffer_max_wait_ms", PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS),
+            maker_min_notional_accumulation_attempts=overrides.get("maker_min_notional_accumulation_attempts", 5),
             maker_cycle_retry_delays_ms=overrides.get("maker_cycle_retry_delays_ms", [500, 2_000, 5_000, 15_000]),
             max_slippage_bps=overrides.get("max_slippage_bps"),
             default_tick_size=overrides.get("default_tick_size", 0.01),
@@ -467,11 +476,204 @@ class PassiveCloseExecutor:
 
             unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
             if unhedged_gap > 1e-9:
+                # --- V1 small-fill buffer: avoid submitting hedge below min-notional ---
+                # Compute hedge price hint for notional check
+                if maker_leg == ActiveMakerLeg.LONG:
+                    hedge_venue_for_notional = position.short_venue
+                else:
+                    hedge_venue_for_notional = position.long_venue
+                hedge_price_hint = self._resolve_local_l2_mid(hedge_venue_for_notional, position.symbol)
+                if hedge_price_hint <= 0.0:
+                    hedge_price_hint = pending.maker_fill.average_price
+                buffered_notional = unhedged_gap * max(hedge_price_hint, 0.0)
+
+                # Check if maker can still accumulate (not in terminal state)
+                maker_terminal = progress is not None and progress.state in (
+                    PassiveOrderState.FILLED,
+                    PassiveOrderState.CANCELED,
+                    PassiveOrderState.REJECTED,
+                    PassiveOrderState.EXPIRED,
+                ) if progress is not None else False
+                can_accumulate = not maker_terminal
+
+                # Resolve buffer start timestamp
+                buffer_start = pending.small_fill_buffer_started_at_ms
+                if buffer_start is None:
+                    if pending.maker_fill.last_fill_time_ms > 0:
+                        buffer_start = pending.maker_fill.last_fill_time_ms
+
+                decision = self._small_fill_buffer_decision(
+                    buffered_notional_quote=buffered_notional,
+                    buffer_notional_quote=self._config.small_fill_buffer_notional_quote,
+                    buffer_wait_ms=self._config.small_fill_buffer_max_wait_ms,
+                    buffer_started_at_ms=buffer_start,
+                    now_ms=now_ms,
+                    can_accumulate_small_fill=can_accumulate,
+                )
+
+                if decision["should_buffer"]:
+                    pending.small_fill_buffer_started_at_ms = buffer_start or now_ms
+                    retry_wait_ms = min(
+                        PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS,
+                        decision["remaining_wait_ms"],
+                    )
+                    pending.next_retry_at_ms = now_ms + max(retry_wait_ms, 1)
+                    self._journal.append(
+                        "exit.passive_close_small_fill_buffering",
+                        {
+                            "position_id": position_id,
+                            "hedge_venue": hedge_venue_for_notional.value,
+                            "missing_hedge_quantity": unhedged_gap,
+                            "buffered_notional_quote": buffered_notional,
+                            "buffered_elapsed_ms": decision["buffered_elapsed_ms"],
+                            "buffer_wait_ms": self._config.small_fill_buffer_max_wait_ms,
+                            "buffer_threshold_quote": self._config.small_fill_buffer_notional_quote,
+                            "retry_wait_ms": retry_wait_ms,
+                        },
+                    )
+                    if wait_until_terminal:
+                        await asyncio.sleep(retry_wait_ms / 1000.0)
+                        continue
+                    return False
+
+                if decision["wait_expired"]:
+                    self._journal.append(
+                        "exit.passive_close_small_fill_buffer_expired",
+                        {
+                            "position_id": position_id,
+                            "hedge_venue": hedge_venue_for_notional.value,
+                            "missing_hedge_quantity": unhedged_gap,
+                            "buffered_notional_quote": buffered_notional,
+                            "buffered_elapsed_ms": decision["buffered_elapsed_ms"],
+                            "buffer_wait_ms": self._config.small_fill_buffer_max_wait_ms,
+                            "buffer_threshold_quote": self._config.small_fill_buffer_notional_quote,
+                        },
+                    )
+                else:
+                    pending.small_fill_buffer_started_at_ms = None
+
+                # --- V1: pre-submit min-notional check ---
+                # V1 exit.rs:2297-2348 — normalize quantity, check min_notional_violation
+                # BEFORE submitting the hedge. If below min_notional and maker can still
+                # accumulate, track attempt without submitting.
+                min_notional_violation = self._check_hedge_min_notional(
+                    hedge_venue_for_notional, position.symbol,
+                    Side.BUY if maker_leg == ActiveMakerLeg.LONG else Side.SELL,
+                    unhedged_gap, hedge_price_hint,
+                )
+                if min_notional_violation is not None and can_accumulate:
+                    # Hedge is below min notional and maker may still accumulate →
+                    # do NOT submit a failing hedge. Track accumulation instead.
+                    if unhedged_gap > pending.last_small_fill_missing_quantity + 1e-9:
+                        pending.small_fill_min_notional_attempts += 1
+                        pending.last_small_fill_missing_quantity = unhedged_gap
+                    self._journal.append(
+                        "exit.passive_close_min_notional_accumulating",
+                        {
+                            "position_id": position_id,
+                            "attempt": pending.small_fill_min_notional_attempts,
+                            "max_attempts": self._config.maker_min_notional_accumulation_attempts,
+                            "missing_hedge_quantity": unhedged_gap,
+                            "leg_notional_quote": min_notional_violation["leg_notional"],
+                            "venue_min_notional_quote": min_notional_violation["min_notional"],
+                            "maker_quantity": pending.maker_fill.quantity,
+                            "hedge_quantity": pending.hedge_fill.quantity,
+                        },
+                    )
+                    if pending.small_fill_min_notional_attempts >= self._config.maker_min_notional_accumulation_attempts:
+                        self._journal.append(
+                            "exit.passive_close_min_notional_abort",
+                            {
+                                "position_id": position_id,
+                                "attempt": pending.small_fill_min_notional_attempts,
+                                "missing_hedge_quantity": unhedged_gap,
+                                "reason": "accumulation attempts exhausted",
+                            },
+                        )
+                        pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                        pending.next_retry_at_ms = 0
+                        return False
+                    pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                    return False
+
+                # Submit hedge
                 result = await self._submit_hedge_for_delta(state, pending, position, unhedged_gap)
                 if not result.success:
                     pending = state.pending_passive_closes.get(position_id)
                     if pending is None:
                         return True
+
+                    # V1: post-submit min-notional accumulation
+                    # If maker is now terminal (not accumulating), escalate.
+                    # If the hedge was above threshold and still got zero fill, it's
+                    # a liquidity issue — log and retry, don't escalate.
+                    if maker_terminal:
+                        self._journal.append(
+                            "exit.passive_close_min_notional_abort",
+                            {
+                                "position_id": position_id,
+                                "missing_hedge_quantity": unhedged_gap,
+                                "reason": "maker_terminal_after_hedge_fail",
+                                "hedge_error": result.error,
+                            },
+                        )
+                        pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                        pending.next_retry_at_ms = 0
+                        return False
+
+                    is_zero_fill = result.error and "zero_fill" in str(result.error)
+                    is_below_min_notional = (
+                        buffered_notional > 0.0
+                        and buffered_notional + 1e-9 < self._config.small_fill_buffer_notional_quote
+                    )
+                    if is_zero_fill and is_below_min_notional:
+                        if unhedged_gap > pending.last_small_fill_missing_quantity + 1e-9:
+                            pending.small_fill_min_notional_attempts += 1
+                            pending.last_small_fill_missing_quantity = unhedged_gap
+                        self._journal.append(
+                            "exit.passive_close_min_notional_accumulating",
+                            {
+                                "position_id": position_id,
+                                "attempt": pending.small_fill_min_notional_attempts,
+                                "max_attempts": self._config.maker_min_notional_accumulation_attempts,
+                                "missing_hedge_quantity": unhedged_gap,
+                                "hedge_notional_quote": buffered_notional,
+                                "min_notional_threshold": self._config.small_fill_buffer_notional_quote,
+                                "maker_quantity": pending.maker_fill.quantity,
+                                "hedge_quantity": pending.hedge_fill.quantity,
+                            },
+                        )
+                        if pending.small_fill_min_notional_attempts >= self._config.maker_min_notional_accumulation_attempts:
+                            # V1: abort maker and escalate to compensate
+                            self._journal.append(
+                                "exit.passive_close_min_notional_abort",
+                                {
+                                    "position_id": position_id,
+                                    "attempt": pending.small_fill_min_notional_attempts,
+                                    "missing_hedge_quantity": unhedged_gap,
+                                    "reason": "accumulation attempts exhausted",
+                                },
+                            )
+                            pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                            pending.next_retry_at_ms = 0
+                            return False
+                        if maker_terminal:
+                            # Maker is done, no more fill expected — escalate
+                            self._journal.append(
+                                "exit.passive_close_min_notional_abort",
+                                {
+                                    "position_id": position_id,
+                                    "attempt": pending.small_fill_min_notional_attempts,
+                                    "missing_hedge_quantity": unhedged_gap,
+                                    "reason": "maker_terminal",
+                                },
+                            )
+                            pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                            pending.next_retry_at_ms = 0
+                            return False
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                        return False
+
                     self._journal.append(
                         "exit.passive_close_hedge_incomplete",
                         {
@@ -1805,6 +2007,91 @@ class PassiveCloseExecutor:
         delays = self._config.maker_cycle_retry_delays_ms
         idx = min(zero_fill_cycles, len(delays) - 1)
         return delays[idx] if idx >= 0 else delays[-1]
+
+    def _check_hedge_min_notional(
+        self,
+        hedge_venue: Venue,
+        symbol: str,
+        side: Side,
+        quantity: float,
+        price_hint: float,
+    ) -> Optional[dict[str, Any]]:
+        """V1: check if hedge quantity is below venue min notional.
+
+        Returns None if the hedge passes min notional check.
+        Returns dict with violation details if below min notional.
+        """
+        if quantity <= 1e-12:
+            return {"venue": hedge_venue, "leg_notional": 0.0, "min_notional": 0.0}
+        # Use venue min notional from spec if available, else buffer threshold
+        from lightfee.venues.specs import get_spec
+        min_notional = self._config.small_fill_buffer_notional_quote
+        try:
+            spec = get_spec(hedge_venue)
+            if hasattr(spec, 'min_notional') and spec.min_notional:
+                min_notional = max(min_notional, float(spec.min_notional))
+        except Exception:
+            pass
+        violation = close_leg_exchange_min_notional_violation(
+            hedge_venue, symbol, side, quantity,
+            reduce_only=True, price_hint=price_hint,
+            min_notional_quote=min_notional,
+        )
+        if violation is not None:
+            venue, leg_notional, min_notional_val = violation
+            return {
+                "venue": venue,
+                "leg_notional": leg_notional,
+                "min_notional": min_notional_val,
+                "quantity": quantity,
+                "price_hint": price_hint,
+            }
+        return None
+
+    # ------------------------------------------------------------------
+    # Small-fill buffer (V1 passive_close_small_fill_buffer_decision)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _small_fill_buffer_decision(
+        buffered_notional_quote: float,
+        buffer_notional_quote: float,
+        buffer_wait_ms: int,
+        buffer_started_at_ms: Optional[int],
+        now_ms: int,
+        can_accumulate_small_fill: bool,
+    ) -> dict[str, Any]:
+        """V1 passive_close_small_fill_buffer_decision (exit.rs:6212).
+
+        Returns dict with keys:
+        - should_buffer: True if the hedge should wait for more maker fill
+        - wait_expired: True if the buffer window has elapsed
+        - buffered_elapsed_ms: time since buffer started
+        - remaining_wait_ms: remaining buffer time
+        """
+        can_buffer = (
+            buffer_notional_quote > 0.0
+            and buffered_notional_quote > 0.0
+            and buffered_notional_quote + 1e-9 < buffer_notional_quote
+            and can_accumulate_small_fill
+        )
+        if not can_buffer:
+            return {
+                "should_buffer": False,
+                "wait_expired": False,
+                "buffered_elapsed_ms": 0,
+                "remaining_wait_ms": 0,
+            }
+        oldest_fill_at_ms = max(buffer_started_at_ms or now_ms, 0)
+        buffered_elapsed_ms = max(now_ms - oldest_fill_at_ms, 0)
+        effective_wait_ms = max(buffer_wait_ms, 1)
+        wait_expired = buffered_elapsed_ms >= effective_wait_ms
+        return {
+            "should_buffer": not wait_expired,
+            "wait_expired": wait_expired,
+            "buffered_elapsed_ms": buffered_elapsed_ms,
+            "remaining_wait_ms": max(effective_wait_ms - buffered_elapsed_ms, 1),
+        }
 
     def _select_preferred_maker_leg(self, position: OpenPosition) -> ActiveMakerLeg:
         """V1 select_exit_maker_leg (discovery.rs line 65).

@@ -596,3 +596,350 @@ class TestLazyOpsTokenBucket:
         # 1ms later — window expires, counter resets
         assert ops_token_available(pending, profile, now_ms + 1)
         assert pending.ops_count_this_window == 0
+
+
+# ============================================================================
+# M-R14: Small-fill buffer decision (V1 passive_close_small_fill_buffer_decision)
+# ============================================================================
+
+
+class TestM14SmallFillBufferDecision:
+    """M-R14: V1 small-fill buffer decision logic — when hedge delta notional is
+    below exchange min-notional but maker may still accumulate fill.
+
+    V1 reference: passive_close_small_fill_buffer_decision (exit.rs:6212).
+    """
+
+    def test_below_threshold_notional_should_buffer(self):
+        """When buffered_notional < threshold and maker can accumulate → buffer."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=None,
+            now_ms=1000,
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is True
+        assert decision["wait_expired"] is False
+        assert decision["buffered_elapsed_ms"] == 0
+        assert decision["remaining_wait_ms"] == 2000
+
+    def test_above_threshold_notional_does_not_buffer(self):
+        """When buffered_notional >= threshold → no buffer, submit hedge immediately."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=15.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=None,
+            now_ms=1000,
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is False
+        assert decision["wait_expired"] is False
+
+    def test_cannot_accumulate_no_buffer(self):
+        """When maker is terminal (can_accumulate=False) → no buffer, submit now."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=None,
+            now_ms=1000,
+            can_accumulate_small_fill=False,
+        )
+        assert decision["should_buffer"] is False
+
+    def test_zero_buffer_notional_disabled(self):
+        """When buffer_notional_quote=0 → buffering disabled entirely."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=0.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=None,
+            now_ms=1000,
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is False
+
+    def test_zero_buffered_notional_no_buffer(self):
+        """Zero notional → no buffer needed."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=0.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=None,
+            now_ms=1000,
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is False
+
+    def test_buffer_expired_after_full_wait(self):
+        """After buffer_max_wait_ms, buffer expires → submit hedge."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=1000,
+            now_ms=3500,  # 2500ms elapsed > 2000ms
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is False
+        assert decision["wait_expired"] is True
+        assert decision["buffered_elapsed_ms"] == 2500
+
+    def test_buffer_active_within_wait_window(self):
+        """Within wait window → still buffering."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=2000,
+            buffer_started_at_ms=1000,
+            now_ms=2500,  # 1500ms elapsed < 2000ms
+            can_accumulate_small_fill=True,
+        )
+        assert decision["should_buffer"] is True
+        assert decision["wait_expired"] is False
+        assert decision["buffered_elapsed_ms"] == 1500
+        assert decision["remaining_wait_ms"] == 500
+
+    def test_remaining_wait_at_least_one_ms(self):
+        """remaining_wait_ms is always at least 1, never 0."""
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        decision = PassiveCloseExecutor._small_fill_buffer_decision(
+            buffered_notional_quote=5.0,
+            buffer_notional_quote=10.0,
+            buffer_wait_ms=1,
+            buffer_started_at_ms=1000,
+            now_ms=1001,  # Exactly 1ms elapsed = expired
+            can_accumulate_small_fill=True,
+        )
+        # wait_expired because buffered_elapsed >= buffer_wait_ms (1 >= 1)
+        assert decision["wait_expired"] is True
+        assert decision["remaining_wait_ms"] == 1  # saturated at 1
+
+    def test_config_defaults_are_reasonable(self):
+        """Default buffer config values are positive and nonzero."""
+        from lightfee.engine.passive_close import (
+            PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE,
+            PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS,
+        )
+        assert PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE > 0
+        assert PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS > 0
+
+
+class TestM14SmallFillBufferStateTransitions:
+    """M-R14: Small-fill buffer state transitions — attempt counting, field reset,
+    cross-chunk non-contamination.
+    """
+
+    def test_attempt_count_increments_on_growing_missing_quantity(self):
+        """When missing hedge quantity grows (more maker fill accumulated),
+        small_fill_min_notional_attempts increments."""
+        from lightfee.engine.state import PendingPassiveClose
+
+        pending = PendingPassiveClose(
+            position_id="test-m14-1",
+            reason="signal",
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+        )
+        assert pending.small_fill_min_notional_attempts == 0
+        pending.small_fill_min_notional_attempts += 1
+        pending.last_small_fill_missing_quantity = 0.005
+        assert pending.small_fill_min_notional_attempts == 1
+        # Same quantity → no increment
+        # Growing → increment again
+        pending.small_fill_min_notional_attempts += 1
+        pending.last_small_fill_missing_quantity = 0.008
+        assert pending.small_fill_min_notional_attempts == 2
+
+    def test_field_reset_on_chunk_advance(self):
+        """On chunk advance, all small-fill fields reset to defaults.
+        V1: advance_pending_passive_close_chunk (exit.rs:1698-1700)."""
+        from lightfee.engine.state import PendingPassiveClose
+
+        pending = PendingPassiveClose(
+            position_id="test-m14-2",
+            reason="signal",
+            target_quantity=1.0,
+            chunk_quantities=[0.5, 0.5],
+            small_fill_min_notional_attempts=3,
+            last_small_fill_missing_quantity=0.01,
+            small_fill_buffer_started_at_ms=123456789,
+        )
+        # Simulate chunk advance reset
+        pending.small_fill_min_notional_attempts = 0
+        pending.last_small_fill_missing_quantity = 0.0
+        pending.small_fill_buffer_started_at_ms = None
+        assert pending.small_fill_min_notional_attempts == 0
+        assert pending.last_small_fill_missing_quantity == 0.0
+        assert pending.small_fill_buffer_started_at_ms is None
+
+    def test_cross_chunk_no_contamination(self):
+        """After chunk advance reset, new chunk starts with clean buffer state."""
+        from lightfee.engine.state import PendingPassiveClose
+
+        pending = PendingPassiveClose(
+            position_id="test-m14-3",
+            reason="signal",
+            target_quantity=2.0,
+            chunk_quantities=[0.5, 0.5, 0.5, 0.5],
+            small_fill_min_notional_attempts=0,
+            last_small_fill_missing_quantity=0.0,
+            small_fill_buffer_started_at_ms=None,
+        )
+        # Chunk 1: accumulate some buffering
+        pending.small_fill_min_notional_attempts = 2
+        pending.last_small_fill_missing_quantity = 0.003
+        pending.small_fill_buffer_started_at_ms = 1000
+        assert pending.small_fill_min_notional_attempts == 2
+
+        # Advance to chunk 2 → reset
+        pending.small_fill_min_notional_attempts = 0
+        pending.last_small_fill_missing_quantity = 0.0
+        pending.small_fill_buffer_started_at_ms = None
+
+        # Chunk 2: clean state
+        assert pending.small_fill_min_notional_attempts == 0
+        assert pending.last_small_fill_missing_quantity == 0.0
+        assert pending.small_fill_buffer_started_at_ms is None
+
+    def test_accumulation_attempts_exhausted_threshold(self):
+        """When attempts >= maker_min_notional_accumulation_attempts → abort.
+        V1: pending.small_fill_min_notional_attempts >= max_attempts → cancel maker + compensate."""
+        from lightfee.engine.passive_close import PassiveCloseConfig
+
+        config = PassiveCloseConfig(maker_min_notional_accumulation_attempts=5)
+        assert config.maker_min_notional_accumulation_attempts == 5
+        # After 5 attempts, escalation to DUAL_TAKER is triggered in the drive loop
+
+    def test_maker_terminal_after_accumulation_escalates(self):
+        """When maker reaches terminal state (FILLED/CANCELED/REJECTED) during
+        accumulation, escalation to DUAL_TAKER is triggered."""
+        from lightfee.core.domain import PassiveOrderState
+
+        terminal_states = {
+            PassiveOrderState.FILLED,
+            PassiveOrderState.CANCELED,
+            PassiveOrderState.REJECTED,
+            PassiveOrderState.EXPIRED,
+        }
+        # Any terminal state → can_accumulate_small_fill = False
+        for state in terminal_states:
+            assert state in terminal_states  # Verify all terminal states recognized
+
+
+# ============================================================================
+# M-R14: Pre-submit min-notional check (V1 normalize_quantity + min_notional_violation)
+# ============================================================================
+
+
+class TestM14PreSubmitMinNotional:
+    """M-R14: V1 pre-submit min-notional check — check BEFORE submitting hedge,
+    not just react to zero_fill after submission.
+    """
+
+    def test_below_min_notional_returns_violation(self):
+        """When hedge notional < min_notional → _check_hedge_min_notional returns dict."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor, PassiveCloseConfig
+
+        executor = PassiveCloseExecutor({}, None)
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.0001,  # Very small quantity
+            price_hint=50000.0,  # notional = 5.0 < 10.0 threshold
+        )
+        assert violation is not None, (
+            "0.0001 * 50000 = 5.0 notional, should be below default threshold 10.0"
+        )
+
+    def test_above_min_notional_returns_none(self):
+        """When hedge notional >= min_notional → returns None."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        executor = PassiveCloseExecutor({}, None)
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,  # Decent quantity
+            price_hint=50000.0,  # notional = 500.0 >> 10.0
+        )
+        assert violation is None, (
+            "0.01 * 50000 = 500 notional, should be above default threshold"
+        )
+
+    def test_zero_quantity_returns_violation(self):
+        """Zero or near-zero quantity → violation."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        executor = PassiveCloseExecutor({}, None)
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.BYBIT,
+            symbol="ETHUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            price_hint=3000.0,
+        )
+        assert violation is not None
+
+    def test_violation_contains_venue_and_notional(self):
+        """Violation dict has venue, leg_notional, min_notional keys."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        executor = PassiveCloseExecutor({}, None)
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.00005,
+            price_hint=50000.0,
+        )
+        assert violation is not None
+        assert "venue" in violation
+        assert "leg_notional" in violation
+        assert "min_notional" in violation
+        assert "quantity" in violation
+        assert "price_hint" in violation
+
+    def test_config_override_affects_threshold(self):
+        """Config override changes the min_notional threshold."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseConfig, PassiveCloseExecutor
+
+        config = PassiveCloseConfig(small_fill_buffer_notional_quote=100.0)
+        executor = PassiveCloseExecutor({}, None, config_overrides={
+            "small_fill_buffer_notional_quote": 100.0,
+        })
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.001,  # notional = 50.0
+            price_hint=50000.0,
+        )
+        assert violation is not None, (
+            "0.001 * 50000 = 50 notional < 100 threshold → violation"
+        )

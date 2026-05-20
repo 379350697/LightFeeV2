@@ -433,6 +433,7 @@ class TestResolveCumulativeOrderProgress:
         rest = CumulativeOrderProgress(
             order_id="rest", cumulative_quantity=0.0, updated_at_ms=90,
         )
-        result = merge_passive_progress_sources(private, rest)
+        # V1 call signature: (detail_progress, reconciliation, private_progress)
+        result = merge_passive_progress_sources(rest, None, private)
         assert result is not None
         assert result.cumulative_quantity == 0.01
