@@ -1700,6 +1700,7 @@ class _FakeVenueAdapter:
         self._place_order_calls: list[OrderRequest] = []
         self._fetch_position_calls: list[str] = []
         self._query_passive_progress_calls: list[tuple[str, str, str | None]] = []
+        self._cancel_passive_order_calls: list[tuple[str, str, str | None]] = []
 
     @property
     def venue(self) -> Venue:
@@ -1725,6 +1726,14 @@ class _FakeVenueAdapter:
 
     async def cancel_order(self, request: OrderRequest) -> None:
         pass
+
+    async def cancel_passive_order(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> None:
+        self._cancel_passive_order_calls.append((symbol, order_id, client_order_id))
 
     async def query_passive_order_progress(
         self,
@@ -1937,6 +1946,62 @@ class TestRealPathAbortCleanupDeadline:
         )
 
         assert abandoned is True
+
+    @pytest.mark.asyncio
+    async def test_hard_ceiling_zero_fill_flat_pending_cancels_then_aborts_before_flat_retain(
+        self, tmp_path
+    ):
+        """V1 hard-ceiling terminalization runs before flat unresolved retain.
+
+        Cloud regression: zero-fill maker_resting entries with both venues flat
+        were retained forever when maker progress returned None. V1 first runs
+        force_terminalize_pending_entry_if_budget_exhausted(), cancels the
+        maker order, then aborts/clears the pending entry at hard ceiling.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        hedge = _FakeVenueAdapter(Venue.ASTER)
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.ASTER] = hedge
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-hard-ceiling-zero-fill",
+            symbol="GENIUSUSDT",
+            long_status="uncertain",
+            short_status="uncertain",
+            is_flat=True,
+        )
+
+        pending = PendingEntry(
+            pending_id="entry-hard-ceiling-zero-fill",
+            symbol="GENIUSUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.ASTER,
+            target_quantity=57.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+            zero_fill_since_ms=1000,
+            reconcile_attempt=1,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(now_ms=200_000)
+
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert maker._cancel_passive_order_calls == [
+            ("GENIUSUSDT", "maker-oid", "maker-cid")
+        ]
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "recovery.maker_cancel_requested" in kinds
+        assert "entry.aborted" in kinds
+        assert "reconciliation.entry_flat_unresolved_maker_retained" not in kinds
 
     # ── Bug 1: _abort_pending_entry_fail_closed enter_fail_closed no NameError ──
 

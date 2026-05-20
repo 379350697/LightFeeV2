@@ -2587,7 +2587,17 @@ class LiveRuntime:
                     {"entry_id": entry_id, "long_status": result.long_status, "short_status": result.short_status},
                 )
                 continue
-            elif result.is_flat:
+
+            # V1: force_terminalize_pending_entry_if_budget_exhausted()
+            # runs before flat-position retention. Otherwise a zero-fill
+            # maker_resting entry with both venues flat but missing maker
+            # terminal evidence can be retained forever.
+            if await self._force_terminalize_pending_entry_if_budget_exhausted(
+                pending, entry_id, now_ms
+            ):
+                continue
+
+            if result.is_flat:
                 if not self._pending_entry_flat_clear_has_terminal_maker_evidence(
                     pending, result
                 ):
@@ -2641,63 +2651,9 @@ class LiveRuntime:
                     continue
 
             # --- V1: terminalization budget check ---
-            # Entries past their hard ceiling must go through cleanup/abort,
-            # never direct pop.  min-notional residuals (repair_state set) past
-            # hard ceiling also go through cleanup — they must not hang forever.
-            budget = self._pending_entry_terminalization_budget(pending, now_ms)
-            if budget is not None and budget.get("hard_ceiling_reached"):
-                if pending.repair_state:
-                    self.journal.append(
-                        "pending_entry.min_notional_hard_ceiling_cleanup",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "repair_state": pending.repair_state,
-                            "final_reason": budget["final_reason"],
-                            "lifetime_ms": budget["lifetime_ms"],
-                        },
-                    )
-                if not pending.has_any_fill():
-                    # Zero-fill entry past hard ceiling → live-size probe
-                    # before popping to verify no residual exists.
-                    abandoned = await self._try_abandon_stale_entry(pending, entry_id)
-                    if abandoned:
-                        resolved_entry_ids.append(entry_id)
-                        continue
-                    # Probe failed → abort (with cleanup) per V1
-                removed = await self._abort_pending_entry(
-                    pending, entry_id, budget["final_reason"]
-                )
-                if removed:
-                    resolved_entry_ids.append(entry_id)
-                continue
-            if budget is not None and budget.get("force_terminal_reached"):
-                if await self._pending_entry_has_unresolved_maker_order(
-                    pending, entry_id
-                ):
-                    self.journal.append(
-                        "pending_entry.force_terminal_retained_unresolved_maker",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "reason": budget["final_reason"],
-                            "lifetime_ms": budget["lifetime_ms"],
-                        },
-                    )
-                    self._apply_reconcile_backoff(pending, now_ms)
-                    continue
-                # Zero-fill entry past force_terminal threshold → safe to
-                # pop directly (no real exposure on either leg).
-                self.journal.append(
-                    "pending_entry.force_terminalized",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "reason": budget["final_reason"],
-                        "lifetime_ms": budget["lifetime_ms"],
-                    },
-                )
-                resolved_entry_ids.append(entry_id)
+            if await self._force_terminalize_pending_entry_if_budget_exhausted(
+                pending, entry_id, now_ms
+            ):
                 continue
 
             # --- V1: drive missing hedge on normal tick ---
@@ -3108,6 +3064,119 @@ class LiveRuntime:
             "final_reason": final_reason,
             "lifetime_ms": lifetime_ms,
         }
+
+    async def _force_terminalize_pending_entry_if_budget_exhausted(
+        self, pending, entry_id: str, now_ms: int
+    ) -> bool:
+        """V1 force_terminalize_pending_entry_if_budget_exhausted.
+
+        Runs before flat-position retention, matching V1's pending entry
+        driver. A stale zero-fill maker order must first go through maker
+        cancel and abort/cleanup once hard ceiling is reached; lack of maker
+        terminal evidence must not retain it forever.
+
+        Returns True when this pending entry was handled for this tick, even if
+        cleanup failed and the entry was deliberately retained fail-closed.
+        """
+        budget = self._pending_entry_terminalization_budget(pending, now_ms)
+        if budget is None:
+            return False
+
+        hard_ceiling_reached = bool(budget.get("hard_ceiling_reached"))
+        force_terminal_reached = bool(budget.get("force_terminal_reached"))
+        final_reason = str(budget["final_reason"])
+
+        if hard_ceiling_reached and pending.repair_state:
+            self.journal.append(
+                "pending_entry.min_notional_hard_ceiling_cleanup",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "repair_state": pending.repair_state,
+                    "final_reason": final_reason,
+                    "lifetime_ms": budget["lifetime_ms"],
+                },
+            )
+
+        if not pending.maker_completed():
+            cancel_issued = False
+            if getattr(pending, "maker_order_id", ""):
+                cancel_issued = await self._recover_cancel_maker_order(
+                    pending, entry_id, final_reason
+                )
+
+            if hard_ceiling_reached:
+                if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
+                    await self._finalize_pending_entry(pending, entry_id, now_ms)
+                    self.state.pending_entries.pop(entry_id, None)
+                    self.journal.append(
+                        "recovery.pending_entry_finalized",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": final_reason,
+                        },
+                    )
+                    return True
+
+                await self._abort_pending_entry(pending, entry_id, final_reason)
+                return True
+
+            if cancel_issued:
+                pending.reconcile_attempt += 1
+                self._apply_reconcile_backoff(pending, now_ms)
+                return True
+
+            return False
+
+        if hard_ceiling_reached:
+            if not pending.has_any_fill():
+                if getattr(
+                    self.config.strategy,
+                    "pending_entry_force_fallback_when_tradeable",
+                    False,
+                ):
+                    fallback_ok = await self._recover_try_taker_fallback(
+                        pending, entry_id, final_reason
+                    )
+                    if fallback_ok:
+                        return True
+                abandoned = await self._try_abandon_stale_entry(pending, entry_id)
+                if abandoned:
+                    self.state.pending_entries.pop(entry_id, None)
+                    return True
+
+            await self._abort_pending_entry(pending, entry_id, final_reason)
+            return True
+
+        if force_terminal_reached:
+            if await self._pending_entry_has_unresolved_maker_order(
+                pending, entry_id
+            ):
+                self.journal.append(
+                    "pending_entry.force_terminal_retained_unresolved_maker",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": final_reason,
+                        "lifetime_ms": budget["lifetime_ms"],
+                    },
+                )
+                self._apply_reconcile_backoff(pending, now_ms)
+                return True
+            self.journal.append(
+                "pending_entry.force_terminalized",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": final_reason,
+                    "lifetime_ms": budget["lifetime_ms"],
+                },
+            )
+            self.state.pending_entries.pop(entry_id, None)
+            return True
+
+        return False
 
     async def _abort_pending_entry_fail_closed(
         self, pending, entry_id: str, reason: str
