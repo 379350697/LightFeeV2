@@ -459,6 +459,89 @@ class TestRuntimePreflight:
             assert bitget.fetch_position_symbols == ["BTCUSDT"]
 
     @pytest.mark.asyncio
+    async def test_local_l2_candidate_activation_filters_unsupported_venue_symbols(self):
+        """Local-L2 bootstrap must not request books for non-trading contracts."""
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.local_l2_enabled = True
+            config.strategy.local_l2_ws_enabled = False
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.loaded = False
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            binance = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+
+            await runtime._ensure_l2_active_for_candidates(
+                [
+                    SimpleNamespace(
+                        symbol="SYSUSDT",
+                        long_venue="binance",
+                        short_venue="binance",
+                    )
+                ],
+                now_ms=1700000010000,
+            )
+
+            assert binance.loaded is True
+            assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
+
+    @pytest.mark.asyncio
+    async def test_local_l2_startup_bootstrap_runs_when_ws_disabled(self):
+        """REST bootstrap must still use filtered target pairs when WS is disabled."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.local_l2_enabled = True
+            config.strategy.local_l2_ws_enabled = False
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.loaded = False
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            binance = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+            runtime.state.retained_local_l2_books = [
+                {"venue": "binance", "symbol": "BTCUSDT"},
+                {"venue": "binance", "symbol": "SYSUSDT"},
+            ]
+
+            started: list[dict] = []
+
+            def capture_bootstrap(**kwargs):
+                started.append(kwargs)
+
+            runtime.l2_data_plane.start_background_bootstrap = capture_bootstrap
+
+            runtime.journal.open()
+            try:
+                await runtime._activate_local_l2_phase(now_ms=1700000010000)
+            finally:
+                runtime.journal.close()
+
+            assert binance.loaded is True
+            assert started[0]["venue"] == "binance"
+            assert started[0]["symbols"] == ["BTCUSDT"]
+            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is not None
+            assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
+
+    @pytest.mark.asyncio
     async def test_housekeeping_recovers_balanced_live_positions_after_start(self):
         """A running clean state must not stay false-clean after live positions appear."""
         with tempfile.TemporaryDirectory() as td:

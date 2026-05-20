@@ -3258,6 +3258,36 @@ class TestBitgetL2Guard:
 
 
 # ---------------------------------------------------------------------------
+# BinanceAdapter symbol catalog guard
+# ---------------------------------------------------------------------------
+
+
+class TestBinanceAdapterSymbolCatalog:
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_keeps_trading_perpetuals_only(self):
+        """SETTLING contracts can return empty depth and must not be L2 targets."""
+        from lightfee.venues.binance import BinanceAdapter
+
+        adapter = BinanceAdapter(mode="paper")
+
+        async def mock_request(method, path, **kwargs):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [
+                    {"symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                    {"symbol": "SYSUSDT", "status": "SETTLING", "contractType": "PERPETUAL"},
+                    {"symbol": "BTCUSDT_260626", "status": "TRADING", "contractType": "CURRENT_QUARTER"},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert adapter.supported_symbols() == ["BTCUSDT"]
+
+
+# ---------------------------------------------------------------------------
 # Task 3 regression: BitgetAdapter L2 metadata guard (no bare transport)
 # ---------------------------------------------------------------------------
 

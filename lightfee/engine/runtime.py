@@ -572,6 +572,22 @@ class LiveRuntime:
         self, venue: Venue, adapter: VenueAdapter, symbols: list[str],
     ) -> list[str]:
         """Filter fallback single-position probes through a venue symbol catalog."""
+        return await self._filter_symbols_supported_by_venue(
+            venue,
+            adapter,
+            symbols,
+            skip_event_kind="recovery.live_position_probe_symbol_skipped",
+        )
+
+    async def _filter_symbols_supported_by_venue(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+        symbols: list[str],
+        *,
+        skip_event_kind: str,
+    ) -> list[str]:
+        """Filter symbols through a venue-provided trading catalog when present."""
         ensure_loaded = getattr(adapter, "ensure_supported_symbols_loaded", None)
         if callable(ensure_loaded):
             try:
@@ -605,10 +621,11 @@ class LiveRuntime:
             else:
                 if getattr(self.journal, "_file", None) is not None:
                     self.journal.append(
-                        "recovery.live_position_probe_symbol_skipped",
+                        skip_event_kind,
                         {
                             "venue": venue.value,
                             "symbol": symbol,
+                            "venue_symbol": venue_symbol,
                             "reason": "unsupported_symbol",
                         },
                     )
@@ -1087,6 +1104,45 @@ class LiveRuntime:
             )
             return
 
+        if self.config.runtime.mode != "paper":
+            from lightfee.core.domain import Venue as VenueEnum
+
+            filtered_pairs: set[tuple[str, str]] = set()
+            venue_symbols_for_filter: dict[str, list[str]] = {}
+            for venue_str, symbol in target_pairs:
+                venue_symbols_for_filter.setdefault(venue_str, []).append(symbol)
+
+            for venue_str, symbols in venue_symbols_for_filter.items():
+                try:
+                    ven = VenueEnum.from_str(venue_str)
+                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                except (ValueError, KeyError):
+                    adapter = None
+                    ven = None
+                if adapter is None or ven is None:
+                    filtered_pairs.update((venue_str, sym) for sym in symbols)
+                    continue
+                filtered_symbols = await self._filter_symbols_supported_by_venue(
+                    ven,
+                    adapter,
+                    sorted(symbols),
+                    skip_event_kind="runtime.local_l2_symbol_skipped",
+                )
+                filtered_pairs.update((venue_str, sym) for sym in filtered_symbols)
+
+            target_pairs = filtered_pairs
+
+        if not target_pairs:
+            self.journal.append(
+                "runtime.local_l2_phase_complete",
+                {
+                    "books_bootstrapped": 0,
+                    "reason": "no target pairs after venue symbol catalog filtering",
+                    "phase_ms": wall_clock_now_ms() - now_ms,
+                },
+            )
+            return
+
         from lightfee.marketdata.local_l2_venues import get_venue_rules
 
         # Step 1: Create books for all target pairs (V1: mark_binance_local_l2_bootstrapping)
@@ -1103,6 +1159,10 @@ class LiveRuntime:
                     book.transition_to_bootstrapping(now_ms)
                 books_created += 1
 
+        venue_symbols: dict[str, list[str]] = {}
+        for venue_str, symbol in target_pairs:
+            venue_symbols.setdefault(venue_str, []).append(symbol)
+
         # Step 2: Start WS streams FIRST for all venues (V1: start_local_l2_ws)
         # This ensures delta updates are captured (buffered) during bootstrap gap
         if (
@@ -1111,10 +1171,6 @@ class LiveRuntime:
             and self.config.runtime.mode != "paper"
         ):
             ws_started = 0
-            venue_symbols: dict[str, list[str]] = {}
-            for venue_str, symbol in target_pairs:
-                venue_symbols.setdefault(venue_str, []).append(symbol)
-
             for venue_str, symbols in venue_symbols.items():
                 try:
                     from lightfee.core.domain import Venue as VenueEnum
@@ -1185,6 +1241,8 @@ class LiveRuntime:
             for entry in getattr(self.state, "retained_local_l2_books", []):
                 venue = entry.get("venue", "")
                 sym = entry.get("symbol", "")
+                if (venue, sym) not in target_pairs:
+                    continue
                 if venue and sym:
                     book = self.local_l2_runtime.ensure_book(venue, sym)
                     if book.status == L2BookStatus.COLD:
@@ -1273,6 +1331,16 @@ class LiveRuntime:
                 continue
 
             # Ensure books exist
+            filtered_symbols = await self._filter_symbols_supported_by_venue(
+                ven,
+                adapter,
+                symbols_list,
+                skip_event_kind="runtime.local_l2_symbol_skipped",
+            )
+            symbols_list = filtered_symbols[:per_venue_budget]
+            if not symbols_list:
+                continue
+
             for sym in symbols_list:
                 rules = get_venue_rules(ven_str)
                 book = self.local_l2_runtime.ensure_book(ven_str, sym)
