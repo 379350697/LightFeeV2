@@ -19,8 +19,10 @@ from urllib.request import Request, urlopen
 
 from lightfee.marketdata.l2 import LocalL2UpdateKind
 from lightfee.marketdata.local_l2_venues import parse_l2_update
+from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.binance import BinanceAdapter
 from lightfee.venues.bitget import BitgetAdapter
+from lightfee.venues.hyperliquid import HyperliquidAdapter
 
 
 @dataclass
@@ -72,6 +74,22 @@ def _get_json(url: str, params: dict[str, Any], timeout_s: float) -> dict[str, A
     with urlopen(request, timeout=timeout_s) as response:
         body = response.read().decode("utf-8")
     raw = json.loads(body)
+    if not isinstance(raw, dict):
+        raise AssertionError(f"expected JSON object from {url}, got {type(raw).__name__}")
+    return raw
+
+
+def _post_json(url: str, body: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    request = Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "LightFeeV2-regression-probe/1.0",
+        },
+    )
+    with urlopen(request, timeout=timeout_s) as response:
+        raw = json.loads(response.read().decode("utf-8"))
     if not isinstance(raw, dict):
         raise AssertionError(f"expected JSON object from {url}, got {type(raw).__name__}")
     return raw
@@ -133,6 +151,20 @@ def _bitget_rest_orderbook_snapshot(timeout_s: float) -> dict[str, Any]:
     return _update_detail(update)
 
 
+def _aster_rest_depth_snapshot(timeout_s: float) -> dict[str, Any]:
+    raw = _get_json(
+        "https://fapi.asterdex.com/fapi/v1/depth",
+        {"symbol": "BTCUSDT", "limit": "5"},
+        timeout_s,
+    )
+    update = parse_l2_update("aster", raw, symbol="BTCUSDT", now_ms=_now_ms())
+    if update.update_kind != LocalL2UpdateKind.SNAPSHOT:
+        raise AssertionError(f"expected snapshot, got {update.update_kind.value}")
+    if not update.bids or not update.asks:
+        raise AssertionError("expected non-empty Aster BTCUSDT bid/ask sides")
+    return _update_detail(update)
+
+
 async def _binance_catalog_filters_settling_symbol(timeout_s: float) -> dict[str, Any]:
     raw = _get_json(
         "https://fapi.binance.com/fapi/v1/exchangeInfo",
@@ -173,6 +205,45 @@ async def _binance_catalog_filters_settling_symbol(timeout_s: float) -> dict[str
             pass
 
 
+async def _aster_catalog_filters_unlisted_symbol(timeout_s: float) -> dict[str, Any]:
+    raw = _get_json(
+        "https://fapi.asterdex.com/fapi/v1/exchangeInfo",
+        {},
+        timeout_s,
+    )
+    adapter = AsterAdapter(mode="paper")
+    try:
+        rows = raw.get("symbols", []) if isinstance(raw, dict) else []
+        rls_row = next(
+            (row for row in rows if isinstance(row, dict) and row.get("symbol") == "RLSUSDT"),
+            None,
+        )
+
+        async def mock_request(method: str, path: str, **kwargs):
+            if method != "GET" or path != "/fapi/v1/exchangeInfo":
+                raise AssertionError(f"unexpected Aster catalog request: {method} {path}")
+            return raw
+
+        adapter._transport._request = mock_request
+        await adapter.ensure_supported_symbols_loaded()
+        supported = set(adapter.supported_symbols())
+        if "BTCUSDT" not in supported:
+            raise AssertionError("BTCUSDT missing from Aster supported symbol catalog")
+        if "RLSUSDT" in supported:
+            raise AssertionError("RLSUSDT leaked into Aster supported symbol catalog")
+        return {
+            "supported_count": len(supported),
+            "btc_supported": "BTCUSDT" in supported,
+            "rls_present_in_exchange_info": rls_row is not None,
+            "rls_supported": "RLSUSDT" in supported,
+        }
+    finally:
+        try:
+            await asyncio.wait_for(adapter.shutdown(), timeout=1.0)
+        except Exception:
+            pass
+
+
 async def _bitget_catalog_loads_public_contracts(timeout_s: float) -> dict[str, Any]:
     raw = _get_json(
         "https://api.bitget.com/api/v2/mix/market/contracts",
@@ -202,9 +273,49 @@ async def _bitget_catalog_loads_public_contracts(timeout_s: float) -> dict[str, 
             pass
 
 
+async def _hyperliquid_catalog_filters_delisted_assets(timeout_s: float) -> dict[str, Any]:
+    raw = _post_json(
+        "https://api.hyperliquid.xyz/info",
+        {"type": "meta"},
+        timeout_s,
+    )
+    adapter = HyperliquidAdapter(mode="paper")
+    try:
+        universe = raw.get("universe", []) if isinstance(raw, dict) else []
+        mav_row = next(
+            (row for row in universe if isinstance(row, dict) and row.get("name") == "MAV"),
+            None,
+        )
+
+        async def mock_request(method: str, path: str, **kwargs):
+            if method != "POST" or path != "/info" or kwargs.get("body") != {"type": "meta"}:
+                raise AssertionError(f"unexpected Hyperliquid catalog request: {method} {path}")
+            return raw
+
+        adapter._transport._request = mock_request
+        await adapter.ensure_supported_symbols_loaded()
+        supported = set(adapter.supported_symbols())
+        if "BTC" not in supported:
+            raise AssertionError("BTC missing from Hyperliquid supported perp universe")
+        if mav_row is not None and bool(mav_row.get("isDelisted", False)) and "MAV" in supported:
+            raise AssertionError("delisted MAV leaked into Hyperliquid supported perp universe")
+        return {
+            "supported_count": len(supported),
+            "btc_supported": "BTC" in supported,
+            "mav_is_delisted": bool(mav_row.get("isDelisted", False)) if mav_row else "missing",
+            "mav_supported": "MAV" in supported,
+        }
+    finally:
+        try:
+            await asyncio.wait_for(adapter.shutdown(), timeout=1.0)
+        except Exception:
+            pass
+
+
 def run(timeout_s: float) -> list[ProbeResult]:
     return [
         _record_sync("binance_rest_depth_snapshot", lambda: _binance_rest_depth_snapshot(timeout_s)),
+        _record_sync("aster_rest_depth_snapshot", lambda: _aster_rest_depth_snapshot(timeout_s)),
         _record_sync("okx_rest_books_snapshot", lambda: _okx_rest_books_snapshot(timeout_s)),
         _record_sync("bybit_rest_orderbook_snapshot", lambda: _bybit_rest_orderbook_snapshot(timeout_s)),
         _record_sync("bitget_rest_orderbook_snapshot", lambda: _bitget_rest_orderbook_snapshot(timeout_s)),
@@ -214,8 +325,18 @@ def run(timeout_s: float) -> list[ProbeResult]:
             timeout_s,
         ),
         _record_async(
+            "aster_catalog_filters_unlisted_symbol",
+            lambda: _aster_catalog_filters_unlisted_symbol(timeout_s),
+            timeout_s,
+        ),
+        _record_async(
             "bitget_catalog_loads_public_contracts",
             lambda: _bitget_catalog_loads_public_contracts(timeout_s),
+            timeout_s,
+        ),
+        _record_async(
+            "hyperliquid_catalog_filters_delisted_assets",
+            lambda: _hyperliquid_catalog_filters_delisted_assets(timeout_s),
             timeout_s,
         ),
     ]

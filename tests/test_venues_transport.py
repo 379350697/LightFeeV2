@@ -3288,6 +3288,62 @@ class TestBinanceAdapterSymbolCatalog:
 
 
 # ---------------------------------------------------------------------------
+# Aster/Hyperliquid symbol catalog guards
+# ---------------------------------------------------------------------------
+
+
+class TestAsterAdapterSymbolCatalog:
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_keeps_trading_perpetuals_only(self):
+        """Aster closed/settling contracts must not become local-L2 targets."""
+        from lightfee.venues.aster import AsterAdapter
+
+        adapter = AsterAdapter(mode="paper")
+
+        async def mock_request(method, path, **kwargs):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [
+                    {"symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                    {"symbol": "RLSUSDT", "status": "SETTLING", "contractType": "PERPETUAL"},
+                    {"symbol": "BTCUSDT_260626", "status": "TRADING", "contractType": "CURRENT_QUARTER"},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert adapter.supported_symbols() == ["BTCUSDT"]
+
+
+class TestHyperliquidAdapterSymbolCatalog:
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_excludes_delisted_assets(self):
+        """Hyperliquid delisted assets can return empty l2Book sides."""
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+
+        adapter = HyperliquidAdapter(mode="paper")
+
+        async def mock_request(method, path, **kwargs):
+            assert method == "POST"
+            assert path == "/info"
+            assert kwargs.get("body") == {"type": "meta"}
+            return {
+                "universe": [
+                    {"name": "BTC", "isDelisted": False},
+                    {"name": "MAV", "isDelisted": True},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert adapter.supported_symbols() == ["BTC"]
+
+
+# ---------------------------------------------------------------------------
 # Task 3 regression: BitgetAdapter L2 metadata guard (no bare transport)
 # ---------------------------------------------------------------------------
 

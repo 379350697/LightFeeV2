@@ -43,6 +43,33 @@ class AsterAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return loaded Aster trading symbols, if available."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        return sorted(str(symbol) for symbol in metadata.keys())
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate the Aster contract catalog with actively trading symbols."""
+        if self._transport._symbol_metadata:
+            return
+        raw = await self._transport._request("GET", "/fapi/v1/exchangeInfo")
+        rows = raw.get("symbols", []) if isinstance(raw, dict) else []
+        metadata: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol", ""))
+            if not symbol:
+                continue
+            status = str(row.get("status", row.get("contractStatus", "TRADING"))).upper()
+            if status != "TRADING":
+                continue
+            contract_type = str(row.get("contractType", "PERPETUAL")).upper()
+            if contract_type != "PERPETUAL":
+                continue
+            metadata[symbol] = dict(row)
+        self._transport.set_symbol_metadata(metadata)
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 

@@ -42,6 +42,34 @@ class HyperliquidAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return loaded Hyperliquid perp asset names, if available."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        return sorted(str(symbol) for symbol in metadata.keys())
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate the Hyperliquid perp universe, excluding delisted assets."""
+        if self._transport._symbol_metadata:
+            return
+        raw = await self._transport._request(
+            "POST",
+            "/info",
+            body={"type": "meta"},
+            private=False,
+        )
+        universe = raw.get("universe", []) if isinstance(raw, dict) else []
+        metadata: dict[str, dict[str, Any]] = {}
+        for row in universe:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", ""))
+            if not name:
+                continue
+            if bool(row.get("isDelisted", False)):
+                continue
+            metadata[name] = dict(row)
+        self._transport.set_symbol_metadata(metadata)
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
