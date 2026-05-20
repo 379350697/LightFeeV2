@@ -275,9 +275,9 @@ class TestFixtureDrivenOrderSuccess:
         hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(
             api_key="k",
-            api_secret=hl_privkey if venue_id == Venue.HYPERLIQUID else "s",
+            api_secret="" if venue_id == Venue.HYPERLIQUID else "s",
             api_passphrase="p",
-            wallet_private_key="0xdead",
+            wallet_private_key=hl_privkey if venue_id == Venue.HYPERLIQUID else "0xdead",
             account_address="0xbeef",
         )
         adapter = adapter_cls(mode="live", credential=cred)
@@ -318,10 +318,14 @@ class TestFixtureDrivenOrderReject:
         # Return non-200 so the transport classifies it as rejection
         mock = _build_mock_transport(fixture, status=400)
 
-        cred = LiveCredential(api_key="k", api_secret="s",
-                              api_passphrase="p",
-                              wallet_private_key="0xdead",
-                              account_address="0xbeef")
+        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(
+            api_key="k",
+            api_secret="" if venue_id == Venue.HYPERLIQUID else "s",
+            api_passphrase="p",
+            wallet_private_key=hl_privkey if venue_id == Venue.HYPERLIQUID else "0xdead",
+            account_address="0xbeef",
+        )
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
@@ -418,8 +422,8 @@ class TestHyperliquidLiveOrderNowSupported:
         mock = _build_mock_transport(fixture)
 
         hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
-        cred = LiveCredential(api_key="k", api_secret=hl_privkey,
-                              wallet_private_key="0xdead",
+        cred = LiveCredential(api_key="k", api_secret="",
+                              wallet_private_key=hl_privkey,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
@@ -705,8 +709,8 @@ class TestHyperliquidCapabilityConsistency:
         mock = _build_mock_transport(fixture)
 
         hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
-        cred = LiveCredential(api_key="k", api_secret=hl_privkey,
-                              wallet_private_key="0xdead",
+        cred = LiveCredential(api_key="k", api_secret="",
+                              wallet_private_key=hl_privkey,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport

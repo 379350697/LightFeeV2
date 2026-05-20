@@ -276,6 +276,7 @@ class Supervisor:
             if self._fail_closed_can_clear():
                 self.state.lifecycle = EngineLifecycle.RUNNING
                 self.state.last_error = None
+                self.state.global_risk_reason = None
                 self.journal.append(
                     "risk.fail_closed_auto_resumed",
                     {
@@ -284,6 +285,8 @@ class Supervisor:
                         "min_health_ratio": health.min_health_ratio,
                     },
                 )
+            else:
+                return old_mode
 
         if new_mode != old_mode:
             self.state.risk_mode = new_mode
@@ -312,18 +315,17 @@ class Supervisor:
         """V1 fail_closed_latch_can_clear (state.rs:476-483).
 
         Returns True when FAIL_CLOSED can be safely auto-recovered:
+        - No operator fail-closed override
         - No recovery block reason
-        - No open positions that need risk protection
+        - No lifecycle-blocking recovery work
         """
+        from lightfee.engine.recovery import needs_reconciliation
+
+        if self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
+            return False
         if self.state.recovery_blocked_reason:
             return False
-        # V1: positions that triggered fail_closed must be resolved
-        for pos in self.state.open_positions.values():
-            if pos.last_risk_reason and "fail_closed" in pos.last_risk_reason:
-                return False
-            if pos.single_side_protection_triggered:
-                return False
-        return True
+        return not needs_reconciliation(self.state)
 
     # ------------------------------------------------------------------
     # Per-position risk supervision
@@ -646,6 +648,23 @@ class Supervisor:
         strategy = self.config.strategy
 
         if not strategy.risk_monitor_enabled:
+            if (
+                self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+                and self._fail_closed_can_clear()
+            ):
+                self.state.lifecycle = EngineLifecycle.RUNNING
+                self.state.risk_mode = GlobalRiskMode.RUNNING
+                self.state.last_error = None
+                self.state.global_risk_reason = None
+                self.journal.append(
+                    "risk.fail_closed_auto_resumed",
+                    {
+                        "from_mode": GlobalRiskMode.FAIL_CLOSED.value,
+                        "to_mode": GlobalRiskMode.RUNNING.value,
+                        "min_health_ratio": None,
+                        "reason": "risk_monitor_disabled_clean_state",
+                    },
+                )
             return
 
         # V1: sync risk snapshot cache from runtime BEFORE health evaluation
@@ -678,5 +697,4 @@ class Supervisor:
                 "risk.warning_line_triggered",
                 {"min_health_ratio": health.min_health_ratio, "ts_ms": now_ms},
             )
-
 

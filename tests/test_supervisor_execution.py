@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from lightfee.config.schema import AppConfig, RuntimeConfig, StrategyConfig
-from lightfee.core.domain import Venue
+from lightfee.core.domain import Side, Venue
 from lightfee.engine.risk_actions import (
     AccountRiskSnapshot,
     PositionRiskView,
@@ -20,7 +20,7 @@ from lightfee.engine.risk_actions import (
     RiskExecutionPlanKind,
     evaluate_position_risk,
 )
-from lightfee.engine.state import EngineState, OpenPosition
+from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -163,6 +163,49 @@ class TestGlobalRiskModeUpdate:
 
         new_mode = supervisor.update_global_risk_mode({"binance": 2.5})
         assert new_mode == GlobalRiskMode.RUNNING
+
+    def test_fail_closed_latch_does_not_clear_with_pending_entry_work(self):
+        config = _make_config()
+        state = EngineState(lifecycle=EngineLifecycle.RISK_ONLY)
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        state.pending_entries["entry-1"] = PendingEntry(
+            pending_id="entry-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+        )
+        journal = _make_journal()
+        supervisor = Supervisor(config, state, journal)
+
+        new_mode = supervisor.update_global_risk_mode({"binance": 5.0, "okx": 6.0})
+
+        assert new_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert not any(
+            event.get("kind") == "risk.fail_closed_auto_resumed"
+            for event in journal.read_all()
+        )
+
+    def test_supervise_disabled_monitor_clears_clean_fail_closed_latch(self):
+        config = _make_config(risk_monitor_enabled=False)
+        state = EngineState(lifecycle=EngineLifecycle.RISK_ONLY)
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        journal = _make_journal()
+        supervisor = Supervisor(config, state, journal)
+
+        supervisor.supervise(5000, {"binance": 5.0, "okx": 6.0})
+
+        assert state.risk_mode == GlobalRiskMode.RUNNING
+        assert state.lifecycle == EngineLifecycle.RUNNING
+        assert any(
+            event.get("kind") == "risk.fail_closed_auto_resumed"
+            for event in journal.read_all()
+        )
 
 
 # ---------------------------------------------------------------------------

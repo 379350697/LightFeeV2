@@ -503,11 +503,73 @@ class TestHyperliquidLiveOrderNowSupported:
     """Hyperliquid live order now works with EIP-712 signing."""
 
     @pytest.mark.asyncio
+    async def test_live_place_order_signs_with_wallet_private_key_not_api_secret(self, monkeypatch):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            api_secret="",
+            wallet_private_key=wallet_key,
+            account_address="0xbeef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_meta_cache["BTC"] = 0
+
+        captured = {}
+
+        from lightfee.venues import hyperliquid_signing
+
+        def fake_build_exchange_payload(**kwargs):
+            captured["private_key_hex"] = kwargs["private_key_hex"]
+            return {"action": kwargs["action"], "signature": {"r": "", "s": "", "v": 27}}
+
+        monkeypatch.setattr(
+            hyperliquid_signing,
+            "build_hyperliquid_exchange_payload",
+            fake_build_exchange_payload,
+        )
+        transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [
+                                    {
+                                        "filled": {
+                                            "oid": 789,
+                                            "totalSz": "1.0",
+                                            "avgPx": "50000.0",
+                                        }
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                )
+            )
+        )
+
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="BTC",
+            side=Side.BUY,
+            quantity=1.0,
+        )
+        try:
+            await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        assert captured["private_key_hex"] == wallet_key
+
+    @pytest.mark.asyncio
     async def test_live_place_order_succeeds_with_mock(self):
         # Valid secp256k1 private key for signing (Rust test-vector key)
         privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
-        cred = LiveCredential(api_key="k", api_secret=privkey,
-                              wallet_private_key="0xdead", account_address="0xbeef")
+        cred = LiveCredential(api_key="k", api_secret="",
+                              wallet_private_key=privkey, account_address="0xbeef")
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
         # Pre-populate asset index cache to avoid needing metadata response
         transport._hl_meta_cache["BTC"] = 0

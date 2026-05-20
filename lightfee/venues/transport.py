@@ -2676,7 +2676,10 @@ class VenueTransport(MarketDataClient):
 
                     body = build_hyperliquid_exchange_payload(
                         action=action,
-                        private_key_hex=self._credential.api_secret if self._credential else "",
+                        private_key_hex=(
+                            self._credential.wallet_private_key
+                            if self._credential else ""
+                        ),
                         vault_address=vault_addr,
                         is_mainnet=True,
                         cloid=cloid if cloid else None,
