@@ -1,0 +1,14 @@
+{
+  "venue": "binance",
+  "symbol": "JTOUSDT",
+  "snapshot_last_update_id": 10591999713003,
+  "buffered_updates": [
+    {"U": 10591999713004, "u": 10591999713004, "pu": 10591999713003, "b": [["1.0000", "10"]], "a": [["1.0010", "10"]]},
+    {"U": 10591999715265, "u": 10591999715270, "pu": 10591999715264, "b": [["1.0001", "10"]], "a": [["1.0011", "10"]]}
+  ],
+  "expected": {
+    "reason": "previous_link_mismatch",
+    "expected_previous": 10591999713004,
+    "observed_previous": 10591999715264
+  }
+}

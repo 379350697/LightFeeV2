@@ -1,0 +1,31 @@
+{
+  "venue": "bybit",
+  "symbol": "IRYSUSDT",
+  "ws_depth": 50,
+  "rest_depth": 50,
+  "current_book": {
+    "status": "bootstrapping",
+    "sequence": 13700598,
+    "last_update_id": 13700598,
+    "observed_at_ms": 0
+  },
+  "rest_snapshot": {
+    "retCode": 0,
+    "retMsg": "OK",
+    "result": {
+      "s": "IRYSUSDT",
+      "b": [["0.02000", "1000"]],
+      "a": [["0.02010", "1000"]],
+      "ts": 1779302500000,
+      "u": 7103120,
+      "seq": 13700610,
+      "cts": 1779302499999
+    },
+    "time": 1779302500001
+  },
+  "expected": {
+    "old_stale_decision": true,
+    "new_rest_sequence_comparable": false,
+    "must_not_replay_rest_snapshot_with_ws_deltas": true
+  }
+}

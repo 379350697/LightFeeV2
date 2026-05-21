@@ -30,6 +30,7 @@ from lightfee.marketdata.l2 import (
     LocalL2Update,
     LocalL2UpdateKind,
 )
+from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
 from lightfee.marketdata.local_l2_runtime import LocalL2Runtime, RuntimeFaultKind
 from lightfee.venues.transport import TransportError, TransportErrorCategory
 from lightfee.persistence.journal import Journal
@@ -37,10 +38,6 @@ from lightfee.persistence.journal import Journal
 if TYPE_CHECKING:
     from lightfee.core.contracts import VenueAdapter
     from lightfee.marketdata.local_l2_ws import LocalL2WsClient
-
-# Pre-snapshot buffer capacity per symbol (V1: BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP)
-_PRE_SNAPSHOT_BUFFER_CAP = 512
-
 
 # ---------------------------------------------------------------------------
 # Buffered WS update wrapper (V1: BufferedBinanceLocalL2DepthUpdate)
@@ -175,18 +172,47 @@ class LocalL2DataPlane:
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
 
+            policy = policy_for_venue(venue)
+            book = self._runtime.get_book(venue, symbol)
+
             # V1: binance_local_l2_snapshot_is_stale — reject older snapshots. Equal
             # sequence snapshots can be a valid refresh when the book has not changed.
-            book = self._runtime.get_book(venue, symbol)
-            if book is not None and update.sequence > 0 and book.last_update_id > 0:
+            #
+            # Venue policy guard: only venues whose REST and WS sequences are proven
+            # comparable may use stale comparison. Bybit/Hyperliquid opt out; Bitget
+            # and Gate intentionally keep legacy behavior until probe evidence proves
+            # a venue-specific change is required.
+            if (
+                book is not None
+                and update.sequence > 0
+                and book.last_update_id > 0
+                and policy.rest_snapshot_sequence_comparable
+            ):
                 if update.sequence < book.last_update_id:
                     self._journal.append(
                         "runtime.local_l2_snapshot_stale",
                         {"venue": venue, "symbol": symbol,
-                         "snapshot_seq": update.sequence, "book_seq": book.last_update_id},
+                         "snapshot_seq": update.sequence, "book_seq": book.last_update_id,
+                         "policy_bridge_mode": policy.bridge_mode.value,
+                         "reason_class": "stale_snapshot"},
                     )
                     # Small delay to avoid tight loop re-fetching the same stale snapshot
                     await asyncio.sleep(0.25)
+                    return False
+
+            # For WS-snapshot-authoritative venues with an active WS client, the REST
+            # snapshot is secondary evidence — it must not be applied as the primary
+            # bootstrap/recovery anchor when a WS stream is providing book snapshots.
+            if policy.bridge_mode is BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+                ws_key = LocalL2BookKey(venue=venue, symbol=symbol)
+                ws_client = self._ws_clients.get(ws_key)
+                if ws_client is not None and getattr(ws_client, "is_connected", False):
+                    self._journal.append(
+                        "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
+                        {"venue": venue, "symbol": symbol,
+                         "snapshot_seq": update.sequence, "book_seq": getattr(book, "last_update_id", 0) if book else 0,
+                         "policy": policy.bridge_mode.value},
+                    )
                     return False
 
             apply_result = self._runtime.record_update_result(update, now_ms)
@@ -205,7 +231,11 @@ class LocalL2DataPlane:
                 return False
 
             # Replay buffered WS updates accumulated during bootstrap gap (V1 parity)
-            replay = self._replay_buffered_updates(venue, symbol)
+            # Skip replay only for policies that cannot bridge REST snapshots with
+            # WS deltas. OKX stays on the V1 buffered replay classifier.
+            replay = _BufferedReplayResult()
+            if policy.replay_rest_snapshot_with_ws_deltas:
+                replay = self._replay_buffered_updates(venue, symbol)
             if replay.replayed > 0:
                 self._journal.append(
                     "runtime.local_l2_buffered_replay",
@@ -376,8 +406,11 @@ class LocalL2DataPlane:
             if buf is None:
                 buf = deque()
                 self._pre_snapshot_buffers[key] = buf
-            if len(buf) >= _PRE_SNAPSHOT_BUFFER_CAP:
+            cap = policy_for_venue(update.venue).pre_snapshot_buffer_cap
+            if len(buf) >= cap:
                 # Overflow → rebuild required (V1: mark_status(Rebuilding), set_last_sequence(None))
+                first_seq = buf[0].update.sequence if buf else 0
+                last_seq = buf[-1].update.sequence if buf else 0
                 buf.clear()
                 book.sequence = 0
                 book.last_update_id = 0
@@ -393,7 +426,13 @@ class LocalL2DataPlane:
                     self._rebuild_evidence(
                         venue=update.venue, symbol=update.symbol,
                         rebuild_trigger="pre_snapshot_buffer_overflow",
-                        buffered_count=_PRE_SNAPSHOT_BUFFER_CAP,
+                        buffered_count=cap,
+                        first_buffered_sequence=first_seq,
+                        last_buffered_sequence=last_seq,
+                        incoming_sequence=update.sequence,
+                        incoming_previous_sequence=update.previous_sequence,
+                        policy_buffer_cap=cap,
+                        reason_class="buffer_overflow",
                     ),
                 )
                 return []
@@ -442,6 +481,62 @@ class LocalL2DataPlane:
         if not filtered:
             return _BufferedReplayResult()
 
+        policy = policy_for_venue(venue)
+        if policy.venue == "okx":
+            replayed = 0
+            for i, bu in enumerate(filtered):
+                link_kind = policy.classify_replay_link(
+                    previous_sequence=previous_sequence,
+                    sequence=bu.update.sequence,
+                    previous_sequence_from_update=bu.update.previous_sequence,
+                    bid_count=len(bu.update.bids),
+                    ask_count=len(bu.update.asks),
+                )
+                if link_kind.value == "obsolete":
+                    continue
+                if link_kind.value == "invalid":
+                    book.sequence = 0
+                    book.last_update_id = 0
+                    book.fault_reason = (
+                        f"buffered_replay_invalid_link: expected {previous_sequence} "
+                        f"got {bu.update.previous_sequence}->{bu.update.sequence}"
+                    )
+                    book.transition_to_rebuilding(int(time.time() * 1000))
+                    self._runtime.handle_runtime_failure(
+                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                        f"buffered_replay_invalid_link: expected {previous_sequence} "
+                        f"got {bu.update.previous_sequence}->{bu.update.sequence}", 0,
+                    )
+                    return _BufferedReplayResult(replayed=replayed, ok=False)
+                try:
+                    replay_result = self._runtime.record_update_result(
+                        bu.update, bu.observed_at_ms,
+                    )
+                    if replay_result.rebuild_required:
+                        book.sequence = 0
+                        book.last_update_id = 0
+                        book.fault_reason = (
+                            replay_result.fault_reason
+                            or f"buffered_replay_apply_failed at index {i}"
+                        )
+                        book.transition_to_rebuilding(int(time.time() * 1000))
+                        return _BufferedReplayResult(replayed=replayed, ok=False)
+                    if replay_result.applied:
+                        previous_sequence = bu.update.sequence
+                        replayed += 1
+                except Exception:
+                    book.sequence = 0
+                    book.last_update_id = 0
+                    book.fault_reason = f"buffered_replay_apply_failed at index {i}"
+                    book.transition_to_rebuilding(int(time.time() * 1000))
+                    self._runtime.handle_runtime_failure(
+                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
+                        f"buffered_replay_apply_failed at index {i}", 0,
+                    )
+                    return _BufferedReplayResult(replayed=replayed, ok=False)
+
+            return _BufferedReplayResult(replayed=replayed)
+
         # Drop updates already covered by the snapshot (V1: final_update_id <= previous_sequence)
         while filtered and filtered[0].update.sequence <= previous_sequence:
             filtered.pop(0)
@@ -477,8 +572,8 @@ class LocalL2DataPlane:
             if bu.update.sequence <= previous_sequence:
                 continue
 
+            # V1 Binance/Aster: standard continuity check
             if i > start_index:
-                # Check continuity between consecutive buffered updates
                 if bu.update.previous_sequence > 0 and bu.update.previous_sequence != previous_sequence:
                     book.sequence = 0
                     book.last_update_id = 0
@@ -568,6 +663,7 @@ class LocalL2DataPlane:
                     continue
                 book.fault_reason = "stale_hot_book"
                 book.transition_to_rebuilding(now_ms)
+                policy = policy_for_venue(key.venue)
                 self._journal.append(
                     "runtime.local_l2_hot_stale_rebuild",
                     {
@@ -576,6 +672,8 @@ class LocalL2DataPlane:
                         "age_ms": book.age_ms(now_ms),
                         "stale_after_ms": stale_after_ms,
                         "ts_ms": now_ms,
+                        "policy_bridge_mode": policy.bridge_mode.value,
+                        "reason_class": "hot_stale",
                     },
                 )
 
@@ -920,12 +1018,20 @@ class LocalL2DataPlane:
         rebuild_trigger: str = "",
         buffered_count: int = 0,
         replayed_count: int = 0,
+        first_buffered_sequence: int = 0,
+        last_buffered_sequence: int = 0,
+        incoming_sequence: int = 0,
+        incoming_previous_sequence: int = 0,
+        policy_buffer_cap: int = 0,
+        book_seq: int = 0,
+        snapshot_seq: int = 0,
+        reason_class: str = "",
     ) -> dict:
         """Build a structured evidence payload for rebuild/transition logging.
 
-        Fields match the required evidence schema: venue, symbol,
-        observed_at_ms, sequence, bid/ask counts, top prices, and
-        rebuild trigger metadata.
+        Includes venue policy, buffer state, and sequence-domain evidence so
+        production diagnostics can distinguish real sequence gaps from
+        config/domain-drift false positives.
         """
         book = self._runtime.get_book(venue, symbol)
         obs_ms = int(getattr(book, "observed_at_ms", 0) or 0)
@@ -934,6 +1040,7 @@ class LocalL2DataPlane:
         ask_count = len(getattr(book, "asks", []) or [])
         top_bid = book.best_bid() if hasattr(book, "best_bid") else 0.0
         top_ask = book.best_ask() if hasattr(book, "best_ask") else 0.0
+        policy = policy_for_venue(venue)
         return {
             "venue": venue,
             "symbol": symbol,
@@ -947,6 +1054,15 @@ class LocalL2DataPlane:
             "rebuild_trigger": rebuild_trigger,
             "buffered_count": buffered_count,
             "replayed_count": replayed_count,
+            "first_buffered_sequence": first_buffered_sequence,
+            "last_buffered_sequence": last_buffered_sequence,
+            "incoming_sequence": incoming_sequence,
+            "incoming_previous_sequence": incoming_previous_sequence,
+            "policy_buffer_cap": policy_buffer_cap,
+            "book_seq": book_seq,
+            "snapshot_seq": snapshot_seq,
+            "reason_class": reason_class,
+            "policy_bridge_mode": policy.bridge_mode.value,
         }
 
     def diagnostics_snapshot(self) -> dict:

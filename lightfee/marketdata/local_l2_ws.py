@@ -480,7 +480,7 @@ class BitgetL2WsClient(LocalL2WsClient):
 # ---------------------------------------------------------------------------
 
 # Gate order_book channel:
-# Subscribe: {"time":1715000000,"channel":"futures.order_book","event":"subscribe","payload":["BTC_USDT","20","100ms"]}
+# Subscribe: {"time":1715000000,"channel":"futures.order_book","event":"subscribe","payload":["BTC_USDT","20","0"]}
 # Snapshot:  {"time":...,"channel":"futures.order_book","event":"all","result":{"t":...,"id":...,"contract":"BTC_USDT","asks":[[p,q]],"bids":[[p,q]]}}
 # Delta:     {"time":...,"channel":"futures.order_book","event":"update","result":{...}}
 
@@ -499,12 +499,13 @@ class GateL2WsClient(LocalL2WsClient):
         return gate_depth_stream_url()
 
     def build_subscribe_message(self) -> Optional[dict]:
-        # Subscribe with venue wire symbol (e.g. BTC_USDT) to match Gate API
+        # Gate's legacy futures.order_book channel uses "0" as the update interval.
+        # "100ms" belongs to futures.order_book_update and is rejected here.
         return {
             "time": int(time.time()),
             "channel": "futures.order_book",
             "event": "subscribe",
-            "payload": [self.wire_symbol, "20", "100ms"],
+            "payload": [self.wire_symbol, "20", "0"],
         }
 
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:

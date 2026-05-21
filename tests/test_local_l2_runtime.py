@@ -16,12 +16,14 @@ from lightfee.marketdata.l2 import (
     LocalL2UpdateKind,
     PriceLevel,
 )
+from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
 from lightfee.marketdata.local_l2_runtime import (
     AssignmentLease,
     LocalL2Runtime,
     LocalL2RuntimeMetrics,
     RuntimeFaultKind,
 )
+from lightfee.persistence.journal import Journal
 
 
 class TestAssignmentLease:
@@ -749,3 +751,288 @@ class TestHandleRuntimeFailureFaultReason:
             "most recent fault should update fault_reason"
         )
         assert "second_fault" in book.fault_reason
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Bybit WS-Snapshot-Authoritative — cross-depth sequence domain fix
+# ---------------------------------------------------------------------------
+
+
+def _make_journal():
+    import tempfile
+    import os as _os
+    jpath = _os.path.join(tempfile.mkdtemp(), "test.journal")
+    from lightfee.persistence.journal import Journal
+    j = Journal(jpath)
+    j.open()
+    return j
+
+
+class TestBybitWsSnapshotAuthoritative:
+    @pytest.mark.asyncio
+    async def test_bybit_rest_bootstrap_fallback_when_registered_ws_is_not_connected(self):
+        """Registered-but-not-connected WS clients must not pin Bybit in BOOTSTRAPPING."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "IRYSUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        class FakeClient:
+            is_connected = False
+
+        dp._ws_clients[LocalL2BookKey("bybit", "IRYSUSDT")] = FakeClient()
+        adapter = MockL2Adapter("bybit", sequence=7103120)
+
+        success = await dp.bootstrap_book(
+            "bybit", "IRYSUSDT", adapter, depth=50, now_ms=1779302500002,
+        )
+
+        assert success is True
+        assert rt.get_book("bybit", "IRYSUSDT").status == L2BookStatus.HOT
+        assert rt.get_book("bybit", "IRYSUSDT").sequence == 7103120
+
+    @pytest.mark.asyncio
+    async def test_bybit_rest_bootstrap_deferred_when_ws_is_connected(self):
+        """Connected Bybit WS stream is snapshot-authoritative; REST bootstrap is evidence only."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "IRYSUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "IRYSUSDT")] = FakeClient()
+        adapter = MockL2Adapter("bybit", sequence=7103120)
+
+        success = await dp.bootstrap_book(
+            "bybit", "IRYSUSDT", adapter, depth=50, now_ms=1779302500002,
+        )
+
+        assert success is False
+        assert rt.get_book("bybit", "IRYSUSDT").status == L2BookStatus.BOOTSTRAPPING
+
+    def test_rest_snapshot_sequence_not_compared_to_ws_depth_book(self):
+        """Bybit REST u (depth-1000 domain) must not be compared with WS orderbook.50 sequence."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "IRYSUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        book.sequence = 13700598
+        book.last_update_id = 13700598
+        book.observed_at_ms = 0
+
+        from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
+        policy = policy_for_venue("bybit")
+
+        assert policy.bridge_mode is BridgeMode.WS_SNAPSHOT_AUTHORITATIVE
+        assert policy.rest_snapshot_sequence_comparable is False
+
+        rest_seq = 7103120  # From REST /v5/market/orderbook u field
+        old_stale = rest_seq < book.last_update_id
+        assert old_stale is True, "old logic would falsely flag stale"
+
+    def test_bybit_ws_snapshot_authoritative_policy_no_cross_depth_replay(self):
+        """Bybit REST snapshot must not be replayed against WS delta buffers."""
+        from lightfee.marketdata.local_l2_policy import policy_for_venue
+        policy = policy_for_venue("bybit")
+        assert policy.replay_rest_snapshot_with_ws_deltas is False
+
+    def test_bybit_pre_snapshot_buffer_cap_matches_default(self):
+        """Bybit uses 4096 buffer cap, not 512."""
+        from lightfee.marketdata.local_l2_policy import policy_for_venue
+        policy = policy_for_venue("bybit")
+        assert policy.pre_snapshot_buffer_cap == 4096
+
+    def test_stale_comparison_is_only_for_venues_with_comparable_sequence(self):
+        """Only proven same-domain replay venues compare REST and WS sequence IDs."""
+        from lightfee.marketdata.local_l2_policy import policy_for_venue
+        for venue in ("bybit", "hyperliquid"):
+            policy = policy_for_venue(venue)
+            assert policy.rest_snapshot_sequence_comparable is False, (
+                f"{venue} must not compare REST/WS sequences across depth domains"
+            )
+        for venue in ("binance", "aster", "okx"):
+            policy = policy_for_venue(venue)
+            assert policy.rest_snapshot_sequence_comparable is True, (
+                f"{venue} REST/WS sequences share the same domain"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Binance/Aster V1 Buffered Replay Parity
+# ---------------------------------------------------------------------------
+
+
+class TestBinanceAsterV1BufferCapParity:
+    def test_binance_pre_snapshot_buffer_uses_v1_capacity(self):
+        """V1 BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP = 4096, not 512."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "CHIPUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        # 512 deltas at the old 512 cap would overflow; at 4096 they must not
+        for seq in range(1, 513):
+            events = dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="CHIPUSDT",
+                    bids=[PriceLevel(1.0, 1.0)],
+                    asks=[],
+                    sequence=seq,
+                    previous_sequence=seq - 1,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=seq,
+            )
+            assert events == []
+
+        assert rt.get_book("binance", "CHIPUSDT").status == L2BookStatus.BOOTSTRAPPING
+
+    def test_binance_buffered_replay_previous_link_mismatch_keeps_book_rebuilding(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "JTOUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        for seq, prev in [(10591999713004, 10591999713003), (10591999715270, 10591999715264)]:
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="JTOUSDT",
+                    bids=[PriceLevel(1.0, 10.0)],
+                    asks=[PriceLevel(1.1, 10.0)],
+                    sequence=seq,
+                    previous_sequence=prev,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=seq,
+            )
+
+        book.apply_snapshot(
+            [PriceLevel(1.0, 10.0)],
+            [PriceLevel(1.1, 10.0)],
+            sequence=10591999713003,
+            now_ms=1,
+        )
+
+        replay = dp._replay_buffered_updates("binance", "JTOUSDT")
+
+        assert replay.ok is False
+        assert "previous_link_mismatch" in rt.get_book("binance", "JTOUSDT").fault_reason
+        assert rt.get_book("binance", "JTOUSDT").status == L2BookStatus.REBUILDING
+
+
+# ---------------------------------------------------------------------------
+# Task 6: OKX V1 Replay Classification — keepalive / reset / obsolete / invalid
+# ---------------------------------------------------------------------------
+
+
+class TestOkxV1ReplayClassification:
+    def test_okx_keepalive_buffered_and_replayed_without_sequence_gap(self):
+        """OKX keepalive: seqId == prevSeqId, empty bids/asks — must not trigger gap."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("okx", "INJUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        # Buffered: snapshot seq 100, then keepalive with same seq
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="okx", symbol="INJUSDT",
+                bids=[], asks=[],
+                sequence=100, previous_sequence=100,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1000,
+        )
+
+        book.apply_snapshot(
+            [PriceLevel(1.0, 10.0)], [PriceLevel(1.1, 10.0)],
+            sequence=100, now_ms=1000,
+        )
+
+        replay = dp._replay_buffered_updates("okx", "INJUSDT")
+        assert replay.ok is True, "keepalive should not break replay"
+        assert replay.replayed == 1
+        assert rt.get_book("okx", "INJUSDT").sequence == 100
+        assert rt.get_book("okx", "INJUSDT").last_delta_ms == 1000
+
+    def test_okx_reset_buffered_and_replayed_accepted(self):
+        """OKX reset: seqId < prevSeqId but pseq matches — reset accepted per V1."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("okx", "CHIPUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _make_journal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="okx", symbol="CHIPUSDT",
+                bids=[PriceLevel(1.0, 1.0)], asks=[PriceLevel(1.1, 1.0)],
+                sequence=5, previous_sequence=15,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1000,
+        )
+
+        book.apply_snapshot(
+            [PriceLevel(1.0, 10.0)], [PriceLevel(1.1, 10.0)],
+            sequence=15, now_ms=1000,
+        )
+
+        replay = dp._replay_buffered_updates("okx", "CHIPUSDT")
+        assert replay.ok is True, "reset should be accepted per V1 classifier"
+        assert replay.replayed == 1
+        assert rt.get_book("okx", "CHIPUSDT").sequence == 5
+
+
+class TestOkxReplayLinkClassification:
+    def test_okx_classify_normal(self):
+        from lightfee.marketdata.local_l2_policy import ReplayLinkKind, policy_for_venue
+        policy = policy_for_venue("okx")
+        kind = policy.classify_replay_link(
+            previous_sequence=10, sequence=11,
+            previous_sequence_from_update=10,
+            bid_count=5, ask_count=5,
+        )
+        assert kind is ReplayLinkKind.NORMAL
+
+    def test_okx_classify_keepalive(self):
+        from lightfee.marketdata.local_l2_policy import ReplayLinkKind, policy_for_venue
+        policy = policy_for_venue("okx")
+        kind = policy.classify_replay_link(
+            previous_sequence=10, sequence=10,
+            previous_sequence_from_update=10,
+            bid_count=0, ask_count=0,
+        )
+        assert kind is ReplayLinkKind.KEEPALIVE
+
+    def test_okx_classify_reset(self):
+        from lightfee.marketdata.local_l2_policy import ReplayLinkKind, policy_for_venue
+        policy = policy_for_venue("okx")
+        kind = policy.classify_replay_link(
+            previous_sequence=15, sequence=3,
+            previous_sequence_from_update=15,
+            bid_count=1, ask_count=1,
+        )
+        assert kind is ReplayLinkKind.RESET
+
+    def test_okx_classify_obsolete(self):
+        from lightfee.marketdata.local_l2_policy import ReplayLinkKind, policy_for_venue
+        policy = policy_for_venue("okx")
+        kind = policy.classify_replay_link(
+            previous_sequence=15, sequence=10,
+            previous_sequence_from_update=10,
+            bid_count=1, ask_count=1,
+        )
+        assert kind is ReplayLinkKind.OBSOLETE
+
+    def test_okx_classify_invalid(self):
+        from lightfee.marketdata.local_l2_policy import ReplayLinkKind, policy_for_venue
+        policy = policy_for_venue("okx")
+        kind = policy.classify_replay_link(
+            previous_sequence=10, sequence=15,
+            previous_sequence_from_update=12,
+            bid_count=1, ask_count=1,
+        )
+        assert kind is ReplayLinkKind.INVALID

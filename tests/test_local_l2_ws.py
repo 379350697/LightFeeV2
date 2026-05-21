@@ -392,6 +392,19 @@ class TestBitgetL2WsClientParsing:
 
 
 class TestGateL2WsClientParsing:
+    def test_build_subscribe_message_uses_legacy_zero_interval(self):
+        dp, rt, _ = _make_data_plane()
+        client = GateL2WsClient(
+            venue="gate", symbol="BTCUSDT", venue_symbol="BTC_USDT", data_plane=dp,
+        )
+
+        message = client.build_subscribe_message()
+
+        assert message is not None
+        assert message["channel"] == "futures.order_book"
+        assert message["payload"] == ["BTC_USDT", "20", "0"]
+        _close_data_plane(dp, _)
+
     def test_parses_snapshot_all_event(self):
         dp, rt, _ = _make_data_plane()
         client = GateL2WsClient(
@@ -957,3 +970,33 @@ class TestWorkerLifecycle:
         assert BinanceL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
         assert OkxL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
         assert HyperliquidL2Poller.OPEN_TIMEOUT_SECONDS == 10.0
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Bybit WS snapshot authoritative reset test
+# ---------------------------------------------------------------------------
+
+
+class TestBybitWsSnapshotAuthoritativeReset:
+    def test_bybit_ws_snapshot_is_authoritative_reset(self):
+        dp, rt, journal = _make_data_plane()
+        try:
+            client = BybitL2WsClient(venue="bybit", symbol="IRYSUSDT", data_plane=dp)
+            first = client.parse_depth_message({
+                "topic": "orderbook.50.IRYSUSDT",
+                "type": "snapshot",
+                "ts": 1779302500000,
+                "data": {"s": "IRYSUSDT", "b": [["0.0200", "1000"]], "a": [["0.0201", "1000"]], "u": 13700598, "seq": 7103120},
+            })
+            second = client.parse_depth_message({
+                "topic": "orderbook.50.IRYSUSDT",
+                "type": "snapshot",
+                "ts": 1779302501000,
+                "data": {"s": "IRYSUSDT", "b": [["0.0199", "900"]], "a": [["0.0202", "1100"]], "u": 1, "seq": 7103200},
+            })
+
+            assert first.update_kind.value == "snapshot"
+            assert second.update_kind.value == "snapshot"
+            assert second.sequence == 1
+        finally:
+            _close_data_plane(dp, journal)
