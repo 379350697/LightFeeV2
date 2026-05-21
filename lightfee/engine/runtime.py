@@ -619,7 +619,7 @@ class LiveRuntime:
             if str(symbol) in supported or venue_symbol in supported:
                 filtered.append(symbol)
             else:
-                if getattr(self.journal, "_file", None) is not None:
+                if skip_event_kind and getattr(self.journal, "_file", None) is not None:
                     self.journal.append(
                         skip_event_kind,
                         {
@@ -630,6 +630,106 @@ class LiveRuntime:
                         },
                     )
         return filtered
+
+    async def _filter_candidates_supported_by_venue_catalog(
+        self,
+        candidates: list,
+        *,
+        skip_event_kind: str = "runtime.candidate_symbol_skipped",
+    ) -> list:
+        """Filter live candidates through both venues' trading catalogs.
+
+        V1 build_scan_symbol_cache only admits symbols supported by both venues
+        in a directed pair. V2 sidecar snapshots can still contain public quote
+        rows for symbols that are not orderable on one venue, so runtime applies
+        the same catalog gate before shortlist/tracking/entry selection.
+        """
+        if self.config.runtime.mode == "paper":
+            return list(candidates)
+
+        venue_symbols: dict[Venue, set[str]] = {}
+        candidate_venues: list[tuple[object, Venue | None, Venue | None]] = []
+        for candidate in candidates:
+            try:
+                long_venue = Venue.from_str(str(getattr(candidate, "long_venue", "")))
+            except ValueError:
+                long_venue = None
+            try:
+                short_venue = Venue.from_str(str(getattr(candidate, "short_venue", "")))
+            except ValueError:
+                short_venue = None
+            candidate_venues.append((candidate, long_venue, short_venue))
+            symbol = str(getattr(candidate, "symbol", "") or "")
+            if not symbol:
+                continue
+            for venue in (long_venue, short_venue):
+                if venue is not None:
+                    venue_symbols.setdefault(venue, set()).add(symbol)
+
+        supported_by_venue: dict[Venue, set[str] | None] = {}
+        for venue, symbols in venue_symbols.items():
+            adapter = self.get_venue_adapter(venue)
+            if adapter is None:
+                supported_by_venue[venue] = None
+                continue
+            filtered = await self._filter_symbols_supported_by_venue(
+                venue,
+                adapter,
+                sorted(symbols),
+                skip_event_kind="",
+            )
+            supported_by_venue[venue] = set(filtered)
+
+        filtered_candidates: list = []
+        skipped = 0
+        for candidate, long_venue, short_venue in candidate_venues:
+            symbol = str(getattr(candidate, "symbol", "") or "")
+
+            def venue_supports(venue: Venue | None) -> bool:
+                if venue is None:
+                    return True
+                supported = supported_by_venue.get(venue)
+                return supported is None or symbol in supported
+
+            long_supported = venue_supports(long_venue)
+            short_supported = venue_supports(short_venue)
+            if long_supported and short_supported:
+                filtered_candidates.append(candidate)
+                continue
+
+            skipped += 1
+            if getattr(self.journal, "_file", None) is not None:
+                self.journal.append(
+                    skip_event_kind,
+                    {
+                        "symbol": symbol,
+                        "pair_id": self._candidate_pair_id(candidate),
+                        "long_venue": (
+                            long_venue.value
+                            if long_venue
+                            else str(getattr(candidate, "long_venue", ""))
+                        ),
+                        "short_venue": (
+                            short_venue.value
+                            if short_venue
+                            else str(getattr(candidate, "short_venue", ""))
+                        ),
+                        "long_supported": long_supported,
+                        "short_supported": short_supported,
+                        "reason": "unsupported_symbol",
+                    },
+                )
+
+        if skipped > 0 and getattr(self.journal, "_file", None) is not None:
+            self.journal.append(
+                "runtime.tradeable_candidates_catalog_filtered",
+                {
+                    "input_count": len(candidates),
+                    "output_count": len(filtered_candidates),
+                    "skipped_count": skipped,
+                },
+            )
+        return filtered_candidates
 
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
@@ -1723,6 +1823,9 @@ class LiveRuntime:
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
+            )
+            tradeable = await self._filter_candidates_supported_by_venue_catalog(
+                tradeable,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
@@ -4216,14 +4319,16 @@ class LiveRuntime:
                 return False
 
             from lightfee.venues.cid import generate_exchange_cid
-            hedge_cloid = generate_exchange_cid(entry_id, "h", hedge_venue)
+            attempt = int(getattr(pending, "hedge_attempt_count", 0) or 0) + 1
+            pending.hedge_attempt_count = attempt
+            hedge_cloid = generate_exchange_cid(entry_id, f"h{attempt}", hedge_venue)
             pending.hedge_client_order_id = hedge_cloid
             pending.hedge_inflight = HedgeInflight(
                 client_order_id=hedge_cloid,
                 venue=hedge_venue,
                 side=pending.hedge_side(),
                 quantity=normalized,
-                attempt=0,
+                attempt=attempt,
                 submitted_at_ms=now_ms,
             )
 
@@ -4237,6 +4342,7 @@ class LiveRuntime:
                     "hedge_quantity": normalized,
                     "hedge_price_hint": hedge_price,
                     "hedge_client_order_id": hedge_cloid,
+                    "hedge_attempt": attempt,
                     "maker_leg_filled": pending.maker_leg_filled,
                     "hedge_leg_filled": pending.hedge_leg_filled,
                 },
@@ -4272,6 +4378,7 @@ class LiveRuntime:
                         "hedge_fill_price": fill.price,
                         "hedge_order_id": fill.order_id,
                         "hedge_client_order_id": hedge_cloid,
+                        "hedge_attempt": attempt,
                         "hedge_leg_filled": pending.hedge_leg_filled,
                         "missing_hedge_remaining": pending.missing_hedge_quantity(),
                     },
@@ -4291,6 +4398,7 @@ class LiveRuntime:
                     "symbol": pending.symbol,
                     "outcome": "zero_fill",
                     "hedge_client_order_id": hedge_cloid,
+                    "hedge_attempt": attempt,
                     "order_id": getattr(fill, "order_id", ""),
                 },
             )
@@ -4340,6 +4448,7 @@ class LiveRuntime:
                         "hedge_fill_price": pending.hedge_fill_price,
                         "hedge_order_id": pending.hedge_order_id,
                         "hedge_client_order_id": hedge_cloid,
+                        "hedge_attempt": attempt,
                         "hedge_leg_filled": pending.hedge_leg_filled,
                         "missing_hedge_remaining": pending.missing_hedge_quantity(),
                     },
@@ -4360,6 +4469,7 @@ class LiveRuntime:
                     "error": str(e),
                     "is_rejected": e.is_rejected,
                     "hedge_client_order_id": submitted_inflight.client_order_id if submitted_inflight else "",
+                    "hedge_attempt": attempt,
                 },
             )
             return False

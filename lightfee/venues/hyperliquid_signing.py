@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import hashlib
 from typing import Any, Optional
 
 from Crypto.Hash import keccak as _keccak
@@ -151,6 +152,7 @@ def build_hyperliquid_exchange_payload(
     """Build a complete signed Hyperliquid exchange payload.
 
     Returns the JSON-serializable dict ready for POST /exchange or WS.
+    The client order id belongs in each order's ``c`` field, not the top level.
     """
     nonce = next_hyperliquid_nonce()
     conn_id = hyperliquid_connection_id(action, nonce, vault_address)
@@ -167,10 +169,29 @@ def build_hyperliquid_exchange_payload(
     }
     if vault_address is not None:
         payload["vaultAddress"] = vault_address
-    if cloid is not None:
-        payload["cloid"] = cloid
 
     return payload
+
+
+def is_hyperliquid_wire_cloid(value: str) -> bool:
+    """Return true when ``value`` already matches Hyperliquid's 128-bit cloid."""
+    text = str(value or "").strip()
+    if len(text) != 34 or not text.startswith("0x"):
+        return False
+    try:
+        int(text[2:], 16)
+    except ValueError:
+        return False
+    return True
+
+
+def hyperliquid_cloid_for_client_order(client_order_id: str) -> str:
+    """V1 parity: map internal client ids to Hyperliquid 128-bit hex cloids."""
+    text = str(client_order_id or "").strip()
+    if is_hyperliquid_wire_cloid(text):
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return "0x" + digest[:16].hex()
 
 
 # ---------------------------------------------------------------------------

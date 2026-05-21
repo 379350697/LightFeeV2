@@ -442,7 +442,7 @@ class TestParseGateL2Update:
         assert update.venue == "gate"
         # Gate normalizes _ to empty and uppercases
         assert update.symbol == "BTCUSDT"
-        assert update.sequence == 1680000000000
+        assert update.sequence == 123
         assert len(update.bids) == 2
         assert update.bids[0].price == 50000.0
 

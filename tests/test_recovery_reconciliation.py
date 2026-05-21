@@ -916,6 +916,65 @@ class TestClientOrderIdReconciliation:
         assert captured_cid == "test-oid"
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_override_uses_wire_cloid_and_official_order_status_shape(self):
+        """Hyperliquid reconciliation must hash internal CIDs to 128-bit cloids."""
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.venues.hyperliquid_signing import hyperliquid_cloid_for_client_order
+
+        internal_cid = "entry-1779342733376-SAGAUSDT-h1"
+        wire_cloid = hyperliquid_cloid_for_client_order(internal_cid)
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key=(
+                    "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+                ),
+                account_address="0x0000000000000000000000000000000000000001",
+            ),
+        )
+        captured_bodies: list[dict] = []
+
+        async def fake_request(method, path, body=None, private=False, **kwargs):
+            captured_bodies.append(body or {})
+            assert method == "POST"
+            assert path == "/info"
+            assert body["cloid"] == wire_cloid
+            return {
+                "status": "order",
+                "order": {
+                    "order": {
+                        "coin": "SAGA",
+                        "side": "A",
+                        "limitPx": "0.03",
+                        "sz": "0.0",
+                        "oid": 123,
+                        "timestamp": 1779342767947,
+                        "origSz": "772.0",
+                        "cloid": wire_cloid,
+                    },
+                    "status": "filled",
+                    "statusTimestamp": 1779342767947,
+                },
+            }
+
+        adapter._transport._request = fake_request
+        try:
+            result = await adapter.fetch_order_fill_reconciliation(
+                "SAGAUSDT",
+                order_id="",
+                client_order_id=internal_cid,
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert result is not None
+        assert captured_bodies[0]["cloid"] == wire_cloid
+        assert result.quantity == 772.0
+        assert result.average_price == 0.03
+        assert result.client_order_id == wire_cloid
+
+    @pytest.mark.asyncio
     async def test_vanilla_fetch_order_fill_reconciliation_returns_none_without_override(self):
         """Default VenueAdapter.fetch_order_fill_reconciliation returns None.
         Only Bybit/Bitget overrides return actual data."""

@@ -2657,17 +2657,22 @@ class VenueTransport(MarketDataClient):
                     body["reduce_only"] = True
             elif spec.venue_id == Venue.HYPERLIQUID:
                 is_buy = request.side == Side.BUY
-                tif = "Gtc" if request.price else "Ioc"
+                tif = "Ioc"
                 limit_px = _format_decimal(request.price) if request.price else "0"
 
                 if self.mode == "live":
                     from lightfee.venues.hyperliquid_signing import (
                         build_hyperliquid_exchange_payload,
                         build_hyperliquid_order_action,
+                        hyperliquid_cloid_for_client_order,
                     )
 
                     asset_index = await self._hl_resolve_asset_index(venue_sym)
-                    cloid = request.client_order_id or ""
+                    wire_cloid = (
+                        hyperliquid_cloid_for_client_order(request.client_order_id)
+                        if request.client_order_id
+                        else None
+                    )
                     action = build_hyperliquid_order_action(
                         symbol=venue_sym,
                         is_buy=is_buy,
@@ -2675,7 +2680,7 @@ class VenueTransport(MarketDataClient):
                         price=float(limit_px),
                         reduce_only=request.reduce_only,
                         tif=tif,
-                        cloid=cloid if cloid else None,
+                        cloid=wire_cloid,
                     )
                     # Override the placeholder asset index with the resolved one
                     action["orders"][0]["a"] = asset_index
@@ -2692,7 +2697,6 @@ class VenueTransport(MarketDataClient):
                         ),
                         vault_address=vault_addr,
                         is_mainnet=True,
-                        cloid=cloid if cloid else None,
                     )
                 else:
                     paper_order: dict[str, Any] = {
@@ -4665,9 +4669,13 @@ class VenueTransport(MarketDataClient):
                 pass
         if client_order_id:
             try:
+                from lightfee.venues.hyperliquid_signing import (
+                    hyperliquid_cloid_for_client_order,
+                )
+                wire_cloid = hyperliquid_cloid_for_client_order(client_order_id)
                 raw = await self._request(
                     "POST", "/info",
-                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "cloid": client_order_id},
+                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "cloid": wire_cloid},
                     private=False,
                 )
                 if raw is not None:
@@ -4693,6 +4701,13 @@ class VenueTransport(MarketDataClient):
         """Parse Hyperliquid historicalOrders response for matching order."""
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side
         orders = raw if isinstance(raw, list) else raw.get("historicalOrders", raw.get("orders", []))
+        client_order_ids: set[str] = set()
+        if client_order_id:
+            client_order_ids.add(client_order_id)
+            from lightfee.venues.hyperliquid_signing import (
+                hyperliquid_cloid_for_client_order,
+            )
+            client_order_ids.add(hyperliquid_cloid_for_client_order(client_order_id))
         for entry in (orders if isinstance(orders, list) else []):
             if not isinstance(entry, dict):
                 continue
@@ -4700,7 +4715,7 @@ class VenueTransport(MarketDataClient):
             entry_cloid = str(entry.get("cloid", ""))
             if order_id and entry_oid != order_id:
                 continue
-            if client_order_id and entry_cloid != client_order_id:
+            if client_order_ids and entry_cloid not in client_order_ids:
                 continue
             status = str(entry.get("status", "")).lower()
             side_raw = str(entry.get("side", "")).upper()

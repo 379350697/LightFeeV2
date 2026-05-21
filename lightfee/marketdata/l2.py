@@ -93,9 +93,16 @@ class LocalL2Update:
     symbol: str
     bids: list[PriceLevel] = field(default_factory=list)
     asks: list[PriceLevel] = field(default_factory=list)
+    # V1 parity: some venues carry an update range (U..u) separately from
+    # previous-link metadata (pu/pseq/prevSeqId).  Do not collapse these into
+    # one field; Binance/Aster/Gate bridge snapshots by range overlap.
+    first_sequence: int = 0
     sequence: int = 0
     previous_sequence: int = 0
+    previous_sequence_present: bool = False
     checksum: int = 0
+    raw_bids: list[tuple[str, str]] = field(default_factory=list)
+    raw_asks: list[tuple[str, str]] = field(default_factory=list)
     event_time_ms: int = 0
     received_at_ms: int = 0
     update_kind: LocalL2UpdateKind = LocalL2UpdateKind.DELTA
@@ -140,12 +147,15 @@ class LocalL2Book:
     last_update_id: int = 0
     sequence: int = 0
     checksum: int = 0
+    raw_checksum_bids: list[tuple[float, float, str, str]] = field(default_factory=list)
+    raw_checksum_asks: list[tuple[float, float, str, str]] = field(default_factory=list)
     last_snapshot_ms: int = 0
     last_delta_ms: int = 0
     resume_waiting_until_ms: int = 0
     runtime_suspended_until_ms: int = 0
     source: str = ""
     fault_reason: str = ""
+    pending_snapshot_bridge: bool = False
 
     # --- V1 degrade/suspend thresholds ---
     max_consecutive_degradations: int = 3
@@ -218,7 +228,38 @@ class LocalL2Book:
         max_depth: int = 0,
     ) -> LocalL2UpdateResult:
         """Merge delta levels into current book. Zero-qty levels are deleted."""
-        prev_seq = previous_sequence or sequence - 1
+        prev_seq = previous_sequence
+
+        same_sequence_refresh = (
+            self.sequence > 0
+            and sequence == self.sequence
+            and prev_seq == self.sequence
+        )
+
+        # V1 parity: when a venue omits previous-link metadata, do not synthesize
+        # sequence - 1.  Bybit legitimately omits pu on some updates and V1 only
+        # enforces the link when pu is present.  Stale numbered updates are still
+        # ignored without mutating the book.
+        if (
+            self.sequence > 0
+            and sequence > 0
+            and sequence <= self.sequence
+            and not same_sequence_refresh
+            and prev_seq != self.sequence
+        ):
+            incoming = (
+                f"incoming_prev={prev_seq}"
+                if prev_seq > 0
+                else f"incoming_sequence={sequence}"
+            )
+            return LocalL2UpdateResult(
+                applied=False,
+                events=[],
+                fault_reason=(
+                    f"stale_update prev={self.sequence} {incoming}"
+                ),
+                rebuild_required=False,
+            )
 
         # Sequence gap detection. max_sequence_gap=0 means strict continuity.
         if self.sequence > 0 and prev_seq > 0 and prev_seq != self.sequence:
@@ -291,6 +332,66 @@ class LocalL2Book:
                                       mid_price=mid))
 
         return LocalL2UpdateResult(applied=True, events=events)
+
+    def apply_raw_checksum_update(
+        self,
+        bids: list[tuple[str, str]],
+        asks: list[tuple[str, str]],
+        update_kind: LocalL2UpdateKind,
+        max_depth: int = 200,
+    ) -> None:
+        """Maintain V1-style raw-string checksum book for OKX/Bitget.
+
+        V1 computes CRC over the original exchange strings, not float-normalized
+        values.  The execution book can use floats, but checksum verification
+        must retain the wire text and process zero-size deletes.
+        """
+        depth = max(1, max_depth)
+        if update_kind == LocalL2UpdateKind.SNAPSHOT:
+            self.raw_checksum_bids = _sanitize_raw_checksum_side(bids, descending=True, max_depth=depth)
+            self.raw_checksum_asks = _sanitize_raw_checksum_side(asks, descending=False, max_depth=depth)
+            return
+
+        self.raw_checksum_bids = _merge_raw_checksum_side(
+            self.raw_checksum_bids,
+            bids,
+            descending=True,
+            max_depth=depth,
+        )
+        self.raw_checksum_asks = _merge_raw_checksum_side(
+            self.raw_checksum_asks,
+            asks,
+            descending=False,
+            max_depth=depth,
+        )
+
+    def compute_raw_checksum(self) -> int:
+        if not self.raw_checksum_bids or not self.raw_checksum_asks:
+            return 0
+        parts: list[str] = []
+        for idx in range(25):
+            if idx < len(self.raw_checksum_bids):
+                _, _, price_text, quantity_text = self.raw_checksum_bids[idx]
+                parts.append(f"{price_text}:{quantity_text}")
+            if idx < len(self.raw_checksum_asks):
+                _, _, price_text, quantity_text = self.raw_checksum_asks[idx]
+                parts.append(f"{price_text}:{quantity_text}")
+        raw = ":".join(parts)
+        checksum = binascii.crc32(raw.encode()) & 0xFFFFFFFF
+        if checksum >= 2**31:
+            checksum -= 2**32
+        return checksum
+
+    def verify_raw_checksum(self, expected: int, now_ms: int) -> LocalL2UpdateResult:
+        actual = self.compute_raw_checksum()
+        if actual != 0 and expected != 0 and actual != expected:
+            return LocalL2UpdateResult(
+                applied=True,
+                events=[_make_event(self, LocalL2EventKind.CHECKSUM_MISMATCH, now_ms, self.sequence,
+                                    detail=f"expected={expected} actual={actual}")],
+                fault_reason=f"checksum_mismatch expected={expected} actual={actual}",
+            )
+        return LocalL2UpdateResult(applied=True, events=[])
 
     def verify_checksum(self, expected: int, now_ms: int) -> LocalL2UpdateResult:
         """Optional checksum verification hook. Returns checksum_mismatch event on failure."""
@@ -503,6 +604,59 @@ def _checksum_number(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return format(value, "f").rstrip("0").rstrip(".")
+
+
+def _raw_checksum_level(level: tuple[str, str]) -> tuple[float, float, str, str] | None:
+    if len(level) < 2:
+        return None
+    price_text = str(level[0])
+    quantity_text = str(level[1])
+    try:
+        price = float(price_text)
+        quantity = float(quantity_text)
+    except (TypeError, ValueError):
+        return None
+    if not (price > 0):
+        return None
+    return (price, quantity, price_text, quantity_text)
+
+
+def _sanitize_raw_checksum_side(
+    levels: list[tuple[str, str]],
+    *,
+    descending: bool,
+    max_depth: int,
+) -> list[tuple[float, float, str, str]]:
+    parsed = [
+        item for item in (_raw_checksum_level(level) for level in levels)
+        if item is not None and item[1] > 0
+    ]
+    parsed.sort(key=lambda item: item[0], reverse=descending)
+    return parsed[:max_depth]
+
+
+def _merge_raw_checksum_side(
+    existing: list[tuple[float, float, str, str]],
+    incoming: list[tuple[str, str]],
+    *,
+    descending: bool,
+    max_depth: int,
+) -> list[tuple[float, float, str, str]]:
+    by_price: dict[float, tuple[float, float, str, str]] = {
+        level[0]: level for level in existing
+    }
+    for raw_level in incoming:
+        parsed = _raw_checksum_level(raw_level)
+        if parsed is None:
+            continue
+        price, quantity, _, _ = parsed
+        if quantity <= 0:
+            by_price.pop(price, None)
+        else:
+            by_price[price] = parsed
+    merged = list(by_price.values())
+    merged.sort(key=lambda item: item[0], reverse=descending)
+    return merged[:max_depth]
 
 
 def _merge_levels(

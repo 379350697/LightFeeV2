@@ -122,7 +122,7 @@ def _bitget_rules() -> LocalL2VenueRules:
         venue="bitget",
         default_depth=50,
         sequence_mode=SequenceMode.INCREMENTAL,
-        checksum_mode=ChecksumMode.NONE,
+        checksum_mode=ChecksumMode.CRC32,
         max_sequence_gap=2,
         reconnect_rebuild_on_gap=True,
     )
@@ -204,7 +204,10 @@ def parse_binance_l2_update(
     return LocalL2Update(
         venue=venue, symbol=symbol or payload.get("s", "").upper(),
         bids=bids, asks=asks,
-        sequence=seq, previous_sequence=payload.get("pu", seq - 1),
+        first_sequence=int(payload.get("U", 0) or 0),
+        sequence=seq,
+        previous_sequence=int(payload.get("pu", 0) or 0),
+        previous_sequence_present="pu" in payload,
         event_time_ms=payload.get("T", payload.get("E", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )
@@ -237,7 +240,7 @@ def parse_okx_l2_update(
     asks = [PriceLevel(price=float(a[0]), quantity=float(a[1])) for a in asks_raw if float(a[1]) > 0]
 
     seq = int(entry.get("seqId", 0))
-    prev_seq = int(entry.get("prevSeqId", payload.get("prevSeqId", seq - 1)))
+    prev_seq = int(entry.get("prevSeqId", payload.get("prevSeqId", 0)) or 0)
     checksum = int(entry.get("checksum", 0))
 
     action = payload.get("action")
@@ -254,7 +257,10 @@ def parse_okx_l2_update(
         venue=venue, symbol=inst,
         bids=bids, asks=asks,
         sequence=seq, previous_sequence=prev_seq,
+        previous_sequence_present=("prevSeqId" in entry or "prevSeqId" in payload),
         checksum=checksum,
+        raw_bids=[(str(b[0]), str(b[1])) for b in bids_raw],
+        raw_asks=[(str(a[0]), str(a[1])) for a in asks_raw],
         event_time_ms=ts, received_at_ms=now_ms,
         update_kind=kind,
     )
@@ -291,7 +297,9 @@ def parse_bybit_l2_update(
     return LocalL2Update(
         venue=venue, symbol=symbol or data.get("s", ""),
         bids=bids, asks=asks,
-        sequence=seq, previous_sequence=payload.get("prevSeq", seq - 1),
+        sequence=seq,
+        previous_sequence=int(data.get("pu", payload.get("prevSeq", 0)) or 0),
+        previous_sequence_present=("pu" in data or "prevSeq" in payload),
         event_time_ms=int(data.get("ts", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )
@@ -326,6 +334,7 @@ def parse_bitget_l2_update(
             venue=venue, symbol=symbol,
             bids=bids, asks=asks,
             sequence=observed_at_ms, previous_sequence=0,
+            previous_sequence_present=False,
             event_time_ms=observed_at_ms, received_at_ms=now_ms,
             update_kind=LocalL2UpdateKind.SNAPSHOT,
         )
@@ -351,7 +360,10 @@ def parse_bitget_l2_update(
         venue=venue, symbol=symbol or payload.get("arg", {}).get("instId", ""),
         bids=bids, asks=asks,
         sequence=seq, previous_sequence=prev_seq,
+        previous_sequence_present=("pseq" in entry or "prevSeqId" in entry),
         checksum=checksum,
+        raw_bids=[(str(b[0]), str(b[1])) for b in bids_raw],
+        raw_asks=[(str(a[0]), str(a[1])) for a in asks_raw],
         event_time_ms=int(entry.get("ts", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )
@@ -370,8 +382,9 @@ def parse_gate_l2_update(
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
-    bids_raw = payload.get("bids", [])
-    asks_raw = payload.get("asks", [])
+    data = payload.get("result") or payload.get("data") or payload
+    bids_raw = data.get("bids", data.get("b", []))
+    asks_raw = data.get("asks", data.get("a", []))
 
     # Gate bids/asks may be dicts {"p": price, "s": size} or arrays [price, size]
     def _parse_level(level):
@@ -384,14 +397,22 @@ def parse_gate_l2_update(
     bids = [b for b in bids if b.quantity > 0]
     asks = [a for a in asks if a.quantity > 0]
 
-    seq = int(payload.get("t", payload.get("id", 0)))
-    kind = LocalL2UpdateKind.SNAPSHOT if not payload.get("event") else LocalL2UpdateKind.DELTA
+    seq = int(data.get("u", data.get("id", data.get("t", 0))) or 0)
+    first_sequence = int(data.get("U", data.get("prev_t", 0)) or 0)
+    kind = (
+        LocalL2UpdateKind.SNAPSHOT
+        if data.get("full") or payload.get("event") == "all" or ("channel" not in payload and "event" not in payload)
+        else LocalL2UpdateKind.DELTA
+    )
 
     return LocalL2Update(
-        venue=venue, symbol=symbol or payload.get("contract", "").replace("_", "").upper(),
+        venue=venue, symbol=symbol or data.get("contract", data.get("name", "")).replace("_", "").upper(),
         bids=bids, asks=asks,
-        sequence=seq, previous_sequence=payload.get("prev_t", 0),
-        event_time_ms=int(payload.get("t", now_ms)), received_at_ms=now_ms,
+        first_sequence=first_sequence,
+        sequence=seq,
+        previous_sequence=first_sequence,
+        previous_sequence_present=first_sequence > 0,
+        event_time_ms=int(data.get("t", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )
 
@@ -472,7 +493,8 @@ def parse_aster_l2_update(
     return LocalL2Update(
         venue=venue, symbol=symbol,
         bids=bids, asks=asks,
-        sequence=seq, previous_sequence=seq - 1,
+        sequence=seq, previous_sequence=0,
+        previous_sequence_present=False,
         event_time_ms=now_ms, received_at_ms=now_ms,
         update_kind=LocalL2UpdateKind.SNAPSHOT if seq > 0 else LocalL2UpdateKind.DELTA,
     )

@@ -8,8 +8,9 @@ using the venue policy module.  For each venue:
     sequence-domain comparison
   - OKX: WS books snapshot/update + keepalive/reset/checksum capture
   - Bitget: UTA depth subscribe request/response + seq/pseq capture
-  - Gate: legacy futures.order_book and futures.order_book_update schema capture
-  - Hyperliquid: /info l2Book poller freshness
+  - Gate: V1 futures.obu / futures.order_book_update range schema capture
+  - Hyperliquid: public l2Book WebSocket freshness
+  - Aster: Binance-compatible depthUpdate WS U/u/pu schema capture
 
 No API secrets are required — this uses public market data endpoints only.
 """
@@ -65,13 +66,11 @@ def _hyperliquid_level_counts(data: dict) -> tuple[int, int]:
 
 
 def _gate_subscribe_message(pair: str, now_s: Optional[int] = None) -> dict:
-    # Gate's legacy futures.order_book channel expects interval "0".
-    # The "100ms" interval is for futures.order_book_update, not this channel.
     return {
         "time": int(time.time()) if now_s is None else now_s,
-        "channel": "futures.order_book",
+        "channel": "futures.obu",
         "event": "subscribe",
-        "payload": [pair, "20", "0"],
+        "payload": [f"ob.{pair}.400"],
     }
 
 # ---------------------------------------------------------------------------
@@ -271,6 +270,62 @@ async def _probe_binance(args: argparse.Namespace) -> JsonObject:
 
 
 HANDLERS["binance"] = _probe_binance
+
+
+# ---------------------------------------------------------------------------
+# Aster
+# ---------------------------------------------------------------------------
+
+
+async def _probe_aster(args: argparse.Namespace) -> JsonObject:
+    symbol = args.symbol.upper()
+    wire_symbol = _wire_symbol("aster", symbol)
+    lower = wire_symbol.lower()
+    ws_events: list[dict] = []
+    started_at = time.time()
+
+    async def _collect_ws():
+        url = f"wss://fstream.asterdex.com/ws/{lower}@depth@100ms"
+        async with websockets.connect(url, open_timeout=10.0) as ws:
+            while time.time() - started_at < args.duration_s:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    ws_events.append(json.loads(raw))
+                except asyncio.TimeoutError:
+                    ws_events.append({"probe_note": "ws_timeout"})
+                    break
+
+    try:
+        await asyncio.wait_for(_collect_ws(), timeout=args.duration_s + 5.0)
+    except asyncio.TimeoutError:
+        ws_events.append({"probe_note": "probe_timeout"})
+    except Exception as exc:
+        return {"ok": False, "venue": "aster", "symbol": symbol, "error": f"ws_error: {exc}"}
+
+    depth_events = [e for e in ws_events if e.get("e") == "depthUpdate"]
+    first = depth_events[0] if depth_events else {}
+    last = depth_events[-1] if depth_events else {}
+    policy = policy_for_venue("aster")
+
+    return {
+        "ok": bool(depth_events),
+        "venue": "aster",
+        "symbol": symbol,
+        "wire_symbol": wire_symbol,
+        "bridge_mode": policy.bridge_mode.value,
+        "pre_snapshot_buffer_cap": policy.pre_snapshot_buffer_cap,
+        "ws_event_count": len(ws_events),
+        "depth_update_count": len(depth_events),
+        "first_U": first.get("U"),
+        "first_u": first.get("u"),
+        "first_pu": first.get("pu"),
+        "last_u": last.get("u"),
+        "previous_sequence_present_count": sum(1 for e in depth_events if e.get("pu") is not None),
+        "events": depth_events[:5],
+    }
+
+
+HANDLERS["aster"] = _probe_aster
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +532,7 @@ async def _probe_gate(args: argparse.Namespace) -> JsonObject:
                 subscribe_failed = True
         if subscribe_failed:
             continue
-        result = e.get("result", {}) if "result" in e else e
+        result = e.get("result") or e.get("data") or e
         channel_field = e.get("channel", result.get("channel"))
         full_field = result.get("full")
         if result.get("id") is not None:
@@ -504,7 +559,7 @@ async def _probe_gate(args: argparse.Namespace) -> JsonObject:
         "first_depth_id": first_depth_id,
         "ws_event_count": len(ws_events),
         "events": ws_events[:10],
-        "note": "Gate probe captures legacy futures.order_book schema; switch to order_book_update only if this channel proves unable to maintain readiness",
+        "note": "Gate probe captures V1 futures.obu/order_book_update U/u range semantics",
     }
 
 
@@ -519,21 +574,27 @@ HANDLERS["gate"] = _probe_gate
 async def _probe_hyperliquid(args: argparse.Namespace) -> JsonObject:
     symbol = args.symbol.upper()
     coin = _wire_symbol("hyperliquid", symbol)
+    ws_events: list[dict] = []
+    started_at = time.time()
     try:
-        import urllib.request
-        body = json.dumps({"type": "l2Book", "coin": coin}).encode()
-        req = urllib.request.Request(
-            "https://api.hyperliquid.xyz/info",
-            data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=10.0)
-        data = json.loads(resp.read())
+        async with websockets.connect("wss://api.hyperliquid.xyz/ws", open_timeout=10.0) as ws:
+            await ws.send(json.dumps({
+                "method": "subscribe",
+                "subscription": {"type": "l2Book", "coin": coin},
+            }))
+            data = {}
+            while time.time() - started_at < args.duration_s:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                payload = json.loads(raw)
+                ws_events.append(payload)
+                if payload.get("channel") == "l2Book":
+                    data = payload.get("data") or {}
+                    break
         bid_count, ask_count = _hyperliquid_level_counts(data)
         empty_side = bid_count == 0 or ask_count == 0
 
         return {
-            "ok": True,
+            "ok": bool(data),
             "venue": "hyperliquid",
             "symbol": symbol,
             "wire_symbol": coin,
@@ -542,10 +603,12 @@ async def _probe_hyperliquid(args: argparse.Namespace) -> JsonObject:
             "ask_levels": ask_count,
             "total_levels": bid_count + ask_count,
             "empty_side": empty_side,
+            "ws_event_count": len(ws_events),
+            "events": ws_events[:10],
             "response_keys": list(data.keys()) if isinstance(data, dict) else "non_dict",
         }
     except Exception as exc:
-        return {"ok": False, "venue": "hyperliquid", "symbol": symbol, "error": f"fetch_error: {exc}"}
+        return {"ok": False, "venue": "hyperliquid", "symbol": symbol, "error": f"ws_error: {exc}"}
 
 
 HANDLERS["hyperliquid"] = _probe_hyperliquid

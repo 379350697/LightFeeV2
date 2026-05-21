@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import time
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -519,6 +520,7 @@ class TestHyperliquidLiveOrderNowSupported:
 
         def fake_build_exchange_payload(**kwargs):
             captured["private_key_hex"] = kwargs["private_key_hex"]
+            captured["action"] = kwargs["action"]
             return {"action": kwargs["action"], "signature": {"r": "", "s": "", "v": 27}}
 
         monkeypatch.setattr(
@@ -556,6 +558,8 @@ class TestHyperliquidLiveOrderNowSupported:
             symbol="BTC",
             side=Side.BUY,
             quantity=1.0,
+            price=50000.0,
+            client_order_id="entry-1779342733376-SAGAUSDT-h1",
         )
         try:
             await transport.place_order(req)
@@ -563,6 +567,70 @@ class TestHyperliquidLiveOrderNowSupported:
             await transport.close()
 
         assert captured["private_key_hex"] == wallet_key
+        from lightfee.venues.hyperliquid_signing import hyperliquid_cloid_for_client_order
+        order = captured["action"]["orders"][0]
+        assert order["c"] == hyperliquid_cloid_for_client_order(req.client_order_id)
+        assert order["t"]["limit"]["tif"] == "Ioc"
+
+    @pytest.mark.asyncio
+    async def test_live_place_order_body_matches_hyperliquid_schema(self):
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(
+            api_key="k",
+            api_secret="",
+            wallet_private_key=privkey,
+            account_address="0xbeef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_meta_cache["BTC"] = 0
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [
+                                {
+                                    "filled": {
+                                        "oid": 789,
+                                        "totalSz": "1.0",
+                                        "avgPx": "50000.0",
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="BTC",
+            side=Side.SELL,
+            quantity=1.0,
+            price=50000.0,
+            client_order_id="entry-1779288723953-CHIPUSDT-h1",
+        )
+        try:
+            await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        from lightfee.venues.hyperliquid_signing import hyperliquid_cloid_for_client_order
+        body = captured["body"]
+        order = body["action"]["orders"][0]
+        assert "cloid" not in body
+        assert sorted(body.keys()) == ["action", "nonce", "signature", "vaultAddress"]
+        assert order["c"] == hyperliquid_cloid_for_client_order(req.client_order_id)
+        assert order["c"].startswith("0x")
+        assert len(order["c"]) == 34
+        assert order["t"]["limit"]["tif"] == "Ioc"
 
     @pytest.mark.asyncio
     async def test_live_place_order_succeeds_with_mock(self):

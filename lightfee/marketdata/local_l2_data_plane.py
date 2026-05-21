@@ -399,6 +399,10 @@ class LocalL2DataPlane:
                 book.transition_to_hot()
             return result.events
 
+        if book is not None and book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+            if self._range_update_requires_rebuild(book, update, now_ms):
+                return []
+
         # Buffer delta updates during bootstrap/rebuild gap
         # V1: handle_binance_local_l2_ws_message_for_instance lines 4423-4435
         if book is not None and book.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
@@ -448,6 +452,82 @@ class LocalL2DataPlane:
                 return []
 
         return self._runtime.record_update(update, now_ms)
+
+    def _range_update_requires_rebuild(
+        self,
+        book,
+        update: LocalL2Update,
+        now_ms: int,
+    ) -> bool:
+        if update.venue not in {"binance", "aster", "gate"}:
+            return False
+        if update.sequence <= 0 or getattr(book, "sequence", 0) <= 0:
+            return False
+        if update.sequence <= book.sequence:
+            return True
+
+        expected = book.sequence + 1
+        first_sequence = update.first_sequence
+        if first_sequence <= 0:
+            if update.previous_sequence > 0:
+                first_sequence = update.previous_sequence + 1
+            else:
+                first_sequence = update.sequence
+        overlaps_expected = first_sequence <= expected <= update.sequence
+
+        if update.previous_sequence_present or update.previous_sequence > 0:
+            if update.previous_sequence != book.sequence and not overlaps_expected:
+                self._mark_rebuilding_from_stream_gap(
+                    book,
+                    update,
+                    now_ms,
+                    f"previous_link_mismatch: expected {book.sequence} got {update.previous_sequence}",
+                )
+                return True
+            return False
+
+        if first_sequence > expected:
+            self._mark_rebuilding_from_stream_gap(
+                book,
+                update,
+                now_ms,
+                f"sequence_ahead: expected {expected} got {first_sequence}",
+            )
+            return True
+
+        return False
+
+    def _mark_rebuilding_from_stream_gap(
+        self,
+        book,
+        update: LocalL2Update,
+        now_ms: int,
+        reason: str,
+    ) -> None:
+        previous_book_seq = getattr(book, "sequence", 0)
+        book.sequence = 0
+        book.last_update_id = 0
+        book.fault_reason = reason
+        book.transition_to_rebuilding(now_ms)
+        self._runtime.handle_runtime_failure(
+            update.venue,
+            update.symbol,
+            RuntimeFaultKind.SEQUENCE_GAP,
+            reason,
+            now_ms,
+        )
+        self._journal.append(
+            "runtime.local_l2_sequence_gap_rebuild",
+            self._rebuild_evidence(
+                venue=update.venue,
+                symbol=update.symbol,
+                rebuild_trigger=reason,
+                incoming_sequence=update.sequence,
+                incoming_previous_sequence=update.previous_sequence,
+                book_seq=previous_book_seq,
+                reason_class="sequence_gap",
+            ),
+        )
 
     def _replay_buffered_updates(
         self, venue: str, symbol: str,
@@ -548,7 +628,12 @@ class LocalL2DataPlane:
         expected = previous_sequence + 1
         start_index = None
         for i, bu in enumerate(filtered):
-            first_id = bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0 else bu.update.sequence
+            first_id = (
+                bu.update.first_sequence
+                if bu.update.first_sequence > 0
+                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
+                else bu.update.sequence
+            )
             if first_id <= expected <= bu.update.sequence:
                 start_index = i
                 break
@@ -571,10 +656,22 @@ class LocalL2DataPlane:
         for i, bu in enumerate(filtered[start_index:], start=start_index):
             if bu.update.sequence <= previous_sequence:
                 continue
+            first_id = (
+                bu.update.first_sequence
+                if bu.update.first_sequence > 0
+                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
+                else bu.update.sequence
+            )
+            overlaps_expected = first_id <= previous_sequence + 1 <= bu.update.sequence
 
             # V1 Binance/Aster: standard continuity check
             if i > start_index:
-                if bu.update.previous_sequence > 0 and bu.update.previous_sequence != previous_sequence:
+                if (
+                    (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
+                    and bu.update.previous_sequence > 0
+                    and bu.update.previous_sequence != previous_sequence
+                    and not overlaps_expected
+                ):
                     book.sequence = 0
                     book.last_update_id = 0
                     book.fault_reason = (
@@ -586,7 +683,11 @@ class LocalL2DataPlane:
                         f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}", 0,
                     )
                     return _BufferedReplayResult(replayed=replayed, ok=False)
-            elif bu.update.previous_sequence > 0 and expected < bu.update.previous_sequence + 1:
+            elif (
+                (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
+                and bu.update.previous_sequence > 0
+                and expected < bu.update.previous_sequence + 1
+            ):
                 # First replay: gap between snapshot and first buffered
                 book.sequence = 0
                 book.last_update_id = 0
@@ -677,6 +778,9 @@ class LocalL2DataPlane:
                     },
                 )
 
+            if policy_for_venue(key.venue).bridge_mode is BridgeMode.STREAM_ONLY:
+                continue
+
             # V1 dual-phase gating: pre-scan only refreshes execution-owned books
             # (RETAINED or HOT_EXEC); post-shortlist allows scan-promoted books too
             if not scan_promoted and book.pool not in (L2PoolAssignment.RETAINED, L2PoolAssignment.HOT_EXEC):
@@ -733,6 +837,13 @@ class LocalL2DataPlane:
         Does NOT block — the worker runs as a background asyncio task.
         Call cancel_background_bootstrap(venue) to abort.
         """
+        if policy_for_venue(venue).bridge_mode is BridgeMode.STREAM_ONLY:
+            self._journal.append(
+                "runtime.local_l2_stream_only_bootstrap_skipped",
+                {"venue": venue, "symbol_count": len(symbols)},
+            )
+            return
+
         # Cancel any existing bootstrap task for this venue
         self.cancel_background_bootstrap(venue)
 
@@ -865,20 +976,20 @@ class LocalL2DataPlane:
         self,
         venue: str,
         symbols: list[str],
-        adapter=None,  # VenueAdapter — required for Hyperliquid poller
+        adapter=None,  # kept for call-site compatibility
     ) -> int:
         """Register WebSocket L2 delta streams for a venue's symbols.
 
         Creates WS clients and registers them in the data plane.
-        For Hyperliquid (REST poller), the adapter is injected so the
-        poller can call adapter.fetch_l2_snapshot().
+        Hyperliquid is V1 stream-only (l2Book WS); the adapter argument is
+        accepted for compatibility with runtime call sites.
 
         Caller must await connect_ws_streams() from an async context
         to actually open the connections.
 
         Returns the number of streams registered.
         """
-        from lightfee.marketdata.local_l2_ws import create_ws_client, HyperliquidL2Poller
+        from lightfee.marketdata.local_l2_ws import create_ws_client
 
         started = 0
         for symbol in symbols:
@@ -889,16 +1000,6 @@ class LocalL2DataPlane:
             )
             if client is None:
                 continue
-
-            # Inject adapter into Hyperliquid poller so it can fetch real data
-            if isinstance(client, HyperliquidL2Poller):
-                if adapter is None:
-                    self._journal.append(
-                        "runtime.local_l2_hyperliquid_no_adapter",
-                        {"venue": venue, "symbol": symbol,
-                         "error": "Hyperliquid poller created without adapter — will not ingest data"},
-                    )
-                client.set_adapter(adapter)
 
             key = LocalL2BookKey(venue=venue, symbol=symbol)
             if key in self._ws_clients:

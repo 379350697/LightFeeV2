@@ -497,6 +497,60 @@ class TestRuntimePreflight:
             assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
 
     @pytest.mark.asyncio
+    async def test_tradeable_candidate_filter_removes_unsupported_pair_before_tracking(self):
+        """Unsupported venue symbols must not reach shortlist/L2 tracking."""
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.local_l2_enabled = True
+
+            class CatalogAdapter(FakeVenueAdapter):
+                def __init__(self, venue: Venue, supported: list[str]):
+                    super().__init__(venue)
+                    self.loaded = False
+                    self._supported = supported
+
+                def supported_symbols(self) -> list[str]:
+                    return self._supported if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            aster = CatalogAdapter(Venue.ASTER, ["BTCUSDT"])
+            okx = CatalogAdapter(Venue.OKX, ["BTCUSDT", "RLSUSDT"])
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.ASTER: aster, Venue.OKX: okx},
+            )
+            runtime.journal.open()
+            try:
+                candidates = [
+                    SimpleNamespace(
+                        symbol="RLSUSDT",
+                        long_venue="aster",
+                        short_venue="okx",
+                        pair_id="rlsusdt:aster->okx",
+                    ),
+                    SimpleNamespace(
+                        symbol="BTCUSDT",
+                        long_venue="aster",
+                        short_venue="okx",
+                        pair_id="btcusdt:aster->okx",
+                    ),
+                ]
+
+                filtered = await runtime._filter_candidates_supported_by_venue_catalog(
+                    candidates,
+                )
+            finally:
+                runtime.journal.close()
+
+            assert aster.loaded is True
+            assert okx.loaded is True
+            assert [candidate.symbol for candidate in filtered] == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
     async def test_local_l2_startup_bootstrap_runs_when_ws_disabled(self):
         """REST bootstrap must still use filtered target pairs when WS is disabled."""
         with tempfile.TemporaryDirectory() as td:

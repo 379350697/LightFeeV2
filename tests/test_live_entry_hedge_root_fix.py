@@ -1856,6 +1856,46 @@ class TestRealPathAbortCleanupDeadline:
         ]
 
     @pytest.mark.asyncio
+    async def test_missing_hedge_retries_use_attempt_scoped_client_ids(self, tmp_path):
+        """V1 seeds each hedge retry with the incremented hedge attempt."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.ASTER)
+        runtime._venue_adapters[Venue.ASTER] = hedge_adapter
+
+        pending = PendingEntry(
+            pending_id="entry-retry-hedge-zero-fill",
+            symbol="CHIPUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            target_quantity=474.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=474.0,
+            maker_fill_price=0.05063,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-1",
+            maker_client_order_id="maker-cid-1",
+        )
+
+        first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+        first_cid = pending.hedge_client_order_id
+        second = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 3000)
+        second_cid = pending.hedge_client_order_id
+
+        assert first is False
+        assert second is False
+        assert pending.hedge_attempt_count == 2
+        assert first_cid != second_cid
+        assert [
+            call.client_order_id for call in hedge_adapter._place_order_calls
+        ] == [first_cid, second_cid]
+
+    @pytest.mark.asyncio
     async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):
         """Flat positions are not enough to clear a pending maker order.
 

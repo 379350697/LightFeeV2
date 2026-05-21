@@ -138,9 +138,13 @@ class HyperliquidAdapter(VenueAdapter):
         # --- Attempt 2: orderStatus by cloid ---
         if client_order_id:
             try:
+                from lightfee.venues.hyperliquid_signing import (
+                    hyperliquid_cloid_for_client_order,
+                )
+                wire_cloid = hyperliquid_cloid_for_client_order(client_order_id)
                 raw = await transport._request(
                     "POST", "/info",
-                    body={"type": "orderStatus", "user": user_addr, "cloid": client_order_id},
+                    body={"type": "orderStatus", "user": user_addr, "cloid": wire_cloid},
                     private=False,
                 )
                 result = self._parse_hl_order_status(raw, symbol, now_ms)
@@ -171,25 +175,31 @@ class HyperliquidAdapter(VenueAdapter):
         """Parse Hyperliquid orderStatus response.
 
         Response shape:
-          {"order": {"order": {oid, cloid, coin, side, status, sz, limitPx, avgPx, ...}, "status": "order"}}
+          {"status": "order", "order": {"order": {oid, cloid, coin, side, sz, ...}, "status": "filled"}}
         Status values: "filled", "open", "canceled", "rejected"
         """
         order_wrapper = raw.get("order", raw)
         if not isinstance(order_wrapper, dict):
             return None
 
+        status = str(order_wrapper.get("status", raw.get("status", ""))).lower()
         order = order_wrapper.get("order", order_wrapper)
         if not isinstance(order, dict):
             return None
 
-        status = str(order.get("status", "")).lower()
+        if not status or status == "order":
+            status = str(order.get("status", status)).lower()
         oid = str(order.get("oid", ""))
         cloid = str(order.get("cloid", ""))
         side_raw = str(order.get("side", "")).upper()
         side = Side.BUY if side_raw == "B" else Side.SELL
-        orig_sz = float(order.get("origSz", 0))
-        sz = float(order.get("sz", 0))
-        total_sz = float(order.get("totalSz", sz))
+        orig_sz = float(order.get("origSz", order.get("totalSz", 0)))
+        remaining_sz = float(order.get("sz", 0))
+        total_sz = float(
+            order.get("totalSz", max(orig_sz - remaining_sz, 0.0))
+        )
+        if status == "filled" and total_sz <= 0 < orig_sz:
+            total_sz = orig_sz
         limit_px = float(order.get("limitPx", 0))
         avg_px = float(order.get("avgPx", 0))
 
@@ -262,6 +272,14 @@ class HyperliquidAdapter(VenueAdapter):
         if isinstance(raw, dict):
             orders = raw.get("historicalOrders", raw.get("orders", []))
 
+        client_order_ids: set[str] = set()
+        if client_order_id:
+            client_order_ids.add(client_order_id)
+            from lightfee.venues.hyperliquid_signing import (
+                hyperliquid_cloid_for_client_order,
+            )
+            client_order_ids.add(hyperliquid_cloid_for_client_order(client_order_id))
+
         for entry in orders:
             if not isinstance(entry, dict):
                 continue
@@ -269,13 +287,19 @@ class HyperliquidAdapter(VenueAdapter):
             entry_cloid = str(entry.get("cloid", ""))
             if order_id and entry_oid != order_id:
                 continue
-            if client_order_id and entry_cloid != client_order_id:
+            if client_order_ids and entry_cloid not in client_order_ids:
                 continue
 
             status = str(entry.get("status", "")).lower()
             side_raw = str(entry.get("side", "")).upper()
             side = Side.BUY if side_raw == "B" else Side.SELL
-            total_sz = float(entry.get("totalSz", entry.get("sz", 0)))
+            orig_sz = float(entry.get("origSz", entry.get("totalSz", 0)))
+            remaining_sz = float(entry.get("sz", 0))
+            total_sz = float(
+                entry.get("totalSz", max(orig_sz - remaining_sz, 0.0))
+            )
+            if status == "filled" and total_sz <= 0 < orig_sz:
+                total_sz = orig_sz
             avg_px = float(entry.get("avgPx", 0))
             limit_px = float(entry.get("limitPx", 0))
 

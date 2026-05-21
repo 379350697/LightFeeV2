@@ -69,6 +69,11 @@ def gate_depth_stream_url() -> str:
     return "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
 
+def hyperliquid_depth_stream_url() -> str:
+    """Hyperliquid public WebSocket."""
+    return "wss://api.hyperliquid.xyz/ws"
+
+
 def aster_depth_stream_url(symbol: str) -> str:
     """Aster (Binance-compatible) per-symbol depth delta stream."""
     return f"wss://fstream.asterdex.com/ws/{symbol.lower()}@depth@100ms"
@@ -299,17 +304,21 @@ class BinanceL2WsClient(LocalL2WsClient):
         if raw.get("e") != "depthUpdate":
             return None
 
+        first_sequence = int(raw.get("U", 0) or 0)
+        previous_sequence_present = raw.get("pu") is not None
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("b", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("a", [])],
+            first_sequence=first_sequence,
             sequence=int(raw.get("u", 0)),
             previous_sequence=(
                 int(raw.get("pu", 0))
-                if raw.get("pu") is not None
-                else int(raw.get("U", 0)) - 1 if raw.get("U") else 0
+                if previous_sequence_present
+                else 0
             ),
+            previous_sequence_present=previous_sequence_present,
             event_time_ms=int(raw.get("E", 0)),
             received_at_ms=int(time.time() * 1000),
             update_kind=LocalL2UpdateKind.DELTA,
@@ -354,14 +363,19 @@ class OkxL2WsClient(LocalL2WsClient):
 
         kind = LocalL2UpdateKind.SNAPSHOT if action == "snapshot" else LocalL2UpdateKind.DELTA
 
+        bids_raw = row.get("bids", [])
+        asks_raw = row.get("asks", [])
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
-            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in row.get("bids", [])],
-            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in row.get("asks", [])],
+            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in bids_raw],
+            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q, *_ in asks_raw],
             sequence=int(row.get("seqId", 0)),
             previous_sequence=int(row.get("prevSeqId", raw.get("prevSeqId", 0))),
+            previous_sequence_present=("prevSeqId" in row or "prevSeqId" in raw),
             checksum=int(row.get("checksum", -1)),
+            raw_bids=[(str(p), str(q)) for p, q, *_ in bids_raw],
+            raw_asks=[(str(p), str(q)) for p, q, *_ in asks_raw],
             event_time_ms=int(row.get("ts", 0)),
             received_at_ms=now_ms,
             update_kind=kind,
@@ -401,12 +415,15 @@ class BybitL2WsClient(LocalL2WsClient):
 
         kind = LocalL2UpdateKind.SNAPSHOT if msg_type == "snapshot" else LocalL2UpdateKind.DELTA
 
+        previous_sequence_present = data.get("pu") is not None
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in data.get("b", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in data.get("a", [])],
             sequence=int(data.get("u", data.get("seq", 0))),
+            previous_sequence=int(data.get("pu", 0)) if previous_sequence_present else 0,
+            previous_sequence_present=previous_sequence_present,
             event_time_ms=int(raw.get("ts", 0)),
             received_at_ms=now_ms,
             update_kind=kind,
@@ -460,6 +477,7 @@ class BitgetL2WsClient(LocalL2WsClient):
         asks_raw = row.get("asks", row.get("a", []))
         sequence = int(row.get("seq", row.get("seqId", 0)) or 0)
         previous_sequence = int(row.get("pseq", row.get("prevSeqId", 0)) or 0)
+        previous_sequence_present = "pseq" in row or "prevSeqId" in row
 
         return LocalL2Update(
             venue=self.venue,
@@ -468,7 +486,10 @@ class BitgetL2WsClient(LocalL2WsClient):
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in asks_raw],
             sequence=sequence,
             previous_sequence=previous_sequence,
+            previous_sequence_present=previous_sequence_present,
             checksum=int(row.get("checksum", 0) or 0),
+            raw_bids=[(str(p), str(q)) for p, q in bids_raw],
+            raw_asks=[(str(p), str(q)) for p, q in asks_raw],
             event_time_ms=int(row.get("ts", 0)),
             received_at_ms=now_ms,
             update_kind=kind,
@@ -479,10 +500,10 @@ class BitgetL2WsClient(LocalL2WsClient):
 # Gate.io V4 WS client
 # ---------------------------------------------------------------------------
 
-# Gate order_book channel:
-# Subscribe: {"time":1715000000,"channel":"futures.order_book","event":"subscribe","payload":["BTC_USDT","20","0"]}
-# Snapshot:  {"time":...,"channel":"futures.order_book","event":"all","result":{"t":...,"id":...,"contract":"BTC_USDT","asks":[[p,q]],"bids":[[p,q]]}}
-# Delta:     {"time":...,"channel":"futures.order_book","event":"update","result":{...}}
+# Gate V1 local-L2 channel:
+# Subscribe: {"time":1715000000,"channel":"futures.obu","event":"subscribe","payload":["ob.BTC_USDT.400"]}
+# Snapshot/update payloads may arrive on futures.obu or futures.order_book_update
+# with U/u sequence ranges.
 
 @dataclass
 class GateL2WsClient(LocalL2WsClient):
@@ -499,37 +520,49 @@ class GateL2WsClient(LocalL2WsClient):
         return gate_depth_stream_url()
 
     def build_subscribe_message(self) -> Optional[dict]:
-        # Gate's legacy futures.order_book channel uses "0" as the update interval.
-        # "100ms" belongs to futures.order_book_update and is rejected here.
         return {
             "time": int(time.time()),
-            "channel": "futures.order_book",
+            "channel": "futures.obu",
             "event": "subscribe",
-            "payload": [self.wire_symbol, "20", "0"],
+            "payload": [f"ob.{self.wire_symbol}.400"],
         }
 
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
-        if raw.get("channel") != "futures.order_book":
+        channel = raw.get("channel")
+        if channel not in ("futures.order_book", "futures.order_book_update", "futures.obu"):
             return None
 
         event = raw.get("event", "")
-        if event not in ("all", "update"):
+        if channel == "futures.order_book" and event not in ("all", "update"):
             return None
 
-        result = raw.get("result", {})
+        result = raw.get("result") or raw.get("data") or {}
         if not result:
             return None
 
         now_ms = int(time.time() * 1000)
-        kind = LocalL2UpdateKind.SNAPSHOT if event == "all" else LocalL2UpdateKind.DELTA
+        is_full = bool(result.get("full")) or event == "all"
+        kind = LocalL2UpdateKind.SNAPSHOT if is_full else LocalL2UpdateKind.DELTA
+        bids_raw = result.get("bids", result.get("b", []))
+        asks_raw = result.get("asks", result.get("a", []))
+        sequence = int(result.get("u", result.get("id", result.get("t", 0))) or 0)
+        first_sequence = int(result.get("U", result.get("prev_t", 0)) or 0)
+
+        def _price_size(row):
+            if isinstance(row, dict):
+                return str(row.get("p", 0)), str(row.get("s", 0))
+            return str(row[0]), str(row[1])
 
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
-            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in result.get("bids", [])],
-            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in result.get("asks", [])],
-            sequence=int(result.get("id", result.get("t", 0))),
-            event_time_ms=int(raw.get("time", 0)) * 1000,  # Gate uses seconds
+            bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in map(_price_size, bids_raw)],
+            asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in map(_price_size, asks_raw)],
+            first_sequence=first_sequence,
+            sequence=sequence,
+            previous_sequence=first_sequence,
+            previous_sequence_present=first_sequence > 0,
+            event_time_ms=int(result.get("t", int(raw.get("time", 0)) * 1000) or 0),
             received_at_ms=now_ms,
             update_kind=kind,
         )
@@ -556,17 +589,21 @@ class AsterL2WsClient(LocalL2WsClient):
         if raw.get("e") != "depthUpdate":
             return None
 
+        first_sequence = int(raw.get("U", 0) or 0)
+        previous_sequence_present = raw.get("pu") is not None
         return LocalL2Update(
             venue=self.venue,
             symbol=self.symbol,
             bids=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("b", [])],
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in raw.get("a", [])],
+            first_sequence=first_sequence,
             sequence=int(raw.get("u", 0)),
             previous_sequence=(
                 int(raw.get("pu", 0))
-                if raw.get("pu") is not None
-                else int(raw.get("U", 0)) - 1 if raw.get("U") else 0
+                if previous_sequence_present
+                else 0
             ),
+            previous_sequence_present=previous_sequence_present,
             event_time_ms=int(raw.get("E", 0)),
             received_at_ms=int(time.time() * 1000),
             update_kind=LocalL2UpdateKind.DELTA,
@@ -574,72 +611,56 @@ class AsterL2WsClient(LocalL2WsClient):
 
 
 # ---------------------------------------------------------------------------
-# Hyperliquid L2 poller (REST-based — no public WS depth stream)
+# Hyperliquid public L2Book WS client
 # ---------------------------------------------------------------------------
 
-# Hyperliquid has no public WebSocket depth endpoint. L2 data comes from
-# POST /info {"type": "l2Book"} → REST periodic polling is the canonical path.
-# This poller wraps REST into the WS client interface so all 7 venues
-# have a uniform ingest path through LocalL2DataPlane.ingest_external_update().
-
-_HYPERLIQUID_L2_POLL_INTERVAL_S = 1.0  # 1s poll interval (max HL rate limit: ~10/s)
-
-
 @dataclass
-class HyperliquidL2Poller(LocalL2WsClient):
-    """Hyperliquid L2 REST poller — wraps periodic /info polling in WS client interface.
-
-    Hyperliquid has no WebSocket depth stream. REST POST /info {"type":"l2Book"}
-    is the only L2 data source. This poller uses the data plane's adapter reference
-    to call fetch_l2_snapshot() periodically, feeding results into ingest_external_update().
-    """
-
-    poll_interval_s: float = _HYPERLIQUID_L2_POLL_INTERVAL_S
-    _adapter: Any = field(default=None, init=False)
+class HyperliquidL2WsClient(LocalL2WsClient):
+    """Hyperliquid l2Book WebSocket client (V1 StreamOnly / HeartbeatAge)."""
 
     def set_adapter(self, adapter) -> None:
-        self._adapter = adapter
-
-    def websocket_url(self) -> str:
-        return ""  # No WS — REST only
-
-    def build_subscribe_message(self) -> Optional[dict]:
+        # Backward-compatible no-op: V1 local-L2 is stream-only.
         return None
 
+    def websocket_url(self) -> str:
+        return hyperliquid_depth_stream_url()
+
+    def build_subscribe_message(self) -> Optional[dict]:
+        return {
+            "method": "subscribe",
+            "subscription": {"type": "l2Book", "coin": self.wire_symbol},
+        }
+
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
-        return None  # Not used — _run_loop is overridden
+        if raw.get("channel") != "l2Book":
+            return None
+        data = raw.get("data") or {}
+        levels = data.get("levels") or []
+        bids_raw = levels[0] if len(levels) > 0 else []
+        asks_raw = levels[1] if len(levels) > 1 else []
 
-    async def _run_loop(self) -> None:
-        """REST polling loop instead of WS read loop.
+        def _levels(rows):
+            result = []
+            for row in rows:
+                price = float(row.get("px", 0))
+                quantity = float(row.get("sz", 0))
+                if price > 0 and quantity > 0:
+                    result.append(PriceLevel(price=price, quantity=quantity))
+            return result
 
-        Polls adapter.fetch_l2_snapshot() periodically and feeds results
-        into the data plane.  If no adapter is set, logs an error and
-        increments the error counter — the poller must be injected with
-        a real adapter to ingest data.
-        """
-        adapter_none_logged = False
-        while self._state not in (WsClientState.CLOSED,):
-            self._state = WsClientState.CONNECTED
-            try:
-                if self._adapter is not None:
-                    update = await self._adapter.fetch_l2_snapshot(
-                        symbol=self.symbol, depth=50,
-                    )
-                    self._message_count += 1
-                    self._last_message_ms = int(time.time() * 1000)
-                    self.data_plane.ingest_external_update(
-                        update, self._last_message_ms,
-                    )
-                else:
-                    if not adapter_none_logged:
-                        self._error_count += 1
-                        adapter_none_logged = True
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                self._error_count += 1
+        return LocalL2Update(
+            venue=self.venue,
+            symbol=self.symbol,
+            bids=_levels(bids_raw),
+            asks=_levels(asks_raw),
+            sequence=0,
+            event_time_ms=int(data.get("time", 0) or 0),
+            received_at_ms=int(time.time() * 1000),
+            update_kind=LocalL2UpdateKind.SNAPSHOT,
+        )
 
-            await asyncio.sleep(self.poll_interval_s)
+
+HyperliquidL2Poller = HyperliquidL2WsClient
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +675,7 @@ WS_CLIENT_REGISTRY: dict[str, type[LocalL2WsClient]] = {
     "bitget": BitgetL2WsClient,
     "gate": GateL2WsClient,
     "aster": AsterL2WsClient,
-    "hyperliquid": HyperliquidL2Poller,
+    "hyperliquid": HyperliquidL2WsClient,
 }
 
 

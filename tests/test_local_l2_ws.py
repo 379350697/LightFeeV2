@@ -25,7 +25,7 @@ from lightfee.marketdata.local_l2_ws import (
     BitgetL2WsClient,
     BybitL2WsClient,
     GateL2WsClient,
-    HyperliquidL2Poller,
+    HyperliquidL2WsClient,
     OkxL2WsClient,
     create_ws_client,
     WS_CLIENT_REGISTRY,
@@ -95,7 +95,9 @@ class TestBinanceL2WsClientParsing:
         assert update.symbol == "BTCUSDT"
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.sequence == 1010
-        assert update.previous_sequence == 1000
+        assert update.first_sequence == 1001
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
         assert len(update.bids) == 2
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 1.5
@@ -392,7 +394,7 @@ class TestBitgetL2WsClientParsing:
 
 
 class TestGateL2WsClientParsing:
-    def test_build_subscribe_message_uses_legacy_zero_interval(self):
+    def test_build_subscribe_message_uses_v1_obu_channel(self):
         dp, rt, _ = _make_data_plane()
         client = GateL2WsClient(
             venue="gate", symbol="BTCUSDT", venue_symbol="BTC_USDT", data_plane=dp,
@@ -401,8 +403,8 @@ class TestGateL2WsClientParsing:
         message = client.build_subscribe_message()
 
         assert message is not None
-        assert message["channel"] == "futures.order_book"
-        assert message["payload"] == ["BTC_USDT", "20", "0"]
+        assert message["channel"] == "futures.obu"
+        assert message["payload"] == ["ob.BTC_USDT.400"]
         _close_data_plane(dp, _)
 
     def test_parses_snapshot_all_event(self):
@@ -556,7 +558,9 @@ class TestAsterL2WsClientParsing:
         assert update.symbol == "BTCUSDT"
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.sequence == 510
-        assert update.previous_sequence == 500
+        assert update.first_sequence == 501
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
         assert len(update.bids) == 2
         assert update.bids[0].price == 50000.0
         assert update.bids[0].quantity == 1.5
@@ -593,44 +597,56 @@ class TestAsterL2WsClientParsing:
         _close_data_plane(dp, _)
 
 
-class TestHyperliquidL2Poller:
-    def test_poller_is_ws_client_subclass(self):
+class TestHyperliquidL2WsClient:
+    def test_client_is_ws_client_subclass(self):
         dp, rt, _ = _make_data_plane()
-        poller = HyperliquidL2Poller(
+        client = HyperliquidL2WsClient(
             venue="hyperliquid", symbol="BTCUSDT", data_plane=dp,
             venue_symbol="BTC",
         )
-        assert isinstance(poller, LocalL2WsClient)
+        assert isinstance(client, LocalL2WsClient)
         _close_data_plane(dp, _)
 
-    def test_websocket_url_is_empty(self):
+    def test_websocket_url_is_public_l2book_endpoint(self):
         dp, rt, _ = _make_data_plane()
-        poller = HyperliquidL2Poller(
+        client = HyperliquidL2WsClient(
             venue="hyperliquid", symbol="BTCUSDT", data_plane=dp,
             venue_symbol="BTC",
         )
-        assert poller.websocket_url() == ""
+        assert client.websocket_url() == "wss://api.hyperliquid.xyz/ws"
         _close_data_plane(dp, _)
 
-    def test_parse_depth_message_returns_none(self):
+    def test_parse_depth_message_parses_l2book(self):
         dp, rt, _ = _make_data_plane()
-        poller = HyperliquidL2Poller(
+        client = HyperliquidL2WsClient(
             venue="hyperliquid", symbol="BTCUSDT", data_plane=dp,
             venue_symbol="BTC",
         )
-        # HL poller doesn't use parse_depth_message — REST polling is in _run_loop
-        assert poller.parse_depth_message({}) is None
+        update = client.parse_depth_message({
+            "channel": "l2Book",
+            "data": {
+                "coin": "BTC",
+                "time": 1715000000000,
+                "levels": [
+                    [{"px": "50000", "sz": "1"}],
+                    [{"px": "50100", "sz": "1"}],
+                ],
+            },
+        })
+        assert update is not None
+        assert update.symbol == "BTCUSDT"
+        assert update.update_kind == LocalL2UpdateKind.SNAPSHOT
         _close_data_plane(dp, _)
 
-    def test_set_adapter_stores_reference(self):
+    def test_set_adapter_is_stream_only_noop(self):
         dp, rt, _ = _make_data_plane()
-        poller = HyperliquidL2Poller(
+        client = HyperliquidL2WsClient(
             venue="hyperliquid", symbol="BTCUSDT", data_plane=dp,
             venue_symbol="BTC",
         )
         adapter = object()
-        poller.set_adapter(adapter)
-        assert poller._adapter is adapter
+        client.set_adapter(adapter)
+        assert not hasattr(client, "_adapter")
         _close_data_plane(dp, _)
 
 
@@ -692,7 +708,7 @@ class TestWsClientFactory:
     def test_creates_hyperliquid_client(self):
         dp, rt, _ = _make_data_plane()
         client = create_ws_client("hyperliquid", "BTCUSDT", dp)
-        assert isinstance(client, HyperliquidL2Poller)
+        assert isinstance(client, HyperliquidL2WsClient)
         # HL: canonical BTCUSDT → wire BTC
         assert client.wire_symbol == "BTC"
         assert client.symbol == "BTCUSDT"
@@ -969,7 +985,7 @@ class TestWorkerLifecycle:
         # Verify subclasses inherit the constant
         assert BinanceL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
         assert OkxL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
-        assert HyperliquidL2Poller.OPEN_TIMEOUT_SECONDS == 10.0
+        assert HyperliquidL2WsClient.OPEN_TIMEOUT_SECONDS == 10.0
 
 
 # ---------------------------------------------------------------------------

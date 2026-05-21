@@ -191,6 +191,10 @@ class PendingEntry:
     # quantity, attempt, submitted_at_ms, soft_deadline_logged.
     # Migrated from plain str; None means no inflight hedge.
     hedge_inflight: HedgeInflight | None = None
+    # --- V1 hedge attempt counter ---
+    # V1 hedge_pending_entry_delta increments this for every submitted hedge
+    # attempt and includes it in the client order id seed.
+    hedge_attempt_count: int = 0
     # --- V1 maker fill price for hedge price hint ---
     maker_fill_price: float = 0.0
     # --- V1 hedge fill price for entry position recording ---

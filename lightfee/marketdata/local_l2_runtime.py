@@ -158,17 +158,37 @@ class LocalL2Runtime:
         applied from the per-venue rules profile.
         """
         book = self.ensure_book(update.venue, update.symbol)
+        preflight = self._preflight_venue_update(book, update, now_ms)
+        if preflight is not None:
+            for event in preflight.events:
+                self._enqueue_event(event)
+            return preflight
+
         result = self._apply_update(book, update, now_ms)
+        if result.applied and not result.rebuild_required:
+            self._update_raw_checksum_book(book, update)
 
         # Venue rules: checksum verification after apply
         from lightfee.marketdata.local_l2_venues import get_venue_rules
         rules = get_venue_rules(update.venue)
         if rules.should_verify_checksum() and update.checksum != 0:
-            checksum_result = book.verify_checksum(update.checksum, now_ms)
+            if update.raw_bids or update.raw_asks or book.raw_checksum_bids or book.raw_checksum_asks:
+                checksum_result = book.verify_raw_checksum(update.checksum, now_ms)
+            else:
+                checksum_result = book.verify_checksum(update.checksum, now_ms)
             result.events.extend(checksum_result.events)
             if checksum_result.fault_reason:
+                book.raw_checksum_bids.clear()
+                book.raw_checksum_asks.clear()
+                book.pending_snapshot_bridge = False
                 checksum_result.rebuild_required = True
                 result = checksum_result
+
+        if update.venue == "bitget" and result.applied and not result.rebuild_required:
+            book.pending_snapshot_bridge = (
+                update.update_kind == LocalL2UpdateKind.SNAPSHOT
+                and update.sequence > 0
+            )
 
         for event in result.events:
             self._enqueue_event(event)
@@ -184,6 +204,121 @@ class LocalL2Runtime:
             )
 
         return result
+
+    def _preflight_venue_update(
+        self,
+        book: LocalL2Book,
+        update: LocalL2Update,
+        now_ms: int,
+    ) -> LocalL2UpdateResult | None:
+        if update.venue != "bitget" or update.update_kind != LocalL2UpdateKind.DELTA:
+            return None
+        if book.sequence <= 0 or update.sequence <= 0:
+            return None
+
+        if update.previous_sequence_present and update.previous_sequence == 0:
+            return self._mark_sequence_boundary_rebuild(
+                book,
+                update,
+                now_ms,
+                "bitget_pseq_zero_snapshot_boundary",
+            )
+
+        if update.sequence <= book.sequence:
+            return LocalL2UpdateResult(
+                applied=False,
+                events=[],
+                fault_reason=(
+                    f"stale_update prev={book.sequence} incoming_sequence={update.sequence}"
+                ),
+                rebuild_required=False,
+            )
+
+        if not update.previous_sequence_present:
+            if self._bitget_missing_prev_sequence_admissible(book, update):
+                return None
+            return self._mark_sequence_boundary_rebuild(
+                book,
+                update,
+                now_ms,
+                "bitget_missing_prev_sequence",
+            )
+
+        if update.previous_sequence != book.sequence:
+            snapshot_bridge_matches = (
+                book.pending_snapshot_bridge
+                and update.previous_sequence <= book.sequence <= update.sequence
+            )
+            if snapshot_bridge_matches:
+                return None
+            return self._mark_sequence_boundary_rebuild(
+                book,
+                update,
+                now_ms,
+                "bitget_previous_link_mismatch",
+            )
+
+        return None
+
+    def _bitget_missing_prev_sequence_admissible(
+        self,
+        book: LocalL2Book,
+        update: LocalL2Update,
+    ) -> bool:
+        if update.checksum == 0 or update.sequence <= book.sequence:
+            return False
+        if not (book.pending_snapshot_bridge or book.status == L2BookStatus.HOT):
+            return False
+        if not (book.raw_checksum_bids or book.raw_checksum_asks):
+            return False
+        candidate = LocalL2Book(venue=book.venue, symbol=book.symbol)
+        candidate.raw_checksum_bids = list(book.raw_checksum_bids)
+        candidate.raw_checksum_asks = list(book.raw_checksum_asks)
+        candidate.apply_raw_checksum_update(
+            update.raw_bids,
+            update.raw_asks,
+            LocalL2UpdateKind.DELTA,
+        )
+        return candidate.compute_raw_checksum() == update.checksum
+
+    def _mark_sequence_boundary_rebuild(
+        self,
+        book: LocalL2Book,
+        update: LocalL2Update,
+        now_ms: int,
+        reason: str,
+    ) -> LocalL2UpdateResult:
+        book.bids.clear()
+        book.asks.clear()
+        book.sequence = 0
+        book.last_update_id = 0
+        book.raw_checksum_bids.clear()
+        book.raw_checksum_asks.clear()
+        book.pending_snapshot_bridge = False
+        book.fault_reason = reason
+        book.transition_to_rebuilding(now_ms)
+        self.handle_runtime_failure(
+            update.venue,
+            update.symbol,
+            RuntimeFaultKind.SEQUENCE_GAP,
+            reason,
+            now_ms,
+        )
+        return LocalL2UpdateResult(
+            applied=False,
+            events=[],
+            fault_reason=reason,
+            rebuild_required=True,
+        )
+
+    @staticmethod
+    def _update_raw_checksum_book(book: LocalL2Book, update: LocalL2Update) -> None:
+        if update.raw_bids or update.raw_asks:
+            book.apply_raw_checksum_update(
+                update.raw_bids,
+                update.raw_asks,
+                update.update_kind,
+            )
 
     def _apply_update(
         self, book: LocalL2Book, update: LocalL2Update, now_ms: int

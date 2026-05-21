@@ -12,6 +12,7 @@ class BridgeMode(Enum):
     REST_SNAPSHOT_BUFFERED_REPLAY = "rest_snapshot_buffered_replay"
     WS_SNAPSHOT_AUTHORITATIVE = "ws_snapshot_authoritative"
     REST_POLLING_SNAPSHOT_ONLY = "rest_polling_snapshot_only"
+    STREAM_ONLY = "stream_only"
 
 
 class ReplayLinkKind(Enum):
@@ -79,7 +80,7 @@ def policy_for_venue(venue: str) -> LocalL2VenuePolicy:
     if normalized == "hyperliquid":
         return LocalL2VenuePolicy(
             venue=normalized,
-            bridge_mode=BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
+            bridge_mode=BridgeMode.STREAM_ONLY,
             pre_snapshot_buffer_cap=0,
             rest_snapshot_sequence_comparable=False,
             replay_rest_snapshot_with_ws_deltas=False,
