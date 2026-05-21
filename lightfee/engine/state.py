@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.domain import OrderFill, PassiveOrderState, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -138,6 +138,38 @@ class HedgeInflight:
 
 
 @dataclass
+class PendingPassiveOrder:
+    """V1 PendingPassiveOrder: tracks the resting maker order lifecycle.
+
+    Mirrors V1 entry_sync.rs PendingPassiveOrder fields used by
+    maintain_pending_entry_passive_order() for active tick-level maintenance:
+    - maker_try_window_fill_shortfall (1500ms fill ratio check)
+    - maker_entry_rest_timeout (6000ms rest timeout)
+    - cancel_requested_at_ms → cancel → abort/finalize lifecycle
+    """
+    order_id: str = ""
+    client_order_id: str = ""
+    limit_price: Optional[float] = None
+    target_quantity: float = 0.0
+    accepted_at_ms: int = 0
+    timeout_at_ms: int = 0
+    cancel_requested_at_ms: int = 0  # 0 means no cancel requested
+    last_progress_state: PassiveOrderState = PassiveOrderState.UNKNOWN
+
+    def maker_completed(self) -> bool:
+        """V1: PendingEntryHedge.maker_completed() — terminal progress state."""
+        return self.last_progress_state.is_terminal()
+
+    def cancel_requested(self) -> bool:
+        """Whether a cancel has been requested for this passive order."""
+        return self.cancel_requested_at_ms > 0
+
+    def timed_out(self, now_ms: int) -> bool:
+        """V1: PendingEntryHedge.timed_out() — rest timeout exceeded."""
+        return self.timeout_at_ms > 0 and now_ms >= self.timeout_at_ms
+
+
+@dataclass
 class PendingEntry:
     pending_id: str
     symbol: str
@@ -202,6 +234,15 @@ class PendingEntry:
     # --- Terminal repair state for unresolvable residuals ---
     # Values: "" (active), "hedge_residual_below_min_notional" (terminal)
     repair_state: str = ""
+    # --- V1 passive order lifecycle (CONTRACT PASSIVE-LIFECYCLE-001) ---
+    # V1: PendingEntryHedge.passive_order: PendingPassiveOrder — tracks
+    # accepted_at_ms, timeout_at_ms, cancel_requested_at_ms, last_progress_state,
+    # limit_price, and target_quantity for active tick-level maker maintenance.
+    passive_order: Optional[PendingPassiveOrder] = None
+    # --- V1 next progress poll timestamp ---
+    # V1: PendingEntryHedge.next_progress_poll_ms — when to next query
+    # passive order progress and run maintain_pending_entry_passive_order.
+    next_progress_poll_ms: int = 0
 
     def __post_init__(self) -> None:
         """Migrate legacy string hedge_inflight to HedgeInflight | None."""
@@ -231,11 +272,24 @@ class PendingEntry:
         return max(0.0, balanced - self.hedge_leg_filled)
 
     def maker_completed(self) -> bool:
-        """Whether the maker leg is fully filled.
+        """Whether the maker leg is fully filled or terminal.
 
-        V1: PendingEntryHedge.maker_completed() — maker leg fill >= target.
+        V1: PendingEntryHedge.maker_completed() — maker leg fill >= target
+        OR passive_order.last_progress_state is a terminal state
+        (Filled/Canceled/Rejected).
         """
-        return self.maker_leg_filled >= self.target_quantity - 1e-9
+        if self.maker_leg_filled >= self.target_quantity - 1e-9:
+            return True
+        if self.passive_order is not None:
+            return self.passive_order.maker_completed()
+        return False
+
+    def maker_passive_terminal(self) -> bool:
+        """True when the passive maker order has reached a terminal progress state
+        (canceled/rejected/filled), matching V1 PassiveOrderState terminal check."""
+        if self.passive_order is not None:
+            return self.passive_order.last_progress_state.is_terminal()
+        return False
 
     def has_any_fill(self) -> bool:
         """Whether any leg has any fill quantity."""
@@ -252,11 +306,16 @@ class PendingEntry:
         implies an order may still be in-flight). Maker completion and missing
         hedge are computed from local fill quantities.
         """
+        cancel_requested = (
+            self.passive_order is not None
+            and self.passive_order.cancel_requested()
+        )
         return (
             self.uncertain_outcome
             or self.maker_completed()
             or self.missing_hedge_quantity() > 1e-9
             or self.hedge_inflight is not None
+            or cancel_requested
         )
 
     def compute_lifetime_ms(self, now_ms: int) -> int:

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
+from lightfee.core.domain import OrderFill, OrderRequest, PassiveOrderState, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.entry import (
     EntryContext,
@@ -36,7 +36,7 @@ from lightfee.engine.residual import (
     ResidualOrigin,
     split_entry_fill_residual,
 )
-from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.engine.state import OpenPosition, PendingEntry, PendingPassiveOrder
 from lightfee.persistence.journal import Journal
 
 
@@ -76,6 +76,9 @@ class EntrySyncExecutor:
         self.min_matched_ratio: float = overrides.get("min_matched_ratio", 0.95)
         # --- V1 active entry/passive-maker knobs ---
         self.maker_entry_max_reposts: int = overrides.get("maker_entry_max_reposts", 0)
+        self.maker_entry_rest_timeout_ms: int = overrides.get(
+            "maker_entry_rest_timeout_ms", 6000
+        )
         self.pending_entry_zero_fill_terminal_cooldown_ms: int = overrides.get(
             "pending_entry_zero_fill_terminal_cooldown_ms", 0
         )
@@ -175,6 +178,7 @@ class EntrySyncExecutor:
                 outcome="maker_resting",
                 maker_order_id=ack.order_id if ack else "",
                 hedge_order_id="",
+                passive_order_ack=ack,
             )
             return result
 
@@ -406,6 +410,7 @@ class EntrySyncExecutor:
         maker_filled: float = 0.0,
         hedge_filled: float = 0.0,
         repost_count: int = 0,
+        passive_order_ack: Any = None,  # PassiveOrderAck from submit_passive_order
     ) -> PendingEntry:
         """Create a PendingEntry for reconciliation after uncertain outcomes.
 
@@ -453,6 +458,30 @@ class EntrySyncExecutor:
             zero_fill_since_ms = prev_zero if prev_zero > 0 else now_ms
 
         maker_is_long = ctx.maker_leg == Side.BUY
+
+        # --- V1: build PendingPassiveOrder when maker order is resting ---
+        passive_order: Optional[PendingPassiveOrder] = None
+        if passive_order_ack is not None:
+            ack_accepted_at_ms = getattr(passive_order_ack, "accepted_at_ms", 0) or now_ms
+            ack_order_id = getattr(passive_order_ack, "order_id", "") or maker_order_id
+            ack_cid = getattr(passive_order_ack, "client_order_id", "") or maker_req.client_order_id or ""
+            ack_price = getattr(passive_order_ack, "price", 0.0) or maker_req.price or 0.0
+            ack_qty = getattr(passive_order_ack, "quantity", 0.0) or ctx.long_quantity
+            ack_state = getattr(passive_order_ack, "state", None)
+            rest_timeout_ms = self.maker_entry_rest_timeout_ms
+            if rest_timeout_ms <= 0:
+                rest_timeout_ms = 6000
+            passive_order = PendingPassiveOrder(
+                order_id=ack_order_id,
+                client_order_id=ack_cid,
+                limit_price=float(ack_price) if ack_price > 0 else None,
+                target_quantity=float(ack_qty),
+                accepted_at_ms=ack_accepted_at_ms,
+                timeout_at_ms=ack_accepted_at_ms + rest_timeout_ms,
+                cancel_requested_at_ms=0,
+                last_progress_state=ack_state if ack_state is not None else PassiveOrderState.UNKNOWN,
+            )
+
         return PendingEntry(
             pending_id=ctx.entry_id,
             symbol=ctx.symbol,
@@ -479,6 +508,7 @@ class EntrySyncExecutor:
             repost_count=next_repost_count,
             zero_fill_since_ms=zero_fill_since_ms,
             maker_leg="long" if maker_is_long else "short",
+            passive_order=passive_order,
         )
 
     # ------------------------------------------------------------------

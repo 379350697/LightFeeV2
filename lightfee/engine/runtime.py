@@ -2672,6 +2672,11 @@ class LiveRuntime:
                         "runtime.maker_event_tick_error", {"error": str(e)}
                     )
 
+            # --- Passive maker maintenance (V1: maintain_pending_entry_passive_order) ---
+            # Active tick-level lifecycle for resting maker orders:
+            # progress query → try_window check → rest_timeout → cancel → abort/finalize
+            await self._maintain_pending_entry_passive_orders(now_ms)
+
             # --- Post-tick housekeeping ---
             await self._post_tick_housekeeping(now_ms)
 
@@ -2687,6 +2692,296 @@ class LiveRuntime:
                 self.state.lifecycle, poll_ms, active_count
             )
             await asyncio.sleep(min(poll_ms, active_poll_ms) / 1000.0)
+
+    # ------------------------------------------------------------------
+    # Passive entry maintenance (V1 maintain_pending_entry_passive_order — Fix 1)
+    # ------------------------------------------------------------------
+
+    async def _maintain_pending_entry_passive_orders(self, now_ms: int) -> None:
+        """V1: maintain_pending_entry_passive_order() at tick level.
+
+        Active maintenance for each pending entry with a resting passive maker
+        order.  Replicates the V1 passive maker lifecycle:
+
+        1. Query passive order progress from the venue adapter
+        2. Apply progress (update fill quantities, progress state)
+        3. maker_try_window_fill_shortfall — cancel if elapsed > 1500ms with
+           fill ratio below 25% (zero-fill protection)
+        4. maker_entry_rest_timeout — cancel if elapsed > 6000ms
+        5. Post-cancel: zero-fill → abort, partial-fill → hedge → finalize,
+           uncertain → retain for reconciliation
+
+        V1 ref: entry_sync.rs:1554 maintain_pending_entry_passive_order()
+        """
+        if not self._venue_adapters:
+            return
+
+        strategy = self.config.strategy
+        try_window_ms = getattr(strategy, "maker_try_window_ms", 0) or 0
+        min_fill_ratio = getattr(strategy, "maker_min_fill_ratio", 0.25) or 0.25
+        rest_timeout_ms = getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000
+        poll_ms = getattr(strategy, "maker_entry_progress_poll_ms", 500) or 500
+
+        resolved: list[str] = []
+
+        for entry_id, pending in list(self.state.pending_entries.items()):
+            po = pending.passive_order
+            if po is None:
+                continue
+            maker_venue = pending.maker_venue()
+
+            # Guard: must have a valid order ID to query/cancel
+            if not po.order_id:
+                continue
+
+            # Respect poll interval — V1 next_progress_poll_ms gate
+            if pending.next_progress_poll_ms > 0 and now_ms < pending.next_progress_poll_ms:
+                continue
+
+            # Already in reconciliation flow
+            if po.cancel_requested() and po.maker_completed():
+                continue
+
+            adapter = self._venue_adapters.get(maker_venue)
+            if adapter is None:
+                continue
+
+            # --- Step 1: Query passive order progress ---
+            progress = None
+            try:
+                progress = await adapter.query_passive_order_progress(
+                    symbol=pending.symbol,
+                    order_id=po.order_id,
+                    client_order_id=po.client_order_id or None,
+                    side=pending.maker_side(),
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "passive_maintenance.progress_query_error",
+                    {"entry_id": entry_id, "symbol": pending.symbol,
+                     "venue": str(maker_venue), "error": str(exc)},
+                )
+                pending.next_progress_poll_ms = now_ms + poll_ms
+                continue
+
+            # --- Step 2: Apply progress to pending entry ---
+            if progress is not None:
+                po.last_progress_state = progress.state
+                if progress.cumulative_quantity > pending.maker_leg_filled:
+                    prev_filled = pending.maker_leg_filled
+                    pending.maker_leg_filled = progress.cumulative_quantity
+                    if progress.average_price > 0:
+                        pending.maker_fill_price = progress.average_price
+                    self.journal.append(
+                        "passive_maintenance.maker_progress",
+                        {
+                            "entry_id": entry_id, "symbol": pending.symbol,
+                            "prev_filled": prev_filled,
+                            "new_filled": progress.cumulative_quantity,
+                            "state": progress.state.value,
+                            "venue": str(maker_venue),
+                        },
+                    )
+
+            # --- Step 3: maker_try_window_fill_shortfall ---
+            if (
+                po.cancel_requested_at_ms <= 0
+                and not po.maker_completed()
+                and try_window_ms > 0
+            ):
+                shortfall = self._maker_try_window_fill_shortfall(
+                    pending, po, now_ms, try_window_ms, min_fill_ratio
+                )
+                if shortfall is not None:
+                    elapsed_ms, fill_ratio = shortfall
+                    cancel_issued = await self._cancel_pending_passive_order(
+                        pending, entry_id, po, adapter, now_ms,
+                        "maker_try_window_fill_ratio_below_threshold",
+                    )
+                    if cancel_issued:
+                        self.journal.append(
+                            "passive_maintenance.cancel_try_window",
+                            {
+                                "entry_id": entry_id, "symbol": pending.symbol,
+                                "elapsed_ms": elapsed_ms,
+                                "fill_ratio": round(fill_ratio, 4),
+                                "try_window_ms": try_window_ms,
+                                "min_fill_ratio": min_fill_ratio,
+                            },
+                        )
+                        continue
+
+            # --- Step 4: maker_entry_rest_timeout ---
+            if (
+                po.cancel_requested_at_ms <= 0
+                and not po.maker_completed()
+                and po.timed_out(now_ms)
+            ):
+                cancel_issued = await self._cancel_pending_passive_order(
+                    pending, entry_id, po, adapter, now_ms,
+                    "maker_entry_rest_timeout_exceeded",
+                )
+                if cancel_issued:
+                    self.journal.append(
+                        "passive_maintenance.cancel_rest_timeout",
+                        {
+                            "entry_id": entry_id, "symbol": pending.symbol,
+                            "timeout_at_ms": po.timeout_at_ms,
+                            "now_ms": now_ms,
+                            "rest_timeout_ms": rest_timeout_ms,
+                        },
+                    )
+                    continue
+
+            # --- Step 5: Post-cancel terminal handling ---
+            if po.cancel_requested() and po.maker_completed():
+                cancel_elapsed = now_ms - po.cancel_requested_at_ms
+                if not pending.has_any_fill():
+                    removed = await self._abort_pending_entry_fail_closed(
+                        pending, entry_id,
+                        f"passive_maker_{po.last_progress_state.value}_zero_fill",
+                    )
+                    if removed:
+                        resolved.append(entry_id)
+                elif pending.missing_hedge_quantity() <= 1e-9:
+                    await self._finalize_pending_entry(pending, entry_id, now_ms)
+                    resolved.append(entry_id)
+                elif cancel_elapsed > 30_000:
+                    # Stale cancel with partial fill — force finalize what we have
+                    await self._finalize_pending_entry(pending, entry_id, now_ms)
+                    resolved.append(entry_id)
+                else:
+                    # Drive hedge for partial fill
+                    hedge_driven = await self._drive_missing_hedge_live(
+                        pending, entry_id, now_ms
+                    )
+                    if hedge_driven and pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
+                        await self._finalize_pending_entry(pending, entry_id, now_ms)
+                        resolved.append(entry_id)
+                    else:
+                        pending.next_progress_poll_ms = now_ms + poll_ms
+            else:
+                # Still resting — schedule next poll
+                pending.next_progress_poll_ms = now_ms + poll_ms
+
+        for eid in resolved:
+            self.state.pending_entries.pop(eid, None)
+
+    def _maker_try_window_fill_shortfall(
+        self,
+        pending,
+        po,
+        now_ms: int,
+        try_window_ms: int,
+        min_fill_ratio: float,
+    ) -> Optional[tuple]:
+        """V1: maker_try_window_fill_shortfall (entry_sync.rs:577-601).
+
+        Only triggers for zero-fill orders.  Returns (elapsed_ms, fill_ratio)
+        when the maker order has been resting beyond try_window_ms and the
+        fill ratio is below min_fill_ratio.
+        """
+        if try_window_ms == 0:
+            return None
+        if pending.has_any_fill():
+            return None
+        if po.cancel_requested():
+            return None
+        if po.maker_completed():
+            return None
+        if po.accepted_at_ms <= 0:
+            return None
+        elapsed_ms = max(0, now_ms - po.accepted_at_ms)
+        if elapsed_ms < try_window_ms:
+            return None
+        target = po.target_quantity
+        if target <= 1e-9:
+            return None
+        fill_ratio = pending.maker_leg_filled / target
+        if fill_ratio + 1e-9 >= min_fill_ratio:
+            return None
+        return (elapsed_ms, fill_ratio)
+
+    async def _cancel_pending_passive_order(
+        self,
+        pending,
+        entry_id: str,
+        po,
+        adapter,
+        now_ms: int,
+        reason: str,
+    ) -> bool:
+        """V1: cancel_pending_entry_passive_order (entry_sync.rs:2401-2445).
+
+        1. Returns false if already canceled or maker completed
+        2. Checks maker venue request budget
+        3. Issues cancel_passive_order on the venue adapter
+        4. Sets cancel_requested_at_ms and updates next_progress_poll_ms
+        5. Returns true if cancel was successfully issued
+        """
+        if po.cancel_requested() or po.maker_completed():
+            return False
+
+        # Rate-limit gate
+        maker_venue = pending.maker_venue()
+        if not self._try_consume_maker_venue_budget(maker_venue, now_ms):
+            pending.next_progress_poll_ms = (
+                now_ms + self.config.strategy.maker_venue_budget_window_ms
+            )
+            self.journal.append(
+                "passive_maintenance.cancel_budget_delayed",
+                {"entry_id": entry_id, "venue": str(maker_venue),
+                 "reason": reason},
+            )
+            return False
+
+        try:
+            await adapter.cancel_passive_order(
+                symbol=pending.symbol,
+                order_id=po.order_id,
+                client_order_id=po.client_order_id or None,
+            )
+        except Exception as exc:
+            self.journal.append(
+                "passive_maintenance.cancel_error",
+                {"entry_id": entry_id, "symbol": pending.symbol,
+                 "venue": str(maker_venue), "error": str(exc)},
+            )
+            # V1: on cancel error, query progress to see if order is already
+            # done — then apply terminal state if confirmed
+            try:
+                progress = await adapter.query_passive_order_progress(
+                    symbol=pending.symbol,
+                    order_id=po.order_id,
+                    client_order_id=po.client_order_id or None,
+                    side=pending.maker_side(),
+                )
+                if progress is not None and progress.state.is_terminal():
+                    po.last_progress_state = progress.state
+                    self.journal.append(
+                        "passive_maintenance.cancel_error_resolved_via_progress",
+                        {"entry_id": entry_id,
+                         "resolved_state": progress.state.value},
+                    )
+                    # Continue to post-cancel handling in next cycle
+                    pending.next_progress_poll_ms = now_ms + (
+                        self.config.strategy.maker_entry_rest_timeout_ms or 6000
+                    ) // 2
+                    return False
+            except Exception:
+                pass
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            return False
+
+        po.cancel_requested_at_ms = now_ms
+        pending.next_progress_poll_ms = now_ms + self.config.strategy.maker_venue_budget_window_ms
+        self.journal.append(
+            "passive_maintenance.cancel_issued",
+            {"entry_id": entry_id, "symbol": pending.symbol,
+             "venue": str(maker_venue), "reason": reason,
+             "cancel_requested_at_ms": now_ms},
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Reconciliation (V1 recovery/reconciliation live path — Fix 3)

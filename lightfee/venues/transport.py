@@ -2597,6 +2597,9 @@ class VenueTransport(MarketDataClient):
                     body["type"] = "LIMIT"
                     body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
+                # V1: Binance/Aster newClientOrderId max 36 chars (FAPI constraint)
+                if request.client_order_id:
+                    body["newClientOrderId"] = request.client_order_id[:36]
                 preflight["position_mode"] = (
                     "hedge" if fapi_hedge_mode else "one_way"
                 )
@@ -3574,7 +3577,7 @@ class VenueTransport(MarketDataClient):
         if quantized_price is not None and float(quantized_price) > 0:
             body["price"] = _format_decimal(float(quantized_price))
         if cid:
-            body["newClientOrderId"] = cid
+            body["newClientOrderId"] = cid[:36]  # V1: Binance/Aster 36-char limit
         if self._fapi_position_hedge_mode:
             body["positionSide"] = self._fapi_position_side(
                 request.side, request.reduce_only

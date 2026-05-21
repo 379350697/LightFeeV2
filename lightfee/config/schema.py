@@ -207,6 +207,7 @@ class StrategyConfig:
     hyperliquid_submit_ack_min_samples: int = 3
     maker_try_window_ms: int = 1500
     maker_min_fill_ratio: float = 0.25
+    maker_entry_progress_poll_ms: int = 500  # V1: 1000; V2: 500 for tighter active polling
     maker_initial_slice_ratio: float = 0.5
     entry_max_initial_clip_ratio: float = 0.8
     maker_leg_default: str = "buy"
