@@ -16,6 +16,7 @@ from lightfee.core.domain import (
     PassiveOrderState,
     PositionSnapshot,
     Side,
+    TimeInForce,
     Venue,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
@@ -1894,6 +1895,9 @@ class TestRealPathAbortCleanupDeadline:
         assert [
             call.client_order_id for call in hedge_adapter._place_order_calls
         ] == [first_cid, second_cid]
+        assert [
+            call.time_in_force for call in hedge_adapter._place_order_calls
+        ] == [TimeInForce.IOC, TimeInForce.IOC]
 
     @pytest.mark.asyncio
     async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):

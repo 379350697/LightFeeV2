@@ -30,6 +30,7 @@ from lightfee.core.domain import (
     OrderRequest,
     PositionSnapshot,
     Side,
+    TimeInForce,
     Venue,
     VenueMarketQuote,
     VenueMarketSnapshot,
@@ -78,6 +79,32 @@ def _missing_hyperliquid_signing_dependencies() -> list[str]:
         if importlib.util.find_spec(module_name) is None:
             missing.append(package_name)
     return missing
+
+
+def _derive_hyperliquid_account_address(wallet_private_key: str) -> str:
+    """V1 Hyperliquid parity: account defaults to the wallet address."""
+    missing = _missing_hyperliquid_signing_dependencies()
+    if missing:
+        return ""
+    try:
+        from eth_account import Account
+
+        return str(Account.from_key(wallet_private_key).address)
+    except Exception as exc:
+        raise ValueError(
+            "failed to derive hyperliquid account_address from wallet_private_key"
+        ) from exc
+
+
+def _normalize_hyperliquid_credential(credential: LiveCredential) -> LiveCredential:
+    if credential.account_address or not credential.wallet_private_key:
+        return credential
+    return replace(
+        credential,
+        account_address=_derive_hyperliquid_account_address(
+            credential.wallet_private_key
+        ),
+    )
 
 
 def _floor_to_step(value: float, step: float) -> float:
@@ -227,18 +254,21 @@ def _build_bybit_order_body(
     passive: bool,
     hedge_mode: bool,
 ) -> dict[str, Any]:
+    use_limit = passive or (
+        request.price is not None and request.time_in_force != TimeInForce.IOC
+    )
     body: dict[str, Any] = {
         "category": "linear",
         "symbol": venue_sym,
         "side": _bybit_side(request.side),
-        "orderType": "Limit" if (passive or request.price is not None) else "Market",
+        "orderType": "Limit" if use_limit else "Market",
         "qty": _format_quantity(request.quantity),
         "reduceOnly": bool(request.reduce_only),
         "positionIdx": _bybit_position_idx(request, hedge_mode=hedge_mode),
     }
     if request.client_order_id:
         body["orderLinkId"] = request.client_order_id
-    if request.price is not None and request.price > 0:
+    if use_limit and request.price is not None and request.price > 0:
         body["price"] = _format_price(request.price)
     if passive:
         body["timeInForce"] = "PostOnly"
@@ -980,6 +1010,8 @@ class VenueTransport(MarketDataClient):
         rate_limiter: Optional[EndpointRateLimiter] = None,
     ) -> None:
         super().__init__(spec, exchange_http_timeout_ms=exchange_http_timeout_ms, rate_limiter=rate_limiter)
+        if mode == "live" and spec.requires_wallet_key and credential is not None:
+            credential = _normalize_hyperliquid_credential(credential)
         self.mode = mode
         self._credential = credential
         self._hl_meta_cache: dict[str, int] = {}
@@ -2561,7 +2593,7 @@ class VenueTransport(MarketDataClient):
                     )
                 elif request.reduce_only:
                     body["reduceOnly"] = "true"
-                if request.price is not None:
+                if request.price is not None and request.time_in_force != TimeInForce.IOC:
                     body["type"] = "LIMIT"
                     body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
@@ -2609,7 +2641,7 @@ class VenueTransport(MarketDataClient):
                     "ordType": "market",
                     "sz": _format_decimal(contract_qty),
                 }
-                if request.price is not None:
+                if request.price is not None and request.time_in_force != TimeInForce.IOC:
                     body["ordType"] = "limit"
                     body["px"] = _format_decimal(request.price)
                 if request.client_order_id:
@@ -2636,7 +2668,10 @@ class VenueTransport(MarketDataClient):
                 )
                 if "qty" in body:
                     body["qty"] = _format_decimal(request.quantity)
-                if request.price is not None:
+                if (
+                    request.price is not None
+                    and request.time_in_force != TimeInForce.IOC
+                ):
                     body["price"] = _format_decimal(request.price)
             elif spec.venue_id == Venue.BITGET:
                 body["marginCoin"] = "USDT"
@@ -2647,11 +2682,16 @@ class VenueTransport(MarketDataClient):
                 signed_size = int(request.quantity)
                 if request.side == Side.SELL:
                     signed_size = -signed_size
+                gate_ioc = request.time_in_force == TimeInForce.IOC
                 body = {
                     "contract": venue_sym,
                     "size": signed_size,
-                    "price": _format_decimal(request.price) if request.price is not None else "0",
-                    "tif": "gtc" if request.price is not None else "ioc",
+                    "price": (
+                        _format_decimal(request.price)
+                        if request.price is not None and not gate_ioc
+                        else "0"
+                    ),
+                    "tif": "gtc" if request.price is not None and not gate_ioc else "ioc",
                 }
                 if request.reduce_only:
                     body["reduce_only"] = True
@@ -2685,17 +2725,13 @@ class VenueTransport(MarketDataClient):
                     # Override the placeholder asset index with the resolved one
                     action["orders"][0]["a"] = asset_index
 
-                    vault_addr = None
-                    if self._credential and self._credential.account_address:
-                        vault_addr = self._credential.account_address
-
                     body = build_hyperliquid_exchange_payload(
                         action=action,
                         private_key_hex=(
                             self._credential.wallet_private_key
                             if self._credential else ""
                         ),
-                        vault_address=vault_addr,
+                        vault_address=None,
                         is_mainnet=True,
                     )
                 else:
@@ -2719,8 +2755,6 @@ class VenueTransport(MarketDataClient):
                     }
                     if request.client_order_id:
                         body["cloid"] = request.client_order_id
-                    if self._credential and self._credential.account_address:
-                        body["vaultAddress"] = self._credential.account_address
 
             if "body_field_names" not in preflight:
                 preflight["body_field_names"] = sorted(body.keys())

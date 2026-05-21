@@ -32,7 +32,7 @@ class HyperliquidAdapter(VenueAdapter):
         self._transport = VenueTransport(spec=spec, mode=mode, credential=credential,
                                          exchange_http_timeout_ms=exchange_http_timeout_ms,
                                          rate_limiter=rate_limiter)
-        self._credential = credential
+        self._credential = self._transport._credential
 
     @property
     def venue(self) -> Venue:

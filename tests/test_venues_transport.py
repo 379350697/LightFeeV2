@@ -19,11 +19,13 @@ from lightfee.core.domain import (
     OrderRequest,
     PositionSnapshot,
     Side,
+    TimeInForce,
     Venue,
     VenueMarketQuote,
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.config.schema import TradeCredentials, VenueConfig
 from lightfee.venues.common import (
     floor_to_step,
     normalize_order_quantity,
@@ -503,6 +505,24 @@ class TestLiveModeFailFast:
 class TestHyperliquidLiveOrderNowSupported:
     """Hyperliquid live order now works with EIP-712 signing."""
 
+    def test_registry_derives_account_address_from_wallet_when_env_omitted(self, monkeypatch):
+        from eth_account import Account
+        from lightfee.venues.registry import build_adapter
+
+        wallet_key = "0x" + "1" * 64
+        monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
+        vc = VenueConfig(venue="hyperliquid")
+        vc.live.trade_credentials = TradeCredentials(
+            wallet_private_key_env="LF_TEST_HL_WALLET",
+            account_address_env=None,
+        )
+
+        adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
+
+        expected = Account.from_key(wallet_key).address
+        assert adapter._transport._credential.account_address == expected
+        assert adapter._credential.account_address == expected
+
     @pytest.mark.asyncio
     async def test_live_place_order_signs_with_wallet_private_key_not_api_secret(self, monkeypatch):
         wallet_key = "0x" + "1" * 64
@@ -520,6 +540,7 @@ class TestHyperliquidLiveOrderNowSupported:
 
         def fake_build_exchange_payload(**kwargs):
             captured["private_key_hex"] = kwargs["private_key_hex"]
+            captured["vault_address"] = kwargs["vault_address"]
             captured["action"] = kwargs["action"]
             return {"action": kwargs["action"], "signature": {"r": "", "s": "", "v": 27}}
 
@@ -567,6 +588,7 @@ class TestHyperliquidLiveOrderNowSupported:
             await transport.close()
 
         assert captured["private_key_hex"] == wallet_key
+        assert captured["vault_address"] is None
         from lightfee.venues.hyperliquid_signing import hyperliquid_cloid_for_client_order
         order = captured["action"]["orders"][0]
         assert order["c"] == hyperliquid_cloid_for_client_order(req.client_order_id)
@@ -626,7 +648,8 @@ class TestHyperliquidLiveOrderNowSupported:
         body = captured["body"]
         order = body["action"]["orders"][0]
         assert "cloid" not in body
-        assert sorted(body.keys()) == ["action", "nonce", "signature", "vaultAddress"]
+        assert "vaultAddress" not in body
+        assert sorted(body.keys()) == ["action", "nonce", "signature"]
         assert order["c"] == hyperliquid_cloid_for_client_order(req.client_order_id)
         assert order["c"].startswith("0x")
         assert len(order["c"]) == 34
@@ -2918,6 +2941,39 @@ class TestBybitOrderBody:
         assert seen_body["orderLinkId"] == "lfv2-hedge-001"
         assert seen_body["positionIdx"] == 2  # Sell in hedge mode
         assert "quantity" not in seen_body
+
+    @pytest.mark.asyncio
+    async def test_bybit_ioc_hedge_ignores_price_hint_and_does_not_rest(self):
+        """V1 Bybit place_order is market; price is only a hedge price hint."""
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bybit/place_order_ack_only.json"))
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="IRYSUSDT",
+            side=Side.SELL,
+            quantity=661.0,
+            price=0.0363,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="e857d13457b6fd02acbe3cd760dc281366b2",
+        )
+
+        from lightfee.core.domain import OrderFill
+        transport._parse_order_fill = lambda raw, req, sym, ms: OrderFill(
+            venue=Venue.BYBIT, symbol=sym, side=req.side,
+            quantity=req.quantity, price=0.0363, order_id="123",
+        )
+        await transport.place_order(req)
+
+        assert seen_body["orderType"] == "Market"
+        assert "price" not in seen_body
+        assert seen_body["positionIdx"] == 2
+        assert seen_body["orderLinkId"] == req.client_order_id
 
     @pytest.mark.asyncio
     async def test_bybit_reduce_only_sell_closes_long_position_idx(self):

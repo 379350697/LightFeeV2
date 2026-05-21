@@ -412,34 +412,10 @@ class LocalL2DataPlane:
                 self._pre_snapshot_buffers[key] = buf
             cap = policy_for_venue(update.venue).pre_snapshot_buffer_cap
             if len(buf) >= cap:
-                # Overflow → rebuild required (V1: mark_status(Rebuilding), set_last_sequence(None))
-                first_seq = buf[0].update.sequence if buf else 0
-                last_seq = buf[-1].update.sequence if buf else 0
-                buf.clear()
-                book.sequence = 0
-                book.last_update_id = 0
-                book.fault_reason = "pre_snapshot_buffer_overflow"
-                book.transition_to_rebuilding(now_ms)
-                self._runtime.handle_runtime_failure(
-                    update.venue, update.symbol,
-                    RuntimeFaultKind.SEQUENCE_GAP,
-                    "pre_snapshot_buffer_overflow", now_ms,
-                )
-                self._journal.append(
-                    "runtime.local_l2_buffer_overflow_rebuild",
-                    self._rebuild_evidence(
-                        venue=update.venue, symbol=update.symbol,
-                        rebuild_trigger="pre_snapshot_buffer_overflow",
-                        buffered_count=cap,
-                        first_buffered_sequence=first_seq,
-                        last_buffered_sequence=last_seq,
-                        incoming_sequence=update.sequence,
-                        incoming_previous_sequence=update.previous_sequence,
-                        policy_buffer_cap=cap,
-                        reason_class="buffer_overflow",
-                    ),
-                )
-                return []
+                # V1 Aster/Binance semantics: keep the newest window while a
+                # REST snapshot is in flight. The replay boundary decides if a
+                # rebuild is needed; overflow itself is not terminal evidence.
+                buf.popleft()
             gen = self._current_stream_generation(update.venue, update.symbol)
             buf.append(_BufferedUpdate(generation=gen, observed_at_ms=now_ms, update=update))
             return []
@@ -634,7 +610,15 @@ class LocalL2DataPlane:
                 else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
                 else bu.update.sequence
             )
-            if first_id <= expected <= bu.update.sequence:
+            previous_link_matches_anchor = (
+                (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
+                and bu.update.previous_sequence == previous_sequence
+            )
+            if (
+                first_id <= previous_sequence <= bu.update.sequence
+                or first_id <= expected <= bu.update.sequence
+                or previous_link_matches_anchor
+            ):
                 start_index = i
                 break
 

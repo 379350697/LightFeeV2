@@ -8,7 +8,7 @@ from typing import Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.domain import OrderFill, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
@@ -4228,6 +4228,7 @@ class LiveRuntime:
                 quantity=normalized,
                 price=hedge_price,
                 post_only=False,
+                time_in_force=TimeInForce.IOC,
                 reduce_only=False,
                 client_order_id=recovery_cid,
             )
@@ -4355,6 +4356,7 @@ class LiveRuntime:
                 quantity=normalized,
                 price=hedge_price,
                 post_only=False,
+                time_in_force=TimeInForce.IOC,
                 reduce_only=False,
                 client_order_id=hedge_cloid,
             )
