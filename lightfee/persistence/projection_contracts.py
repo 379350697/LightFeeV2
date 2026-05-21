@@ -166,6 +166,7 @@ JOURNAL_ONLY_DIAGNOSTIC_KINDS: frozenset[str] = frozenset({
     "runtime.active_tick_error",
     "runtime.adapter_shutdown_error",
     "runtime.candidates_tradeable",
+    "scan.shortlist_ready",
     "runtime.entry_dispatched",
     "runtime.entry_dispatch_error",
     "runtime.entry_skipped_duplicate_client_order_id",

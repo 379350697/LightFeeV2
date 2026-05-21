@@ -1758,6 +1758,19 @@ class LiveRuntime:
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
                 )
+                # V1: scan.shortlist_ready — basic shortlist generated, before post-shortlist processing
+                self.journal.append(
+                    "scan.shortlist_ready",
+                    {
+                        "candidate_count": len(tradeable),
+                        "tradeable_count": len(tradeable),
+                        "shortlist_candidate_count": len(tradeable),
+                        "shortlist_tradeable_count": len(tradeable),
+                        "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
+                        "best_pair_id": tradeable[0].pair_id if tradeable else None,
+                        "ts_ms": now_ms,
+                    },
+                )
                 # V1: refresh tracked entry local L2 opportunities per tick
                 # select_tracked_entry_local_l2_opportunities → primary + shadow
                 if self.config.strategy.local_l2_enabled:
