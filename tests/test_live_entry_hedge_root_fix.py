@@ -1695,10 +1695,12 @@ class _FakeVenueAdapter:
         self.position: PositionSnapshot | None = None
         self.place_order_fill: OrderFill | None = None
         self.place_order_raises: Exception | None = None
+        self.order_fill_reconciliation: OrderFillReconciliation | None = None
         self.passive_progress: PassiveOrderProgress | None = None
         self.query_passive_progress_raises: Exception | None = None
         self._place_order_calls: list[OrderRequest] = []
         self._fetch_position_calls: list[str] = []
+        self._fetch_order_fill_reconciliation_calls: list[tuple[str, str, str | None]] = []
         self._query_passive_progress_calls: list[tuple[str, str, str | None]] = []
         self._cancel_passive_order_calls: list[tuple[str, str, str | None]] = []
 
@@ -1723,6 +1725,17 @@ class _FakeVenueAdapter:
             quantity=0.0,
             price=0.0,
         )
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> OrderFillReconciliation | None:
+        self._fetch_order_fill_reconciliation_calls.append(
+            (symbol, order_id, client_order_id)
+        )
+        return self.order_fill_reconciliation
 
     async def cancel_order(self, request: OrderRequest) -> None:
         pass
@@ -1788,6 +1801,59 @@ class TestRealPathAbortCleanupDeadline:
     """Real-path tests that call LiveRuntime._abort_pending_entry,
     _abort_pending_entry_fail_closed, _cleanup_failed_leg_exposure,
     and _reconcile_pending_state directly — not simulated state changes."""
+
+    @pytest.mark.asyncio
+    async def test_uncertain_hedge_submit_reconciles_fill_by_client_id(self, tmp_path):
+        """V1 reconciles a hedge submit error by CID before leaving it pending."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted but fill not confirmed",
+        )
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="IRYSUSDT",
+            side=Side.SELL,
+            quantity=661.0,
+            average_price=0.0362,
+            order_id="hedge-oid-1",
+            client_order_id="unused-before-submit",
+            filled_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        pending = PendingEntry(
+            pending_id="entry-reconcile-hedge-error",
+            symbol="IRYSUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=661.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=661.0,
+            maker_fill_price=0.0363,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-1",
+            maker_client_order_id="maker-cid-1",
+        )
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+
+        assert driven is True
+        assert pending.hedge_leg_filled == 661.0
+        assert pending.hedge_order_id == "hedge-oid-1"
+        assert pending.hedge_fill_price == 0.0362
+        assert pending.hedge_inflight is None
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("IRYSUSDT", "", pending.hedge_client_order_id)
+        ]
 
     @pytest.mark.asyncio
     async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):

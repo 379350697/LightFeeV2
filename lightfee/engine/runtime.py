@@ -4300,6 +4300,54 @@ class LiveRuntime:
             # V1: retain inflight on UNCERTAIN so reconciliation can query it;
             # only clear on REJECTED where we know the order never reached the exchange.
             submitted_inflight = pending.hedge_inflight
+            try:
+                reconciliation = await adapter.fetch_order_fill_reconciliation(
+                    pending.symbol,
+                    "",
+                    hedge_cloid,
+                )
+            except Exception as reconcile_error:
+                reconciliation = None
+                self.journal.append(
+                    "pending_entry.hedge_submit_reconcile_error",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "hedge_client_order_id": hedge_cloid,
+                        "error": str(reconcile_error),
+                    },
+                )
+            if reconciliation is not None and getattr(reconciliation, "quantity", 0.0) > 0:
+                fill_qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+                pending.hedge_leg_filled += fill_qty
+                pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
+                pending.hedge_fill_price = float(
+                    getattr(reconciliation, "average_price", 0.0)
+                    or getattr(reconciliation, "price", 0.0)
+                    or pending.hedge_fill_price
+                    or 0.0
+                )
+                pending.hedge_inflight = None
+                self._flush_adapter_order_diagnostics(adapter)
+                self.journal.append(
+                    "pending_entry.hedge_submit_result",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "outcome": "filled",
+                        "reconciled": True,
+                        "hedge_fill_quantity": fill_qty,
+                        "hedge_fill_price": pending.hedge_fill_price,
+                        "hedge_order_id": pending.hedge_order_id,
+                        "hedge_client_order_id": hedge_cloid,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "missing_hedge_remaining": pending.missing_hedge_quantity(),
+                    },
+                )
+                if pending.missing_hedge_quantity() <= 1e-9:
+                    pending.uncertain_outcome = False
+                    pending.outcome = "filled"
+                return True
             if e.is_rejected:
                 pending.hedge_inflight = None
             self._flush_adapter_order_diagnostics(adapter)
