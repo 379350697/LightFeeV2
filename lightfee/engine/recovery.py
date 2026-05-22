@@ -1125,6 +1125,46 @@ def clear_stale_fail_closed_if_recovery_clean(state: EngineState, journal: Journ
     return True
 
 
+def clear_stale_recovery_block_if_recovery_clean(
+    state: EngineState,
+    journal: Journal | None = None,
+) -> bool:
+    """Clear a stale recovery block after its recovery work is gone.
+
+    Mirrors the startup clean-snapshot recovery path: a recovery_blocked_reason
+    is authoritative while recovery work still exists, but it must not keep the
+    runtime in risk_only after all open/pending/passive work has been resolved.
+    Fail-closed recovery blocks remain latched until the fail-closed path clears.
+    """
+    if not state.recovery_blocked_reason:
+        return False
+    if state.risk_mode == GlobalRiskMode.FAIL_CLOSED:
+        return False
+    if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
+        return False
+    if needs_reconciliation(state):
+        return False
+
+    previous_reason = state.recovery_blocked_reason
+    previous_lifecycle = state.lifecycle.value
+    previous_risk_mode = state.risk_mode.value
+    state.lifecycle = EngineLifecycle.RUNNING
+    state.risk_mode = GlobalRiskMode.RUNNING
+    state.recovery_blocked_reason = None
+    state.recovery_blocked_at_ms = 0
+    state.last_error = None
+    state.global_risk_reason = None
+
+    if journal is not None:
+        _try_emit_recovery(journal, "runtime.stale_recovery_block_cleared", {
+            "reason": "clean_recovery_work_resolved",
+            "previous_recovery_blocked_reason": previous_reason,
+            "previous_lifecycle": previous_lifecycle,
+            "previous_risk_mode": previous_risk_mode,
+        })
+    return True
+
+
 def _try_emit_recovery(journal: Journal, kind: str, payload: dict[str, Any]) -> None:
     """Emit a recovery diagnostic event through the journal.
 

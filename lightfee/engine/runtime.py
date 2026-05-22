@@ -37,6 +37,7 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
     has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
+    clear_stale_recovery_block_if_recovery_clean,
     build_persistent_state_view,
 )
 from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
@@ -258,14 +259,10 @@ class LiveRuntime:
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
 
         classified_recovery_state = classify_startup_recovery_state(self.state)
-        if (
-            self.state.recovery_blocked_reason
-            and classified_recovery_state == "clean"
-            and self.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
-            and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+        if classified_recovery_state == "clean" and clear_stale_recovery_block_if_recovery_clean(
+            self.state,
+            self.journal,
         ):
-            from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
-            clear_risk_mode_for_recovery(self.state)
             classified_recovery_state = "clean"
 
         recovery_class = (
@@ -365,6 +362,7 @@ class LiveRuntime:
 
         # Phase 8 – Recover pending passive closes
         await self._recover_passive_closes()
+        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
 
         self.journal.append(
             "runtime.started",
@@ -5153,6 +5151,7 @@ class LiveRuntime:
         # V1 latch parity: a fail-closed state with no operator override,
         # no recovery block, and no recovery work is stale even after live
         # entry/recovery cleanup, not only during startup snapshot recovery.
+        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
         clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
 
         # V1: ensure private WS workers are running for live adapters
@@ -5175,6 +5174,7 @@ class LiveRuntime:
 
         # Detect false-clean state where exchanges hold positions but V2 missed them.
         await self._maybe_recover_clean_live_positions(now_ms)
+        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(

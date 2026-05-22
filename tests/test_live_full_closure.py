@@ -17,7 +17,8 @@ import pytest
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
+from lightfee.engine.passive_close import PassiveCloseExecutor
+from lightfee.engine.state import EngineState, OpenPosition, PendingEntry, PendingPassiveClose
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import (
     FakeVenueAdapter,
@@ -269,6 +270,39 @@ class TestLiveFullClosure:
             records = runtime.journal.read_all()
             assert any(
                 r.get("kind") == "runtime.stale_fail_closed_cleared"
+                for r in records
+            )
+
+    @pytest.mark.asyncio
+    async def test_housekeeping_clears_clean_recovery_block_after_passive_orphan_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+            runtime.passive_close_executor = PassiveCloseExecutor({}, runtime.journal)
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = (
+                "startup_recovery_pending_work_without_open_positions"
+            )
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.pending_passive_closes["entry-orphan"] = PendingPassiveClose(
+                position_id="entry-orphan",
+                reason="funding_capture",
+            )
+
+            await runtime._maybe_tick_passive_close(5000)
+            await runtime._post_tick_housekeeping(5000)
+
+            assert runtime.state.pending_passive_closes == {}
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            records = runtime.journal.read_all()
+            assert any(
+                r.get("kind") == "runtime.stale_recovery_block_cleared"
                 for r in records
             )
 
