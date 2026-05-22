@@ -379,6 +379,69 @@ class TestFallbackToAggressive:
         )
         assert result is True
 
+    def test_fallback_clears_when_live_positions_are_flat(self):
+        """V1: flat pending passive close is reconciled before retrying fallback."""
+        journal = _open_journal()
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class FlatAdapter(VenueAdapter):
+            def __init__(self, venue):
+                self._venue = venue
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                raise AssertionError("flat recovery must not submit new close orders")
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue, symbol=symbol,
+                    side=Side.BUY, quantity=0.0, entry_price=0.0,
+                    observed_at_ms=1000,
+                )
+
+        long_adapter = FlatAdapter(Venue.ASTER)
+        short_adapter = FlatAdapter(Venue.BYBIT)
+        mock_close_exec = MagicMock(spec=CloseExecutor)
+        mock_close_exec.execute_close = AsyncMock()
+
+        executor = PassiveCloseExecutor(
+            {Venue.ASTER: long_adapter, Venue.BYBIT: short_adapter}, journal,
+        )
+        executor.set_close_executor(mock_close_exec)
+        state = EngineState()
+        position = _make_position(
+            symbol="PROVEUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=82.0,
+            short_quantity=82.0,
+            matched_quantity=82.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=82.0,
+            chunk_quantities=[82.0],
+            phase_state=PassivePhaseState(phase=PassiveExecutionPhase.DUAL_TAKER),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        mock_close_exec.execute_close.assert_not_called()
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "recovery.flat" in kinds
+
 
 # ---------------------------------------------------------------------------
 # Recovery probe

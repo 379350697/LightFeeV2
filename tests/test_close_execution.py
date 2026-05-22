@@ -73,6 +73,10 @@ def _make_uncertain_error(reason: str = "order timeout") -> OrderSubmitError:
     return OrderSubmitError(SubmitFailureClass.UNCERTAIN, reason)
 
 
+def _make_rejected_error(reason: str = "order rejected") -> OrderSubmitError:
+    return OrderSubmitError(SubmitFailureClass.REJECTED, reason)
+
+
 # ---------------------------------------------------------------------------
 # CloseBalance
 # ---------------------------------------------------------------------------
@@ -713,6 +717,125 @@ class TestCloseChunkExecutor:
             # Should reference clientOrderIds
             if pc.short_uncertain:
                 assert pc.short_client_order_id != ""
+
+    @pytest.mark.asyncio
+    async def test_short_reject_stops_before_long_and_does_not_emit_closed(self):
+        """V1: if the first close leg is rejected, do not submit the opposite leg."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        short_adapter = FakeVenueAdapter(Venue.BYBIT, default_fill_price=0.2911)
+        long_adapter = FakeVenueAdapter(Venue.ASTER, default_fill_price=0.2908)
+        short_adapter.place_order_outcomes = [
+            _make_rejected_error("bybit order failed: bybit retCode=10001 retMsg=risk limit")
+        ]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.ASTER: long_adapter, Venue.BYBIT: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        pos = _make_position(
+            symbol="PROVEUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=82.0,
+            short_quantity=82.0,
+            matched_quantity=82.0,
+            long_entry_price=0.2908,
+            short_entry_price=0.2911,
+        )
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        close = await executor.execute_close(
+            pos, "funding_capture", 2000,
+            long_price_hint=0.2908, short_price_hint=0.2911,
+            total_quantity=82.0, state=state,
+        )
+
+        assert close is None
+        assert short_adapter.place_order_call_count == 1
+        assert long_adapter.place_order_call_count == 0
+        assert pos.position_id in state.open_positions
+        assert state.pending_closes == {}
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "order.rejected" in kinds
+        assert "exit.closed" not in kinds
+        assert "exit.partial_closed" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_bybit_duplicate_close_id_registers_pending_reconciliation(self):
+        """V1 idempotency: duplicate orderLinkId is uncertain until reconciled."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+        from lightfee.venues.cid import compact_client_order_id
+
+        class DuplicateBybitAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT, default_fill_price=0.2911)
+                self.reconciliation_lookups = []
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return None
+
+        short_adapter = DuplicateBybitAdapter()
+        long_adapter = FakeVenueAdapter(Venue.ASTER, default_fill_price=0.2908)
+        short_adapter.place_order_outcomes = [
+            _make_rejected_error(
+                "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate"
+            )
+        ]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.ASTER: long_adapter, Venue.BYBIT: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        pos = _make_position(
+            symbol="PROVEUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=82.0,
+            short_quantity=82.0,
+            matched_quantity=82.0,
+            long_entry_price=0.2908,
+            short_entry_price=0.2911,
+        )
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+        expected_short_cid = compact_client_order_id(pos.position_id, "exit_short")
+
+        close = await executor.execute_close(
+            pos, "funding_capture", 2000,
+            long_price_hint=0.2908, short_price_hint=0.2911,
+            total_quantity=82.0, state=state,
+        )
+
+        assert close is not None
+        assert close.long_close_qty == 0.0
+        assert close.short_close_qty == 0.0
+        assert short_adapter.reconciliation_lookups == [
+            ("PROVEUSDT", "", expected_short_cid)
+        ]
+        assert long_adapter.place_order_call_count == 0
+        assert len(state.pending_closes) == 1
+        pending_close = next(iter(state.pending_closes.values()))
+        assert pending_close.short_uncertain is True
+        assert pending_close.short_client_order_id == expected_short_cid
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.pending_close_registered" in kinds
+        assert "exit.closed" not in kinds
+        assert "exit.partial_closed" not in kinds
 
     @pytest.mark.asyncio
     async def test_multichunk_pnl_aggregation_correct(self):

@@ -177,6 +177,11 @@ def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
     }
 
 
+def _is_bybit_duplicate_order_link_id(reason: str) -> bool:
+    lower = reason.lower()
+    return "110072" in lower or ("orderlinkedid" in lower and "duplicate" in lower)
+
+
 def _is_terminal_reduce_only(error_class: dict[str, Any], reason: str) -> bool:
     """V1: determine if a reduce-only rejection is truly terminal.
 
@@ -587,7 +592,7 @@ class CloseExecutor:
         state: Any | None = None,
         short_stage: str = "exit_short",
         long_stage: str = "exit_long",
-    ) -> CloseExecution:
+    ) -> CloseExecution | None:
         """Execute a full close for an open position.
 
         Submits both legs (short=buy, long=sell) as reduce-only IOC taker orders.
@@ -703,6 +708,34 @@ class CloseExecutor:
                         return build_close_execution_from_legs(
                             position, total_chunks, short_legs, long_legs,
                         )
+            elif short_result["outcome"] == "rejected":
+                chunk_short_cids.append(short_cid)
+                chunk_short_order_ids.append(short_result.get("order_id", ""))
+                self.journal.append(
+                    "exit.close_chunk_submitted",
+                    {
+                        "position_id": position.position_id,
+                        "chunk_index": chunk_idx,
+                        "total_chunks": total_chunks,
+                        "chunk_quantity": chunk_qty,
+                        "short_client_order_id": short_cid,
+                        "long_client_order_id": "",
+                        "short_outcome": "rejected",
+                        "long_outcome": "not_submitted",
+                        "reason": short_result.get("reason", ""),
+                    },
+                )
+                self.journal.append(
+                    "execution.close_failed",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "reason": reason,
+                        "failed_leg": "short",
+                        "error": short_result.get("reason", "close leg rejected"),
+                    },
+                )
+                return None
 
             long_req = OrderRequest(
                 venue=position.long_venue, symbol=position.symbol,
@@ -813,6 +846,18 @@ class CloseExecutor:
                 delay_s = self.config.close_chunk_min_interval_ms / 1000.0
                 await asyncio.sleep(delay_s)
 
+        if not short_legs and not long_legs and not (any_short_uncertain or any_long_uncertain):
+            self.journal.append(
+                "execution.close_failed",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": reason,
+                    "error": "close produced no confirmed fills",
+                },
+            )
+            return None
+
 
         # Aggregate PnL across all chunks
         close = build_close_execution_from_legs(
@@ -869,28 +914,29 @@ class CloseExecutor:
 
         pnl_attr = build_exit_pnl_attribution(position, close)
 
-        # V1: exit.closed is a critical event — synchronous durability
-        self.journal.append_critical(
-            now_ms,
-            "exit.closed",
-            {
-                "position_id": position.position_id,
-                "reason": reason,
-                "long_closed_qty": long_closed,
-                "short_closed_qty": short_closed,
-                "long_uncertain": any_long_uncertain,
-                "short_uncertain": any_short_uncertain,
-                "price_pnl": pnl_attr["price_pnl_quote"],
-                "funding_pnl_quote": pnl_attr["funding_quote"],
-                "entry_fee_quote": pnl_attr["entry_fee_quote"],
-                "exit_fee_quote": pnl_attr["exit_fee_quote"],
-                "net_quote": pnl_attr["net_quote"],
-                "close_id": close_id,
-                "chunk_count": total_chunks,
-                "long_client_order_id": ", ".join(chunk_long_cids),
-                "short_client_order_id": ", ".join(chunk_short_cids),
-            },
-        )
+        if long_closed > 1e-12 or short_closed > 1e-12:
+            # V1: exit.closed is a critical event — synchronous durability
+            self.journal.append_critical(
+                now_ms,
+                "exit.closed",
+                {
+                    "position_id": position.position_id,
+                    "reason": reason,
+                    "long_closed_qty": long_closed,
+                    "short_closed_qty": short_closed,
+                    "long_uncertain": any_long_uncertain,
+                    "short_uncertain": any_short_uncertain,
+                    "price_pnl": pnl_attr["price_pnl_quote"],
+                    "funding_pnl_quote": pnl_attr["funding_quote"],
+                    "entry_fee_quote": pnl_attr["entry_fee_quote"],
+                    "exit_fee_quote": pnl_attr["exit_fee_quote"],
+                    "net_quote": pnl_attr["net_quote"],
+                    "close_id": close_id,
+                    "chunk_count": total_chunks,
+                    "long_client_order_id": ", ".join(chunk_long_cids),
+                    "short_client_order_id": ", ".join(chunk_short_cids),
+                },
+            )
 
         return close
 
@@ -967,7 +1013,7 @@ class CloseExecutor:
 
         # Emit partial close when position remains open
         # V1: exit.partial_closed is a critical event
-        if position.matched_quantity > 1e-12:
+        if matched_closed > 1e-12 and position.matched_quantity > 1e-12:
             self.journal.append_critical(
                 now_ms,
                 "exit.partial_closed",
@@ -1131,6 +1177,82 @@ class CloseExecutor:
             if result["outcome"] == "rejected":
                 # V1: check for terminal reduce-only success (venue already flat)
                 reason = result.get("reason", "")
+                if request.venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(reason):
+                    adapter = self.adapters.get(request.venue)
+                    reconciliation = None
+                    if adapter is not None:
+                        try:
+                            reconciliation = await adapter.fetch_order_fill_reconciliation(
+                                request.symbol, "", request.client_order_id,
+                            )
+                        except Exception as exc:
+                            self.journal.append(
+                                "exit.close_duplicate_client_order_reconcile_failed",
+                                {
+                                    "position_id": position_id,
+                                    "leg": leg,
+                                    "client_order_id": request.client_order_id,
+                                    "error": str(exc),
+                                },
+                            )
+                    recon_qty = getattr(reconciliation, "quantity", 0.0) or 0.0
+                    if recon_qty > 1e-12:
+                        fill = OrderFill(
+                            venue=request.venue,
+                            symbol=request.symbol,
+                            side=request.side,
+                            quantity=float(recon_qty),
+                            price=float(
+                                getattr(
+                                    reconciliation,
+                                    "price",
+                                    getattr(reconciliation, "average_price", request.price or 0.0),
+                                )
+                                or 0.0
+                            ),
+                            order_id=getattr(reconciliation, "order_id", "") or "",
+                            client_order_id=(
+                                getattr(reconciliation, "client_order_id", None)
+                                or request.client_order_id
+                            ),
+                            fee_quote=getattr(reconciliation, "fee_quote", None),
+                            filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+                        )
+                        self.journal.append(
+                            "order.filled",
+                            {
+                                "position_id": position_id,
+                                "leg": leg,
+                                "venue": request.venue.value,
+                                "symbol": request.symbol,
+                                "side": request.side.value,
+                                "order_id": fill.order_id,
+                                "client_order_id": fill.client_order_id,
+                                "quantity": fill.quantity,
+                                "price": fill.price,
+                                "fee_quote": fill.fee_quote,
+                                "filled_at_ms": fill.filled_at_ms,
+                                "reason": "duplicate_client_order_reconciled",
+                            },
+                        )
+                        return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
+
+                    self.journal.append(
+                        "exit.close_duplicate_client_order_pending_reconcile",
+                        {
+                            "position_id": position_id,
+                            "leg": leg,
+                            "client_order_id": request.client_order_id,
+                            "reason": reason,
+                        },
+                    )
+                    return {
+                        "outcome": "uncertain",
+                        "fill": None,
+                        "reason": reason,
+                        "order_id": "",
+                    }
+
                 # --- Structured classification (Gate first, then generic) ---
                 error_class = _classify_close_leg_error(reason)
                 is_terminal = _is_terminal_reduce_only(error_class, reason)

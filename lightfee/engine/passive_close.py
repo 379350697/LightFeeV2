@@ -1719,6 +1719,29 @@ class PassiveCloseExecutor:
         if total_remaining <= 1e-9:
             return True
 
+        if await self._probe_live_flatness(pending, self._adapters):
+            state.pending_passive_closes.pop(pending.position_id, None)
+            state.open_positions.pop(pending.position_id, None)
+            self._journal.append(
+                "recovery.flat",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "source": "pending_passive_close_flat_probe",
+                },
+            )
+            self._journal.append(
+                "runtime.position_drift_corrected",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "old_quantity": position.matched_quantity,
+                    "new_quantity": 0.0,
+                    "source": "pending_passive_close_flat_probe",
+                },
+            )
+            return True
+
         if self._close_executor is None:
             self._journal.append(
                 "exit.passive_close_fallback_unavailable",
@@ -1954,16 +1977,27 @@ class PassiveCloseExecutor:
 
         try:
             pos = await adapter.fetch_position(symbol)
-            if pos is not None and pos.quantity < 1e-9:
+            qty = getattr(pos, "quantity", None)
+            if (
+                isinstance(qty, (int, float))
+                and math.isfinite(float(qty))
+                and abs(float(qty)) < 1e-9
+            ):
                 return True
         except Exception:
             pass
 
         try:
             all_positions = await adapter.fetch_all_positions()
-            if all_positions is not None:
+            if isinstance(all_positions, (list, tuple)):
                 for pos in all_positions:
-                    if pos.symbol == symbol and pos.quantity > 1e-9:
+                    qty = getattr(pos, "quantity", None)
+                    if (
+                        getattr(pos, "symbol", None) == symbol
+                        and isinstance(qty, (int, float))
+                        and math.isfinite(float(qty))
+                        and abs(float(qty)) > 1e-9
+                    ):
                         return False
                 return True
         except Exception:
