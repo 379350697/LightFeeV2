@@ -394,6 +394,7 @@ class PassivePhaseState:
     cycle_attempt: int = 1
     cycle_started_at_ms: int = 0
     zero_fill_cycles_in_phase: int = 0
+    maker_submit_attempt: int = 0
     maker_order_id: str = ""
     maker_client_order_id: str = ""
     maker_resting_limit_price: Optional[float] = None
@@ -738,6 +739,7 @@ class EngineState:
                         "cycle_attempt": ppc.phase_state.cycle_attempt,
                         "cycle_started_at_ms": ppc.phase_state.cycle_started_at_ms,
                         "zero_fill_cycles_in_phase": ppc.phase_state.zero_fill_cycles_in_phase,
+                        "maker_submit_attempt": ppc.phase_state.maker_submit_attempt,
                         "maker_order_id": ppc.phase_state.maker_order_id,
                         "maker_client_order_id": ppc.phase_state.maker_client_order_id,
                         "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,

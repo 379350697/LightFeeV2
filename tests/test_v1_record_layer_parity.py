@@ -592,8 +592,11 @@ class TestV1CloseReconciliation:
         await executor.execute_close(pos, "profit_take", 5000)
 
         assert okx_ada.last_request.client_order_id is not None
-        assert "close" in okx_ada.last_request.client_order_id
-        assert "-short" in okx_ada.last_request.client_order_id
+        cid = okx_ada.last_request.client_order_id
+        # CIDs are compact V1 format (lf...): ~20 chars, well under all limits
+        assert cid.startswith("lf")
+        assert 18 <= len(cid) <= 24
+        assert all(c.isalnum() for c in cid)
 
     @pytest.mark.asyncio
     async def test_uncertain_close_creates_pending_close_with_client_order_id(self, adapters, journal):
@@ -621,7 +624,10 @@ class TestV1CloseReconciliation:
         for pc in state.pending_closes.values():
             assert pc.short_uncertain is True
             assert pc.short_client_order_id is not None
-            assert "short" in pc.short_client_order_id
+            cid = pc.short_client_order_id
+            assert cid.startswith("lf")
+            assert 18 <= len(cid) <= 24
+            assert all(c.isalnum() for c in cid)
 
 
 # ===========================================================================

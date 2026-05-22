@@ -658,9 +658,15 @@ class TestCloseChunkExecutor:
         # Each chunk should have a distinct clientOrderId
         assert len(all_short_cids) >= 2
         assert len(all_long_cids) >= 2
-        # All IDs should contain "_chunk_"
+        # CIDs are compact V1 format (lf...): ~20 chars, well under 36 limit
         for cid in all_short_cids:
-            assert "_chunk_" in cid
+            assert cid.startswith("lf")
+            assert 18 <= len(cid) <= 24
+            assert all(c.isalnum() for c in cid)
+        for cid in all_long_cids:
+            assert cid.startswith("lf")
+            assert 18 <= len(cid) <= 24
+            assert all(c.isalnum() for c in cid)
 
     @pytest.mark.asyncio
     async def test_chunk_uncertain_creates_pending_close_with_chunk_info(self):

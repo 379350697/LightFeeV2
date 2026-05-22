@@ -6564,6 +6564,8 @@ class LiveRuntime:
                         reason_str,
                         long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
                         short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                        short_stage="exit_short",
+                        long_stage="exit_long",
                     )
                     if pending is not None:
                         # Immediately drive one cycle

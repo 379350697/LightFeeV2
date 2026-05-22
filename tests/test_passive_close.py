@@ -934,7 +934,8 @@ class TestFallbackResidualReal:
         captured_total_qty = []
 
         async def fake_execute_close(position, reason, now_ms, long_price_hint,
-                                     short_price_hint, total_quantity, state):
+                                     short_price_hint, total_quantity, state,
+                                     short_stage="", long_stage=""):
             captured_total_qty.append(total_quantity)
             return CloseExecution(
                 position_id=position.position_id, reason=reason,
@@ -1034,7 +1035,8 @@ class TestFallbackResidualReal:
 
         # Mock returns zero-fill close with no PendingClose created
         async def fake_zero_fill(position, reason, now_ms, long_price_hint,
-                                 short_price_hint, total_quantity, state):
+                                 short_price_hint, total_quantity, state,
+                             short_stage="", long_stage=""):
             return CloseExecution(
                 position_id=position.position_id, reason=reason,
                 long_close_price=0.0, short_close_price=0.0,
@@ -1748,7 +1750,8 @@ class TestDualTakerDriveConsumption:
         captured_total_qty = []
 
         async def fake_execute_close(position, reason, now_ms, long_price_hint,
-                                     short_price_hint, total_quantity, state):
+                                     short_price_hint, total_quantity, state,
+                                     short_stage="", long_stage=""):
             captured_total_qty.append(total_quantity)
             return CloseExecution(
                 position_id=position.position_id, reason=reason,
@@ -1818,7 +1821,8 @@ class TestDualTakerDriveConsumption:
         captured_total_qty = []
 
         async def fake_execute_close(position, reason, now_ms, long_price_hint,
-                                     short_price_hint, total_quantity, state):
+                                     short_price_hint, total_quantity, state,
+                                     short_stage="", long_stage=""):
             captured_total_qty.append(total_quantity)
             return CloseExecution(
                 position_id=position.position_id, reason=reason,

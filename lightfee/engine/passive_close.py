@@ -36,6 +36,7 @@ from lightfee.engine.close_executor import (
     close_leg_exchange_min_notional_violation,
     compute_close_chunks,
 )
+from lightfee.venues.cid import compact_client_order_id
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
     ActiveMakerLeg,
@@ -879,8 +880,17 @@ class PassiveCloseExecutor:
         if adapter is None:
             return False
 
-        close_id = f"pclose-{position.position_id}-{self._now_ms()}"
-        maker_cid = f"{close_id}-maker{pending.current_chunk_suffix()}"
+        # V1 stage resolution: maker_stage from pending's short/long_stage
+        maker_stage = pending.long_stage if maker_leg_label == "long" else pending.short_stage
+        attempt = pending.phase_state.maker_submit_attempt
+        stage = (
+            f"{maker_stage}_maker{pending.current_chunk_suffix()}"
+            f"_phase_{pending.phase_state.phase.value}"
+            f"_cycle_{pending.phase_state.cycle_attempt}"
+            f"_attempt_{attempt}"
+        )
+        maker_cid = compact_client_order_id(position.position_id, stage)
+        pending.phase_state.maker_submit_attempt = attempt + 1
 
         request = OrderRequest(
             venue=maker_venue,
@@ -1060,8 +1070,13 @@ class PassiveCloseExecutor:
                 error=f"no adapter for {hedge_venue.value}",
             )
 
-        close_id = f"pclose-{position.position_id}-{self._now_ms()}"
-        hedge_cid = f"{close_id}-hedge{pending.current_chunk_suffix()}"
+        # V1 stage resolution: hedge_stage is opposite of maker_stage
+        hedge_stage = (
+            pending.short_stage if hedge_leg_label == "short"
+            else pending.long_stage
+        )
+        stage = f"{hedge_stage}_hedge{pending.current_chunk_suffix()}"
+        hedge_cid = compact_client_order_id(position.position_id, stage)
 
         request = OrderRequest(
             venue=hedge_venue,
@@ -1766,6 +1781,8 @@ class PassiveCloseExecutor:
                 short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
                 total_quantity=paired_residual,
                 state=state,
+                short_stage=pending.short_stage,
+                long_stage=pending.long_stage,
             )
             # Check if aggressive close actually executed
             if close_result is None:

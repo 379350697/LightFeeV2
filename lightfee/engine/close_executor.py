@@ -26,6 +26,7 @@ from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
 from lightfee.engine.state import CloseLegRecord, OpenPosition, PendingClose
 from lightfee.persistence.journal import Journal
+from lightfee.venues.cid import compact_client_order_id
 from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
 
 
@@ -584,6 +585,8 @@ class CloseExecutor:
         short_price_hint: float = 0.0,
         total_quantity: float | None = None,
         state: Any | None = None,
+        short_stage: str = "exit_short",
+        long_stage: str = "exit_long",
     ) -> CloseExecution:
         """Execute a full close for an open position.
 
@@ -638,8 +641,14 @@ class CloseExecutor:
             chunk_suffix = f"_chunk_{chunk_idx + 1}" if total_chunks > 1 else ""
             chunk_start_ms = now_ms
 
-            short_cid = f"{close_id}-short{chunk_suffix}"
-            long_cid = f"{close_id}-long{chunk_suffix}"
+            short_cid = compact_client_order_id(
+                position.position_id,
+                f"{short_stage}{chunk_suffix}",
+            )
+            long_cid = compact_client_order_id(
+                position.position_id,
+                f"{long_stage}{chunk_suffix}",
+            )
 
             # Submit short close first (V1: short leg first per chunk)
             short_req = OrderRequest(
@@ -1368,14 +1377,13 @@ class CloseExecutor:
 
         Returns (fill, client_order_id, submit_started_at_ms) or None.
         """
-        from lightfee.venues.cid import generate_exchange_cid
 
         adapter = self.adapters.get(venue)
         if adapter is None:
             return None
 
-        client_order_id = generate_exchange_cid(
-            f"{position_id}:{stage}:{symbol}", "c", venue,
+        client_order_id = compact_client_order_id(
+            position_id, f"{stage}:{symbol}",
         )
         submit_ms = wall_clock_now_ms()
 
