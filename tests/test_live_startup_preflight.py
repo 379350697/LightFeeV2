@@ -808,7 +808,7 @@ class TestRuntimePreflight:
 
     @pytest.mark.asyncio
     async def test_startup_blocks_unpaired_live_exchange_position_when_flatten_fails(self):
-        """If mismatch flattening fails, V2 must fail closed with visible reason."""
+        """If all V1 mismatch-flatten attempts fail, runtime fail-closes visibly."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             binance = FakeVenueAdapter(Venue.BINANCE)
@@ -824,7 +824,11 @@ class TestRuntimePreflight:
             ]
             binance.default_position_side = Side.BUY
             binance.default_position_qty = 0.05
-            binance.place_order_outcomes = [make_uncertain_error("cleanup timeout")]
+            binance.place_order_outcomes = [
+                make_uncertain_error("cleanup timeout 1"),
+                make_uncertain_error("cleanup timeout 2"),
+                make_uncertain_error("cleanup timeout 3"),
+            ]
 
             runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
 
@@ -832,9 +836,45 @@ class TestRuntimePreflight:
             await runtime.stop()
 
             assert len(runtime.state.open_positions) == 0
-            assert binance.place_order_call_count == 1
+            assert binance.place_order_call_count == 3
             assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
             assert runtime.state.recovery_blocked_reason == "live_position_mismatch_flatten_failed"
+
+    @pytest.mark.asyncio
+    async def test_startup_live_mismatch_retries_uncertain_cleanup_like_v1(self):
+        """V1 recovery flatten retries uncertain cleanup before fail-closing."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            live_position = PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=0.05,
+                entry_price=65000.0,
+                observed_at_ms=1700000010000,
+            )
+            binance.position_snapshots = [
+                live_position,  # startup probe
+                live_position,  # cleanup attempt 1 prefetch
+                live_position,  # attempt 1 post-error verification still not flat
+                live_position,  # cleanup attempt 2 prefetch
+            ]
+            binance.place_order_outcomes = [
+                make_uncertain_error("okx-style ack accepted before fill visibility"),
+                # Retry succeeds with a normal taker fill.
+            ]
+
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+
+            await runtime.start()
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 0
+            assert binance.place_order_call_count == 2
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
 
     @pytest.mark.asyncio
     async def test_active_position_drift_flattens_excess_leg_and_updates_quantity(self):

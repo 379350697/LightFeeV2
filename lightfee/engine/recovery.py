@@ -1133,12 +1133,10 @@ def clear_stale_recovery_block_if_recovery_clean(
 
     Mirrors the startup clean-snapshot recovery path: a recovery_blocked_reason
     is authoritative while recovery work still exists, but it must not keep the
-    runtime in risk_only after all open/pending/passive work has been resolved.
-    Fail-closed recovery blocks remain latched until the fail-closed path clears.
+    runtime in risk_only/fail_closed after all open/pending/passive work has
+    been resolved.
     """
     if not state.recovery_blocked_reason:
-        return False
-    if state.risk_mode == GlobalRiskMode.FAIL_CLOSED:
         return False
     if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
         return False

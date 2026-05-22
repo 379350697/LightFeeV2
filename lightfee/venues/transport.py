@@ -2384,7 +2384,10 @@ class VenueTransport(MarketDataClient):
                     params["productType"] = "USDT-FUTURES"
                     params["marginCoin"] = "USDT"
                 raw = await self._request("GET", spec.position_path, params=params, private=True)
-            positions = self._parse_all_positions(raw, now_ms)
+            if spec.venue_id == Venue.OKX:
+                positions = await self._parse_all_positions_okx(raw, now_ms)
+            else:
+                positions = self._parse_all_positions(raw, now_ms)
             # Populate position cache for supervisor private position confirmation
             for pos in positions:
                 self._position_cache[pos.symbol] = (pos, now_ms)
@@ -2447,7 +2450,16 @@ class VenueTransport(MarketDataClient):
                 return snapshot
 
             raw = await self._request("GET", spec.position_path, params=params, private=True)
-            snapshot = self._parse_position(raw, venue_sym, now_ms)
+            if spec.venue_id == Venue.OKX:
+                contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
+                snapshot = self._parse_position(
+                    raw,
+                    symbol,
+                    now_ms,
+                    contract_size_override=contract_size,
+                )
+            else:
+                snapshot = self._parse_position(raw, venue_sym, now_ms)
             self._position_cache[symbol] = (snapshot, now_ms)
             return snapshot
         except TransportError:
@@ -2474,8 +2486,70 @@ class VenueTransport(MarketDataClient):
             )
         return positions
 
+    async def _parse_all_positions_okx(
+        self,
+        raw: Any,
+        now_ms: int,
+    ) -> list[PositionSnapshot]:
+        spec = self._spec
+        positions: list[PositionSnapshot] = []
+        for row in _venue_position_rows(raw, Venue.OKX):
+            venue_symbol = _position_row_symbol(row, Venue.OKX)
+            if not venue_symbol:
+                continue
+            payload = _position_row_parse_payload(row, Venue.OKX)
+            contract_size = await self._okx_contract_size_for_venue_symbol(venue_symbol)
+            pos = self._parse_position(
+                payload,
+                _canonical_position_symbol(spec, venue_symbol),
+                now_ms,
+                contract_size_override=contract_size,
+            )
+            if abs(pos.quantity) <= 1e-9:
+                continue
+            positions.append(
+                replace(pos, symbol=_canonical_position_symbol(spec, venue_symbol))
+            )
+        return positions
+
+    async def _okx_contract_size_for_venue_symbol(self, venue_symbol: str) -> float:
+        """Resolve OKX ctVal used to convert position contracts into base size."""
+        spec = self._spec
+        metadata_candidates: list[str] = [venue_symbol]
+        if spec.symbol_from_venue is not None:
+            try:
+                canonical = spec.symbol_from_venue(venue_symbol)
+                metadata_candidates.append(canonical)
+            except Exception:
+                pass
+
+        for key in metadata_candidates:
+            metadata = self._symbol_metadata.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            for field in ("ct_val", "ctVal", "contract_size", "contractSize"):
+                value = _safe_float(metadata.get(field), default=0.0)
+                if value > 0:
+                    return value
+
+        try:
+            symbol_rule = await get_symbol_rules_cache().get(self, Venue.OKX, venue_symbol)
+            ct_val = float(getattr(symbol_rule, "ct_val", 0.0) or 0.0)
+            if ct_val > 0:
+                return ct_val
+        except Exception:
+            pass
+
+        fallback = float(getattr(spec, "contract_size", 0.0) or 0.0)
+        return fallback if fallback > 0 else 1.0
+
     def _parse_position(
-        self, raw: dict[str, Any], symbol: str, now_ms: int
+        self,
+        raw: dict[str, Any],
+        symbol: str,
+        now_ms: int,
+        *,
+        contract_size_override: float | None = None,
     ) -> PositionSnapshot:
         """Dispatch to venue-specific position parser.
 
@@ -2498,7 +2572,12 @@ class VenueTransport(MarketDataClient):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
         if spec.venue_id == Venue.OKX:
-            result = _parse_okx_position(raw, venue_sym, now_ms, contract_size=spec.contract_size)
+            contract_size = (
+                contract_size_override
+                if contract_size_override is not None
+                else spec.contract_size
+            )
+            result = _parse_okx_position(raw, venue_sym, now_ms, contract_size=contract_size)
             if result.quantity > 0 or not isinstance(raw, dict):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
@@ -2789,22 +2868,19 @@ class VenueTransport(MarketDataClient):
                     await self._refresh_okx_pos_mode()
                 pos_side = self._okx_pos_side(request.side, request.reduce_only)
 
-                # V1: OKX opening orders use base_qty / ctVal -> contracts. Reduce-only
-                # cleanup receives position size from OKX, which is already contract units.
+                # V1: OKX order quantities are always canonical base size at the
+                # engine boundary; wire sz is contracts = base_qty / ctVal.
                 rules_cache = get_symbol_rules_cache()
                 symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
-                ct_val = float(getattr(symbol_rule, 'ct_val', 0) or 0)
+                ct_val = float(
+                    getattr(symbol_rule, 'ct_val', 0)
+                    or getattr(spec, "contract_size", 1)
+                    or 1
+                )
                 lot_sz = float(getattr(symbol_rule, 'qty_step', 0) or 0)
                 base_qty = float(request.quantity)
 
-                if request.reduce_only:
-                    contract_qty = (
-                        _floor_to_step(base_qty, lot_sz)
-                        if lot_sz > 0
-                        else base_qty
-                    )
-                    quantity_units = "contracts"
-                elif ct_val > 0 and lot_sz > 0:
+                if ct_val > 0 and lot_sz > 0:
                     contract_qty = _floor_to_step(base_qty / ct_val, lot_sz)
                     quantity_units = "base_to_contracts"
                 elif ct_val > 0:
@@ -2968,6 +3044,28 @@ class VenueTransport(MarketDataClient):
                 fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
             except OrderSubmitError as exc:
                 order_id, client_order_id = self._extract_order_identifiers(raw)
+                if (
+                    spec.venue_id == Venue.OKX
+                    and exc.class_ == SubmitFailureClass.UNCERTAIN
+                    and order_id
+                ):
+                    fill = await self._okx_ack_fill_from_preflight(
+                        request=request,
+                        venue_sym=venue_sym,
+                        preflight=preflight,
+                        order_id=order_id,
+                        client_order_id=client_order_id or request.client_order_id or "",
+                        now_ms=now_ms,
+                    )
+                    result_payload = dict(preflight)
+                    result_payload["order_id"] = fill.order_id
+                    result_payload["client_order_id"] = (
+                        fill.client_order_id or request.client_order_id or ""
+                    )
+                    result_payload["response_classification"] = "ack_accepted"
+                    self._record_order_diagnostic("order.submit_result", result_payload)
+                    result_recorded = True
+                    return fill
                 result_payload = dict(preflight)
                 result_payload["order_id"] = order_id
                 result_payload["client_order_id"] = client_order_id or request.client_order_id or ""
@@ -3014,6 +3112,61 @@ class VenueTransport(MarketDataClient):
             raise
         except Exception as e:
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
+
+    async def _okx_ack_fill_from_preflight(
+        self,
+        *,
+        request: OrderRequest,
+        venue_sym: str,
+        preflight: dict[str, Any],
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> OrderFill:
+        """V1-compatible OKX market-order ack projection.
+
+        OKX REST acks often contain only ordId/clOrdId. Rust V1 treats an
+        accepted market order as the submitted base quantity and lets later
+        position reconciliation prove any residual. Keep the stricter
+        uncertain behavior for other venues.
+        """
+        contract_qty = float(preflight.get("contract_qty") or 0.0)
+        ct_val = float(preflight.get("ct_val") or 0.0)
+        quantity = (
+            contract_qty * ct_val
+            if contract_qty > 0 and ct_val > 0
+            else float(request.quantity)
+        )
+
+        price = float(
+            request.price_hint
+            or request.mark_price_hint
+            or request.price
+            or 0.0
+        )
+        if price <= 0:
+            try:
+                snapshot = await self.fetch_market_snapshot([request.symbol])
+                for quote in snapshot.quotes:
+                    if quote.symbol not in (request.symbol, venue_sym):
+                        continue
+                    candidate = quote.ask if request.side == Side.BUY else quote.bid
+                    if candidate > 0:
+                        price = float(candidate)
+                        break
+            except Exception:
+                price = 0.0
+
+        return OrderFill(
+            venue=Venue.OKX,
+            symbol=venue_sym,
+            side=request.side,
+            quantity=quantity,
+            price=price,
+            order_id=order_id,
+            client_order_id=client_order_id or request.client_order_id,
+            filled_at_ms=now_ms,
+        )
 
     def _parse_order_fill(
         self,

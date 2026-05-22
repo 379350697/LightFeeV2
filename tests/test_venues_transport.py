@@ -1670,7 +1670,7 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert "key-secret" not in serialized
 
     @pytest.mark.asyncio
-    async def test_okx_reduce_only_uses_contract_position_quantity_without_ctval_conversion(self, monkeypatch):
+    async def test_okx_reduce_only_converts_base_quantity_and_ack_returns_fill(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
         class FakeRulesCache:
@@ -1714,24 +1714,82 @@ class TestOrderSubmitDiagnosticsAndQuantization:
             venue=Venue.OKX,
             symbol="STABLEUSDT",
             side=Side.SELL,
-            quantity=78.0,
+            quantity=500.0,
             reduce_only=True,
             client_order_id="okx-close-stable",
+            price_hint=0.049,
+            observed_at_ms=123456,
         )
 
-        with pytest.raises(OrderSubmitError) as exc_info:
-            await transport.place_order(req)
+        fill = await transport.place_order(req)
 
-        assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
         assert sent[-1]["path"] == spec.order_path
         assert sent[-1]["body"]["instId"] == "STABLE-USDT-SWAP"
         assert sent[-1]["body"]["reduceOnly"] == "true"
-        assert sent[-1]["body"]["sz"] == "78"
+        assert sent[-1]["body"]["sz"] == "5"
+        assert fill.venue == Venue.OKX
+        assert fill.quantity == pytest.approx(500.0)
+        assert fill.price == pytest.approx(0.049)
+        assert fill.order_id == "okx_ack_1"
+        assert fill.client_order_id == "okx-close-stable"
         attempt = next(e["payload"] for e in transport.order_diagnostics if e["kind"] == "order.submit_attempt")
         assert attempt["ct_val"] == 100.0
-        assert attempt["base_qty"] == 78.0
-        assert attempt["contract_qty"] == 78.0
-        assert attempt["body_sanitized"]["sz"] == "78"
+        assert attempt["base_qty"] == 500.0
+        assert attempt["contract_qty"] == 5.0
+        assert attempt["quantity_units"] == "base_to_contracts"
+        assert attempt["body_sanitized"]["sz"] == "5"
+        result = next(e["payload"] for e in transport.order_diagnostics if e["kind"] == "order.submit_result")
+        assert result["response_classification"] == "ack_accepted"
+
+    @pytest.mark.asyncio
+    async def test_okx_fetch_position_uses_instrument_ct_val_for_base_quantity(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="okx-key", api_secret="okx-secret", api_passphrase="okx-pass"),
+        )
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            assert path == transport._spec.position_path
+            assert params == {"instId": "CHIP-USDT-SWAP"}
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "pos": "5",
+                        "posSide": "net",
+                        "avgPx": "0.04794",
+                    }
+                ],
+            }
+
+        transport._request = fake_request
+
+        pos = await transport.fetch_position("CHIPUSDT")
+
+        assert pos.symbol == "CHIP-USDT-SWAP"
+        assert pos.side == Side.BUY
+        assert pos.quantity == pytest.approx(500.0)
+        assert pos.entry_price == pytest.approx(0.04794)
 
     def test_bybit_preflight_preserves_exact_step_quantity_without_float_slip(self):
         transport = VenueTransport(spec=bybit_spec(), mode="paper")

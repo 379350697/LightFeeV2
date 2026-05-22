@@ -250,18 +250,27 @@ class LiveRuntime:
 
         # Build recovery dedup index from recovered pending state
         self._recovery_dedup_index = build_recovery_dedup_index(self.state)
+        startup_live_probe_ms = wall_clock_now_ms()
         await self._recover_startup_live_positions(
             self._startup_position_probe_symbols(symbol_info),
-            wall_clock_now_ms(),
+            startup_live_probe_ms,
+        )
+        current_startup_recovery_block = (
+            bool(self.state.recovery_blocked_reason)
+            and self.state.recovery_blocked_at_ms >= startup_live_probe_ms
         )
 
         # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
 
         classified_recovery_state = classify_startup_recovery_state(self.state)
-        if classified_recovery_state == "clean" and clear_stale_recovery_block_if_recovery_clean(
-            self.state,
-            self.journal,
+        if (
+            classified_recovery_state == "clean"
+            and not current_startup_recovery_block
+            and clear_stale_recovery_block_if_recovery_clean(
+                self.state,
+                self.journal,
+            )
         ):
             classified_recovery_state = "clean"
 
@@ -362,7 +371,8 @@ class LiveRuntime:
 
         # Phase 8 – Recover pending passive closes
         await self._recover_passive_closes()
-        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
+        if not current_startup_recovery_block:
+            clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
 
         self.journal.append(
             "runtime.started",
@@ -3835,9 +3845,9 @@ class LiveRuntime:
     async def _cleanup_failed_leg_exposure(
         self, venue, symbol: str, entry_id: str, stage: str
     ) -> bool | None:
-        """V1: cleanup_failed_leg_exposure — flatten residual position on one venue.
+        """V1: flatten residual startup/recovery exposure on one venue.
 
-        entry.rs:4101-4144
+        entry.rs:2711-2801, recovery.rs:1750-1870
 
         Returns:
           True: position was flattened (or was already zero)
@@ -3848,77 +3858,100 @@ class LiveRuntime:
         if adapter is None:
             return None
 
-        try:
-            pos = await adapter.fetch_position(symbol)
-        except Exception:
-            return False  # can't verify — assume position exists
-
-        if pos is None or abs(pos.quantity) <= 1e-9:
-            return True  # Already flat
-
-        # V1: direction is based on position.side, NOT signed quantity.
-        # V2 PositionSnapshot.quantity is always abs(size); side carries direction.
-        # side=BUY (long) → cleanup SELL; side=SELL (short) → cleanup BUY
-        cleanup_side = pos.side.opposite()
         from lightfee.venues.cid import generate_exchange_cid
         cleanup_client_order_id = generate_exchange_cid(
             f"{entry_id}:{stage}:{symbol}", "c", venue
         )
 
-        self.journal.append(
-            "entry.cleanup_leg_exposure",
-            {
-                "entry_id": entry_id,
-                "stage": stage,
-                "venue": venue.value,
-                "symbol": symbol,
-                "size": pos.quantity,
-                "side": pos.side.value,
-                "cleanup_side": cleanup_side.value,
-                "cleanup_client_order_id": cleanup_client_order_id,
-            },
-        )
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                pos = await adapter.fetch_position(symbol)
+            except Exception:
+                return False  # can't verify — assume position exists
 
-        try:
-            from lightfee.core.domain import OrderRequest
+            if pos is None or abs(pos.quantity) <= 1e-9:
+                return True  # Already flat
 
-            req = OrderRequest(
-                venue=venue,
-                symbol=symbol,
-                side=cleanup_side,
-                quantity=abs(pos.quantity),
-                price=None,
-                post_only=False,
-                reduce_only=True,  # V1: cleanup always reduce-only
-                client_order_id=cleanup_client_order_id,
+            # V1: direction is based on position.side, NOT signed quantity.
+            # V2 PositionSnapshot.quantity is always abs(size); side carries direction.
+            # side=BUY (long) → cleanup SELL; side=SELL (short) → cleanup BUY
+            cleanup_side = pos.side.opposite()
+
+            event_kind = (
+                "entry.cleanup_leg_exposure"
+                if attempt == 1
+                else "entry.cleanup_leg_exposure_retry"
             )
-            fill = await adapter.place_order(req)
-            self._flush_adapter_order_diagnostics(adapter)
+            self.journal.append(
+                event_kind,
+                {
+                    "entry_id": entry_id,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "size": pos.quantity,
+                    "side": pos.side.value,
+                    "cleanup_side": cleanup_side.value,
+                    "cleanup_client_order_id": cleanup_client_order_id,
+                },
+            )
 
-            # V1: cleanup success needs EITHER fill covering target qty
-            # OR verified-flat position after partial fill.
-            target_qty = abs(pos.quantity)
-            if fill.quantity >= target_qty - 1e-9:
-                return True
-
-            # Partial fill — re-fetch position to verify true flatness
             try:
-                verify_pos = await adapter.fetch_position(symbol)
-                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
-                    return True  # Position flat despite partial fill
-            except Exception:
-                pass
+                from lightfee.core.domain import OrderRequest
 
-            return False  # Position not flat after cleanup
-        except Exception:
-            self._flush_adapter_order_diagnostics(adapter)
-            try:
-                verify_pos = await adapter.fetch_position(symbol)
-                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                req = OrderRequest(
+                    venue=venue,
+                    symbol=symbol,
+                    side=cleanup_side,
+                    quantity=abs(pos.quantity),
+                    price=None,
+                    post_only=False,
+                    reduce_only=True,  # V1: cleanup always reduce-only
+                    client_order_id=cleanup_client_order_id,
+                )
+                fill = await adapter.place_order(req)
+                self._flush_adapter_order_diagnostics(adapter)
+
+                # V1: cleanup success needs EITHER fill covering target qty
+                # OR verified-flat position after partial/ambiguous fill.
+                target_qty = abs(pos.quantity)
+                if fill.quantity >= target_qty - 1e-9:
                     return True
+
+                try:
+                    verify_pos = await adapter.fetch_position(symbol)
+                    if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                        return True
+                except Exception:
+                    pass
             except Exception:
-                pass
-            return False
+                self._flush_adapter_order_diagnostics(adapter)
+                try:
+                    verify_pos = await adapter.fetch_position(symbol)
+                    if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                        return True
+                except Exception:
+                    pass
+
+            if attempt >= max_attempts:
+                return False
+
+            self.journal.append(
+                "entry.cleanup_leg_exposure_retry_scheduled",
+                {
+                    "entry_id": entry_id,
+                    "stage": stage,
+                    "next_attempt": attempt + 1,
+                    "max_attempts": max_attempts,
+                    "venue": venue.value,
+                    "symbol": symbol,
+                },
+            )
+
+        return False
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
         """Force-reconcile pending entries ignoring backoff windows.

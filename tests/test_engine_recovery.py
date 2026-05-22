@@ -14,6 +14,8 @@ from lightfee.engine.lifecycle import (
 )
 from lightfee.engine.recovery import (
     build_recovery_snapshot,
+    clear_stale_fail_closed_if_recovery_clean,
+    clear_stale_recovery_block_if_recovery_clean,
     recover_from_snapshot,
 )
 from lightfee.engine.state import EngineState, OpenPosition
@@ -77,6 +79,24 @@ class TestLifecycle:
         assert state.risk_mode == GlobalRiskMode.RUNNING
         assert state.recovery_blocked_reason is None
         assert state.recovery_blocked_at_ms == 0
+
+    def test_clean_live_mismatch_fail_closed_latch_auto_clears_like_v1(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "live_position_mismatch_flatten_failed"
+        state.recovery_blocked_at_ms = 1234
+        state.last_error = "live exchange position mismatch cleanup failed"
+
+        block_cleared = clear_stale_recovery_block_if_recovery_clean(state, None)
+        fail_closed_cleared = clear_stale_fail_closed_if_recovery_clean(state, None)
+
+        assert block_cleared is True
+        assert fail_closed_cleared is False
+        assert state.lifecycle == EngineLifecycle.RUNNING
+        assert state.risk_mode == GlobalRiskMode.RUNNING
+        assert state.recovery_blocked_reason is None
+        assert state.recovery_blocked_at_ms == 0
+        assert state.last_error is None
 
 
 class TestRecovery:
