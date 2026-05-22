@@ -26,13 +26,29 @@ ASTER_LISTEN_KEY_KEEPALIVE_SECS = 30 * 60
 ASTER_PRIVATE_PING_INTERVAL_SECS = 20
 
 
+async def _request_aster_listen_key(
+    transport, method: str, api_key: str, listen_key: str | None = None,
+) -> dict[str, Any]:
+    params = {"listenKey": listen_key} if listen_key else None
+    request_listen_key = getattr(transport, "_request_listen_key", None)
+    if request_listen_key is not None:
+        return await request_listen_key(
+            method,
+            "/fapi/v1/listenKey",
+            api_key=api_key,
+            params=params,
+        )
+    return await transport._request(
+        method,
+        "/fapi/v1/listenKey",
+        params=params,
+        private=True,
+    )
+
+
 async def _start_aster_listen_key(transport, api_key: str) -> str:
     try:
-        raw = await transport._request(
-            "POST",
-            "/fapi/v1/listenKey",
-            private=True,
-        )
+        raw = await _request_aster_listen_key(transport, "POST", api_key)
         listen_key = raw.get("listenKey", "")
         if not listen_key:
             raise ValueError("aster listenKey response missing listenKey")
@@ -46,7 +62,9 @@ async def _start_aster_listen_key(transport, api_key: str) -> str:
 
 async def _keepalive_aster_listen_key(transport, api_key: str, listen_key: str) -> None:
     try:
-        await transport._request("PUT", "/fapi/v1/listenKey", private=True)
+        await _request_aster_listen_key(
+            transport, "PUT", api_key, listen_key
+        )
         logger.debug("aster listenKey keepalive success")
     except Exception as e:
         logger.warning("aster listenKey keepalive failed: %s", e)
@@ -55,7 +73,9 @@ async def _keepalive_aster_listen_key(transport, api_key: str, listen_key: str) 
 
 async def _close_aster_listen_key(transport, api_key: str, listen_key: str) -> None:
     try:
-        await transport._request("DELETE", "/fapi/v1/listenKey", private=True)
+        await _request_aster_listen_key(
+            transport, "DELETE", api_key, listen_key
+        )
         logger.debug("aster listenKey closed")
     except Exception as e:
         logger.debug("aster listenKey close ignored: %s", e)

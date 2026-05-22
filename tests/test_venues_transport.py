@@ -9,7 +9,7 @@ import json
 import os
 import time
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -1685,6 +1685,10 @@ class TestOrderSubmitDiagnosticsAndQuantization:
                 )
 
         monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
             "lightfee.venues.transport.get_symbol_rules_cache",
             lambda: FakeRulesCache(),
         )
@@ -2609,6 +2613,249 @@ class TestAckOnlyResponses:
         ack = await transport2.submit_passive_order(req)
         assert ack.order_id == "121211212122"
         assert ack.client_order_id == "lfv2-entry-maker-001"
+
+
+class TestV1PassiveBusinessFlowParity:
+    @pytest.mark.asyncio
+    async def test_aster_passive_submit_clamps_to_remaining_openable_notional(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_aster_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+        calls = []
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            calls.append((method, path, dict(params or body or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "30"}
+            if path == "/fapi/v1/order":
+                return {
+                    "orderId": "aster-oid-1",
+                    "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                    "status": "NEW",
+                    "price": (params or {}).get("price", "0"),
+                    "origQty": (params or {}).get("quantity", "0"),
+                }
+            return {}
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="GUAUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-1",
+        )
+
+        ack = await transport.submit_passive_order(req)
+
+        order_call = [call for call in calls if call[1] == "/fapi/v1/order"][0]
+        assert order_call[2]["quantity"] == "15"
+        assert ack.quantity == 15.0
+        attempt = next(
+            e["payload"] for e in transport.order_diagnostics
+            if e["kind"] == "order.submit_attempt"
+        )
+        assert attempt["aster_headroom_source"] == "remaining_openable_notional"
+        assert attempt["aster_requested_qty"] == 100.0
+        assert attempt["normalized_qty"] == 15.0
+
+    @pytest.mark.asyncio
+    async def test_aster_passive_submit_retries_smaller_after_max_notional_reject(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_aster_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+        order_attempts = []
+        headroom_calls = 0
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            nonlocal headroom_calls
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                headroom_calls += 1
+                if headroom_calls == 1:
+                    raise TransportError(
+                        TransportErrorCategory.TRANSPORT_FAILURE,
+                        "headroom endpoint temporarily unavailable",
+                    )
+                return {"remainingOpenableNotionalValue": "30"}
+            if path == "/fapi/v1/order":
+                order_attempts.append(dict(params or {}))
+                if len(order_attempts) == 1:
+                    raise TransportError(
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        "HTTP 400: max notional",
+                        status_code=400,
+                        body='{"code":-5018,"msg":"maximum notional value limit"}',
+                    )
+                return {
+                    "orderId": "aster-oid-2",
+                    "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                    "status": "NEW",
+                    "price": (params or {}).get("price", "0"),
+                    "origQty": (params or {}).get("quantity", "0"),
+                }
+            return {}
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="GUAUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-2",
+        )
+
+        ack = await transport.submit_passive_order(req)
+
+        assert [attempt["quantity"] for attempt in order_attempts] == ["100", "15"]
+        assert ack.quantity == 15.0
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "ack_accepted"
+        assert result["aster_retry_after_max_notional"] is True
+
+    @pytest.mark.asyncio
+    async def test_binance_post_only_would_take_is_classified_explicitly(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_binance_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: post only rejected",
+                status_code=400,
+                body='{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="GUAUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price=1.5,
+            post_only=True,
+            client_order_id="binance-maker-1",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "post_only_would_take"
+
+    @pytest.mark.asyncio
+    async def test_okx_fetch_position_reuses_fresh_cache_to_reduce_private_rest(self):
+        transport = VenueTransport(
+            okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        now_ms = int(time.time() * 1000)
+        cached = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="ALTUSDT",
+            side=Side.BUY,
+            quantity=3.0,
+            entry_price=1.25,
+            observed_at_ms=now_ms,
+        )
+        transport._position_cache["ALTUSDT"] = (cached, now_ms)
+
+        async def fake_request(*args, **kwargs):
+            raise AssertionError("fresh OKX position cache should avoid REST")
+
+        transport._request = fake_request
+
+        pos = await transport.fetch_position("ALTUSDT")
+
+        assert pos is cached
 
 
 class TestExchangeErrorEnvelopes:
@@ -5447,6 +5694,139 @@ class TestCancelAbsentOrderDetection:
         assert seen["kwargs"]["body"]["category"] == "linear"
         assert seen["kwargs"]["body"]["symbol"] == "BTCUSDT"
         assert seen["kwargs"]["body"]["orderId"] == "oid-1"
+
+    @pytest.mark.asyncio
+    async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):
+        """Bybit V5 order lookup is GET /v5/order/realtime, not GET /v5/order/create."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(bybit_spec(), mode="paper")
+        transport.mode = "live"
+        seen = {}
+        transport.private_order_progress = Mock(return_value=None)
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["kwargs"] = kwargs
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "orderId": "oid-1",
+                    "orderLinkId": "cid-1",
+                    "orderStatus": "New",
+                    "side": "Buy",
+                    "cumExecQty": "0",
+                    "avgPrice": "0",
+                    "price": "1.23",
+                    "qty": "2",
+                    "updatedTime": "1779450000000",
+                },
+            }
+
+        transport._request = fake_request
+        progress = await transport.query_passive_order_progress(
+            symbol="ALTUSDT",
+            order_id="oid-1",
+            client_order_id="cid-1",
+            side=Side.BUY,
+        )
+
+        assert progress is not None
+        assert seen["method"] == "GET"
+        assert seen["path"] == "/v5/order/realtime"
+        assert seen["kwargs"]["params"]["category"] == "linear"
+        assert seen["kwargs"]["params"]["symbol"] == "ALTUSDT"
+        assert seen["kwargs"]["params"]["orderId"] == "oid-1"
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_client_order_query_uses_historical_orders_first(self):
+        """V1 resolves client IDs through historicalOrders, not /info orderStatus cloid."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import hyperliquid_spec
+
+        credential = LiveCredential(account_address="0xabc")
+        transport = VenueTransport(hyperliquid_spec(), mode="paper", credential=credential)
+        calls = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            body = kwargs.get("body") or {}
+            if body.get("type") == "historicalOrders":
+                return []
+            return {"status": "unexpected"}
+
+        transport._request = fake_request
+        result = await transport._query_hyperliquid_order(
+            transport._spec,
+            "ALT",
+            "",
+            "client-123",
+            1779450000000,
+        )
+
+        assert result == ([], True)
+        assert calls[0][0] == "POST"
+        assert calls[0][1] == "/info"
+        assert calls[0][2]["body"] == {
+            "type": "historicalOrders",
+            "user": "0xabc",
+        }
+        assert all("cloid" not in (kwargs.get("body") or {}) for _, _, kwargs in calls)
+
+    @pytest.mark.asyncio
+    async def test_listen_key_request_uses_api_key_header_without_signature(self):
+        """Binance/Aster user-stream listenKey calls are API-key only, not trading signed."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import binance_spec
+
+        class FakeResponse:
+            status_code = 200
+            text = '{"listenKey":"lk-1"}'
+            headers = {}
+
+            def json(self):
+                return {"listenKey": "lk-1"}
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def put(self, url, headers=None):
+                self.calls.append(("PUT", url, headers or {}))
+                return FakeResponse()
+
+        client = FakeClient()
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="trade-key", api_secret="trade-secret"),
+        )
+
+        async def fake_get_client():
+            return client
+
+        transport._get_client = fake_get_client
+
+        raw = await transport._request_listen_key(
+            "PUT",
+            "/fapi/v1/listenKey",
+            api_key="stream-key",
+            params={"listenKey": "lk-1"},
+        )
+
+        assert raw == {"listenKey": "lk-1"}
+        assert client.calls == [
+            (
+                "PUT",
+                "https://fapi.binance.com/fapi/v1/listenKey?listenKey=lk-1",
+                {"X-MBX-APIKEY": "stream-key"},
+            )
+        ]
+        assert "timestamp" not in client.calls[0][1]
+        assert "signature" not in client.calls[0][1]
 
     @pytest.mark.asyncio
     async def test_cancel_passive_order_raises_on_real_error(self):

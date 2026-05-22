@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--current-state", default="/opt/lightfee-v2/runtime/live-state-current.json")
     parser.add_argument("--resolv-conf", default="/etc/resolv.conf")
     parser.add_argument("--now-ms", type=int, default=0)
-    parser.add_argument("--snapshot-max-age-ms", type=int, default=10_000)
+    parser.add_argument("--snapshot-max-age-ms", type=int, default=60_000)
     parser.add_argument("--max-tick-age-ms", type=int, default=15_000)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()

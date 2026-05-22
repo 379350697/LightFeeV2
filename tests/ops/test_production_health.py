@@ -158,6 +158,58 @@ def test_verify_production_services_cli_json_success(tmp_path):
     assert payload["ok"] is True
 
 
+def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_path):
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    (unit_dir / "lightfee-sidecar.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
+    )
+    (unit_dir / "lightfee-live.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.live --config /opt/lightfee-v2/config/live.toml\n"
+    )
+    snapshot = tmp_path / "snapshot.json"
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    snapshot.write_text(json.dumps({
+        "market_observed_at_ms": 1778786955000,
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "degraded_venues": [],
+    }))
+    current = tmp_path / "current.json"
+    current.write_text(json.dumps({
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+    }))
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir", str(unit_dir),
+            "--snapshot", str(snapshot),
+            "--current-state", str(current),
+            "--resolv-conf", str(resolv),
+            "--now-ms", "1778787000000",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+
+
 def test_verify_production_services_cli_json_failure(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()
@@ -180,7 +232,7 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 
 def test_deploy_systemd_templates_pass_contract():
-    sidecar = Path("deploy/systemd/lightfee-sidecar-rust-v1.service").read_text()
+    sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok

@@ -52,6 +52,10 @@ from lightfee.venues.specs import AuthScheme, VenueSpec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
 
+ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE = 4
+OKX_POSITION_REST_CACHE_MAX_AGE_MS = 30_000
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
@@ -466,6 +470,30 @@ def _map_to_submit_error(
     ):
         return OrderSubmitError(SubmitFailureClass.REJECTED, message)
     return OrderSubmitError(SubmitFailureClass.UNCERTAIN, message)
+
+
+def _transport_error_text(error: Exception) -> str:
+    body = getattr(error, "body", "")
+    return f"{error} {body}".lower()
+
+
+def _is_aster_max_notional_error(error: Exception) -> bool:
+    message = _transport_error_text(error)
+    return "code=-5018" in message or "-5018" in message \
+        or "maximum notional value limit" in message
+
+
+def _is_post_only_would_take_reject(venue: "Venue", error: Exception) -> bool:
+    if venue not in (Venue.BINANCE, Venue.ASTER):
+        return False
+    message = _transport_error_text(error)
+    return (
+        "-5022" in message
+        or "could not be executed as maker" in message
+        or "post only order will be rejected" in message
+        or "post_only" in message
+        or "gtx" in message
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1930,6 +1958,100 @@ class VenueTransport(MarketDataClient):
                 f"unexpected error: {method} {path}: {e}",
             )
 
+    async def _request_listen_key(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_key: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Send Binance/Aster user-stream listenKey requests.
+
+        V1 parity: these endpoints use only the API-key header and optional
+        listenKey query parameter. They are not trading signed requests.
+        """
+        client = await self._get_client()
+        base_url = self._spec.private_base_url
+        qp_list: list[tuple[str, str]] = []
+        if params:
+            qp_list = [(k, str(v)) for k, v in params.items() if v is not None]
+        query_string = "?" + _build_query_v1(qp_list) if qp_list else ""
+        url = base_url + path + query_string
+        headers: dict[str, str] = {}
+        if self._spec.api_key_header and api_key:
+            headers[self._spec.api_key_header] = api_key
+
+        scopes = self._rest_rate_limit_scopes(method, path, base_url, private=True)
+        if self._rate_limiter is not None:
+            await self._rate_limiter.wait_until_ready_for_scopes(scopes)
+            await self._rate_limiter.pace_for_scopes(scopes)
+
+        from lightfee.rate_limit.engine import global_rate_limit_runtime as _get_global_rt
+        global_rt = _get_global_rt()
+        if global_rt is not None:
+            await global_rt.async_wait_until_ready_for_scopes(scopes)
+
+        try:
+            method_upper = method.upper()
+            if method_upper == "POST":
+                resp = await client.post(url, headers=headers)
+            elif method_upper == "PUT":
+                resp = await client.put(url, headers=headers)
+            elif method_upper == "DELETE":
+                resp = await client.delete(url, headers=headers)
+            elif method_upper == "GET":
+                resp = await client.get(url, headers=headers)
+            else:
+                raise ValueError(f"unsupported HTTP method: {method}")
+
+            if resp.status_code >= 400:
+                if resp.status_code in (429, 418):
+                    now_ms = int(time.time() * 1000)
+                    retry_after_ms = _parse_venue_retry_after_ms(
+                        self._spec.venue_id, dict(resp.headers), now_ms,
+                    )
+                    if self._rate_limiter is not None:
+                        self._rate_limiter.record_rate_limit_for_scopes(
+                            scopes, retry_after_ms=retry_after_ms,
+                        )
+                    if global_rt is not None:
+                        global_rt.record_rate_limit_for_scopes(
+                            scopes, retry_after_ms=retry_after_ms or 0,
+                        )
+                cat = classify_transport_error(resp.status_code, resp.text)
+                raise TransportError(
+                    cat or TransportErrorCategory.TRANSPORT_FAILURE,
+                    f"HTTP {resp.status_code}: {resp.text[:200]}",
+                    status_code=resp.status_code,
+                    body=resp.text,
+                    headers=dict(resp.headers),
+                )
+
+            if self._rate_limiter is not None:
+                self._rate_limiter.record_success_for_scopes(scopes)
+
+            if not resp.text:
+                return {}
+            return resp.json()
+        except httpx.TimeoutException:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"timeout: {method} {path}",
+            )
+        except httpx.NetworkError as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"network error: {method} {path}: {e}",
+            )
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"unexpected error: {method} {path}: {e}",
+            )
+
     def _is_time_offset_retryable(self, status_code: int, body: str) -> bool:
         """V1: should_retry_binance_order_error — retry once on time/signature/order-mode/5xx errors.
 
@@ -2291,6 +2413,21 @@ class VenueTransport(MarketDataClient):
             )
             self._position_cache[symbol] = (snapshot, now_ms)
             return snapshot
+
+        if spec.venue_id == Venue.OKX:
+            cached = self.cached_position(symbol)
+            if cached is None and spec.symbol_from_venue is not None:
+                cached = self.cached_position(spec.symbol_from_venue(venue_sym))
+            if cached is not None:
+                cached_entry = (
+                    self._position_cache.get(cached.symbol)
+                    or self._position_cache.get(symbol)
+                )
+                if cached_entry is None:
+                    return cached
+                cached_at = cached_entry[1]
+                if now_ms - cached_at <= OKX_POSITION_REST_CACHE_MAX_AGE_MS:
+                    return cached
 
         try:
             params: dict[str, Any] = {}
@@ -3371,6 +3508,73 @@ class VenueTransport(MarketDataClient):
     # Passive order contract (V1: GTC post-only maker order lifecycle)
     # ------------------------------------------------------------------
 
+    async def _fetch_aster_remaining_openable_notional(
+        self, venue_sym: str,
+    ) -> Optional[float]:
+        raw = await self._request(
+            "GET",
+            "/fapi/v1/remainingOpenableNotionalValue",
+            params={
+                "symbol": venue_sym,
+                "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+            },
+            private=True,
+        )
+        value = raw.get("remainingOpenableNotionalValue") if isinstance(raw, dict) else None
+        remaining = _safe_float(value, default=-1.0)
+        if math.isfinite(remaining) and remaining >= 0.0:
+            return remaining
+        return None
+
+    async def _aster_apply_remaining_openable_headroom(
+        self,
+        request: OrderRequest,
+        venue_sym: str,
+        quantized_qty: float,
+        quantized_price: Any,
+        qty_step: float,
+        min_qty: float,
+    ) -> tuple[float, dict[str, Any]]:
+        payload: dict[str, Any] = {}
+        if self._spec.venue_id != Venue.ASTER or request.reduce_only:
+            return quantized_qty, payload
+        if quantized_qty <= 0.0:
+            return quantized_qty, payload
+        price = _safe_float(quantized_price, default=0.0)
+        if price <= 0.0:
+            return quantized_qty, payload
+
+        try:
+            remaining = await self._fetch_aster_remaining_openable_notional(venue_sym)
+        except Exception as exc:
+            payload["aster_headroom_error"] = str(exc)[:200]
+            return quantized_qty, payload
+
+        if remaining is None:
+            return quantized_qty, payload
+
+        max_qty = max(remaining / price, 0.0)
+        adjusted_qty = min(quantized_qty, max_qty)
+        if qty_step > 0:
+            adjusted_qty = _floor_to_step(adjusted_qty, qty_step)
+        payload.update({
+            "aster_headroom_source": "remaining_openable_notional",
+            "aster_remaining_openable_notional": remaining,
+            "aster_requested_qty": quantized_qty,
+            "aster_max_qty": max_qty,
+        })
+        if adjusted_qty + 1e-12 < quantized_qty:
+            if adjusted_qty + 1e-12 < max(min_qty, 0.0):
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "aster entry notional headroom exhausted: "
+                    f"remaining_openable_notional={remaining} price={price}",
+                )
+            payload["aster_headroom_clamped"] = True
+            return adjusted_qty, payload
+        payload["aster_headroom_clamped"] = False
+        return quantized_qty, payload
+
     async def submit_passive_order(self, request: OrderRequest) -> "PassiveOrderAck":
         """Submit a GTC post-only maker order. Returns ack, not fill.
 
@@ -3423,6 +3627,7 @@ class VenueTransport(MarketDataClient):
             min_notional = float(preflight.get("min_notional", 0))
             rule_source = str(preflight.get("rule_source", "spec"))
             cid = request.client_order_id or ""
+            aster_headroom_payload: dict[str, Any] = {}
 
             # --- V1: OKX posMode refresh + contract sizing ---
             if spec.venue_id == Venue.OKX:
@@ -3430,6 +3635,17 @@ class VenueTransport(MarketDataClient):
                     await self._refresh_okx_pos_mode()
             if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
                 await self._refresh_fapi_position_mode()
+            if spec.venue_id == Venue.ASTER:
+                quantized_qty, aster_headroom_payload = (
+                    await self._aster_apply_remaining_openable_headroom(
+                        request,
+                        venue_sym,
+                        quantized_qty,
+                        quantized_price,
+                        qty_step,
+                        min_qty,
+                    )
+                )
             ct_val_sz = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
             lot_sz = float(getattr(symbol_rule, 'qty_step', 0)) if symbol_rule else (qty_step or 0.0)
             if spec.venue_id == Venue.OKX and ct_val_sz > 0:
@@ -3463,6 +3679,8 @@ class VenueTransport(MarketDataClient):
                 "body_field_names": sorted(body.keys()),
                 "post_only": True,
             }
+            if aster_headroom_payload:
+                attempt_payload.update(aster_headroom_payload)
             if spec.venue_id == Venue.OKX:
                 attempt_payload["pos_side"] = self._okx_pos_side(request.side, request.reduce_only)
                 attempt_payload["pos_mode"] = self._okx_pos_mode
@@ -3480,11 +3698,51 @@ class VenueTransport(MarketDataClient):
                     attempt_payload["position_side"] = body["positionSide"]
             self._record_order_diagnostic("order.submit_attempt", attempt_payload)
 
+            aster_retry_after_max_notional = False
+
+            async def _send_passive_order(current_body: dict[str, Any]):
+                if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                    return await self._request(
+                        "POST", spec.order_path, params=current_body, private=True
+                    )
+                return await self._request(
+                    "POST", spec.order_path, body=current_body, private=True
+                )
+
             # --- Send request ---
-            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
-                raw = await self._request("POST", spec.order_path, params=body, private=True)
-            else:
-                raw = await self._request("POST", spec.order_path, body=body, private=True)
+            try:
+                raw = await _send_passive_order(body)
+            except TransportError as first_error:
+                if spec.venue_id != Venue.ASTER or not _is_aster_max_notional_error(first_error):
+                    raise
+                retry_qty, retry_payload = await self._aster_apply_remaining_openable_headroom(
+                    request,
+                    venue_sym,
+                    quantized_qty,
+                    quantized_price,
+                    qty_step,
+                    min_qty,
+                )
+                if retry_qty + 1e-12 >= quantized_qty:
+                    raise
+                quantized_qty = retry_qty
+                contract_qty = retry_qty
+                body = self._build_passive_order_body(
+                    request, venue_sym, contract_qty, quantized_price, cid,
+                )
+                if retry_payload:
+                    self._record_order_diagnostic(
+                        "order.submit_attempt",
+                        {
+                            **attempt_payload,
+                            **retry_payload,
+                            "normalized_qty": quantized_qty,
+                            "body_field_names": sorted(body.keys()),
+                            "aster_retry_after_max_notional": True,
+                        },
+                    )
+                aster_retry_after_max_notional = True
+                raw = await _send_passive_order(body)
 
             # --- Venue-specific success guard ---
             if spec.venue_id == Venue.BYBIT:
@@ -3511,18 +3769,31 @@ class VenueTransport(MarketDataClient):
                 "ack_order_id": ack.order_id,
                 "ack_client_order_id": ack.client_order_id,
                 "response_classification": "ack_accepted",
+                "aster_retry_after_max_notional": aster_retry_after_max_notional,
             }
             self._record_order_diagnostic("order.submit_result", result_payload)
             return ack
 
         except TransportError as e:
+            classification = (
+                "post_only_would_take"
+                if _is_post_only_would_take_reject(spec.venue_id, e)
+                else "rejected"
+            )
             self._record_passive_diagnostic_failure(
                 request, venue_sym, e.status_code, str(e),
+                classification=classification,
             )
             raise _map_to_submit_error(e.category, str(e))
         except OrderSubmitError as e:
+            classification = (
+                "post_only_would_take"
+                if _is_post_only_would_take_reject(spec.venue_id, e)
+                else "rejected"
+            )
             self._record_passive_diagnostic_failure(
                 request, venue_sym, 0, str(e),
+                classification=classification,
             )
             raise
         except Exception as e:
@@ -3533,7 +3804,7 @@ class VenueTransport(MarketDataClient):
 
     def _record_passive_diagnostic_failure(
         self, request: OrderRequest, venue_sym: str,
-        status_code: int, message: str,
+        status_code: int, message: str, *, classification: str = "rejected",
     ) -> None:
         self._record_order_diagnostic("order.submit_result", {
             "venue": self._spec.venue_id.value,
@@ -3544,7 +3815,7 @@ class VenueTransport(MarketDataClient):
             "response_msg": message[:200],
             "ack_order_id": "",
             "ack_client_order_id": "",
-            "response_classification": "rejected",
+            "response_classification": classification,
         })
 
     # ------------------------------------------------------------------
@@ -4035,7 +4306,8 @@ class VenueTransport(MarketDataClient):
                     return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
                 return None
 
-            raw = await self._request("GET", spec.order_path, params=params, private=True)
+            query_path = "/v5/order/realtime" if spec.venue_id == Venue.BYBIT else spec.order_path
+            raw = await self._request("GET", query_path, params=params, private=True)
             return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
 
         except TransportError:
@@ -4733,37 +5005,34 @@ class VenueTransport(MarketDataClient):
         """V1: query Hyperliquid info API for order status (hyperliquid.rs:2033-2130)."""
         if self._credential is None or not self._credential.account_address:
             return None
+        user = self._credential.account_address if self._credential else ""
+        if client_order_id:
+            try:
+                raw = await self._request(
+                    "POST", "/info",
+                    body={"type": "historicalOrders", "user": user},
+                    private=False,
+                )
+                if raw is not None:
+                    return (raw, True)
+            except Exception:
+                pass
         if order_id:
             try:
                 oid = int(order_id)
                 raw = await self._request(
                     "POST", "/info",
-                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "oid": oid},
+                    body={"type": "orderStatus", "user": user, "oid": oid},
                     private=False,
                 )
                 if raw is not None:
                     return (raw, False)
             except (ValueError, Exception):
                 pass
-        if client_order_id:
-            try:
-                from lightfee.venues.hyperliquid_signing import (
-                    hyperliquid_cloid_for_client_order,
-                )
-                wire_cloid = hyperliquid_cloid_for_client_order(client_order_id)
-                raw = await self._request(
-                    "POST", "/info",
-                    body={"type": "orderStatus", "user": self._credential.account_address if self._credential else "", "cloid": wire_cloid},
-                    private=False,
-                )
-                if raw is not None:
-                    return (raw, False)
-            except Exception:
-                pass
         try:
             raw = await self._request(
                 "POST", "/info",
-                body={"type": "historicalOrders", "user": self._credential.account_address if self._credential else ""},
+                body={"type": "historicalOrders", "user": user},
                 private=False,
             )
             if raw is not None:

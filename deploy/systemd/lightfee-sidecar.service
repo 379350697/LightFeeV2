@@ -1,18 +1,21 @@
 [Unit]
-Description=LightFee opportunity input sidecar (Rust V1 bridge for V2 live)
+Description=LightFee V2 Sidecar
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/projects/LightFee
+User=root
+WorkingDirectory=/opt/lightfee-v2
 EnvironmentFile=/etc/lightfee/lightfee.env
 Environment=LIGHTFEE_PRODUCTION_GUARD=1
-ExecStart=/root/projects/LightFee/target/release/opportunity_input_sidecar --config /root/projects/LightFee/config/live.auto.toml
+ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

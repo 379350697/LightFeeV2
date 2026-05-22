@@ -36,17 +36,32 @@ BINANCE_PRIVATE_PING_INTERVAL_SECS = 20
 # ---------------------------------------------------------------------------
 
 
+async def _request_binance_listen_key(
+    transport, method: str, api_key: str, listen_key: str | None = None,
+) -> dict[str, Any]:
+    params = {"listenKey": listen_key} if listen_key else None
+    request_listen_key = getattr(transport, "_request_listen_key", None)
+    if request_listen_key is not None:
+        return await request_listen_key(
+            method,
+            "/fapi/v1/listenKey",
+            api_key=api_key,
+            params=params,
+        )
+    return await transport._request(
+        method,
+        "/fapi/v1/listenKey",
+        params=params,
+        private=True,
+    )
+
+
 async def _start_binance_listen_key(
     transport, api_key: str
 ) -> str:
     """V1 start_binance_listen_key() — POST /fapi/v1/listenKey."""
     try:
-        raw = await transport._request(
-            "POST",
-            "/fapi/v1/listenKey",
-            private=True,
-            headers={"X-MBX-APIKEY": api_key},
-        )
+        raw = await _request_binance_listen_key(transport, "POST", api_key)
         listen_key = raw.get("listenKey", "")
         if not listen_key:
             raise ValueError("binance listenKey response missing listenKey")
@@ -63,11 +78,8 @@ async def _keepalive_binance_listen_key(
 ) -> None:
     """V1 keepalive_binance_listen_key() — PUT /fapi/v1/listenKey."""
     try:
-        await transport._request(
-            "PUT",
-            "/fapi/v1/listenKey",
-            private=True,
-            headers={"X-MBX-APIKEY": api_key},
+        await _request_binance_listen_key(
+            transport, "PUT", api_key, listen_key
         )
         logger.debug("binance listenKey keepalive success")
     except Exception as e:
@@ -80,11 +92,8 @@ async def _close_binance_listen_key(
 ) -> None:
     """V1 close_binance_listen_key() — DELETE /fapi/v1/listenKey."""
     try:
-        await transport._request(
-            "DELETE",
-            "/fapi/v1/listenKey",
-            private=True,
-            headers={"X-MBX-APIKEY": api_key},
+        await _request_binance_listen_key(
+            transport, "DELETE", api_key, listen_key
         )
         logger.debug("binance listenKey closed")
     except Exception as e:

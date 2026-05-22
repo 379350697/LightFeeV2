@@ -38,7 +38,7 @@ CRITICAL_FILES = [
     "lightfee/ops/production_health.py",
     "scripts/verify_production_services.py",
     "deploy/systemd/lightfee-live.service",
-    "deploy/systemd/lightfee-sidecar-rust-v1.service",
+    "deploy/systemd/lightfee-sidecar.service",
     "deploy/network/NetworkManager-lightfee-dns.conf",
 ]
 
@@ -133,26 +133,40 @@ def check_critical_files(manifest: dict[str, str]) -> list[str]:
 
 
 def verify_remote_manifest(remote_host: str, remote_path: str, local_manifest: dict[str, str]) -> bool:
-    """SSH to remote and verify sha256 of critical files match local."""
-    all_ok = True
+    """Single-SSH-call sha256 verification of all critical files on remote."""
+    cmds = []
     for f in CRITICAL_FILES:
+        cmds.append(
+            f"sha256sum {remote_path}/{f} 2>/dev/null || echo 'MISSING {f}'"
+        )
+    batch_cmd = "; ".join(cmds)
+
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", remote_host, batch_cmd],
+        capture_output=True, text=True,
+    )
+
+    all_ok = True
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        if line.startswith("MISSING "):
+            f = line[len("MISSING "):]
+            print(f"  MISSING {f}: file not found on remote")
+            all_ok = False
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        remote_hash = parts[0]
+        f = parts[1].replace(f"{remote_path}/", "", 1) if parts[1].startswith(remote_path) else parts[1]
+
         local_hash = local_manifest.get(f)
         if local_hash is None:
             print(f"  SKIP {f}: not in local manifest")
             continue
 
-        remote_file = f"{remote_path}/{f}"
-        cmd = f"sha256sum {remote_file} 2>/dev/null | cut -d' ' -f1"
-        result = subprocess.run(
-            ["ssh", remote_host, cmd],
-            capture_output=True, text=True,
-        )
-        remote_hash = result.stdout.strip()
-
-        if not remote_hash:
-            print(f"  MISSING {f}: file not found on remote")
-            all_ok = False
-        elif remote_hash != local_hash:
+        if remote_hash != local_hash:
             print(f"  MISMATCH {f}:")
             print(f"    local:  {local_hash}")
             print(f"    remote: {remote_hash}")
@@ -167,7 +181,7 @@ def read_deploy_version(remote_host: str, remote_path: str) -> str | None:
     """Read .deploy_version from remote."""
     cmd = f"cat {remote_path}/.deploy_version 2>/dev/null"
     result = subprocess.run(
-        ["ssh", remote_host, cmd],
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", remote_host, cmd],
         capture_output=True, text=True,
     )
     return result.stdout.strip() or None
@@ -208,8 +222,6 @@ def generate_deploy_script(root: Path, remote_host: str, remote_path: str) -> st
     exclude_args = []
     for pat in EXCLUDE_PATTERNS:
         exclude_args.extend(["--exclude", pat])
-    exclude_args.extend(["--exclude", ".deploy_manifest.json"])
-
     head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
         capture_output=True, text=True, cwd=root,
@@ -221,7 +233,10 @@ def generate_deploy_script(root: Path, remote_host: str, remote_path: str) -> st
 set -euo pipefail
 
 REMOTE="{remote_host}:{remote_path}"
+REMOTE_HOST="{remote_host}"
+REMOTE_PATH="{remote_path}"
 LOCAL="{root}"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
 echo "=== Generating deploy manifest ==="
 python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
@@ -229,11 +244,14 @@ python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
 echo "=== Syncing files to $REMOTE ==="
 rsync -avz --delete {' '.join(exclude_args)} "$LOCAL/" "$REMOTE/"
 
-echo "=== Writing .deploy_version ==="
-echo "{head}" | ssh {remote_host} "cat > {remote_path}/.deploy_version"
+echo "=== Uploading deploy manifest ==="
+scp -o BatchMode=yes -o ConnectTimeout=10 "$LOCAL/.deploy_manifest.json" "$REMOTE/.deploy_manifest.json"
 
-echo "=== Verifying critical file hashes on remote ==="
-ssh {remote_host} "cd {remote_path} && python3 scripts/verify_deploy_manifest.py --check {remote_path}"
+echo "=== Writing .deploy_version ==="
+echo "{head}" | ssh $SSH_OPTS {remote_host} "cat > {remote_path}/.deploy_version"
+
+echo "=== Verifying deployment integrity on remote ==="
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && python3 scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Deploy complete: {head} ==="
 """
@@ -251,7 +269,16 @@ def main() -> None:
 
     root = repo_root()
 
-    if args.local:
+    if args.generate_deploy:
+        script = generate_deploy_script(root, args.remote or "root@YOUR_HOST", args.path)
+        script_path = root / "scripts" / "deploy.sh"
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+        print(f"Deploy script written: {script_path}")
+        print("Review before running!")
+
+    elif args.local:
         manifest = build_manifest(root)
         manifest_path = root / ".deploy_manifest.json"
         with open(manifest_path, "w") as f:
@@ -321,15 +348,6 @@ def main() -> None:
         else:
             print("\nFAIL: deployment integrity mismatch detected")
             sys.exit(1)
-
-    elif args.generate_deploy:
-        script = generate_deploy_script(root, args.remote or "root@YOUR_HOST", args.path)
-        script_path = root / "scripts" / "deploy.sh"
-        with open(script_path, "w") as f:
-            f.write(script)
-        os.chmod(script_path, 0o755)
-        print(f"Deploy script written: {script_path}")
-        print("Review before running!")
 
     else:
         # Default: build manifest and check local

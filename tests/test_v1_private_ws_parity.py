@@ -645,6 +645,70 @@ class _FakeTransport:
         return {}
 
 
+class _ListenKeyCaptureTransport:
+    def __init__(self):
+        self.calls = []
+        self._failure_count = 0
+        self._last_error = ""
+
+    async def _request_listen_key(self, method, path, *, api_key, params=None):
+        self.calls.append((method, path, api_key, params))
+        if method == "POST":
+            return {"listenKey": "lk-start"}
+        return {}
+
+    def record_private_ws_failure(self, now_ms: int, error: str,
+                                   unhealthy_after: int = 5) -> None:
+        self._failure_count += 1
+        self._last_error = error
+
+
+class TestListenKeyRequestShape:
+    """V1 listenKey REST calls are API-key user-stream calls, not trading orders."""
+
+    @pytest.mark.asyncio
+    async def test_binance_listen_key_helpers_use_v1_request_shape(self):
+        from lightfee.venues.binance_private_ws import (
+            _close_binance_listen_key,
+            _keepalive_binance_listen_key,
+            _start_binance_listen_key,
+        )
+
+        transport = _ListenKeyCaptureTransport()
+
+        listen_key = await _start_binance_listen_key(transport, "api-key")
+        await _keepalive_binance_listen_key(transport, "api-key", listen_key)
+        await _close_binance_listen_key(transport, "api-key", listen_key)
+
+        assert listen_key == "lk-start"
+        assert transport.calls == [
+            ("POST", "/fapi/v1/listenKey", "api-key", None),
+            ("PUT", "/fapi/v1/listenKey", "api-key", {"listenKey": "lk-start"}),
+            ("DELETE", "/fapi/v1/listenKey", "api-key", {"listenKey": "lk-start"}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_aster_listen_key_helpers_use_v1_request_shape(self):
+        from lightfee.venues.aster_private_ws import (
+            _close_aster_listen_key,
+            _keepalive_aster_listen_key,
+            _start_aster_listen_key,
+        )
+
+        transport = _ListenKeyCaptureTransport()
+
+        listen_key = await _start_aster_listen_key(transport, "api-key")
+        await _keepalive_aster_listen_key(transport, "api-key", listen_key)
+        await _close_aster_listen_key(transport, "api-key", listen_key)
+
+        assert listen_key == "lk-start"
+        assert transport.calls == [
+            ("POST", "/fapi/v1/listenKey", "api-key", None),
+            ("PUT", "/fapi/v1/listenKey", "api-key", {"listenKey": "lk-start"}),
+            ("DELETE", "/fapi/v1/listenKey", "api-key", {"listenKey": "lk-start"}),
+        ]
+
+
 class TestBinanceWorkerLifecycle:
     """Binance private WS worker lifecycle with fake websocket."""
 
