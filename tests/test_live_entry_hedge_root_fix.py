@@ -3476,3 +3476,579 @@ class TestStartupZeroFillNoDirectPop:
         # Cleanup succeeded (full fill) → pending removed
         assert "entry-startup-zero-cleanup-ok" not in runtime.state.pending_entries
         assert len(fake_long._place_order_calls) >= 1
+
+
+class TestZeroFillFinalizeV1ParityGate:
+    """V1 parity: zero-fill pending entries MUST NOT create open positions or
+    emit entry.opened/runtime.position_opened.  V1 entry_sync.rs:5342 guards
+    with `if balanced_quantity > 0.0`; zero-fill goes to passive_unfilled/abort.
+
+    Production evidence: PROVEUSDT and XCNUSDT had maker_leg_filled=0.0 and
+    hedge_leg_filled=0.0 but still appeared as open_position_count=2.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_balanced_quantity_does_not_create_open_position(self, tmp_path):
+        """_if _finalize_pending_entry is called with 0/0 fills, it must NOT
+        write to state.open_positions or emit entry.opened."""
+        runtime = _make_open_runtime(tmp_path)
+        runtime.journal.open()
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-proveusdt-zero-fill",
+            symbol="PROVEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=100.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=0.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.0,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid-zero",
+            hedge_order_id="hedge-oid-zero",
+            maker_client_order_id="maker-cid-zero",
+            hedge_client_order_id="hedge-cid-zero",
+        )
+        runtime.state.pending_entries["entry-proveusdt-zero-fill"] = pending
+
+        await runtime._finalize_pending_entry(pending, "entry-proveusdt-zero-fill", now_ms)
+
+        assert "entry-proveusdt-zero-fill" not in runtime.state.open_positions, (
+            "Zero-fill pending entry MUST NOT create open position (V1 parity gate)"
+        )
+        assert "entry-proveusdt-zero-fill" not in runtime.state.pending_entries, (
+            "Zero-fill pending entry MUST be removed from pending_entries (V1 unfilled path)"
+        )
+        runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_zero_balanced_quantity_emits_passive_unfilled_not_entry_opened(self, tmp_path):
+        """V1: zero balanced_quantity emits entry.passive_unfilled, NOT entry.opened."""
+        runtime = _make_open_runtime(tmp_path)
+        runtime.journal.open()
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-xcnusdt-zero-fill",
+            symbol="XCNUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=50.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=0.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.0,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid-xcn-zero",
+            hedge_order_id="hedge-oid-xcn-zero",
+            maker_client_order_id="maker-cid-xcn-zero",
+            hedge_client_order_id="hedge-cid-xcn-zero",
+        )
+        runtime.state.pending_entries["entry-xcnusdt-zero-fill"] = pending
+
+        await runtime._finalize_pending_entry(pending, "entry-xcnusdt-zero-fill", now_ms)
+
+        assert len(runtime.state.open_positions) == 0, (
+            "No open positions for zero-fill entry"
+        )
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert len(events) == 0, (
+            "Zero-fill entry MUST NOT emit entry.opened"
+        )
+        unfilled = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.passive_unfilled"]
+        assert len(unfilled) >= 1, (
+            "Zero-fill entry MUST emit entry.passive_unfilled (V1 parity)"
+        )
+        assert unfilled[0].get("payload", {}).get("reason") == "zero_fill_unfilled_removal"
+        assert unfilled[0].get("payload", {}).get("maker_leg_filled") == 0.0
+        assert unfilled[0].get("payload", {}).get("hedge_leg_filled") == 0.0
+        runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_asymmetric_zero_fill_one_leg_zero_does_not_create_position(self, tmp_path):
+        """If maker filled 10 but hedge filled 0, balanced_quantity=0, still
+        no open position.  V1: min(10, 0) = 0 > 0.0 is False.
+
+        The pending entry must NOT be silently removed — it has real maker fill
+        exposure (has_any_fill() is True). Instead it enters fail-closed cleanup.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        runtime.journal.open()
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-asym-zero-fill",
+            symbol="IRYSUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=100.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.0363,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid-asym",
+            hedge_order_id="hedge-oid-asym",
+            maker_client_order_id="maker-cid-asym",
+            hedge_client_order_id="hedge-cid-asym",
+        )
+        runtime.state.pending_entries["entry-asym-zero-fill"] = pending
+
+        assert pending.has_any_fill(), "maker=10 hedge=0 has real fill evidence"
+
+        await runtime._finalize_pending_entry(pending, "entry-asym-zero-fill", now_ms)
+
+        assert "entry-asym-zero-fill" not in runtime.state.open_positions, (
+            "Asymmetric zero-fill (maker=10, hedge=0) MUST NOT create open position"
+        )
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert len(events) == 0, "Must NOT emit entry.opened for one-sided exposure"
+
+        # Must NOT be silently removed — it has real fill evidence
+        retained = [e for e in runtime.journal.read_all()
+                    if e.get("kind") == "pending_entry.zero_balanced_with_fill_retained"]
+        assert len(retained) >= 1, (
+            "One-sided fill MUST emit zero_balanced_with_fill_retained, not passive_unfilled"
+        )
+        assert retained[0].get("payload", {}).get("balanced_quantity") == 0.0
+        assert retained[0].get("payload", {}).get("maker_leg_filled") == 10.0
+        assert retained[0].get("payload", {}).get("hedge_leg_filled") == 0.0
+
+        # Must NOT emit entry.passive_unfilled for partial fill
+        unfilled = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.passive_unfilled"]
+        assert len(unfilled) == 0, (
+            "One-sided fill MUST NOT emit entry.passive_unfilled"
+        )
+        runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_positive_balanced_quantity_creates_open_position(self, tmp_path):
+        """When balanced_quantity > 0, V1 path creates position normally."""
+        runtime = _make_open_runtime(tmp_path)
+        runtime.journal.open()
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-normal-fill",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=0.1,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=0.1,
+            hedge_leg_filled=0.1,
+            maker_fill_price=50000.0,
+            hedge_fill_price=50001.0,
+            maker_order_id="maker-oid-normal",
+            hedge_order_id="hedge-oid-normal",
+            maker_client_order_id="maker-cid-normal",
+            hedge_client_order_id="hedge-cid-normal",
+        )
+        runtime.state.pending_entries["entry-normal-fill"] = pending
+
+        await runtime._finalize_pending_entry(pending, "entry-normal-fill", now_ms)
+
+        assert "entry-normal-fill" in runtime.state.open_positions, (
+            "Normal fill must create open position (V1 parity)"
+        )
+        pos = runtime.state.open_positions["entry-normal-fill"]
+        assert pos.matched_quantity == 0.1
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert len(events) >= 1
+        assert events[0].get("payload", {}).get("balanced_quantity") == 0.1
+        runtime.journal.close()
+
+
+class TestPartiallyMatchedResidualV1Parity:
+    """V1 parity: partially matched entries (maker=10, hedge=8) must create
+    a balanced OpenPosition AND persist a residual repair task for the
+    excess leg (2 units on the over-exposed venue).
+
+    V1 entry_sync.rs:5338-5430:
+    - build_residual_task → Some(task) when fills are asymmetric
+    - balanced_quantity > 0: create position, then persist
+      "incremental_entry_open_partially_matched" residual
+    """
+
+    @pytest.mark.asyncio
+    async def test_partial_match_creates_position_and_residual_task(self, tmp_path):
+        """maker=10, hedge=8 → balanced_quantity=8 → open position for 8,
+        plus residual task for excess 2 on the over-exposed venue."""
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-partial-match",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=8.0,
+            maker_fill_price=50000.0,
+            hedge_fill_price=50001.0,
+            maker_order_id="maker-oid-pm",
+            hedge_order_id="hedge-oid-pm",
+            maker_client_order_id="maker-cid-pm",
+            hedge_client_order_id="hedge-cid-pm",
+        )
+        runtime.state.pending_entries["entry-partial-match"] = pending
+
+        await runtime._finalize_pending_entry(pending, "entry-partial-match", now_ms)
+
+        # Must create open position with balanced_quantity = 8
+        assert "entry-partial-match" in runtime.state.open_positions, (
+            "Partially matched entry must create open position"
+        )
+        pos = runtime.state.open_positions["entry-partial-match"]
+        assert pos.matched_quantity == 8.0, (
+            f"Expected matched_quantity=8.0, got {pos.matched_quantity}"
+        )
+
+        # Must persist residual task for the excess (2 units)
+        residual_tasks = runtime.state.pending_residual_repairs
+        assert len(residual_tasks) >= 1, (
+            "Partially matched entry must persist residual repair task"
+        )
+        task = residual_tasks[0]
+        # The excess is on the long (maker/Binance) side: 10 - 8 = 2
+        assert task.get("origin") == "entry_open", (
+            f"Residual origin must be entry_open, got {task}"
+        )
+        assert task.get("repair_venue") == "binance", (
+            f"Expected repair_venue=binance, got {task}"
+        )
+        assert task.get("repair_side") == "sell", (
+            f"Expected repair_side=sell, got {task}"
+        )
+        assert float(task.get("repair_quantity", 0)) == pytest.approx(2.0, abs=1e-6), (
+            f"Expected repair_quantity=2.0, got {task}"
+        )
+
+        # Must emit entry.opened
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert len(events) >= 1, "Partially matched entry must emit entry.opened"
+        assert events[0].get("payload", {}).get("balanced_quantity") == 8.0
+
+        # Must emit execution.residual_repair_queued with correct reason
+        queued = [e for e in runtime.journal.read_all()
+                  if e.get("kind") == "execution.residual_repair_queued"]
+        assert len(queued) >= 1, "Must emit residual_repair_queued"
+        assert queued[0].get("payload", {}).get("reason") == (
+            "incremental_entry_open_partially_matched"
+        )
+
+    @pytest.mark.asyncio
+    async def test_balanced_match_creates_position_no_residual(self, tmp_path):
+        """maker=10, hedge=10 → balanced_quantity=10, no residual task."""
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-balanced",
+            symbol="ETHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=10.0,
+            maker_fill_price=3000.0,
+            hedge_fill_price=3001.0,
+            maker_order_id="maker-oid-bal",
+            hedge_order_id="hedge-oid-bal",
+            maker_client_order_id="maker-cid-bal",
+            hedge_client_order_id="hedge-cid-bal",
+        )
+        runtime.state.pending_entries["entry-balanced"] = pending
+
+        await runtime._finalize_pending_entry(pending, "entry-balanced", now_ms)
+
+        assert "entry-balanced" in runtime.state.open_positions
+        assert len(runtime.state.pending_residual_repairs) == 0, (
+            "Balanced fill must NOT create residual task"
+        )
+
+        # Must NOT emit residual_repair_queued
+        queued = [e for e in runtime.journal.read_all()
+                  if e.get("kind") == "execution.residual_repair_queued"]
+        assert len(queued) == 0, "Balanced fill must NOT emit residual_repair_queued"
+
+
+class TestUnmatchedResidualV1Parity:
+    """V1 parity: one-sided entries (maker=10, hedge=0) must persist an
+    incremental_entry_open_unmatched_residual task and NOT create an open
+    position or emit entry.opened.
+
+    V1 entry_sync.rs:5436-5443:
+    - balanced_quantity == 0 but residual_task is Some →
+      persist_pending_residual_repair(task, "incremental_entry_open_unmatched_residual")
+    - No OpenPosition created, no entry.opened emitted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_sided_fill_creates_unmatched_residual_no_position(self, tmp_path):
+        """maker=10, hedge=0 → balanced_quantity=0, has_any_fill=True →
+        no open position, emit zero_balanced_with_fill_retained, persist
+        incremental_entry_open_unmatched_residual residual task."""
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-one-sided",
+            symbol="IRYSUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=100.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.0363,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid-one",
+            hedge_order_id="hedge-oid-one",
+            maker_client_order_id="maker-cid-one",
+            hedge_client_order_id="hedge-cid-one",
+        )
+        runtime.state.pending_entries["entry-one-sided"] = pending
+
+        assert pending.has_any_fill(), "maker=10 hedge=0 has real fill evidence"
+
+        await runtime._finalize_pending_entry(pending, "entry-one-sided", now_ms)
+
+        # Must NOT create open position
+        assert "entry-one-sided" not in runtime.state.open_positions, (
+            "One-sided fill MUST NOT create open position"
+        )
+
+        # Must NOT emit entry.opened
+        opened = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert len(opened) == 0, "One-sided fill MUST NOT emit entry.opened"
+
+        # Must NOT emit entry.passive_unfilled
+        unfilled = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.passive_unfilled"]
+        assert len(unfilled) == 0, "One-sided fill MUST NOT emit entry.passive_unfilled"
+
+        # Must emit zero_balanced_with_fill_retained
+        retained = [e for e in runtime.journal.read_all()
+                    if e.get("kind") == "pending_entry.zero_balanced_with_fill_retained"]
+        assert len(retained) >= 1, (
+            "One-sided fill MUST emit zero_balanced_with_fill_retained"
+        )
+
+        # Must persist residual repair task for the unmatched exposure
+        residual_tasks = runtime.state.pending_residual_repairs
+        assert len(residual_tasks) >= 1, (
+            "One-sided fill must persist unmatched residual repair task"
+        )
+        task = residual_tasks[0]
+        # The excess is on the maker (long/Binance) side: 10 units
+        assert task.get("origin") == "entry_open"
+        assert task.get("repair_venue") == "binance"
+        assert task.get("repair_side") == "sell"
+        assert float(task.get("repair_quantity", 0)) == pytest.approx(10.0, abs=1e-6), (
+            f"Expected repair_quantity=10.0 for one-sided maker fill, got {task.get('repair_quantity')}"
+        )
+        assert "entry-one-sided" not in runtime.state.pending_entries, (
+            "One-sided fill with residual task must terminalize pending entry (V1 parity)"
+        )
+        assert runtime.state.risk_mode.value == "running", (
+            "One-sided residual task path must not enter fail_closed by itself"
+        )
+
+        # Must emit residual_repair_queued with correct reason
+        queued = [e for e in runtime.journal.read_all()
+                  if e.get("kind") == "execution.residual_repair_queued"]
+        assert len(queued) >= 1, "Must emit residual_repair_queued"
+        assert queued[0].get("payload", {}).get("reason") == (
+            "incremental_entry_open_unmatched_residual"
+        ), f"Expected reason=incremental_entry_open_unmatched_residual, got {queued[0].get('payload', {}).get('reason')}"
+
+    @pytest.mark.asyncio
+    async def test_hedge_side_unmatched_creates_residual(self, tmp_path):
+        """maker=0, hedge=12 → balanced_quantity=0, has_any_fill=True →
+        residual on the hedge (short) side: exposure_quantity=12, BUY to close."""
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-hedge-only",
+            symbol="SOLUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=20.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=0.0,
+            hedge_leg_filled=12.0,
+            maker_fill_price=0.0,
+            hedge_fill_price=150.0,
+            maker_order_id="maker-oid-ho",
+            hedge_order_id="hedge-oid-ho",
+            maker_client_order_id="maker-cid-ho",
+            hedge_client_order_id="hedge-cid-ho",
+        )
+        runtime.state.pending_entries["entry-hedge-only"] = pending
+
+        assert pending.has_any_fill(), "maker=0 hedge=12 has real fill evidence"
+
+        await runtime._finalize_pending_entry(pending, "entry-hedge-only", now_ms)
+
+        # Must NOT create open position
+        assert "entry-hedge-only" not in runtime.state.open_positions
+
+        # Must persist residual task for the unmatched short exposure
+        residual_tasks = runtime.state.pending_residual_repairs
+        assert len(residual_tasks) >= 1, (
+            "Hedge-only fill must persist unmatched residual repair task"
+        )
+        task = residual_tasks[0]
+        # The excess is on the short (hedge/BYBIT) side: 12 units, BUY to close
+        assert task.get("repair_venue") == "bybit"
+        assert float(task.get("repair_quantity", 0)) == pytest.approx(12.0, abs=1e-6), (
+            f"Expected repair_quantity=12.0 for unmatched hedge fill, got {task.get('repair_quantity')}"
+        )
+        assert task.get("repair_side") in ("BUY", "buy"), (
+            f"Expected repair_side=BUY (close short), got {task.get('repair_side')}"
+        )
+
+
+class TestResidualRepairExecutionV1Parity:
+    """V1 parity: pending_residual_repairs repair only the live excess on the
+    recorded repair venue/side. They must not full-close the matched position.
+    """
+
+    @pytest.mark.asyncio
+    async def test_partial_match_residual_repairs_excess_only_and_keeps_position(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-partial-repair",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=8.0,
+            maker_fill_price=50000.0,
+            hedge_fill_price=50001.0,
+        )
+        runtime.state.pending_entries["entry-partial-repair"] = pending
+        await runtime._finalize_pending_entry(pending, "entry-partial-repair", now_ms)
+
+        assert runtime.state.open_positions["entry-partial-repair"].matched_quantity == 8.0
+        assert runtime.state.pending_residual_repairs[0]["repair_quantity"] == pytest.approx(2.0)
+
+        binance = _FakeVenueAdapter(Venue.BINANCE)
+        binance.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            entry_price=50000.0,
+            observed_at_ms=now_ms,
+        )
+        binance.place_order_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=2.0,
+            price=50000.0,
+            order_id="repair-fill-2",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.BINANCE: binance}
+
+        await runtime._recover_residual_repairs(now_ms + 1)
+
+        assert len(binance._place_order_calls) == 1
+        req = binance._place_order_calls[0]
+        assert req.venue == Venue.BINANCE
+        assert req.side == Side.SELL
+        assert req.quantity == pytest.approx(2.0)
+        assert req.reduce_only is True
+        assert "entry-partial-repair" in runtime.state.open_positions, (
+            "Residual repair must not full-close the matched open position"
+        )
+        assert runtime.state.open_positions["entry-partial-repair"].matched_quantity == 8.0
+        assert runtime.state.pending_residual_repairs == []
+
+    @pytest.mark.asyncio
+    async def test_unmatched_residual_repairs_without_open_position(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-one-sided-repair",
+            "pair_id": "irysusdt:binance->bybit",
+            "symbol": "IRYSUSDT",
+            "origin": "entry_open",
+            "repair_venue": "binance",
+            "repair_side": "sell",
+            "repair_quantity": 10.0,
+            "created_at_ms": now_ms,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+        })
+
+        binance = _FakeVenueAdapter(Venue.BINANCE)
+        binance.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="IRYSUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            entry_price=0.0363,
+            observed_at_ms=now_ms,
+        )
+        binance.place_order_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="IRYSUSDT",
+            side=Side.SELL,
+            quantity=10.0,
+            price=0.0363,
+            order_id="repair-fill-10",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.BINANCE: binance}
+
+        await runtime._recover_residual_repairs(now_ms + 1)
+
+        assert len(binance._place_order_calls) == 1
+        req = binance._place_order_calls[0]
+        assert req.venue == Venue.BINANCE
+        assert req.side == Side.SELL
+        assert req.quantity == pytest.approx(10.0)
+        assert req.reduce_only is True
+        assert req.post_only is False
+        assert runtime.state.pending_residual_repairs == []

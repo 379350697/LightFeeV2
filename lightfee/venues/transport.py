@@ -197,6 +197,40 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
+def _parse_optional_float(value: Any) -> Optional[float]:
+    """V1 parse_optional_f64_field parity: returns None for missing/empty values.
+
+    V1 (entry_sync.rs): parse_optional_f64_field returns Ok(None) for
+    None, empty string, "--", "null", "n/a", "nan". Only actual numeric
+    strings are parsed to Some(f64). Uses eq_ignore_ascii_case so all
+    case variants of "nan" match. This prevents
+    `could not convert string to float: ''` errors in Bybit risk snapshots
+    where exchange fields like totalMaintenanceMargin may be empty strings.
+    Non-finite floats (nan, inf, -inf) also return None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None
+        lower = stripped.lower()
+        if lower in ("--", "null", "n/a"):
+            return None
+        if lower == "nan":
+            return None
+        # Check for inf variants after NaN, since "nan" != "inf"
+        if lower in ("inf", "infinity", "-inf", "-infinity"):
+            return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
 def _require_bybit_success(raw: dict[str, Any], context: str) -> None:
     """Raise REJECTED if Bybit retCode is non-zero."""
     if int(raw.get("retCode", 0) or 0) != 0:
@@ -2379,12 +2413,11 @@ class VenueTransport(MarketDataClient):
         try:
             if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
                 raw = await self._request("GET", spec.account_risk_path, private=True)
-                equity = float(raw.get("totalMarginBalance", 0))
-                maint_margin_val = raw.get("totalMaintMargin")
-                if maint_margin_val is None or str(maint_margin_val).strip() == "":
+                equity = _parse_optional_float(raw.get("totalMarginBalance"))
+                if equity is None:
                     return None
-                maint = float(maint_margin_val)
-                if maint <= 0.0:
+                maint = _parse_optional_float(raw.get("totalMaintMargin"))
+                if maint is None or maint <= 0.0:
                     return None
                 snapshot = ARS(
                     venue=spec.venue_id,
@@ -2394,7 +2427,7 @@ class VenueTransport(MarketDataClient):
                     observed_at_ms=now_ms,
                     source="fapi_account",
                 )
-                snapshot.available_balance_quote = float(raw.get("availableBalance", 0))
+                snapshot.available_balance_quote = _parse_optional_float(raw.get("availableBalance"))
                 return snapshot
 
             elif spec.venue_id == Venue.OKX:
@@ -2403,12 +2436,11 @@ class VenueTransport(MarketDataClient):
                 if not data_list:
                     return None
                 row = data_list[0] if isinstance(data_list, list) else data_list
-                equity = float(row.get("totalEq", 0))
-                mmr = row.get("mmr")
-                if mmr is None:
+                equity = _parse_optional_float(row.get("totalEq"))
+                if equity is None or equity <= 0.0:
                     return None
-                maint = float(mmr)
-                if maint <= 0.0:
+                maint = _parse_optional_float(row.get("mmr"))
+                if maint is None or maint <= 0.0:
                     return None
                 snapshot = ARS(
                     venue=spec.venue_id,
@@ -2418,7 +2450,7 @@ class VenueTransport(MarketDataClient):
                     observed_at_ms=now_ms,
                     source="okx_account_balance",
                 )
-                snapshot.available_balance_quote = float(row.get("availEq", 0)) if row.get("availEq") else None
+                snapshot.available_balance_quote = _parse_optional_float(row.get("availEq"))
                 return snapshot
 
             elif spec.venue_id == Venue.BYBIT:
@@ -2431,11 +2463,12 @@ class VenueTransport(MarketDataClient):
                 if not acct_list:
                     return None
                 row = acct_list[0]
-                equity = float(row.get("totalEquity", 0))
-                maint_margin_val = row.get("totalMaintenanceMargin")
-                if maint_margin_val is None:
+                equity = _parse_optional_float(row.get("totalEquity"))
+                if equity is None:
                     return None
-                maint = float(maint_margin_val)
+                maint = _parse_optional_float(row.get("totalMaintenanceMargin"))
+                if maint is None:
+                    return None
                 if maint <= 0.0:
                     return None
                 snapshot = ARS(
@@ -2446,7 +2479,7 @@ class VenueTransport(MarketDataClient):
                     observed_at_ms=now_ms,
                     source="bybit_wallet_balance",
                 )
-                snapshot.available_balance_quote = float(row.get("totalAvailableBalance", 0)) if row.get("totalAvailableBalance") else None
+                snapshot.available_balance_quote = _parse_optional_float(row.get("totalAvailableBalance"))
                 return snapshot
 
             elif spec.venue_id == Venue.BITGET:
@@ -2467,17 +2500,19 @@ class VenueTransport(MarketDataClient):
                 maint = None
                 for key in ("maintenanceMargin", "maintMargin", "maintainMargin", "maintenance_margin"):
                     if key in row:
-                        val = row[key]
-                        if val is not None and str(val).strip():
-                            maint = float(val)
+                        parsed = _parse_optional_float(row[key])
+                        if parsed is not None:
+                            maint = parsed
                             break
                 if maint is None or maint <= 0.0:
                     return None
                 equity = None
                 for key in ("usdtEquity", "equity", "accountEquity"):
                     if key in row:
-                        equity = float(row[key])
-                        break
+                        parsed = _parse_optional_float(row[key])
+                        if parsed is not None:
+                            equity = parsed
+                            break
                 if equity is None:
                     return None
                 snapshot = ARS(
@@ -2491,8 +2526,10 @@ class VenueTransport(MarketDataClient):
                 avail = None
                 for key in ("available", "availableBalance", "crossedMaxAvailable"):
                     if key in row:
-                        avail = float(row[key])
-                        break
+                        parsed = _parse_optional_float(row[key])
+                        if parsed is not None:
+                            avail = parsed
+                            break
                 snapshot.available_balance_quote = avail
                 return snapshot
 
@@ -2503,17 +2540,19 @@ class VenueTransport(MarketDataClient):
                 maint = None
                 for key in ("maintenance_margin", "maintenanceMargin", "maint_margin", "maintMargin"):
                     if key in raw:
-                        val = raw[key]
-                        if val is not None and str(val).strip():
-                            maint = float(val)
+                        parsed = _parse_optional_float(raw[key])
+                        if parsed is not None:
+                            maint = parsed
                             break
                 if maint is None or maint <= 0.0:
                     return None
                 equity = None
                 for key in ("total", "equity", "total_balance"):
                     if key in raw:
-                        equity = float(raw[key])
-                        break
+                        parsed = _parse_optional_float(raw[key])
+                        if parsed is not None:
+                            equity = parsed
+                            break
                 if equity is None:
                     return None
                 snapshot = ARS(
@@ -2527,8 +2566,10 @@ class VenueTransport(MarketDataClient):
                 avail = None
                 for key in ("available", "available_balance"):
                     if key in raw:
-                        avail = float(raw[key])
-                        break
+                        parsed = _parse_optional_float(raw[key])
+                        if parsed is not None:
+                            avail = parsed
+                            break
                 snapshot.available_balance_quote = avail
                 return snapshot
 

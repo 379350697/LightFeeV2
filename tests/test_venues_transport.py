@@ -5659,3 +5659,260 @@ class TestDrivePendingEntryHedgeCancelReplace:
         )
         assert "cancel failed before replacement" in result.detail.lower() or \
             "cancel" in result.detail.lower()
+
+
+class TestParseOptionalFloatV1Parity:
+    """V1 parse_optional_f64_field parity: empty string, None, --, null, n/a, nan
+    must all return None instead of raising ValueError.
+
+    V1 uses eq_ignore_ascii_case("nan") so all case variants must match.
+    Non-finite floats (nan, inf, -inf) also return None.
+
+    Production evidence: Bybit risk_snapshot_fetch_error reported
+    `could not convert string to float: ''` for totalMaintenanceMargin.
+    """
+
+    def test_empty_string_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("") is None
+
+    def test_none_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float(None) is None
+
+    def test_double_dash_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("--") is None
+
+    def test_null_string_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("null") is None
+        assert _parse_optional_float("NULL") is None
+
+    def test_na_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("n/a") is None
+        assert _parse_optional_float("N/A") is None
+
+    def test_nan_all_case_variants_return_none(self):
+        """V1 eq_ignore_ascii_case("nan"): NAN, Nan, nan, NaN all return None."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("nan") is None
+        assert _parse_optional_float("NaN") is None
+        assert _parse_optional_float("NAN") is None
+        assert _parse_optional_float("Nan") is None
+
+    def test_inf_variants_return_none(self):
+        """Non-finite string values must return None."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("inf") is None
+        assert _parse_optional_float("Infinity") is None
+        assert _parse_optional_float("-inf") is None
+        assert _parse_optional_float("-Infinity") is None
+
+    def test_float_nan_returns_none(self):
+        """Non-finite Python float values must return None (not float('nan'))."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float(float("nan")) is None
+        assert _parse_optional_float(float("inf")) is None
+        assert _parse_optional_float(float("-inf")) is None
+
+    def test_whitespace_empty_returns_none(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("  ") is None
+
+    def test_valid_number_returns_float(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("1234.56") == 1234.56
+
+    def test_zero_returns_zero(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("0") == 0.0
+
+    def test_negative_number_returns_float(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("-500.0") == -500.0
+
+    def test_int_value_returns_float(self):
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float(100) == 100.0
+
+
+class TestBybitRiskSnapshotEmptyStringV1Parity:
+    """V1 parity: Bybit risk snapshot must not crash on empty string fields.
+
+    These tests call VenueTransport.fetch_account_risk_snapshot() directly
+    with a mocked _request() that returns Bybit wallet-balance responses,
+    ensuring the real transport parsing path handles all edge cases correctly.
+
+    Production error: `could not convert string to float: ''`
+    V1: parse_optional_f64_field returns None for "", "--", "null", "n/a", "nan".
+    """
+
+    def _make_bybit_transport(self):
+        """Create a live Bybit VenueTransport with mock credentials."""
+        transport = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="test-key", api_secret="test-secret"),
+        )
+        return transport
+
+    def _bybit_wallet_balance_response(self, total_equity="10000.50",
+                                        total_maintenance_margin="500.25",
+                                        total_available_balance="8000.00",
+                                        total_wallet_balance="10000.00"):
+        """Build a realistic Bybit /v5/account/wallet-balance response shape."""
+        return {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [{
+                    "totalEquity": total_equity,
+                    "totalMaintenanceMargin": total_maintenance_margin,
+                    "totalAvailableBalance": total_available_balance,
+                    "totalWalletBalance": total_wallet_balance,
+                }],
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin="" MUST return None, not crash."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "Empty maintenance_margin MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_dash_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin='--' MUST return None (V1 parity)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="--",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "Dash maintenance_margin MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_null_string_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin='null' MUST return None (V1 parity)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="null",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "'null' string MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_na_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin='n/a' MUST return None (V1 parity)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="n/a",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "'n/a' string MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_nan_string_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin='nan' MUST return None (V1 parity)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="nan",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "'nan' string MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_nan_uppercase_maintenance_margin_returns_none(self):
+        """Bybit totalMaintenanceMargin='NAN' MUST return None (V1 parity: eq_ignore_ascii_case)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="NAN",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "'NAN' string MUST return None (V1 parity)"
+
+    @pytest.mark.asyncio
+    async def test_valid_maintenance_margin_returns_snapshot(self):
+        """Bybit valid totalMaintenanceMargin MUST return AccountRiskSnapshot."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="10000.50",
+                total_maintenance_margin="500.25",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is not None
+        assert result.maintenance_margin_quote == 500.25
+        assert result.equity_quote == 10000.50
+
+    @pytest.mark.asyncio
+    async def test_empty_equity_returns_none(self):
+        """Bybit totalEquity="" MUST return None (V1 parity)."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            return self._bybit_wallet_balance_response(
+                total_equity="",
+                total_maintenance_margin="500.25",
+            )
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+        assert result is None, "Empty equity MUST return None (V1 parity)"
+
+
+class TestOkxAsterBinanceRiskSnapshotEmptyStringV1Parity:
+    """V1 parity: OKX/Binance/Aster risk snapshots must not crash on empty strings."""
+
+    def test_okx_mmr_empty_string_returns_none(self):
+        """OKX mmr="" MUST return None, not crash (V1 parity)."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("") is None
+
+    def test_binance_maint_margin_empty_string_returns_none(self):
+        """Binance totalMaintMargin="" MUST return None (V1 parity)."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("") is None
+
+    def test_aster_maint_margin_dash_returns_none(self):
+        """Aster totalMaintMargin='--' MUST return None (V1 parity)."""
+        from lightfee.venues.transport import _parse_optional_float
+        assert _parse_optional_float("--") is None

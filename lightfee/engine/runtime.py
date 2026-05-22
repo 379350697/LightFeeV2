@@ -4785,14 +4785,30 @@ class LiveRuntime:
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
 
-        V1: When both maker and hedge legs are filled, the pending entry is
-        converted into an OpenPosition and recorded durably.
+        V1 parity gate (entry_sync.rs:5338-5454):
+        1. Compute residual_task BEFORE the balanced_quantity branch (line 5338).
+        2. balanced_quantity > 0: create OpenPosition, emit entry.opened; if residual
+           exists → persist as "incremental_entry_open_partially_matched".
+        3. balanced_quantity == 0 with residual (has_any_fill): persist as
+           "incremental_entry_open_unmatched_residual", no open position.
+        4. balanced_quantity == 0 with no fill (zero-fill): emit
+           entry.passive_unfilled, remove pending.
+
+        Zero-fill (maker=0, hedge=0) entries are safely removed as passive_unfilled.
+        One-sided fill (maker>0, hedge=0) creates an unmatched residual task for
+        cleanup but does NOT create an open position or emit entry.opened.
         """
         from lightfee.engine.entry import build_open_position, EntryContext, EntryType
+        from lightfee.engine.residual import (
+            split_entry_fill_residual,
+            residual_pair_id,
+        )
 
         maker_is_long = pending.maker_leg == "long"
         maker_side = Side.BUY if maker_is_long else Side.SELL
 
+        # V1: build_residual_task — computed before branching (entry_sync.rs:5338-5341).
+        # Detects asymmetric dual-leg fills and returns a residual for the excess.
         maker_fill = OrderFill(
             venue=pending.maker_venue(),
             symbol=pending.symbol,
@@ -4811,6 +4827,107 @@ class LiveRuntime:
             order_id=pending.hedge_order_id,
             filled_at_ms=now_ms,
         )
+
+        pair_id = getattr(pending, "pair_id", "") or residual_pair_id(
+            pending.symbol, pending.long_venue, pending.short_venue
+        )
+        residual_task = split_entry_fill_residual(
+            position_id=entry_id,
+            pair_id=pair_id,
+            symbol=pending.symbol,
+            long_venue=pending.long_venue,
+            short_venue=pending.short_venue,
+            long_fill=OrderFill(
+                venue=pending.long_venue,
+                symbol=pending.symbol,
+                side=Side.BUY,
+                quantity=pending.maker_leg_filled if maker_is_long else pending.hedge_leg_filled,
+                price=pending.maker_fill_price if maker_is_long else pending.hedge_fill_price,
+            ),
+            short_fill=OrderFill(
+                venue=pending.short_venue,
+                symbol=pending.symbol,
+                side=Side.SELL,
+                quantity=pending.hedge_leg_filled if maker_is_long else pending.maker_leg_filled,
+                price=pending.hedge_fill_price if maker_is_long else pending.maker_fill_price,
+            ),
+            created_cycle=getattr(self.state, "cycle", 0),
+            now_ms=now_ms,
+        )
+
+        balanced_quantity = min(pending.maker_leg_filled, pending.hedge_leg_filled)
+        balanced_quantity = max(balanced_quantity, 0.0)
+
+        if balanced_quantity <= 0.0:
+            if not pending.has_any_fill():
+                # V1: !has_any_fill → zero-fill, safe to remove as passive_unfilled
+                self.journal.append(
+                    "entry.passive_unfilled",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "pair_id": pair_id,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "balanced_quantity": balanced_quantity,
+                        "reason": "zero_fill_unfilled_removal",
+                    },
+                )
+                self.journal.append(
+                    "pending_entry.pending_entry_finalized",
+                    {
+                        "entry_id": entry_id,
+                        "position_id": None,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "maker_fill_price": pending.maker_fill_price,
+                        "hedge_fill_price": pending.hedge_fill_price,
+                        "finalized_as": "unfilled_zero_balanced",
+                    },
+                )
+                self.state.pending_entries.pop(entry_id, None)
+                return
+
+            # V1: balanced_quantity == 0 but has_any_fill → one-sided exposure.
+            # No open position, no entry.opened. Persist residual task if asymmetric.
+            # entry_sync.rs:5436-5443: if let Some(task) = residual_task {
+            #   persist_pending_residual_repair(task, "incremental_entry_open_unmatched_residual")
+            # }
+            if residual_task is not None:
+                self._queue_pending_residual_repair(
+                    residual_task,
+                    "incremental_entry_open_unmatched_residual",
+                )
+
+            self.journal.append(
+                "pending_entry.zero_balanced_with_fill_retained",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "pair_id": pair_id,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                    "balanced_quantity": balanced_quantity,
+                    "reason": "one_sided_fill_retained_for_cleanup",
+                },
+            )
+            self.journal.append(
+                "pending_entry.pending_entry_finalized",
+                {
+                    "entry_id": entry_id,
+                    "position_id": None,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                    "maker_fill_price": pending.maker_fill_price,
+                    "hedge_fill_price": pending.hedge_fill_price,
+                    "balanced_quantity": balanced_quantity,
+                    "finalized_as": "unmatched_residual",
+                },
+            )
+            self.state.pending_entries.pop(entry_id, None)
+            return
+
+        # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -4845,6 +4962,7 @@ class LiveRuntime:
                 "short_entry_price": position.short_entry_price,
                 "opened_at_ms": position.opened_at_ms,
                 "matched_quantity": position.matched_quantity,
+                "balanced_quantity": balanced_quantity,
                 "maker_order_id": maker_fill.order_id,
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": pending.maker_client_order_id,
@@ -4861,6 +4979,7 @@ class LiveRuntime:
                 "hedge_leg_filled": pending.hedge_leg_filled,
                 "maker_fill_price": pending.maker_fill_price,
                 "hedge_fill_price": pending.hedge_fill_price,
+                "balanced_quantity": balanced_quantity,
             },
         )
 
@@ -4871,6 +4990,35 @@ class LiveRuntime:
                 "symbol": position.symbol,
             },
         )
+
+        # V1: entry_sync.rs:5423-5430 — if residual exists for partially matched
+        # fill (e.g. maker=10, hedge=8 → 8 balanced + 2 residual), persist it.
+        if residual_task is not None:
+            self._queue_pending_residual_repair(
+                residual_task,
+                "incremental_entry_open_partially_matched",
+            )
+
+    def _queue_pending_residual_repair(self, residual_task, reason: str) -> None:
+        """Persist a residual repair task using the V1 runtime field contract."""
+        from lightfee.engine.close_executor import _residual_task_to_dict
+
+        task_dict = _residual_task_to_dict(residual_task)
+        self.state.pending_residual_repairs = [
+            task for task in self.state.pending_residual_repairs
+            if not (
+                isinstance(task, dict)
+                and task.get("position_id") == task_dict["position_id"]
+                and task.get("pair_id") == task_dict["pair_id"]
+                and task.get("origin") == task_dict["origin"]
+                and (task.get("repair_venue") or task.get("exposure_venue")) == task_dict["repair_venue"]
+                and (task.get("repair_side") or task.get("exposure_side")) == task_dict["repair_side"]
+            )
+        ]
+        self.state.pending_residual_repairs.append(task_dict)
+        payload = dict(task_dict)
+        payload["reason"] = reason
+        self.journal.append("execution.residual_repair_queued", payload)
 
     def _finalize_startup_recovery(self) -> None:
         """Transition lifecycle after startup recovery per V1 semantics.
@@ -4960,47 +5108,231 @@ class LiveRuntime:
         V1: process_pending_residual_repairs() — iterates over
         pending_residual_repairs and attempts to repair one-sided exposure
         by submitting reduce-only orders on the over-exposed venue.
+
+        V1 does NOT require a matching open_position — it fetches the live
+        position from the exchange via fetch_position_via_port. Residual tasks
+        from unmatched entries (incremental_entry_open_unmatched_residual) have
+        no corresponding OpenPosition but still represent real exchange exposure.
         """
         if not self.state.pending_residual_repairs:
             return
 
-        if self.close_executor is None:
-            self.journal.append(
-                "recovery.residual_repairs_skipped_no_executor",
-                {"count": len(self.state.pending_residual_repairs), "ts_ms": now_ms},
-            )
-            return
+        from lightfee.core.domain import OrderRequest
+        from lightfee.venues.cid import compact_client_order_id
 
         repaired = 0
         for task in list(self.state.pending_residual_repairs):
             if not isinstance(task, dict):
                 continue
-            position_id = task.get("position_id", "")
-            pos = self.state.open_positions.get(position_id)
-            if pos is None:
+
+            fields = self._pending_residual_repair_fields(task)
+            if fields is None:
+                self.journal.append(
+                    "recovery.residual_repair_invalid_removed",
+                    {"position_id": task.get("position_id", ""), "symbol": task.get("symbol", "")},
+                )
                 self.state.pending_residual_repairs.remove(task)
                 continue
 
-            try:
-                await self.close_executor.execute_close(
-                    pos, "residual_repair", now_ms,
-                    long_price_hint=self._resolve_local_l2_mid(pos.long_venue, pos.symbol),
-                    short_price_hint=self._resolve_local_l2_mid(pos.short_venue, pos.symbol),
-                    state=self.state,
+            repair_venue, repair_side, task_repair_quantity = fields
+            position_id = task.get("position_id", "")
+            pair_id = task.get("pair_id", "")
+            symbol = task.get("symbol", "")
+            adapter = self.get_venue_adapter(repair_venue)
+            if adapter is None:
+                self._reschedule_pending_residual_repair_task(task, now_ms, "adapter_missing")
+                self.journal.append(
+                    "recovery.residual_repair_failed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "repair_quantity": task_repair_quantity,
+                        "error": "adapter_missing",
+                    },
                 )
+                continue
+
+            try:
+                live_position = await adapter.fetch_position(symbol)
+            except Exception as e:
+                self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                self.journal.append(
+                    "recovery.residual_repair_failed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "repair_quantity": task_repair_quantity,
+                        "error": str(e),
+                    },
+                )
+                continue
+
+            baseline = self._residual_repair_baseline_size(task, repair_venue)
+            live_size = self._signed_position_size(live_position)
+            if repair_side == Side.SELL:
+                live_excess_quantity = max(live_size - baseline, 0.0)
+            else:
+                live_excess_quantity = max(baseline - live_size, 0.0)
+
+            if live_excess_quantity <= 1e-9:
                 self.state.pending_residual_repairs.remove(task)
                 repaired += 1
-            except Exception as e:
                 self.journal.append(
-                    "recovery.residual_repair_error",
-                    {"position_id": position_id, "error": str(e)},
+                    "execution.residual_repair_completed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "origin": task.get("origin", ""),
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "result": "already_flat",
+                    },
                 )
+                continue
+
+            repair_quantity = live_excess_quantity
+            if hasattr(adapter, "normalize_quantity"):
+                try:
+                    repair_quantity = await adapter.normalize_quantity(symbol, repair_quantity)
+                except Exception as e:
+                    self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                    self.journal.append(
+                        "recovery.residual_repair_failed",
+                        {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "repair_venue": repair_venue.value,
+                            "repair_side": repair_side.value,
+                            "repair_quantity": live_excess_quantity,
+                            "error": str(e),
+                        },
+                    )
+                    continue
+            if repair_quantity <= 1e-9:
+                self._reschedule_pending_residual_repair_task(
+                    task, now_ms, "normalized_repair_quantity_zero"
+                )
+                continue
+
+            req = OrderRequest(
+                venue=repair_venue,
+                symbol=symbol,
+                side=repair_side,
+                quantity=repair_quantity,
+                price=None,
+                post_only=False,
+                reduce_only=True,
+                time_in_force=TimeInForce.IOC,
+                client_order_id=compact_client_order_id(position_id, "residual_repair"),
+            )
+            try:
+                fill = await adapter.place_order(req)
+                self._flush_adapter_order_diagnostics(adapter)
+            except Exception as e:
+                self._flush_adapter_order_diagnostics(adapter)
+                self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                self.journal.append(
+                    "recovery.residual_repair_failed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "repair_quantity": repair_quantity,
+                        "error": str(e),
+                    },
+                )
+                continue
+
+            remaining_quantity = max(live_excess_quantity - float(fill.quantity or 0.0), 0.0)
+            self.state.pending_residual_repairs.remove(task)
+            if remaining_quantity > 1e-9:
+                updated = dict(task)
+                updated["repair_venue"] = repair_venue.value
+                updated["repair_side"] = repair_side.value
+                updated["repair_quantity"] = remaining_quantity
+                updated.pop("exposure_venue", None)
+                updated.pop("exposure_side", None)
+                updated.pop("exposure_quantity", None)
+                updated["retry_count"] = 0
+                updated["last_attempt_at_ms"] = now_ms
+                self.state.pending_residual_repairs.append(updated)
+            else:
+                repaired += 1
+            self.journal.append(
+                "execution.residual_repair_completed",
+                {
+                    "position_id": position_id,
+                    "pair_id": pair_id,
+                    "symbol": symbol,
+                    "origin": task.get("origin", ""),
+                    "repair_venue": repair_venue.value,
+                    "repair_side": repair_side.value,
+                    "requested_quantity": repair_quantity,
+                    "filled_quantity": float(fill.quantity or 0.0),
+                    "remaining_quantity": remaining_quantity,
+                },
+            )
 
         if repaired > 0:
             self.journal.append(
                 "recovery.residual_repairs_complete",
                 {"repaired": repaired, "ts_ms": now_ms},
             )
+
+    def _pending_residual_repair_fields(self, task: dict) -> tuple[Venue, Side, float] | None:
+        venue_raw = task.get("repair_venue") or task.get("exposure_venue")
+        side_raw = task.get("repair_side") or task.get("exposure_side")
+        quantity_raw = task.get("repair_quantity", task.get("exposure_quantity", 0.0))
+        if venue_raw is None or side_raw is None:
+            return None
+        try:
+            repair_venue = Venue.from_str(str(venue_raw))
+            repair_side = Side(str(side_raw).strip().lower())
+            repair_quantity = float(quantity_raw or 0.0)
+        except Exception:
+            return None
+        if repair_quantity <= 1e-9:
+            return None
+        return repair_venue, repair_side, repair_quantity
+
+    def _signed_position_size(self, position: PositionSnapshot | None) -> float:
+        if position is None:
+            return 0.0
+        quantity = abs(float(position.quantity or 0.0))
+        return quantity if position.side == Side.BUY else -quantity
+
+    def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
+        position_id = task.get("position_id", "")
+        position = self.state.open_positions.get(position_id)
+        if position is None:
+            return 0.0
+        matched_quantity = float(
+            position.matched_quantity
+            or min(position.long_quantity, position.short_quantity)
+            or 0.0
+        )
+        if repair_venue == position.long_venue:
+            return matched_quantity
+        if repair_venue == position.short_venue:
+            return -matched_quantity
+        return 0.0
+
+    def _reschedule_pending_residual_repair_task(
+        self, task: dict, now_ms: int, error: str
+    ) -> None:
+        task["retry_count"] = int(task.get("retry_count", 0) or 0) + 1
+        task["last_attempt_at_ms"] = now_ms
+        task["last_error"] = error
 
     # ------------------------------------------------------------------
     # Housekeeping
