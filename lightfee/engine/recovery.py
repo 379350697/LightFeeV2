@@ -569,8 +569,8 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                 state.pending_passive_closes[pid] = PendingPassiveClose(
                     position_id=pdata.get("position_id", pid),
                     reason=pdata.get("reason", ""),
-                    short_stage=pdata.get("short_stage", ""),
-                    long_stage=pdata.get("long_stage", ""),
+                    short_stage=pdata.get("short_stage", "") or "exit_short",
+                    long_stage=pdata.get("long_stage", "") or "exit_long",
                     target_quantity=float(pdata.get("target_quantity", 0)),
                     max_slippage_bps=pdata.get("max_slippage_bps"),
                     chunk_quantities=[float(x) for x in pdata.get("chunk_quantities", [])],

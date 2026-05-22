@@ -932,11 +932,13 @@ class TestFallbackResidualReal:
         from lightfee.engine.close_executor import CloseExecutor
         mock_close_exec = MagicMock(spec=CloseExecutor)
         captured_total_qty = []
+        captured_stages = []
 
         async def fake_execute_close(position, reason, now_ms, long_price_hint,
                                      short_price_hint, total_quantity, state,
                                      short_stage="", long_stage=""):
             captured_total_qty.append(total_quantity)
+            captured_stages.append((short_stage, long_stage))
             return CloseExecution(
                 position_id=position.position_id, reason=reason,
                 long_close_price=50000.0, short_close_price=50000.0,
@@ -971,6 +973,7 @@ class TestFallbackResidualReal:
 
         assert len(captured_total_qty) == 1
         assert abs(captured_total_qty[0] - 0.6) < 1e-9
+        assert captured_stages == [("exit_short", "exit_long")]
 
     def test_fallback_unhedged_fails_blocks_aggressive_close(self):
         """maker=0.4, hedge=0.2, chunk=1.0 → unhedged=0.2 must succeed before aggressive close."""

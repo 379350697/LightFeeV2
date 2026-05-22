@@ -251,8 +251,8 @@ class PassiveCloseExecutor:
         long_price_hint: float = 0.0,
         short_price_hint: float = 0.0,
         quantity: Optional[float] = None,
-        short_stage: str = "",
-        long_stage: str = "",
+        short_stage: str = "exit_short",
+        long_stage: str = "exit_long",
     ) -> Optional[PendingPassiveClose]:
         """V1 start_pending_passive_close (exit.rs line 1603).
 
@@ -295,8 +295,8 @@ class PassiveCloseExecutor:
             position_id=pid,
             reason=reason,
             position_snapshot=position,
-            short_stage=short_stage,
-            long_stage=long_stage,
+            short_stage=short_stage or "exit_short",
+            long_stage=long_stage or "exit_long",
             target_quantity=target,
             max_slippage_bps=self._config.max_slippage_bps,
             chunk_quantities=chunk_quantities,
@@ -882,6 +882,7 @@ class PassiveCloseExecutor:
 
         # V1 stage resolution: maker_stage from pending's short/long_stage
         maker_stage = pending.long_stage if maker_leg_label == "long" else pending.short_stage
+        maker_stage = maker_stage or ("exit_long" if maker_leg_label == "long" else "exit_short")
         attempt = pending.phase_state.maker_submit_attempt
         stage = (
             f"{maker_stage}_maker{pending.current_chunk_suffix()}"
@@ -1075,6 +1076,7 @@ class PassiveCloseExecutor:
             pending.short_stage if hedge_leg_label == "short"
             else pending.long_stage
         )
+        hedge_stage = hedge_stage or ("exit_short" if hedge_leg_label == "short" else "exit_long")
         stage = f"{hedge_stage}_hedge{pending.current_chunk_suffix()}"
         hedge_cid = compact_client_order_id(position.position_id, stage)
 
@@ -1781,8 +1783,8 @@ class PassiveCloseExecutor:
                 short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
                 total_quantity=paired_residual,
                 state=state,
-                short_stage=pending.short_stage,
-                long_stage=pending.long_stage,
+                short_stage=pending.short_stage or "exit_short",
+                long_stage=pending.long_stage or "exit_long",
             )
             # Check if aggressive close actually executed
             if close_result is None:
