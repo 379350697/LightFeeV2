@@ -542,6 +542,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     cycle_attempt=int(ps_data.get("cycle_attempt", 1)),
                     cycle_started_at_ms=int(ps_data.get("cycle_started_at_ms", 0)),
                     zero_fill_cycles_in_phase=int(ps_data.get("zero_fill_cycles_in_phase", 0)),
+                    maker_submit_attempt=int(ps_data.get("maker_submit_attempt", 0)),
                     maker_order_id=str(ps_data.get("maker_order_id", "")),
                     maker_client_order_id=str(ps_data.get("maker_client_order_id", "")),
                     maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
