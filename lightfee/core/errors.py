@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any, Optional
 
 
 class SubmitFailureClass(Enum):
@@ -17,11 +18,24 @@ class LightFeeError(Exception):
 
 
 class OrderSubmitError(LightFeeError):
-    """Order submission failure with classified outcome."""
+    """Order submission failure with classified outcome.
 
-    def __init__(self, class_: SubmitFailureClass, message: str) -> None:
+    Carries the original TransportError (if any) so evidence builders can
+    extract status_code, raw_body, exchange_code, and exchange_msg without
+    relying on string parsing.
+    """
+
+    def __init__(
+        self,
+        class_: SubmitFailureClass,
+        message: str,
+        transport_error: Optional[Any] = None,
+    ) -> None:
         super().__init__(message)
         self.class_ = class_
+        self.transport_error = transport_error
+        if transport_error is not None:
+            self.__cause__ = transport_error
 
     @property
     def is_rejected(self) -> bool:

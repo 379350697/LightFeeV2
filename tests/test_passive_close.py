@@ -1095,6 +1095,186 @@ class TestFallbackResidualReal:
         failed_events = [e for e in events if e.get("kind") == "exit.passive_close_fallback_unhedged_failed"]
         assert len(failed_events) == 1
 
+    def test_fallback_unhedged_terminal_reduceonly_rechecks_flat_and_clears(self):
+        """A terminal reduce-only hedge reject after a stale probe must clear once live venues are flat."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class SequencedFlatAdapter(VenueAdapter):
+            def __init__(self, venue, fetch_quantities, place_error=None):
+                self._venue = venue
+                self._fetch_quantities = list(fetch_quantities)
+                self._place_error = place_error
+                self.place_order_calls = 0
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                self.place_order_calls += 1
+                if self._place_error is not None:
+                    raise self._place_error
+                return _make_order_fill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0,
+                )
+
+            async def fetch_position(self, symbol):
+                qty = self._fetch_quantities.pop(0) if self._fetch_quantities else 0.0
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=qty,
+                    entry_price=1.0 if qty else 0.0,
+                    observed_at_ms=1000,
+                )
+
+        bybit = SequencedFlatAdapter(Venue.BYBIT, [0.0, 0.0])
+        aster = SequencedFlatAdapter(
+            Venue.ASTER,
+            [1874.0, 0.0],
+            OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                'HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+            ),
+        )
+        adapters = {Venue.BYBIT: bybit, Venue.ASTER: aster}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0134)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-gmt",
+            symbol="GMTUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.ASTER,
+            long_quantity=1874.0,
+            short_quantity=1874.0,
+            matched_quantity=1874.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            target_quantity=1874.0,
+            chunk_quantities=[1874.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=1874.0, average_price=0.012817),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert aster.place_order_calls == 1
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_fallback_terminal_flat" in kinds
+
+    def test_fallback_paired_terminal_reduceonly_rechecks_flat_and_clears(self):
+        """Paired fallback must not loop when both close legs report already-flat terminal rejects."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class TerminalFlatAdapter(VenueAdapter):
+            def __init__(self, venue, fetch_quantities, place_error):
+                self._venue = venue
+                self._fetch_quantities = list(fetch_quantities)
+                self._place_error = place_error
+                self.place_order_calls = 0
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                self.place_order_calls += 1
+                raise self._place_error
+
+            async def fetch_position(self, symbol):
+                qty = self._fetch_quantities.pop(0) if self._fetch_quantities else 0.0
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=qty,
+                    entry_price=1.0 if qty else 0.0,
+                    observed_at_ms=1000,
+                )
+
+        aster = TerminalFlatAdapter(
+            Venue.ASTER,
+            [533.0, 0.0, 0.0],
+            OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                'HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+            ),
+        )
+        bybit = TerminalFlatAdapter(
+            Venue.BYBIT,
+            [0.0, 0.0, 0.0],
+            OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "bybit retCode=110017 retMsg=current position is zero, cannot fix reduce-only order qty",
+            ),
+        )
+        adapters = {Venue.ASTER: aster, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.045)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-lyn",
+            symbol="LYNUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=533.0,
+            short_quantity=533.0,
+            matched_quantity=533.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            target_quantity=533.0,
+            chunk_quantities=[533.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert bybit.place_order_calls == 1
+        assert aster.place_order_calls == 1
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_fallback_terminal_flat" in kinds
+
     def test_fallback_zero_fill_no_pending_does_not_clear(self):
         """Aggressive close returns zero fill AND no PendingClose → don't clear passive pending."""
         journal = _open_journal()
@@ -2458,6 +2638,66 @@ class TestProductionPathCoroutineSafety:
 
 class TestReduceOnlyRejectedEscalation:
     """Reduce-only rejected → immediate DUAL_TAKER escalation, no infinite retry."""
+
+    def test_recovered_terminal_rejected_maker_order_escalates_without_spin(self):
+        """Recovered terminal rejected maker order must not be polled forever."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE,
+            side=Side.SELL,
+            order_id="rejected-maker",
+            client_order_id="rejected-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.REJECTED,
+        ))
+        maker_adapter.submit_passive_order = AsyncMock()
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                zero_fill_cycles_in_phase=PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES - 1,
+                maker_order_id="rejected-maker",
+                maker_client_order_id="rejected-client",
+                maker_resting_limit_price=50000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False),
+            timeout=0.1,
+        ))
+
+        assert result is False
+        assert maker_adapter.query_passive_order_progress.await_count == 1
+        maker_adapter.submit_passive_order.assert_not_called()
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        assert pending.phase_state.maker_order_id == ""
+        events = journal.read_all()
+        terminal_events = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_terminal_no_fill"
+        ]
+        assert len(terminal_events) == 1
 
     def test_order_submit_error_rejected_escalates_to_dual_taker(self):
         """OrderSubmitError with is_rejected=True transitions to DUAL_TAKER."""

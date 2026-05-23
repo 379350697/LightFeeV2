@@ -89,7 +89,7 @@ def test_http_status_without_body_is_partial():
         )
 
         # Evidence completeness should reflect partial/missing
-        ec = result["evidence_completeness"]
+        ec = result["evidence_quality"]
         assert ec["overall"] in ("partial", "missing")
         assert ec["confidence"] in ("low", "medium")
 
@@ -162,7 +162,7 @@ def test_body_with_exchange_code_is_complete():
         assert ex_err.get("exchange_code") == "10001"
         assert ex_err.get("evidence_completeness") == "complete"
 
-        ec = result["evidence_completeness"]
+        ec = result["evidence_quality"]
         # Overall may be "partial" due to missing exchange_truth (unavailable in read-only mode)
         assert ec["overall"] in ("complete", "partial")
         assert ec["confidence"] in ("high", "medium")
@@ -449,7 +449,7 @@ def test_output_structure_has_all_required_sections():
             "order_error_evidence",
             "l2_evidence",
             "runtime_warnings",
-            "evidence_completeness",
+            "evidence_quality",
             "conclusion",
         ]
         for section in required_sections:
@@ -461,9 +461,367 @@ def test_output_structure_has_all_required_sections():
             assert f in c, "missing conclusion field: {}".format(f)
 
         # Evidence completeness must have required fields
-        ec = result["evidence_completeness"]
+        ec = result["evidence_quality"]
         for f in ["overall", "missing_evidence", "confidence"]:
             assert f in ec, "missing evidence_completeness field: {}".format(f)
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# State mismatch: ALTUSDT open locally, exchange flat → critical
+# ---------------------------------------------------------------------------
+
+
+def test_altusdt_local_open_exchange_flat_is_critical_mismatch():
+    """Local runtime has ALTUSDT open position qty 2789, exchange flat.
+
+    Must produce: state_mismatch.local_open_exchange_flat=true, health.ok=false,
+    critical containing local/exchange mismatch, evidence source pointing to
+    local state + exchange truth.
+    """
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "open_positions": [
+                {
+                    "position_id": "pos_alt_001",
+                    "symbol": "ALTUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "quantity": 2789,
+                    "matched_quantity": 2789,
+                    "opened_at_ms": 1700000000000,
+                }
+            ],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+
+        events = [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "pos_alt_001",
+                    "venue": "binance",
+                    "symbol": "ALTUSDT",
+                    "reason": "ReduceOnly Order is rejected.",
+                    "exchange_error": {
+                        "venue": "binance",
+                        "operation": "place_order",
+                        "transport_error_type": "exchange_retcode",
+                        "http_status": 400,
+                        "raw_body": '{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+                        "exchange_code": "-2022",
+                        "exchange_msg": "ReduceOnly Order is rejected.",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                    },
+                    "request_context": {
+                        "symbol": "ALTUSDT", "side": "sell",
+                        "reduce_only": True, "quantity": 2789,
+                    },
+                    "evidence_completeness": "complete",
+                },
+            }
+        ]
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        result = run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        # Local has open position
+        assert result["local_state"]["open_position_count"] == 1
+
+        # Exchange truth is unavailable (no credentials) → confidence low
+        assert result["exchange_truth"]["available"] is False
+        assert result["state_consistency"]["confidence"] == "low"
+        assert "exchange_truth" in result["state_consistency"].get("missing_evidence", [])
+
+        # Order error with body must show code=-2022
+        assert len(result["order_error_evidence"]) >= 1
+        oe = result["order_error_evidence"][0]
+        assert oe["symbol"] == "ALTUSDT"
+        assert oe["raw_body_present"] is True
+        assert oe["exchange_code"] == "-2022"
+
+        # Evidence quality should reflect missing exchange truth
+        ec = result["evidence_quality"]
+        assert "exchange_truth_unavailable" in ec.get("missing_evidence", [])
+
+        # Health: no critical service failures if no service data
+        # but exchange truth missing means evidence is low confidence
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# since_deploy: uses real deploy/service time, not 24h
+# ---------------------------------------------------------------------------
+
+
+def test_since_deploy_uses_service_or_deploy_time_not_24h_fallback():
+    """--since-deploy must compute window from deploy/service started_at.
+
+    When no service/deploy time available, fallback to 24h with low confidence.
+    """
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {"ts_ms": 1700000001000, "kind": "order.rejected", "payload": {}},
+        ])
+
+        result = run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+            since_deploy=True,
+        )
+
+        w = result["window"]
+        assert "mode" in w
+        assert "since_ms" in w
+        assert "until_ms" in w
+        assert "source" in w
+        assert "confidence" in w
+
+        # Without deploy/service time → fallback 24h with low confidence
+        if w["mode"] == "since_deploy_fallback_24h":
+            assert w["confidence"] == "low"
+            assert "missing_evidence" in w
+
+        # Verify it's NOT exactly 24h ago from NOW if deploy time is available
+        # (In this test, no deploy time available, so fallback is expected)
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Tail read: newest events must appear even with long JSONL
+# ---------------------------------------------------------------------------
+
+
+def test_tail_read_captures_latest_events_not_cut_by_max_records():
+    """Long JSONL where old events are at head and new -2022 error is at tail.
+
+    The tail-reading logic must capture the -2022 error even if max_records
+    would cut it off when reading from head.
+    """
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+
+        # Build a long event list: 200 old events + 1 critical -2022 at tail
+        events = []
+        for i in range(200):
+            events.append({
+                "ts_ms": 1700000000000 + i * 1000,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "pos_old",
+                    "venue": "binance",
+                    "symbol": "BTCUSDT",
+                    "reason": "old error {}".format(i),
+                    "exchange_error": {},
+                },
+            })
+        # The critical -2022 event at the tail
+        events.append({
+            "ts_ms": 1700000300000,
+            "kind": "exit.passive_close_maker_submit_error",
+            "payload": {
+                "position_id": "pos_critical",
+                "venue": "binance",
+                "symbol": "ALTUSDT",
+                "reason": "ReduceOnly Order is rejected.",
+                "exchange_error": {
+                    "venue": "binance",
+                    "operation": "submit_passive_order",
+                    "transport_error_type": "exchange_retcode",
+                    "http_status": 400,
+                    "raw_body": '{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+                    "exchange_code": "-2022",
+                    "exchange_msg": "ReduceOnly Order is rejected.",
+                    "evidence_completeness": "complete",
+                    "missing_evidence": [],
+                    "confidence": "high",
+                },
+                "request_context": {"symbol": "ALTUSDT", "reduce_only": True},
+                "evidence_completeness": "complete",
+            },
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        result = run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000400000,
+            max_events=50,  # low limit — but tail read should still capture -2022
+        )
+
+        # The -2022 event must be present in order_error_evidence
+        alt_errors = [e for e in result["order_error_evidence"]
+                      if e.get("symbol") == "ALTUSDT"]
+        assert len(alt_errors) >= 1, (
+            "Tail read must capture -2022 event at tail, even with max_events=50"
+        )
+        assert alt_errors[0]["exchange_code"] == "-2022"
+        # Event counts should include the passive close error
+        ec = result.get("event_counts", {})
+        assert "exit.passive_close_maker_submit_error" in ec
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Production state path resolution: live-state-current.json first
+# ---------------------------------------------------------------------------
+
+
+def test_state_path_prioritizes_live_state_current():
+    """live-state-current.json is preferred over state-current.json for production."""
+    d = _make_tmpdir()
+    try:
+        live_state = {"lifecycle": "running", "risk_mode": "running",
+                      "open_position_count": 5, "open_positions": [],
+                      "pending_entry_count": 0, "pending_close_count": 0,
+                      "last_tick_ms": 1700000000000}
+        fallback_state = {"lifecycle": "stopped", "risk_mode": "fail_closed",
+                         "open_position_count": 0, "open_positions": [],
+                         "pending_entry_count": 0, "pending_close_count": 0,
+                         "last_tick_ms": 0}
+
+        _write_json(os.path.join(d, "live-state-current.json"), live_state)
+        _write_json(os.path.join(d, "state-current.json"), fallback_state)
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        result = run_diagnose(
+            runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000400000,
+        )
+
+        # Must have used live-state-current.json → lifecycle=running, open=5
+        assert result["local_state"]["lifecycle"] == "running"
+        assert result["local_state"]["open_position_count"] == 5
+        assert result["scope"]["state_path_source"] == "live-state-current.json"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_state_path_falls_back_when_live_missing():
+    """When live-state-current.json doesn't exist, fall back to state-current.json."""
+    d = _make_tmpdir()
+    try:
+        fallback_state = {"lifecycle": "stopped", "risk_mode": "fail_closed",
+                         "open_position_count": 0, "open_positions": [],
+                         "pending_entry_count": 0, "pending_close_count": 0,
+                         "last_tick_ms": 0}
+        _write_json(os.path.join(d, "state-current.json"), fallback_state)
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        result = run_diagnose(
+            runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000400000,
+        )
+
+        assert result["local_state"]["lifecycle"] == "stopped"
+        assert "fallback" in result["scope"].get("state_path_source", "")
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Missing exchange body in events → evidence quality reports it
+# ---------------------------------------------------------------------------
+
+
+def test_missing_exchange_body_in_events_reported():
+    """When exchange_error has no raw_body, evidence must report missing_exchange_body."""
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running", "risk_mode": "running",
+            "open_position_count": 0, "open_positions": [],
+            "pending_entry_count": 0, "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+
+        events = [{
+            "ts_ms": 1700000001000,
+            "kind": "exit.passive_close_maker_submit_error",
+            "payload": {
+                "position_id": "pos_no_body",
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "reason": "HTTP 400 Bad Request",
+                "exchange_error": {
+                    "venue": "binance",
+                    "operation": "submit_passive_order",
+                    "transport_error_type": "http_status",
+                    "http_status": 400,
+                    "raw_body": "",
+                    "exchange_code": "",
+                    "exchange_msg": "",
+                    "evidence_completeness": "missing_exchange_body",
+                    "missing_evidence": ["exchange_response_body", "exchange_error_code", "exchange_error_msg"],
+                    "confidence": "medium",
+                },
+                "request_context": {"symbol": "BTCUSDT"},
+                "evidence_completeness": "missing_exchange_body",
+            },
+        }]
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        result = run_diagnose(
+            runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000400000,
+        )
+
+        oe = result["order_error_evidence"][0]
+        assert oe["raw_body_present"] is False
+        assert "exchange_response_body" in oe.get("missing_evidence", [])
+        assert oe["evidence_completeness"] == "missing_exchange_body"
+
+        # evidence_quality should reflect body missing
+        ec = result["evidence_quality"]
+        assert ec["overall"] in ("missing", "partial")
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

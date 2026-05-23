@@ -493,8 +493,25 @@ class PassiveCloseExecutor:
                         pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
                         return False
                     else:
-                        # Maker order died — restart maintenance cycle
-                        continue
+                        # Terminal non-filled maker orders must not be polled forever.
+                        # Clear the stale order and fall through to the normal zero-fill
+                        # phase budget so recovery can switch phase or arm DUAL_TAKER.
+                        self._journal.append(
+                            "exit.passive_close_maker_terminal_no_fill",
+                            {
+                                "position_id": position_id,
+                                "maker_order_id": progress.order_id or maker_order_id,
+                                "maker_client_order_id": progress.client_order_id or maker_client_id,
+                                "state": progress.state.value,
+                                "cumulative_quantity": progress.cumulative_quantity,
+                                "phase": pending.phase_state.phase.value,
+                                "zero_fill_cycles": pending.phase_state.zero_fill_cycles_in_phase,
+                            },
+                        )
+                        pending.phase_state.maker_order_id = ""
+                        pending.phase_state.maker_client_order_id = ""
+                        pending.phase_state.maker_resting_limit_price = None
+                        pending.phase_state.maker_resting_since_ms = 0
 
             # --- Delta hedge: hedge outstanding gap between maker and hedge ---
             # V1: hedges unhedged_gap, not just maker_fill_delta, so that
@@ -1874,6 +1891,53 @@ class PassiveCloseExecutor:
         """True if this passive close should fall back to aggressive (dual taker)."""
         return pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
 
+    async def _clear_if_live_flat(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        extra: dict[str, Any] | None = None,
+    ) -> bool:
+        if not await self._probe_live_flatness(
+            pending,
+            self._adapters,
+            position_snapshot=position,
+        ):
+            return False
+
+        payload = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "source": source,
+        }
+        if extra:
+            payload.update(extra)
+        self._journal.append("exit.passive_close_fallback_terminal_flat", payload)
+
+        state.pending_passive_closes.pop(pending.position_id, None)
+        state.open_positions.pop(pending.position_id, None)
+        self._journal.append(
+            "recovery.flat",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "source": source,
+            },
+        )
+        self._journal.append(
+            "runtime.position_drift_corrected",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "old_quantity": position.matched_quantity,
+                "new_quantity": 0.0,
+                "source": source,
+            },
+        )
+        return True
+
     async def _fallback_to_aggressive_close(
         self,
         state: EngineState,
@@ -1898,27 +1962,12 @@ class PassiveCloseExecutor:
         if total_remaining <= 1e-9:
             return True
 
-        if await self._probe_live_flatness(pending, self._adapters):
-            state.pending_passive_closes.pop(pending.position_id, None)
-            state.open_positions.pop(pending.position_id, None)
-            self._journal.append(
-                "recovery.flat",
-                {
-                    "position_id": pending.position_id,
-                    "symbol": position.symbol,
-                    "source": "pending_passive_close_flat_probe",
-                },
-            )
-            self._journal.append(
-                "runtime.position_drift_corrected",
-                {
-                    "position_id": pending.position_id,
-                    "symbol": position.symbol,
-                    "old_quantity": position.matched_quantity,
-                    "new_quantity": 0.0,
-                    "source": "pending_passive_close_flat_probe",
-                },
-            )
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source="pending_passive_close_flat_probe",
+        ):
             return True
 
         if self._close_executor is None:
@@ -1970,6 +2019,18 @@ class PassiveCloseExecutor:
                         "hedge_result_error": result.error,
                     },
                 )
+                if self._is_non_retryable_hedge_error(result.error or ""):
+                    if await self._clear_if_live_flat(
+                        state,
+                        pending,
+                        position,
+                        source="pending_passive_close_terminal_hedge_probe",
+                        extra={
+                            "unhedged_residual": unhedged_residual,
+                            "hedge_result_error": result.error,
+                        },
+                    ):
+                        return True
                 pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
             # Recompute paired residual after hedge catch-up
@@ -1994,6 +2055,14 @@ class PassiveCloseExecutor:
                     "exit.passive_close_fallback_aggressive_null_result",
                     {"position_id": pending.position_id},
                 )
+                if await self._clear_if_live_flat(
+                    state,
+                    pending,
+                    position,
+                    source="pending_passive_close_null_result_flat_probe",
+                    extra={"paired_residual": paired_residual},
+                ):
+                    return True
                 pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
 
@@ -2015,6 +2084,14 @@ class PassiveCloseExecutor:
                             "reason": "aggressive close returned zero fill with no pending close registered",
                         },
                     )
+                    if await self._clear_if_live_flat(
+                        state,
+                        pending,
+                        position,
+                        source="pending_passive_close_zero_fill_flat_probe",
+                        extra={"paired_residual": paired_residual},
+                    ):
+                        return True
                     pending.next_retry_at_ms = self._now_ms() + 5_000
                     return False
 
@@ -2110,6 +2187,7 @@ class PassiveCloseExecutor:
         self,
         pending: PendingPassiveClose,
         adapters: dict[Venue, VenueAdapter],
+        position_snapshot: OpenPosition | None = None,
     ) -> bool:
         """Check if position is flat on all relevant venues.
 
@@ -2118,7 +2196,7 @@ class PassiveCloseExecutor:
         the position is considered flat. If either venue is unreachable
         or returns ambiguous data, conservatively reports not-flat.
         """
-        snapshot = pending.position_snapshot
+        snapshot = position_snapshot or pending.position_snapshot
         if snapshot is None:
             return False
 

@@ -421,6 +421,26 @@ class TestM12VenueErrorCodes:
         )
         assert cls["empty_position"] is True
 
+    def test_bybit_position_zero_code_110017(self):
+        """Bybit 110017 current position is zero is terminal reduce-only."""
+        from lightfee.engine.close_executor import _classify_close_leg_error, _is_terminal_reduce_only
+
+        cls = _classify_close_leg_error(
+            "bybit retCode=110017 retMsg=current position is zero, cannot fix reduce-only order qty"
+        )
+        assert cls["empty_position"] is True
+        assert _is_terminal_reduce_only(cls, "") is True
+
+    def test_binance_like_minus_2022_reduceonly_rejected(self):
+        """Binance/Aster -2022 ReduceOnly rejected means the reduce-only leg is terminal."""
+        from lightfee.engine.close_executor import _classify_close_leg_error, _is_terminal_reduce_only
+
+        cls = _classify_close_leg_error(
+            'HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}'
+        )
+        assert cls["empty_position"] is True
+        assert _is_terminal_reduce_only(cls, "") is True
+
     def test_binance_code_minus_2010_insufficient_position(self):
         """Binance -2010 → empty_position (reduce-only rejected)."""
         from lightfee.engine.close_executor import _classify_close_leg_error, _is_terminal_reduce_only

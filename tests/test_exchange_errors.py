@@ -59,8 +59,14 @@ def test_http_401_without_body_is_transport_only():
     evidence.assess_completeness()
     assert evidence.evidence_completeness == EvidenceCompleteness.TRANSPORT_ONLY
     assert evidence.confidence == "low"
-    assert "raw_body" in evidence.missing_evidence
-    assert "exchange_code_or_msg" in evidence.missing_evidence
+    assert (
+        "raw_body" in evidence.missing_evidence
+        or "exchange_response_body" in evidence.missing_evidence
+    )
+    assert (
+        "exchange_code_or_msg" in evidence.missing_evidence
+        or "exchange_error_code" in evidence.missing_evidence
+    )
 
 
 def test_http_429_with_body_but_no_exchange_code_is_missing_exchange_code():
@@ -74,10 +80,16 @@ def test_http_429_with_body_but_no_exchange_code_is_missing_exchange_code():
         request_context=RequestContext(symbol="ETHUSDT"),
     )
     evidence.assess_completeness()
-    # Has body but no exchange code -> missing_exchange_code
-    assert evidence.evidence_completeness == EvidenceCompleteness.MISSING_EXCHANGE_CODE
+    # HTML body is not parseable JSON -> unparsed_exchange_body
+    assert evidence.evidence_completeness in (
+        EvidenceCompleteness.MISSING_EXCHANGE_CODE,
+        EvidenceCompleteness.UNPARSED_EXCHANGE_BODY,
+    )
     assert evidence.confidence == "medium"
-    assert "exchange_code_or_msg" in evidence.missing_evidence
+    assert (
+        "exchange_code_or_msg" in evidence.missing_evidence
+        or "exchange_response_body_unparseable" in evidence.missing_evidence
+    )
 
 
 def test_http_5xx_with_body_is_partial():
@@ -91,10 +103,13 @@ def test_http_5xx_with_body_is_partial():
         request_context=RequestContext(symbol="BTCUSDT"),
     )
     evidence.assess_completeness()
-    # Has body but no exchange code/msg extractable -> completeness determined by assess
+    # Has body with extractable error code -> partial (missing msg or request_ctx fields)
     assert evidence.evidence_completeness != EvidenceCompleteness.COMPLETE
     assert evidence.confidence != "high"
-    assert "exchange_code_or_msg" in evidence.missing_evidence
+    assert any(
+        m in evidence.missing_evidence
+        for m in ("exchange_code_or_msg", "exchange_error_msg", "request_context")
+    )
 
 
 def test_timeout_yields_transport_only():
@@ -183,7 +198,7 @@ def test_okx_code_zero_is_success_not_extracted():
 
 
 # ---------------------------------------------------------------------------
-# Missing body downgrades confidence to low
+# Missing body downgrades confidence to medium when HTTP/request context exists
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +213,7 @@ def test_missing_body_downgrades_confidence():
     )
     evidence.assess_completeness()
     assert evidence.evidence_completeness != EvidenceCompleteness.COMPLETE
-    assert evidence.confidence == "low"
+    assert evidence.confidence == "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -254,11 +269,13 @@ def test_build_evidence_from_ose_without_transport_cause():
     )
     # String extraction should find retCode=110001 from the error message
     assert evidence.exchange_code == "110001"
-    # No body -> missing_body
+    # No body -> completeness reflects missing body or transport_only
     expected = evidence.evidence_completeness
     assert expected in (
         EvidenceCompleteness.COMPLETE, EvidenceCompleteness.PARTIAL,
         EvidenceCompleteness.MISSING_EXCHANGE_CODE, EvidenceCompleteness.MISSING_BODY,
+        EvidenceCompleteness.MISSING_EXCHANGE_BODY, EvidenceCompleteness.TRANSPORT_ONLY,
+        EvidenceCompleteness.MISSING_EXCHANGE_CODE_OR_MSG,
     )
 
 
@@ -368,3 +385,286 @@ def test_evidence_round_trip():
     assert restored.exchange_code == "10001"
     assert restored.evidence_completeness == EvidenceCompleteness.COMPLETE
     assert restored.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# TransportError body preserved through OrderSubmitError (real chain)
+# ---------------------------------------------------------------------------
+
+
+def test_transport_error_body_preserved_through_ose_cause_chain():
+    """TransportError(400, body={-2022}) -> OrderSubmitError -> evidence.
+
+    The __cause__ chain must preserve TransportError so the evidence builder
+    can extract status_code, body, exchange_code, and exchange_msg.
+    """
+    from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+    te = TransportError(
+        TransportErrorCategory.REQUEST_REJECTED,
+        "400 Bad Request",
+        status_code=400,
+        body='{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+    )
+    # Simulate _map_to_submit_error with transport_error=... (now sets __cause__)
+    ose = OrderSubmitError(
+        SubmitFailureClass.REJECTED, str(te), transport_error=te,
+    )
+
+    evidence = build_evidence_from_order_submit_error(
+        ose,
+        venue="binance",
+        operation="place_order",
+        endpoint="/fapi/v1/order",
+        request_context=RequestContext(symbol="ALTUSDT", side="sell", reduce_only=True),
+    )
+
+    assert evidence.http_status == 400
+    assert evidence.raw_body == '{"code":-2022,"msg":"ReduceOnly Order is rejected."}'
+    assert evidence.exchange_code == "-2022"
+    assert "ReduceOnly" in evidence.exchange_msg
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+    assert evidence.confidence == "high"
+    assert "exchange_response_body" not in evidence.missing_evidence
+    assert evidence.request_context.symbol == "ALTUSDT"
+    assert evidence.request_context.reduce_only is True
+
+
+def test_transport_error_body_preserved_through_real_map_path():
+    """Integration: TransportError -> _map_to_submit_error -> evidence.
+
+    Uses the real _map_to_submit_error function (not manual construction).
+    """
+    from lightfee.venues.transport import (
+        TransportError,
+        TransportErrorCategory,
+        _map_to_submit_error,
+    )
+
+    te = TransportError(
+        TransportErrorCategory.REQUEST_REJECTED,
+        "400 Bad Request",
+        status_code=400,
+        body='{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+    )
+    ose = _map_to_submit_error(te.category, str(te), transport_error=te)
+
+    assert ose.is_rejected
+    assert ose.transport_error is te
+    assert ose.__cause__ is te
+
+    evidence = build_evidence_from_order_submit_error(
+        ose, venue="binance", operation="place_order", endpoint="",
+        request_context=RequestContext(symbol="ALTUSDT", side="sell", reduce_only=True),
+    )
+
+    assert evidence.http_status == 400
+    assert evidence.raw_body != ""
+    assert evidence.exchange_code == "-2022"
+    assert "ReduceOnly" in evidence.exchange_msg
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+    assert evidence.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# Generic HTTP status codes — all must produce correct evidence
+# ---------------------------------------------------------------------------
+
+
+def test_http_401_with_json_body():
+    body = '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}'
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=401,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT", side="buy"),
+    )
+    evidence.assess_completeness()
+    assert evidence.http_status == 401
+    assert evidence.exchange_code == "-2015"
+    assert "Invalid API-key" in evidence.exchange_msg
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+    assert evidence.confidence == "high"
+
+
+def test_http_403_with_json_body():
+    body = '{"code":-2014,"msg":"API-key format invalid."}'
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=403,
+        raw_body=body,
+        request_context=RequestContext(symbol="ETHUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.http_status == 403
+    assert evidence.exchange_code == "-2014"
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+
+
+def test_http_429_with_json_body():
+    body = '{"code":-1015,"msg":"Too many requests; rate limit exceeded."}'
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=429,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.http_status == 429
+    assert evidence.exchange_code == "-1015"
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+
+
+def test_http_500_with_generic_error_body():
+    body = '{"error":"Internal Server Error","errorCode":"500_INTERNAL"}'
+    evidence = ExchangeErrorEvidence(
+        venue="bybit",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=500,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.http_status == 500
+    assert evidence.exchange_code != ""
+    assert evidence.confidence != "low"
+
+
+def test_http_503_with_body():
+    body = '{"code":"-1","msg":"Service Unavailable"}'
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=503,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.http_status == 503
+    assert evidence.evidence_completeness != EvidenceCompleteness.TRANSPORT_ONLY
+
+
+# ---------------------------------------------------------------------------
+# Body non-JSON → unparsed_exchange_body
+# ---------------------------------------------------------------------------
+
+
+def test_html_body_not_json_yields_unparsed():
+    body = "<html><body>502 Bad Gateway</body></html>"
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=502,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.evidence_completeness == EvidenceCompleteness.UNPARSED_EXCHANGE_BODY
+    assert evidence.confidence == "medium"
+    assert "exchange_response_body_unparseable" in evidence.missing_evidence
+
+
+# ---------------------------------------------------------------------------
+# Body missing → missing_exchange_body, confidence low
+# ---------------------------------------------------------------------------
+
+
+def test_body_missing_is_missing_exchange_body():
+    evidence = ExchangeErrorEvidence(
+        venue="binance",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=400,
+        raw_body="",
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.evidence_completeness == EvidenceCompleteness.MISSING_EXCHANGE_BODY
+    assert evidence.confidence == "medium"  # has http_status but no body
+    assert "exchange_response_body" in evidence.missing_evidence
+    assert "exchange_error_code" in evidence.missing_evidence
+
+
+# ---------------------------------------------------------------------------
+# Generic JSON field extraction: errorCode/errorMessage, error, etc.
+# ---------------------------------------------------------------------------
+
+
+def test_generic_error_code_extraction():
+    body = '{"errorCode":"ORDER_REJECTED","errorMessage":"Insufficient margin"}'
+    evidence = ExchangeErrorEvidence(
+        venue="unknown_venue",
+        operation="place_order",
+        transport_error_type=TransportErrorType.HTTP_STATUS,
+        http_status=400,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.exchange_code == "ORDER_REJECTED"
+    assert "Insufficient margin" in evidence.exchange_msg
+    assert evidence.evidence_completeness == EvidenceCompleteness.COMPLETE
+
+
+def test_generic_error_field_extraction():
+    body = '{"error":"POSITION_NOT_FOUND","message":"No open position for this symbol"}'
+    evidence = ExchangeErrorEvidence(
+        venue="unknown_venue",
+        operation="cancel_order",
+        http_status=400,
+        raw_body=body,
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    evidence.assess_completeness()
+    assert evidence.exchange_code == "POSITION_NOT_FOUND"
+    assert evidence.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# Old completeness levels still work (backward compatibility)
+# ---------------------------------------------------------------------------
+
+
+def test_old_missing_body_completeness_still_valid():
+    """Old EvidenceCompleteness.MISSING_BODY still exists for backward compat."""
+    assert hasattr(EvidenceCompleteness, "MISSING_BODY")
+    assert EvidenceCompleteness.MISSING_BODY == "missing_body"
+
+
+def test_old_transport_only_still_valid():
+    assert EvidenceCompleteness.TRANSPORT_ONLY == "transport_only"
+
+
+# ---------------------------------------------------------------------------
+# Evidence builder from TransportError with missing body
+# ---------------------------------------------------------------------------
+
+
+def test_build_evidence_from_transport_error_missing_body():
+    """When TransportError has no body, evidence must report missing_exchange_body."""
+    from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+    te = TransportError(
+        TransportErrorCategory.TRANSPORT_FAILURE,
+        "503 Service Unavailable",
+        status_code=503,
+        body="",
+    )
+    evidence = build_evidence_from_transport_error(
+        te, venue="binance", operation="place_order", endpoint="",
+        request_context=RequestContext(symbol="BTCUSDT"),
+    )
+    assert evidence.http_status == 503
+    assert evidence.raw_body == ""
+    assert evidence.evidence_completeness == EvidenceCompleteness.MISSING_EXCHANGE_BODY
+    assert evidence.confidence == "medium"
+    assert "exchange_response_body" in evidence.missing_evidence

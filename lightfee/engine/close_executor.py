@@ -143,10 +143,10 @@ def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
     # --- Bybit structured detection (code-based) ---
     # V1: Bybit error codes for reduce-only terminal conditions
     if not empty_position and not order_not_found:
-        if "position" in lower and _string_contains_any(lower, ("110001", "110043", "20001", "20070")):
+        if "position" in lower and _string_contains_any(lower, ("110001", "110017", "110043", "20001", "20070")):
             empty_position = True
         # Bybit: "no position" / "position idx" error for reduce_only
-        if "no position" in lower:
+        if "no position" in lower or "current position is zero" in lower:
             empty_position = True
 
     # --- Binance structured detection (code-based) ---
@@ -157,8 +157,12 @@ def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
     if not empty_position:
         if _string_contains_any(lower, ("-2010", "-4069", "-4164")):
             empty_position = True
+        if "-2022" in lower and _string_contains_any(lower, ("reduceonly", "reduce only", "reduce_only")):
+            empty_position = True
         # Binance: "position is not enough" / "insufficient position"
         if "reduce" in lower and ("insufficient" in lower or "not enough" in lower):
+            empty_position = True
+        if "reduceonly order is rejected" in lower or "reduce only order is rejected" in lower:
             empty_position = True
 
     # --- Terminal: when empty_position or order_not_found confirmed, or generic pattern ---
@@ -169,6 +173,8 @@ def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
             "position closed", "empty position", "position does not exist",
             "reduce_only", "no position", "insufficient position",
             "position not found", "order does not exist",
+            "current position is zero", "reduceonly order is rejected",
+            "reduce only order is rejected",
         ))
     )
 

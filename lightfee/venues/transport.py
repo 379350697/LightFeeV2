@@ -459,7 +459,8 @@ def _normalize_host_scope(base_url: str) -> str:
 
 
 def _map_to_submit_error(
-    category: TransportErrorCategory, message: str
+    category: TransportErrorCategory, message: str,
+    transport_error: Optional[TransportError] = None,
 ) -> OrderSubmitError:
     if category in (
         TransportErrorCategory.AUTH_FAILURE,
@@ -468,8 +469,14 @@ def _map_to_submit_error(
         TransportErrorCategory.UNSUPPORTED_CAPABILITY,
         TransportErrorCategory.NORMALIZATION_FAILURE,
     ):
-        return OrderSubmitError(SubmitFailureClass.REJECTED, message)
-    return OrderSubmitError(SubmitFailureClass.UNCERTAIN, message)
+        return OrderSubmitError(
+            SubmitFailureClass.REJECTED, message,
+            transport_error=transport_error,
+        )
+    return OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN, message,
+        transport_error=transport_error,
+    )
 
 
 def _transport_error_text(error: Exception) -> str:
@@ -3102,7 +3109,7 @@ class VenueTransport(MarketDataClient):
                     else "uncertain"
                 )
                 self._record_order_diagnostic("order.submit_result", result_payload)
-            raise _map_to_submit_error(e.category, str(e))
+            raise _map_to_submit_error(e.category, str(e), transport_error=e)
         except OrderSubmitError as e:
             if preflight is not None and not result_recorded:
                 result_payload = dict(preflight)
@@ -3937,7 +3944,7 @@ class VenueTransport(MarketDataClient):
                 request, venue_sym, e.status_code, str(e),
                 classification=classification,
             )
-            raise _map_to_submit_error(e.category, str(e))
+            raise _map_to_submit_error(e.category, str(e), transport_error=e)
         except OrderSubmitError as e:
             classification = (
                 "post_only_would_take"
