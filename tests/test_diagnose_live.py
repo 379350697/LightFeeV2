@@ -548,7 +548,13 @@ def test_altusdt_local_open_exchange_flat_is_critical_mismatch():
         # Exchange truth is unavailable (no credentials) → confidence low
         assert result["exchange_truth"]["available"] is False
         assert result["state_consistency"]["confidence"] == "low"
-        assert "exchange_truth" in result["state_consistency"].get("missing_evidence", [])
+        assert (
+            "exchange_truth" in result["state_consistency"].get("missing_evidence", [])
+            or "binance_credentials" in result["state_consistency"].get("missing_evidence", [])
+            or "bybit_credentials" in result["state_consistency"].get("missing_evidence", [])
+        ), "state_consistency missing_evidence: {}".format(
+            result["state_consistency"].get("missing_evidence", [])
+        )
 
         # Order error with body must show code=-2022
         assert len(result["order_error_evidence"]) >= 1

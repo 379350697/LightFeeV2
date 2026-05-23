@@ -470,8 +470,13 @@ def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
     return None
 
 
-async def _fetch_venue_positions(adapter: Any, symbols: list[str]) -> dict[str, Any]:
+async def _fetch_venue_positions(
+    adapter: Any, symbols: list[str],
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    """Fetch positions. Returns (positions, succeeded_symbols, failed_symbols)."""
     positions: dict[str, Any] = {}
+    succeeded: set[str] = set()
+    failed: set[str] = set()
     for sym in symbols:
         try:
             pos = await adapter.fetch_position(sym)
@@ -483,16 +488,26 @@ async def _fetch_venue_positions(adapter: Any, symbols: list[str]) -> dict[str, 
                     "entry_price": float(getattr(pos, "entry_price", 0) or 0),
                     "side": str(getattr(pos, "side", "")),
                 }
+            succeeded.add(sym)
         except Exception as exc:
             positions[sym] = {"symbol": sym, "error": str(exc)[:200]}
-    return positions
+            failed.add(sym)
+    return positions, succeeded, failed
 
 
-async def _fetch_venue_open_orders(adapter: Any, symbols: list[str]) -> dict[str, Any]:
+async def _fetch_venue_open_orders(
+    adapter: Any, symbols: list[str],
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    """Fetch open orders. Returns (orders, succeeded_symbols, failed_symbols)."""
     orders: dict[str, Any] = {}
+    succeeded: set[str] = set()
+    failed: set[str] = set()
     transport = getattr(adapter, "_transport", None)
     if transport is None:
-        return {"error": "no transport available"}
+        for sym in symbols:
+            orders[sym] = {"error": "no transport available"}
+            failed.add(sym)
+        return orders, succeeded, failed
 
     venue = str(getattr(adapter, "venue", ""))
     for sym in symbols:
@@ -507,6 +522,8 @@ async def _fetch_venue_open_orders(adapter: Any, symbols: list[str]) -> dict[str
                     params={"category": "linear", "symbol": sym, "settleCoin": "USDT"},
                 )
             else:
+                succeeded.add(sym)
+                orders[sym] = []
                 continue
 
             order_list = raw if isinstance(raw, list) else raw.get("result", {}).get("list", raw.get("data", []))
@@ -524,9 +541,11 @@ async def _fetch_venue_open_orders(adapter: Any, symbols: list[str]) -> dict[str
                         })
             else:
                 orders[sym] = []
+            succeeded.add(sym)
         except Exception as exc:
             orders[sym] = {"error": str(exc)[:200]}
-    return orders
+            failed.add(sym)
+    return orders, succeeded, failed
 
 
 async def _build_exchange_truth_async(
@@ -536,37 +555,93 @@ async def _build_exchange_truth_async(
     all_positions: dict[str, dict[str, Any]] = {}
     all_open_orders: dict[str, dict[str, Any]] = {}
     available_venues: list[str] = []
+    fetch_status: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+
+    target_symbols = symbols if symbols else []
 
     for venue in ["binance", "bybit"]:
         credential = _load_venue_credential(venue)
         if credential is None:
             all_positions[venue] = {"error": "no credentials available"}
             all_open_orders[venue] = {"error": "no credentials available"}
+            fetch_status[venue] = {
+                "status": "no_credentials",
+                "positions_succeeded": [],
+                "positions_failed": [],
+                "orders_succeeded": [],
+                "orders_failed": [],
+            }
+            missing.append("{}_credentials".format(venue))
             continue
 
         adapter = _create_readonly_adapter(venue, credential)
         if adapter is None:
             errors.append("failed to create {} adapter".format(venue))
+            fetch_status[venue] = {
+                "status": "adapter_creation_failed",
+                "positions_succeeded": [],
+                "positions_failed": list(target_symbols),
+                "orders_succeeded": [],
+                "orders_failed": list(target_symbols),
+            }
+            missing.append("{}_adapter".format(venue))
             continue
 
+        # Fetch positions
+        pos_succeeded: set[str] = set()
+        pos_failed: set[str] = set()
         try:
-            positions = await _fetch_venue_positions(adapter, symbols)
+            positions, pos_succeeded, pos_failed = await _fetch_venue_positions(
+                adapter, target_symbols,
+            )
             all_positions[venue] = positions
         except Exception as exc:
             all_positions[venue] = {"error": str(exc)[:300]}
+            pos_failed = set(target_symbols)
 
+        # Fetch open orders
+        ord_succeeded: set[str] = set()
+        ord_failed: set[str] = set()
         try:
-            orders = await _fetch_venue_open_orders(adapter, symbols)
+            orders, ord_succeeded, ord_failed = await _fetch_venue_open_orders(
+                adapter, target_symbols,
+            )
             all_open_orders[venue] = orders
         except Exception as exc:
             all_open_orders[venue] = {"error": str(exc)[:300]}
+            ord_failed = set(target_symbols)
 
         try:
             await adapter.shutdown()
         except Exception:
             pass
-        available_venues.append(venue)
 
+        # Only count venue as available if at least one position OR order query succeeded
+        any_success = bool(pos_succeeded) or bool(ord_succeeded)
+        any_failure = bool(pos_failed) or bool(ord_failed)
+
+        fetch_status[venue] = {
+            "status": "partial" if (any_success and any_failure) else (
+                "ok" if any_success else "all_failed"
+            ),
+            "positions_succeeded": sorted(pos_succeeded),
+            "positions_failed": sorted(pos_failed),
+            "orders_succeeded": sorted(ord_succeeded),
+            "orders_failed": sorted(ord_failed),
+        }
+
+        if any_success:
+            available_venues.append(venue)
+
+        if pos_failed:
+            for sym in sorted(pos_failed):
+                missing.append("{}_position_fetch_failed_{}".format(venue, sym))
+        if ord_failed:
+            for sym in sorted(ord_failed):
+                missing.append("{}_open_order_fetch_failed_{}".format(venue, sym))
+
+    # has_nonzero_position: True ONLY if at least one SUCCESSFULLY fetched symbol has qty > 0
     has_any_position = any(
         isinstance(v, dict) and "quantity" in v
         for vp in all_positions.values() if isinstance(vp, dict)
@@ -578,19 +653,31 @@ async def _build_exchange_truth_async(
         for v in vo.values() if isinstance(v, list)
     )
 
+    # Confidence: high only if we successfully queried at least one venue and all queries succeeded
+    all_ok = all(
+        fs.get("status") == "ok"
+        for fs in fetch_status.values()
+    )
+    any_available = len(available_venues) > 0
+
+    if not any_available:
+        confidence = "low"
+    elif not all_ok:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
     return {
-        "available": len(available_venues) > 0,
+        "available": any_available,
         "available_venues": available_venues,
-        "confidence": "high" if available_venues else "low",
+        "confidence": confidence,
         "positions": all_positions,
         "open_orders": all_open_orders,
         "has_nonzero_position": has_any_position,
         "has_open_order": has_any_open_order,
+        "fetch_status": fetch_status,
         "errors": errors,
-        "missing_evidence": (
-            [] if available_venues
-            else ["exchange_credentials_unavailable_for_binance_and_bybit"]
-        ),
+        "missing_evidence": missing,
     }
 
 
@@ -631,48 +718,122 @@ def _build_exchange_truth(
 def _build_state_consistency(
     local_state: dict[str, Any], exchange_truth: dict[str, Any]
 ) -> dict[str, Any]:
+    """Compare local state against exchange truth.
+
+    CRITICAL: Only declares local_open_exchange_flat=true when exchange truth
+    confidence is "high" (all symbol queries succeeded). When queries partially
+    or fully failed, the mismatch is reported as "unknown" (cannot verify), not
+    as "flat" (confirmed no position).
+    """
     details: list[dict[str, Any]] = []
     local_open = local_state.get("open_position_count", 0)
-    exchange_available = exchange_truth.get("available", False)
+    et_available = exchange_truth.get("available", False)
+    et_confidence = exchange_truth.get("confidence", "low")
+    fetch_status = exchange_truth.get("fetch_status", {})
 
-    if not exchange_available:
+    # Collect local symbols for cross-reference
+    local_symbols = [
+        p.get("symbol", "")
+        for p in local_state.get("positions", [])
+        if isinstance(p, dict)
+    ]
+
+    # Build list of symbols where position fetch failed
+    position_fetch_failed: list[str] = []
+    for venue, fs in fetch_status.items():
+        if isinstance(fs, dict):
+            for sym in fs.get("positions_failed", []) or []:
+                if sym not in position_fetch_failed:
+                    position_fetch_failed.append(sym)
+
+    if not et_available:
         details.append({
             "check": "exchange_truth_available",
             "ok": False,
-            "detail": "exchange truth not available — cannot verify consistency",
+            "detail": (
+                "exchange truth not available — cannot verify consistency"
+            ),
             "evidence_source": "exchange_truth.available=false",
         })
         return {
             "state_mismatch": False,
             "local_open_exchange_flat": False,
+            "state_verdict": "unknown",
             "details": details,
             "confidence": "low",
-            "missing_evidence": ["exchange_truth"],
+            "missing_evidence": exchange_truth.get("missing_evidence", []),
         }
 
+    # Determine which local symbols were successfully checked on exchange
+    local_with_failed_fetch = [
+        s for s in local_symbols if s in position_fetch_failed
+    ]
+    local_with_success_fetch = [
+        s for s in local_symbols if s not in position_fetch_failed
+    ]
+
+    if et_confidence not in ("high",):
+        # Partial or full fetch failure — cannot reliably declare flat
+        details.append({
+            "check": "exchange_truth_confidence",
+            "ok": False,
+            "detail": (
+                "exchange truth confidence={} — cannot confirm positions for all symbols. "
+                "fetch_failed_symbols={}".format(
+                    et_confidence, position_fetch_failed,
+                )
+            ),
+            "evidence_source": "exchange_truth.confidence",
+        })
+        if local_symbols and local_with_failed_fetch:
+            details.append({
+                "check": "local_open_unverified",
+                "ok": False,
+                "detail": (
+                    "local has {} open position(s) ({}) but exchange fetch failed for: {}".format(
+                        local_open, ", ".join(local_symbols[:5]),
+                        ", ".join(local_with_failed_fetch[:5]),
+                    )
+                ),
+                "evidence_source": "exchange_truth.fetch_status",
+            })
+        return {
+            "state_mismatch": False,
+            "local_open_exchange_flat": False,
+            "state_verdict": "unknown",
+            "details": details,
+            "confidence": "low",
+            "missing_evidence": [
+                "exchange_truth_fetch_partial_or_failed_for_{}".format(s)
+                for s in local_with_failed_fetch[:5]
+            ],
+        }
+
+    # Confidence high: all queries succeeded — we can reliably compare
     exchange_has_positions = exchange_truth.get("has_nonzero_position", False)
     local_has_positions = local_open > 0
     state_mismatch = local_has_positions != exchange_has_positions
     local_open_exchange_flat = local_has_positions and not exchange_has_positions
 
     if local_open_exchange_flat:
-        local_positions = local_state.get("positions", [])
         details.append({
             "check": "local_open_exchange_flat",
             "ok": False,
-            "detail": "local has {} open position(s) but exchange reports no positions".format(
-                local_open,
+            "detail": (
+                "CONFIRMED: local has {} open position(s) ({}) but exchange reports "
+                "no positions (all {} symbol(s) successfully queried)".format(
+                    local_open, ", ".join(local_symbols[:5]),
+                    len(local_with_success_fetch),
+                )
             ),
-            "evidence_source": "local_state.open_positions vs exchange_truth.positions",
-            "local_symbols": [
-                p.get("symbol", "") for p in local_positions if isinstance(p, dict)
-            ],
+            "evidence_source": "local_state.open_positions vs exchange_truth.positions (confidence=high)",
+            "local_symbols": local_symbols,
         })
-    if state_mismatch:
+    if state_mismatch and not local_open_exchange_flat:
         details.append({
             "check": "state_mismatch",
             "ok": False,
-            "detail": "local and exchange state diverge",
+            "detail": "local and exchange state diverge (exchange has positions not in local)",
             "evidence_source": "local_state vs exchange_truth",
         })
 
@@ -681,12 +842,17 @@ def _build_state_consistency(
             "check": "consistency",
             "ok": True,
             "detail": "local and exchange state consistent",
-            "evidence_source": "local_state + exchange_truth",
+            "evidence_source": "local_state + exchange_truth (confidence=high)",
         })
 
     return {
         "state_mismatch": state_mismatch,
         "local_open_exchange_flat": local_open_exchange_flat,
+        "state_verdict": (
+            "local_open_exchange_flat" if local_open_exchange_flat
+            else "consistent" if not state_mismatch
+            else "state_mismatch"
+        ),
         "details": details,
         "confidence": "high",
     }
