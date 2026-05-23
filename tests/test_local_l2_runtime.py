@@ -156,6 +156,26 @@ class TestLocalL2RuntimeAssignments:
         assert len(hot) == 1
         assert hot[0] == LocalL2BookKey(venue="binance", symbol="BTCUSDT")
 
+    def test_prune_untracked_books_removes_dropped_and_keeps_tracked(self):
+        rt = LocalL2Runtime()
+        rt.ensure_book("binance", "BTCUSDT")
+        rt.ensure_book("binance", "ETHUSDT")
+
+        pruned = rt.prune_untracked_books(
+            tracked={LocalL2BookKey(venue="binance", symbol="ETHUSDT")},
+            now_ms=10000,
+        )
+
+        assert pruned == [
+            {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "reason": "dropped_untracked",
+            }
+        ]
+        assert rt.get_book("binance", "BTCUSDT") is None
+        assert rt.get_book("binance", "ETHUSDT") is not None
+
 
 class TestLocalL2RuntimeEvents:
     def test_drain_events_all(self):

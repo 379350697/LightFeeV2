@@ -481,10 +481,30 @@ class LocalL2DataPlane:
         reason: str,
     ) -> None:
         previous_book_seq = getattr(book, "sequence", 0)
+        status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
+        pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
+        expected_sequence = previous_book_seq + 1 if previous_book_seq > 0 else 0
+        incoming_first_sequence = update.first_sequence
+        if incoming_first_sequence <= 0:
+            if update.previous_sequence > 0:
+                incoming_first_sequence = update.previous_sequence + 1
+            else:
+                incoming_first_sequence = update.sequence
+
+        buf = self._pre_snapshot_buffers.get(f"{update.venue}:{update.symbol}")
+        buffered_count = len(buf) if buf is not None else 0
+        first_buffered_sequence = 0
+        last_buffered_sequence = 0
+        if buf:
+            first_buffered_sequence = int(getattr(buf[0].update, "sequence", 0) or 0)
+            last_buffered_sequence = int(getattr(buf[-1].update, "sequence", 0) or 0)
+        policy = policy_for_venue(update.venue)
+
         book.sequence = 0
         book.last_update_id = 0
         book.fault_reason = reason
         book.transition_to_rebuilding(now_ms)
+        status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
         self._runtime.handle_runtime_failure(
             update.venue,
             update.symbol,
@@ -500,8 +520,17 @@ class LocalL2DataPlane:
                 rebuild_trigger=reason,
                 incoming_sequence=update.sequence,
                 incoming_previous_sequence=update.previous_sequence,
+                incoming_first_sequence=incoming_first_sequence,
+                expected_sequence=expected_sequence,
+                buffered_count=buffered_count,
+                first_buffered_sequence=first_buffered_sequence,
+                last_buffered_sequence=last_buffered_sequence,
+                policy_buffer_cap=policy.pre_snapshot_buffer_cap,
                 book_seq=previous_book_seq,
                 reason_class="sequence_gap",
+                status_before=status_before,
+                status_after=status_after,
+                pool_before=pool_before,
             ),
         )
 
@@ -740,22 +769,31 @@ class LocalL2DataPlane:
             if dispatched >= self.max_concurrent_snapshots:
                 break
 
+            if book.pool == L2PoolAssignment.DROPPED:
+                continue
+
             # V1: HOT books rely on WS deltas, but stale HOT books must be
             # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
                 stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
                 if stale_after_ms <= 0 or not book.is_stale(stale_after_ms, now_ms):
                     continue
+                status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
+                pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
                 book.fault_reason = "stale_hot_book"
                 book.transition_to_rebuilding(now_ms)
+                status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
                 policy = policy_for_venue(key.venue)
                 self._journal.append(
                     "runtime.local_l2_hot_stale_rebuild",
                     {
                         "venue": key.venue,
                         "symbol": key.symbol,
-                        "book_status": book.status.value if hasattr(book.status, "value") else str(book.status),
-                        "pool": book.pool.value if hasattr(book.pool, "value") else str(book.pool),
+                        "book_status": status_before,
+                        "status_before": status_before,
+                        "status_after": status_after,
+                        "pool": pool_before,
+                        "pool_before": pool_before,
                         "age_ms": book.age_ms(now_ms),
                         "observed_at_ms": book.observed_at_ms,
                         "stale_after_ms": stale_after_ms,
@@ -807,6 +845,38 @@ class LocalL2DataPlane:
             )
 
         return dispatched
+
+    def prune_untracked_books(
+        self,
+        tracked: set[LocalL2BookKey],
+        now_ms: int,
+        *,
+        retained_max_age_ms: int = 300_000,
+        retained_global_limit: int = 128,
+        retained_per_venue_limit: int = 32,
+    ) -> list[dict]:
+        pruned = self._runtime.prune_untracked_books(
+            tracked,
+            now_ms,
+            retained_max_age_ms=retained_max_age_ms,
+            retained_global_limit=retained_global_limit,
+            retained_per_venue_limit=retained_per_venue_limit,
+        )
+        if not pruned:
+            return []
+
+        for item in pruned:
+            key = LocalL2BookKey(venue=item["venue"], symbol=item["symbol"])
+            self.stop_worker(key)
+            self._snap_states.pop(key, None)
+            self._pre_snapshot_buffers.pop(f"{key.venue}:{key.symbol}", None)
+            self._stream_generations.pop(f"{key.venue}:{key.symbol}", None)
+
+        self._journal.append(
+            "runtime.local_l2_books_pruned",
+            {"pruned_count": len(pruned), "items": pruned, "ts_ms": now_ms},
+        )
+        return pruned
 
     def start_background_bootstrap(
         self,
@@ -1114,10 +1184,15 @@ class LocalL2DataPlane:
         last_buffered_sequence: int = 0,
         incoming_sequence: int = 0,
         incoming_previous_sequence: int = 0,
+        incoming_first_sequence: int = 0,
+        expected_sequence: int = 0,
         policy_buffer_cap: int = 0,
         book_seq: int = 0,
         snapshot_seq: int = 0,
         reason_class: str = "",
+        status_before: str = "",
+        status_after: str = "",
+        pool_before: str = "",
     ) -> dict:
         """Build a structured evidence payload for rebuild/transition logging.
 
@@ -1133,10 +1208,21 @@ class LocalL2DataPlane:
         top_bid = book.best_bid() if hasattr(book, "best_bid") else 0.0
         top_ask = book.best_ask() if hasattr(book, "best_ask") else 0.0
         policy = policy_for_venue(venue)
+        current_status = (
+            book.status.value if book is not None and hasattr(book.status, "value")
+            else str(getattr(book, "status", "unknown")) if book else "missing"
+        )
+        current_pool = (
+            book.pool.value if book is not None and hasattr(book.pool, "value")
+            else str(getattr(book, "pool", "unknown")) if book else "missing"
+        )
         return {
             "venue": venue,
             "symbol": symbol,
-            "status_before": str(getattr(book, "status", "unknown")) if book else "missing",
+            "status_before": status_before or current_status,
+            "status_after": status_after or current_status,
+            "pool_before": pool_before or current_pool,
+            "pool": current_pool,
             "observed_at_ms": obs_ms,
             "sequence": seq,
             "bid_count": bid_count,
@@ -1150,6 +1236,8 @@ class LocalL2DataPlane:
             "last_buffered_sequence": last_buffered_sequence,
             "incoming_sequence": incoming_sequence,
             "incoming_previous_sequence": incoming_previous_sequence,
+            "incoming_first_sequence": incoming_first_sequence,
+            "expected_sequence": expected_sequence,
             "policy_buffer_cap": policy_buffer_cap,
             "book_seq": book_seq,
             "snapshot_seq": snapshot_seq,

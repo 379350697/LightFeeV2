@@ -520,6 +520,7 @@ class TestMarketSnapshotDiagnostics:
         dp.hot_stale_after_ms = 5000
 
         book = rt.ensure_book("binance", "BTCUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
         book.apply_snapshot(
             [PriceLevel(100.0, 1.0)],
             [PriceLevel(101.0, 1.0)],
@@ -539,6 +540,102 @@ class TestMarketSnapshotDiagnostics:
         assert book.status == L2BookStatus.HOT
         assert book.sequence == 8
         assert book.best_bid() == 110.0
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshots_skips_dropped_stale_hot_book(self):
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            call_count = 0
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+                self.call_count += 1
+                raise AssertionError("dropped books must be pruned, not rebuilt")
+
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.hot_stale_after_ms = 5000
+
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1000,
+        )
+        book.transition_to_bootstrapping(1000)
+        book.transition_to_hot()
+        assert book.pool == L2PoolAssignment.DROPPED
+
+        adapter = Adapter()
+        dispatched = await dp.sync_snapshots(
+            {Venue.BINANCE: adapter},
+            now_ms=8000,
+            scan_promoted=True,
+        )
+
+        assert dispatched == 0
+        assert adapter.call_count == 0
+        assert book.status == L2BookStatus.HOT
+        assert not [
+            record for record in journal.records
+            if record[0] == "runtime.local_l2_hot_stale_rebuild"
+        ]
+
+    def test_sequence_gap_rebuild_evidence_uses_pre_transition_status(self):
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=100,
+            now_ms=1000,
+        )
+        book.transition_to_bootstrapping(1000)
+        book.transition_to_hot()
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(99.0, 1.0)],
+                asks=[],
+                first_sequence=106,
+                sequence=110,
+                previous_sequence=105,
+                previous_sequence_present=True,
+                event_time_ms=2000,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2000,
+        )
+
+        payload = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_sequence_gap_rebuild"
+        ][0]
+        assert payload["status_before"] == "hot"
+        assert payload["expected_sequence"] == 101
+        assert payload["incoming_first_sequence"] == 106
+        assert payload["policy_buffer_cap"] == 4096
 
     def test_degraded_transition_preserves_error(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")

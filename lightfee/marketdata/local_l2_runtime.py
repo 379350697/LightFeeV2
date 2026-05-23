@@ -352,6 +352,67 @@ class LocalL2Runtime:
         self.assignments.pop(key, None)
         self.leases.pop(key, None)
 
+    def prune_untracked_books(
+        self,
+        tracked: set[LocalL2BookKey],
+        now_ms: int,
+        *,
+        retained_max_age_ms: int = 300_000,
+        retained_global_limit: int = 128,
+        retained_per_venue_limit: int = 32,
+    ) -> list[dict]:
+        """Prune untracked DROPPED books and over-budget stale RETAINED books.
+
+        Rust V1 parity: dropped books are not a passive cache. Once a book is
+        outside the tracked execution/scan set, V1 removes it instead of letting
+        stale monitoring rebuild it forever.
+        """
+        tracked = set(tracked or set())
+        prune_reasons: dict[LocalL2BookKey, str] = {}
+        retained_candidates: list[tuple[int, str, str, LocalL2BookKey]] = []
+
+        for key, book in list(self.books.items()):
+            if key in tracked:
+                continue
+
+            pool = self.assignments.get(key, getattr(book, "pool", L2PoolAssignment.DROPPED))
+            if pool == L2PoolAssignment.DROPPED:
+                prune_reasons[key] = "dropped_untracked"
+                continue
+
+            if pool != L2PoolAssignment.RETAINED:
+                continue
+
+            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+            age_ms = now_ms - observed_at_ms if observed_at_ms > 0 else retained_max_age_ms + 1
+            if age_ms > retained_max_age_ms:
+                prune_reasons[key] = "retained_expired"
+                continue
+
+            retained_candidates.append((observed_at_ms, key.venue, key.symbol, key))
+
+        retained_candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        retained_global_count = 0
+        retained_venue_counts: dict[str, int] = {}
+        for _observed, venue, _symbol, key in retained_candidates:
+            venue_count = retained_venue_counts.get(venue, 0)
+            if retained_global_count < retained_global_limit and venue_count < retained_per_venue_limit:
+                retained_global_count += 1
+                retained_venue_counts[venue] = venue_count + 1
+                continue
+            prune_reasons[key] = "retained_over_budget"
+
+        pruned: list[dict] = []
+        for key in sorted(prune_reasons, key=lambda item: (item.venue, item.symbol)):
+            reason = prune_reasons[key]
+            self.remove_book(key.venue, key.symbol)
+            pruned.append({
+                "venue": key.venue,
+                "symbol": key.symbol,
+                "reason": reason,
+            })
+        return pruned
+
     # ------------------------------------------------------------------
     # Assignment semantics
     # ------------------------------------------------------------------

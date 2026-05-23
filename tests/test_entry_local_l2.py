@@ -1781,7 +1781,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
 
         activated_symbols = []
 
-        async def record_l2_activation(candidates, now_ms):
+        async def record_l2_activation(candidates, now_ms, **kwargs):
             activated_symbols.extend(c.symbol for c in candidates)
 
         async def no_sync(now_ms, scan_promoted=False):
@@ -1840,6 +1840,74 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert ("start", "binance", ("BTCUSDT",), True) in calls
         assert ("start", "bybit", ("BTCUSDT",), True) in calls
         assert ("connect",) in calls
+
+        from lightfee.marketdata.l2 import L2PoolAssignment
+
+        assert (
+            rt.local_l2_runtime.get_assignment("binance", "BTCUSDT")
+            == L2PoolAssignment.HOT_EXEC
+        )
+        assert (
+            rt.local_l2_runtime.get_assignment("bybit", "BTCUSDT")
+            == L2PoolAssignment.HOT_EXEC
+        )
+
+    @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_preserves_shadow_warm_assignment(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from lightfee.core.domain import Venue
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+        from lightfee.marketdata.l2 import L2PoolAssignment
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("background bootstrap is stubbed in this test")
+
+        rt = runtime_with_l2
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+        monkeypatch.setattr(
+            rt.l2_data_plane,
+            "start_background_bootstrap",
+            lambda **kwargs: None,
+        )
+
+        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        tracked = [
+            TrackedOpportunity(
+                pair_id="shadow",
+                symbol="BTCUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                ranking_edge_bps=12.0,
+                class_=TrackedOpportunityClass.SHADOW,
+            )
+        ]
+
+        try:
+            await rt._ensure_l2_active_for_candidates(
+                [candidate],
+                now_ms=10000,
+                tracked_opportunities=tracked,
+            )
+        finally:
+            rt.journal.close()
+
+        assert (
+            rt.local_l2_runtime.get_assignment("binance", "BTCUSDT")
+            == L2PoolAssignment.WARM
+        )
+        assert (
+            rt.local_l2_runtime.get_assignment("bybit", "BTCUSDT")
+            == L2PoolAssignment.WARM
+        )
 
     @pytest.mark.asyncio
     async def test_snapshot_degraded_and_stale_events_include_root_diagnostics(

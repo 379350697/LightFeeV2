@@ -45,7 +45,7 @@ from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
+from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
@@ -1370,7 +1370,13 @@ class LiveRuntime:
             },
         )
 
-    async def _ensure_l2_active_for_candidates(self, candidates, now_ms: int) -> None:
+    async def _ensure_l2_active_for_candidates(
+        self,
+        candidates,
+        now_ms: int,
+        *,
+        tracked_opportunities=None,
+    ) -> None:
         """Ensure L2 books are active for candidate entry symbols.
 
         V1 parity: activity_local_l2_symbols() → live_startup_activate_local_l2().
@@ -1387,6 +1393,44 @@ class LiveRuntime:
         if self.config.runtime.mode == "paper":
             return
 
+        candidates = list(candidates or [])
+        tracked_opportunities = list(tracked_opportunities or [])
+        tracked_keys: set[LocalL2BookKey] = set()
+        pool_by_key: dict[LocalL2BookKey, L2PoolAssignment] = {}
+        pool_rank = {
+            L2PoolAssignment.HOT_EXEC: 0,
+            L2PoolAssignment.WARM: 1,
+            L2PoolAssignment.RETAINED: 2,
+        }
+
+        def venue_name(venue) -> str:
+            return venue.value if hasattr(venue, "value") else str(venue or "")
+
+        def remember_key(venue, symbol, pool: L2PoolAssignment) -> LocalL2BookKey | None:
+            ven_str = venue_name(venue)
+            sym = str(symbol or "")
+            if not ven_str or not sym:
+                return None
+            key = LocalL2BookKey(venue=ven_str, symbol=sym)
+            tracked_keys.add(key)
+            existing = pool_by_key.get(key)
+            if existing is None or pool_rank[pool] < pool_rank[existing]:
+                pool_by_key[key] = pool
+            return key
+
+        for opportunity in tracked_opportunities:
+            pool = (
+                L2PoolAssignment.HOT_EXEC
+                if getattr(getattr(opportunity, "class_", None), "value", "") == "primary_tracked"
+                else L2PoolAssignment.WARM
+            )
+            sym = getattr(opportunity, "symbol", "")
+            for venue in (
+                getattr(opportunity, "long_venue", ""),
+                getattr(opportunity, "short_venue", ""),
+            ):
+                remember_key(venue, sym, pool)
+
         # Collect (venue, symbol) pairs from candidates that need L2
         # CandidateInput has long_venue/short_venue as str fields (not leg objects)
         needed: dict[str, set[str]] = {}  # venue -> {symbols}
@@ -1396,9 +1440,16 @@ class LiveRuntime:
             for ven_str in (getattr(c, 'long_venue', ''), getattr(c, 'short_venue', '')):
                 if not ven_str or not sym:
                     continue
+                key = LocalL2BookKey(venue=ven_str, symbol=str(sym))
+                tracked_keys.add(key)
+                pool_by_key.setdefault(key, L2PoolAssignment.HOT_EXEC)
+                desired_pool = pool_by_key.get(key, L2PoolAssignment.HOT_EXEC)
                 # Skip if already active
                 book = self.local_l2_runtime.get_book(ven_str, sym)
                 if book is not None:
+                    self.local_l2_runtime.assign(
+                        ven_str, sym, desired_pool, now_ms=now_ms,
+                    )
                     if book.status == L2BookStatus.HOT:
                         stale = book.is_stale(stale_after_ms, now_ms)
                         crossed = book.has_crossed_book()
@@ -1414,7 +1465,30 @@ class LiveRuntime:
                         continue
                 needed.setdefault(ven_str, set()).add(sym)
 
+        for position in getattr(self.state, "open_positions", {}).values():
+            sym = getattr(position, "symbol", "")
+            remember_key(getattr(position, "long_venue", ""), sym, L2PoolAssignment.RETAINED)
+            remember_key(getattr(position, "short_venue", ""), sym, L2PoolAssignment.RETAINED)
+
+        for pending in getattr(self.state, "pending_entries", {}).values():
+            sym = getattr(pending, "symbol", "")
+            remember_key(getattr(pending, "long_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
+            remember_key(getattr(pending, "short_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
+
+        for pending_close in getattr(self.state, "pending_passive_closes", {}).values():
+            position = getattr(pending_close, "position_snapshot", None)
+            if position is None:
+                continue
+            sym = getattr(position, "symbol", "")
+            remember_key(getattr(position, "long_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
+            remember_key(getattr(position, "short_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
+
         if not needed:
+            self.l2_data_plane.prune_untracked_books(
+                tracked_keys,
+                now_ms,
+                retained_max_age_ms=max(stale_after_ms, 300_000),
+            )
             return
 
         per_venue_budget = max(
@@ -1452,7 +1526,12 @@ class LiveRuntime:
 
             for sym in symbols_list:
                 rules = get_venue_rules(ven_str)
+                key = LocalL2BookKey(venue=ven_str, symbol=sym)
+                desired_pool = pool_by_key.get(key, L2PoolAssignment.HOT_EXEC)
                 book = self.local_l2_runtime.ensure_book(ven_str, sym)
+                self.local_l2_runtime.assign(
+                    ven_str, sym, desired_pool, now_ms=now_ms,
+                )
                 book.max_depth = rules.default_depth
                 book.max_sequence_gap = rules.max_sequence_gap
                 if book.status == L2BookStatus.COLD:
@@ -1490,6 +1569,12 @@ class LiveRuntime:
                     "ts_ms": wall_clock_now_ms(),
                 },
             )
+
+        self.l2_data_plane.prune_untracked_books(
+            tracked_keys,
+            now_ms,
+            retained_max_age_ms=max(stale_after_ms, 300_000),
+        )
 
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot.
@@ -1909,6 +1994,7 @@ class LiveRuntime:
                     await self._ensure_l2_active_for_candidates(
                         tracked_candidates,
                         now_ms,
+                        tracked_opportunities=tracked,
                     )
                     self._tracked_primary_pair_ids = {
                         t.pair_id for t in tracked
