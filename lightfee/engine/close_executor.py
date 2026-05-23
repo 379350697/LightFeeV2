@@ -20,6 +20,11 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.core.exchange_errors import (
+    RequestContext,
+    build_evidence_from_order_submit_error,
+    build_fallback_evidence,
+)
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.lifecycle import enter_fail_closed
@@ -1117,6 +1122,14 @@ class CloseExecutor:
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except OrderSubmitError as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_evidence_from_order_submit_error(
+                e,
+                venue=request.venue.value,
+                operation="place_order",
+                endpoint="",
+                request_context=req_ctx,
+            )
             if e.is_rejected:
                 self.journal.append(
                     "order.rejected",
@@ -1125,6 +1138,9 @@ class CloseExecutor:
                         "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "rejected", "fill": None, "reason": str(e), "order_id": ""}
@@ -1136,11 +1152,21 @@ class CloseExecutor:
                         "leg": leg,
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_fallback_evidence(
+                e,
+                venue=request.venue.value,
+                operation="place_order",
+                request_context=req_ctx,
+            )
             self.journal.append(
                 "order.uncertain",
                 {
@@ -1148,6 +1174,9 @@ class CloseExecutor:
                     "leg": leg,
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}

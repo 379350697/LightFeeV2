@@ -33,6 +33,8 @@ from lightfee.core.domain import (
 from lightfee.engine.close_executor import CloseExecutionLeg
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.passive_close import (
+    PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES,
+    PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES,
     PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES,
     PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS,
     PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS,
@@ -42,6 +44,7 @@ from lightfee.engine.passive_close import (
     PassiveCloseManagerProfile,
     PassiveManagerDecisionKind,
 )
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.state import (
     ActiveMakerLeg,
     EngineState,
@@ -2406,6 +2409,392 @@ class TestCancelReplaceSubmitFailure:
 
         submit_failed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_submit_failed"]
         assert len(submit_failed) == 0
+
+
+# ---------------------------------------------------------------------------
+# Production path semantic tests — coroutine safety, reduce-only escalation,
+# L2/tick missing escalation, retry backoff
+# ---------------------------------------------------------------------------
+
+
+class TestProductionPathCoroutineSafety:
+    """Verify _resolve_local_l2_mid never creates unawaited coroutines."""
+
+    def test_no_coroutine_created_for_async_adapter(self):
+        """_resolve_local_l2_mid with no injected resolver returns 0.0
+        without calling adapter.fetch_market_snapshot (which is async)."""
+        import warnings
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        # No l2_mid_resolver injected — should return 0.0 cleanly
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = executor._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT")
+        assert result == 0.0
+        coroutine_warnings = [
+            x for x in w
+            if "coroutine" in str(x.message).lower() and "never awaited" in str(x.message).lower()
+        ]
+        assert len(coroutine_warnings) == 0, (
+            f"Got coroutine warning: {[str(x.message) for x in coroutine_warnings]}"
+        )
+
+    def test_with_injected_resolver_returns_mid(self):
+        """Injected resolver is used, no adapter call attempted."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        result = executor._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT")
+        assert result == 50000.0
+
+    def test_resolver_returns_zero_falls_back_to_zero(self):
+        """Resolver returns 0 → 0.0, not fallback to async adapter."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+        result = executor._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT")
+        assert result == 0.0
+
+
+class TestReduceOnlyRejectedEscalation:
+    """Reduce-only rejected → immediate DUAL_TAKER escalation, no infinite retry."""
+
+    def test_order_submit_error_rejected_escalates_to_dual_taker(self):
+        """OrderSubmitError with is_rejected=True transitions to DUAL_TAKER."""
+        journal = _open_journal()
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        rejected_error = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "Binance API error: code=-2022, msg=ReduceOnly Order is rejected.",
+        )
+        mock_adapter.submit_passive_order = AsyncMock(side_effect=rejected_error)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: mock_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+            )
+        )
+
+        # Must have escalated to DUAL_TAKER
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER, (
+            f"Expected DUAL_TAKER after reduce-only rejection, got {pending.phase_state.phase}"
+        )
+
+    def test_order_submit_error_uncertain_backs_off_with_escalation(self):
+        """OrderSubmitError with is_rejected=False counts failures, backs off,
+        escalates to DUAL_TAKER after PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES."""
+        journal = _open_journal()
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        uncertain_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "Network timeout during order submit",
+        )
+        mock_adapter.submit_passive_order = AsyncMock(side_effect=uncertain_error)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: mock_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        # Submit PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES times
+        for i in range(PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES):
+            phase_before = pending.phase_state.phase
+            asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+                )
+            )
+            if i < PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES - 1:
+                # Still in maker phase, backoff applied
+                assert pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER, (
+                    f"Attempt {i}: still in maker phase"
+                )
+                assert pending.next_retry_at_ms > 0
+            else:
+                # Last attempt: escalated
+                assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER, (
+                    f"Attempt {i}: expected escalation to DUAL_TAKER"
+                )
+
+        # Verify failure counter
+        assert pending.phase_state.maker_submit_consecutive_failures == PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES
+
+
+class TestMissingL2TickEscalation:
+    """Missing L2/tick data escalates after max consecutive failures."""
+
+    def test_missing_l2_escalates_after_max_failures(self):
+        """When price_hint is 0 three consecutive times, escalate to DUAL_TAKER."""
+        journal = _open_journal()
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        # submit is never called because L2 is missing
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: mock_adapter},
+            journal,
+        )
+        # No L2 resolver → price_hint will be 0
+        # No l2_mid_resolver set
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        for i in range(PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES):
+            asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.BINANCE, Side.SELL, "long", 0.0, 1.0,
+                )
+            )
+            if i < PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES - 1:
+                assert pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+            else:
+                assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER, (
+                    f"Attempt {i}: expected DUAL_TAKER escalation"
+                )
+
+        assert pending.phase_state.missing_l2_tick_consecutive_count == PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES
+
+    def test_missing_l2_counter_resets_on_data_available(self):
+        """Missing L2 counter resets to 0 when L2 data becomes available."""
+        journal = _open_journal()
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.submit_passive_order = AsyncMock(
+            return_value=_make_passive_ack(order_id="ok-oid")
+        )
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: mock_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                missing_l2_tick_consecutive_count=2,  # near the edge
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        # Successful submit should reset the counter
+        asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+            )
+        )
+
+        assert pending.phase_state.missing_l2_tick_consecutive_count == 0
+        assert pending.phase_state.maker_submit_consecutive_failures == 0
+
+
+class TestPassiveCloseBackoffBehavior:
+    """Backoff increases with consecutive failures."""
+
+    def test_missing_l2_backoff_increases(self):
+        """Each missing L2 failure increases the retry delay."""
+        journal = _open_journal()
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: mock_adapter},
+            journal,
+        )
+        # No L2 resolver → price_hint = 0
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        prev_retry_at = 0
+        for i in range(PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES):
+            asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.BINANCE, Side.SELL, "long", 0.0, 1.0,
+                )
+            )
+            if i < PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES - 1:
+                assert pending.next_retry_at_ms >= prev_retry_at, (
+                    f"Attempt {i}: backoff should increase"
+                )
+                prev_retry_at = pending.next_retry_at_ms
+
+
+class TestHedgeNonRetryableEscalation:
+    """Hedge side reduce-only rejected escalates to DUAL_TAKER."""
+
+    def test_is_non_retryable_hedge_error_reduce_only(self):
+        """_is_non_retryable_hedge_error detects reduce-only rejections."""
+        executor = PassiveCloseExecutor({}, _open_journal())
+        assert executor._is_non_retryable_hedge_error(
+            "HTTP 400: {\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}"
+        )
+        assert executor._is_non_retryable_hedge_error("ReduceOnly Order is rejected")
+        assert not executor._is_non_retryable_hedge_error("Network timeout")
+        assert not executor._is_non_retryable_hedge_error("")
+
+    def test_hedge_reduce_only_escalates_in_drive_loop(self):
+        """When hedge fails with reduce-only rejection in the drive loop,
+        the pending phase transitions to DUAL_TAKER."""
+        journal = _open_journal()
+
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        # Maker submit succeeds
+        maker_ack = _make_passive_ack(order_id="maker-oid-001")
+        maker_adapter.submit_passive_order = AsyncMock(return_value=maker_ack)
+        # Maker progress shows FILLED
+        maker_adapter.query_passive_order_progress = AsyncMock(
+            return_value=PassiveOrderProgress(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                side=Side.SELL,
+                order_id="maker-oid-001",
+                cumulative_quantity=1.0,
+                average_price=50000.0,
+                state=PassiveOrderState.FILLED,
+            )
+        )
+        # Hedge (place_order on OKX) fails with reduce-only
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+        hedge_adapter.place_order = AsyncMock(
+            side_effect=OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "HTTP 400: {\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}",
+            )
+        )
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(
+            matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0,
+            long_venue=Venue.BINANCE, short_venue=Venue.OKX,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=1.0, average_price=50000.0),
+            hedge_fill=PendingPassiveLegFill(),
+            short_stage="exit_short",
+            long_stage="exit_long",
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        # Drive once: maker already filled, hedge will fail
+        asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id)
+        )
+
+        # Should have escalated to DUAL_TAKER
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER, (
+            f"Expected DUAL_TAKER after non-retryable hedge error, got {pending.phase_state.phase}"
+        )
+
+        events = journal.read_all()
+        escalated = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_hedge_non_retryable_escalated"
+        ]
+        assert len(escalated) == 1
+        assert "ReduceOnly" in escalated[0]["payload"]["hedge_error"]
 
 
 class TestPassiveManagerProfileAndConfig:

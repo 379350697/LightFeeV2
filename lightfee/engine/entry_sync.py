@@ -18,6 +18,11 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, OrderRequest, PassiveOrderState, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.core.exchange_errors import (
+    RequestContext,
+    build_evidence_from_order_submit_error,
+    build_fallback_evidence,
+)
 from lightfee.engine.entry import (
     EntryContext,
     EntryState,
@@ -651,6 +656,14 @@ class EntrySyncExecutor:
 
         except OrderSubmitError as e:
             self._flush_adapter_order_diagnostics(adapter)
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_evidence_from_order_submit_error(
+                e,
+                venue=request.venue.value,
+                operation="submit_passive_order" if is_maker else "place_order",
+                endpoint="",
+                request_context=req_ctx,
+            )
             if e.is_rejected:
                 self.journal.append(
                     "order.rejected",
@@ -663,6 +676,9 @@ class EntrySyncExecutor:
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "rejected", "fill": None, "order_id": ""}
@@ -678,12 +694,22 @@ class EntrySyncExecutor:
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
             self._flush_adapter_order_diagnostics(adapter)
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_fallback_evidence(
+                e,
+                venue=request.venue.value,
+                operation="submit_passive_order" if is_maker else "place_order",
+                request_context=req_ctx,
+            )
             self.journal.append(
                 "order.uncertain",
                 {
@@ -695,6 +721,9 @@ class EntrySyncExecutor:
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                     "is_maker": is_maker,
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}
@@ -742,6 +771,14 @@ class EntrySyncExecutor:
 
         except OrderSubmitError as e:
             self._flush_adapter_order_diagnostics(adapter)
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_evidence_from_order_submit_error(
+                e,
+                venue=request.venue.value,
+                operation="submit_passive_order",
+                endpoint="",
+                request_context=req_ctx,
+            )
             if e.is_rejected:
                 self.journal.append(
                     "order.rejected",
@@ -754,6 +791,9 @@ class EntrySyncExecutor:
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": True,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "rejected", "fill": None, "order_id": ""}
@@ -769,12 +809,22 @@ class EntrySyncExecutor:
                         "reason": str(e),
                         "client_order_id": request.client_order_id,
                         "is_maker": True,
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
                 return {"outcome": "uncertain", "fill": None, "order_id": ""}
 
         except Exception as e:
             self._flush_adapter_order_diagnostics(adapter)
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_fallback_evidence(
+                e,
+                venue=request.venue.value,
+                operation="submit_passive_order",
+                request_context=req_ctx,
+            )
             self.journal.append(
                 "order.uncertain",
                 {
@@ -786,6 +836,9 @@ class EntrySyncExecutor:
                     "reason": str(e),
                     "client_order_id": request.client_order_id,
                     "is_maker": True,
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
                 },
             )
             return {"outcome": "uncertain", "fill": None, "order_id": ""}

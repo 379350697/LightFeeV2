@@ -20,6 +20,13 @@ from enum import Enum
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
+from lightfee.core.errors import OrderSubmitError
+from lightfee.core.exchange_errors import (
+    ExchangeErrorEvidence,
+    RequestContext,
+    build_evidence_from_order_submit_error,
+    build_fallback_evidence,
+)
 from lightfee.core.domain import (
     OrderFill,
     OrderRequest,
@@ -65,6 +72,8 @@ PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE = 10.0
 PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS = 5_000
 PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES = 3
 PASSIVE_CLOSE_MAX_MANAGER_FAILURES = 3
+PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES = 3
+PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES = 3
 PASSIVE_CLOSE_MANAGER_COOLDOWN_MS = 30_000
 PASSIVE_CLOSE_DEFAULT_AMEND_THRESHOLD_BPS = 5.0
 PASSIVE_CLOSE_DEFAULT_CANCEL_REPLACE_THRESHOLD_BPS = 20.0
@@ -450,6 +459,19 @@ class PassiveCloseExecutor:
                         pending = state.pending_passive_closes.get(position_id)
                         if pending is None:
                             return True
+                        # Non-retryable hedge error → escalate to aggressive close
+                        if not result.success and self._is_non_retryable_hedge_error(result.error or ""):
+                            self._journal.append(
+                                "exit.passive_close_hedge_non_retryable_escalated",
+                                {
+                                    "position_id": position_id,
+                                    "hedge_error": result.error,
+                                    "unhedged_gap": pending.maker_fill.quantity - pending.hedge_fill.quantity,
+                                    "reason": "escalating to aggressive close after non-retryable hedge error",
+                                },
+                            )
+                            pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                            return False
                         # Chunk advance invariant: hedge must have caught up to maker fill
                         if pending.hedge_fill.quantity + 1e-9 >= pending.maker_fill.quantity:
                             if await self._advance_chunk(state, pending):
@@ -610,6 +632,20 @@ class PassiveCloseExecutor:
                     pending = state.pending_passive_closes.get(position_id)
                     if pending is None:
                         return True
+
+                    # Non-retryable hedge error → escalate regardless of maker state
+                    if self._is_non_retryable_hedge_error(result.error or ""):
+                        self._journal.append(
+                            "exit.passive_close_hedge_non_retryable_escalated",
+                            {
+                                "position_id": position_id,
+                                "hedge_error": result.error,
+                                "unhedged_gap": unhedged_gap,
+                                "reason": "escalating to aggressive close after non-retryable hedge error",
+                            },
+                        )
+                        pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                        return False
 
                     # V1: post-submit min-notional accumulation
                     # If maker is now terminal (not accumulating), escalate.
@@ -857,6 +893,10 @@ class PassiveCloseExecutor:
             side=maker_side,
         )
         if tick_size <= 0.0 or price_hint <= 0.0:
+            phase = pending.phase_state
+            phase.missing_l2_tick_consecutive_count += 1
+            fail_count = phase.missing_l2_tick_consecutive_count
+
             self._journal.append(
                 "exit.passive_close_missing_l2_or_tick",
                 {
@@ -865,11 +905,33 @@ class PassiveCloseExecutor:
                     "maker_leg": maker_leg_label,
                     "price_hint": price_hint,
                     "tick_size": tick_size,
+                    "consecutive_failures": fail_count,
                     "reason": "cannot submit post-only maker without valid L2 mid and tick size",
                 },
             )
-            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+
+            if fail_count >= PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES:
+                self._journal.append(
+                    "exit.passive_close_missing_l2_tick_escalated",
+                    {
+                        "position_id": position.position_id,
+                        "consecutive_failures": fail_count,
+                        "reason": "escalating to aggressive close after max missing-L2 failures",
+                    },
+                )
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                return False
+
+            # Exponential backoff: 3s, 6s, 12s, ... capped at 60s
+            backoff_ms = min(
+                PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS * (2 ** (fail_count - 1)),
+                60_000,
+            )
+            pending.next_retry_at_ms = self._now_ms() + backoff_ms
             return False
+
+        # Reset missing-L2 counter when L2 and tick are available
+        pending.phase_state.missing_l2_tick_consecutive_count = 0
 
         aligned_price = align_passive_price_to_tick(price_hint, tick_size, maker_side)
         if aligned_price <= 0.0:
@@ -931,17 +993,108 @@ class PassiveCloseExecutor:
             # Fallback: mark for dual taker
             pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
             return False
-        except Exception as e:
+        except OrderSubmitError as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_evidence_from_order_submit_error(
+                e,
+                venue=maker_venue.value,
+                operation="submit_passive_order",
+                endpoint="",
+                request_context=req_ctx,
+            )
+            if e.is_rejected:
+                self._journal.append(
+                    "exit.passive_close_maker_submit_error",
+                    {
+                        "position_id": position.position_id,
+                        "venue": maker_venue.value,
+                        "error": str(e),
+                        "exchange_error": evidence.to_dict(),
+                        "request_context": req_ctx.to_dict(),
+                        "evidence_completeness": evidence.evidence_completeness,
+                    },
+                )
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                return False
+
+            # Non-rejected error (e.g. uncertain): count failures, backoff, escalate if max reached
+            phase = pending.phase_state
+            phase.maker_submit_consecutive_failures += 1
+            fail_count = phase.maker_submit_consecutive_failures
+
             self._journal.append(
                 "exit.passive_close_maker_submit_error",
                 {
                     "position_id": position.position_id,
                     "venue": maker_venue.value,
                     "error": str(e),
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
+                    "consecutive_failures": fail_count,
                 },
             )
-            pending.next_retry_at_ms = self._now_ms() + 2_000
+
+            if fail_count >= PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES:
+                self._journal.append(
+                    "exit.passive_close_maker_submit_max_failures_escalated",
+                    {
+                        "position_id": position.position_id,
+                        "consecutive_failures": fail_count,
+                        "reason": "escalating to aggressive close after max maker submit failures",
+                    },
+                )
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                return False
+
+            # Exponential backoff: 2s, 4s, 8s, ... capped at 60s
+            backoff_ms = min(2_000 * (2 ** (fail_count - 1)), 60_000)
+            pending.next_retry_at_ms = self._now_ms() + backoff_ms
             return False
+        except Exception as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = build_fallback_evidence(
+                e,
+                venue=maker_venue.value,
+                operation="submit_passive_order",
+                request_context=req_ctx,
+            )
+            # Generic exceptions also count toward failure limit
+            phase = pending.phase_state
+            phase.maker_submit_consecutive_failures += 1
+            fail_count = phase.maker_submit_consecutive_failures
+
+            self._journal.append(
+                "exit.passive_close_maker_submit_error",
+                {
+                    "position_id": position.position_id,
+                    "venue": maker_venue.value,
+                    "error": str(e),
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
+                    "consecutive_failures": fail_count,
+                },
+            )
+
+            if fail_count >= PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES:
+                self._journal.append(
+                    "exit.passive_close_maker_submit_max_failures_escalated",
+                    {
+                        "position_id": position.position_id,
+                        "consecutive_failures": fail_count,
+                        "reason": "escalating to aggressive close after max maker submit failures",
+                    },
+                )
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                return False
+
+            backoff_ms = min(2_000 * (2 ** (fail_count - 1)), 60_000)
+            pending.next_retry_at_ms = self._now_ms() + backoff_ms
+            return False
+
+        # Success: reset failure counters
+        pending.phase_state.maker_submit_consecutive_failures = 0
 
         pending.phase_state.maker_order_id = ack.order_id
         pending.phase_state.maker_client_order_id = ack.client_order_id
@@ -1106,6 +1259,12 @@ class PassiveCloseExecutor:
         try:
             fill = await adapter.place_order(request)
         except Exception as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = (
+                build_evidence_from_order_submit_error(e, venue=hedge_venue.value, operation="place_order", endpoint="", request_context=req_ctx)
+                if isinstance(e, OrderSubmitError)
+                else build_fallback_evidence(e, venue=hedge_venue.value, operation="place_order", request_context=req_ctx)
+            )
             self._journal.append(
                 "exit.passive_close_hedge_error",
                 {
@@ -1114,6 +1273,9 @@ class PassiveCloseExecutor:
                     "hedge_leg": hedge_leg_label,
                     "delta": delta,
                     "error": str(e),
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
                 },
             )
             return HedgeDeltaResult(
@@ -2141,9 +2303,11 @@ class PassiveCloseExecutor:
     def _resolve_local_l2_mid(self, venue: Venue, symbol: str) -> float:
         """Resolve mid price from injected L2 resolver (runtime's local-L2 book).
 
-        Falls back to adapter snapshot if resolver not injected, then to 0.0.
+        No adapter fallback — every adapter's fetch_market_snapshot is async,
+        and calling it synchronously creates unawaited coroutine warnings.
+        The runtime injects a resolver backed by the local L2 book; when that
+        resolver returns 0.0 the caller must treat the price hint as unavailable.
         """
-        # Primary: injected resolver from runtime.local_l2_runtime
         if self._l2_mid_resolver is not None:
             try:
                 mid = self._l2_mid_resolver(venue, symbol)
@@ -2151,27 +2315,6 @@ class PassiveCloseExecutor:
                     return mid
             except Exception:
                 pass
-
-        # Fallback: adapter snapshot (synchronous, may return 0 for async adapters)
-        adapter = self._adapter(venue)
-        if adapter is None:
-            return 0.0
-
-        try:
-            snapshot = adapter.fetch_market_snapshot([symbol])
-            import asyncio
-            if asyncio.iscoroutine(snapshot):
-                return 0.0
-            if snapshot is not None:
-                for quote in getattr(snapshot, 'quotes', []):
-                    if getattr(quote, 'symbol', '') == symbol:
-                        bid = getattr(quote, 'bid', 0)
-                        ask = getattr(quote, 'ask', 0)
-                        if bid > 0 and ask > 0:
-                            return (bid + ask) / 2.0
-        except Exception:
-            pass
-
         return 0.0
 
     def _resolve_local_l2_quote(self, venue: Venue, symbol: str) -> tuple[float, float] | None:
@@ -2204,6 +2347,17 @@ class PassiveCloseExecutor:
         delays = self._config.maker_cycle_retry_delays_ms
         idx = min(zero_fill_cycles, len(delays) - 1)
         return delays[idx] if idx >= 0 else delays[-1]
+
+    @staticmethod
+    def _is_non_retryable_hedge_error(error_str: str) -> bool:
+        """Return True if the hedge error is non-retryable (reduce-only rejected etc)."""
+        if not error_str:
+            return False
+        return (
+            "-2022" in error_str
+            or "ReduceOnly" in error_str
+            or "reduce_only" in error_str.lower()
+        )
 
     def _check_hedge_min_notional(
         self,
@@ -2297,8 +2451,8 @@ class PassiveCloseExecutor:
         estimated slippage/bps on each venue. The leg with higher estimated
         taker cost should be the maker leg to save on fees/slippage.
 
-        Uses runtime-injected local L2 data as the primary signal (mid + spread).
-        Falls back to adapter snapshot, then to venue taker fee comparison.
+        Uses runtime-injected local L2 resolver for mid + quote resolver for
+        spread. Falls back to venue taker fee comparison if L2 is unavailable.
         If L2 data is missing for either venue, journals the gap and uses a
         deterministic fallback chain. Tie-break defaults to LONG (V1 behavior).
         """
@@ -2383,30 +2537,18 @@ class PassiveCloseExecutor:
     ) -> float:
         """Estimate the effective taker cost in bps for a venue.
 
-        Uses local L2 spread (bid-ask width as bps of mid) + venue taker fee.
-        Primary: runtime-injected L2 resolver for mid, adapter snapshot for spread.
-        Fallback: taker fee only if L2 is unavailable.
+        Uses injected L2 quote resolver for spread + venue taker fee.
+        Fallback: taker fee only if L2 spread unavailable.
         """
         cost_bps = 0.0
 
-        # Add spread-based slippage estimate from L2
-        adapter = self._adapter(venue)
-        if adapter is not None:
-            try:
-                snapshot = adapter.fetch_market_snapshot([symbol])
-                import asyncio
-                if not asyncio.iscoroutine(snapshot) and snapshot is not None:
-                    for quote in getattr(snapshot, 'quotes', []):
-                        if getattr(quote, 'symbol', '') == symbol:
-                            bid = getattr(quote, 'bid', 0)
-                            ask = getattr(quote, 'ask', 0)
-                            if bid > 0 and ask > 0:
-                                mid = (bid + ask) / 2.0
-                                spread_bps = (ask - bid) / mid * 10_000
-                                cost_bps += spread_bps
-                            break
-            except Exception:
-                pass
+        # Spread-based slippage from injected L2 quote resolver
+        quote = self._resolve_local_l2_quote(venue, symbol)
+        if quote is not None and l2_mid > 0.0:
+            best_bid, best_ask = quote
+            if best_bid > 0 and best_ask > best_bid:
+                spread_bps = (best_ask - best_bid) / l2_mid * 10_000
+                cost_bps += spread_bps
 
         # Add venue taker fee from spec
         try:

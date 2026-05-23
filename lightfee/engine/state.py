@@ -395,6 +395,8 @@ class PassivePhaseState:
     cycle_started_at_ms: int = 0
     zero_fill_cycles_in_phase: int = 0
     maker_submit_attempt: int = 0
+    maker_submit_consecutive_failures: int = 0
+    missing_l2_tick_consecutive_count: int = 0
     maker_order_id: str = ""
     maker_client_order_id: str = ""
     maker_resting_limit_price: Optional[float] = None
