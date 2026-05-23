@@ -365,6 +365,7 @@ class LiveRuntime:
             )
             # Inject the L2 mid resolver so repricing has live book data
             self.passive_close_executor.set_l2_mid_resolver(self._resolve_local_l2_mid)
+            self.passive_close_executor.set_l2_quote_resolver(self._resolve_local_l2_quote)
             # Inject close executor for DUAL_TAKER fallback
             if self.close_executor is not None:
                 self.passive_close_executor.set_close_executor(self.close_executor)
@@ -6966,6 +6967,22 @@ class LiveRuntime:
         except Exception:
             pass
         return 0.0
+
+    def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
+        """Get best bid/ask from the local L2 book for passive tick inference."""
+        try:
+            book = self.local_l2_runtime.get_book(
+                venue.value if hasattr(venue, "value") else str(venue),
+                symbol,
+            )
+            if book is not None and book.status.value == "hot":
+                best_bid = book.best_bid()
+                best_ask = book.best_ask()
+                if best_bid > 0 and best_ask > best_bid:
+                    return best_bid, best_ask
+        except Exception:
+            pass
+        return None
 
     def _apply_tick_backoff(self, is_active: bool = False, is_maker: bool = False) -> None:
         """Apply incremental tick-failure backoff from config floors / caps.

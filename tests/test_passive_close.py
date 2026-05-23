@@ -1187,6 +1187,7 @@ class TestMaintainFailClosed:
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
         executor._get_tick_size = lambda venue, symbol: 0.01
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         state = EngineState()
         position = _make_position()
@@ -1221,6 +1222,7 @@ class TestMaintainFailClosed:
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
         executor._get_tick_size = lambda venue, symbol: 0.01
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         state = EngineState()
         position = _make_position()
@@ -1306,6 +1308,289 @@ class TestMaintainFailClosed:
         )
         assert success is False
         assert pending.phase_state.maker_order_id == ""
+
+    def test_submit_maker_uses_dynamic_bybit_tick_before_static_spec(self):
+        """V1 parity: passive close uses symbol metadata tick before VenueSpec default."""
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        class FakeBybitTransport:
+            _spec = get_spec(Venue.BYBIT)
+
+            def _venue_symbol(self, symbol):
+                return symbol
+
+            async def _public_get(self, path, params=None):
+                assert path == "/v5/market/instruments-info"
+                assert params == {"category": "linear", "symbol": "ALTUSDT"}
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "ALTUSDT",
+                                "priceFilter": {"tickSize": "0.000001"},
+                                "lotSizeFilter": {
+                                    "qtyStep": "1",
+                                    "minOrderQty": "1",
+                                    "minNotionalValue": "5",
+                                },
+                            }
+                        ]
+                    }
+                }
+
+        get_symbol_rules_cache().clear()
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.BYBIT, tick=0.01)
+        adapter._transport = FakeBybitTransport()
+        adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.BYBIT,
+            symbol="ALTUSDT",
+            side=Side.BUY,
+            order_id="bybit-passive-1",
+            client_order_id="cid-1",
+            price=0.007802,
+            quantity=2789.0,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1779479522323-ALTUSDT",
+            symbol="ALTUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=2789.0,
+            short_quantity=2789.0,
+            matched_quantity=2789.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=2789.0,
+            chunk_quantities=[2789.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        try:
+            success = asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.BYBIT, Side.BUY, "short", 0.0078025, 2789.0,
+                )
+            )
+        finally:
+            get_symbol_rules_cache().clear()
+
+        assert success is True
+        sent_request = adapter.submit_passive_order.await_args.args[0]
+        assert sent_request.price == pytest.approx(0.007802)
+        invalid_price = [
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_invalid_aligned_price"
+        ]
+        assert invalid_price == []
+
+    def test_submit_maker_infers_tick_from_l2_quote_before_static_spec(self):
+        """V1 parity: when metadata is absent, infer passive tick from L2 quote precision."""
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.BYBIT, tick=0.01)
+        adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.BYBIT,
+            symbol="ALTUSDT",
+            side=Side.BUY,
+            order_id="bybit-passive-quote-1",
+            client_order_id="cid-quote-1",
+            price=0.007802,
+            quantity=2789.0,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.007802, 0.007803))
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1779479522323-ALTUSDT",
+            symbol="ALTUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=2789.0,
+            short_quantity=2789.0,
+            matched_quantity=2789.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=2789.0,
+            chunk_quantities=[2789.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        success = asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BYBIT, Side.BUY, "short", 0.0078025, 2789.0,
+            )
+        )
+
+        assert success is True
+        sent_request = adapter.submit_passive_order.await_args.args[0]
+        assert sent_request.price == pytest.approx(0.007802)
+        invalid_price = [
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_invalid_aligned_price"
+        ]
+        assert invalid_price == []
+
+    def test_submit_maker_ignores_rule_cache_spec_fallback_before_l2_quote(self):
+        """V1 parity: failed metadata lookup must not outrank quote tick inference."""
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        class FailingBybitTransport:
+            _spec = get_spec(Venue.BYBIT)
+
+            def _venue_symbol(self, symbol):
+                return symbol
+
+            async def _public_get(self, path, params=None):
+                raise RuntimeError("metadata unavailable")
+
+        get_symbol_rules_cache().clear()
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.BYBIT, tick=0.01)
+        adapter._transport = FailingBybitTransport()
+        adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.BYBIT,
+            symbol="ALTUSDT",
+            side=Side.BUY,
+            order_id="bybit-passive-fallback-1",
+            client_order_id="cid-fallback-1",
+            price=0.007802,
+            quantity=2789.0,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.007802, 0.007803))
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1779479522323-ALTUSDT",
+            symbol="ALTUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=2789.0,
+            short_quantity=2789.0,
+            matched_quantity=2789.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=2789.0,
+            chunk_quantities=[2789.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        try:
+            success = asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.BYBIT, Side.BUY, "short", 0.0078025, 2789.0,
+                )
+            )
+        finally:
+            get_symbol_rules_cache().clear()
+
+        assert success is True
+        sent_request = adapter.submit_passive_order.await_args.args[0]
+        assert sent_request.price == pytest.approx(0.007802)
+
+    def test_submit_maker_infers_tick_for_spec_fallback_only_venue(self):
+        """V1 parity: venues without dynamic rule fetch still use quote precision first."""
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        class GateSpecOnlyTransport:
+            _spec = get_spec(Venue.GATE)
+
+        get_symbol_rules_cache().clear()
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.GATE, tick=0.01)
+        adapter._transport = GateSpecOnlyTransport()
+        adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.GATE,
+            symbol="ALTUSDT",
+            side=Side.BUY,
+            order_id="gate-passive-quote-1",
+            client_order_id="cid-gate-1",
+            price=0.007802,
+            quantity=2789.0,
+        ))
+        executor = PassiveCloseExecutor({Venue.GATE: adapter}, journal)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.007802, 0.007803))
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1779479522323-ALTUSDT",
+            symbol="ALTUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.GATE,
+            long_quantity=2789.0,
+            short_quantity=2789.0,
+            matched_quantity=2789.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=2789.0,
+            chunk_quantities=[2789.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        try:
+            success = asyncio.run(
+                executor._submit_maker_order(
+                    state, pending, position,
+                    Venue.GATE, Side.BUY, "short", 0.0078025, 2789.0,
+                )
+            )
+        finally:
+            get_symbol_rules_cache().clear()
+
+        assert success is True
+        sent_request = adapter.submit_passive_order.await_args.args[0]
+        assert sent_request.price == pytest.approx(0.007802)
+
+    def test_passive_tick_missing_metadata_and_quote_returns_zero_not_static_spec(self):
+        """Strict V1 parity: no metadata/quote means no passive tick, not spec fallback."""
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.BYBIT, tick=0.01)
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+
+        tick_size = asyncio.run(
+            executor._get_passive_tick_size(
+                Venue.BYBIT,
+                "ALTUSDT",
+                target_price=0.0078025,
+                side=Side.BUY,
+            )
+        )
+
+        assert tick_size == 0.0
 
 
 class TestMakerLegSelection:
@@ -1427,6 +1712,7 @@ class TestAmendCancelReplace:
 
         executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         asyncio.run(
             executor._cancel_replace_maker_order(
@@ -1468,6 +1754,7 @@ class TestAmendCancelReplace:
 
         executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         asyncio.run(
             executor._cancel_replace_maker_order(
@@ -1517,6 +1804,7 @@ class TestAmendCancelReplace:
 
         executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         asyncio.run(
             executor._cancel_replace_maker_order(
@@ -1911,6 +2199,7 @@ class TestDualTakerDriveConsumption:
         )
         executor.set_close_executor(mock_close_exec)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
@@ -1995,6 +2284,7 @@ class TestCancelReplaceSubmitFailure:
 
         executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         asyncio.run(
             executor._cancel_replace_maker_order(
@@ -2098,6 +2388,7 @@ class TestCancelReplaceSubmitFailure:
 
         executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
 
         asyncio.run(
             executor._cancel_replace_maker_order(

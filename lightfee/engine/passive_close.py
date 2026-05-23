@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -51,6 +52,7 @@ from lightfee.engine.state import (
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import align_passive_price_to_tick, resolve_price_tick
 from lightfee.venues.specs import get_spec
+from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
 # ---------------------------------------------------------------------------
 # V1 constants
@@ -215,6 +217,8 @@ class PassiveCloseExecutor:
         )
         # Inject L2 mid resolver for live repricing (set by runtime after construction)
         self._l2_mid_resolver: Optional[callable] = None
+        # Inject L2 top-of-book resolver for V1 passive tick inference.
+        self._l2_quote_resolver: Optional[callable] = None
         # Inject aggressive close executor for fallback (set by runtime after construction)
         self._close_executor: Optional[object] = None
 
@@ -226,6 +230,9 @@ class PassiveCloseExecutor:
 
     def set_l2_mid_resolver(self, resolver: callable) -> None:
         self._l2_mid_resolver = resolver
+
+    def set_l2_quote_resolver(self, resolver: callable) -> None:
+        self._l2_quote_resolver = resolver
 
     def set_close_executor(self, executor: object) -> None:
         self._close_executor = executor
@@ -843,7 +850,12 @@ class PassiveCloseExecutor:
         Fails closed when L2 mid or tick size is unavailable — a GTC post-only
         maker order must have a valid limit price (V1: price_hint required).
         """
-        tick_size = self._get_tick_size(maker_venue, position.symbol)
+        tick_size = await self._get_passive_tick_size(
+            maker_venue,
+            position.symbol,
+            target_price=price_hint,
+            side=maker_side,
+        )
         if tick_size <= 0.0 or price_hint <= 0.0:
             self._journal.append(
                 "exit.passive_close_missing_l2_or_tick",
@@ -1196,7 +1208,12 @@ class PassiveCloseExecutor:
         now_ms = self._now_ms()
         pid = position.position_id
 
-        tick_size = self._get_tick_size(maker_venue, position.symbol)
+        tick_size = await self._get_passive_tick_size(
+            maker_venue,
+            position.symbol,
+            target_price=price_hint,
+            side=maker_side,
+        )
         if tick_size <= 0.0:
             self._journal.append(
                 "exit.passive_close_maintain_no_tick_size",
@@ -2019,6 +2036,108 @@ class PassiveCloseExecutor:
             pass
         return resolve_price_tick(venue_spec=spec, adapter=adapter, symbol=symbol)
 
+    async def _get_passive_tick_size(
+        self,
+        venue: Venue,
+        symbol: str,
+        *,
+        target_price: float | None = None,
+        side: Side | None = None,
+    ) -> float:
+        """Resolve passive order tick size using V1 metadata and quote precedence."""
+        tick_size = await self._get_symbol_rule_tick_size(venue, symbol)
+        if tick_size > 0.0:
+            return tick_size
+
+        tick_size = self._infer_passive_tick_from_l2_quote(
+            venue,
+            symbol,
+            target_price=target_price,
+            side=side,
+        )
+        if tick_size > 0.0:
+            return tick_size
+
+        return 0.0
+
+    def _infer_passive_tick_from_l2_quote(
+        self,
+        venue: Venue,
+        symbol: str,
+        *,
+        target_price: float | None = None,
+        side: Side | None = None,
+    ) -> float:
+        quote = self._resolve_local_l2_quote(venue, symbol)
+        if quote is None:
+            return 0.0
+        best_bid, best_ask = quote
+        if not (
+            math.isfinite(best_bid)
+            and math.isfinite(best_ask)
+            and best_bid > 0.0
+            and best_ask > best_bid
+        ):
+            return 0.0
+
+        tick_size = self._infer_price_tick_size([best_bid, best_ask])
+        if tick_size > 0.0:
+            return tick_size
+
+        if target_price is None or side is None or not math.isfinite(target_price) or target_price <= 0.0:
+            return 0.0
+        spread = abs(best_ask - best_bid)
+        price_distance = (
+            abs(target_price - best_bid)
+            if side == Side.BUY
+            else abs(best_ask - target_price)
+        )
+        tick_size = max(price_distance, spread, sys.float_info.epsilon)
+        return tick_size if math.isfinite(tick_size) and tick_size > 0.0 else 0.0
+
+    @staticmethod
+    def _infer_price_tick_size(values: list[float]) -> float:
+        tick_size = 0.0
+        for value in values:
+            if not (math.isfinite(value) and value > 0.0):
+                continue
+            text = str(value)
+            if "e" in text.lower():
+                text = format(value, ".15f").rstrip("0").rstrip(".")
+            if "." not in text:
+                continue
+            fractional = text.split(".", 1)[1].rstrip("0")
+            if not fractional:
+                continue
+            inferred = 10.0 ** (-len(fractional))
+            tick_size = inferred if tick_size <= 0.0 else min(tick_size, inferred)
+        return tick_size
+
+    async def _get_symbol_rule_tick_size(self, venue: Venue, symbol: str) -> float:
+        adapter = self._adapter(venue)
+        transport = getattr(adapter, "_transport", None) if adapter is not None else None
+        if transport is None:
+            return 0.0
+
+        venue_symbol = symbol
+        venue_symbol_fn = getattr(transport, "_venue_symbol", None)
+        if callable(venue_symbol_fn):
+            try:
+                venue_symbol = venue_symbol_fn(symbol)
+            except Exception:
+                venue_symbol = symbol
+
+        try:
+            symbol_rule = await get_symbol_rules_cache().get(transport, venue, venue_symbol)
+            if getattr(symbol_rule, "rule_source", "") == "spec_fallback":
+                return 0.0
+            tick_size = float(getattr(symbol_rule, "tick_size", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+        if math.isfinite(tick_size) and tick_size > 0.0:
+            return tick_size
+        return 0.0
+
     def _resolve_local_l2_mid(self, venue: Venue, symbol: str) -> float:
         """Resolve mid price from injected L2 resolver (runtime's local-L2 book).
 
@@ -2054,6 +2173,31 @@ class PassiveCloseExecutor:
             pass
 
         return 0.0
+
+    def _resolve_local_l2_quote(self, venue: Venue, symbol: str) -> tuple[float, float] | None:
+        """Resolve best bid/ask from injected local-L2 resolver."""
+        if self._l2_quote_resolver is None:
+            return None
+        try:
+            quote = self._l2_quote_resolver(venue, symbol)
+        except Exception:
+            return None
+        if quote is None:
+            return None
+        try:
+            best_bid, best_ask = quote
+            best_bid = float(best_bid)
+            best_ask = float(best_ask)
+        except Exception:
+            return None
+        if (
+            math.isfinite(best_bid)
+            and math.isfinite(best_ask)
+            and best_bid > 0.0
+            and best_ask > best_bid
+        ):
+            return best_bid, best_ask
+        return None
 
     def _maker_cycle_retry_delay(self, zero_fill_cycles: int) -> int:
         """V1 maker_cycle_retry_delay_ms: exponential backoff for zero-fill cycles."""
