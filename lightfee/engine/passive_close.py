@@ -40,6 +40,7 @@ from lightfee.core.domain import (
 )
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
+    _is_bybit_duplicate_order_link_id,
     build_close_execution_from_legs,
     close_leg_exchange_min_notional_violation,
     compute_close_chunks,
@@ -1273,50 +1274,20 @@ class PassiveCloseExecutor:
             client_order_id=hedge_cid,
         )
 
-        try:
-            fill = await adapter.place_order(request)
-        except Exception as e:
-            req_ctx = RequestContext.from_order_request(request)
-            evidence = (
-                build_evidence_from_order_submit_error(e, venue=hedge_venue.value, operation="place_order", endpoint="", request_context=req_ctx)
-                if isinstance(e, OrderSubmitError)
-                else build_fallback_evidence(e, venue=hedge_venue.value, operation="place_order", request_context=req_ctx)
-            )
-            self._journal.append(
-                "exit.passive_close_hedge_error",
-                {
-                    "position_id": position.position_id,
-                    "hedge_venue": hedge_venue.value,
-                    "hedge_leg": hedge_leg_label,
-                    "delta": delta,
-                    "error": str(e),
-                    "exchange_error": evidence.to_dict(),
-                    "request_context": req_ctx.to_dict(),
-                    "evidence_completeness": evidence.evidence_completeness,
-                },
-            )
-            return HedgeDeltaResult(
-                requested=delta, filled=0.0, residual=delta, success=False,
-                error=str(e),
-            )
-
-        filled_qty = fill.quantity if fill.quantity > 0 else 0.0
-        residual = max(delta - filled_qty, 0.0)
-        success = residual < 1e-12
-
-        if fill.quantity > 0:
-            pending.hedge_fill.quantity += fill.quantity
-            prev_total = (pending.hedge_fill.quantity - fill.quantity) * pending.hedge_fill.average_price
+        def record_hedge_fill(fill: OrderFill) -> None:
+            previous_qty = pending.hedge_fill.quantity
+            new_qty = previous_qty + fill.quantity
+            pending.hedge_fill.quantity = new_qty
+            prev_total = previous_qty * pending.hedge_fill.average_price
             pending.hedge_fill.average_price = (
-                (prev_total + fill.quantity * fill.price) / pending.hedge_fill.quantity
-                if pending.hedge_fill.quantity > 0 else fill.price
+                (prev_total + fill.quantity * fill.price) / new_qty
+                if new_qty > 0 else fill.price
             )
             pending.hedge_fill.fee_quote += fill.fee_quote or 0.0
             pending.hedge_fill.last_fill_time_ms = fill.filled_at_ms
             pending.hedge_fill.order_id = fill.order_id
             pending.hedge_fill.client_order_id = hedge_cid
 
-            # Persist hedge leg
             leg = PersistedCloseExecutionLeg(
                 fill=fill,
                 client_order_id=hedge_cid,
@@ -1340,6 +1311,122 @@ class PassiveCloseExecutor:
                     "chunk_index": pending.active_chunk_index,
                 },
             )
+
+        try:
+            fill = await adapter.place_order(request)
+        except Exception as e:
+            req_ctx = RequestContext.from_order_request(request)
+            evidence = (
+                build_evidence_from_order_submit_error(e, venue=hedge_venue.value, operation="place_order", endpoint="", request_context=req_ctx)
+                if isinstance(e, OrderSubmitError)
+                else build_fallback_evidence(e, venue=hedge_venue.value, operation="place_order", request_context=req_ctx)
+            )
+            is_bybit_duplicate = (
+                hedge_venue == Venue.BYBIT
+                and _is_bybit_duplicate_order_link_id(str(e))
+            )
+            should_reconcile = isinstance(e, OrderSubmitError) or is_bybit_duplicate
+            if should_reconcile:
+                reconciliation = None
+                try:
+                    reconciliation = await adapter.fetch_order_fill_reconciliation(
+                        position.symbol, "", hedge_cid,
+                    )
+                except Exception as reconcile_error:
+                    self._journal.append(
+                        "exit.passive_close_hedge_reconcile_failed",
+                        {
+                            "position_id": position.position_id,
+                            "hedge_venue": hedge_venue.value,
+                            "hedge_leg": hedge_leg_label,
+                            "client_order_id": hedge_cid,
+                            "error": str(reconcile_error),
+                        },
+                    )
+
+                recon_qty_raw = getattr(reconciliation, "quantity", 0.0) if reconciliation is not None else 0.0
+                recon_qty = float(recon_qty_raw) if isinstance(recon_qty_raw, (int, float)) else 0.0
+                if recon_qty > 1e-12:
+                    recon_price_raw = getattr(reconciliation, "average_price", hedge_price or 0.0)
+                    recon_price = float(recon_price_raw) if isinstance(recon_price_raw, (int, float)) else (hedge_price or 0.0)
+                    fill = OrderFill(
+                        venue=hedge_venue,
+                        symbol=position.symbol,
+                        side=getattr(reconciliation, "side", hedge_side) or hedge_side,
+                        quantity=recon_qty,
+                        price=recon_price,
+                        order_id=getattr(reconciliation, "order_id", "") or "",
+                        client_order_id=getattr(reconciliation, "client_order_id", None) or hedge_cid,
+                        fee_quote=getattr(reconciliation, "fee_quote", None),
+                        filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or self._now_ms(),
+                    )
+                    record_hedge_fill(fill)
+                    residual = max(delta - fill.quantity, 0.0)
+                    success = residual < 1e-12
+                    event_kind = (
+                        "exit.passive_close_hedge_duplicate_client_order_reconciled"
+                        if is_bybit_duplicate
+                        else "exit.passive_close_hedge_reconciled_after_error"
+                    )
+                    self._journal.append(
+                        event_kind,
+                        {
+                            "position_id": position.position_id,
+                            "hedge_venue": hedge_venue.value,
+                            "hedge_leg": hedge_leg_label,
+                            "client_order_id": hedge_cid,
+                            "order_id": fill.order_id,
+                            "requested": delta,
+                            "filled": fill.quantity,
+                            "residual": residual,
+                            "original_error": str(e),
+                        },
+                    )
+                    return HedgeDeltaResult(
+                        requested=delta,
+                        filled=fill.quantity,
+                        residual=residual,
+                        success=success,
+                        error=None if success else "partial_fill",
+                        order_id=fill.order_id,
+                    )
+
+                if is_bybit_duplicate:
+                    self._journal.append(
+                        "exit.passive_close_hedge_duplicate_client_order_pending_reconcile",
+                        {
+                            "position_id": position.position_id,
+                            "hedge_venue": hedge_venue.value,
+                            "hedge_leg": hedge_leg_label,
+                            "client_order_id": hedge_cid,
+                            "error": str(e),
+                        },
+                    )
+
+            self._journal.append(
+                "exit.passive_close_hedge_error",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg_label,
+                    "delta": delta,
+                    "error": str(e),
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
+                },
+            )
+            return HedgeDeltaResult(
+                requested=delta, filled=0.0, residual=delta, success=False,
+                error=str(e),
+            )
+
+        filled_qty = fill.quantity if fill.quantity > 0 else 0.0
+        residual = max(delta - filled_qty, 0.0)
+        success = residual < 1e-12
+
+        if fill.quantity > 0:
+            record_hedge_fill(fill)
 
         if not success and filled_qty > 0:
             self._journal.append(
@@ -1799,6 +1886,95 @@ class PassiveCloseExecutor:
                     submit_started_at_ms=leg.submit_started_at_ms,
                     latency_ms=leg.latency_ms,
                 ))
+
+        def append_synthesized_leg(
+            target: list[CloseExecutionLeg],
+            *,
+            pending_fill: PendingPassiveLegFill,
+            existing_qty: float,
+            venue: Venue,
+            side: Side,
+            leg_label: str,
+            source: str,
+        ) -> None:
+            gap = max(pending_fill.quantity - existing_qty, 0.0)
+            if gap <= 1e-9:
+                return
+            fee_quote = 0.0
+            if pending_fill.quantity > 1e-12:
+                fee_quote = pending_fill.fee_quote * (gap / pending_fill.quantity)
+            fill = OrderFill(
+                venue=venue,
+                symbol=position.symbol,
+                side=side,
+                quantity=gap,
+                price=pending_fill.average_price,
+                order_id=pending_fill.order_id,
+                client_order_id=pending_fill.client_order_id or None,
+                fee_quote=fee_quote,
+                filled_at_ms=pending_fill.last_fill_time_ms,
+            )
+            target.append(CloseExecutionLeg(
+                fill=fill,
+                client_order_id=pending_fill.client_order_id,
+                submit_started_at_ms=pending_fill.last_fill_time_ms,
+                latency_ms=0,
+            ))
+            self._journal.append(
+                "exit.passive_close_synthesized_missing_leg",
+                {
+                    "position_id": pending.position_id,
+                    "leg": leg_label,
+                    "source": source,
+                    "venue": venue.value,
+                    "quantity": gap,
+                    "price": pending_fill.average_price,
+                    "order_id": pending_fill.order_id,
+                    "client_order_id": pending_fill.client_order_id,
+                },
+            )
+
+        existing_long_qty = sum(leg.fill.quantity for leg in long_legs if leg.fill)
+        existing_short_qty = sum(leg.fill.quantity for leg in short_legs if leg.fill)
+        maker_leg = pending.phase_state.active_maker_leg
+        if maker_leg == ActiveMakerLeg.LONG:
+            append_synthesized_leg(
+                long_legs,
+                pending_fill=pending.maker_fill,
+                existing_qty=existing_long_qty,
+                venue=position.long_venue,
+                side=Side.SELL,
+                leg_label="long",
+                source="maker_fill",
+            )
+            append_synthesized_leg(
+                short_legs,
+                pending_fill=pending.hedge_fill,
+                existing_qty=existing_short_qty,
+                venue=position.short_venue,
+                side=Side.BUY,
+                leg_label="short",
+                source="hedge_fill",
+            )
+        else:
+            append_synthesized_leg(
+                short_legs,
+                pending_fill=pending.maker_fill,
+                existing_qty=existing_short_qty,
+                venue=position.short_venue,
+                side=Side.BUY,
+                leg_label="short",
+                source="maker_fill",
+            )
+            append_synthesized_leg(
+                long_legs,
+                pending_fill=pending.hedge_fill,
+                existing_qty=existing_long_qty,
+                venue=position.long_venue,
+                side=Side.SELL,
+                leg_label="long",
+                source="hedge_fill",
+            )
 
         close = build_close_execution_from_legs(
             position, pending.chunk_count(), short_legs, long_legs,

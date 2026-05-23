@@ -20,6 +20,7 @@ import pytest
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
     PassiveOrderAmendRequest,
@@ -1184,6 +1185,144 @@ class TestFallbackResidualReal:
         assert aster.place_order_calls == 1
         kinds = [record["kind"] for record in journal.read_all()]
         assert "exit.passive_close_fallback_terminal_flat" in kinds
+
+    def test_fallback_unhedged_bybit_duplicate_reconciles_fill_and_clears(self):
+        """V1 parity: duplicate orderLinkId on Bybit hedge is recovered via client id lookup."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class FlatAdapter(VenueAdapter):
+            def __init__(self, venue):
+                self._venue = venue
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                return _make_order_fill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0,
+                )
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1000,
+                )
+
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return None
+
+        class FilledMakerAdapter(FlatAdapter):
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return PassiveOrderProgress(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    cumulative_quantity=534.0,
+                    average_price=0.04496,
+                    fee_quote=0.0,
+                    last_fill_time_ms=1500,
+                    state=PassiveOrderState.FILLED,
+                    observed_at_ms=1500,
+                )
+
+        class DuplicateBybitAdapter(FlatAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.place_order_calls = 0
+                self.reconciliation_lookups = []
+
+            async def place_order(self, request):
+                self.place_order_calls += 1
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=534.0,
+                    average_price=0.04508,
+                    order_id="95dbe960-6b01-4259-958b-02ef11bb6dbc",
+                    client_order_id=client_order_id,
+                    fee_quote=0.0123,
+                    filled_at_ms=2000,
+                )
+
+        binance = FilledMakerAdapter(Venue.BINANCE)
+        bybit = DuplicateBybitAdapter()
+        adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.04508)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1779551578130-LYNUSDT",
+            symbol="LYNUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=534.0,
+            short_quantity=534.0,
+            matched_quantity=534.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=534.0,
+            chunk_quantities=[534.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="1513843783",
+                maker_client_order_id="lfex99b5bef67012c096",
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=534.0,
+                average_price=0.04496,
+                order_id="1513843783",
+                client_order_id="lfex99b5bef67012c096",
+            ),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        expected_cid = compact_client_order_id(position.position_id, "exit_short_hedge")
+        assert result is True
+        assert bybit.place_order_calls == 1
+        assert bybit.reconciliation_lookups == [("LYNUSDT", "", expected_cid)]
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert pending.hedge_fill.quantity == 534.0
+        assert pending.hedge_fill.order_id == "95dbe960-6b01-4259-958b-02ef11bb6dbc"
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_hedge_duplicate_client_order_reconciled" in kinds
+        assert "exit.passive_close_resolved" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
 
     def test_fallback_paired_terminal_reduceonly_rechecks_flat_and_clears(self):
         """Paired fallback must not loop when both close legs report already-flat terminal rejects."""
