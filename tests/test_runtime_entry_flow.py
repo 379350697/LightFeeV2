@@ -40,6 +40,7 @@ class FakeVenueAdapter(VenueAdapter):
     default_fill_price: float = 0.0
     default_position_side: Side = Side.BUY
     default_position_qty: float = 0.0
+    okx_base_quantity_step: float = 0.0
     last_request: Optional[OrderRequest] = None
     place_order_call_count: int = 0
     fetch_position_call_count: int = 0
@@ -317,6 +318,58 @@ class TestPlannerDispatchIntegration:
         records = runtime.journal.read_all()
         kinds = [r["kind"] for r in records]
         assert "runtime.entry_dispatched" in kinds
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_aligns_okx_swap_quantity_to_contract_base_step(
+        self, config, tmp_journal,
+    ):
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="UBUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=176.0,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(100.0)
+        assert executor.ctx.short_quantity == pytest.approx(100.0)
+        selected = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "execution.entry_selected"
+        ][-1]
+        assert selected["payload"]["quantity"] == pytest.approx(100.0)
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_does_not_register_rejected_pending(self, config, tmp_journal):

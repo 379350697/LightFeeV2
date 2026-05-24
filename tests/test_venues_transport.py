@@ -49,6 +49,7 @@ from lightfee.venues.transport import (
     TransportError,
     TransportErrorCategory,
     VenueTransport,
+    _parse_okx_position,
     _safe_float,
     _require_bybit_success,
     _require_bitget_success,
@@ -1617,6 +1618,311 @@ class TestOrderAckNotFill:
 
 
 class TestOrderSubmitDiagnosticsAndQuantization:
+    def test_okx_net_short_position_preserves_signed_contracts(self):
+        pos = _parse_okx_position(
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "UB-USDT-SWAP",
+                        "pos": "-1",
+                        "posSide": "net",
+                        "avgPx": "0.01",
+                    }
+                ],
+            },
+            "UB-USDT-SWAP",
+            1234,
+            contract_size=100.0,
+        )
+
+        assert pos.side == Side.SELL
+        assert pos.quantity == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "symbol,base_qty,ct_val",
+        [
+            ("UBUSDT", 1.0, 100.0),
+            ("OPGUSDT", 9.0, 10.0),
+        ],
+    )
+    async def test_okx_taker_rejects_when_base_quantity_rounds_to_zero_contracts(
+        self, monkeypatch, symbol, base_qty, ct_val,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=ct_val,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {"code": "0", "data": [{"ordId": "must-not-send", "sCode": "0"}]}
+
+        transport._request = fake_request
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.place_order(
+                OrderRequest(
+                    venue=Venue.OKX,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=base_qty,
+                    price_hint=0.01,
+                    client_order_id=f"{symbol.lower()}reject",
+                )
+            )
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert sent == []
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["base_qty"] == pytest.approx(base_qty)
+        assert result["ct_val"] == pytest.approx(ct_val)
+        assert result["lot_sz"] == pytest.approx(1.0)
+        assert result["contract_qty"] == pytest.approx(0.0)
+        assert result["reject_reason"] == "contract_qty_zero"
+
+    @pytest.mark.asyncio
+    async def test_okx_taker_sends_contract_quantity_after_base_conversion(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {
+                "code": "0",
+                "data": [{"ordId": "okx-contract-1", "clOrdId": "ubvalid100", "sCode": "0"}],
+            }
+
+        transport._request = fake_request
+
+        fill = await transport.place_order(
+            OrderRequest(
+                venue=Venue.OKX,
+                symbol="UBUSDT",
+                side=Side.BUY,
+                quantity=100.0,
+                price_hint=0.01,
+                client_order_id="ubvalid100",
+            )
+        )
+
+        assert sent[-1]["path"] == "/api/v5/trade/order"
+        assert sent[-1]["body"]["sz"] == "1"
+        assert fill.quantity == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_passive_rejects_zero_contract_quantity_without_request(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=10.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {"code": "0", "data": [{"ordId": "must-not-send", "sCode": "0"}]}
+
+        transport._request = fake_request
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.submit_passive_order(
+                OrderRequest(
+                    venue=Venue.OKX,
+                    symbol="OPGUSDT",
+                    side=Side.SELL,
+                    quantity=9.0,
+                    price=0.02,
+                    post_only=True,
+                    client_order_id="opgreject9",
+                )
+            )
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert sent == []
+        assert transport.order_diagnostics[-1]["payload"]["reject_reason"] == "contract_qty_zero"
+
+    @pytest.mark.asyncio
+    async def test_okx_passive_sends_contract_quantity_after_base_conversion(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {
+                "code": "0",
+                "data": [{"ordId": "okx-passive-1", "clOrdId": "ubpassive100", "sCode": "0"}],
+            }
+
+        transport._request = fake_request
+
+        ack = await transport.submit_passive_order(
+            OrderRequest(
+                venue=Venue.OKX,
+                symbol="UBUSDT",
+                side=Side.SELL,
+                quantity=100.0,
+                price=0.02,
+                post_only=True,
+                client_order_id="ubpassive100",
+            )
+        )
+
+        assert sent[-1]["path"] == "/api/v5/trade/order"
+        assert sent[-1]["body"]["sz"] == "1"
+        assert ack.order_id == "okx-passive-1"
+
+    @pytest.mark.asyncio
+    async def test_okx_cancel_uses_post_cancel_order_endpoint(self):
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({
+                "method": method,
+                "path": path,
+                "body": dict(body or {}),
+                "params": dict(params or {}),
+            })
+            return {"code": "0", "data": [{"ordId": "12345", "sCode": "0"}]}
+
+        transport._request = fake_request
+
+        ack = await transport.cancel_passive_order("UBUSDT", "12345")
+
+        assert sent == [
+            {
+                "method": "POST",
+                "path": "/api/v5/trade/cancel-order",
+                "body": {"instId": "UB-USDT-SWAP", "ordId": "12345"},
+                "params": {},
+            }
+        ]
+        assert ack.order_id == "12345"
+
     @pytest.mark.asyncio
     async def test_bybit_live_place_order_quantizes_and_records_sanitized_attempt_result(self):
         spec = bybit_spec()

@@ -54,6 +54,7 @@ from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
 ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE = 4
 OKX_POSITION_REST_CACHE_MAX_AGE_MS = 30_000
+OKX_CANCEL_ORDER_PATH = "/api/v5/trade/cancel-order"
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,50 @@ def _step_decimals(step: float) -> int:
         return 12
     text = f"{step:.12f}".rstrip("0").rstrip(".")
     return len(text.split(".", 1)[1]) if "." in text else 0
+
+
+def _okx_contract_order_diagnostics(
+    *,
+    base_qty: float,
+    ct_val: float,
+    lot_sz: float,
+    min_sz: float,
+    max_mkt_sz: float = 0.0,
+) -> dict[str, Any]:
+    """Return OKX base→contract sizing evidence and local reject reason.
+
+    The engine boundary is canonical base quantity. OKX derivative wire `sz`
+    is contract count, and OKX `lotSz`/`minSz` are contract units.
+    """
+    payload = {
+        "base_qty": float(base_qty),
+        "ct_val": float(ct_val or 0.0),
+        "lot_sz": float(lot_sz or 0.0),
+        "min_sz": float(min_sz or 0.0),
+        "max_mkt_sz": float(max_mkt_sz or 0.0),
+        "quantity_units": "base_to_contracts",
+    }
+
+    if ct_val <= 0 or not math.isfinite(ct_val):
+        payload["contract_qty"] = 0.0
+        payload["reject_reason"] = "missing_ct_val"
+        return payload
+
+    if lot_sz > 0 and math.isfinite(lot_sz):
+        contract_qty = _floor_to_step(base_qty / ct_val, lot_sz)
+    else:
+        contract_qty = base_qty / ct_val
+    if not math.isfinite(contract_qty):
+        contract_qty = 0.0
+
+    payload["contract_qty"] = float(contract_qty)
+    if contract_qty <= 0:
+        payload["reject_reason"] = "contract_qty_zero"
+    elif min_sz > 0 and contract_qty + 1e-12 < min_sz:
+        payload["reject_reason"] = "contract_qty_below_min_sz"
+    elif max_mkt_sz > 0 and contract_qty - 1e-12 > max_mkt_sz:
+        payload["reject_reason"] = "contract_qty_above_max_mkt_sz"
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -773,9 +818,15 @@ def _parse_okx_position(raw: dict[str, Any], symbol: str, now_ms: int, *, contra
         inst = row.get("instId", "")
         if inst and inst != symbol:
             continue
-        qty = abs(_safe_float(row.get("pos"), default=0.0)) * contract_size
+        contracts = _safe_float(row.get("pos"), default=0.0)
         pos_side = str(row.get("posSide", "")).lower()
-        net += qty if pos_side == "long" else -qty if pos_side == "short" else qty
+        if pos_side == "long":
+            signed_contracts = abs(contracts)
+        elif pos_side == "short":
+            signed_contracts = -abs(contracts)
+        else:
+            signed_contracts = contracts
+        net += signed_contracts * contract_size
         entry_price = _safe_float(row.get("avgPx"), default=entry_price)
     return PositionSnapshot(
         venue=Venue.OKX,
@@ -1384,11 +1435,14 @@ class VenueTransport(MarketDataClient):
             if symbol_rule is not None and symbol_rule.min_qty > 0
             else float(spec.min_quantity or 0.0)
         )
-        min_notional = (
-            float(symbol_rule.min_notional)
-            if symbol_rule is not None and symbol_rule.min_notional > 0
-            else float(spec.min_notional or 0.0)
-        )
+        if symbol_rule is not None and spec.venue_id == Venue.OKX:
+            min_notional = float(symbol_rule.min_notional or 0.0)
+        else:
+            min_notional = (
+                float(symbol_rule.min_notional)
+                if symbol_rule is not None and symbol_rule.min_notional > 0
+                else float(spec.min_notional or 0.0)
+            )
         rule_source = (
             symbol_rule.rule_source
             if symbol_rule is not None and symbol_rule.rule_source
@@ -2879,23 +2933,29 @@ class VenueTransport(MarketDataClient):
                 # engine boundary; wire sz is contracts = base_qty / ctVal.
                 rules_cache = get_symbol_rules_cache()
                 symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
-                ct_val = float(
-                    getattr(symbol_rule, 'ct_val', 0)
-                    or getattr(spec, "contract_size", 1)
-                    or 1
-                )
+                ct_val = float(getattr(symbol_rule, 'ct_val', 0) or 0)
                 lot_sz = float(getattr(symbol_rule, 'qty_step', 0) or 0)
+                min_sz = float(getattr(symbol_rule, 'min_qty', 0) or 0)
+                max_mkt_sz = float(getattr(symbol_rule, 'max_market_qty', 0) or 0)
                 base_qty = float(request.quantity)
-
-                if ct_val > 0 and lot_sz > 0:
-                    contract_qty = _floor_to_step(base_qty / ct_val, lot_sz)
-                    quantity_units = "base_to_contracts"
-                elif ct_val > 0:
-                    contract_qty = base_qty / ct_val
-                    quantity_units = "base_to_contracts"
-                else:
-                    contract_qty = base_qty
-                    quantity_units = "base"
+                okx_sizing = _okx_contract_order_diagnostics(
+                    base_qty=base_qty,
+                    ct_val=ct_val,
+                    lot_sz=lot_sz,
+                    min_sz=min_sz,
+                    max_mkt_sz=max_mkt_sz,
+                )
+                preflight.update(okx_sizing)
+                contract_qty = float(okx_sizing["contract_qty"])
+                reject_reason = okx_sizing.get("reject_reason")
+                if reject_reason:
+                    preflight["response_classification"] = "rejected"
+                    self._record_order_diagnostic("order.submit_result", preflight)
+                    result_recorded = True
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        str(reject_reason),
+                    )
 
                 body = {
                     "instId": venue_sym,
@@ -2915,11 +2975,7 @@ class VenueTransport(MarketDataClient):
                 # Enrich diagnostic with OKX-specific evidence
                 preflight["pos_side"] = pos_side
                 preflight["pos_mode"] = self._okx_pos_mode
-                preflight["ct_val"] = ct_val
-                preflight["base_qty"] = base_qty
                 preflight["contract_qty"] = contract_qty
-                preflight["quantity_units"] = quantity_units
-                preflight["lot_sz"] = lot_sz
                 preflight["body_field_names"] = sorted(body.keys())
                 preflight["body_sanitized"] = {
                     k: v for k, v in body.items()
@@ -3767,6 +3823,8 @@ class VenueTransport(MarketDataClient):
                 state=PassiveOrderState.OPEN,
             )
 
+        result_recorded = False
+
         try:
             # --- Preflight: fetch dynamic symbol rules + normalize ---
             rules_cache = get_symbol_rules_cache()
@@ -3808,8 +3866,26 @@ class VenueTransport(MarketDataClient):
                 )
             ct_val_sz = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
             lot_sz = float(getattr(symbol_rule, 'qty_step', 0)) if symbol_rule else (qty_step or 0.0)
-            if spec.venue_id == Venue.OKX and ct_val_sz > 0:
-                contract_qty = _floor_to_step(quantized_qty / ct_val_sz, lot_sz) if lot_sz > 0 else (quantized_qty / ct_val_sz)
+            if spec.venue_id == Venue.OKX:
+                okx_sizing = _okx_contract_order_diagnostics(
+                    base_qty=quantized_qty,
+                    ct_val=ct_val_sz,
+                    lot_sz=lot_sz,
+                    min_sz=float(getattr(symbol_rule, 'min_qty', 0) if symbol_rule else min_qty),
+                    max_mkt_sz=float(getattr(symbol_rule, 'max_market_qty', 0) if symbol_rule else 0.0),
+                )
+                preflight.update(okx_sizing)
+                contract_qty = float(okx_sizing["contract_qty"])
+                reject_reason = okx_sizing.get("reject_reason")
+                if reject_reason:
+                    result_payload = dict(preflight)
+                    result_payload["response_classification"] = "rejected"
+                    self._record_order_diagnostic("order.submit_result", result_payload)
+                    result_recorded = True
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        str(reject_reason),
+                    )
             else:
                 contract_qty = quantized_qty
 
@@ -3940,10 +4016,11 @@ class VenueTransport(MarketDataClient):
                 if _is_post_only_would_take_reject(spec.venue_id, e)
                 else "rejected"
             )
-            self._record_passive_diagnostic_failure(
-                request, venue_sym, e.status_code, str(e),
-                classification=classification,
-            )
+            if not result_recorded:
+                self._record_passive_diagnostic_failure(
+                    request, venue_sym, e.status_code, str(e),
+                    classification=classification,
+                )
             raise _map_to_submit_error(e.category, str(e), transport_error=e)
         except OrderSubmitError as e:
             classification = (
@@ -3951,15 +4028,17 @@ class VenueTransport(MarketDataClient):
                 if _is_post_only_would_take_reject(spec.venue_id, e)
                 else "rejected"
             )
-            self._record_passive_diagnostic_failure(
-                request, venue_sym, 0, str(e),
-                classification=classification,
-            )
+            if not result_recorded:
+                self._record_passive_diagnostic_failure(
+                    request, venue_sym, 0, str(e),
+                    classification=classification,
+                )
             raise
         except Exception as e:
-            self._record_passive_diagnostic_failure(
-                request, venue_sym, 0, str(e),
-            )
+            if not result_recorded:
+                self._record_passive_diagnostic_failure(
+                    request, venue_sym, 0, str(e),
+                )
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
 
     def _record_passive_diagnostic_failure(
@@ -4920,6 +4999,67 @@ class VenueTransport(MarketDataClient):
                 f"amend passive order failed: {e}",
             )
 
+    async def _cancel_okx_passive_order_once(
+        self,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: Optional[str],
+        now_ms: int,
+    ) -> "PassiveOrderAck":
+        from lightfee.core.domain import PassiveOrderAck, PassiveOrderState, Side
+
+        body: dict[str, Any] = {"instId": venue_sym}
+        if order_id:
+            body["ordId"] = order_id
+        elif client_order_id:
+            body["clOrdId"] = client_order_id
+        raw = await self._request(
+            "POST",
+            OKX_CANCEL_ORDER_PATH,
+            body=body,
+            private=True,
+        )
+        if _cancel_response_indicates_absent_order(raw, Venue.OKX):
+            return PassiveOrderAck(
+                venue=Venue.OKX,
+                symbol=venue_sym,
+                side=Side.BUY,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                price=0.0,
+                quantity=0.0,
+                accepted_at_ms=now_ms,
+                state=PassiveOrderState.CANCELED,
+            )
+
+        code = str(raw.get("code", "0"))
+        row = raw.get("data", [{}])
+        if isinstance(row, list) and row:
+            row = row[0]
+        if not isinstance(row, dict):
+            row = {}
+        s_code = str(row.get("sCode", "0"))
+        if code != "0" or s_code != "0":
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "okx cancel passive order failed: "
+                f"code={raw.get('code')} msg={raw.get('msg', '')} "
+                f"sCode={row.get('sCode', '')} sMsg={row.get('sMsg', '')}",
+                status_code=400,
+                body=json.dumps(raw, ensure_ascii=False),
+            )
+        return PassiveOrderAck(
+            venue=Venue.OKX,
+            symbol=venue_sym,
+            side=Side.BUY,
+            order_id=order_id or str(row.get("ordId", "") or ""),
+            client_order_id=client_order_id or str(row.get("clOrdId", "") or ""),
+            price=0.0,
+            quantity=0.0,
+            accepted_at_ms=now_ms,
+            state=PassiveOrderState.CANCELED,
+        )
+
     async def cancel_passive_order(
         self, symbol: str, order_id: str, client_order_id: Optional[str] = None,
     ) -> "PassiveOrderAck":
@@ -4961,6 +5101,12 @@ class VenueTransport(MarketDataClient):
                     params["ordId"] = order_id
                 elif client_order_id:
                     params["clOrdId"] = client_order_id
+                return await self._cancel_okx_passive_order_once(
+                    venue_sym,
+                    order_id,
+                    client_order_id,
+                    now_ms,
+                )
             elif spec.venue_id == Venue.BYBIT:
                 params["category"] = "linear"
                 params["symbol"] = venue_sym

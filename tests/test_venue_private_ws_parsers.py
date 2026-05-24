@@ -11,7 +11,10 @@ import pytest
 from lightfee.core.domain import PassiveOrderState
 from lightfee.marketdata.private_ws import PrivateWsState
 from lightfee.venues.binance_private_ws import handle_binance_private_message
-from lightfee.venues.okx_private_ws import handle_okx_private_message
+from lightfee.venues.okx_private_ws import (
+    _build_okx_ct_val_map,
+    handle_okx_private_message,
+)
 from lightfee.venues.bybit_private_ws import handle_bybit_private_message
 from lightfee.venues.bitget_private_ws import handle_bitget_private_message
 from lightfee.venues.gate_private_ws import handle_gate_private_message
@@ -131,7 +134,14 @@ class TestOkxPrivateParser:
                 "uTime": "1700000000000",
             }],
         })
-        handle_okx_private_message(state, symbol_map, sub_msgs, raw, subscribed=True)
+        handle_okx_private_message(
+            state,
+            symbol_map,
+            sub_msgs,
+            raw,
+            subscribed=True,
+            ct_val_map={"ETH-USDT-SWAP": 1.0},
+        )
         await asyncio_sleep_short()
         update = state.order_by_order_id("okx-order-1")
         assert update is not None
@@ -153,11 +163,83 @@ class TestOkxPrivateParser:
                 "uTime": "1700000000000",
             }],
         })
-        handle_okx_private_message(state, symbol_map, sub_msgs, raw, subscribed=True)
+        handle_okx_private_message(
+            state,
+            symbol_map,
+            sub_msgs,
+            raw,
+            subscribed=True,
+            ct_val_map={"ETH-USDT-SWAP": 1.0},
+        )
         await asyncio_sleep_short()
         pos = state.position("ETHUSDT")
         assert pos is not None
         assert pos.size == 2.5
+
+    @pytest.mark.asyncio
+    async def test_position_update_net_short_uses_ct_val_contract_size(self):
+        state = PrivateWsState()
+        symbol_map = {"UB-USDT-SWAP": "UBUSDT"}
+        raw = json.dumps({
+            "arg": {"channel": "positions", "instType": "SWAP", "instId": "UB-USDT-SWAP"},
+            "data": [{
+                "instId": "UB-USDT-SWAP",
+                "pos": "-1",
+                "posSide": "net",
+                "uTime": "1700000000000",
+            }],
+        })
+
+        handle_okx_private_message(
+            state,
+            symbol_map,
+            [],
+            raw,
+            subscribed=True,
+            ct_val_map={"UB-USDT-SWAP": 100.0},
+        )
+
+        await asyncio_sleep_short()
+        pos = state.position("UBUSDT")
+        assert pos is not None
+        assert pos.size == pytest.approx(-100.0)
+
+    @pytest.mark.asyncio
+    async def test_position_update_without_ct_val_does_not_cache_contracts_as_base(self):
+        state = PrivateWsState()
+        symbol_map = {"UB-USDT-SWAP": "UBUSDT"}
+        raw = json.dumps({
+            "arg": {"channel": "positions", "instType": "SWAP", "instId": "UB-USDT-SWAP"},
+            "data": [{
+                "instId": "UB-USDT-SWAP",
+                "pos": "-1",
+                "posSide": "net",
+                "uTime": "1700000000000",
+            }],
+        })
+
+        handle_okx_private_message(
+            state,
+            symbol_map,
+            [],
+            raw,
+            subscribed=True,
+            ct_val_map={},
+        )
+
+        await asyncio_sleep_short()
+        assert state.position("UBUSDT") is None
+
+    def test_build_ct_val_map_does_not_default_known_swap_to_one(self):
+        class Transport:
+            _symbol_metadata = {}
+
+        ct_val_map = _build_okx_ct_val_map(
+            Transport(),
+            {"UB-USDT-SWAP": "UBUSDT"},
+        )
+
+        assert ct_val_map == {}
 
 
 # ---------------------------------------------------------------------------

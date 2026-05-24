@@ -1696,6 +1696,8 @@ class _FakeVenueAdapter:
         self.position: PositionSnapshot | None = None
         self.place_order_fill: OrderFill | None = None
         self.place_order_raises: Exception | None = None
+        self.normalized_quantity: float | None = None
+        self.min_notional_quote: float = 0.0
         self.order_fill_reconciliation: OrderFillReconciliation | None = None
         self.passive_progress: PassiveOrderProgress | None = None
         self.query_passive_progress_raises: Exception | None = None
@@ -1763,6 +1765,19 @@ class _FakeVenueAdapter:
 
     async def fetch_all_positions(self) -> Optional[list[PositionSnapshot]]:
         return None
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        if self.normalized_quantity is not None:
+            return self.normalized_quantity
+        return quantity
+
+    def passive_metadata(self, symbol: str) -> dict:
+        return {
+            "min_notional": self.min_notional_quote,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "max_quantity": 0.0,
+        }
 
 
 def _make_test_config(tmp_path, **strategy_overrides):
@@ -4052,3 +4067,192 @@ class TestResidualRepairExecutionV1Parity:
         assert req.reduce_only is True
         assert req.post_only is False
         assert runtime.state.pending_residual_repairs == []
+
+    @pytest.mark.asyncio
+    async def test_pending_residual_repairs_are_driven_by_normal_housekeeping_tick(self, tmp_path, monkeypatch):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-runtime-repair",
+            "pair_id": "irysusdt:binance->bybit",
+            "symbol": "IRYSUSDT",
+            "origin": "entry_open",
+            "repair_venue": "binance",
+            "repair_side": "sell",
+            "repair_quantity": 10.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+
+        binance = _FakeVenueAdapter(Venue.BINANCE)
+        binance.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="IRYSUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            entry_price=0.0363,
+            observed_at_ms=now_ms,
+        )
+        binance.place_order_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="IRYSUSDT",
+            side=Side.SELL,
+            quantity=10.0,
+            price=0.0363,
+            order_id="repair-fill-10",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.BINANCE: binance}
+        runtime.supervisor.supervise = lambda *args, **kwargs: None
+
+        async def noop(_now_ms):
+            return None
+
+        monkeypatch.setattr(runtime, "_reconcile_pending_state", noop)
+        monkeypatch.setattr(runtime, "_maybe_recover_clean_live_positions", noop)
+
+        await runtime._post_tick_housekeeping(now_ms)
+
+        assert len(binance._place_order_calls) == 1
+        assert runtime.state.pending_residual_repairs == []
+
+    @pytest.mark.asyncio
+    async def test_residual_already_flat_removes_task(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-already-flat",
+            "pair_id": "flat:okx->bybit",
+            "symbol": "FLATUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 5.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="FLATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.01,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert runtime.state.pending_residual_repairs == []
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "execution.residual_repair_completed" in kinds
+
+    @pytest.mark.asyncio
+    async def test_residual_below_exchange_min_notional_terminalizes_and_releases_gate(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.live_recovery_reduce_only_pairs.append({
+            "pair_id": "dust:okx->bybit",
+            "symbol": "DUSTUSDT",
+        })
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-dust",
+            "pair_id": "dust:okx->bybit",
+            "symbol": "DUSTUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 5.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.min_notional_quote = 1.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="DUSTUSDT",
+            side=Side.BUY,
+            quantity=5.0,
+            entry_price=0.01,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert okx._place_order_calls == []
+        assert runtime.state.pending_residual_repairs == []
+        assert runtime.state.live_recovery_reduce_only_pairs == []
+        terminal = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.residual_repair_terminal"
+        ]
+        assert terminal
+        assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_notional_dust"
+
+    @pytest.mark.asyncio
+    async def test_residual_deadline_pauses_task_instead_of_retrying_forever(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-deadline",
+            "pair_id": "deadline:okx->bybit",
+            "symbol": "DEADUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 5.0,
+            "created_at_ms": now_ms - 60_000,
+            "deadline_ms": now_ms - 1,
+            "retry_count": 2,
+            "last_attempt_at_ms": now_ms - 1_000,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="DEADUSDT",
+            side=Side.BUY,
+            quantity=5.0,
+            entry_price=1.0,
+            observed_at_ms=now_ms,
+        )
+        okx.place_order_raises = RuntimeError("exchange temporarily unavailable")
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert len(runtime.state.pending_residual_repairs) == 1
+        task = runtime.state.pending_residual_repairs[0]
+        assert task["local_entry_paused"] is True
+        assert task["last_error"] == "residual_repair_deadline_or_attempts_exhausted"
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "execution.residual_repair_paused" in kinds
+
+    def test_pending_residual_symbols_are_tracked_by_private_ws(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-private-track",
+            "pair_id": "ub:binance->okx",
+            "symbol": "UBUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "buy",
+            "repair_quantity": 100.0,
+            "created_at_ms": 1000,
+            "deadline_ms": 31000,
+        })
+
+        tracked = runtime._current_tracked_private_symbols()
+
+        assert tracked[Venue.OKX] == {"UBUSDT"}

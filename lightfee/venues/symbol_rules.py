@@ -25,6 +25,7 @@ class SymbolRule:
     min_qty: float
     min_notional: float
     ct_val: float = 0.0  # OKX contract value (ctVal) for base→contract sizing
+    max_market_qty: float = 0.0  # OKX maxMktSz, contract units for derivatives
     rule_source: str = ""  # "exchangeInfo", "instruments-info", "instrument", "spec_fallback"
 
 
@@ -180,6 +181,7 @@ class SymbolRulesCache:
         lot_sz = float(item.get("lotSz", 0) or 0)
         min_sz = float(item.get("minSz", 0) or 0)
         ct_val = float(item.get("ctVal", 1) or 1)
+        max_mkt_sz = float(item.get("maxMktSz", 0) or 0)
 
         spec = transport._spec
         if tick_size <= 0:
@@ -198,6 +200,7 @@ class SymbolRulesCache:
             min_qty=min_sz,
             min_notional=min_notional,
             ct_val=ct_val,
+            max_market_qty=max_mkt_sz,
             rule_source="instrument",
         )
 

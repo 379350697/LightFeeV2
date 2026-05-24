@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import Counter
 from typing import Optional
 
@@ -169,6 +170,24 @@ class LiveRuntime:
         adapter = self.get_venue_adapter(venue)
         if adapter is None:
             return 0.0
+        passive_metadata = getattr(adapter, "passive_metadata", None)
+        if callable(passive_metadata):
+            try:
+                metadata = passive_metadata(symbol) or {}
+                min_notional = float(
+                    metadata.get("min_notional", metadata.get("min_notional_quote", 0.0))
+                    or 0.0
+                )
+                if min_notional > 0:
+                    return min_notional
+            except Exception:
+                pass
+        adapter_min = float(
+            getattr(adapter, "min_notional_quote", getattr(adapter, "_min_notional_quote", 0.0))
+            or 0.0
+        )
+        if adapter_min > 0:
+            return adapter_min
         transport = getattr(adapter, "_transport", adapter)
         spec = getattr(transport, "_spec", None)
         if spec is not None:
@@ -5223,21 +5242,12 @@ class LiveRuntime:
                     pass
 
     async def _recover_residual_repairs(self, now_ms: int) -> None:
-        """Process pending residual repair tasks after startup recovery.
-
-        V1: process_pending_residual_repairs() — iterates over
-        pending_residual_repairs and attempts to repair one-sided exposure
-        by submitting reduce-only orders on the over-exposed venue.
-
-        V1 does NOT require a matching open_position — it fetches the live
-        position from the exchange via fetch_position_via_port. Residual tasks
-        from unmatched entries (incremental_entry_open_unmatched_residual) have
-        no corresponding OpenPosition but still represent real exchange exposure.
-        """
+        """Process ready pending residual repair tasks during normal runtime."""
         if not self.state.pending_residual_repairs:
             return
 
         from lightfee.core.domain import OrderRequest
+        from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
         from lightfee.venues.cid import compact_client_order_id
 
         repaired = 0
@@ -5258,6 +5268,16 @@ class LiveRuntime:
             position_id = task.get("position_id", "")
             pair_id = task.get("pair_id", "")
             symbol = task.get("symbol", "")
+
+            if bool(task.get("local_entry_paused", False)):
+                continue
+            next_attempt_ms = int(task.get("next_attempt_ms", 0) or 0)
+            if next_attempt_ms > 0 and now_ms < next_attempt_ms:
+                continue
+            if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+                self._pause_pending_residual_repair(task, now_ms)
+                continue
+
             adapter = self.get_venue_adapter(repair_venue)
             if adapter is None:
                 self._reschedule_pending_residual_repair_task(task, now_ms, "adapter_missing")
@@ -5302,6 +5322,7 @@ class LiveRuntime:
 
             if live_excess_quantity <= 1e-9:
                 self.state.pending_residual_repairs.remove(task)
+                self._release_residual_repair_pair_gate(pair_id, symbol)
                 repaired += 1
                 self.journal.append(
                     "execution.residual_repair_completed",
@@ -5339,6 +5360,38 @@ class LiveRuntime:
             if repair_quantity <= 1e-9:
                 self._reschedule_pending_residual_repair_task(
                     task, now_ms, "normalized_repair_quantity_zero"
+                )
+                self.journal.append(
+                    "recovery.residual_repair_failed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "repair_quantity": live_excess_quantity,
+                        "error": "normalized_repair_quantity_zero",
+                    },
+                )
+                continue
+
+            min_notional = self._venue_min_notional(repair_venue, symbol)
+            live_price = abs(float(getattr(live_position, "entry_price", 0.0) or 0.0))
+            if (
+                min_notional > 0
+                and live_price > 0
+                and repair_quantity * live_price + 1e-12 < min_notional
+                and not venue_reduce_only_close_exempts_min_notional(repair_venue)
+            ):
+                self._terminalize_residual_repair_task(
+                    task,
+                    now_ms,
+                    terminal_reason="exchange_min_notional_dust",
+                    repair_venue=repair_venue,
+                    repair_side=repair_side,
+                    repair_quantity=repair_quantity,
+                    live_price=live_price,
+                    min_notional=min_notional,
                 )
                 continue
 
@@ -5385,8 +5438,10 @@ class LiveRuntime:
                 updated.pop("exposure_quantity", None)
                 updated["retry_count"] = 0
                 updated["last_attempt_at_ms"] = now_ms
+                updated["next_attempt_ms"] = now_ms
                 self.state.pending_residual_repairs.append(updated)
             else:
+                self._release_residual_repair_pair_gate(pair_id, symbol)
                 repaired += 1
             self.journal.append(
                 "execution.residual_repair_completed",
@@ -5447,12 +5502,111 @@ class LiveRuntime:
             return -matched_quantity
         return 0.0
 
+    @staticmethod
+    def _residual_repair_retry_delay_ms(attempt_count: int) -> int:
+        attempt = max(int(attempt_count or 0), 1)
+        return min(1_000 * (2 ** (attempt - 1)), 30_000)
+
+    @staticmethod
+    def _residual_repair_attempt_count(task: dict) -> int:
+        return int(task.get("retry_count", task.get("attempt_count", 0)) or 0)
+
+    def _residual_repair_deadline_or_attempts_exhausted(
+        self, task: dict, now_ms: int,
+    ) -> bool:
+        deadline_ms = int(task.get("deadline_ms", 0) or 0)
+        attempts = self._residual_repair_attempt_count(task)
+        return (deadline_ms > 0 and now_ms >= deadline_ms) or attempts >= 3
+
+    def _pause_pending_residual_repair(self, task: dict, now_ms: int) -> None:
+        task["local_entry_paused"] = True
+        task["last_attempt_at_ms"] = now_ms
+        task["next_attempt_ms"] = 0
+        task["last_error"] = "residual_repair_deadline_or_attempts_exhausted"
+        self.journal.append(
+            "execution.residual_repair_paused",
+            {
+                "position_id": task.get("position_id", ""),
+                "pair_id": task.get("pair_id", ""),
+                "symbol": task.get("symbol", ""),
+                "repair_venue": task.get("repair_venue", task.get("exposure_venue", "")),
+                "repair_side": task.get("repair_side", task.get("exposure_side", "")),
+                "retry_count": self._residual_repair_attempt_count(task),
+                "deadline_ms": int(task.get("deadline_ms", 0) or 0),
+                "ts_ms": now_ms,
+                "last_error": task["last_error"],
+            },
+        )
+
+    def _release_residual_repair_pair_gate(self, pair_id: str, symbol: str) -> None:
+        if not getattr(self.state, "live_recovery_reduce_only_pairs", None):
+            return
+        kept = []
+        for item in self.state.live_recovery_reduce_only_pairs:
+            item_pair_id = ""
+            item_symbol = ""
+            if isinstance(item, dict):
+                item_pair_id = str(item.get("pair_id", ""))
+                item_symbol = str(item.get("symbol", ""))
+            else:
+                item_pair_id = str(getattr(item, "pair_id", ""))
+                item_symbol = str(getattr(item, "symbol", ""))
+            if pair_id and item_pair_id == pair_id:
+                continue
+            if not pair_id and symbol and item_symbol == symbol:
+                continue
+            kept.append(item)
+        self.state.live_recovery_reduce_only_pairs = kept
+
+    def _terminalize_residual_repair_task(
+        self,
+        task: dict,
+        now_ms: int,
+        *,
+        terminal_reason: str,
+        repair_venue: Venue,
+        repair_side: Side,
+        repair_quantity: float,
+        live_price: float,
+        min_notional: float,
+    ) -> None:
+        try:
+            self.state.pending_residual_repairs.remove(task)
+        except ValueError:
+            pass
+        pair_id = str(task.get("pair_id", ""))
+        symbol = str(task.get("symbol", ""))
+        self._release_residual_repair_pair_gate(pair_id, symbol)
+        self.journal.append(
+            "execution.residual_repair_terminal",
+            {
+                "position_id": task.get("position_id", ""),
+                "pair_id": pair_id,
+                "symbol": symbol,
+                "origin": task.get("origin", ""),
+                "repair_venue": repair_venue.value,
+                "repair_side": repair_side.value,
+                "repair_quantity": repair_quantity,
+                "live_price": live_price,
+                "notional": repair_quantity * live_price,
+                "min_notional": min_notional,
+                "terminal_reason": terminal_reason,
+                "ts_ms": now_ms,
+            },
+        )
+
     def _reschedule_pending_residual_repair_task(
         self, task: dict, now_ms: int, error: str
     ) -> None:
-        task["retry_count"] = int(task.get("retry_count", 0) or 0) + 1
+        retry_count = self._residual_repair_attempt_count(task) + 1
+        task["retry_count"] = retry_count
+        task["attempt_count"] = retry_count
         task["last_attempt_at_ms"] = now_ms
         task["last_error"] = error
+        if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+            self._pause_pending_residual_repair(task, now_ms)
+            return
+        task["next_attempt_ms"] = now_ms + self._residual_repair_retry_delay_ms(retry_count)
 
     # ------------------------------------------------------------------
     # Housekeeping
@@ -5596,6 +5750,21 @@ class LiveRuntime:
                     if short_v is not None and isinstance(short_v, Venue):
                         result.setdefault(short_v, set()).add(sym)
 
+        # from pending residual repairs — repair venue must be privately tracked
+        # while the task is pending so live excess can converge without restart.
+        for task in getattr(self.state, "pending_residual_repairs", []):
+            if not isinstance(task, dict):
+                continue
+            sym = str(task.get("symbol", "") or "")
+            venue_raw = task.get("repair_venue") or task.get("exposure_venue")
+            if not sym or venue_raw is None:
+                continue
+            try:
+                venue = Venue.from_str(str(venue_raw))
+            except Exception:
+                continue
+            result.setdefault(venue, set()).add(sym)
+
         return result
 
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
@@ -5623,6 +5792,9 @@ class LiveRuntime:
 
         # Reconciliation of pending/uncertain outcomes
         await self._reconcile_pending_state(now_ms)
+
+        # V1: residual repairs are normal runtime work, not startup-only work.
+        await self._recover_residual_repairs(now_ms)
 
         # Detect false-clean state where exchanges hold positions but V2 missed them.
         await self._maybe_recover_clean_live_positions(now_ms)
@@ -6563,6 +6735,104 @@ class LiveRuntime:
 
         return None
 
+    @staticmethod
+    def _safe_positive_float(value) -> float:
+        try:
+            result = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return result if math.isfinite(result) and result > 0 else 0.0
+
+    async def _okx_entry_base_quantity_step(
+        self, venue: Venue, symbol: str,
+    ) -> float | None:
+        if venue != Venue.OKX:
+            return 0.0
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return None
+
+        explicit_step = self._safe_positive_float(
+            getattr(adapter, "okx_base_quantity_step", 0.0)
+        )
+        if explicit_step > 0:
+            return explicit_step
+
+        transport = getattr(adapter, "_transport", None)
+        if transport is None:
+            return 0.0
+
+        transport_step = self._safe_positive_float(
+            getattr(transport, "okx_base_quantity_step", 0.0)
+        )
+        if transport_step > 0:
+            return transport_step
+
+        venue_symbol = symbol
+        venue_symbol_fn = getattr(transport, "_venue_symbol", None)
+        if callable(venue_symbol_fn):
+            try:
+                venue_symbol = venue_symbol_fn(symbol)
+            except Exception:
+                venue_symbol = symbol
+
+        metadata = getattr(transport, "_symbol_metadata", {}) or {}
+        for key in (symbol, venue_symbol):
+            meta = metadata.get(key) or {}
+            if not isinstance(meta, dict):
+                continue
+            ct_val = self._safe_positive_float(
+                meta.get("ct_val") or meta.get("ctVal") or meta.get("contract_size")
+            )
+            lot_sz = self._safe_positive_float(
+                meta.get("lot_sz") or meta.get("lotSz") or meta.get("qty_step")
+            )
+            if ct_val > 0 and lot_sz > 0:
+                return ct_val * lot_sz
+
+        try:
+            from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+            rule = await get_symbol_rules_cache().get(transport, Venue.OKX, venue_symbol)
+            ct_val = self._safe_positive_float(getattr(rule, "ct_val", 0.0))
+            lot_sz = self._safe_positive_float(getattr(rule, "qty_step", 0.0))
+            if ct_val > 0 and lot_sz > 0:
+                return ct_val * lot_sz
+        except Exception:
+            pass
+
+        mode = str(getattr(transport, "mode", "") or "").lower()
+        if mode == "live":
+            return None
+        return 0.0
+
+    async def _okx_aligned_entry_quantity(
+        self,
+        *,
+        long_venue: Venue,
+        short_venue: Venue,
+        symbol: str,
+        quantity: float,
+        now_ms: int,
+    ) -> tuple[float, float | None]:
+        okx_steps: list[float] = []
+        missing = False
+        for venue in (long_venue, short_venue):
+            step = await self._okx_entry_base_quantity_step(venue, symbol)
+            if step is None:
+                missing = True
+            elif step > 0:
+                okx_steps.append(step)
+        if missing:
+            return 0.0, None
+        if not okx_steps:
+            return quantity, 0.0
+        step = max(okx_steps)
+        aligned = math.floor((quantity / step) + 1e-12) * step
+        if aligned <= 0:
+            return 0.0, step
+        return aligned, step
+
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
@@ -6640,6 +6910,40 @@ class LiveRuntime:
         long_venue = Venue.from_str(candidate.long_venue)
         short_venue = Venue.from_str(candidate.short_venue)
         quantity = candidate.entry_notional_quote / price_hint
+        quantity, okx_base_step = await self._okx_aligned_entry_quantity(
+            long_venue=long_venue,
+            short_venue=short_venue,
+            symbol=candidate.symbol,
+            quantity=quantity,
+            now_ms=now_ms,
+        )
+        if okx_base_step is None:
+            self.journal.append(
+                "runtime.entry_skipped_okx_contract_metadata_missing",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "raw_quantity": candidate.entry_notional_quote / price_hint,
+                    "reason": "okx_ct_val_lot_sz_unconfirmed",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+        if quantity <= 0:
+            self.journal.append(
+                "runtime.entry_skipped_okx_contract_step",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "okx_base_quantity_step": okx_base_step,
+                    "raw_quantity": candidate.entry_notional_quote / price_hint,
+                    "reason": "quantity_below_okx_contract_step",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
 
         # V1 runtime entry guards (apply_runtime_entry_guards)
         gate_checks = [
@@ -6723,6 +7027,8 @@ class LiveRuntime:
 
         # V1: min_hedgeable_chunk aligns to venue step and notional floor
         min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
+        if okx_base_step and okx_base_step > 0:
+            min_hedgeable_chunk = max(min_hedgeable_chunk, okx_base_step)
 
         route, plan = plan_incremental_entry_execution(
             target_quantity=quantity,
@@ -6752,10 +7058,10 @@ class LiveRuntime:
             effective_quantity = plan.initial_maker_target_quantity
         elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
             entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = quantity
+            effective_quantity = plan.full_target_quantity
         else:
             entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = quantity
+            effective_quantity = plan.full_target_quantity
 
         # V1: maker leg from strategy config (funding arb: long side is typically maker)
         maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL

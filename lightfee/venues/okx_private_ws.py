@@ -144,7 +144,10 @@ def _parse_okx_order_data(
     symbol = symbol_map.get(venue_symbol)
     if symbol is None:
         return
-    ct_val = ct_val_map.get(venue_symbol, 1.0)
+    ct_val = float(ct_val_map.get(venue_symbol, 0.0) or 0.0)
+    if ct_val <= 0:
+        logger.warning("okx private order skipped without trusted ctVal: %s", venue_symbol)
+        return
 
     order_id = str(row.get("ordId", ""))
     client_order_id = row.get("clOrdId", "")
@@ -225,7 +228,13 @@ def _parse_okx_position_data(
         symbol = symbol_map.get(venue_symbol)
         if symbol is None:
             continue
-        ct_val = ct_val_map.get(venue_symbol, 1.0)
+        ct_val = float(ct_val_map.get(venue_symbol, 0.0) or 0.0)
+        if ct_val <= 0:
+            logger.warning(
+                "okx private position skipped without trusted ctVal: %s",
+                venue_symbol,
+            )
+            continue
 
         # V1: use uTime from first row
         ts_str = row.get("uTime") or row.get("cTime")
@@ -498,25 +507,26 @@ async def _okx_private_ws_loop(
 
 
 def _build_okx_ct_val_map(transport, symbol_map: dict[str, str]) -> dict[str, float]:
-    """V1: build ct_val map from contract metadata — vendor_sym → ct_val.
+    """Build ct_val map from trusted contract metadata — vendor_sym → ct_val.
 
-    V1 okx_ct_val_map_from_cached_metadata() (okx.rs:5791-5805):
-    - metadata is keyed by canonical symbol, but may also be keyed by vendor sym
-    - priority: canonical symbol lookup first, vendor key fallback
-    - every inst_id defaults to ct_val=1.0
+    metadata is keyed by canonical symbol, but may also be keyed by vendor sym.
+    Do not default SWAP instruments to 1.0: OKX private position/order sizes
+    are contracts, and a silent fallback pollutes base-unit state.
     """
     ct_val_map: dict[str, float] = {}
     metadata = getattr(transport, '_symbol_metadata', {}) or {}
     for vendor_sym, canonical_sym in symbol_map.items():
-        # V1: priority lookup by canonical symbol, vendor fallback
         meta = metadata.get(canonical_sym) or metadata.get(vendor_sym) or {}
-        ct_val = float(meta.get('ct_val', 0) or 0)
+        ct_val = 0.0
+        for key in ("ct_val", "ctVal", "contract_size", "contractSize"):
+            try:
+                ct_val = float(meta.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                ct_val = 0.0
+            if ct_val > 0:
+                break
         if ct_val > 0:
             ct_val_map[vendor_sym] = ct_val
-    # V1: every inst_id defaults to 1.0
-    for vendor_sym in symbol_map:
-        if vendor_sym not in ct_val_map:
-            ct_val_map[vendor_sym] = 1.0
     return ct_val_map
 
 
@@ -537,6 +547,19 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
 
     symbol_map = {transport._venue_symbol(s): s for s in symbols}
     ct_val_map = _build_okx_ct_val_map(transport, symbol_map)
+    missing_ct_val = sorted(set(symbol_map) - set(ct_val_map))
+    if missing_ct_val:
+        transport.record_private_ws_failure(
+            _now_ms(),
+            "okx private ws ctVal metadata missing: "
+            + ",".join(missing_ct_val[:10]),
+            unhealthy_after=1,
+        )
+        logger.warning(
+            "okx private WS not started: missing ctVal for %d symbols",
+            len(missing_ct_val),
+        )
+        return
 
     task = asyncio.create_task(
         _okx_private_ws_loop(
