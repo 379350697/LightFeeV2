@@ -17,6 +17,7 @@ import pytest
 from lightfee.core.domain import (
     OrderFill,
     OrderRequest,
+    PassiveOrderAmendRequest,
     PositionSnapshot,
     Side,
     TimeInForce,
@@ -506,6 +507,52 @@ class TestLiveModeFailFast:
 class TestHyperliquidLiveOrderNowSupported:
     """Hyperliquid live order now works with EIP-712 signing."""
 
+    def test_hyperliquid_wire_size_and_price_quantization(self):
+        from lightfee.venues.hyperliquid_signing import (
+            build_hyperliquid_order_action,
+            float_to_wire_string,
+            hyperliquid_ioc_price_and_size,
+            hyperliquid_price_decimals,
+            round_to_decimals,
+            round_to_significant_and_decimal,
+        )
+
+        assert float_to_wire_string(200.0) == "200"
+        assert round_to_decimals(1.25, 1) == pytest.approx(1.3)
+        assert round_to_decimals(-1.25, 1) == pytest.approx(-1.3)
+        assert round_to_decimals(1.005, 2) == pytest.approx(1.0)
+        assert round_to_decimals(0.145, 2) == pytest.approx(0.14)
+        assert round_to_significant_and_decimal(2.5, 1, 0) == pytest.approx(3.0)
+        assert round_to_significant_and_decimal(-2.5, 1, 0) == pytest.approx(-3.0)
+        assert round_to_significant_and_decimal(1.005, 4, 2) == pytest.approx(1.0)
+        assert round_to_significant_and_decimal(0.145, 3, 2) == pytest.approx(0.14)
+        price_decimals = hyperliquid_price_decimals(asset_index=123, sz_decimals=0)
+        limit_px, wire_qty = hyperliquid_ioc_price_and_size(
+            side_is_buy=True,
+            quantity=200.0,
+            reference_price=0.16272,
+            sz_decimals=0,
+            price_decimals=price_decimals,
+        )
+        assert wire_qty == 200.0
+        assert limit_px == pytest.approx(0.16435)
+
+        action = build_hyperliquid_order_action(
+            symbol="SUPER",
+            is_buy=True,
+            quantity=wire_qty,
+            price=limit_px,
+            tif="Ioc",
+            asset_index=123,
+            sz_decimals=0,
+            price_decimals=price_decimals,
+        )
+        order = action["orders"][0]
+        assert order["a"] == 123
+        assert order["s"] == "200"
+        assert order["p"] == "0.16435"
+        assert "200.0" not in json.dumps(action)
+
     def test_registry_derives_account_address_from_wallet_when_env_omitted(self, monkeypatch):
         from eth_account import Account
         from lightfee.venues.registry import build_adapter
@@ -523,6 +570,66 @@ class TestHyperliquidLiveOrderNowSupported:
         expected = Account.from_key(wallet_key).address
         assert adapter._transport._credential.account_address == expected
         assert adapter._credential.account_address == expected
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):
+        from eth_account import Account
+
+        wallet_key = "0x" + "1" * 64
+        account_address = Account.from_key(wallet_key).address
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address=account_address,
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            assert body["type"] == "clearinghouseState"
+            assert body["user"].lower() == account_address.lower()
+            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "ok"
+        assert result["signer_matches_account"] is True
+        assert result["wallet_matches_account"] is True
+        assert result["clearinghouse_state_readable"] is True
+        assert result["trading_capability_trusted"] is True
+        assert transport.trading_capability_trusted is True
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_readonly_preflight_disables_unverified_api_wallet(self):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address="0x000000000000000000000000000000000000beef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            assert body["type"] == "clearinghouseState"
+            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "failed"
+        assert result["wallet_matches_account"] is False
+        assert result["signer_matches_account"] is False
+        assert result["api_wallet_authorization_verified"] is False
+        assert result["clearinghouse_state_readable"] is True
+        assert result["trading_capability_trusted"] is False
+        assert transport.trading_capability_trusted is False
+        assert result["reason"] == "api_wallet_authorization_unverified"
 
     @pytest.mark.asyncio
     async def test_live_place_order_signs_with_wallet_private_key_not_api_secret(self, monkeypatch):
@@ -657,6 +764,256 @@ class TestHyperliquidLiveOrderNowSupported:
         assert order["t"]["limit"]["tif"] == "Ioc"
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_super_ioc_wire_payload_has_no_trailing_zero_size(self):
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(
+            wallet_private_key=privkey,
+            account_address="0xbeef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [
+                                {
+                                    "filled": {
+                                        "oid": 981,
+                                        "totalSz": "200",
+                                        "avgPx": "0.16435",
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.BUY,
+            quantity=200.0,
+            price=0.16272,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="entry-1779288723953-SUPERUSDT-h1",
+        )
+        try:
+            await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        body = captured["body"]
+        order = body["action"]["orders"][0]
+        assert order["a"] == 123
+        assert order["s"] == "200"
+        assert order["p"] == "0.16435"
+        assert order["t"]["limit"]["tif"] == "Ioc"
+        assert "200.0" not in json.dumps(body)
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_reduce_only_ioc_without_price_uses_l2_fallback(self):
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(wallet_private_key=privkey, account_address="0xbeef")
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
+        seen: list[str] = []
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path.endswith("/info"):
+                seen.append("l2Book")
+                assert body == {"type": "l2Book", "coin": "SUPER"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "coin": "SUPER",
+                        "time": 1779422875621,
+                        "levels": [
+                            [{"px": "0.162", "sz": "1000"}],
+                            [{"px": "0.164", "sz": "1000"}],
+                        ],
+                    },
+                )
+            seen.append("exchange")
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [
+                                {
+                                    "filled": {
+                                        "oid": 982,
+                                        "totalSz": "200",
+                                        "avgPx": "0.16038",
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.SELL,
+            quantity=200.0,
+            price=None,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="cleanup-1779422875621-SUPERUSDT-hl",
+        )
+        try:
+            await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        assert seen == ["l2Book", "exchange"]
+        order = captured["body"]["action"]["orders"][0]
+        assert order["r"] is True
+        assert order["s"] == "200"
+        assert order["p"] == "0.16038"
+        assert order["t"]["limit"]["tif"] == "Ioc"
+        attempt = next(
+            e["payload"] for e in transport.order_diagnostics
+            if e["kind"] == "order.submit_attempt"
+        )
+        assert attempt["reference_price_source"] == "l2_snapshot_best_bid"
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_ioc_without_price_rejects_when_l2_side_missing(self):
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(wallet_private_key=privkey, account_address="0xbeef")
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path.endswith("/info"):
+                seen.append("l2Book")
+                assert body == {"type": "l2Book", "coin": "SUPER"}
+                return httpx.Response(
+                    200,
+                    json={"coin": "SUPER", "levels": [[], []], "time": 1779422875621},
+                )
+            seen.append("exchange")
+            return httpx.Response(500, json={"error": "must not submit"})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.SELL,
+            quantity=200.0,
+            price=None,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="cleanup-1779422875621-SUPERUSDT-hl",
+        )
+        try:
+            with pytest.raises(OrderSubmitError) as exc:
+                await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert seen == ["l2Book"]
+        result = next(
+            e["payload"] for e in transport.order_diagnostics
+            if e["kind"] == "order.submit_result"
+        )
+        assert result["response_classification"] == "rejected"
+        assert result["reference_price_source"] == "l2_snapshot_best_bid"
+        assert result["best_bid"] == 0.0
+        assert result["best_ask"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_passive_order_uses_signed_exchange_action_alo(self):
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        cred = LiveCredential(
+            wallet_private_key=privkey,
+            account_address="0xbeef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {"statuses": [{"resting": {"oid": 555}}]},
+                    },
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.SELL,
+            quantity=200.0,
+            price=0.16435000000000002,
+            post_only=True,
+            client_order_id="entry-1779288723953-SUPERUSDT-m1",
+        )
+        try:
+            ack = await transport.submit_passive_order(req)
+        finally:
+            await transport.close()
+
+        body = captured["body"]
+        assert sorted(body.keys()) == ["action", "nonce", "signature"]
+        assert "postOnly" not in body
+        assert "timeInForce" not in body
+        assert "quantity" not in body
+        assert "cloid" not in body
+        order = body["action"]["orders"][0]
+        assert order["a"] == 123
+        assert order["s"] == "200"
+        assert order["p"] == "0.16435"
+        assert order["t"]["limit"]["tif"] == "Alo"
+        assert ack.order_id == "555"
+        assert "200.0" not in json.dumps(body)
+
+    @pytest.mark.asyncio
     async def test_live_place_order_succeeds_with_mock(self):
         # Valid secp256k1 private key for signing (Rust test-vector key)
         privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
@@ -674,7 +1031,8 @@ class TestHyperliquidLiveOrderNowSupported:
             )
         )
         req = OrderRequest(
-            venue=Venue.HYPERLIQUID, symbol="BTC", side=Side.BUY, quantity=1.0,
+            venue=Venue.HYPERLIQUID, symbol="BTC", side=Side.BUY,
+            quantity=1.0, price=50000.0, time_in_force=TimeInForce.IOC,
         )
         try:
             fill = await transport.place_order(req)
@@ -1770,6 +2128,95 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert fill.quantity == pytest.approx(100.0)
 
     @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_terminalizes_below_contract_min(self):
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        transport.set_symbol_metadata({
+            "UB-USDT-SWAP": {
+                "ct_val": "100",
+                "lot_sz": "1",
+                "min_sz": "1",
+            }
+        })
+
+        assert await transport.normalize_quantity("UBUSDT", 1.0) == 0.0
+        assert await transport.normalize_quantity("UBUSDT", 100.0) == pytest.approx(100.0)
+        assert await transport.normalize_quantity("UBUSDT", 150.0) == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_uses_symbol_rules_cache_without_metadata(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.OKX
+                assert venue_symbol == "UB-USDT-SWAP"
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        assert await transport.normalize_quantity("UBUSDT", 50.0) == 0.0
+        assert await transport.normalize_quantity("UBUSDT", 100.0) == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_fails_closed_without_contract_size(self, monkeypatch):
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return type(
+                    "Rule",
+                    (),
+                    {"ct_val": 0.0, "qty_step": 1.0, "min_qty": 1.0},
+                )()
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        transport.set_symbol_metadata({
+            "UB-USDT-SWAP": {
+                "lot_sz": "1",
+                "min_sz": "1",
+            }
+        })
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport.normalize_quantity("UBUSDT", 100.0)
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_contract_size_lookup_fails_closed_without_ct_val(self, monkeypatch):
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return type("Rule", (), {"ct_val": 0.0})()
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport._okx_contract_size_for_venue_symbol("UB-USDT-SWAP")
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_okx_passive_rejects_zero_contract_quantity_without_request(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
@@ -1886,6 +2333,76 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert sent[-1]["path"] == "/api/v5/trade/order"
         assert sent[-1]["body"]["sz"] == "1"
         assert ack.order_id == "okx-passive-1"
+
+    @pytest.mark.asyncio
+    async def test_okx_passive_preflight_does_not_treat_contract_lot_as_base_qty(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=0.1,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"method": method, "path": path, "body": dict(body or {})})
+            return {
+                "code": "0",
+                "data": [{"ordId": "okx-passive-min", "clOrdId": "ubpassive01", "sCode": "0"}],
+            }
+
+        transport._request = fake_request
+
+        ack = await transport.submit_passive_order(
+            OrderRequest(
+                venue=Venue.OKX,
+                symbol="UBUSDT",
+                side=Side.SELL,
+                quantity=0.1,
+                price=0.02,
+                post_only=True,
+                client_order_id="ubpassive01",
+            )
+        )
+
+        assert sent[-1]["path"] == "/api/v5/trade/order"
+        assert sent[-1]["body"]["sz"] == "1"
+        assert ack.order_id == "okx-passive-min"
+        preflight = next(
+            e["payload"] for e in transport.order_diagnostics
+            if e["kind"] == "order.submit_attempt"
+        )
+        assert preflight["raw_qty"] == pytest.approx(0.1)
+        assert preflight["normalized_qty"] == pytest.approx(0.1)
+        assert preflight["qty_step"] == 0.0
+        assert preflight["min_qty"] == 0.0
 
     @pytest.mark.asyncio
     async def test_okx_cancel_uses_post_cancel_order_endpoint(self):
@@ -5791,8 +6308,9 @@ class TestPassivePreflight:
         preflight = transport.preflight_order_request(req, symbol_rule=rule)
         assert preflight["rule_source"] == "instrument"
         assert preflight["tick_size"] == 0.1
-        assert preflight["quantity_step"] == 0.01
-        assert preflight["min_qty"] == 0.01
+        assert preflight["quantity_step"] == 0.0
+        assert preflight["min_qty"] == 0.0
+        assert preflight["quantized_qty"] == pytest.approx(0.01234)
 
 
 # ===========================================================================
@@ -6660,3 +7178,81 @@ class TestOkxAsterBinanceRiskSnapshotEmptyStringV1Parity:
         """Aster totalMaintMargin='--' MUST return None (V1 parity)."""
         from lightfee.venues.transport import _parse_optional_float
         assert _parse_optional_float("--") is None
+
+
+class TestPassiveAmendWireContracts:
+    @pytest.mark.asyncio
+    async def test_binance_amend_uses_signed_query_params_without_json_body(self):
+        cred = LiveCredential(api_key="key", api_secret="secret")
+        transport = VenueTransport(spec=binance_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["method"] = request.method
+            captured["path"] = request.url.path
+            captured["query"] = request.url.query.decode()
+            captured["content"] = request.content
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": 12345,
+                    "clientOrderId": "cid-amend",
+                    "price": "50001",
+                    "origQty": "0.2",
+                    "status": "NEW",
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            order_id="12345",
+            client_order_id="cid-old",
+            new_price_hint=50001.0,
+            new_quantity=0.2,
+        )
+        try:
+            await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        assert captured["method"] == "PUT"
+        assert captured["path"] == "/fapi/v1/order"
+        assert captured["content"] == b""
+        query = captured["query"]
+        assert "symbol=BTCUSDT" in query
+        assert "orderId=12345" in query
+        assert "side=BUY" in query
+        assert "price=50001" in query
+        assert "quantity=0.2" in query
+        assert "recvWindow=10000" in query
+        assert "timestamp=" in query
+        assert "signature=" in query
+
+    @pytest.mark.asyncio
+    async def test_aster_amend_is_unsupported_and_does_not_send_put(self):
+        cred = LiveCredential(api_key="key", api_secret="secret")
+        transport = VenueTransport(spec=aster_spec(), mode="live", credential=cred)
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500, text="should not be called")
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            order_id="aster-oid",
+            client_order_id="aster-cid",
+            new_price_hint=50001.0,
+            new_quantity=0.2,
+        )
+        try:
+            with pytest.raises(NotImplementedError):
+                await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+        assert calls == []

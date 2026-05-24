@@ -6,6 +6,9 @@ Each test validates a specific root cause identified after deployment 021178e.
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from lightfee.core.domain import (
@@ -389,6 +392,35 @@ class TestOKXV1Parity:
         )
         assert rule.ct_val == 0.01
         assert rule.rule_source == "instrument"
+
+    @pytest.mark.asyncio
+    async def test_okx_symbol_rule_missing_ct_val_does_not_fallback_to_one(self):
+        """Missing OKX ctVal must fail closed downstream, not synthesize 1.0."""
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import okx_spec
+
+        class FakeTransport(VenueTransport):
+            async def _public_get(self, path, *, params=None):
+                assert path == "/api/v5/public/instruments"
+                return {
+                    "data": [
+                        {
+                            "instId": "UB-USDT-SWAP",
+                            "tickSz": "0.000001",
+                            "lotSz": "1",
+                            "minSz": "1",
+                        }
+                    ]
+                }
+
+        transport = FakeTransport(spec=okx_spec(), mode="paper")
+        rule = await SymbolRulesCache().get(transport, Venue.OKX, "UB-USDT-SWAP")
+
+        assert rule.rule_source == "instrument"
+        assert rule.ct_val == 0.0
+        assert rule.qty_step == 1.0
+        assert rule.min_qty == 1.0
 
     def test_ct_val_default_zero_for_non_okx(self):
         """Non-OKX SymbolRules have ct_val=0.0 by default."""
@@ -1872,6 +1904,48 @@ class TestRealPathAbortCleanupDeadline:
         ]
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_auth_signing_reject_is_non_retryable(self, tmp_path):
+        """HL auth/signing rejection fails closed and does not spin retries."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge_adapter.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "User or API Wallet 0xabc does not exist",
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge_adapter
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-hl-auth",
+            symbol="SUPERUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=200.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=200.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.16435,
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+        )
+
+        first = await runtime._drive_missing_hedge_live(pending, "entry-hl-auth", now_ms)
+        second = await runtime._drive_missing_hedge_live(pending, "entry-hl-auth", now_ms + 1)
+
+        assert first is False
+        assert second is False
+        assert pending.hedge_attempt_count == 1
+        assert pending.hedge_inflight is None
+        assert pending.repair_state == "non_retryable_auth_signing_failure"
+        assert runtime.state.risk_mode.value == "fail_closed"
+        kinds = [record["kind"] for record in runtime.journal.read_all()]
+        assert "pending_entry.hedge_non_retryable_auth_signing_failure" in kinds
+
+    @pytest.mark.asyncio
     async def test_missing_hedge_retries_use_attempt_scoped_client_ids(self, tmp_path):
         """V1 seeds each hedge retry with the incremented hedge attempt."""
 
@@ -2206,6 +2280,107 @@ class TestRealPathAbortCleanupDeadline:
         assert req.reduce_only is True  # V1: cleanup always reduce-only
         assert req.venue == Venue.HYPERLIQUID
         assert req.client_order_id
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_cleanup_price_none_uses_transport_l2_fallback(self, tmp_path):
+        """Runtime cleanup must not local-reject Hyperliquid reduce-only IOC when
+        the cleanup OrderRequest has no price."""
+        from lightfee.venues.specs import hyperliquid_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        runtime = _make_open_runtime(tmp_path)
+        privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+        transport = VenueTransport(
+            spec=hyperliquid_spec(),
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key=privkey,
+                account_address="0xbeef",
+            ),
+        )
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
+        seen: list[str] = []
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path.endswith("/info"):
+                seen.append("l2Book")
+                assert body == {"type": "l2Book", "coin": "SUPER"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "coin": "SUPER",
+                        "time": 1779422875621,
+                        "levels": [
+                            [{"px": "0.162", "sz": "1000"}],
+                            [{"px": "0.164", "sz": "1000"}],
+                        ],
+                    },
+                )
+            seen.append("exchange")
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [
+                                {
+                                    "filled": {
+                                        "oid": 983,
+                                        "totalSz": "200",
+                                        "avgPx": "0.16038",
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        class _TransportBackedAdapter:
+            venue = Venue.HYPERLIQUID
+
+            async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
+                return PositionSnapshot(
+                    venue=Venue.HYPERLIQUID,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=200.0,
+                    entry_price=0.162,
+                    observed_at_ms=1779422875621,
+                )
+
+            async def place_order(self, request: OrderRequest) -> OrderFill:
+                assert request.price is None
+                assert request.reduce_only is True
+                assert request.time_in_force == TimeInForce.IOC
+                return await transport.place_order(request)
+
+        runtime._venue_adapters[Venue.HYPERLIQUID] = _TransportBackedAdapter()
+        try:
+            result = await runtime._cleanup_failed_leg_exposure(
+                Venue.HYPERLIQUID, "SUPERUSDT", "entry-cleanup-hl", "cleanup"
+            )
+        finally:
+            await transport.close()
+
+        assert result is True
+        assert seen == ["l2Book", "exchange"]
+        order = captured["body"]["action"]["orders"][0]  # type: ignore[index]
+        assert order["r"] is True
+        assert order["s"] == "200"
+        assert order["p"] == "0.16038"
+        assert order["t"]["limit"]["tif"] == "Ioc"
 
     @pytest.mark.asyncio
     async def test_cleanup_failed_leg_exposure_short_position(self, tmp_path):
@@ -3687,6 +3862,207 @@ class TestZeroFillFinalizeV1ParityGate:
         assert events[0].get("payload", {}).get("balanced_quantity") == 0.1
         runtime.journal.close()
 
+    @pytest.mark.asyncio
+    async def test_balanced_quantity_with_missing_hedge_details_defers_open(self, tmp_path):
+        """Balanced qty alone is insufficient: price/order id must reconcile first."""
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-incomplete-hedge",
+            symbol="HYPEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            hedge_leg_filled=1.0,
+            maker_fill_price=20.0,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid",
+            hedge_order_id="",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        assert pending.pending_id not in runtime.state.open_positions
+        assert pending.pending_id in runtime.state.pending_entries
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert events == []
+        deferred = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.finalize_deferred_incomplete_fill"
+        ]
+        assert deferred
+        assert "hedge_fill_price" in deferred[0]["payload"]["missing_fields"]
+        assert "hedge_order_id" in deferred[0]["payload"]["missing_fields"]
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("HYPEUSDT", "", "hedge-cid")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_success_allows_incomplete_hedge_finalize(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="HYPEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            average_price=20.01,
+            order_id="hedge-real-oid",
+            client_order_id="hedge-cid",
+            filled_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-reconciled-hedge",
+            symbol="HYPEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            hedge_leg_filled=1.0,
+            maker_fill_price=20.0,
+            hedge_fill_price=0.0,
+            maker_order_id="maker-oid",
+            hedge_order_id="",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        assert pending.pending_id in runtime.state.open_positions
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.short_entry_price == pytest.approx(20.01)
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert events
+        assert events[0]["payload"]["hedge_order_id"] == "hedge-real-oid"
+
+    @pytest.mark.asyncio
+    async def test_finalize_recomputes_residual_after_reconciliation_balances_entry(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="HYPEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            average_price=20.01,
+            order_id="hedge-real-oid",
+            client_order_id="hedge-cid",
+            filled_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-reconciled-balanced",
+            symbol="HYPEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            hedge_leg_filled=0.5,
+            maker_fill_price=20.0,
+            hedge_fill_price=20.02,
+            maker_order_id="maker-oid",
+            hedge_order_id="hedge-stale-oid",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        assert runtime.state.pending_residual_repairs == []
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.matched_quantity == pytest.approx(1.0)
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert events[0]["payload"]["balanced_quantity"] == pytest.approx(1.0)
+        assert events[0]["payload"]["hedge_order_id"] == "hedge-real-oid"
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("HYPEUSDT", "hedge-stale-oid", "hedge-cid")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_finalize_recomputes_real_residual_after_reconciliation(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        maker_adapter = _FakeVenueAdapter(Venue.BINANCE)
+        maker_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="HYPEUSDT",
+            side=Side.BUY,
+            quantity=1.5,
+            average_price=20.0,
+            order_id="maker-real-oid",
+            client_order_id="maker-cid",
+            filled_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BINANCE] = maker_adapter
+
+        now_ms = 1779422875621
+        pending = PendingEntry(
+            pending_id="entry-reconciled-residual",
+            symbol="HYPEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            hedge_leg_filled=1.0,
+            maker_fill_price=20.0,
+            hedge_fill_price=20.02,
+            maker_order_id="maker-stale-oid",
+            hedge_order_id="hedge-oid",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.matched_quantity == pytest.approx(1.0)
+        assert pending.maker_leg_filled == pytest.approx(1.5)
+        residual_tasks = runtime.state.pending_residual_repairs
+        assert len(residual_tasks) == 1
+        task = residual_tasks[0]
+        assert task["repair_venue"] == "binance"
+        assert task["repair_side"] == "sell"
+        assert task["repair_quantity"] == pytest.approx(0.5)
+        events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
+        assert events[0]["payload"]["balanced_quantity"] == pytest.approx(1.0)
+        queued = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "execution.residual_repair_queued"
+        ]
+        assert queued[0]["payload"]["reason"] == "incremental_entry_open_partially_matched"
+
 
 class TestPartiallyMatchedResidualV1Parity:
     """V1 parity: partially matched entries (maker=10, hedge=8) must create
@@ -3978,6 +4354,10 @@ class TestResidualRepairExecutionV1Parity:
             hedge_leg_filled=8.0,
             maker_fill_price=50000.0,
             hedge_fill_price=50001.0,
+            maker_order_id="maker-oid-partial-repair",
+            hedge_order_id="hedge-oid-partial-repair",
+            maker_client_order_id="maker-cid-partial-repair",
+            hedge_client_order_id="hedge-cid-partial-repair",
         )
         runtime.state.pending_entries["entry-partial-repair"] = pending
         await runtime._finalize_pending_entry(pending, "entry-partial-repair", now_ms)
@@ -4155,6 +4535,53 @@ class TestResidualRepairExecutionV1Parity:
         assert "execution.residual_repair_completed" in kinds
 
     @pytest.mark.asyncio
+    async def test_expired_residual_already_flat_removes_task_before_pause(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.live_recovery_reduce_only_pairs.append({
+            "pair_id": "expired-flat:okx->bybit",
+            "symbol": "FLATEXPIREDUSDT",
+        })
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-expired-flat",
+            "pair_id": "expired-flat:okx->bybit",
+            "symbol": "FLATEXPIREDUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 5.0,
+            "created_at_ms": now_ms - 60_000,
+            "deadline_ms": now_ms - 1,
+            "retry_count": 2,
+            "last_attempt_at_ms": now_ms - 1_000,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="FLATEXPIREDUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.01,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert okx._fetch_position_calls == ["FLATEXPIREDUSDT"]
+        assert runtime.state.pending_residual_repairs == []
+        assert runtime.state.live_recovery_reduce_only_pairs == []
+        events = runtime.journal.read_all()
+        kinds = [event["kind"] for event in events]
+        assert "execution.residual_repair_paused" not in kinds
+        completed = [
+            event for event in events
+            if event["kind"] == "execution.residual_repair_completed"
+        ]
+        assert completed[-1]["payload"]["result"] == "already_flat"
+
+    @pytest.mark.asyncio
     async def test_residual_below_exchange_min_notional_terminalizes_and_releases_gate(self, tmp_path):
         runtime = _make_open_runtime(tmp_path)
         now_ms = 1779422875621
@@ -4199,6 +4626,131 @@ class TestResidualRepairExecutionV1Parity:
         ]
         assert terminal
         assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_notional_dust"
+
+    @pytest.mark.asyncio
+    async def test_okx_residual_below_contract_min_terminalizes_and_releases_gate(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.live_recovery_reduce_only_pairs.append({
+            "pair_id": "contract-dust:okx->bybit",
+            "symbol": "CONTRACTDUSTUSDT",
+        })
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-contract-dust",
+            "pair_id": "contract-dust:okx->bybit",
+            "symbol": "CONTRACTDUSTUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 0.5,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 0.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="CONTRACTDUSTUSDT",
+            side=Side.BUY,
+            quantity=0.5,
+            entry_price=0.01,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert okx._place_order_calls == []
+        assert runtime.state.pending_residual_repairs == []
+        assert runtime.state.live_recovery_reduce_only_pairs == []
+        terminal = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.residual_repair_terminal"
+        ]
+        assert terminal
+        assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_quantity_dust"
+        assert terminal[-1]["payload"]["repair_quantity"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_okx_residual_contract_dust_uses_transport_symbol_rules_cache(
+        self, tmp_path, monkeypatch,
+    ):
+        from lightfee.venues.specs import okx_spec
+        from lightfee.venues.symbol_rules import SymbolRule
+        from lightfee.venues.transport import VenueTransport
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.OKX
+                assert venue_symbol == "UB-USDT-SWAP"
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        class TransportBackedOkxAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.OKX)
+                self._transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+            async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+                return await self._transport.normalize_quantity(symbol, quantity)
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.live_recovery_reduce_only_pairs.append({
+            "pair_id": "transport-contract-dust:okx->bybit",
+            "symbol": "UBUSDT",
+        })
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-transport-contract-dust",
+            "pair_id": "transport-contract-dust:okx->bybit",
+            "symbol": "UBUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 50.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = TransportBackedOkxAdapter()
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="UBUSDT",
+            side=Side.BUY,
+            quantity=50.0,
+            entry_price=0.01,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert okx._place_order_calls == []
+        assert runtime.state.pending_residual_repairs == []
+        assert runtime.state.live_recovery_reduce_only_pairs == []
+        terminal = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.residual_repair_terminal"
+        ]
+        assert terminal
+        assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_quantity_dust"
+        assert terminal[-1]["payload"]["repair_quantity"] == pytest.approx(50.0)
 
     @pytest.mark.asyncio
     async def test_residual_deadline_pauses_task_instead_of_retrying_forever(self, tmp_path):

@@ -99,6 +99,10 @@ class TestAdapterContract:
     @pytest.mark.asyncio
     async def test_normalize_quantity_floors_to_step(self, venue_id, adapter_cls):
         adapter = adapter_cls()
+        if venue_id == Venue.OKX:
+            adapter._transport.set_symbol_metadata({
+                "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
+            })
         qty = await adapter.normalize_quantity("BTCUSDT", 1.7)
         assert qty >= 0
 
@@ -113,6 +117,10 @@ class TestAdapterContract:
             OrderRequest(venue=venue_id, symbol="BTCUSDT", side=Side.BUY, quantity=0.01)
         )
         assert fill is not None
+        if venue_id == Venue.OKX:
+            adapter._transport.set_symbol_metadata({
+                "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
+            })
         qty = await adapter.normalize_quantity("BTCUSDT", 0.01)
         assert qty >= 0
 
@@ -246,6 +254,10 @@ class TestFixtureDrivenPosition:
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
+        if venue_id == Venue.OKX:
+            transport.set_symbol_metadata({
+                "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
+            })
 
         try:
             pos = await adapter.fetch_position(symbol)
@@ -267,7 +279,7 @@ class TestFixtureDrivenOrderSuccess:
 
     @pytest.mark.asyncio
     async def test_place_order_success_returns_parsed_fill(
-        self, fixture_name, venue_id, adapter_cls, symbol
+        self, fixture_name, venue_id, adapter_cls, symbol, monkeypatch
     ):
         fixture = _load_fixture(fixture_name, "place_order_success")
         mock = _build_mock_transport(fixture)
@@ -289,6 +301,25 @@ class TestFixtureDrivenOrderSuccess:
         # transport (single-response) doesn't need to serve metadata.
         if venue_id == Venue.HYPERLIQUID:
             transport._hl_meta_cache[symbol] = 0
+        if venue_id == Venue.OKX:
+            class FakeRulesCache:
+                async def get(self, transport, venue, venue_symbol):
+                    return type(
+                        "Rule",
+                        (),
+                        {
+                            "ct_val": 0.01,
+                            "qty_step": 1.0,
+                            "min_qty": 1.0,
+                            "max_market_qty": 0.0,
+                            "rule_source": "instrument",
+                        },
+                    )()
+
+            monkeypatch.setattr(
+                "lightfee.venues.transport.get_symbol_rules_cache",
+                lambda: FakeRulesCache(),
+            )
 
         try:
             req = OrderRequest(
@@ -296,6 +327,7 @@ class TestFixtureDrivenOrderSuccess:
                 symbol=symbol,
                 side=Side.BUY,
                 quantity=1.0 if venue_id in (Venue.GATE, Venue.HYPERLIQUID) else 0.01,
+                price=50000.0 if venue_id == Venue.HYPERLIQUID else None,
             )
             fill = await adapter.place_order(req)
             assert isinstance(fill, OrderFill)
@@ -442,7 +474,7 @@ class TestHyperliquidLiveOrderNowSupported:
 
         try:
             req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
-                              side=Side.BUY, quantity=1.0)
+                              side=Side.BUY, quantity=1.0, price=50000.0)
             fill = await adapter.place_order(req)
             assert fill.venue == Venue.HYPERLIQUID
             assert fill.order_id == "123"
@@ -728,7 +760,7 @@ class TestHyperliquidCapabilityConsistency:
 
         try:
             req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
-                              side=Side.BUY, quantity=1.0)
+                              side=Side.BUY, quantity=1.0, price=50000.0)
             fill = await adapter.place_order(req)
             assert fill.venue == Venue.HYPERLIQUID
             assert fill.order_id == "123"

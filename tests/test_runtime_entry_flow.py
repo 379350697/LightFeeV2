@@ -281,6 +281,80 @@ class TestPendingEntryTracking:
 class TestPlannerDispatchIntegration:
     """Prove runtime calls planner for route/maker-leg instead of hardcoding."""
 
+    def test_untrusted_hyperliquid_transport_is_not_tradeable_for_selection(
+        self, config, tmp_journal,
+    ):
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        hyperliquid = FakeVenueAdapter(Venue.HYPERLIQUID)
+        hyperliquid.trading_capability_trusted = False
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.HYPERLIQUID: hyperliquid, Venue.BINANCE: binance},
+        )
+        runtime.journal = tmp_journal
+
+        candidate = CandidateInput(
+            long_venue="hyperliquid",
+            short_venue="binance",
+            symbol="SUPERUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+        )
+
+        assert runtime._candidate_is_tradeable_for_selection(candidate) is False
+
+    @pytest.mark.asyncio
+    async def test_post_only_gtx_reject_sets_pair_cooldown_without_pending(
+        self, config, tmp_journal,
+    ):
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        binance.submit_passive_order = AsyncMock(
+            side_effect=OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "binance error code=-5022 GTX_ORDER_REJECT: "
+                "Due to the order could not be executed as maker",
+            )
+        )
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+        )
+
+        assert await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0) is True
+        assert runtime.state.pending_entries == {}
+        pair_key = ("BTCUSDT", "binance", "okx")
+        assert runtime._zero_fill_cooldown_until_ms[pair_key] > 5000
+        assert runtime._gate_zero_fill_cooldown(candidate, 5001)[0] is False
+        kinds = [record["kind"] for record in tmp_journal.read_all()]
+        assert "runtime.entry_post_only_reject_cooldown" in kinds
+
     @pytest.mark.asyncio
     async def test_dispatch_entry_uses_planner_route(self, config, tmp_journal):
         """Entry route comes from planner, not hardcoded STANDARD_DUAL_TAKER."""

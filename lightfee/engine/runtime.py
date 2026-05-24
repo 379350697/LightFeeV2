@@ -50,6 +50,7 @@ from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKe
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
+from lightfee.venues.transport import is_hyperliquid_non_retryable_auth_signing_error
 
 
 class LiveRuntime:
@@ -223,6 +224,44 @@ class LiveRuntime:
             payload.setdefault("status", "ok")
             self.journal.append("startup.order_path_preflight", payload)
 
+    async def _verify_live_trading_preflights(self) -> None:
+        """Run read-only venue admission checks before selector can trade."""
+        blocked = {
+            "api_key",
+            "api_secret",
+            "secret",
+            "signature",
+            "private_key",
+            "headers",
+            "auth",
+        }
+        for venue, adapter in sorted(
+            self._venue_adapters.items(),
+            key=lambda item: item[0].value if hasattr(item[0], "value") else str(item[0]),
+        ):
+            transport = getattr(adapter, "_transport", adapter)
+            preflight_fn = getattr(transport, "verify_live_trading_preflight", None)
+            if not callable(preflight_fn):
+                continue
+            try:
+                raw_payload = await preflight_fn()
+            except Exception as exc:
+                raw_payload = {
+                    "venue": venue.value if hasattr(venue, "value") else str(venue),
+                    "status": "failed",
+                    "trading_capability_trusted": False,
+                    "reason": str(exc),
+                }
+            payload: dict[str, object] = {}
+            for key, value in dict(raw_payload or {}).items():
+                key_s = str(key)
+                if any(token in key_s.lower() for token in blocked):
+                    continue
+                payload[key_s] = value
+            payload.setdefault("venue", venue.value if hasattr(venue, "value") else str(venue))
+            payload.setdefault("status", "ok")
+            self.journal.append("startup.trading_preflight", payload)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -256,6 +295,7 @@ class LiveRuntime:
             flush=True,
         )
         self._emit_startup_order_path_preflight()
+        await self._verify_live_trading_preflights()
 
         # Phase 2 – Resolve runtime symbols (daily-universe integration point)
         symbol_info = await prepare_runtime_symbols(self.config)
@@ -4016,6 +4056,7 @@ class LiveRuntime:
                     price=None,
                     post_only=False,
                     reduce_only=True,  # V1: cleanup always reduce-only
+                    time_in_force=TimeInForce.IOC,
                     client_order_id=cleanup_client_order_id,
                 )
                 fill = await adapter.place_order(req)
@@ -4891,6 +4932,35 @@ class LiveRuntime:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
                 return True
+            if (
+                hedge_venue == Venue.HYPERLIQUID
+                and is_hyperliquid_non_retryable_auth_signing_error(e)
+            ):
+                pending.hedge_inflight = None
+                pending.repair_state = "non_retryable_auth_signing_failure"
+                pending.uncertain_outcome = True
+                enter_fail_closed(self.state)
+                self.state.last_error = (
+                    f"non_retryable_hyperliquid_auth_signing_failure:{entry_id}"
+                )
+                self._flush_adapter_order_diagnostics(adapter)
+                self.journal.append(
+                    "pending_entry.hedge_non_retryable_auth_signing_failure",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_client_order_id": (
+                            submitted_inflight.client_order_id
+                            if submitted_inflight
+                            else hedge_cloid
+                        ),
+                        "hedge_attempt": attempt,
+                        "error": str(e),
+                        "reason": "non_retryable_auth_signing_failure",
+                    },
+                )
+                return False
             if e.is_rejected:
                 pending.hedge_inflight = None
             self._flush_adapter_order_diagnostics(adapter)
@@ -4921,6 +4991,138 @@ class LiveRuntime:
             )
             return False
 
+    async def _ensure_pending_entry_open_fill_details(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+    ) -> bool:
+        """Gate entry.opened on confirmed price and order id for both legs."""
+
+        async def _reconcile_leg(label: str, venue: Venue) -> None:
+            adapter = self.get_venue_adapter(venue)
+            if adapter is None:
+                return
+            order_id = getattr(pending, f"{label}_order_id", "") or ""
+            client_order_id = getattr(pending, f"{label}_client_order_id", "") or ""
+            if not order_id and not client_order_id:
+                return
+            try:
+                reconciliation = await adapter.fetch_order_fill_reconciliation(
+                    pending.symbol,
+                    order_id,
+                    client_order_id,
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "pending_entry.finalize_fill_reconciliation_error",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "leg": label,
+                        "venue": venue.value,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "error": str(exc),
+                    },
+                )
+                return
+            if reconciliation is None:
+                return
+            qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+            avg_price = float(
+                getattr(reconciliation, "average_price", 0.0)
+                or getattr(reconciliation, "price", 0.0)
+                or 0.0
+            )
+            reconciled_order_id = getattr(reconciliation, "order_id", "") or order_id
+            before_qty = float(getattr(pending, f"{label}_leg_filled", 0.0) or 0.0)
+            before_price = float(getattr(pending, f"{label}_fill_price", 0.0) or 0.0)
+            before_order_id = getattr(pending, f"{label}_order_id", "") or ""
+            if math.isfinite(qty) and qty >= 0:
+                setattr(pending, f"{label}_leg_filled", qty)
+            if avg_price > 0:
+                setattr(pending, f"{label}_fill_price", avg_price)
+            if reconciled_order_id:
+                setattr(pending, f"{label}_order_id", reconciled_order_id)
+            after_qty = float(getattr(pending, f"{label}_leg_filled", 0.0) or 0.0)
+            after_price = float(getattr(pending, f"{label}_fill_price", 0.0) or 0.0)
+            after_order_id = getattr(pending, f"{label}_order_id", "") or ""
+            if (
+                abs(after_qty - before_qty) > 1e-12
+                or abs(after_price - before_price) > 1e-12
+                or after_order_id != before_order_id
+            ):
+                self.journal.append(
+                    "pending_entry.finalize_fill_reconciled",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "leg": label,
+                        "venue": venue.value,
+                        "before_quantity": before_qty,
+                        "after_quantity": after_qty,
+                        "before_price": before_price,
+                        "after_price": after_price,
+                        "before_order_id": before_order_id,
+                        "after_order_id": after_order_id,
+                    },
+                )
+
+        if (
+            float(getattr(pending, "maker_leg_filled", 0.0) or 0.0) > 0.0
+            or getattr(pending, "maker_order_id", "")
+            or getattr(pending, "maker_client_order_id", "")
+        ):
+            await _reconcile_leg("maker", pending.maker_venue())
+        if (
+            float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0) > 0.0
+            or getattr(pending, "hedge_order_id", "")
+            or getattr(pending, "hedge_client_order_id", "")
+        ):
+            await _reconcile_leg("hedge", pending.hedge_venue())
+
+        balanced_quantity = min(
+            float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
+            float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0),
+        )
+        if balanced_quantity <= 0.0:
+            return True
+
+        missing: list[str] = []
+        if float(getattr(pending, "maker_fill_price", 0.0) or 0.0) <= 0.0:
+            missing.append("maker_fill_price")
+        if not getattr(pending, "maker_order_id", ""):
+            missing.append("maker_order_id")
+        if float(getattr(pending, "hedge_fill_price", 0.0) or 0.0) <= 0.0:
+            missing.append("hedge_fill_price")
+        if not getattr(pending, "hedge_order_id", ""):
+            missing.append("hedge_order_id")
+
+        if not missing:
+            return True
+
+        pending.uncertain_outcome = True
+        pending.reconcile_next_attempt_ms = max(
+            int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+            now_ms + 1_000,
+        )
+        self.journal.append(
+            "pending_entry.finalize_deferred_incomplete_fill",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "missing_fields": missing,
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "maker_fill_price": pending.maker_fill_price,
+                "hedge_fill_price": pending.hedge_fill_price,
+                "maker_order_id": pending.maker_order_id,
+                "hedge_order_id": pending.hedge_order_id,
+            },
+        )
+        return False
+
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
 
@@ -4946,8 +5148,15 @@ class LiveRuntime:
         maker_is_long = pending.maker_leg == "long"
         maker_side = Side.BUY if maker_is_long else Side.SELL
 
-        # V1: build_residual_task — computed before branching (entry_sync.rs:5338-5341).
-        # Detects asymmetric dual-leg fills and returns a residual for the excess.
+        if not await self._ensure_pending_entry_open_fill_details(
+            pending,
+            entry_id,
+            now_ms,
+        ):
+            return
+
+        # V1: build_residual_task is computed before branching, but only after
+        # order/fill reconciliation has made pending quantities authoritative.
         maker_fill = OrderFill(
             venue=pending.maker_venue(),
             symbol=pending.symbol,
@@ -5067,6 +5276,24 @@ class LiveRuntime:
             return
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
+        maker_fill = OrderFill(
+            venue=pending.maker_venue(),
+            symbol=pending.symbol,
+            side=maker_side,
+            quantity=pending.maker_leg_filled,
+            price=pending.maker_fill_price,
+            order_id=pending.maker_order_id,
+            filled_at_ms=now_ms,
+        )
+        hedge_fill = OrderFill(
+            venue=pending.hedge_venue(),
+            symbol=pending.symbol,
+            side=pending.hedge_side(),
+            quantity=pending.hedge_leg_filled,
+            price=pending.hedge_fill_price,
+            order_id=pending.hedge_order_id,
+            filled_at_ms=now_ms,
+        )
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -5274,12 +5501,12 @@ class LiveRuntime:
             next_attempt_ms = int(task.get("next_attempt_ms", 0) or 0)
             if next_attempt_ms > 0 and now_ms < next_attempt_ms:
                 continue
-            if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
-                self._pause_pending_residual_repair(task, now_ms)
-                continue
 
             adapter = self.get_venue_adapter(repair_venue)
             if adapter is None:
+                if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+                    self._pause_pending_residual_repair(task, now_ms)
+                    continue
                 self._reschedule_pending_residual_repair_task(task, now_ms, "adapter_missing")
                 self.journal.append(
                     "recovery.residual_repair_failed",
@@ -5298,6 +5525,9 @@ class LiveRuntime:
             try:
                 live_position = await adapter.fetch_position(symbol)
             except Exception as e:
+                if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+                    self._pause_pending_residual_repair(task, now_ms)
+                    continue
                 self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
                 self.journal.append(
                     "recovery.residual_repair_failed",
@@ -5338,6 +5568,10 @@ class LiveRuntime:
                 )
                 continue
 
+            if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+                self._pause_pending_residual_repair(task, now_ms)
+                continue
+
             repair_quantity = live_excess_quantity
             if hasattr(adapter, "normalize_quantity"):
                 try:
@@ -5358,6 +5592,19 @@ class LiveRuntime:
                     )
                     continue
             if repair_quantity <= 1e-9:
+                if repair_venue == Venue.OKX:
+                    live_price = abs(float(getattr(live_position, "entry_price", 0.0) or 0.0))
+                    self._terminalize_residual_repair_task(
+                        task,
+                        now_ms,
+                        terminal_reason="exchange_min_quantity_dust",
+                        repair_venue=repair_venue,
+                        repair_side=repair_side,
+                        repair_quantity=live_excess_quantity,
+                        live_price=live_price,
+                        min_notional=0.0,
+                    )
+                    continue
                 self._reschedule_pending_residual_repair_task(
                     task, now_ms, "normalized_repair_quantity_zero"
                 )
@@ -5931,6 +6178,45 @@ class LiveRuntime:
             return False, "zero_fill_cooldown"
         return True, ""
 
+    @staticmethod
+    def _entry_reject_is_post_only_would_take(reason: str) -> bool:
+        text = str(reason or "").lower()
+        return (
+            "-5022" in text
+            or "could not be executed as maker" in text
+            or "post only order will be rejected" in text
+            or "gtx_order_reject" in text
+            or "post_only_would_take" in text
+        )
+
+    def _record_post_only_reject_cooldown(self, candidate, now_ms: int, reason: str) -> None:
+        cooldown_ms = int(
+            getattr(
+                self.config.strategy,
+                "pending_entry_zero_fill_terminal_cooldown_ms",
+                30_000,
+            )
+            or 30_000
+        )
+        pair_key = (
+            getattr(candidate, "symbol", ""),
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        )
+        until_ms = now_ms + cooldown_ms
+        self._zero_fill_cooldown_until_ms[pair_key] = until_ms
+        self.journal.append(
+            "runtime.entry_post_only_reject_cooldown",
+            {
+                "symbol": pair_key[0],
+                "long_venue": pair_key[1],
+                "short_venue": pair_key[2],
+                "cooldown_until_ms": until_ms,
+                "cooldown_ms": cooldown_ms,
+                "reason": reason[:300],
+            },
+        )
+
     def _gate_pending_entry_dedup(self, candidate) -> tuple[bool, str]:
         """Block entry if a pending entry already exists for same symbol+venue pair."""
         from lightfee.engine.recovery import has_pending_entry_for_symbol
@@ -6353,6 +6639,21 @@ class LiveRuntime:
             return False
         if float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0) <= 0:
             return False
+        for venue_raw in (
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        ):
+            try:
+                venue = Venue.from_str(str(venue_raw)) if venue_raw else None
+            except Exception:
+                venue = None
+            if venue is None:
+                continue
+            adapter = self.get_venue_adapter(venue)
+            transport = getattr(adapter, "_transport", adapter)
+            trusted = getattr(transport, "trading_capability_trusted", True)
+            if trusted is False:
+                return False
         return True
 
     def _market_quote_lookup(self, market_quotes) -> dict[tuple[str, str], object]:
@@ -6847,6 +7148,19 @@ class LiveRuntime:
             plan_incremental_entry_execution,
         )
 
+        if not self._candidate_is_tradeable_for_selection(candidate):
+            self.journal.append(
+                "runtime.entry_blocked_trading_capability",
+                {
+                    "symbol": getattr(candidate, "symbol", ""),
+                    "long_venue": getattr(candidate, "long_venue", ""),
+                    "short_venue": getattr(candidate, "short_venue", ""),
+                    "reason": "candidate_not_tradeable_for_selection",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
         # V1: apply_runtime_entry_guards — 8+ gate checks before entry
         gates = [
             ("reduce_only", self._gate_reduce_only, ()),
@@ -7174,6 +7488,18 @@ class LiveRuntime:
                     "has_uncertainty": result.has_uncertainty,
                 },
             )
+            if (
+                result.route == ExecutionRoute.REJECTED
+                and self._entry_reject_is_post_only_would_take(
+                    getattr(result, "reject_reason", "")
+                )
+            ):
+                self._record_post_only_reject_cooldown(
+                    candidate,
+                    now_ms,
+                    getattr(result, "reject_reason", ""),
+                )
+                return True
             if result.open_position is not None:
                 self.state.open_positions[result.open_position.position_id] = result.open_position
                 self.journal.append(

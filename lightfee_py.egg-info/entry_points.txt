@@ -1,0 +1,10 @@
+[console_scripts]
+lightfee-evolution = lightfee.apps.evolution:main
+lightfee-explain = lightfee.apps.explain:main
+lightfee-live = lightfee.apps.live:main
+lightfee-ops = lightfee.apps.ops:main
+lightfee-probe = lightfee.apps.probe:main
+lightfee-replay = lightfee.apps.replay:main
+lightfee-report = lightfee.apps.report:main
+lightfee-scheduler = lightfee.apps.scheduler:main
+lightfee-sidecar = lightfee.apps.sidecar:main

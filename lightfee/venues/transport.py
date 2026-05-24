@@ -548,6 +548,24 @@ def _is_post_only_would_take_reject(venue: "Venue", error: Exception) -> bool:
     )
 
 
+def is_hyperliquid_non_retryable_auth_signing_error(error: Exception) -> bool:
+    """Classify Hyperliquid auth/signing failures that must not be retried."""
+    message = _transport_error_text(error)
+    return (
+        "user or api wallet" in message
+        and "does not exist" in message
+    ) or (
+        "recovered signer" in message
+    ) or (
+        "api wallet" in message
+        and ("not authorized" in message or "unauthorized" in message)
+    ) or (
+        "invalid signature" in message
+    ) or (
+        "signature" in message and "wallet" in message
+    )
+
+
 # ---------------------------------------------------------------------------
 # Signing helpers
 # ---------------------------------------------------------------------------
@@ -1135,9 +1153,14 @@ class VenueTransport(MarketDataClient):
         self.mode = mode
         self._credential = credential
         self._hl_meta_cache: dict[str, int] = {}
+        self._hl_asset_meta_cache: dict[str, dict[str, int]] = {}
         self._symbol_metadata: dict[str, dict[str, Any]] = {}  # sym → vendor contract info
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
         self._order_diagnostics: list[dict[str, Any]] = []
+        self._trading_capability_trusted = not (
+            mode == "live" and spec.venue_id == Venue.HYPERLIQUID
+        )
+        self._trading_preflight_status: dict[str, Any] = {}
 
         # V1: private WebSocket connection health tracking.
         # The private WS state owns the canonical health object; setup below.
@@ -1241,6 +1264,104 @@ class VenueTransport(MarketDataClient):
             raise ValueError(
                 f"live mode requires passphrase for {self._spec.venue_id.value}"
             )
+
+    @property
+    def trading_capability_trusted(self) -> bool:
+        """True only after read-only live preflight trusts order submission."""
+        return bool(self._trading_capability_trusted)
+
+    async def verify_live_trading_preflight(self) -> dict[str, Any]:
+        """Run read-only live trading preflight.
+
+        Hyperliquid is deliberately conservative: if the configured account
+        address is not the address derived from the signing key, read-only
+        checks cannot prove API-wallet authorization, so trading remains
+        disabled until a stronger admission path is added.
+        """
+        if self.mode != "live" or self._spec.venue_id != Venue.HYPERLIQUID:
+            self._trading_capability_trusted = True
+            self._trading_preflight_status = {
+                "venue": self._spec.venue_id.value,
+                "status": "ok",
+                "trading_capability_trusted": True,
+            }
+            return dict(self._trading_preflight_status)
+
+        payload: dict[str, Any] = {
+            "venue": self._spec.venue_id.value,
+            "status": "failed",
+            "trading_capability_trusted": False,
+            "wallet_matches_account": False,
+            "signer_matches_account": False,
+            "api_wallet_authorization_verified": False,
+            "clearinghouse_state_readable": False,
+        }
+        cred = self._credential
+        if cred is None or not cred.wallet_private_key:
+            payload["reason"] = "missing_wallet_private_key"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        try:
+            wallet_address = _derive_hyperliquid_account_address(cred.wallet_private_key)
+        except Exception as exc:
+            payload["reason"] = "wallet_private_key_derivation_failed"
+            payload["error"] = str(exc)[:200]
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        account_address = (cred.account_address or wallet_address or "").strip()
+        account_matches_wallet = (
+            bool(account_address)
+            and wallet_address.lower() == account_address.lower()
+        )
+        payload["wallet_matches_account"] = account_matches_wallet
+        payload["signer_matches_account"] = account_matches_wallet
+        payload["account_address_present"] = bool(account_address)
+        payload["configured_account_address"] = account_address
+        payload["signer_address"] = wallet_address
+
+        if not account_address:
+            payload["reason"] = "missing_account_address"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        try:
+            raw = await self._request(
+                "POST",
+                "/info",
+                body={"type": "clearinghouseState", "user": account_address},
+                private=False,
+            )
+            payload["clearinghouse_state_readable"] = isinstance(raw, dict)
+        except Exception as exc:
+            payload["reason"] = "clearinghouse_state_unreadable"
+            payload["error"] = str(exc)[:200]
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        if not payload["clearinghouse_state_readable"]:
+            payload["reason"] = "clearinghouse_state_unreadable"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        if not account_matches_wallet:
+            payload["reason"] = "api_wallet_authorization_unverified"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        payload["status"] = "ok"
+        payload["trading_capability_trusted"] = True
+        payload["api_wallet_authorization_verified"] = True
+        self._trading_capability_trusted = True
+        self._trading_preflight_status = payload
+        return dict(payload)
 
     # ------------------------------------------------------------------
     # Private WS state access
@@ -1393,6 +1514,8 @@ class VenueTransport(MarketDataClient):
             "missing_dependencies": missing,
             "endpoint": self._spec.order_path,
             "product_type": self._product_type(),
+            "trading_capability_trusted": self.trading_capability_trusted,
+            "trading_preflight_status": dict(self._trading_preflight_status),
         }
 
     def _product_type(self) -> str:
@@ -1425,16 +1548,23 @@ class VenueTransport(MarketDataClient):
             if symbol_rule is not None and symbol_rule.tick_size > 0
             else float(spec.price_tick or 0.0)
         )
-        quantity_step = (
-            float(symbol_rule.qty_step)
-            if symbol_rule is not None and symbol_rule.qty_step > 0
-            else float(spec.quantity_step or 0.0)
-        )
-        min_qty = (
-            float(symbol_rule.min_qty)
-            if symbol_rule is not None and symbol_rule.min_qty > 0
-            else float(spec.min_quantity or 0.0)
-        )
+        if symbol_rule is not None and spec.venue_id == Venue.OKX:
+            # OKX SWAP/FUTURES/OPTION SymbolRule qty_step/min_qty are lotSz/minSz
+            # in contracts. The engine request quantity is base units; contract
+            # validation happens later via _okx_contract_order_diagnostics.
+            quantity_step = 0.0
+            min_qty = 0.0
+        else:
+            quantity_step = (
+                float(symbol_rule.qty_step)
+                if symbol_rule is not None and symbol_rule.qty_step > 0
+                else float(spec.quantity_step or 0.0)
+            )
+            min_qty = (
+                float(symbol_rule.min_qty)
+                if symbol_rule is not None and symbol_rule.min_qty > 0
+                else float(spec.min_quantity or 0.0)
+            )
         if symbol_rule is not None and spec.venue_id == Venue.OKX:
             min_notional = float(symbol_rule.min_notional or 0.0)
         else:
@@ -1852,7 +1982,7 @@ class VenueTransport(MarketDataClient):
             qp_list = [(k, str(v)) for k, v in sorted(params.items())]
             query_string = "?" + _build_query_v1(qp_list) if qp_list else ""
 
-        if body is not None:
+        if body is not None and not (spec.signature_param and private and cred):
             req_body = json.dumps(body)
 
         headers = await self._build_auth_headers_async(method, path, query_string, req_body or "", private=private)
@@ -2601,8 +2731,10 @@ class VenueTransport(MarketDataClient):
         except Exception:
             pass
 
-        fallback = float(getattr(spec, "contract_size", 0.0) or 0.0)
-        return fallback if fallback > 0 else 1.0
+        raise TransportError(
+            TransportErrorCategory.NORMALIZATION_FAILURE,
+            "okx_contract_metadata_missing_ct_val",
+        )
 
     def _parse_position(
         self,
@@ -2884,18 +3016,144 @@ class VenueTransport(MarketDataClient):
 
         preflight: dict[str, Any] | None = None
         result_recorded = False
+        hl_asset_meta: dict[str, int] | None = None
 
         try:
-            preflight = self.preflight_order_request(request)
-            request = replace(
-                request,
-                quantity=float(preflight["quantized_qty"]),
-                price=(
-                    None
-                    if preflight["quantized_price"] is None
-                    else float(preflight["quantized_price"])
-                ),
-            )
+            if spec.venue_id == Venue.HYPERLIQUID:
+                from lightfee.venues.hyperliquid_signing import (
+                    hyperliquid_ioc_price_and_size,
+                )
+
+                hl_asset_meta = (
+                    await self._hl_resolve_asset_meta(venue_sym)
+                    if self.mode == "live"
+                    else {"asset_index": 0, "sz_decimals": 0, "price_decimals": 6}
+                )
+                reference_price = 0.0
+                reference_price_source = "none"
+                for source, candidate in (
+                    ("price_hint", request.price_hint),
+                    ("mark_price_hint", request.mark_price_hint),
+                    ("price", request.price),
+                ):
+                    try:
+                        candidate_f = float(candidate or 0.0)
+                    except (TypeError, ValueError):
+                        candidate_f = 0.0
+                    if math.isfinite(candidate_f) and candidate_f > 0.0:
+                        reference_price = candidate_f
+                        reference_price_source = source
+                        break
+                if reference_price <= 0.0:
+                    fallback_diag: dict[str, Any] = {
+                        "venue": spec.venue_id.value,
+                        "symbol": venue_sym,
+                        "side": request.side.value,
+                        "raw_qty": request.quantity,
+                        "raw_price": 0.0,
+                        "reference_price_source": "l2_snapshot_unavailable",
+                        "quantity_step": 10 ** (-hl_asset_meta["sz_decimals"]),
+                        "tick_size": 0.0,
+                        "min_qty": 0.0,
+                        "min_notional": 0.0,
+                        "rule_source": "hyperliquid_meta",
+                        "asset_index": hl_asset_meta["asset_index"],
+                        "sz_decimals": hl_asset_meta["sz_decimals"],
+                        "price_decimals": hl_asset_meta["price_decimals"],
+                    }
+                    try:
+                        snapshot = await self.fetch_l2_snapshot(
+                            request.symbol,
+                            depth=20,
+                            retry_initial_ms=0,
+                            retry_max_ms=0,
+                            max_retries=0,
+                        )
+                    except Exception as exc:
+                        preflight = fallback_diag
+                        preflight["snapshot_error"] = str(exc)[:300]
+                        raise OrderSubmitError(
+                            SubmitFailureClass.REJECTED,
+                            "Hyperliquid IOC order requires positive reference "
+                            "price; l2Book fallback unavailable",
+                        ) from exc
+
+                    best_bid = (
+                        float(snapshot.bids[0].price)
+                        if getattr(snapshot, "bids", None)
+                        else 0.0
+                    )
+                    best_ask = (
+                        float(snapshot.asks[0].price)
+                        if getattr(snapshot, "asks", None)
+                        else 0.0
+                    )
+                    reference_price = best_ask if request.side == Side.BUY else best_bid
+                    reference_price_source = (
+                        "l2_snapshot_best_ask"
+                        if request.side == Side.BUY
+                        else "l2_snapshot_best_bid"
+                    )
+                    if (
+                        not math.isfinite(reference_price)
+                        or reference_price <= 0.0
+                    ):
+                        preflight = fallback_diag
+                        preflight["reference_price_source"] = reference_price_source
+                        preflight["best_bid"] = best_bid
+                        preflight["best_ask"] = best_ask
+                        raise OrderSubmitError(
+                            SubmitFailureClass.REJECTED,
+                            "Hyperliquid IOC order requires positive reference "
+                            "price; l2Book side is empty",
+                        )
+                if reference_price <= 0.0:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Hyperliquid IOC order requires positive reference price",
+                    )
+                limit_px, wire_qty = hyperliquid_ioc_price_and_size(
+                    side_is_buy=request.side == Side.BUY,
+                    quantity=request.quantity,
+                    reference_price=reference_price,
+                    sz_decimals=hl_asset_meta["sz_decimals"],
+                    price_decimals=hl_asset_meta["price_decimals"],
+                )
+                preflight = {
+                    "venue": spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "side": request.side.value,
+                    "raw_qty": request.quantity,
+                    "raw_price": reference_price,
+                    "reference_price_source": reference_price_source,
+                    "quantized_qty": wire_qty,
+                    "quantized_price": limit_px,
+                    "quantity_step": 10 ** (-hl_asset_meta["sz_decimals"]),
+                    "tick_size": 0.0,
+                    "min_qty": 0.0,
+                    "min_notional": 0.0,
+                    "rule_source": "hyperliquid_meta",
+                    "asset_index": hl_asset_meta["asset_index"],
+                    "sz_decimals": hl_asset_meta["sz_decimals"],
+                    "price_decimals": hl_asset_meta["price_decimals"],
+                }
+                if wire_qty <= 0.0 or limit_px <= 0.0:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Hyperliquid normalized IOC order has zero quantity or price",
+                    )
+                request = replace(request, quantity=wire_qty, price=limit_px)
+            else:
+                preflight = self.preflight_order_request(request)
+                request = replace(
+                    request,
+                    quantity=float(preflight["quantized_qty"]),
+                    price=(
+                        None
+                        if preflight["quantized_price"] is None
+                        else float(preflight["quantized_price"])
+                    ),
+                )
             body: dict[str, Any] = {
                 "symbol": venue_sym,
                 "side": request.side.value.upper(),
@@ -3018,7 +3276,6 @@ class VenueTransport(MarketDataClient):
             elif spec.venue_id == Venue.HYPERLIQUID:
                 is_buy = request.side == Side.BUY
                 tif = "Ioc"
-                limit_px = _format_decimal(request.price) if request.price else "0"
 
                 if self.mode == "live":
                     from lightfee.venues.hyperliquid_signing import (
@@ -3027,7 +3284,8 @@ class VenueTransport(MarketDataClient):
                         hyperliquid_cloid_for_client_order,
                     )
 
-                    asset_index = await self._hl_resolve_asset_index(venue_sym)
+                    if hl_asset_meta is None:
+                        hl_asset_meta = await self._hl_resolve_asset_meta(venue_sym)
                     wire_cloid = (
                         hyperliquid_cloid_for_client_order(request.client_order_id)
                         if request.client_order_id
@@ -3037,13 +3295,14 @@ class VenueTransport(MarketDataClient):
                         symbol=venue_sym,
                         is_buy=is_buy,
                         quantity=request.quantity,
-                        price=float(limit_px),
+                        price=float(request.price or 0.0),
                         reduce_only=request.reduce_only,
                         tif=tif,
                         cloid=wire_cloid,
+                        asset_index=hl_asset_meta["asset_index"],
+                        sz_decimals=hl_asset_meta["sz_decimals"],
+                        price_decimals=hl_asset_meta["price_decimals"],
                     )
-                    # Override the placeholder asset index with the resolved one
-                    action["orders"][0]["a"] = asset_index
 
                     body = build_hyperliquid_exchange_payload(
                         action=action,
@@ -3055,11 +3314,13 @@ class VenueTransport(MarketDataClient):
                         is_mainnet=True,
                     )
                 else:
+                    from lightfee.venues.hyperliquid_signing import float_to_wire_string
+
                     paper_order: dict[str, Any] = {
                         "a": 0,  # asset index — placeholder for paper
                         "b": is_buy,
-                        "p": limit_px,
-                        "s": str(request.quantity),
+                        "p": float_to_wire_string(float(request.price or 0.0)),
+                        "s": float_to_wire_string(request.quantity),
                         "r": request.reduce_only,
                         "t": {"limit": {"tif": tif}},
                     }
@@ -3148,6 +3409,11 @@ class VenueTransport(MarketDataClient):
             return fill
 
         except TransportError as e:
+            if (
+                spec.venue_id == Venue.HYPERLIQUID
+                and is_hyperliquid_non_retryable_auth_signing_error(e)
+            ):
+                self._trading_capability_trusted = False
             if preflight is not None and not result_recorded:
                 result_payload = dict(preflight)
                 result_payload["response_code"] = e.status_code
@@ -3167,6 +3433,11 @@ class VenueTransport(MarketDataClient):
                 self._record_order_diagnostic("order.submit_result", result_payload)
             raise _map_to_submit_error(e.category, str(e), transport_error=e)
         except OrderSubmitError as e:
+            if (
+                spec.venue_id == Venue.HYPERLIQUID
+                and is_hyperliquid_non_retryable_auth_signing_error(e)
+            ):
+                self._trading_capability_trusted = False
             if preflight is not None and not result_recorded:
                 result_payload = dict(preflight)
                 result_payload["response_classification"] = e.class_.value
@@ -3262,6 +3533,18 @@ class VenueTransport(MarketDataClient):
                 )
 
             status_entry = statuses[0]
+            if isinstance(status_entry, str):
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, status_entry)
+            if not isinstance(status_entry, dict):
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"Hyperliquid unknown order status: {status_entry!r}",
+                )
+            if "error" in status_entry:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    str(status_entry.get("error", "")),
+                )
             if "filled" in status_entry:
                 filled = status_entry["filled"]
                 return OrderFill(
@@ -3827,15 +4110,59 @@ class VenueTransport(MarketDataClient):
 
         try:
             # --- Preflight: fetch dynamic symbol rules + normalize ---
-            rules_cache = get_symbol_rules_cache()
-            symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
+            symbol_rule = None
+            if spec.venue_id == Venue.HYPERLIQUID:
+                from lightfee.venues.hyperliquid_signing import (
+                    round_to_decimals,
+                    round_to_significant_and_decimal,
+                )
 
-            try:
-                preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
-            except OrderSubmitError:
-                raise
-            except Exception:
-                preflight = self.preflight_order_request(request)
+                hl_meta = (
+                    await self._hl_resolve_asset_meta(venue_sym)
+                    if self.mode == "live"
+                    else {"asset_index": 0, "sz_decimals": 0, "price_decimals": 6}
+                )
+                quantized_qty_hl = round_to_decimals(
+                    request.quantity,
+                    hl_meta["sz_decimals"],
+                )
+                quantized_price_hl = round_to_significant_and_decimal(
+                    float(request.price or 0.0),
+                    5,
+                    hl_meta["price_decimals"],
+                )
+                if quantized_qty_hl <= 0.0 or quantized_price_hl <= 0.0:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Hyperliquid passive order normalized to zero quantity or price",
+                    )
+                preflight = {
+                    "venue": spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "side": request.side.value,
+                    "raw_qty": request.quantity,
+                    "raw_price": request.price,
+                    "quantized_qty": quantized_qty_hl,
+                    "quantized_price": quantized_price_hl,
+                    "tick_size": 0.0,
+                    "quantity_step": 10 ** (-hl_meta["sz_decimals"]),
+                    "min_qty": 0.0,
+                    "min_notional": 0.0,
+                    "rule_source": "hyperliquid_meta",
+                    "asset_index": hl_meta["asset_index"],
+                    "sz_decimals": hl_meta["sz_decimals"],
+                    "price_decimals": hl_meta["price_decimals"],
+                }
+            else:
+                rules_cache = get_symbol_rules_cache()
+                symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
+
+                try:
+                    preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
+                except OrderSubmitError:
+                    raise
+                except Exception:
+                    preflight = self.preflight_order_request(request)
 
             quantized_qty = float(preflight["quantized_qty"])
             quantized_price = preflight["quantized_price"]
@@ -3987,7 +4314,14 @@ class VenueTransport(MarketDataClient):
                 _require_bitget_success(raw, "bitget passive order failed")
 
             # --- Parse ack with venue-specific validation ---
-            ack = self._parse_passive_order_ack(raw, request, venue_sym, now_ms)
+            ack_request = request
+            if spec.venue_id == Venue.HYPERLIQUID:
+                ack_request = replace(
+                    request,
+                    quantity=quantized_qty,
+                    price=float(quantized_price or 0.0),
+                )
+            ack = self._parse_passive_order_ack(raw, ack_request, venue_sym, now_ms)
 
             # --- Diagnostic: order.submit_result ---
             result_payload = {
@@ -4011,6 +4345,11 @@ class VenueTransport(MarketDataClient):
             return ack
 
         except TransportError as e:
+            if (
+                spec.venue_id == Venue.HYPERLIQUID
+                and is_hyperliquid_non_retryable_auth_signing_error(e)
+            ):
+                self._trading_capability_trusted = False
             classification = (
                 "post_only_would_take"
                 if _is_post_only_would_take_reject(spec.venue_id, e)
@@ -4023,6 +4362,11 @@ class VenueTransport(MarketDataClient):
                 )
             raise _map_to_submit_error(e.category, str(e), transport_error=e)
         except OrderSubmitError as e:
+            if (
+                spec.venue_id == Venue.HYPERLIQUID
+                and is_hyperliquid_non_retryable_auth_signing_error(e)
+            ):
+                self._trading_capability_trusted = False
             classification = (
                 "post_only_would_take"
                 if _is_post_only_would_take_reject(spec.venue_id, e)
@@ -4097,7 +4441,7 @@ class VenueTransport(MarketDataClient):
             )
         elif spec.venue_id == Venue.HYPERLIQUID:
             return self._build_hyperliquid_passive_body(
-                request, quantized_qty, quantized_price, cid,
+                request, venue_sym, quantized_qty, quantized_price, cid,
             )
         else:
             # Fallback — should never happen
@@ -4334,20 +4678,43 @@ class VenueTransport(MarketDataClient):
         return body
 
     def _build_hyperliquid_passive_body(
-        self, request: OrderRequest,
+        self, request: OrderRequest, venue_sym: str,
         quantized_qty: float, quantized_price: Any,
         cid: str = "",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "timeInForce": "Gtc",
-            "postOnly": True,
-        }
-        if quantized_price is not None and float(quantized_price) > 0:
-            body["price"] = _format_decimal(float(quantized_price))
-        body["quantity"] = _format_decimal(quantized_qty)
-        if cid:
-            body["cloid"] = cid
-        return body
+        from lightfee.venues.hyperliquid_signing import (
+            build_hyperliquid_exchange_payload,
+            build_hyperliquid_order_action,
+            hyperliquid_cloid_for_client_order,
+        )
+
+        meta = self._hl_cached_asset_meta(venue_sym)
+        wire_cloid = hyperliquid_cloid_for_client_order(cid) if cid else None
+        action = build_hyperliquid_order_action(
+            symbol=venue_sym,
+            is_buy=request.side == Side.BUY,
+            quantity=quantized_qty,
+            price=float(quantized_price or 0.0),
+            reduce_only=request.reduce_only,
+            tif="Alo",
+            cloid=wire_cloid,
+            asset_index=meta["asset_index"],
+            sz_decimals=meta["sz_decimals"],
+            price_decimals=meta["price_decimals"],
+        )
+        if self.mode != "live":
+            return {"action": action, "type": "order"}
+        if self._credential is None or not self._credential.wallet_private_key:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "Hyperliquid passive order requires wallet_private_key",
+            )
+        return build_hyperliquid_exchange_payload(
+            action=action,
+            private_key_hex=self._credential.wallet_private_key,
+            vault_address=None,
+            is_mainnet=True,
+        )
 
     def _parse_passive_order_ack(
         self, raw: dict[str, Any], request: OrderRequest, venue_sym: str, now_ms: int,
@@ -4355,6 +4722,74 @@ class VenueTransport(MarketDataClient):
         from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
 
         spec = self._spec
+
+        if spec.venue_id == Venue.HYPERLIQUID:
+            resp_status = str(raw.get("status", "")).lower()
+            if resp_status == "err":
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    str(raw.get("response", "Hyperliquid exchange error")),
+                )
+            response = raw.get("response", {})
+            statuses: list[Any] = []
+            if isinstance(response, dict):
+                inner_data = response.get("data", response)
+                if isinstance(inner_data, dict):
+                    statuses = inner_data.get("statuses", []) or []
+            if not statuses:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "Hyperliquid passive order response contains no statuses",
+                )
+            status_entry = statuses[0]
+            if isinstance(status_entry, str):
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, status_entry)
+            if not isinstance(status_entry, dict):
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"Hyperliquid passive unknown status: {status_entry!r}",
+                )
+            if "error" in status_entry:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    str(status_entry.get("error", "")),
+                )
+            order_info = status_entry.get("resting") or status_entry.get("filled")
+            if not isinstance(order_info, dict):
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"Hyperliquid passive unknown status: {list(status_entry.keys())}",
+                )
+            oid = str(order_info.get("oid", ""))
+            if not oid:
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "Hyperliquid passive accepted without oid",
+                )
+            state = (
+                PassiveOrderState.FILLED
+                if "filled" in status_entry
+                else PassiveOrderState.OPEN
+            )
+            qty = _safe_float(
+                order_info.get("totalSz", order_info.get("sz", request.quantity)),
+                default=float(request.quantity),
+            )
+            price = _safe_float(
+                order_info.get("avgPx", order_info.get("limitPx", request.price or 0.0)),
+                default=float(request.price or 0.0),
+            )
+            return PassiveOrderAck(
+                venue=spec.venue_id,
+                symbol=venue_sym,
+                side=request.side,
+                order_id=oid,
+                client_order_id=request.client_order_id or "",
+                price=price,
+                quantity=qty,
+                accepted_at_ms=now_ms,
+                state=state,
+            )
 
         # --- OKX-specific envelope validation ---
         if spec.venue_id == Venue.OKX:
@@ -4939,13 +5374,15 @@ class VenueTransport(MarketDataClient):
         try:
             body: dict[str, Any] = {"symbol": venue_sym}
 
-            if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
+            if spec.venue_id == Venue.BINANCE:
                 body["orderId"] = request.order_id
                 body["side"] = request.side.value.upper()
                 if request.new_price_hint is not None and request.new_price_hint > 0:
-                    body["price"] = str(request.new_price_hint)
+                    body["price"] = _format_decimal(request.new_price_hint)
                 if request.new_quantity is not None and request.new_quantity > 0:
-                    body["quantity"] = str(request.new_quantity)
+                    body["quantity"] = _format_decimal(request.new_quantity)
+            elif spec.venue_id == Venue.ASTER:
+                raise NotImplementedError("Aster passive amend not supported")
             elif spec.venue_id == Venue.OKX:
                 body["instId"] = venue_sym
                 if request.order_id:
@@ -4979,7 +5416,12 @@ class VenueTransport(MarketDataClient):
                 # Hyperliquid amend via cancel+replace only
                 raise NotImplementedError("Hyperliquid amend not supported")
 
-            raw = await self._request("PUT", spec.order_path, body=body, private=True)
+            if spec.venue_id == Venue.BINANCE:
+                raw = await self._request(
+                    "PUT", spec.order_path, params=body, private=True
+                )
+            else:
+                raw = await self._request("PUT", spec.order_path, body=body, private=True)
             return self._parse_passive_order_ack(
                 raw,
                 OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=request.side,
@@ -5243,6 +5685,76 @@ class VenueTransport(MarketDataClient):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         spec = self._spec
+        if spec.venue_id == Venue.OKX:
+            venue_sym = self._venue_symbol(symbol)
+            metadata = (
+                self._symbol_metadata.get(venue_sym)
+                or self._symbol_metadata.get(symbol)
+                or {}
+            )
+            ct_val = _safe_float(
+                metadata.get("ct_val", metadata.get("ctVal", metadata.get("contract_size", 0.0))),
+                default=0.0,
+            )
+            lot_sz = _safe_float(
+                metadata.get("lot_sz", metadata.get("lotSz", metadata.get("qty_step", 0.0))),
+                default=0.0,
+            )
+            min_sz = _safe_float(
+                metadata.get("min_sz", metadata.get("minSz", metadata.get("min_qty", 0.0))),
+                default=0.0,
+            )
+            if ct_val <= 0.0 or lot_sz <= 0.0 or min_sz <= 0.0:
+                try:
+                    symbol_rule = await get_symbol_rules_cache().get(self, Venue.OKX, venue_sym)
+                except Exception:
+                    symbol_rule = None
+                if symbol_rule is not None:
+                    rule_ct_val = _safe_float(
+                        getattr(symbol_rule, "ct_val", 0.0),
+                        default=0.0,
+                    )
+                    rule_lot_sz = _safe_float(
+                        getattr(symbol_rule, "qty_step", 0.0),
+                        default=0.0,
+                    )
+                    rule_min_sz = _safe_float(
+                        getattr(symbol_rule, "min_qty", 0.0),
+                        default=0.0,
+                    )
+                    if ct_val <= 0.0 and rule_ct_val > 0.0:
+                        ct_val = rule_ct_val
+                    if lot_sz <= 0.0 and rule_lot_sz > 0.0:
+                        lot_sz = rule_lot_sz
+                    if min_sz <= 0.0 and rule_min_sz > 0.0:
+                        min_sz = rule_min_sz
+                    if ct_val > 0.0 or lot_sz > 0.0 or min_sz > 0.0:
+                        merged = dict(metadata)
+                        if ct_val > 0.0:
+                            merged["ct_val"] = ct_val
+                        if lot_sz > 0.0:
+                            merged["lot_sz"] = lot_sz
+                        if min_sz > 0.0:
+                            merged["min_sz"] = min_sz
+                        self._symbol_metadata[venue_sym] = merged
+                        if symbol != venue_sym:
+                            self._symbol_metadata[symbol] = merged
+            diagnostics = _okx_contract_order_diagnostics(
+                base_qty=float(quantity),
+                ct_val=ct_val,
+                lot_sz=lot_sz,
+                min_sz=min_sz,
+            )
+            reject_reason = diagnostics.get("reject_reason")
+            if reject_reason == "missing_ct_val":
+                raise TransportError(
+                    TransportErrorCategory.NORMALIZATION_FAILURE,
+                    "okx_contract_metadata_missing_ct_val",
+                )
+            if reject_reason in ("contract_qty_zero", "contract_qty_below_min_sz"):
+                return 0.0
+            contract_qty = float(diagnostics.get("contract_qty", 0.0) or 0.0)
+            return contract_qty * ct_val
         return normalize_venue_quantity(
             quantity=quantity,
             step_size=spec.quantity_step,
@@ -5275,6 +5787,82 @@ class VenueTransport(MarketDataClient):
     # Hyperliquid asset index resolution
     # ------------------------------------------------------------------
 
+    def _hl_cache_asset_universe(self, universe: Any) -> None:
+        from lightfee.venues.hyperliquid_signing import hyperliquid_price_decimals
+
+        if not isinstance(universe, list):
+            return
+        for idx, entry in enumerate(universe):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "") or "")
+            if not name:
+                continue
+            sz_decimals = int(entry.get("szDecimals", 0) or 0)
+            price_decimals = hyperliquid_price_decimals(idx, sz_decimals)
+            self._hl_meta_cache[name] = idx
+            self._hl_asset_meta_cache[name] = {
+                "asset_index": idx,
+                "sz_decimals": sz_decimals,
+                "price_decimals": price_decimals,
+            }
+            self._symbol_metadata[name] = {
+                **entry,
+                "asset_index": idx,
+                "sz_decimals": sz_decimals,
+                "price_decimals": price_decimals,
+            }
+
+    def _hl_cached_asset_meta(self, asset_name: str) -> dict[str, int]:
+        cached = self._hl_asset_meta_cache.get(asset_name)
+        if cached is not None:
+            return dict(cached)
+        metadata = self._symbol_metadata.get(asset_name, {})
+        if isinstance(metadata, dict) and "asset_index" in metadata:
+            asset_index = int(metadata.get("asset_index", 0) or 0)
+            sz_decimals = int(
+                metadata.get("sz_decimals", metadata.get("szDecimals", 0)) or 0
+            )
+            price_decimals = int(metadata.get("price_decimals", 0) or 0)
+            if price_decimals <= 0:
+                from lightfee.venues.hyperliquid_signing import hyperliquid_price_decimals
+
+                price_decimals = hyperliquid_price_decimals(asset_index, sz_decimals)
+            return {
+                "asset_index": asset_index,
+                "sz_decimals": sz_decimals,
+                "price_decimals": price_decimals,
+            }
+        if asset_name in self._hl_meta_cache:
+            from lightfee.venues.hyperliquid_signing import hyperliquid_price_decimals
+
+            asset_index = int(self._hl_meta_cache[asset_name])
+            return {
+                "asset_index": asset_index,
+                "sz_decimals": 0,
+                "price_decimals": hyperliquid_price_decimals(asset_index, 0),
+            }
+        raise ValueError(
+            f"Hyperliquid asset '{asset_name}' not found in metadata universe"
+        )
+
+    async def _hl_resolve_asset_meta(self, asset_name: str) -> dict[str, int]:
+        if asset_name in self._hl_asset_meta_cache:
+            return dict(self._hl_asset_meta_cache[asset_name])
+        if asset_name in self._hl_meta_cache:
+            return self._hl_cached_asset_meta(asset_name)
+
+        raw = await self._request(
+            "POST", "/info",
+            body={"type": "meta"},
+            private=False,
+        )
+        universe = raw.get("universe", []) if isinstance(raw, dict) else []
+        if isinstance(raw, list) and raw:
+            universe = raw[0].get("universe", raw) if isinstance(raw[0], dict) else raw
+        self._hl_cache_asset_universe(universe)
+        return self._hl_cached_asset_meta(asset_name)
+
     async def _hl_resolve_asset_index(self, asset_name: str) -> int:
         """Return the Hyperliquid asset index for *asset_name*.
 
@@ -5282,28 +5870,7 @@ class VenueTransport(MarketDataClient):
         name→index mapping.  The index is the 0-based position in the
         ``universe`` array — matching the Rust implementation.
         """
-        if asset_name in self._hl_meta_cache:
-            return self._hl_meta_cache[asset_name]
-
-        raw = await self._request(
-            "POST", "/info",
-            body={"type": "meta"},
-            private=False,
-        )
-        universe = raw.get("universe", []) if isinstance(raw, list) else raw.get("universe", [])
-        if isinstance(raw, list) and len(raw) > 0 and "universe" not in raw:
-            universe = raw[0].get("universe", raw) if isinstance(raw[0], dict) else []
-
-        for idx, entry in enumerate(universe):
-            name = entry.get("name", "") if isinstance(entry, dict) else ""
-            if name:
-                self._hl_meta_cache[name] = idx
-
-        if asset_name not in self._hl_meta_cache:
-            raise ValueError(
-                f"Hyperliquid asset '{asset_name}' not found in metadata universe"
-            )
-        return self._hl_meta_cache[asset_name]
+        return (await self._hl_resolve_asset_meta(asset_name))["asset_index"]
 
     async def _query_hyperliquid_order(
         self, spec, symbol: str, order_id: str, client_order_id: str | None, now_ms: int,

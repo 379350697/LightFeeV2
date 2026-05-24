@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import time
 import hashlib
+import math
+import time
 from typing import Any, Optional
 
 from Crypto.Hash import keccak as _keccak
@@ -199,6 +200,70 @@ def hyperliquid_cloid_for_client_order(client_order_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def float_to_wire_string(value: float) -> str:
+    """V1 Hyperliquid wire formatting: fixed 8 dp, trim trailing zeroes."""
+    if not math.isfinite(float(value)):
+        raise ValueError(f"non-finite Hyperliquid wire value: {value!r}")
+    text = f"{float(value):.8f}"
+    while text.endswith("0"):
+        text = text[:-1]
+    if text.endswith("."):
+        text = text[:-1]
+    return "0" if text == "-0" else text
+
+
+def _round_half_away_from_zero_f64(value: float) -> float:
+    value_f = float(value)
+    if not math.isfinite(value_f):
+        return value_f
+    if value_f >= 0.0:
+        return float(math.floor(value_f + 0.5))
+    return float(math.ceil(value_f - 0.5))
+
+
+def round_to_decimals(value: float, decimals: int) -> float:
+    factor = 10.0 ** max(int(decimals), 0)
+    return _round_half_away_from_zero_f64(float(value) * factor) / factor
+
+
+def round_to_significant_and_decimal(
+    value: float, sig_figs: int, max_decimals: int,
+) -> float:
+    value_f = float(value)
+    if abs(value_f) <= 1e-15:
+        return 0.0
+    magnitude = math.floor(math.log10(abs(value_f)))
+    scale = 10.0 ** (int(sig_figs) - magnitude - 1)
+    rounded = _round_half_away_from_zero_f64(abs(value_f) * scale) / scale
+    signed = math.copysign(rounded, value_f)
+    return round_to_decimals(signed, max(int(max_decimals), 0))
+
+
+def hyperliquid_price_decimals(asset_index: int, sz_decimals: int) -> int:
+    max_decimals = 6 if int(asset_index) < 10_000 else 8
+    return max(max_decimals - int(sz_decimals), 0)
+
+
+def hyperliquid_ioc_price_and_size(
+    *,
+    side_is_buy: bool,
+    quantity: float,
+    reference_price: float,
+    sz_decimals: int,
+    price_decimals: int,
+) -> tuple[float, float]:
+    if reference_price <= 0 or not math.isfinite(float(reference_price)):
+        raise ValueError("Hyperliquid IOC requires a positive reference price")
+    slippage_factor = 1.01 if side_is_buy else 0.99
+    limit_px = round_to_significant_and_decimal(
+        float(reference_price) * slippage_factor,
+        5,
+        price_decimals,
+    )
+    wire_qty = round_to_decimals(quantity, sz_decimals)
+    return limit_px, wire_qty
+
+
 def build_hyperliquid_order_action(
     symbol: str,
     is_buy: bool,
@@ -207,17 +272,25 @@ def build_hyperliquid_order_action(
     reduce_only: bool = False,
     tif: str = "Ioc",
     cloid: Optional[str] = None,
+    asset_index: int = 0,
+    sz_decimals: Optional[int] = None,
+    price_decimals: Optional[int] = None,
 ) -> dict[str, Any]:
     """Build an unsigned Hyperliquid order action dict.
 
     The ``symbol`` is the venue-native name (e.g. "BTC").
     The action still needs to be signed before submission.
     """
+    if sz_decimals is not None:
+        quantity = round_to_decimals(quantity, sz_decimals)
+    if price_decimals is not None:
+        price = round_to_significant_and_decimal(price, 5, price_decimals)
+
     order: dict[str, Any] = {
-        "a": 0,  # asset index — must be resolved from metadata
+        "a": int(asset_index),
         "b": is_buy,
-        "p": str(price),
-        "s": str(quantity),
+        "p": float_to_wire_string(price),
+        "s": float_to_wire_string(quantity),
         "r": reduce_only,
         "t": {"limit": {"tif": tif}},
     }

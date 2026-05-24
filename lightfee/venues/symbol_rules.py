@@ -180,7 +180,7 @@ class SymbolRulesCache:
         tick_size = float(item.get("tickSz", 0) or 0)
         lot_sz = float(item.get("lotSz", 0) or 0)
         min_sz = float(item.get("minSz", 0) or 0)
-        ct_val = float(item.get("ctVal", 1) or 1)
+        ct_val = float(item.get("ctVal", 0) or 0)
         max_mkt_sz = float(item.get("maxMktSz", 0) or 0)
 
         spec = transport._spec
@@ -190,8 +190,6 @@ class SymbolRulesCache:
             lot_sz = float(spec.quantity_step or 0.0)
         if min_sz <= 0:
             min_sz = float(spec.min_quantity or 0.0)
-        if ct_val <= 0:
-            ct_val = float(getattr(spec, 'contract_size', 1) or 1)
         min_notional = float(spec.min_notional or 0.0)
 
         return SymbolRule(

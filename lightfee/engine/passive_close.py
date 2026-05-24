@@ -59,6 +59,7 @@ from lightfee.engine.state import (
 )
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import align_passive_price_to_tick, resolve_price_tick
+from lightfee.venues.capabilities import get_capability_flags
 from lightfee.venues.specs import get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
@@ -1571,14 +1572,34 @@ class PassiveCloseExecutor:
             pending.ops_window_started_at_ms = now_ms
 
         # Decide amend vs cancel-replace
-        if price_distance_bps < profile.cancel_replace_threshold_bps:
+        if (
+            self._passive_amend_supported(maker_venue)
+            and price_distance_bps < profile.cancel_replace_threshold_bps
+        ):
             await self._amend_maker_order(state, pending, position, maker_venue,
                                            maker_side, maker_leg_label,
                                            target_price, remaining, tick_size, reference_mid)
         else:
+            if not self._passive_amend_supported(maker_venue):
+                self._journal.append(
+                    "exit.passive_close_amend_unsupported_cancel_replace",
+                    {
+                        "position_id": pid,
+                        "venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
+                        "price_distance_bps": price_distance_bps,
+                        "reason": "venue_capability_passive_amend_supported_false",
+                    },
+                )
             await self._cancel_replace_maker_order(state, pending, position, maker_venue,
                                                     maker_side, maker_leg_label,
                                                     target_price, remaining, tick_size, reference_mid)
+
+    def _passive_amend_supported(self, venue: Venue) -> bool:
+        try:
+            return bool(get_capability_flags(venue).passive_amend_supported)
+        except Exception:
+            return False
 
     async def _amend_maker_order(
         self,

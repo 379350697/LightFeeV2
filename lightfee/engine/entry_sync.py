@@ -55,6 +55,7 @@ class EntryExecutionResult:
     has_uncertainty: bool = False
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
+    reject_reason: str = ""
     journal_entries: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -190,6 +191,7 @@ class EntrySyncExecutor:
         if maker_result["outcome"] == "rejected":
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
+            result.reject_reason = maker_result.get("reason", "maker rejected")
             self.journal.append(
                 "entry.aborted",
                 {
@@ -594,7 +596,12 @@ class EntrySyncExecutor:
                     "is_maker": is_maker,
                 },
             )
-            return {"outcome": "rejected", "fill": None, "order_id": ""}
+            return {
+                "outcome": "rejected",
+                "fill": None,
+                "order_id": "",
+                "reason": str(e),
+            }
 
         # V2: post_only maker orders go through passive submit (ACK, not fill)
         if is_maker and request.post_only:
@@ -681,7 +688,13 @@ class EntrySyncExecutor:
                         "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
-                return {"outcome": "rejected", "fill": None, "order_id": ""}
+                return {
+                    "outcome": "rejected",
+                    "fill": None,
+                    "order_id": "",
+                    "reason": str(e),
+                    "exchange_error": evidence.to_dict(),
+                }
             else:
                 self.journal.append(
                     "order.uncertain",
@@ -796,7 +809,13 @@ class EntrySyncExecutor:
                         "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
-                return {"outcome": "rejected", "fill": None, "order_id": ""}
+                return {
+                    "outcome": "rejected",
+                    "fill": None,
+                    "order_id": "",
+                    "reason": str(e),
+                    "exchange_error": evidence.to_dict(),
+                }
             else:
                 self.journal.append(
                     "order.uncertain",

@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: lightfee-py
+Version: 0.1.0
+Summary: Python LightFee: funding-rate arbitrage execution engine
+Author: LightFee Team
+License: MIT
+Requires-Python: >=3.12
+Requires-Dist: pydantic>=2.0
+Requires-Dist: tomli>=2.0; python_version < "3.11"
+Requires-Dist: httpx>=0.25
+Requires-Dist: websockets>=12.0
+Requires-Dist: aiosqlite>=0.19
+Requires-Dist: orjson>=3.9
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ruff>=0.1; extra == "dev"

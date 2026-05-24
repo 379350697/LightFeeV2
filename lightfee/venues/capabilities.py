@@ -66,6 +66,7 @@ class VenueCapabilityFlags:
 
     # --- Passive orders ---
     passive_order_supported: bool = True
+    passive_amend_supported: bool = True
     passive_progress_mode: PassiveProgressMode = PassiveProgressMode.UNSUPPORTED
     passive_wakeups: bool = False  # V1: WS events can wake the maker-event lane
     passive_metadata: bool = True  # V1: venue provides metadata (min notional, tick size)
@@ -209,6 +210,7 @@ def capability_matrix() -> dict[Venue, VenueCapabilityFlags]:
             cached_private_health=True,
             execution_liquidity=ExecutionLiquidityCapability.TRUE_L2,
             reconcile_quality=ReconcileQuality.ORDER_FILL,
+            passive_amend_supported=False,
             passive_progress_mode=PassiveProgressMode.ORDER_FILL_STREAM,
             passive_wakeups=True,
             order_sizing_mode=OrderSizingMode.CONTRACT_SIZE_STEP,
@@ -225,6 +227,7 @@ def capability_matrix() -> dict[Venue, VenueCapabilityFlags]:
             private_health=CapabilitySupport.SUPPORTED,
             execution_liquidity=ExecutionLiquidityCapability.TRUE_L2,
             reconcile_quality=ReconcileQuality.UNSUPPORTED,
+            passive_amend_supported=False,
             passive_progress_mode=PassiveProgressMode.PERIODIC_POLL,
             order_sizing_mode=OrderSizingMode.NATIVE_ROUND_LOT,
             entry_open_notional_headroom=False,

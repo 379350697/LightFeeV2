@@ -2004,6 +2004,14 @@ class TestMakerLegSelection:
 class TestAmendCancelReplace:
     """Test 6: amend unsupported → cancel-replace; cancel fail → no double-order."""
 
+    def test_capability_disables_aster_and_hyperliquid_passive_amend(self):
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+
+        assert executor._passive_amend_supported(Venue.BINANCE) is True
+        assert executor._passive_amend_supported(Venue.ASTER) is False
+        assert executor._passive_amend_supported(Venue.HYPERLIQUID) is False
+
     def test_amend_not_implemented_falls_back_to_cancel_replace(self):
         """When amend raises NotImplementedError, cancel-replace is used."""
         journal = _open_journal()

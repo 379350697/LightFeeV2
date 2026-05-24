@@ -276,7 +276,7 @@ class TestOkxCtValConversion:
 
     @pytest.mark.asyncio
     async def test_no_ct_val_defaults_to_one(self):
-        """When ct_val_map is empty, fill is not converted (ct_val=1.0 default)."""
+        """When ct_val_map is empty, OKX private order fill is skipped fail-closed."""
         from lightfee.venues.okx_private_ws import handle_okx_private_message
 
         state = PrivateWsState()
@@ -295,9 +295,7 @@ class TestOkxCtValConversion:
         handle_okx_private_message(state, symbol_map, [], raw, subscribed=True)
         await _sleep_short()
         update = state.order_by_order_id("okx-no-ct")
-        assert update is not None
-        # No ct_val → defaults to 1.0
-        assert update.filled_quantity == 3.0
+        assert update is None
 
 
 class TestBybitPrivateParserExtended:
@@ -789,6 +787,7 @@ class TestOkxWorkerLifecycle:
         transport = _FakeTransport()
         transport._spec.venue_id = Venue.OKX
         transport._spec.rest_url = "https://www.okx.com"
+        transport._symbol_metadata = {"ETHUSDT": {"ct_val": 1.0}}
 
         # Override _request to return proper server time for OKX signing
         async def _fake_okx_request(method, path, **kwargs):
@@ -1525,7 +1524,7 @@ class TestOkxCtValMap:
         assert result == {"ETH-USDT-SWAP": 0.01}
 
     def test_missing_metadata_defaults_to_one(self):
-        """metadata missing → every inst_id defaults to ct_val=1.0."""
+        """metadata missing → no trusted ct_val entry is produced."""
         from lightfee.venues.okx_private_ws import _build_okx_ct_val_map
 
         transport = _FakeTransport(venue=Venue.OKX)
@@ -1533,10 +1532,10 @@ class TestOkxCtValMap:
         symbol_map = {"ETH-USDT-SWAP": "ETHUSDT", "BTC-USDT-SWAP": "BTCUSDT"}
 
         result = _build_okx_ct_val_map(transport, symbol_map)
-        assert result == {"ETH-USDT-SWAP": 1.0, "BTC-USDT-SWAP": 1.0}
+        assert result == {}
 
     def test_mixed_metadata(self):
-        """some metadata present, some missing → found uses ct_val, missing defaults to 1.0."""
+        """some metadata present, some missing → only trusted ct_val entries are kept."""
         from lightfee.venues.okx_private_ws import _build_okx_ct_val_map
 
         transport = _FakeTransport(venue=Venue.OKX)
@@ -1547,10 +1546,10 @@ class TestOkxCtValMap:
         }
 
         result = _build_okx_ct_val_map(transport, symbol_map)
-        assert result == {"ETH-USDT-SWAP": 0.1, "BTC-USDT-SWAP": 1.0}
+        assert result == {"ETH-USDT-SWAP": 0.1}
 
     def test_zero_ct_val_ignored_defaults_to_one(self):
-        """ct_val=0 in metadata is ignored → defaults to 1.0."""
+        """ct_val=0 in metadata is ignored and does not fallback to 1.0."""
         from lightfee.venues.okx_private_ws import _build_okx_ct_val_map
 
         transport = _FakeTransport(venue=Venue.OKX)
@@ -1558,7 +1557,7 @@ class TestOkxCtValMap:
         symbol_map = {"ETH-USDT-SWAP": "ETHUSDT"}
 
         result = _build_okx_ct_val_map(transport, symbol_map)
-        assert result == {"ETH-USDT-SWAP": 1.0}
+        assert result == {}
 
 
 # ============================================================================
