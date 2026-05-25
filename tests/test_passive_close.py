@@ -1458,6 +1458,122 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_flatten" in kinds
         assert "exit.passive_close_fallback_unhedged_failed" not in kinds
 
+    def test_beatusdt_live_imbalanced_under_min_excess_compensates_flat(self):
+        """Both live legs nonzero but imbalanced must not retry stale local dust."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        class LiveAdapter(VenueAdapter):
+            def __init__(self, venue, snapshots):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0211,
+                    order_id=f"{self._venue.value}-flatten",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=2000,
+                )
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    qty, side = self._snapshots.pop(0)
+                else:
+                    qty, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    entry_price=1.0211 if qty else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        okx = LiveAdapter(
+            Venue.OKX,
+            [
+                (18.0, Side.BUY),
+                (18.0, Side.BUY),
+                (0.0, Side.BUY),
+            ],
+        )
+        bybit = LiveAdapter(
+            Venue.BYBIT,
+            [
+                (20.0, Side.SELL),
+                (20.0, Side.SELL),
+                (0.0, Side.SELL),
+            ],
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-beatusdt-imbalanced",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=2.0, average_price=1.0211),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert [request.quantity for request in bybit.place_order_calls] == [20.0]
+        assert [request.quantity for request in okx.place_order_calls] == [18.0]
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert pending.next_retry_at_ms == 0
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_imbalanced" in kinds
+        assert "execution.min_notional_abort_and_flatten" in kinds
+        assert "exit.compensated" in kinds
+        assert "exit.passive_close_fallback_unhedged_failed" not in kinds
+
+        persisted = build_persistent_state_view(state)
+        assert position.position_id not in persisted["open_positions"]
+        assert position.position_id not in persisted["pending_passive_closes"]
+
     def test_live_flat_fallback_clears_pending_open_and_last_error(self):
         """Fallback starts from live truth; already-flat venues remove all local state."""
         journal = _open_journal()

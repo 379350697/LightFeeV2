@@ -76,6 +76,39 @@ def _recon_meta_get(obj, key: str, default: Any = "") -> Any:
     return meta.get(key, default)
 
 
+def _venue_id(venue: Optional[Venue]) -> str:
+    if venue is None:
+        return ""
+    return venue.value if hasattr(venue, "value") else str(venue)
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _live_position_delta(position: Optional[PositionSnapshot]) -> dict[str, Any]:
+    if position is None:
+        return {
+            "quantity": 0.0,
+            "side": "",
+            "observed_at_ms": 0,
+            "source": "fetch_position_unavailable",
+        }
+    return {
+        "quantity": abs(float(position.quantity)),
+        "signed_quantity": float(position.quantity),
+        "side": position.side.value if hasattr(position.side, "value") else str(position.side),
+        "observed_at_ms": position.observed_at_ms,
+        "source": "fetch_position",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Order reconciler
 # ---------------------------------------------------------------------------
@@ -122,36 +155,191 @@ class OrderReconciler:
         position_qty: float = 0.0,
         position_side: str = "",
         hedge_submitted: bool = False,
+        uncertain_subtype: str = "",
+        queried_endpoints: Optional[list[str]] = None,
+        endpoint_responses: Optional[list[dict[str, Any]]] = None,
+        live_position_delta: Optional[dict[str, Any]] = None,
+        next_action: str = "",
     ) -> None:
         if venue is None:
             return
+        endpoint_list = [str(e) for e in (queried_endpoints or []) if str(e)]
+        if not endpoint_list:
+            endpoint_list = ["adapter.fetch_order_fill_reconciliation"]
+        response_summary = raw_exchange_status or status
+        payload = {
+            "venue": _venue_id(venue),
+            "symbol": symbol,
+            "endpoint": endpoint_list[0],
+            "queried_endpoints": endpoint_list,
+            "endpoint_responses": endpoint_responses or [
+                {"endpoint": endpoint, "classification": response_summary}
+                for endpoint in endpoint_list
+            ],
+            "product_type": "reconciliation",
+            "category": "reconciliation",
+            "order_id": order_id,
+            "exchange_order_id": order_id,
+            "client_order_id": client_order_id,
+            "status": status,
+            "reason": reason,
+            "uncertain_subtype": uncertain_subtype,
+            "raw_exchange_status": raw_exchange_status,
+            "fill_qty": fill_qty,
+            "fill_price": fill_price,
+            "position_qty": position_qty,
+            "position_side": position_side,
+            "live_position_delta": live_position_delta or {
+                "quantity": abs(float(position_qty)),
+                "signed_quantity": float(position_qty),
+                "side": position_side,
+                "observed_at_ms": 0,
+                "source": "fetch_position",
+            },
+            "next_action": next_action,
+            "hedge_submitted": hedge_submitted,
+            "raw_price": None,
+            "raw_qty": None,
+            "quantized_price": None,
+            "quantized_qty": None,
+            "tick_size": None,
+            "quantity_step": None,
+            "response_classification": response_summary,
+        }
         self._order_diagnostics.append({
             "kind": "order.reconcile_result",
-            "payload": {
-                "venue": venue.value if hasattr(venue, "value") else str(venue),
-                "symbol": symbol,
-                "endpoint": "fetch_order_status",
-                "product_type": "reconciliation",
-                "category": "reconciliation",
-                "order_id": order_id,
-                "client_order_id": client_order_id,
-                "status": status,
-                "reason": reason,
-                "raw_exchange_status": raw_exchange_status,
-                "fill_qty": fill_qty,
-                "fill_price": fill_price,
-                "position_qty": position_qty,
-                "position_side": position_side,
-                "hedge_submitted": hedge_submitted,
-                "raw_price": None,
-                "raw_qty": None,
-                "quantized_price": None,
-                "quantized_qty": None,
-                "tick_size": None,
-                "quantity_step": None,
-                "response_classification": status,
-            },
+            "payload": payload,
         })
+        if next_action == "clear_uncertain_state" and uncertain_subtype:
+            self._order_diagnostics.append({
+                "kind": "order.reconcile_resolution",
+                "payload": {
+                    "venue": payload["venue"],
+                    "symbol": symbol,
+                    "client_order_id": client_order_id,
+                    "exchange_order_id": order_id,
+                    "queried_endpoints": endpoint_list,
+                    "response_classification": response_summary,
+                    "live_position_delta": payload["live_position_delta"],
+                    "resolution": uncertain_subtype,
+                    "clears_uncertain_state": True,
+                    "next_action": "clear_uncertain_state",
+                },
+            })
+
+    @staticmethod
+    def _drain_adapter_order_diagnostics(adapter: Any) -> list[dict[str, Any]]:
+        drains = []
+        drain = getattr(adapter, "drain_order_diagnostics", None)
+        if callable(drain):
+            drains.append(drain)
+        transport = getattr(adapter, "_transport", None)
+        transport_drain = getattr(transport, "drain_order_diagnostics", None)
+        if callable(transport_drain):
+            drains.append(transport_drain)
+
+        events: list[dict[str, Any]] = []
+        for drain_fn in drains:
+            try:
+                events.extend(drain_fn())
+            except Exception:
+                continue
+        return events
+
+    @staticmethod
+    def _latest_query_payload(events: list[dict[str, Any]]) -> dict[str, Any]:
+        for event in reversed(events):
+            if event.get("kind") == "order.reconcile_query":
+                payload = event.get("payload", {})
+                return payload if isinstance(payload, dict) else {}
+        return {}
+
+    @staticmethod
+    def _status_from_reconciliation(
+        reconciliation: Any,
+        position: Optional[PositionSnapshot],
+        query_payload: dict[str, Any],
+    ) -> tuple[str, str, str, str, list[str], list[dict[str, Any]], str]:
+        meta = _recon_metadata(reconciliation) or {}
+        endpoints = _as_list(meta.get("queried_endpoints") or meta.get("reconcile_endpoints"))
+        if not endpoints:
+            endpoints = _as_list(query_payload.get("queried_endpoints"))
+        endpoint_responses = _as_list(meta.get("endpoint_responses"))
+        if not endpoint_responses:
+            endpoint_responses = _as_list(query_payload.get("endpoint_responses"))
+        response_classification = str(
+            meta.get("response_classification")
+            or query_payload.get("response_classification")
+            or meta.get("raw_exchange_status")
+            or ""
+        )
+        subtype = str(
+            meta.get("uncertain_subtype")
+            or query_payload.get("uncertain_subtype")
+            or ""
+        )
+        next_action = str(meta.get("next_action") or query_payload.get("next_action") or "")
+
+        if reconciliation is not None and getattr(reconciliation, "quantity", 0.0) > 0:
+            raw = str(meta.get("raw_exchange_status") or response_classification or "filled")
+            if subtype:
+                next_action = "clear_uncertain_state"
+            return (
+                "filled",
+                raw,
+                subtype,
+                response_classification or "filled",
+                [str(e) for e in endpoints],
+                [e for e in endpoint_responses if isinstance(e, dict)],
+                next_action,
+            )
+
+        position_qty = abs(float(position.quantity)) if position is not None else 0.0
+        has_endpoint_evidence = bool(endpoints or query_payload)
+        if position_qty > 1e-12 and has_endpoint_evidence:
+            return (
+                "filled",
+                response_classification or "live_position_confirmed",
+                "live_position_confirmed",
+                response_classification or "live_position_confirmed",
+                [str(e) for e in endpoints],
+                [e for e in endpoint_responses if isinstance(e, dict)],
+                "clear_uncertain_state",
+            )
+        if position is not None and position_qty <= 1e-12 and has_endpoint_evidence:
+            return (
+                "not_found",
+                response_classification or "live_no_effect_confirmed",
+                "live_no_effect_confirmed",
+                response_classification or "live_no_effect_confirmed",
+                [str(e) for e in endpoints],
+                [e for e in endpoint_responses if isinstance(e, dict)],
+                "clear_uncertain_state",
+            )
+
+        if not subtype:
+            text = response_classification.lower()
+            if "timeout" in text:
+                subtype = "submit_timeout"
+            elif "duplicate" in text:
+                subtype = "duplicate_client_id"
+            elif "open" in text and "not_found" in text:
+                subtype = "open_order_not_found"
+            elif "closed" in text and "not_found" in text:
+                subtype = "closed_order_not_found"
+            elif "accepted" in text or "new" in text or "open" in text:
+                subtype = "stale_accepted_order"
+            else:
+                subtype = "execution_not_found"
+        return (
+            "uncertain",
+            response_classification or subtype,
+            subtype,
+            response_classification or subtype,
+            [str(e) for e in endpoints],
+            [e for e in endpoint_responses if isinstance(e, dict)],
+            next_action or "reconcile_again_after_backoff",
+        )
 
     async def reconcile_position(
         self,
@@ -178,6 +366,14 @@ class OrderReconciler:
         short_adapter = self._adapter_for(short_venue) if short_venue else None
         long_raw_status = ""
         short_raw_status = ""
+        long_uncertain_subtype = ""
+        short_uncertain_subtype = ""
+        long_queried_endpoints: list[str] = []
+        short_queried_endpoints: list[str] = []
+        long_endpoint_responses: list[dict[str, Any]] = []
+        short_endpoint_responses: list[dict[str, Any]] = []
+        long_next_action = ""
+        short_next_action = ""
 
         if long_adapter is not None:
             long_recon = None
@@ -189,15 +385,22 @@ class OrderReconciler:
                 long_recon = await long_adapter.fetch_order_fill_reconciliation(
                     symbol, "", long_client_order_id
                 )
-            if long_recon is not None and long_recon.quantity > 0:
-                result.long_status = "filled"
-                result.long_fill = long_recon
-                long_raw_status = _recon_meta_get(long_recon, 'raw_exchange_status', '')
-            else:
-                result.long_status = "uncertain" if long_recon is None else _recon_meta_get(long_recon, 'raw_exchange_status', 'uncertain')
-                long_raw_status = _recon_meta_get(long_recon, 'raw_exchange_status', '') if long_recon is not None else ''
             pos = await long_adapter.fetch_position(symbol)
             result.long_position = pos
+            long_query_diagnostics = self._drain_adapter_order_diagnostics(long_adapter)
+            self._order_diagnostics.extend(long_query_diagnostics)
+            long_query_payload = self._latest_query_payload(long_query_diagnostics)
+            (
+                result.long_status,
+                long_raw_status,
+                long_uncertain_subtype,
+                _long_response_classification,
+                long_queried_endpoints,
+                long_endpoint_responses,
+                long_next_action,
+            ) = self._status_from_reconciliation(long_recon, pos, long_query_payload)
+            if long_recon is not None and long_recon.quantity > 0:
+                result.long_fill = long_recon
 
         if short_adapter is not None:
             short_recon = None
@@ -209,15 +412,22 @@ class OrderReconciler:
                 short_recon = await short_adapter.fetch_order_fill_reconciliation(
                     symbol, "", short_client_order_id
                 )
-            if short_recon is not None and short_recon.quantity > 0:
-                result.short_status = "filled"
-                result.short_fill = short_recon
-                short_raw_status = _recon_meta_get(short_recon, 'raw_exchange_status', '')
-            else:
-                result.short_status = "uncertain" if short_recon is None else _recon_meta_get(short_recon, 'raw_exchange_status', 'uncertain')
-                short_raw_status = _recon_meta_get(short_recon, 'raw_exchange_status', '') if short_recon is not None else ''
             pos = await short_adapter.fetch_position(symbol)
             result.short_position = pos
+            short_query_diagnostics = self._drain_adapter_order_diagnostics(short_adapter)
+            self._order_diagnostics.extend(short_query_diagnostics)
+            short_query_payload = self._latest_query_payload(short_query_diagnostics)
+            (
+                result.short_status,
+                short_raw_status,
+                short_uncertain_subtype,
+                _short_response_classification,
+                short_queried_endpoints,
+                short_endpoint_responses,
+                short_next_action,
+            ) = self._status_from_reconciliation(short_recon, pos, short_query_payload)
+            if short_recon is not None and short_recon.quantity > 0:
+                result.short_fill = short_recon
 
         # Determine if flat
         long_qty = result.long_position.quantity if result.long_position else 0.0
@@ -233,7 +443,11 @@ class OrderReconciler:
         self._record_reconcile_result(
             venue=long_venue,
             symbol=symbol,
-            order_id=long_order_id,
+            order_id=(
+                result.long_fill.order_id
+                if result.long_fill is not None and result.long_fill.order_id
+                else long_order_id
+            ),
             client_order_id=long_client_order_id,
             status=result.long_status,
             raw_exchange_status=long_raw_status,
@@ -241,11 +455,20 @@ class OrderReconciler:
             fill_price=_recon_fill_price(result.long_fill),
             position_qty=result.long_position.quantity if result.long_position else 0.0,
             position_side=result.long_position.side.value if result.long_position else "",
+            uncertain_subtype=long_uncertain_subtype,
+            queried_endpoints=long_queried_endpoints,
+            endpoint_responses=long_endpoint_responses,
+            live_position_delta=_live_position_delta(result.long_position),
+            next_action=long_next_action,
         )
         self._record_reconcile_result(
             venue=short_venue,
             symbol=symbol,
-            order_id=short_order_id,
+            order_id=(
+                result.short_fill.order_id
+                if result.short_fill is not None and result.short_fill.order_id
+                else short_order_id
+            ),
             client_order_id=short_client_order_id,
             status=result.short_status,
             raw_exchange_status=short_raw_status,
@@ -253,6 +476,11 @@ class OrderReconciler:
             fill_price=_recon_fill_price(result.short_fill),
             position_qty=result.short_position.quantity if result.short_position else 0.0,
             position_side=result.short_position.side.value if result.short_position else "",
+            uncertain_subtype=short_uncertain_subtype,
+            queried_endpoints=short_queried_endpoints,
+            endpoint_responses=short_endpoint_responses,
+            live_position_delta=_live_position_delta(result.short_position),
+            next_action=short_next_action,
         )
         return result
 

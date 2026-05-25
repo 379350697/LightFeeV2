@@ -60,6 +60,7 @@ class _BufferedUpdate:
 class _BufferedReplayResult:
     replayed: int = 0
     ok: bool = True
+    failure_evidence: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +133,9 @@ class LocalL2DataPlane:
         self.bootstrap_timeout_ms: int = 15_000  # Overall bootstrap phase timeout
         self.hot_refresh_interval_ms: int = SNAPSHOT_INTERVAL_HOT_MS
         self.hot_stale_after_ms: int = 300_000
+        self.buffered_replay_failure_alert_threshold: int = 3
+        self._buffered_replay_failure_counts: dict[str, int] = {}
+        self._rebuild_attempt_ids: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Bootstrap: initial snapshot population for target books
@@ -235,7 +239,7 @@ class LocalL2DataPlane:
             # WS deltas. OKX stays on the V1 buffered replay classifier.
             replay = _BufferedReplayResult()
             if policy.replay_rest_snapshot_with_ws_deltas:
-                replay = self._replay_buffered_updates(venue, symbol)
+                replay = self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
             if replay.replayed > 0:
                 self._journal.append(
                     "runtime.local_l2_buffered_replay",
@@ -255,6 +259,7 @@ class LocalL2DataPlane:
                         "symbol": symbol,
                         "error": ss.last_error,
                         "category": "buffered_replay_failed",
+                        **replay.failure_evidence,
                     },
                 )
                 return False
@@ -271,6 +276,7 @@ class LocalL2DataPlane:
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
             ss.last_error = ""
+            self._buffered_replay_failure_counts.pop(f"{venue}:{symbol}", None)
             self._journal.append(
                 "runtime.local_l2_snapshot_ok",
                 {"venue": venue, "symbol": symbol},
@@ -369,6 +375,147 @@ class LocalL2DataPlane:
             book.sequence = 0
             book.last_update_id = 0
 
+    def _next_rebuild_attempt_id(self, venue: str, symbol: str) -> int:
+        key = f"{venue}:{symbol}"
+        attempt = self._rebuild_attempt_ids.get(key, 0) + 1
+        self._rebuild_attempt_ids[key] = attempt
+        return attempt
+
+    @staticmethod
+    def _status_value(status) -> str:
+        return status.value if hasattr(status, "value") else str(status)
+
+    @staticmethod
+    def _buffer_age_ms(buf: deque[_BufferedUpdate], now_ms: int) -> int:
+        if not buf:
+            return 0
+        first_observed = int(getattr(buf[0], "observed_at_ms", 0) or 0)
+        if first_observed <= 0 or now_ms <= 0:
+            return 0
+        return max(0, now_ms - first_observed)
+
+    def _buffered_replay_failure_evidence(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        reason: str,
+        book,
+        status_before: str,
+        status_after: str,
+        now_ms: int,
+        rebuild_attempt_id: int,
+        snapshot_last_update_id: int,
+        expected_previous_sequence: int,
+        buf: deque[_BufferedUpdate],
+        filtered: list[_BufferedUpdate],
+        failure_update: LocalL2Update | None,
+        replayed: int,
+        replay_index: int,
+    ) -> dict:
+        key = f"{venue}:{symbol}"
+        failure_count = self._buffered_replay_failure_counts.get(key, 0) + 1
+        self._buffered_replay_failure_counts[key] = failure_count
+        threshold = max(1, int(self.buffered_replay_failure_alert_threshold or 1))
+        alert = failure_count >= threshold
+        policy = policy_for_venue(venue)
+        raw_u = int(getattr(failure_update, "sequence", 0) or 0) if failure_update else 0
+        raw_U = int(getattr(failure_update, "first_sequence", 0) or 0) if failure_update else 0
+        raw_pu = int(getattr(failure_update, "previous_sequence", 0) or 0) if failure_update else 0
+        previous_present = bool(
+            getattr(failure_update, "previous_sequence_present", False)
+        ) if failure_update else False
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "error": reason,
+            "rebuild_trigger": reason,
+            "rebuild_attempt_id": rebuild_attempt_id,
+            "snapshot_lastUpdateId": snapshot_last_update_id,
+            "snapshot_last_update_id": snapshot_last_update_id,
+            "expected_previous_sequence": expected_previous_sequence,
+            "raw_U": raw_U,
+            "raw_u": raw_u,
+            "raw_pu": raw_pu,
+            "incoming_first_sequence": raw_U,
+            "incoming_sequence": raw_u,
+            "incoming_previous_sequence": raw_pu,
+            "previous_sequence_present": previous_present,
+            "buffered_count": len(buf),
+            "filtered_buffered_count": len(filtered),
+            "buffer_age_ms": self._buffer_age_ms(buf, now_ms),
+            "first_buffer_observed_at_ms": int(getattr(buf[0], "observed_at_ms", 0) or 0) if buf else 0,
+            "last_buffer_observed_at_ms": int(getattr(buf[-1], "observed_at_ms", 0) or 0) if buf else 0,
+            "replayed": replayed,
+            "replay_index": replay_index,
+            "status_before": status_before,
+            "status_after": status_after,
+            "status_transition": f"{status_before}->{status_after}",
+            "book_seq": int(getattr(book, "sequence", 0) or 0),
+            "book_last_update_id": int(getattr(book, "last_update_id", 0) or 0),
+            "policy_bridge_mode": policy.bridge_mode.value,
+            "policy_buffer_cap": policy.pre_snapshot_buffer_cap,
+            "reason_class": "buffered_replay_failed",
+            "strict_continuity_rule": "pu_must_equal_previous_u",
+            "semantic_action": "strict_rebuild",
+            "root_bug_suspected": False,
+            "replay_failure_count_for_symbol": failure_count,
+            "replay_failure_alert_threshold": threshold,
+            "replay_failure_alert": alert,
+            "severity": "warning" if alert else "info",
+            "evidence_level": "warning" if alert else "info",
+        }
+
+    def _mark_rebuilding_from_buffered_replay_failure(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        book,
+        reason: str,
+        now_ms: int,
+        snapshot_last_update_id: int,
+        expected_previous_sequence: int,
+        buf: deque[_BufferedUpdate],
+        filtered: list[_BufferedUpdate],
+        failure_update: LocalL2Update | None,
+        replayed: int,
+        replay_index: int,
+    ) -> _BufferedReplayResult:
+        status_before = self._status_value(book.status)
+        rebuild_attempt_id = self._next_rebuild_attempt_id(venue, symbol)
+        book.sequence = 0
+        book.last_update_id = 0
+        book.fault_reason = reason
+        book.transition_to_rebuilding(now_ms)
+        status_after = self._status_value(book.status)
+        self._runtime.handle_runtime_failure(
+            venue,
+            symbol,
+            RuntimeFaultKind.SEQUENCE_GAP,
+            reason,
+            now_ms,
+        )
+        evidence = self._buffered_replay_failure_evidence(
+            venue=venue,
+            symbol=symbol,
+            reason=reason,
+            book=book,
+            status_before=status_before,
+            status_after=status_after,
+            now_ms=now_ms,
+            rebuild_attempt_id=rebuild_attempt_id,
+            snapshot_last_update_id=snapshot_last_update_id,
+            expected_previous_sequence=expected_previous_sequence,
+            buf=buf,
+            filtered=filtered,
+            failure_update=failure_update,
+            replayed=replayed,
+            replay_index=replay_index,
+        )
+        self._journal.append("runtime.local_l2_buffered_replay_rebuild", evidence)
+        return _BufferedReplayResult(replayed=replayed, ok=False, failure_evidence=evidence)
+
     # ------------------------------------------------------------------
     # Ingest: WS/REST update entry point
     # ------------------------------------------------------------------
@@ -449,10 +596,9 @@ class LocalL2DataPlane:
                 first_sequence = update.previous_sequence + 1
             else:
                 first_sequence = update.sequence
-        overlaps_expected = first_sequence <= expected <= update.sequence
 
         if update.previous_sequence_present or update.previous_sequence > 0:
-            if update.previous_sequence != book.sequence and not overlaps_expected:
+            if update.previous_sequence != book.sequence:
                 self._mark_rebuilding_from_stream_gap(
                     book,
                     update,
@@ -481,6 +627,7 @@ class LocalL2DataPlane:
         reason: str,
     ) -> None:
         previous_book_seq = getattr(book, "sequence", 0)
+        previous_book_last_update_id = getattr(book, "last_update_id", 0)
         status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
         pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
         expected_sequence = previous_book_seq + 1 if previous_book_seq > 0 else 0
@@ -505,6 +652,7 @@ class LocalL2DataPlane:
         book.fault_reason = reason
         book.transition_to_rebuilding(now_ms)
         status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
+        rebuild_attempt_id = self._next_rebuild_attempt_id(update.venue, update.symbol)
         self._runtime.handle_runtime_failure(
             update.venue,
             update.symbol,
@@ -521,7 +669,14 @@ class LocalL2DataPlane:
                 incoming_sequence=update.sequence,
                 incoming_previous_sequence=update.previous_sequence,
                 incoming_first_sequence=incoming_first_sequence,
+                raw_U=update.first_sequence,
+                raw_u=update.sequence,
+                raw_pu=update.previous_sequence,
+                previous_sequence_present=update.previous_sequence_present,
                 expected_sequence=expected_sequence,
+                expected_previous_sequence=previous_book_seq,
+                snapshot_last_update_id=previous_book_last_update_id,
+                rebuild_attempt_id=rebuild_attempt_id,
                 buffered_count=buffered_count,
                 first_buffered_sequence=first_buffered_sequence,
                 last_buffered_sequence=last_buffered_sequence,
@@ -535,7 +690,7 @@ class LocalL2DataPlane:
         )
 
     def _replay_buffered_updates(
-        self, venue: str, symbol: str,
+        self, venue: str, symbol: str, now_ms: int | None = None,
     ) -> _BufferedReplayResult:
         """Replay buffered WS updates accumulated during bootstrap gap.
 
@@ -555,8 +710,10 @@ class LocalL2DataPlane:
         if book is None:
             return _BufferedReplayResult()
 
+        replay_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         current_gen = self._current_stream_generation(venue, symbol)
         previous_sequence = book.sequence  # snapshot's sequence
+        snapshot_last_update_id = previous_sequence
 
         # Filter: keep only current-generation updates (V1: retain by generation)
         # Convert to list for indexed access
@@ -580,45 +737,66 @@ class LocalL2DataPlane:
                 if link_kind.value == "obsolete":
                     continue
                 if link_kind.value == "invalid":
-                    book.sequence = 0
-                    book.last_update_id = 0
-                    book.fault_reason = (
+                    reason = (
                         f"buffered_replay_invalid_link: expected {previous_sequence} "
                         f"got {bu.update.previous_sequence}->{bu.update.sequence}"
                     )
-                    book.transition_to_rebuilding(int(time.time() * 1000))
-                    self._runtime.handle_runtime_failure(
-                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                        f"buffered_replay_invalid_link: expected {previous_sequence} "
-                        f"got {bu.update.previous_sequence}->{bu.update.sequence}", 0,
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
                     )
-                    return _BufferedReplayResult(replayed=replayed, ok=False)
                 try:
                     replay_result = self._runtime.record_update_result(
                         bu.update, bu.observed_at_ms,
                     )
                     if replay_result.rebuild_required:
-                        book.sequence = 0
-                        book.last_update_id = 0
-                        book.fault_reason = (
+                        reason = (
                             replay_result.fault_reason
                             or f"buffered_replay_apply_failed at index {i}"
                         )
-                        book.transition_to_rebuilding(int(time.time() * 1000))
-                        return _BufferedReplayResult(replayed=replayed, ok=False)
+                        return self._mark_rebuilding_from_buffered_replay_failure(
+                            venue=venue,
+                            symbol=symbol,
+                            book=book,
+                            reason=reason,
+                            now_ms=replay_now_ms,
+                            snapshot_last_update_id=snapshot_last_update_id,
+                            expected_previous_sequence=previous_sequence,
+                            buf=buf,
+                            filtered=filtered,
+                            failure_update=bu.update,
+                            replayed=replayed,
+                            replay_index=i,
+                        )
                     if replay_result.applied:
                         previous_sequence = bu.update.sequence
                         replayed += 1
                 except Exception:
-                    book.sequence = 0
-                    book.last_update_id = 0
-                    book.fault_reason = f"buffered_replay_apply_failed at index {i}"
-                    book.transition_to_rebuilding(int(time.time() * 1000))
-                    self._runtime.handle_runtime_failure(
-                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                        f"buffered_replay_apply_failed at index {i}", 0,
+                    reason = f"buffered_replay_apply_failed at index {i}"
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
                     )
-                    return _BufferedReplayResult(replayed=replayed, ok=False)
 
             return _BufferedReplayResult(replayed=replayed)
 
@@ -653,15 +831,20 @@ class LocalL2DataPlane:
 
         if start_index is None:
             # No overlap — gap between snapshot and buffered updates
-            book.sequence = 0
-            book.last_update_id = 0
-            book.fault_reason = "buffered_replay_snapshot_boundary: no overlapping update"
-            book.transition_to_rebuilding(int(time.time() * 1000))
-            self._runtime.handle_runtime_failure(
-                venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                "buffered_replay_snapshot_boundary: no overlapping update", 0,
+            return self._mark_rebuilding_from_buffered_replay_failure(
+                venue=venue,
+                symbol=symbol,
+                book=book,
+                reason="buffered_replay_snapshot_boundary: no overlapping update",
+                now_ms=replay_now_ms,
+                snapshot_last_update_id=snapshot_last_update_id,
+                expected_previous_sequence=previous_sequence,
+                buf=buf,
+                filtered=filtered,
+                failure_update=filtered[0].update if filtered else None,
+                replayed=0,
+                replay_index=-1,
             )
-            return _BufferedReplayResult(ok=False)
 
         # Replay from overlap point with continuity check
         # V1: buffered_updates.into_iter().skip(start_index).enumerate()
@@ -669,77 +852,101 @@ class LocalL2DataPlane:
         for i, bu in enumerate(filtered[start_index:], start=start_index):
             if bu.update.sequence <= previous_sequence:
                 continue
-            first_id = (
-                bu.update.first_sequence
-                if bu.update.first_sequence > 0
-                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
-                else bu.update.sequence
-            )
-            overlaps_expected = first_id <= previous_sequence + 1 <= bu.update.sequence
-
-            # V1 Binance/Aster: standard continuity check
-            if i > start_index:
-                if (
-                    (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
-                    and bu.update.previous_sequence > 0
-                    and bu.update.previous_sequence != previous_sequence
-                    and not overlaps_expected
-                ):
-                    book.sequence = 0
-                    book.last_update_id = 0
-                    book.fault_reason = (
-                        f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}"
-                    )
-                    book.transition_to_rebuilding(int(time.time() * 1000))
-                    self._runtime.handle_runtime_failure(
-                        venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                        f"buffered_replay_previous_link_mismatch: expected {previous_sequence} got {bu.update.previous_sequence}", 0,
-                    )
-                    return _BufferedReplayResult(replayed=replayed, ok=False)
-            elif (
+            has_previous_link = (
                 (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
                 and bu.update.previous_sequence > 0
-                and expected < bu.update.previous_sequence + 1
-            ):
+            )
+
+            # Binance/Aster strict continuity: for every replayed event, pu must
+            # equal the previous accepted u. Range overlap can bridge a snapshot,
+            # but it must never excuse a broken previous-link chain.
+            if has_previous_link and bu.update.previous_sequence != previous_sequence:
+                reason = (
+                    f"buffered_replay_previous_link_mismatch: expected {previous_sequence} "
+                    f"got {bu.update.previous_sequence}"
+                )
+                if i == start_index and expected < bu.update.previous_sequence + 1:
+                    reason = (
+                        f"buffered_replay_snapshot_boundary: expected {expected} "
+                        f"got {bu.update.previous_sequence + 1}"
+                    )
+                return self._mark_rebuilding_from_buffered_replay_failure(
+                    venue=venue,
+                    symbol=symbol,
+                    book=book,
+                    reason=reason,
+                    now_ms=replay_now_ms,
+                    snapshot_last_update_id=snapshot_last_update_id,
+                    expected_previous_sequence=previous_sequence,
+                    buf=buf,
+                    filtered=filtered,
+                    failure_update=bu.update,
+                    replayed=replayed,
+                    replay_index=i,
+                )
+
+            if i == start_index and has_previous_link and expected < bu.update.previous_sequence + 1:
                 # First replay: gap between snapshot and first buffered
-                book.sequence = 0
-                book.last_update_id = 0
-                book.fault_reason = (
+                reason = (
                     f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}"
                 )
-                book.transition_to_rebuilding(int(time.time() * 1000))
-                self._runtime.handle_runtime_failure(
-                    venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                    f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}", 0,
+                return self._mark_rebuilding_from_buffered_replay_failure(
+                    venue=venue,
+                    symbol=symbol,
+                    book=book,
+                    reason=reason,
+                    now_ms=replay_now_ms,
+                    snapshot_last_update_id=snapshot_last_update_id,
+                    expected_previous_sequence=previous_sequence,
+                    buf=buf,
+                    filtered=filtered,
+                    failure_update=bu.update,
+                    replayed=replayed,
+                    replay_index=i,
                 )
-                return _BufferedReplayResult(replayed=replayed, ok=False)
 
             try:
                 replay_result = self._runtime.record_update_result(
                     bu.update, bu.observed_at_ms,
                 )
                 if replay_result.rebuild_required:
-                    book.sequence = 0
-                    book.last_update_id = 0
-                    book.fault_reason = (
+                    reason = (
                         replay_result.fault_reason
                         or f"buffered_replay_apply_failed at index {i}"
                     )
-                    book.transition_to_rebuilding(int(time.time() * 1000))
-                    return _BufferedReplayResult(replayed=replayed, ok=False)
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
+                    )
                 if replay_result.applied:
                     previous_sequence = bu.update.sequence
                     replayed += 1
             except Exception:
-                book.sequence = 0
-                book.last_update_id = 0
-                book.fault_reason = f"buffered_replay_apply_failed at index {i}"
-                book.transition_to_rebuilding(int(time.time() * 1000))
-                self._runtime.handle_runtime_failure(
-                    venue, symbol, RuntimeFaultKind.SEQUENCE_GAP,
-                    f"buffered_replay_apply_failed at index {i}", 0,
+                reason = f"buffered_replay_apply_failed at index {i}"
+                return self._mark_rebuilding_from_buffered_replay_failure(
+                    venue=venue,
+                    symbol=symbol,
+                    book=book,
+                    reason=reason,
+                    now_ms=replay_now_ms,
+                    snapshot_last_update_id=snapshot_last_update_id,
+                    expected_previous_sequence=previous_sequence,
+                    buf=buf,
+                    filtered=filtered,
+                    failure_update=bu.update,
+                    replayed=replayed,
+                    replay_index=i,
                 )
-                return _BufferedReplayResult(replayed=replayed, ok=False)
 
         return _BufferedReplayResult(replayed=replayed)
 
@@ -1193,6 +1400,7 @@ class LocalL2DataPlane:
         status_before: str = "",
         status_after: str = "",
         pool_before: str = "",
+        **extra,
     ) -> dict:
         """Build a structured evidence payload for rebuild/transition logging.
 
@@ -1216,7 +1424,7 @@ class LocalL2DataPlane:
             book.pool.value if book is not None and hasattr(book.pool, "value")
             else str(getattr(book, "pool", "unknown")) if book else "missing"
         )
-        return {
+        payload = {
             "venue": venue,
             "symbol": symbol,
             "status_before": status_before or current_status,
@@ -1244,6 +1452,8 @@ class LocalL2DataPlane:
             "reason_class": reason_class,
             "policy_bridge_mode": policy.bridge_mode.value,
         }
+        payload.update(extra)
+        return payload
 
     def diagnostics_snapshot(self) -> dict:
         """Return a diagnostics view of the data plane."""

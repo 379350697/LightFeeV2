@@ -2645,6 +2645,259 @@ class PassiveCloseExecutor:
         pending.next_retry_at_ms = self._now_ms() + 5_000
         return False
 
+    async def _handle_live_balanced_close_target(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        live_quantity: float,
+        source: str,
+    ) -> bool:
+        """Close the matched quantity from live truth instead of stale local fills."""
+        from lightfee.engine.close_executor import CloseExecutor
+
+        if live_quantity <= 1e-9:
+            return await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source=f"{source}_flat_probe",
+            )
+
+        if not isinstance(self._close_executor, CloseExecutor):
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        self._journal.append(
+            "exit.passive_close_live_matched_close",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "live_matched_quantity": live_quantity,
+                "source": source,
+            },
+        )
+        close_result = await self._close_executor.execute_close(
+            position=position,
+            reason=pending.reason,
+            now_ms=self._now_ms(),
+            long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
+            short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+            total_quantity=live_quantity,
+            state=state,
+            short_stage=pending.short_stage or "exit_short",
+            long_stage=pending.long_stage or "exit_long",
+        )
+        if close_result is None:
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source=f"{source}_matched_close_flat_probe",
+            extra={"live_matched_quantity": live_quantity},
+        ):
+            return True
+        pending.next_retry_at_ms = self._now_ms() + 5_000
+        return False
+
+    async def _handle_live_imbalanced_positions(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        live_long: Any,
+        live_short: Any,
+        live_long_qty: float,
+        live_short_qty: float,
+    ) -> bool:
+        """Rebuild fallback target from nonzero but imbalanced live positions."""
+        live_matched_qty = min(live_long_qty, live_short_qty)
+        excess_qty = abs(live_long_qty - live_short_qty)
+        if excess_qty <= 1e-9:
+            return await self._handle_live_balanced_close_target(
+                state,
+                pending,
+                position,
+                live_quantity=live_matched_qty,
+                source="fallback_live_balanced",
+            )
+
+        if live_long_qty > live_short_qty:
+            excess_venue = position.long_venue
+            excess_snapshot = live_long
+            excess_leg = "long"
+            default_close_side = Side.SELL
+            failed_stage = pending.long_stage or "exit_long"
+        else:
+            excess_venue = position.short_venue
+            excess_snapshot = live_short
+            excess_leg = "short"
+            default_close_side = Side.BUY
+            failed_stage = pending.short_stage or "exit_short"
+
+        live_side = getattr(excess_snapshot, "side", None)
+        close_side = live_side.opposite() if isinstance(live_side, Side) else default_close_side
+        adapter = self._adapter(excess_venue)
+        if adapter is None:
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        try:
+            normalized_excess = float(await adapter.normalize_quantity(position.symbol, excess_qty))
+        except Exception as exc:
+            self._journal.append(
+                "exit.passive_close_live_imbalanced_normalize_failed",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "excess_venue": excess_venue.value,
+                    "excess_quantity": excess_qty,
+                    "error": str(exc),
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        price_hint = self._resolve_local_l2_mid(excess_venue, position.symbol)
+        min_notional_violation = self._check_hedge_min_notional(
+            excess_venue,
+            position.symbol,
+            close_side,
+            normalized_excess,
+            price_hint,
+        )
+        self._journal.append(
+            "exit.passive_close_live_imbalanced",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "live_long_quantity": live_long_qty,
+                "live_short_quantity": live_short_qty,
+                "live_matched_quantity": live_matched_qty,
+                "excess_venue": excess_venue.value,
+                "excess_leg": excess_leg,
+                "excess_quantity": excess_qty,
+                "normalized_excess_quantity": normalized_excess,
+                "excess_notional_quote": normalized_excess * max(price_hint, 0.0),
+                "min_notional_rejected": min_notional_violation is not None,
+            },
+        )
+
+        if normalized_excess <= 1e-12 or min_notional_violation is not None:
+            leg_notional = 0.0
+            min_notional = 0.0
+            if min_notional_violation is not None:
+                leg_notional = min_notional_violation["leg_notional"]
+                min_notional = min_notional_violation["min_notional"]
+            self._journal.append(
+                "exit.passive_close_hedge_dust_aborted",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": excess_venue.value,
+                    "hedge_leg": excess_leg,
+                    "requested": excess_qty,
+                    "normalized_quantity": normalized_excess,
+                    "price_hint": price_hint,
+                    "reason": (
+                        "normalized_quantity_zero"
+                        if normalized_excess <= 1e-12
+                        else "min_notional_rejected"
+                    ),
+                    "maker_terminal": True,
+                    "leg_notional_quote": leg_notional,
+                    "venue_min_notional_quote": min_notional,
+                },
+            )
+            return await self._abort_and_compensate_min_notional(
+                state,
+                pending,
+                position,
+                hedge_venue=excess_venue,
+                hedge_leg=excess_leg,
+                missing_quantity=excess_qty,
+                normalized_quantity=normalized_excess,
+                leg_notional_quote=leg_notional,
+                venue_min_notional_quote=min_notional,
+                failed_stage=failed_stage,
+                source="fallback_live_imbalanced_min_notional",
+            )
+
+        client_order_id = compact_client_order_id(
+            position.position_id,
+            f"exit_live_excess_{excess_leg}",
+        )
+        request = OrderRequest(
+            venue=excess_venue,
+            symbol=position.symbol,
+            side=close_side,
+            quantity=normalized_excess,
+            price=price_hint if price_hint > 0 else None,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+        try:
+            fill = await adapter.place_order(request)
+        except Exception as exc:
+            self._journal.append(
+                "exit.passive_close_live_imbalanced_excess_error",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "excess_venue": excess_venue.value,
+                    "excess_quantity": normalized_excess,
+                    "error": str(exc),
+                },
+            )
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="fallback_live_imbalanced_excess_error_flat_probe",
+                extra={
+                    "excess_venue": excess_venue.value,
+                    "excess_quantity": normalized_excess,
+                    "flatten_error": str(exc),
+                },
+            ):
+                return True
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        leg = PersistedCloseExecutionLeg(
+            fill=fill,
+            client_order_id=client_order_id,
+            submit_started_at_ms=self._now_ms(),
+        )
+        if excess_leg == "short":
+            pending.short_legs.append(leg)
+        else:
+            pending.long_legs.append(leg)
+        self._journal.append(
+            "exit.passive_close_live_imbalanced_excess_flattened",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "excess_venue": excess_venue.value,
+                "excess_leg": excess_leg,
+                "excess_quantity": normalized_excess,
+                "filled_quantity": getattr(fill, "quantity", 0.0),
+                "live_matched_quantity": live_matched_qty,
+            },
+        )
+
+        return await self._handle_live_balanced_close_target(
+            state,
+            pending,
+            position,
+            live_quantity=live_matched_qty,
+            source="fallback_live_imbalanced",
+        )
+
     async def _fallback_to_aggressive_close(
         self,
         state: EngineState,
@@ -2707,6 +2960,16 @@ class PassiveCloseExecutor:
                     venue=position.short_venue,
                     live_snapshot=live_short,
                     leg_label="short",
+                )
+            if live_long_qty > 1e-9 and live_short_qty > 1e-9:
+                return await self._handle_live_imbalanced_positions(
+                    state,
+                    pending,
+                    position,
+                    live_long=live_long,
+                    live_short=live_short,
+                    live_long_qty=live_long_qty,
+                    live_short_qty=live_short_qty,
                 )
         elif await self._clear_if_live_flat(
             state,

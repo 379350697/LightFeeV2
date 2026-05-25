@@ -788,6 +788,15 @@ def _make_journal():
     return j
 
 
+class _RecordingJournal:
+    def __init__(self):
+        self.records = []
+
+    def append(self, kind, payload, **kwargs):
+        self.records.append((kind, payload))
+        return len(self.records)
+
+
 class TestBybitWsSnapshotAuthoritative:
     @pytest.mark.asyncio
     async def test_bybit_rest_bootstrap_fallback_when_registered_ws_is_not_connected(self):
@@ -884,6 +893,77 @@ class TestBybitWsSnapshotAuthoritative:
 
 
 class TestBinanceAsterV1BufferCapParity:
+    @pytest.mark.asyncio
+    async def test_binance_buffered_replay_valid_bridge_promotes_hot(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "VALIDUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="VALIDUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=101,
+                sequence=101,
+                previous_sequence=100,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "VALIDUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is True
+        assert rt.get_book("binance", "VALIDUSDT").status == L2BookStatus.HOT
+        assert rt.get_book("binance", "VALIDUSDT").sequence == 101
+        assert not [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_error"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_binance_buffered_replay_invalid_bridge_keeps_rebuilding(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "GAPUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="GAPUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=106,
+                sequence=110,
+                previous_sequence=105,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "GAPUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert "snapshot_boundary" in rt.get_book("binance", "GAPUSDT").fault_reason
+        assert rt.get_book("binance", "GAPUSDT").status == L2BookStatus.REBUILDING
+
     def test_binance_pre_snapshot_buffer_uses_v1_capacity(self):
         """V1 BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP = 4096, not 512."""
         rt = LocalL2Runtime()
@@ -920,8 +1000,8 @@ class TestBinanceAsterV1BufferCapParity:
                 LocalL2Update(
                     venue="binance",
                     symbol="JTOUSDT",
-                    bids=[PriceLevel(1.0, 10.0)],
-                    asks=[PriceLevel(1.1, 10.0)],
+                    bids=[PriceLevel(49910.0, 10.0)],
+                    asks=[PriceLevel(50110.0, 10.0)],
                     sequence=seq,
                     previous_sequence=prev,
                     update_kind=LocalL2UpdateKind.DELTA,
@@ -930,8 +1010,8 @@ class TestBinanceAsterV1BufferCapParity:
             )
 
         book.apply_snapshot(
-            [PriceLevel(1.0, 10.0)],
-            [PriceLevel(1.1, 10.0)],
+            [PriceLevel(49900.0, 10.0)],
+            [PriceLevel(50100.0, 10.0)],
             sequence=10591999713003,
             now_ms=1,
         )
@@ -941,6 +1021,117 @@ class TestBinanceAsterV1BufferCapParity:
         assert replay.ok is False
         assert "previous_link_mismatch" in rt.get_book("binance", "JTOUSDT").fault_reason
         assert rt.get_book("binance", "JTOUSDT").status == L2BookStatus.REBUILDING
+
+    @pytest.mark.asyncio
+    async def test_binance_buffered_replay_previous_link_mismatch_payload(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "DEXEUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        for now_ms, first_seq, seq, prev in (
+            (1000, 101, 102, 100),
+            (1250, 103, 104, 101),
+        ):
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="DEXEUSDT",
+                    bids=[PriceLevel(49920.0, 10.0)],
+                    asks=[PriceLevel(50120.0, 10.0)],
+                    first_sequence=first_seq,
+                    sequence=seq,
+                    previous_sequence=prev,
+                    previous_sequence_present=True,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=now_ms,
+            )
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "DEXEUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        payload = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_error"
+            and payload.get("category") == "buffered_replay_failed"
+        ][0]
+        assert payload["raw_U"] == 103
+        assert payload["raw_u"] == 104
+        assert payload["raw_pu"] == 101
+        assert payload["snapshot_lastUpdateId"] == 100
+        assert payload["expected_previous_sequence"] == 102
+        assert payload["buffered_count"] == 2
+        assert payload["buffer_age_ms"] == 1000
+        assert payload["rebuild_attempt_id"] == 1
+        assert payload["venue"] == "binance"
+        assert payload["symbol"] == "DEXEUSDT"
+        assert payload["status_before"] == "bootstrapping"
+        assert payload["status_after"] == "rebuilding"
+        assert payload["replay_failure_alert"] is False
+        assert payload["root_bug_suspected"] is False
+
+    @pytest.mark.asyncio
+    async def test_binance_buffered_replay_same_symbol_alert_threshold(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "EDENUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.buffered_replay_failure_alert_threshold = 3
+
+        for attempt in range(3):
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="EDENUSDT",
+                    bids=[PriceLevel(49910.0, 10.0)],
+                    asks=[PriceLevel(50110.0, 10.0)],
+                    first_sequence=101,
+                    sequence=102,
+                    previous_sequence=100,
+                    previous_sequence_present=True,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=1000 + attempt * 100,
+            )
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="EDENUSDT",
+                    bids=[PriceLevel(49920.0, 10.0)],
+                    asks=[PriceLevel(50120.0, 10.0)],
+                    first_sequence=103,
+                    sequence=104,
+                    previous_sequence=101,
+                    previous_sequence_present=True,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=1100 + attempt * 100,
+            )
+            await dp.bootstrap_book(
+                "binance",
+                "EDENUSDT",
+                MockL2Adapter("binance", sequence=100),
+                now_ms=2000 + attempt * 1000,
+            )
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_error"
+            and payload.get("category") == "buffered_replay_failed"
+        ]
+        assert [p["replay_failure_count_for_symbol"] for p in payloads] == [1, 2, 3]
+        assert [p["replay_failure_alert"] for p in payloads] == [False, False, True]
+        assert payloads[0]["severity"] == "info"
+        assert payloads[2]["severity"] == "warning"
+        assert all(p["root_bug_suspected"] is False for p in payloads)
 
 
 # ---------------------------------------------------------------------------

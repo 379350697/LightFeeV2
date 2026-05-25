@@ -637,6 +637,57 @@ class TestMarketSnapshotDiagnostics:
         assert payload["incoming_first_sequence"] == 106
         assert payload["policy_buffer_cap"] == 4096
 
+    def test_hot_binance_pu_mismatch_rebuilds_even_when_range_overlaps(self):
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=100,
+            now_ms=1000,
+        )
+        book.transition_to_bootstrapping(1000)
+        book.transition_to_hot()
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(99.0, 1.0)],
+                asks=[],
+                first_sequence=101,
+                sequence=102,
+                previous_sequence=99,
+                previous_sequence_present=True,
+                event_time_ms=2000,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2000,
+        )
+
+        assert book.status == L2BookStatus.REBUILDING
+        assert "previous_link_mismatch" in book.fault_reason
+        payload = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_sequence_gap_rebuild"
+        ][0]
+        assert payload["raw_U"] == 101
+        assert payload["raw_u"] == 102
+        assert payload["raw_pu"] == 99
+        assert payload["expected_previous_sequence"] == 100
+        assert payload["status_before"] == "hot"
+        assert payload["status_after"] == "rebuilding"
+
     def test_degraded_transition_preserves_error(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.transition_to_degraded("connection timeout")

@@ -1504,6 +1504,40 @@ class VenueTransport(MarketDataClient):
         }
         self._order_diagnostics.append({"kind": kind, "payload": clean})
 
+    def _record_order_reconcile_query(
+        self,
+        *,
+        symbol: str,
+        order_id: str = "",
+        client_order_id: str = "",
+        queried_endpoints: Optional[list[str]] = None,
+        response_classification: str = "",
+        uncertain_subtype: str = "",
+        next_action: str = "reconcile_again_after_backoff",
+    ) -> None:
+        endpoints = [str(e) for e in (queried_endpoints or []) if str(e)]
+        if not endpoints:
+            endpoints = ["fetch_order_status"]
+        classification = response_classification or uncertain_subtype or "uncertain"
+        self._record_order_diagnostic(
+            "order.reconcile_query",
+            {
+                "venue": self._spec.venue_id.value,
+                "symbol": symbol,
+                "client_order_id": client_order_id,
+                "order_id": order_id,
+                "exchange_order_id": order_id,
+                "queried_endpoints": endpoints,
+                "endpoint_responses": [
+                    {"endpoint": endpoint, "classification": classification}
+                    for endpoint in endpoints
+                ],
+                "response_classification": classification,
+                "uncertain_subtype": uncertain_subtype,
+                "next_action": next_action,
+            },
+        )
+
     def startup_preflight(self) -> dict[str, Any]:
         missing: list[str] = []
         if self._spec.requires_wallet_key:
@@ -3712,6 +3746,16 @@ class VenueTransport(MarketDataClient):
                     venue_sym, order_id, client_order_id, now_ms,
                 )
 
+            elif spec.venue_id == Venue.BINANCE:
+                return await self._fetch_order_status_binance(
+                    venue_sym, order_id, client_order_id, now_ms,
+                )
+
+            elif spec.venue_id == Venue.OKX:
+                return await self._fetch_order_status_okx(
+                    venue_sym, order_id, client_order_id, now_ms,
+                )
+
             elif spec.venue_id == Venue.BITGET:
                 params: dict[str, Any] = {}
                 if order_id:
@@ -3726,11 +3770,247 @@ class VenueTransport(MarketDataClient):
         except TransportError as e:
             if e.category == TransportErrorCategory.REQUEST_REJECTED:
                 raise
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=["fetch_order_status"],
+                response_classification=f"transport_error:{e.category.value}",
+                uncertain_subtype="submit_timeout",
+            )
             return None
         except _BybitOrderNotFound:
             return None
 
         return None
+
+    async def _fetch_order_status_binance(
+        self,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        if not order_id and not client_order_id:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                queried_endpoints=["/fapi/v1/order"],
+                response_classification="missing_order_identifier",
+                uncertain_subtype="execution_not_found",
+            )
+            return None
+
+        params: dict[str, Any] = {"symbol": venue_sym}
+        if order_id:
+            params["orderId"] = order_id
+        else:
+            params["origClientOrderId"] = client_order_id
+        raw = await self._request("GET", "/fapi/v1/order", params=params, private=True)
+
+        code = raw.get("code") if isinstance(raw, dict) else None
+        if code is not None and str(code).lstrip("-").isdigit() and int(code) < 0:
+            msg = str(raw.get("msg", ""))
+            subtype = "open_order_not_found" if str(code) in ("-2011", "-2013") else "execution_not_found"
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=["/fapi/v1/order"],
+                response_classification=f"binance_error_{code}:{msg}",
+                uncertain_subtype=subtype,
+            )
+            return None
+
+        result = self._parse_order_status_binance(raw, venue_sym, now_ms)
+        classification = "filled" if result is not None else self._classify_binance_zero_fill(raw)
+        subtype = "" if result is not None else (
+            "stale_accepted_order"
+            if classification == "stale_accepted_order"
+            else "execution_not_found"
+        )
+        self._record_order_reconcile_query(
+            symbol=venue_sym,
+            order_id=str(raw.get("orderId", order_id)) if isinstance(raw, dict) else order_id,
+            client_order_id=str(raw.get("clientOrderId", client_order_id)) if isinstance(raw, dict) else client_order_id,
+            queried_endpoints=["/fapi/v1/order"],
+            response_classification=classification,
+            uncertain_subtype=subtype,
+            next_action="clear_uncertain_state" if result is not None else "check_live_position",
+        )
+        return result
+
+    @staticmethod
+    def _classify_binance_zero_fill(raw: dict[str, Any]) -> str:
+        status = str(raw.get("status", "")).upper() if isinstance(raw, dict) else ""
+        if status in ("NEW", "PENDING_NEW", "PARTIALLY_FILLED"):
+            return "stale_accepted_order"
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            return "closed_order_not_found"
+        return "execution_not_found"
+
+    def _parse_order_status_binance(
+        self,
+        raw: dict[str, Any],
+        venue_sym: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        if not isinstance(raw, dict):
+            return None
+        qty = _safe_float(raw.get("executedQty", raw.get("cumQty", "0")))
+        if qty <= 0.0:
+            return None
+        side_raw = str(raw.get("side", "")).upper()
+        if side_raw == "BUY":
+            side = Side.BUY
+        elif side_raw == "SELL":
+            side = Side.SELL
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"binance order status has invalid/missing side value {side_raw!r}",
+            )
+        avg_price = _safe_float(raw.get("avgPrice", raw.get("price", "0")))
+        if avg_price <= 0.0:
+            quote_qty = _safe_float(raw.get("cumQuote", raw.get("cumQuoteQty", "0")))
+            if quote_qty > 0.0:
+                avg_price = quote_qty / qty
+        status = str(raw.get("status", ""))
+        return OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol=venue_sym,
+            side=side,
+            quantity=qty,
+            average_price=avg_price,
+            order_id=str(raw.get("orderId", "")),
+            client_order_id=str(raw.get("clientOrderId", "")) or None,
+            filled_at_ms=int(raw.get("updateTime", raw.get("time", now_ms)) or now_ms),
+            metadata={
+                "raw_exchange_status": status,
+                "queried_endpoints": ["/fapi/v1/order"],
+                "response_classification": "filled",
+            },
+        )
+
+    async def _fetch_order_status_okx(
+        self,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        if not order_id and not client_order_id:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                queried_endpoints=["/api/v5/trade/order"],
+                response_classification="missing_order_identifier",
+                uncertain_subtype="execution_not_found",
+            )
+            return None
+
+        params: dict[str, Any] = {"instId": venue_sym}
+        if order_id:
+            params["ordId"] = order_id
+        else:
+            params["clOrdId"] = client_order_id
+
+        endpoints: list[str] = ["/api/v5/trade/order"]
+        open_raw = await self._request(
+            "GET", "/api/v5/trade/order", params=params, private=True,
+        )
+        open_result = self._parse_order_status_okx(open_raw, venue_sym, now_ms)
+        if open_result is not None:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=open_result.order_id,
+                client_order_id=open_result.client_order_id or client_order_id,
+                queried_endpoints=endpoints,
+                response_classification="filled",
+                next_action="clear_uncertain_state",
+            )
+            return open_result
+
+        history_params = dict(params)
+        history_params["instType"] = "SWAP"
+        endpoints.append("/api/v5/trade/orders-history")
+        history_raw = await self._request(
+            "GET", "/api/v5/trade/orders-history", params=history_params, private=True,
+        )
+        history_result = self._parse_order_status_okx(history_raw, venue_sym, now_ms)
+        if history_result is not None:
+            metadata = dict(history_result.metadata or {})
+            metadata["queried_endpoints"] = list(endpoints)
+            metadata["response_classification"] = "filled"
+            history_result = replace(history_result, metadata=metadata)
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=history_result.order_id,
+                client_order_id=history_result.client_order_id or client_order_id,
+                queried_endpoints=endpoints,
+                response_classification="filled",
+                next_action="clear_uncertain_state",
+            )
+            return history_result
+
+        self._record_order_reconcile_query(
+            symbol=venue_sym,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            queried_endpoints=endpoints,
+            response_classification="open_order_not_found;closed_order_not_found",
+            uncertain_subtype="closed_order_not_found",
+            next_action="check_live_position",
+        )
+        return None
+
+    def _parse_order_status_okx(
+        self,
+        raw: dict[str, Any],
+        venue_sym: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        if not isinstance(raw, dict):
+            return None
+        if str(raw.get("code", "0")) != "0":
+            return None
+        data = raw.get("data", [])
+        if isinstance(data, list):
+            row = data[0] if data else {}
+        elif isinstance(data, dict):
+            row = data
+        else:
+            row = {}
+        if not isinstance(row, dict) or not row:
+            return None
+        qty = _safe_float(row.get("accFillSz", row.get("fillSz", "0")))
+        if qty <= 0.0:
+            return None
+        side_raw = str(row.get("side", "")).lower()
+        if side_raw == "buy":
+            side = Side.BUY
+        elif side_raw == "sell":
+            side = Side.SELL
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"okx order status has invalid/missing side value {side_raw!r}",
+            )
+        avg_price = _safe_float(row.get("avgPx", row.get("fillPx", "0")))
+        return OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol=venue_sym,
+            side=side,
+            quantity=qty,
+            average_price=avg_price,
+            order_id=str(row.get("ordId", "")),
+            client_order_id=str(row.get("clOrdId", "")) or None,
+            fee_quote=abs(_safe_float(row.get("fee", "0"))) or None,
+            filled_at_ms=int(row.get("uTime", row.get("fillTime", now_ms)) or now_ms),
+            metadata={
+                "raw_exchange_status": str(row.get("state", "")),
+                "queried_endpoints": ["/api/v5/trade/order"],
+                "response_classification": "filled",
+            },
+        )
 
     async def _fetch_order_status_bybit(
         self,
@@ -3745,33 +4025,76 @@ class VenueTransport(MarketDataClient):
         """
         resolved_order_id = order_id
         resolved_client_id = ""
+        queried_endpoints: list[str] = []
 
-        # Step 1: resolve orderId from client_order_id if needed
+        # Step 1: resolve orderId from client_order_id if needed.
+        # V1 duplicate orderLinkId reconciliation must search open/realtime
+        # state first, then closed order history, before aggregating executions.
         if not resolved_order_id:
-            params: dict[str, Any] = {
-                "category": "linear",
-                "symbol": venue_sym,
-                "openOnly": 0,
-            }
             if client_order_id:
-                params["orderLinkId"] = client_order_id
+                lookup_specs = [
+                    (
+                        "/v5/order/realtime",
+                        {
+                            "category": "linear",
+                            "symbol": venue_sym,
+                            "openOnly": 0,
+                            "orderLinkId": client_order_id,
+                        },
+                        "bybit order realtime",
+                    ),
+                    (
+                        "/v5/order/history",
+                        {
+                            "category": "linear",
+                            "symbol": venue_sym,
+                            "orderLinkId": client_order_id,
+                        },
+                        "bybit order history",
+                    ),
+                ]
             else:
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    queried_endpoints=["/v5/order/realtime"],
+                    response_classification="missing_order_identifier",
+                    uncertain_subtype="execution_not_found",
+                )
                 return None  # need at least one identifier
 
-            raw = await self._request(
-                "GET", "/v5/order/realtime", params=params, private=True,
-            )
-            # V1: check retCode before parsing (Bybit error codes doc)
-            self._require_bybit_reconciliation_success(raw, "bybit order realtime")
+            for path, params, context in lookup_specs:
+                queried_endpoints.append(path)
+                raw = await self._request(
+                    "GET", path, params=params, private=True,
+                )
+                try:
+                    self._require_bybit_reconciliation_success(raw, context)
+                except _BybitOrderNotFound:
+                    continue
 
-            result = raw.get("result", {})
-            data = result.get("list", [None])[0] if isinstance(result, dict) and result.get("list") else result
-            if not isinstance(data, dict):
-                return None
+                result = raw.get("result", {})
+                data = (
+                    result.get("list", [None])[0]
+                    if isinstance(result, dict) and result.get("list")
+                    else result
+                )
+                if not isinstance(data, dict):
+                    continue
 
-            resolved_order_id = str(data.get("orderId", ""))
-            resolved_client_id = str(data.get("orderLinkId", ""))
+                resolved_order_id = str(data.get("orderId", ""))
+                resolved_client_id = str(data.get("orderLinkId", ""))
+                if resolved_order_id:
+                    break
+
             if not resolved_order_id:
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    client_order_id=client_order_id,
+                    queried_endpoints=queried_endpoints,
+                    response_classification="open_order_not_found;closed_order_not_found",
+                    uncertain_subtype="closed_order_not_found",
+                    next_action="check_live_position",
+                )
                 return None
 
         # Step 2: query /v5/execution/list with resolved orderId
@@ -3780,6 +4103,7 @@ class VenueTransport(MarketDataClient):
             "symbol": venue_sym,
             "orderId": resolved_order_id,
         }
+        queried_endpoints.append("/v5/execution/list")
         exec_raw = await self._request(
             "GET", "/v5/execution/list", params=exec_params, private=True,
         )
@@ -3787,9 +4111,34 @@ class VenueTransport(MarketDataClient):
         self._require_bybit_reconciliation_success(exec_raw, "bybit execution reconciliation")
 
         # Step 3: aggregate executions
-        return self._parse_bybit_execution_list(
+        reconciliation = self._parse_bybit_execution_list(
             exec_raw, venue_sym, resolved_order_id, resolved_client_id, now_ms,
         )
+        if reconciliation is not None:
+            metadata = dict(reconciliation.metadata or {})
+            metadata["queried_endpoints"] = list(queried_endpoints)
+            metadata["response_classification"] = "filled"
+            reconciliation = replace(reconciliation, metadata=metadata)
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=reconciliation.order_id,
+                client_order_id=reconciliation.client_order_id or client_order_id,
+                queried_endpoints=queried_endpoints,
+                response_classification="filled",
+                next_action="clear_uncertain_state",
+            )
+            return reconciliation
+
+        self._record_order_reconcile_query(
+            symbol=venue_sym,
+            order_id=resolved_order_id,
+            client_order_id=resolved_client_id or client_order_id,
+            queried_endpoints=queried_endpoints,
+            response_classification="execution_not_found",
+            uncertain_subtype="execution_not_found",
+            next_action="check_live_position",
+        )
+        return None
 
     def _require_bybit_reconciliation_success(
         self, raw: dict[str, Any], context: str,

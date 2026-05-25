@@ -378,6 +378,29 @@ class TestMetricsExportV1Semantics:
             "V1 parity violation: metrics missing position group quantity"
         )
 
+    def test_metrics_include_snapshot_freshness_by_venue_symbol_domain(self):
+        state = EngineState(
+            lifecycle=EngineLifecycle.RUNNING,
+            risk_mode=GlobalRiskMode.RUNNING,
+        )
+        state.last_scan = {
+            "snapshot_freshness_metrics": {
+                "okx|BTCUSDT|liquidity": {"fresh": 0, "stale": 2},
+                "bybit|BTCUSDT|quote": {"fresh": 1, "stale": 0},
+            }
+        }
+
+        samples = _build_prometheus_metric_samples(state)
+
+        assert (
+            'lightfee_snapshot_freshness_observed_total{venue="okx",symbol="BTCUSDT",domain="liquidity",decision="stale"} 2'
+            in samples
+        )
+        assert (
+            'lightfee_snapshot_freshness_observed_total{venue="bybit",symbol="BTCUSDT",domain="quote",decision="fresh"} 1'
+            in samples
+        )
+
     def test_metrics_include_lifecycle_and_risk_mode_gauges(self):
         """V1 parity: lifecycle and risk_mode are exported as gauge metrics."""
         state = EngineState(

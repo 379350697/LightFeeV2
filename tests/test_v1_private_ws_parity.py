@@ -35,6 +35,15 @@ async def _sleep_short():
     await asyncio.sleep(0.02)
 
 
+async def _wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    assert predicate()
+
+
 # ============================================================================
 # V1 real-event parser fixtures
 # ============================================================================
@@ -546,6 +555,41 @@ class _FakeWebSocket:
         self.closed = True
 
 
+class _BlockingFakeWebSocket(_FakeWebSocket):
+    """Fake websocket that stays open until the worker explicitly closes it."""
+
+    def __init__(self):
+        super().__init__(messages=[])
+        self._closed_event = asyncio.Event()
+
+    async def recv(self) -> str:
+        await self._closed_event.wait()
+        from websockets.exceptions import ConnectionClosed
+        raise ConnectionClosed(1000, "closed by test")
+
+    async def close(self) -> None:
+        self.closed = True
+        self._closed_event.set()
+
+    async def __aexit__(self, *args):
+        await self.close()
+
+
+class _MessageThenBlockingFakeWebSocket(_BlockingFakeWebSocket):
+    """Fake websocket that emits canned messages, then stays open."""
+
+    def __init__(self, messages: list[str]):
+        super().__init__()
+        self.messages = messages
+
+    async def recv(self) -> str:
+        if self._count < len(self.messages):
+            msg = self.messages[self._count]
+            self._count += 1
+            return msg
+        return await super().recv()
+
+
 def _fake_connect(fake_ws: _FakeWebSocket):
     """Return a callable that returns the async context manager.
 
@@ -586,6 +630,7 @@ class _FakeTransport:
         self._credential.wallet_private_key = ""
         self._credential.account_address = ""
         self._symbol_metadata: dict = {}
+        self._diagnostics: list[dict] = []
 
     def record_private_ws_success(self, now_ms: int) -> None:
         self._success_count += 1
@@ -597,6 +642,9 @@ class _FakeTransport:
 
     def _venue_symbol(self, sym: str) -> str:
         return sym
+
+    def _record_order_diagnostic(self, kind: str, payload: dict) -> None:
+        self._diagnostics.append({"kind": kind, "payload": payload})
 
     def cached_private_connection_health(self):
         from lightfee.marketdata.resilience import ConnectionHealth
@@ -1051,6 +1099,132 @@ class TestAsterWorkerLifecycle:
             await _sleep_short()
 
         assert transport._failure_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_listen_key_keepalive_closes_ws_and_rotates(self):
+        """Aster -1125 keepalive is terminal: close old WS and reconnect with a new listenKey."""
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        transport = _FakeTransport(venue=Venue.ASTER)
+        transport._spec.rest_url = "https://fapi.aster.com"
+        transport._spec.private_base_url = "https://fapi.aster.com"
+        listen_keys = ["lk-old", "lk-new"]
+        requests: list[tuple[str, Optional[str]]] = []
+        connect_urls: list[str] = []
+
+        async def _request(method: str, path: str, **kwargs):
+            params = kwargs.get("params") or {}
+            requests.append((method, params.get("listenKey")))
+            if method == "POST":
+                return {"listenKey": listen_keys.pop(0)}
+            if method == "PUT" and params.get("listenKey") == "lk-old":
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    'HTTP 400: {"code":-1125,"msg":"This listenKey does not exist."}',
+                    status_code=400,
+                    body='{"code":-1125,"msg":"This listenKey does not exist."}',
+                )
+            return {}
+
+        old_ws = _BlockingFakeWebSocket()
+        new_ws = _MessageThenBlockingFakeWebSocket(
+            messages=[json.dumps({
+                "e": "TRADE_LITE",
+                "s": "ETHUSDT",
+                "i": 222,
+                "c": "rotated-client",
+                "l": "0.03",
+                "L": "2145.00",
+                "T": 1700000003000,
+            })],
+        )
+        sockets = [old_ws, new_ws]
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return sockets[len(connect_urls) - 1]
+
+        transport._request = _request
+        with (
+            patch("lightfee.venues.aster_private_ws.ASTER_LISTEN_KEY_KEEPALIVE_SECS", 0.01),
+            patch("lightfee.marketdata.resilience.compute_backoff_ms", return_value=1),
+            patch("lightfee.venues.aster_private_ws.websockets.connect", side_effect=_connect),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: old_ws.closed and len(connect_urls) >= 2)
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_client_id("rotated-client") is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert old_ws.closed is True
+        assert connect_urls == [
+            "wss://fapi.aster.com/ws/lk-old",
+            "wss://fapi.aster.com/ws/lk-new",
+        ]
+        assert requests.count(("POST", None)) == 2
+        assert ("PUT", "lk-old") in requests
+        assert transport.private_ws_state.order_by_client_id("rotated-client") is not None
+        rotation_events = [
+            event["payload"]
+            for event in transport._diagnostics
+            if event["kind"] == "aster.listen_key_rotation"
+        ]
+        assert rotation_events
+        rotation = rotation_events[-1]
+        assert rotation["invalid_reason"] == "invalid_listen_key_-1125"
+        assert rotation["rotation_count"] == 1
+        assert rotation["reconnect_result"] == "success"
+        assert rotation["listenKey_created_at"] is not None
+        assert "last_keepalive_ok_at" in rotation
+        assert rotation["private_ws_silent_age"] is not None
+        assert rotation["new_listenKey_created_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_transient_keepalive_failure_does_not_create_new_listen_keys(self):
+        """Generic keepalive failures are not terminal invalid-listen-key rotations."""
+        transport = _FakeTransport(venue=Venue.ASTER)
+        transport._spec.rest_url = "https://fapi.aster.com"
+        transport._spec.private_base_url = "https://fapi.aster.com"
+        requests: list[tuple[str, Optional[str]]] = []
+        connect_urls: list[str] = []
+        put_attempts = 0
+
+        async def _request(method: str, path: str, **kwargs):
+            nonlocal put_attempts
+            params = kwargs.get("params") or {}
+            requests.append((method, params.get("listenKey")))
+            if method == "POST":
+                return {"listenKey": "lk-stable"}
+            if method == "PUT":
+                put_attempts += 1
+                if put_attempts == 1:
+                    raise RuntimeError("temporary keepalive timeout")
+                return {}
+            return {}
+
+        ws = _BlockingFakeWebSocket()
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return ws
+
+        transport._request = _request
+        with (
+            patch("lightfee.venues.aster_private_ws.ASTER_LISTEN_KEY_KEEPALIVE_SECS", 0.01),
+            patch("lightfee.venues.aster_private_ws.websockets.connect", side_effect=_connect),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: put_attempts >= 2)
+            await asyncio.sleep(0.04)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert ws.closed is True
+        assert connect_urls == ["wss://fapi.aster.com/ws/lk-stable"]
+        assert requests.count(("POST", None)) == 1
+        assert not any(event["kind"] == "aster.listen_key_rotation" for event in transport._diagnostics)
 
 
 # ============================================================================

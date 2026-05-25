@@ -7,6 +7,7 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
     Venue,
@@ -82,6 +83,18 @@ class BinanceAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> Optional[OrderFillReconciliation]:
+        return await self._transport.fetch_order_status(
+            symbol,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+        )
 
     async def shutdown(self) -> None:
         await self._transport.close()

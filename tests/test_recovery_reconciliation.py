@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderFillReconciliation,
+    PositionSnapshot,
+    Side,
+    Venue,
+)
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.recovery import (
     DustResidual,
@@ -915,6 +921,7 @@ class TestClientOrderIdReconciliation:
         assert result is not None
         assert captured_cid == "test-oid"
 
+
     @pytest.mark.asyncio
     async def test_hyperliquid_override_uses_wire_cloid_and_official_order_status_shape(self):
         """Hyperliquid reconciliation must hash internal CIDs to 128-bit cloids."""
@@ -977,14 +984,254 @@ class TestClientOrderIdReconciliation:
     @pytest.mark.asyncio
     async def test_vanilla_fetch_order_fill_reconciliation_returns_none_without_override(self):
         """Default VenueAdapter.fetch_order_fill_reconciliation returns None.
-        Only Bybit/Bitget overrides return actual data."""
+        Concrete venue overrides return actual data."""
         from lightfee.core.contracts import VenueAdapter as VA
         from lightfee.core.domain import Venue as V
 
-        # OKX does not override fetch_order_fill_reconciliation
         adapter = FakeVenueAdapter(V.OKX)
         result = await adapter.fetch_order_fill_reconciliation(
             "BTCUSDT", "some-order", "some-cid",
         )
         # FakeVenueAdapter default returns None
         assert result is None
+
+
+class _EvidenceAdapter:
+    def __init__(
+        self,
+        venue: Venue,
+        *,
+        reconciliation: OrderFillReconciliation | None = None,
+        position_qty: float = 0.0,
+        position_side: Side = Side.BUY,
+        diagnostics: list[dict] | None = None,
+    ) -> None:
+        self.venue = venue
+        self.reconciliation = reconciliation
+        self.position = PositionSnapshot(
+            venue=venue,
+            symbol="BTCUSDT",
+            side=position_side,
+            quantity=position_qty,
+            entry_price=50000.0,
+            observed_at_ms=1234,
+        )
+        self._diagnostics = diagnostics or []
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> OrderFillReconciliation | None:
+        return self.reconciliation
+
+    async def fetch_position(self, symbol: str) -> PositionSnapshot:
+        return self.position
+
+    def drain_order_diagnostics(self) -> list[dict]:
+        events = list(self._diagnostics)
+        self._diagnostics.clear()
+        return events
+
+
+class TestOrderReconcileUncertainEvidence:
+    """CL-001-G: uncertain reconciliation must carry venue terminality evidence."""
+
+    def _diag(
+        self,
+        venue: Venue,
+        subtype: str,
+        classification: str,
+        endpoints: list[str],
+    ) -> dict:
+        return {
+            "kind": "order.reconcile_query",
+            "payload": {
+                "venue": venue.value,
+                "symbol": "BTCUSDT",
+                "client_order_id": "cid-1",
+                "exchange_order_id": "oid-1",
+                "queried_endpoints": endpoints,
+                "response_classification": classification,
+                "uncertain_subtype": subtype,
+                "next_action": "reconcile_again_after_backoff",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_bybit_duplicate_emits_resolution_with_endpoint_evidence(self):
+        fill = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.5,
+            average_price=50000.0,
+            order_id="oid-1",
+            client_order_id="cid-1",
+            metadata={
+                "uncertain_subtype": "duplicate_client_id",
+                "queried_endpoints": [
+                    "/v5/order/realtime",
+                    "/v5/order/history",
+                    "/v5/execution/list",
+                ],
+                "response_classification": "filled_after_duplicate_client_id",
+                "next_action": "clear_uncertain_state",
+            },
+        )
+        adapter = _EvidenceAdapter(Venue.BYBIT, reconciliation=fill)
+        reconciler = OrderReconciler({Venue.BYBIT: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BYBIT,
+            long_client_order_id="cid-1",
+        )
+
+        assert result.long_status == "filled"
+        events = reconciler.drain_order_diagnostics()
+        payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_result"][-1]
+        assert payload["uncertain_subtype"] == "duplicate_client_id"
+        assert payload["queried_endpoints"] == [
+            "/v5/order/realtime",
+            "/v5/order/history",
+            "/v5/execution/list",
+        ]
+        assert payload["exchange_order_id"] == "oid-1"
+        resolution = [e["payload"] for e in events if e["kind"] == "order.reconcile_resolution"][-1]
+        assert resolution["resolution"] == "duplicate_client_id"
+        assert resolution["clears_uncertain_state"] is True
+
+    @pytest.mark.asyncio
+    async def test_binance_submit_timeout_accepted_later_clears_uncertain(self):
+        fill = OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.25,
+            average_price=51000.0,
+            order_id="bn-oid-1",
+            client_order_id="bn-timeout-cid",
+            metadata={
+                "uncertain_subtype": "submit_timeout",
+                "queried_endpoints": ["/fapi/v1/order"],
+                "response_classification": "filled_after_submit_timeout",
+                "next_action": "clear_uncertain_state",
+            },
+        )
+        adapter = _EvidenceAdapter(Venue.BINANCE, reconciliation=fill, position_qty=0.25)
+        reconciler = OrderReconciler({Venue.BINANCE: adapter})
+
+        await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            long_client_order_id="bn-timeout-cid",
+        )
+
+        events = reconciler.drain_order_diagnostics()
+        result_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_result"][-1]
+        assert result_payload["uncertain_subtype"] == "submit_timeout"
+        assert result_payload["live_position_delta"]["quantity"] == pytest.approx(0.25)
+        resolution = [e["payload"] for e in events if e["kind"] == "order.reconcile_resolution"][-1]
+        assert resolution["resolution"] == "submit_timeout"
+        assert resolution["next_action"] == "clear_uncertain_state"
+
+    @pytest.mark.asyncio
+    async def test_okx_order_not_found_live_flat_is_no_effect_resolution(self):
+        adapter = _EvidenceAdapter(
+            Venue.OKX,
+            position_qty=0.0,
+            diagnostics=[
+                self._diag(
+                    Venue.OKX,
+                    "open_order_not_found",
+                    "open_order_not_found;closed_order_not_found",
+                    ["/api/v5/trade/order", "/api/v5/trade/orders-history"],
+                )
+            ],
+        )
+        reconciler = OrderReconciler({Venue.OKX: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.OKX,
+            long_client_order_id="cid-1",
+        )
+
+        assert result.long_status == "not_found"
+        events = reconciler.drain_order_diagnostics()
+        payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_result"][-1]
+        assert payload["uncertain_subtype"] == "live_no_effect_confirmed"
+        assert payload["queried_endpoints"] == [
+            "/api/v5/trade/order",
+            "/api/v5/trade/orders-history",
+        ]
+        assert payload["next_action"] == "clear_uncertain_state"
+        resolution = [e["payload"] for e in events if e["kind"] == "order.reconcile_resolution"][-1]
+        assert resolution["resolution"] == "live_no_effect_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_live_position_confirmed_resolution_has_live_delta(self):
+        adapter = _EvidenceAdapter(
+            Venue.BINANCE,
+            position_qty=0.4,
+            diagnostics=[
+                self._diag(
+                    Venue.BINANCE,
+                    "execution_not_found",
+                    "order_found_without_execution",
+                    ["/fapi/v1/order", "/fapi/v1/userTrades"],
+                )
+            ],
+        )
+        reconciler = OrderReconciler({Venue.BINANCE: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            long_client_order_id="cid-1",
+        )
+
+        assert result.long_status == "filled"
+        events = reconciler.drain_order_diagnostics()
+        payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_result"][-1]
+        assert payload["uncertain_subtype"] == "live_position_confirmed"
+        assert payload["live_position_delta"]["quantity"] == pytest.approx(0.4)
+        assert payload["next_action"] == "clear_uncertain_state"
+
+    @pytest.mark.asyncio
+    async def test_live_no_effect_confirmed_is_terminal_not_generic_uncertain(self):
+        adapter = _EvidenceAdapter(
+            Venue.BYBIT,
+            position_qty=0.0,
+            diagnostics=[
+                self._diag(
+                    Venue.BYBIT,
+                    "execution_not_found",
+                    "order_history_found_no_execution",
+                    ["/v5/order/history", "/v5/execution/list"],
+                )
+            ],
+        )
+        reconciler = OrderReconciler({Venue.BYBIT: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BYBIT,
+            long_client_order_id="cid-1",
+        )
+
+        assert result.long_status == "not_found"
+        payload = [
+            e["payload"]
+            for e in reconciler.drain_order_diagnostics()
+            if e["kind"] == "order.reconcile_result"
+        ][-1]
+        assert payload["status"] != "uncertain"
+        assert payload["uncertain_subtype"] == "live_no_effect_confirmed"

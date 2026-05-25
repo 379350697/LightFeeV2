@@ -2528,6 +2528,216 @@ class TestRealPathAbortCleanupDeadline:
         assert fake._transport.drained is True
         assert fake._fetch_position_calls == ["0GUSDT", "0GUSDT"]
 
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_reconciles_filled_order(self, tmp_path):
+        """Bybit 110072 in recovery cleanup must reconcile the original cleanup cid."""
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = _FakeVenueAdapter(Venue.BYBIT)
+        fake.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="UBUSDT",
+            side=Side.SELL,
+            quantity=400.0,
+            entry_price=0.011,
+            observed_at_ms=1000,
+        )
+        fake.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+        )
+        fake.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="UBUSDT",
+            side=Side.BUY,
+            quantity=400.0,
+            average_price=0.011,
+            order_id="bybit-cleanup-oid",
+            client_order_id="exchange-cid",
+            filled_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "UBUSDT", "live-recovery:probe:UBUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is True
+        assert len(fake._place_order_calls) == 1
+        cleanup_cid = fake._place_order_calls[0].client_order_id
+        assert fake._fetch_order_fill_reconciliation_calls == [
+            ("UBUSDT", "", cleanup_cid)
+        ]
+        events = runtime.journal.read_all()
+        reconciled = [
+            e for e in events
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ]
+        assert reconciled
+        payload = reconciled[-1]["payload"]
+        assert payload["client_order_id"] == cleanup_cid
+        assert payload["attempt"] == 1
+        assert payload["reconcile_endpoints"] == [
+            "bybit_order_realtime",
+            "bybit_order_history",
+            "bybit_execution_list",
+        ]
+        assert payload["live_exposure"]["quantity"] == pytest.approx(400.0)
+        assert payload["decision"] == "filled"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_not_found_live_flat_succeeds(self, tmp_path):
+        """Duplicate cleanup id not found is success if the live exposure is flat."""
+
+        class FlatAfterDuplicateAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.positions = [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="UBUSDT",
+                        side=Side.SELL,
+                        quantity=400.0,
+                        entry_price=0.011,
+                        observed_at_ms=1000,
+                    ),
+                    None,
+                ]
+
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                return self.positions.pop(0)
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = FlatAfterDuplicateAdapter()
+        fake.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "UBUSDT", "live-recovery:probe:UBUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is True
+        assert len(fake._place_order_calls) == 1
+        payload = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ][-1]
+        assert payload["decision"] == "live_flat"
+        assert payload["live_exposure"]["quantity"] == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_not_found_live_nonzero_uses_new_id(self, tmp_path):
+        """Unresolved duplicate with live exposure must retry with a new cleanup cid."""
+
+        class DuplicateThenFilledAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.positions = [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+                        quantity=400.0, entry_price=0.011, observed_at_ms=1000,
+                    ),
+                    PositionSnapshot(
+                        venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+                        quantity=400.0, entry_price=0.011, observed_at_ms=1100,
+                    ),
+                    PositionSnapshot(
+                        venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+                        quantity=400.0, entry_price=0.011, observed_at_ms=1200,
+                    ),
+                ]
+
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                return self.positions.pop(0)
+
+            async def place_order(self, request):
+                self._place_order_calls.append(request)
+                if len(self._place_order_calls) == 1:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                    )
+                return OrderFill(
+                    venue=request.venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=0.011,
+                    client_order_id=request.client_order_id,
+                    order_id="cleanup-retry-oid",
+                )
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = DuplicateThenFilledAdapter()
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "UBUSDT", "live-recovery:probe:UBUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is True
+        assert len(fake._place_order_calls) == 2
+        first_cid = fake._place_order_calls[0].client_order_id
+        second_cid = fake._place_order_calls[1].client_order_id
+        assert first_cid != second_cid
+        assert fake._fetch_order_fill_reconciliation_calls == [
+            ("UBUSDT", "", first_cid)
+        ]
+        payload = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ][-1]
+        assert payload["decision"] == "retry_new_client_order_id"
+        assert payload["next_client_order_id"] == second_cid
+
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_retries_never_reuse_duplicate_id(self, tmp_path):
+        """Three duplicate retries must not blindly resubmit the same orderLinkId."""
+
+        class AlwaysDuplicateAdapter(_FakeVenueAdapter):
+            async def place_order(self, request):
+                self._place_order_calls.append(request)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = AlwaysDuplicateAdapter(Venue.BYBIT)
+        fake.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="UBUSDT",
+            side=Side.SELL,
+            quantity=400.0,
+            entry_price=0.011,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "UBUSDT", "live-recovery:probe:UBUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is False
+        cids = [req.client_order_id for req in fake._place_order_calls]
+        assert len(cids) == 3
+        assert len(set(cids)) == 3
+        payloads = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ]
+        assert [p["attempt"] for p in payloads] == [1, 2, 3]
+        assert payloads[-1]["decision"] == "failed_live_exposure_remaining"
+
     # ── Bug 3: _abort_pending_entry returns bool; resolved pop conditional ──
 
     @pytest.mark.asyncio

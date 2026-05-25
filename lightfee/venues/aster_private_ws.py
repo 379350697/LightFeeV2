@@ -24,6 +24,55 @@ logger = logging.getLogger(__name__)
 
 ASTER_LISTEN_KEY_KEEPALIVE_SECS = 30 * 60
 ASTER_PRIVATE_PING_INTERVAL_SECS = 20
+ASTER_INVALID_LISTEN_KEY_CODE = -1125
+
+
+class AsterInvalidListenKeyError(Exception):
+    def __init__(self, reason: str, original: Exception) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.original = original
+
+
+def _aster_listen_key_error_code(exc: Exception) -> Optional[int]:
+    candidates = [getattr(exc, "body", ""), str(exc)]
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and "code" in payload:
+            try:
+                return int(payload["code"])
+            except (TypeError, ValueError):
+                pass
+        text = str(raw)
+        if "-1125" in text and "listenkey" in text.lower():
+            return ASTER_INVALID_LISTEN_KEY_CODE
+    return None
+
+
+def _record_aster_private_ws_event(
+    transport,
+    kind: str,
+    payload: dict[str, Any],
+) -> None:
+    record = getattr(transport, "_record_order_diagnostic", None)
+    if record is not None:
+        record(kind, payload)
+    logger.info("%s %s", kind, payload)
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 async def _request_aster_listen_key(
@@ -60,13 +109,19 @@ async def _start_aster_listen_key(transport, api_key: str) -> str:
         raise
 
 
-async def _keepalive_aster_listen_key(transport, api_key: str, listen_key: str) -> None:
+async def _keepalive_aster_listen_key(transport, api_key: str, listen_key: str) -> int:
     try:
         await _request_aster_listen_key(
             transport, "PUT", api_key, listen_key
         )
+        now_ms = _now_ms()
         logger.debug("aster listenKey keepalive success")
+        return now_ms
     except Exception as e:
+        if _aster_listen_key_error_code(e) == ASTER_INVALID_LISTEN_KEY_CODE:
+            raise AsterInvalidListenKeyError(
+                "invalid_listen_key_-1125", e
+            ) from e
         logger.warning("aster listenKey keepalive failed: %s", e)
         raise
 
@@ -370,19 +425,46 @@ async def _aster_private_ws_loop(
     from lightfee.marketdata.resilience import compute_backoff_ms
 
     failures = 0
+    rotation_count = 0
+    pending_rotation: Optional[dict[str, Any]] = None
     while True:
         listen_key: Optional[str] = None
+        listen_key_created_at: Optional[int] = None
+        last_keepalive_ok_at: Optional[int] = None
         try:
             listen_key = await _start_aster_listen_key(transport, api_key)
+            listen_key_created_at = _now_ms()
+            _record_aster_private_ws_event(
+                transport,
+                "aster.listen_key_created",
+                {
+                    "listenKey_created_at": listen_key_created_at,
+                    "rotation_count": rotation_count,
+                    "reconnect_result": (
+                        "pending" if pending_rotation is not None else "initial"
+                    ),
+                },
+            )
         except Exception:
             failures += 1
+            if pending_rotation is not None:
+                pending_rotation["reconnect_result"] = "failed_listen_key_create"
+                _record_aster_private_ws_event(
+                    transport,
+                    "aster.listen_key_rotation",
+                    pending_rotation,
+                )
             delay = compute_backoff_ms(reconnect_initial_ms, reconnect_max_ms, failures)
             await asyncio.sleep(delay / 1000.0)
             continue
 
         keepalive_done = asyncio.Event()
+        rotate_listen_key = asyncio.Event()
+        invalid_reason: Optional[str] = None
+        private_ws_last_ok_at: Optional[int] = None
 
         async def _keepalive_loop():
+            nonlocal invalid_reason, last_keepalive_ok_at
             try:
                 while not keepalive_done.is_set():
                     try:
@@ -393,9 +475,36 @@ async def _aster_private_ws_loop(
                     except asyncio.TimeoutError:
                         pass
                     try:
-                        await _keepalive_aster_listen_key(transport, api_key, listen_key)
-                    except Exception:
+                        last_keepalive_ok_at = await _keepalive_aster_listen_key(
+                            transport, api_key, listen_key
+                        )
+                    except AsterInvalidListenKeyError as e:
+                        invalid_reason = e.reason
+                        rotate_listen_key.set()
                         break
+                    except Exception:
+                        now_ms = _now_ms()
+                        transport.record_private_ws_failure(
+                            now_ms,
+                            "aster listenKey keepalive transient failure",
+                            unhealthy_after_failures,
+                        )
+                        _record_aster_private_ws_event(
+                            transport,
+                            "aster.listen_key_keepalive_failed",
+                            {
+                                "listenKey_created_at": listen_key_created_at,
+                                "last_keepalive_ok_at": last_keepalive_ok_at,
+                                "invalid_reason": "transient_keepalive_failure",
+                                "rotation_count": rotation_count,
+                                "private_ws_silent_age": (
+                                    now_ms - private_ws_last_ok_at
+                                    if private_ws_last_ok_at is not None
+                                    else None
+                                ),
+                                "reconnect_result": "not_rotated",
+                            },
+                        )
             except Exception:
                 pass
 
@@ -404,19 +513,46 @@ async def _aster_private_ws_loop(
         url = f"{ws_base_url}/{listen_key}"
         try:
             async with websockets.connect(url) as ws:
-                transport.record_private_ws_success(_now_ms())
+                now_ms = _now_ms()
+                private_ws_last_ok_at = now_ms
+                transport.record_private_ws_success(now_ms)
                 failures = 0
                 logger.debug("aster private websocket connected")
+                if pending_rotation is not None:
+                    pending_rotation.update(
+                        {
+                            "new_listenKey_created_at": listen_key_created_at,
+                            "reconnect_result": "success",
+                        }
+                    )
+                    _record_aster_private_ws_event(
+                        transport,
+                        "aster.listen_key_rotation",
+                        pending_rotation,
+                    )
+                    pending_rotation = None
 
                 while True:
+                    recv_task = asyncio.create_task(ws.recv())
+                    rotate_task = asyncio.create_task(rotate_listen_key.wait())
                     try:
-                        message = await asyncio.wait_for(
-                            ws.recv(), timeout=ASTER_PRIVATE_PING_INTERVAL_SECS
+                        done, pending = await asyncio.wait(
+                            {recv_task, rotate_task},
+                            timeout=ASTER_PRIVATE_PING_INTERVAL_SECS,
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    except asyncio.TimeoutError:
+                    except asyncio.CancelledError:
+                        await _cancel_task(recv_task)
+                        await _cancel_task(rotate_task)
+                        raise
+                    if not done:
+                        await _cancel_task(recv_task)
+                        await _cancel_task(rotate_task)
                         try:
                             await ws.ping()
-                            transport.record_private_ws_success(_now_ms())
+                            now_ms = _now_ms()
+                            private_ws_last_ok_at = now_ms
+                            transport.record_private_ws_success(now_ms)
                         except Exception as e:
                             transport.record_private_ws_failure(
                                 _now_ms(),
@@ -425,13 +561,43 @@ async def _aster_private_ws_loop(
                             )
                             break
                         continue
+                    if rotate_task in done and rotate_listen_key.is_set():
+                        await _cancel_task(recv_task)
+                        await _cancel_task(rotate_task)
+                        now_ms = _now_ms()
+                        private_ws_silent_age = (
+                            now_ms - private_ws_last_ok_at
+                            if private_ws_last_ok_at is not None
+                            else None
+                        )
+                        rotation_count += 1
+                        pending_rotation = {
+                            "listenKey_created_at": listen_key_created_at,
+                            "last_keepalive_ok_at": last_keepalive_ok_at,
+                            "invalid_reason": invalid_reason or "invalid_listen_key",
+                            "rotation_count": rotation_count,
+                            "private_ws_silent_age": private_ws_silent_age,
+                            "reconnect_result": "pending",
+                        }
+                        transport.record_private_ws_failure(
+                            now_ms,
+                            "aster listenKey invalidated: "
+                            + pending_rotation["invalid_reason"],
+                            1,
+                        )
+                        await ws.close()
+                        break
+                    await _cancel_task(rotate_task)
 
+                    message = recv_task.result()
                     if isinstance(message, bytes):
                         continue
 
                     try:
                         handle_aster_private_message(private_state, symbol_map, message)
-                        transport.record_private_ws_success(_now_ms())
+                        now_ms = _now_ms()
+                        private_ws_last_ok_at = now_ms
+                        transport.record_private_ws_success(now_ms)
                     except Exception as e:
                         logger.debug("aster private ws message ignored: %s", e)
 
@@ -445,11 +611,7 @@ async def _aster_private_ws_loop(
             )
 
         keepalive_done.set()
-        keepalive_task.cancel()
-        try:
-            await keepalive_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_task(keepalive_task)
 
         if listen_key:
             try:

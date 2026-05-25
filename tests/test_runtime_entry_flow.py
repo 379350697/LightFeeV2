@@ -281,6 +281,36 @@ class TestPendingEntryTracking:
 class TestPlannerDispatchIntegration:
     """Prove runtime calls planner for route/maker-leg instead of hardcoding."""
 
+    @staticmethod
+    def _install_hot_book(runtime, venue: str, symbol: str, *, bid: float, ask: float, observed_at_ms: int):
+        from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+
+        book = runtime.local_l2_runtime.ensure_book(venue, symbol)
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(price=bid, quantity=10.0)]
+        book.asks = [PriceLevel(price=ask, quantity=10.0)]
+        book.observed_at_ms = observed_at_ms
+        return book
+
+    @staticmethod
+    def _candidate(symbol: str = "BTCUSDT"):
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        return CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol=symbol,
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+        )
+
     def test_untrusted_hyperliquid_transport_is_not_tradeable_for_selection(
         self, config, tmp_journal,
     ):
@@ -312,12 +342,17 @@ class TestPlannerDispatchIntegration:
 
         assert runtime._candidate_is_tradeable_for_selection(candidate) is False
 
+    def test_binance_5022_gtx_reject_classified_as_post_only_would_take(self):
+        assert LiveRuntime._entry_reject_is_post_only_would_take(
+            "binance error code=-5022 GTX_ORDER_REJECT: Due to the order could not be executed as maker"
+        ) is True
+
     @pytest.mark.asyncio
     async def test_post_only_gtx_reject_sets_pair_cooldown_without_pending(
         self, config, tmp_journal,
     ):
-        from lightfee.sidecar.snapshot import CandidateInput
-
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         binance.submit_passive_order = AsyncMock(
@@ -331,29 +366,91 @@ class TestPlannerDispatchIntegration:
         runtime = LiveRuntime(config, venue_adapters=adapters)
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
+        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
 
-        candidate = CandidateInput(
-            long_venue="binance",
-            short_venue="okx",
-            symbol="BTCUSDT",
-            funding_diff_bps=10.0,
-            funding_edge_bps=8.0,
-            expected_edge_bps=5.0,
-            worst_case_edge_bps=2.0,
-            ranking_edge_bps=8.0,
-            transfer_bias_bps=0.0,
-            opportunity_type="funding_arb",
-            blocked=False,
-            entry_notional_quote=500.0,
-        )
+        candidate = self._candidate()
 
         assert await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0) is True
         assert runtime.state.pending_entries == {}
         pair_key = ("BTCUSDT", "binance", "okx")
         assert runtime._zero_fill_cooldown_until_ms[pair_key] > 5000
         assert runtime._gate_zero_fill_cooldown(candidate, 5001)[0] is False
-        kinds = [record["kind"] for record in tmp_journal.read_all()]
+        records = tmp_journal.read_all()
+        kinds = [record["kind"] for record in records]
         assert "runtime.entry_post_only_reject_cooldown" in kinds
+        payload = [r["payload"] for r in records if r["kind"] == "runtime.entry_post_only_reject_cooldown"][-1]
+        assert payload["venue"] == "binance"
+        assert payload["price"] == 50000.0
+        assert payload["best_bid"] == 50000.0
+        assert payload["best_ask"] == 50010.0
+        assert payload["freshness"] == "fresh"
+        assert payload["cooldown_until_ms"] == payload["cooldown_until"]
+
+    @pytest.mark.asyncio
+    async def test_fresh_bbo_allows_post_only_maker_submit(self, config, tmp_journal):
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
+        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is True
+
+        assert binance.last_request is not None
+        assert binance.last_request.post_only is True
+        assert binance.last_request.price == 50000.0
+        assert len(runtime.state.pending_entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
+        config.strategy.local_l2_enabled = True
+        config.strategy.max_liquidity_snapshot_age_ms = 5000
+        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=3000)
+        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is False
+
+        assert binance.last_request is None
+        assert runtime.state.pending_entries == {}
+        kinds = [record["kind"] for record in tmp_journal.read_all()]
+        assert "runtime.entry_blocked_post_only_bbo" in kinds
+
+    @pytest.mark.asyncio
+    async def test_crossing_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
+        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0) is False
+
+        assert binance.last_request is None
+        payload = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_post_only_bbo"
+        ][-1]
+        assert payload["reason"] == "would_cross_bbo"
+        assert payload["would_cross"] is True
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_uses_planner_route(self, config, tmp_journal):

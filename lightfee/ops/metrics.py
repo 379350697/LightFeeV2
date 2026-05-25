@@ -211,6 +211,30 @@ def build_prometheus_metric_samples(
             f"lightfee_position{{id=\"{pos_id}\",symbol=\"{pos.symbol}\"}} 1"
         )
 
+    freshness_metrics = {}
+    if isinstance(getattr(state, "last_scan", None), dict):
+        freshness_metrics = state.last_scan.get("snapshot_freshness_metrics", {}) or {}
+    if freshness_metrics:
+        samples.extend([
+            "# HELP lightfee_snapshot_freshness_observed_total Sidecar freshness observations by venue, symbol, domain, and decision.",
+            "# TYPE lightfee_snapshot_freshness_observed_total counter",
+        ])
+    for key, counts in sorted(freshness_metrics.items()):
+        try:
+            venue, symbol, domain = str(key).split("|", 2)
+        except ValueError:
+            continue
+        if not isinstance(counts, dict):
+            continue
+        for decision in ("fresh", "stale"):
+            count = int(counts.get(decision, 0) or 0)
+            if count <= 0:
+                continue
+            samples.append(
+                f"lightfee_snapshot_freshness_observed_total{{venue=\"{venue}\","
+                f"symbol=\"{symbol}\",domain=\"{domain}\",decision=\"{decision}\"}} {count}"
+            )
+
     return samples
 
 

@@ -5090,6 +5090,98 @@ class TestBitgetParseOrderStatusRedLight:
         assert result.client_order_id == "cid-1"
 
 
+class TestVenueSpecificOrderReconciliationEvidence:
+    """CL-001-G: venue query paths must expose endpoint-level evidence."""
+
+    @pytest.mark.anyio
+    async def test_binance_timeout_accepted_later_queries_order_endpoint(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            if request.url.path == "/fapi/v1/order":
+                return httpx.Response(200, json={
+                    "symbol": "BTCUSDT",
+                    "orderId": 12345,
+                    "clientOrderId": "bn-timeout-cid",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "avgPrice": "51000",
+                    "side": "BUY",
+                    "updateTime": 1770000000000,
+                })
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="", client_order_id="bn-timeout-cid",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.quantity == pytest.approx(0.25)
+        assert result.metadata["queried_endpoints"] == ["/fapi/v1/order"]
+        assert result.metadata["response_classification"] == "filled"
+        assert "/fapi/v1/order" in seen_paths
+        query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
+        assert query_payload["queried_endpoints"] == ["/fapi/v1/order"]
+        assert query_payload["client_order_id"] == "bn-timeout-cid"
+
+    @pytest.mark.anyio
+    async def test_okx_order_not_found_queries_open_and_history(self):
+        from lightfee.venues.okx import OkxAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            if request.url.path == "/api/v5/trade/order":
+                return httpx.Response(200, json={
+                    "code": "51603",
+                    "msg": "Order does not exist",
+                    "data": [],
+                })
+            if request.url.path == "/api/v5/trade/orders-history":
+                return httpx.Response(200, json={"code": "0", "data": []})
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTC-USDT-SWAP", order_id="", client_order_id="okx-missing-cid",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is None
+        assert seen_paths == ["/api/v5/trade/order", "/api/v5/trade/orders-history"]
+        query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
+        assert query_payload["uncertain_subtype"] == "closed_order_not_found"
+        assert query_payload["queried_endpoints"] == [
+            "/api/v5/trade/order",
+            "/api/v5/trade/orders-history",
+        ]
+        assert query_payload["response_classification"] == "open_order_not_found;closed_order_not_found"
+
+
 # ===========================================================================
 # RED-LIGHT: Bybit adapter real HTTP path — execution side + retCode
 # ===========================================================================
@@ -5243,6 +5335,75 @@ class TestBybitAdapterHttpRedLight:
         assert result is None, (
             f"order-not-found (110001) should return None, got {result}"
         )
+
+    @pytest.mark.anyio
+    async def test_bybit_reconciliation_falls_back_to_order_history_before_executions(self):
+        """Duplicate orderLinkId reconciliation must check realtime, history, then executions."""
+
+        import httpx
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.core.domain import Side
+
+        seen: list[str] = []
+
+        async def mock_handler(request):
+            url = str(request.url)
+            if "/v5/order/realtime" in url:
+                seen.append("realtime")
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": []},
+                })
+            if "/v5/order/history" in url:
+                seen.append("history")
+                assert "orderLinkId=cid-history" in url
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "orderId": "oid-history",
+                        "orderLinkId": "cid-history",
+                    }]},
+                })
+            if "/v5/execution/list" in url:
+                seen.append("executions")
+                assert "orderId=oid-history" in url
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "execQty": "400",
+                        "execPrice": "0.011",
+                        "execFee": "0.02",
+                        "execTime": "2000",
+                        "side": "Buy",
+                        "symbol": "UBUSDT",
+                    }]},
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "UBUSDT", order_id="", client_order_id="cid-history",
+        )
+        await adapter._transport.close()
+
+        assert seen == ["realtime", "history", "executions"]
+        assert result is not None
+        assert result.order_id == "oid-history"
+        assert result.client_order_id == "cid-history"
+        assert result.side == Side.BUY
+        assert result.quantity == pytest.approx(400.0)
 
 
 # ===========================================================================

@@ -11,6 +11,7 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError
+from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
@@ -136,6 +137,7 @@ class LiveRuntime:
         # V1 entry gate cooldown state
         self._venue_cooldown_until_ms: dict[str, int] = {}
         self._zero_fill_cooldown_until_ms: dict[tuple, int] = {}
+        self._post_only_reject_cooldown_until_ms: dict[tuple[str, str], int] = {}
 
         # V1 live scan recovery state (B2)
         self._live_scan_success_streak: int = 0
@@ -1914,6 +1916,15 @@ class LiveRuntime:
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
+        snapshot_freshness_metrics, snapshot_freshness_ages = (
+            self._snapshot_freshness_observability(
+                snapshot=snapshot,
+                candidates=list(getattr(snapshot, "candidates", []) or []),
+                now_ms=now_ms,
+            )
+        )
+        self.state.last_scan["snapshot_freshness_metrics"] = snapshot_freshness_metrics
+        self.state.last_scan["snapshot_freshness_observed_age_ms"] = snapshot_freshness_ages
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             reason = "live_scan_revalidate_required:last_good_sidecar"
             self.state.last_scan["no_entry_reason"] = reason
@@ -1979,6 +1990,13 @@ class LiveRuntime:
             )
             tradeable = await self._filter_candidates_supported_by_venue_catalog(
                 tradeable,
+            )
+            tradeable = self._filter_candidates_by_snapshot_freshness(
+                tradeable,
+                snapshot=snapshot,
+                now_ms=now_ms,
+                metrics=snapshot_freshness_metrics,
+                ages=snapshot_freshness_ages,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
@@ -4005,12 +4023,16 @@ class LiveRuntime:
             return None
 
         from lightfee.venues.cid import generate_exchange_cid
-        cleanup_client_order_id = generate_exchange_cid(
-            f"{entry_id}:{stage}:{symbol}", "c", venue
-        )
+
+        def cleanup_client_order_id_for_attempt(attempt: int) -> str:
+            seed = f"{entry_id}:{stage}:{symbol}"
+            if attempt > 1:
+                seed = f"{seed}:attempt:{attempt}"
+            return generate_exchange_cid(seed, "c", venue)
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            cleanup_client_order_id = cleanup_client_order_id_for_attempt(attempt)
             try:
                 pos = await adapter.fetch_position(symbol)
             except Exception:
@@ -4042,6 +4064,7 @@ class LiveRuntime:
                     "side": pos.side.value,
                     "cleanup_side": cleanup_side.value,
                     "cleanup_client_order_id": cleanup_client_order_id,
+                    "client_order_id": cleanup_client_order_id,
                 },
             )
 
@@ -4074,8 +4097,50 @@ class LiveRuntime:
                         return True
                 except Exception:
                     pass
-            except Exception:
+            except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
+                is_bybit_duplicate = (
+                    venue == Venue.BYBIT
+                    and _is_bybit_duplicate_order_link_id(str(e))
+                )
+                if is_bybit_duplicate:
+                    next_client_order_id = (
+                        cleanup_client_order_id_for_attempt(attempt + 1)
+                        if attempt < max_attempts
+                        else ""
+                    )
+                    reconciled = await self._reconcile_bybit_duplicate_cleanup_order(
+                        adapter=adapter,
+                        symbol=symbol,
+                        entry_id=entry_id,
+                        stage=stage,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        client_order_id=cleanup_client_order_id,
+                        next_client_order_id=next_client_order_id,
+                        target_qty=abs(pos.quantity),
+                        live_pos_before=pos,
+                        original_error=str(e),
+                    )
+                    if reconciled is True:
+                        return True
+                    if attempt >= max_attempts:
+                        return False
+                    self.journal.append(
+                        "entry.cleanup_leg_exposure_retry_scheduled",
+                        {
+                            "entry_id": entry_id,
+                            "stage": stage,
+                            "next_attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "client_order_id": cleanup_client_order_id,
+                            "next_client_order_id": next_client_order_id,
+                            "reason": "duplicate_client_order_id_unresolved",
+                        },
+                    )
+                    continue
                 try:
                     verify_pos = await adapter.fetch_position(symbol)
                     if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
@@ -4099,6 +4164,122 @@ class LiveRuntime:
             )
 
         return False
+
+    async def _reconcile_bybit_duplicate_cleanup_order(
+        self,
+        *,
+        adapter,
+        symbol: str,
+        entry_id: str,
+        stage: str,
+        attempt: int,
+        max_attempts: int,
+        client_order_id: str,
+        next_client_order_id: str,
+        target_qty: float,
+        live_pos_before: PositionSnapshot,
+        original_error: str,
+    ) -> bool:
+        """Reconcile Bybit duplicate cleanup order ids before retrying.
+
+        This intentionally uses the same adapter.fetch_order_fill_reconciliation
+        contract as passive close/close execution so Bybit endpoint semantics
+        stay centralized in the venue adapter.
+        """
+        endpoints = [
+            "bybit_order_realtime",
+            "bybit_order_history",
+            "bybit_execution_list",
+        ]
+        reconciliation = None
+        reconcile_error = ""
+        try:
+            reconciliation = await adapter.fetch_order_fill_reconciliation(
+                symbol, "", client_order_id,
+            )
+        except Exception as exc:
+            reconcile_error = str(exc)
+
+        recon_qty_raw = (
+            getattr(reconciliation, "quantity", 0.0)
+            if reconciliation is not None
+            else 0.0
+        )
+        recon_qty = (
+            float(recon_qty_raw)
+            if isinstance(recon_qty_raw, (int, float))
+            else 0.0
+        )
+
+        live_pos_after = None
+        live_fetch_error = ""
+        live_fetch_attempted = False
+        if recon_qty < max(target_qty - 1e-9, 0.0):
+            try:
+                live_fetch_attempted = True
+                live_pos_after = await adapter.fetch_position(symbol)
+            except Exception as exc:
+                live_fetch_error = str(exc)
+
+        live_pos = (
+            live_pos_after
+            if live_fetch_attempted and not live_fetch_error
+            else live_pos_before
+        )
+        live_qty = (
+            abs(getattr(live_pos, "quantity", 0.0) or 0.0)
+            if live_pos is not None
+            else 0.0
+        )
+        live_side = getattr(getattr(live_pos, "side", None), "value", None)
+
+        if recon_qty >= target_qty - 1e-9 and recon_qty > 0.0:
+            decision = "filled"
+            success = True
+        elif live_fetch_attempted and not live_fetch_error and live_qty <= 1e-9:
+            decision = "live_flat"
+            success = True
+        elif attempt >= max_attempts:
+            decision = "failed_live_exposure_remaining"
+            success = False
+        else:
+            decision = "retry_new_client_order_id"
+            success = False
+
+        payload = {
+            "entry_id": entry_id,
+            "stage": stage,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "venue": Venue.BYBIT.value,
+            "symbol": symbol,
+            "client_order_id": client_order_id,
+            "next_client_order_id": next_client_order_id,
+            "reconcile_endpoints": endpoints,
+            "reconciled_quantity": recon_qty,
+            "target_quantity": target_qty,
+            "order_id": (
+                getattr(reconciliation, "order_id", "")
+                if reconciliation is not None
+                else ""
+            ),
+            "live_exposure": {
+                "quantity": live_qty,
+                "side": live_side,
+            },
+            "decision": decision,
+            "original_error": original_error,
+        }
+        if reconcile_error:
+            payload["reconcile_error"] = reconcile_error
+        if live_fetch_error:
+            payload["live_fetch_error"] = live_fetch_error
+
+        self.journal.append(
+            "entry.cleanup_duplicate_client_order_reconcile_result",
+            payload,
+        )
+        return success
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
         """Force-reconcile pending entries ignoring backoff windows.
@@ -6176,6 +6357,13 @@ class LiveRuntime:
         until = self._zero_fill_cooldown_until_ms.get(pair_key, 0)
         if until > 0 and now_ms < until:
             return False, "zero_fill_cooldown"
+        symbol = getattr(candidate, "symbol", "")
+        for venue in (getattr(candidate, "long_venue", ""), getattr(candidate, "short_venue", "")):
+            if not venue:
+                continue
+            until = self._post_only_reject_cooldown_until_ms.get((symbol, venue), 0)
+            if until > 0 and now_ms < until:
+                return False, f"post_only_reject_cooldown_{venue}"
         return True, ""
 
     @staticmethod
@@ -6189,7 +6377,17 @@ class LiveRuntime:
             or "post_only_would_take" in text
         )
 
-    def _record_post_only_reject_cooldown(self, candidate, now_ms: int, reason: str) -> None:
+    def _record_post_only_reject_cooldown(
+        self,
+        candidate,
+        now_ms: int,
+        reason: str,
+        *,
+        venue: str = "",
+        side: str = "",
+        price: float = 0.0,
+        bbo: dict | None = None,
+    ) -> None:
         cooldown_ms = int(
             getattr(
                 self.config.strategy,
@@ -6205,17 +6403,109 @@ class LiveRuntime:
         )
         until_ms = now_ms + cooldown_ms
         self._zero_fill_cooldown_until_ms[pair_key] = until_ms
+        venue = venue or pair_key[1]
+        if venue:
+            self._post_only_reject_cooldown_until_ms[(pair_key[0], venue)] = until_ms
+        bbo_payload = dict(bbo or {})
         self.journal.append(
             "runtime.entry_post_only_reject_cooldown",
             {
                 "symbol": pair_key[0],
+                "venue": venue,
                 "long_venue": pair_key[1],
                 "short_venue": pair_key[2],
+                "side": side or bbo_payload.get("side", ""),
+                "price": price or bbo_payload.get("price", 0.0),
+                "best_bid": bbo_payload.get("best_bid"),
+                "best_ask": bbo_payload.get("best_ask"),
+                "book_age_ms": bbo_payload.get("book_age_ms"),
+                "stale_after_ms": bbo_payload.get("stale_after_ms"),
+                "freshness": bbo_payload.get("freshness", "unknown"),
+                "would_cross": bbo_payload.get("would_cross", False),
                 "cooldown_until_ms": until_ms,
+                "cooldown_until": until_ms,
                 "cooldown_ms": cooldown_ms,
                 "reason": reason[:300],
             },
         )
+
+    def _post_only_maker_bbo_guard(
+        self,
+        *,
+        venue: Venue,
+        symbol: str,
+        side: Side,
+        price: float,
+        now_ms: int,
+    ) -> tuple[bool, str, dict]:
+        venue_str = venue.value if hasattr(venue, "value") else str(venue)
+        side_str = side.value if hasattr(side, "value") else str(side)
+        stale_after_ms = self._entry_local_l2_stale_after_ms()
+        payload = {
+            "venue": venue_str,
+            "symbol": symbol,
+            "side": side_str,
+            "price": price,
+            "best_bid": None,
+            "best_ask": None,
+            "book_age_ms": None,
+            "stale_after_ms": stale_after_ms,
+            "freshness": "not_checked_local_l2_disabled",
+            "would_cross": False,
+        }
+        if not self.config.strategy.local_l2_enabled:
+            return True, "", payload
+
+        book = self.local_l2_runtime.get_book(venue_str, symbol)
+        if book is None:
+            payload["freshness"] = "missing"
+            return False, "missing_bbo", payload
+
+        try:
+            best_bid = float(book.best_bid())
+            best_ask = float(book.best_ask())
+        except Exception:
+            best_bid = 0.0
+            best_ask = 0.0
+        try:
+            age_ms = int(book.age_ms(now_ms))
+        except Exception:
+            observed = int(getattr(book, "observed_at_ms", 0) or 0)
+            age_ms = now_ms - observed if observed > 0 else 0
+
+        status = getattr(getattr(book, "status", None), "value", str(getattr(book, "status", "")))
+        try:
+            stale = bool(book.is_stale(stale_after_ms, now_ms))
+        except Exception:
+            stale = age_ms > stale_after_ms
+        fresh = status == "hot" and not stale
+        valid_bbo = best_bid > 0.0 and best_ask > best_bid
+        would_cross = (
+            valid_bbo
+            and price > 0.0
+            and (
+                (side == Side.BUY and price >= best_ask)
+                or (side == Side.SELL and price <= best_bid)
+            )
+        )
+
+        payload.update(
+            {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "book_age_ms": age_ms,
+                "freshness": "fresh" if fresh else "stale",
+                "would_cross": would_cross,
+            }
+        )
+        if not valid_bbo:
+            payload["freshness"] = "invalid_bbo"
+            return False, "invalid_bbo", payload
+        if not fresh:
+            return False, "stale_bbo", payload
+        if would_cross:
+            return False, "would_cross_bbo", payload
+        return True, "", payload
 
     def _gate_pending_entry_dedup(self, candidate) -> tuple[bool, str]:
         """Block entry if a pending entry already exists for same symbol+venue pair."""
@@ -6247,6 +6537,228 @@ class LiveRuntime:
             if value > 0:
                 return value
         return 300_000
+
+    def _snapshot_domain_budget_ms(self, domain: str) -> int:
+        domain_s = str(domain or "").lower()
+        if domain_s == "liquidity":
+            return int(
+                getattr(
+                    self.config.runtime,
+                    "sidecar_perp_liquidity_budget_ms",
+                    self.config.strategy.max_liquidity_snapshot_age_ms,
+                )
+                or self.config.strategy.max_liquidity_snapshot_age_ms
+            )
+        if domain_s == "quote":
+            return int(
+                getattr(self.config.runtime, "max_order_quote_age_ms", 0)
+                or self.config.runtime.max_market_age_ms
+                or self.config.runtime.sidecar_snapshot_max_age_ms
+            )
+        if domain_s == "market":
+            return int(
+                getattr(self.config.runtime, "max_market_age_ms", 0)
+                or self.config.runtime.sidecar_snapshot_max_age_ms
+            )
+        if domain_s == "funding":
+            return int(self.config.runtime.sidecar_snapshot_max_age_ms)
+        return int(self.config.runtime.sidecar_snapshot_max_age_ms)
+
+    @staticmethod
+    def _snapshot_metric_key(venue: str, symbol: str, domain: str) -> str:
+        return f"{str(venue).lower()}|{str(symbol).upper()}|{str(domain).lower()}"
+
+    @staticmethod
+    def _record_snapshot_metric(metrics: dict, key: str, fresh: bool) -> None:
+        row = metrics.setdefault(key, {"fresh": 0, "stale": 0})
+        row["fresh" if fresh else "stale"] = int(row.get("fresh" if fresh else "stale", 0)) + 1
+
+    def _snapshot_fallback_source(self, snapshot) -> str:
+        source = str(getattr(snapshot, "acquisition_mode", "") or "")
+        return source or "fresh_sidecar"
+
+    def _snapshot_quote_observed_at_ms(self, snapshot, quote) -> int:
+        return (
+            int(getattr(quote, "observed_at_ms", 0) or 0)
+            or int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
+            or int(getattr(snapshot, "published_at_ms", 0) or 0)
+        )
+
+    def _snapshot_lifecycle_rows_by_venue(self, snapshot, domain: str) -> dict[str, object]:
+        attr = {
+            "funding": "funding_lifecycle",
+            "market": "market_lifecycle",
+            "liquidity": "liquidity_lifecycle",
+        }.get(domain)
+        if not attr:
+            return {}
+        rows = getattr(snapshot, attr, []) or []
+        result: dict[str, object] = {}
+        for row in rows:
+            venue = str(getattr(row, "venue", "") or "").lower()
+            if venue:
+                result[venue] = row
+        return result
+
+    def _snapshot_freshness_observability(
+        self,
+        *,
+        snapshot,
+        candidates: list,
+        now_ms: int,
+    ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+        metrics: dict[str, dict[str, int]] = {}
+        ages: dict[str, int] = {}
+        if snapshot is None:
+            return metrics, ages
+
+        for quote in getattr(snapshot, "quotes", {}).values():
+            venue = str(getattr(quote, "venue", "") or "").lower()
+            symbol = str(getattr(quote, "symbol", "") or "").upper()
+            if not venue or not symbol:
+                continue
+            observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+            budget_ms = self._snapshot_domain_budget_ms("quote")
+            key = self._snapshot_metric_key(venue, symbol, "quote")
+            self._record_snapshot_metric(metrics, key, observed_at_ms > 0 and age_ms <= budget_ms)
+            ages[key] = age_ms
+
+        lifecycle_by_domain = {
+            "market": self._snapshot_lifecycle_rows_by_venue(snapshot, "market"),
+            "funding": self._snapshot_lifecycle_rows_by_venue(snapshot, "funding"),
+            "liquidity": self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity"),
+        }
+        seen: set[tuple[str, str, str]] = set()
+        for candidate in candidates:
+            symbol = str(getattr(candidate, "symbol", "") or "").upper()
+            for venue_attr in ("long_venue", "short_venue"):
+                venue = str(getattr(candidate, venue_attr, "") or "").lower()
+                if not venue or not symbol:
+                    continue
+                for domain, rows in lifecycle_by_domain.items():
+                    row = rows.get(venue)
+                    if row is None:
+                        continue
+                    marker = (venue, symbol, domain)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    observed_at_ms = int(getattr(row, "observed_at_ms", 0) or 0)
+                    age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+                    budget_ms = self._snapshot_domain_budget_ms(domain)
+                    key = self._snapshot_metric_key(venue, symbol, domain)
+                    self._record_snapshot_metric(
+                        metrics,
+                        key,
+                        observed_at_ms > 0 and age_ms <= budget_ms,
+                    )
+                    ages[key] = age_ms
+
+        return metrics, ages
+
+    def _candidate_snapshot_freshness_failures(
+        self,
+        candidate,
+        *,
+        snapshot,
+        now_ms: int,
+    ) -> list[dict]:
+        if snapshot is None:
+            return []
+        quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
+        liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
+        fallback_source = self._snapshot_fallback_source(snapshot)
+        failures: list[dict] = []
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
+
+        for venue_attr in ("long_venue", "short_venue"):
+            venue = str(getattr(candidate, venue_attr, "") or "").lower()
+            if not venue or not symbol:
+                continue
+
+            quote = quote_lookup.get((venue, symbol))
+            quote_budget_ms = self._snapshot_domain_budget_ms("quote")
+            if quote is None:
+                failures.append({
+                    "venue": venue,
+                    "symbol": symbol,
+                    "domain": "quote",
+                    "age_ms": 0,
+                    "budget_ms": quote_budget_ms,
+                    "decision": "skip_entry",
+                    "fallback_source": fallback_source,
+                    "reason": "missing_quote",
+                })
+            else:
+                observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
+                age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                if observed_at_ms <= 0 or age_ms > quote_budget_ms or bid <= 0.0 or ask <= 0.0:
+                    failures.append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "domain": "quote",
+                        "age_ms": age_ms,
+                        "budget_ms": quote_budget_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": fallback_source,
+                        "reason": "stale_quote" if age_ms > quote_budget_ms else "invalid_quote",
+                    })
+
+            liquidity = liquidity_rows.get(venue)
+            if liquidity is not None:
+                liq_budget_ms = self._snapshot_domain_budget_ms("liquidity")
+                observed_at_ms = int(getattr(liquidity, "observed_at_ms", 0) or 0)
+                age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+                if observed_at_ms <= 0 or age_ms > liq_budget_ms:
+                    failures.append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "domain": "liquidity",
+                        "age_ms": age_ms,
+                        "budget_ms": liq_budget_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": fallback_source,
+                        "reason": "stale_liquidity",
+                    })
+
+        return failures
+
+    def _filter_candidates_by_snapshot_freshness(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+        metrics: dict,
+        ages: dict,
+    ) -> list:
+        filtered = []
+        for candidate in candidates:
+            failures = self._candidate_snapshot_freshness_failures(
+                candidate,
+                snapshot=snapshot,
+                now_ms=now_ms,
+            )
+            if not failures:
+                filtered.append(candidate)
+                continue
+            for failure in failures:
+                key = self._snapshot_metric_key(
+                    failure["venue"],
+                    failure["symbol"],
+                    failure["domain"],
+                )
+                if key not in metrics:
+                    self._record_snapshot_metric(metrics, key, False)
+                ages[key] = int(failure.get("age_ms", 0) or 0)
+                payload = dict(failure)
+                payload["ts_ms"] = now_ms
+                payload["pair_id"] = self._candidate_pair_id(candidate)
+                self.journal.append("runtime.snapshot_freshness_decision", payload)
+        return filtered
 
     def _snapshot_health_payload(
         self,
@@ -7429,6 +7941,40 @@ class LiveRuntime:
             )
             return False
 
+        maker_bbo_evidence: dict = {}
+        if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
+            bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
+                venue=maker_venue,
+                symbol=candidate.symbol,
+                side=maker_leg,
+                price=price_hint,
+                now_ms=now_ms,
+            )
+            if not bbo_ok:
+                payload = {
+                    **maker_bbo_evidence,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "reason": bbo_reason,
+                    "ts_ms": now_ms,
+                }
+                self.journal.append("runtime.entry_blocked_post_only_bbo", payload)
+                self.journal.append(
+                    "review.candidate_rejected",
+                    {
+                        "symbol": candidate.symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "rejected_stage": "post_only_bbo_gate",
+                        "rejected_reason": bbo_reason,
+                        "ranking_edge_bps": candidate.ranking_edge_bps,
+                        "expected_edge_bps": candidate.expected_edge_bps,
+                        "funding_edge_bps": candidate.funding_edge_bps,
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+
         ctx = EntryContext(
             entry_id=entry_id,
             symbol=candidate.symbol,
@@ -7498,6 +8044,10 @@ class LiveRuntime:
                     candidate,
                     now_ms,
                     getattr(result, "reject_reason", ""),
+                    venue=maker_venue.value,
+                    side=maker_leg.value,
+                    price=price_hint,
+                    bbo=maker_bbo_evidence,
                 )
                 return True
             if result.open_position is not None:
@@ -7646,8 +8196,8 @@ class LiveRuntime:
                         self.state,
                         position,
                         reason_str,
-                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
-                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
+                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
                         short_stage="exit_short",
                         long_stage="exit_long",
                     )
@@ -7669,16 +8219,36 @@ class LiveRuntime:
                     )
                     await self.close_executor.execute_close(
                         position, reason_str, now_ms,
-                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol),
-                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol),
+                        long_price_hint=self._resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
+                        short_price_hint=self._resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
                         state=self.state,
                     )
 
-    def _resolve_local_l2_mid(self, venue, symbol: str) -> float:
+    def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
         """Get mid price from local L2 book or sidecar for the given venue+symbol."""
+        if now_ms is None:
+            now_ms = wall_clock_now_ms()
+        venue_value = venue.value if hasattr(venue, 'value') else str(venue)
+        budget_ms = int(self.config.strategy.max_liquidity_snapshot_age_ms or 0)
         try:
-            book = self.local_l2_runtime.get_book(venue.value if hasattr(venue, 'value') else str(venue), symbol)
+            book = self.local_l2_runtime.get_book(venue_value, symbol)
             if book is not None and book.status.value == "hot":
+                age_ms = book.age_ms(now_ms)
+                if budget_ms > 0 and book.is_stale(budget_ms, now_ms):
+                    self.journal.append(
+                        "runtime.close_price_evidence_stale",
+                        {
+                            "venue": venue_value,
+                            "symbol": symbol,
+                            "domain": "local_l2_book",
+                            "age_ms": age_ms,
+                            "budget_ms": budget_ms,
+                            "decision": "reject_price_hint",
+                            "fallback_source": "none",
+                            "ts_ms": now_ms,
+                        },
+                    )
+                    return 0.0
                 mid = book.mid_price()
                 if mid and mid > 0:
                     return mid
