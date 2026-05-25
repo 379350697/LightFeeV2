@@ -1330,8 +1330,40 @@ class PassiveCloseExecutor:
                 )
 
             if maker_terminal:
-                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
-                pending.next_retry_at_ms = 0
+                leg_notional = 0.0
+                min_notional = 0.0
+                if min_notional_violation is not None:
+                    leg_notional = min_notional_violation["leg_notional"]
+                    min_notional = min_notional_violation["min_notional"]
+                compensated = await self._abort_and_compensate_min_notional(
+                    state,
+                    pending,
+                    position,
+                    hedge_venue=hedge_venue,
+                    hedge_leg=hedge_leg_label,
+                    missing_quantity=delta,
+                    normalized_quantity=normalized_delta,
+                    leg_notional_quote=leg_notional,
+                    venue_min_notional_quote=min_notional,
+                    failed_stage=(
+                        pending.short_stage or "exit_short"
+                        if hedge_leg_label == "short"
+                        else pending.long_stage or "exit_long"
+                    ),
+                    source="terminal_maker_hedge_min_notional",
+                )
+                if compensated:
+                    return HedgeDeltaResult(
+                        requested=delta,
+                        filled=0.0,
+                        residual=0.0,
+                        success=True,
+                        error=None,
+                    )
+                pending = state.pending_passive_closes.get(position.position_id)
+                if pending is not None:
+                    pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                    pending.next_retry_at_ms = 0
             return HedgeDeltaResult(
                 requested=delta, filled=0.0, residual=delta, success=False,
                 error=dust_reason,
@@ -2205,6 +2237,30 @@ class PassiveCloseExecutor:
             position.short_venue, position.symbol
         )
 
+        self._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source=source,
+            actual_long_size=actual_long_size,
+            actual_short_size=actual_short_size,
+            extra=extra,
+        )
+        return True
+
+    def _clear_live_flat_state(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        actual_long_size: float,
+        actual_short_size: float,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Clear local passive/open state after live exchange truth is flat."""
+
         payload = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
@@ -2249,7 +2305,6 @@ class PassiveCloseExecutor:
                 "source": source,
             },
         )
-        return True
 
     async def _fetch_live_position_size(self, venue: Venue, symbol: str) -> float:
         adapter = self._adapter(venue)
@@ -2278,6 +2333,318 @@ class PassiveCloseExecutor:
             and "reduceonly" in last_error.replace(" ", "").lower()
         )
 
+    async def _fetch_live_position_snapshot(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[Any | None, str | None]:
+        adapter = self._adapter(venue)
+        if adapter is None:
+            return None, "adapter_missing"
+        try:
+            pos = await adapter.fetch_position(symbol)
+        except Exception as exc:
+            return None, str(exc)
+        qty = getattr(pos, "quantity", None)
+        side = getattr(pos, "side", None)
+        if not isinstance(qty, (int, float)) or not math.isfinite(float(qty)):
+            return None, f"invalid_quantity:{qty!r}"
+        if not isinstance(side, Side):
+            return None, f"invalid_side:{side!r}"
+        return pos, None
+
+    @staticmethod
+    def _live_position_quantity(snapshot: Any | None) -> float:
+        qty = getattr(snapshot, "quantity", None)
+        if isinstance(qty, (int, float)) and math.isfinite(float(qty)):
+            return abs(float(qty))
+        return 0.0
+
+    def _pending_runtime_close_legs(
+        self,
+        pending: PendingPassiveClose,
+    ) -> tuple[list[CloseExecutionLeg], list[CloseExecutionLeg]]:
+        short_legs: list[CloseExecutionLeg] = []
+        for leg in pending.short_legs:
+            if leg.fill is not None:
+                short_legs.append(CloseExecutionLeg(
+                    fill=leg.fill,
+                    client_order_id=leg.client_order_id,
+                    submit_started_at_ms=leg.submit_started_at_ms,
+                    latency_ms=leg.latency_ms,
+                ))
+
+        long_legs: list[CloseExecutionLeg] = []
+        for leg in pending.long_legs:
+            if leg.fill is not None:
+                long_legs.append(CloseExecutionLeg(
+                    fill=leg.fill,
+                    client_order_id=leg.client_order_id,
+                    submit_started_at_ms=leg.submit_started_at_ms,
+                    latency_ms=leg.latency_ms,
+                ))
+        return short_legs, long_legs
+
+    async def _abort_and_compensate_min_notional(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        hedge_venue: Venue,
+        hedge_leg: str,
+        missing_quantity: float,
+        normalized_quantity: float,
+        leg_notional_quote: float,
+        venue_min_notional_quote: float,
+        failed_stage: str,
+        source: str,
+    ) -> bool:
+        """V1 terminal small-fill path: abort accumulation and flatten live residuals."""
+        if missing_quantity > pending.last_small_fill_missing_quantity + 1e-9:
+            pending.small_fill_min_notional_attempts += 1
+            pending.last_small_fill_missing_quantity = missing_quantity
+
+        accumulating_payload = {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "execution_kind": "exit",
+            "hedge_venue": hedge_venue.value,
+            "hedge_leg": hedge_leg,
+            "attempt": pending.small_fill_min_notional_attempts,
+            "max_attempts": self._config.maker_min_notional_accumulation_attempts,
+            "missing_hedge_quantity": missing_quantity,
+            "normalized_quantity": normalized_quantity,
+            "leg_notional_quote": leg_notional_quote,
+            "venue_min_notional_quote": venue_min_notional_quote,
+            "source": source,
+        }
+        self._journal.append("execution.min_notional_accumulating", accumulating_payload)
+
+        abort_payload = {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "execution_kind": "exit",
+            "hedge_venue": hedge_venue.value,
+            "attempt": pending.small_fill_min_notional_attempts,
+            "missing_hedge_quantity": missing_quantity,
+            "normalized_quantity": normalized_quantity,
+            "leg_notional_quote": leg_notional_quote,
+            "venue_min_notional_quote": venue_min_notional_quote,
+            "source": source,
+        }
+        self._journal.append("execution.min_notional_abort_and_flatten", abort_payload)
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        if not isinstance(self._close_executor, CloseExecutor):
+            self._journal.append(
+                "exit.passive_close_min_notional_compensation_unavailable",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "missing_hedge_quantity": missing_quantity,
+                    "reason": "no close_executor injected",
+                },
+            )
+            return False
+
+        short_legs, long_legs = self._pending_runtime_close_legs(pending)
+        await self._close_executor.compensate_failed_full_close(
+            position=position,
+            close_reason="passive_close_hedge_below_min_notional",
+            failed_stage=failed_stage,
+            failed_venue=hedge_venue,
+            error=RuntimeError("passive close hedge leg below minimum notional"),
+            short_legs=short_legs,
+            long_legs=long_legs,
+            state=state,
+        )
+
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source="passive_close_min_notional_compensated_flat",
+            extra={
+                "hedge_venue": hedge_venue.value,
+                "hedge_leg": hedge_leg,
+                "missing_hedge_quantity": missing_quantity,
+            },
+        ):
+            return True
+
+        pending.next_retry_at_ms = 0
+        return False
+
+    async def _flatten_live_one_sided_position(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        venue: Venue,
+        live_snapshot: Any,
+        leg_label: str,
+    ) -> bool:
+        """Close actual live one-sided exposure before using stale local deltas."""
+        live_qty = self._live_position_quantity(live_snapshot)
+        if live_qty <= 1e-9:
+            return True
+
+        live_side = getattr(live_snapshot, "side", None)
+        close_side = live_side.opposite() if isinstance(live_side, Side) else (
+            Side.SELL if leg_label == "long" else Side.BUY
+        )
+        adapter = self._adapter(venue)
+        if adapter is None:
+            return False
+
+        try:
+            normalized_qty = float(await adapter.normalize_quantity(position.symbol, live_qty))
+        except Exception as exc:
+            self._journal.append(
+                "exit.passive_close_live_one_sided_normalize_failed",
+                {
+                    "position_id": position.position_id,
+                    "venue": venue.value,
+                    "requested": live_qty,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+        price_hint = self._resolve_local_l2_mid(venue, position.symbol)
+        min_notional_violation = self._check_hedge_min_notional(
+            venue,
+            position.symbol,
+            close_side,
+            normalized_qty,
+            price_hint,
+        )
+        if normalized_qty <= 1e-12 or min_notional_violation is not None:
+            leg_notional = 0.0
+            min_notional = 0.0
+            if min_notional_violation is not None:
+                leg_notional = min_notional_violation["leg_notional"]
+                min_notional = min_notional_violation["min_notional"]
+            self._journal.append(
+                "exit.passive_close_hedge_dust_aborted",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": venue.value,
+                    "hedge_leg": leg_label,
+                    "requested": live_qty,
+                    "normalized_quantity": normalized_qty,
+                    "price_hint": price_hint,
+                    "reason": (
+                        "normalized_quantity_zero"
+                        if normalized_qty <= 1e-12
+                        else "min_notional_rejected"
+                    ),
+                    "maker_terminal": True,
+                    "leg_notional_quote": leg_notional,
+                    "venue_min_notional_quote": min_notional,
+                },
+            )
+            return await self._abort_and_compensate_min_notional(
+                state,
+                pending,
+                position,
+                hedge_venue=venue,
+                hedge_leg=leg_label,
+                missing_quantity=live_qty,
+                normalized_quantity=normalized_qty,
+                leg_notional_quote=leg_notional,
+                venue_min_notional_quote=min_notional,
+                failed_stage=(
+                    pending.short_stage or "exit_short"
+                    if leg_label == "short"
+                    else pending.long_stage or "exit_long"
+                ),
+                source="fallback_live_one_sided_min_notional",
+            )
+
+        stage = "exit_live_one_sided_short" if leg_label == "short" else "exit_live_one_sided_long"
+        client_order_id = compact_client_order_id(position.position_id, stage)
+        request = OrderRequest(
+            venue=venue,
+            symbol=position.symbol,
+            side=close_side,
+            quantity=normalized_qty,
+            price=price_hint if price_hint > 0 else None,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+        try:
+            fill = await adapter.place_order(request)
+        except Exception as exc:
+            self._journal.append(
+                "exit.passive_close_live_one_sided_error",
+                {
+                    "position_id": position.position_id,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "live_quantity": live_qty,
+                    "normalized_quantity": normalized_qty,
+                    "side": close_side.value,
+                    "error": str(exc),
+                },
+            )
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_live_one_sided_error_flat_probe",
+                extra={
+                    "flattened_venue": venue.value,
+                    "flattened_quantity": normalized_qty,
+                    "flatten_error": str(exc),
+                },
+            ):
+                return True
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+        self._journal.append(
+            "exit.passive_close_live_one_sided_flatten",
+            {
+                "position_id": position.position_id,
+                "venue": venue.value,
+                "leg": leg_label,
+                "live_quantity": live_qty,
+                "normalized_quantity": normalized_qty,
+                "filled_quantity": getattr(fill, "quantity", 0.0),
+                "side": close_side.value,
+                "client_order_id": client_order_id,
+            },
+        )
+
+        leg = PersistedCloseExecutionLeg(
+            fill=fill,
+            client_order_id=client_order_id,
+            submit_started_at_ms=self._now_ms(),
+        )
+        if leg_label == "short":
+            pending.short_legs.append(leg)
+        else:
+            pending.long_legs.append(leg)
+
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source="passive_close_live_one_sided_flattened",
+            extra={
+                "flattened_venue": venue.value,
+                "flattened_quantity": normalized_qty,
+            },
+        ):
+            return True
+
+        pending.next_retry_at_ms = self._now_ms() + 5_000
+        return False
+
     async def _fallback_to_aggressive_close(
         self,
         state: EngineState,
@@ -2302,7 +2669,46 @@ class PassiveCloseExecutor:
         if total_remaining <= 1e-9:
             return True
 
-        if await self._clear_if_live_flat(
+        live_long, live_long_error = await self._fetch_live_position_snapshot(
+            position.long_venue, position.symbol
+        )
+        live_short, live_short_error = await self._fetch_live_position_snapshot(
+            position.short_venue, position.symbol
+        )
+        live_long_qty = self._live_position_quantity(live_long)
+        live_short_qty = self._live_position_quantity(live_short)
+        if live_long_error is None and live_short_error is None:
+            if live_long_qty <= 1e-9 and live_short_qty <= 1e-9:
+                self._clear_live_flat_state(
+                    state,
+                    pending,
+                    position,
+                    source="pending_passive_close_flat_probe",
+                    actual_long_size=live_long_qty,
+                    actual_short_size=live_short_qty,
+                )
+                return True
+
+            live_one_sided = (live_long_qty > 1e-9) != (live_short_qty > 1e-9)
+            if live_one_sided:
+                if live_long_qty > 1e-9:
+                    return await self._flatten_live_one_sided_position(
+                        state,
+                        pending,
+                        position,
+                        venue=position.long_venue,
+                        live_snapshot=live_long,
+                        leg_label="long",
+                    )
+                return await self._flatten_live_one_sided_position(
+                    state,
+                    pending,
+                    position,
+                    venue=position.short_venue,
+                    live_snapshot=live_short,
+                    leg_label="short",
+                )
+        elif await self._clear_if_live_flat(
             state,
             pending,
             position,

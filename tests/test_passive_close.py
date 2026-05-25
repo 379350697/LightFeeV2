@@ -762,6 +762,123 @@ class TestAdvanceChunkRootInvariant:
 class TestTerminalMakerFillHedgeFail:
     """Test 2: terminal maker FILLED + hedge error → chunk NOT advanced."""
 
+    def test_terminal_small_maker_fill_below_min_notional_compensates_flat(self):
+        """V1 parity: terminal maker dust aborts and compensates in the same drive."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class SequencedPositionAdapter(VenueAdapter):
+            def __init__(self, venue, snapshots):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0211,
+                    order_id=f"{self._venue.value}-fill",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=2000,
+                )
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    qty, side = self._snapshots.pop(0)
+                else:
+                    qty, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    entry_price=1.0211 if qty else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        class MakerAdapter(SequencedPositionAdapter):
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return PassiveOrderProgress(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    cumulative_quantity=2.0,
+                    average_price=1.0211,
+                    fee_quote=0.0,
+                    last_fill_time_ms=1500,
+                    state=PassiveOrderState.FILLED,
+                    observed_at_ms=1500,
+                )
+
+        okx = MakerAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
+        bybit = SequencedPositionAdapter(
+            Venue.BYBIT,
+            [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-beat-terminal-dust",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is True
+        assert [request.quantity for request in bybit.place_order_calls] == [2.0]
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.min_notional_accumulating" in kinds
+        assert "execution.min_notional_abort_and_flatten" in kinds
+        assert "exit.compensated" in kinds
+        assert "exit.passive_close_fallback_unhedged_failed" not in kinds
+
     def test_terminal_maker_filled_bybit_dust_gap_uses_guard_and_live_flat_cleanup(self):
         """Terminal FILLED UBUSDT gap below Bybit dynamic min qty must not submit hedge."""
         journal = _open_journal()
@@ -1134,6 +1251,266 @@ class TestPartialMakerFillGradualCatchUp:
 
 class TestFallbackResidualReal:
     """Test 3: fallback residual strict validation with real mock flow."""
+
+    def test_v1_small_maker_fill_below_min_notional_compensates_flat(self):
+        """Terminal maker dust must enter V1 abort/compensate semantics, not retry."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        class SequencedPositionAdapter(VenueAdapter):
+            def __init__(self, venue, snapshots):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0211,
+                    order_id=f"{self._venue.value}-fill",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=2000,
+                )
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    qty, side = self._snapshots.pop(0)
+                else:
+                    qty, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    entry_price=1.0211 if qty else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        okx = SequencedPositionAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
+        bybit = SequencedPositionAdapter(
+            Venue.BYBIT,
+            [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-beat-dust",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=2.0, average_price=1.0211),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+            next_retry_at_ms=0,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert [request.quantity for request in bybit.place_order_calls] == [2.0]
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert pending.next_retry_at_ms == 0
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.min_notional_accumulating" in kinds
+        assert "execution.min_notional_abort_and_flatten" in kinds
+        assert "exit.compensated" in kinds
+        assert "exit.passive_close_fallback_unhedged_failed" not in kinds
+
+        persisted = build_persistent_state_view(state)
+        assert position.position_id not in persisted["open_positions"]
+        assert position.position_id not in persisted["pending_passive_closes"]
+
+    def test_beatusdt_stale_local_live_one_sided_rebuilds_close_target(self):
+        """Fallback must close live one-sided exposure, not stale 2-BEAT delta."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class LiveAdapter(VenueAdapter):
+            def __init__(self, venue, snapshots):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0211,
+                    order_id=f"{self._venue.value}-close",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=2000,
+                )
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    qty, side = self._snapshots.pop(0)
+                else:
+                    qty, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    entry_price=1.0211 if qty else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        okx = LiveAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
+        bybit = LiveAdapter(Venue.BYBIT, [(20.0, Side.SELL), (0.0, Side.SELL)])
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        state = EngineState()
+        state.last_error = "pending passive close failed for entry-beatusdt"
+        position = _make_position(
+            position_id="entry-beatusdt",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=2.0, average_price=1.0211),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert okx.place_order_calls == []
+        assert len(bybit.place_order_calls) == 1
+        request = bybit.place_order_calls[0]
+        assert request.quantity == 20.0
+        assert request.side == Side.BUY
+        assert request.reduce_only is True
+        assert request.time_in_force == TimeInForce.IOC
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert state.last_error is None
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        assert "exit.passive_close_fallback_unhedged_failed" not in kinds
+
+    def test_live_flat_fallback_clears_pending_open_and_last_error(self):
+        """Fallback starts from live truth; already-flat venues remove all local state."""
+        journal = _open_journal()
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.SELL,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+        okx.place_order = AsyncMock()
+        bybit.place_order = AsyncMock()
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+
+        state = EngineState()
+        state.last_error = "pending passive close failed for entry-beatusdt-flat"
+        position = _make_position(
+            position_id="entry-beatusdt-flat",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=2.0, average_price=1.0211),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert state.last_error is None
+        okx.place_order.assert_not_called()
+        bybit.place_order.assert_not_called()
 
     def test_fallback_paired_residual_total_quantity(self):
         """maker=0.4, hedge=0.4, chunk=1.0 → paired_residual=0.6 sent to close_executor."""
@@ -1552,7 +1929,7 @@ class TestFallbackResidualReal:
         assert result is True
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
-        assert bybit.place_order_calls == 1
+        assert bybit.place_order_calls == 0
         assert aster.place_order_calls == 1
         kinds = [record["kind"] for record in journal.read_all()]
         assert "exit.passive_close_fallback_terminal_flat" in kinds
