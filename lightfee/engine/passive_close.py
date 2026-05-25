@@ -452,9 +452,15 @@ class PassiveCloseExecutor:
                         maker_fill_delta = pending.maker_fill.quantity - cycle_fill_before
                         unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
                         if unhedged_gap > 1e-9:
-                            result = await self._submit_hedge_for_delta(state, pending, position, unhedged_gap)
+                            result = await self._submit_hedge_for_delta(
+                                state, pending, position, unhedged_gap,
+                                maker_terminal=True,
+                            )
                         elif maker_fill_delta > 1e-9:
-                            result = await self._submit_hedge_for_delta(state, pending, position, maker_fill_delta)
+                            result = await self._submit_hedge_for_delta(
+                                state, pending, position, maker_fill_delta,
+                                maker_terminal=True,
+                            )
                         else:
                             result = HedgeDeltaResult(requested=0.0, filled=0.0, residual=0.0, success=True)
                         # Re-read pending after hedge
@@ -646,7 +652,10 @@ class PassiveCloseExecutor:
                     return False
 
                 # Submit hedge
-                result = await self._submit_hedge_for_delta(state, pending, position, unhedged_gap)
+                result = await self._submit_hedge_for_delta(
+                    state, pending, position, unhedged_gap,
+                    maker_terminal=maker_terminal,
+                )
                 if not result.success:
                     pending = state.pending_passive_closes.get(position_id)
                     if pending is None:
@@ -1226,6 +1235,8 @@ class PassiveCloseExecutor:
         pending: PendingPassiveClose,
         position: OpenPosition,
         delta: float,
+        *,
+        maker_terminal: bool = False,
     ) -> HedgeDeltaResult:
         """Submit IOC reduce-only taker hedge for maker fill delta.
 
@@ -1255,6 +1266,77 @@ class PassiveCloseExecutor:
                 error=f"no adapter for {hedge_venue.value}",
             )
 
+        try:
+            normalized_delta = float(await adapter.normalize_quantity(position.symbol, delta))
+        except Exception as e:
+            self._journal.append(
+                "exit.passive_close_hedge_normalize_failed",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg_label,
+                    "requested": delta,
+                    "error": str(e),
+                },
+            )
+            return HedgeDeltaResult(
+                requested=delta, filled=0.0, residual=delta, success=False,
+                error=f"normalize_quantity_failed: {e}",
+            )
+
+        min_notional_violation = self._check_hedge_min_notional(
+            hedge_venue, position.symbol, hedge_side,
+            normalized_delta, price_hint,
+        )
+        dust_reason = ""
+        if normalized_delta <= 1e-12:
+            dust_reason = "normalized_quantity_zero"
+        elif min_notional_violation is not None:
+            dust_reason = "min_notional_rejected"
+
+        if dust_reason:
+            payload = {
+                "position_id": position.position_id,
+                "hedge_venue": hedge_venue.value,
+                "hedge_leg": hedge_leg_label,
+                "requested": delta,
+                "normalized_quantity": normalized_delta,
+                "price_hint": price_hint,
+                "reason": dust_reason,
+                "maker_terminal": maker_terminal,
+            }
+            if min_notional_violation is not None:
+                payload.update({
+                    "leg_notional_quote": min_notional_violation["leg_notional"],
+                    "venue_min_notional_quote": min_notional_violation["min_notional"],
+                })
+            self._journal.append("exit.passive_close_hedge_dust_aborted", payload)
+
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_hedge_dust_flat_probe",
+                extra={
+                    "hedge_venue": hedge_venue.value,
+                    "requested": delta,
+                    "normalized_quantity": normalized_delta,
+                    "reason": dust_reason,
+                },
+            ):
+                return HedgeDeltaResult(
+                    requested=delta, filled=0.0, residual=0.0, success=True,
+                    error=None,
+                )
+
+            if maker_terminal:
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                pending.next_retry_at_ms = 0
+            return HedgeDeltaResult(
+                requested=delta, filled=0.0, residual=delta, success=False,
+                error=dust_reason,
+            )
+
         # V1 stage resolution: hedge_stage is opposite of maker_stage
         hedge_stage = (
             pending.short_stage if hedge_leg_label == "short"
@@ -1268,7 +1350,7 @@ class PassiveCloseExecutor:
             venue=hedge_venue,
             symbol=position.symbol,
             side=hedge_side,
-            quantity=delta,
+            quantity=normalized_delta,
             price=hedge_price,
             reduce_only=True,
             time_in_force=TimeInForce.IOC,
@@ -2076,6 +2158,18 @@ class PassiveCloseExecutor:
             if ppc.next_retry_at_ms <= now_ms
         ]
         for pid in pending_ids:
+            pending = state.pending_passive_closes.get(pid)
+            position = state.open_positions.get(pid) or (
+                pending.position_snapshot if pending is not None else None
+            )
+            if pending is not None and position is not None:
+                if await self._clear_if_live_flat(
+                    state,
+                    pending,
+                    position,
+                    source="pending_passive_close_flat_probe",
+                ):
+                    continue
             await self.drive_pending_passive_close(state, pid, wait_until_terminal=False)
 
         return set(state.pending_passive_closes.keys())
@@ -2104,17 +2198,39 @@ class PassiveCloseExecutor:
         ):
             return False
 
+        actual_long_size = await self._fetch_live_position_size(
+            position.long_venue, position.symbol
+        )
+        actual_short_size = await self._fetch_live_position_size(
+            position.short_venue, position.symbol
+        )
+
         payload = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
+            "long_venue": position.long_venue.value,
+            "short_venue": position.short_venue.value,
+            "expected_size": position.matched_quantity,
+            "old_quantity": position.matched_quantity,
+            "actual_long_size": actual_long_size,
+            "actual_short_size": actual_short_size,
+            "new_quantity": 0.0,
             "source": source,
         }
         if extra:
             payload.update(extra)
+        self._journal.append("runtime.position_drift_detected", payload)
         self._journal.append("exit.passive_close_fallback_terminal_flat", payload)
 
         state.pending_passive_closes.pop(pending.position_id, None)
         state.open_positions.pop(pending.position_id, None)
+        last_error = getattr(state, "last_error", None)
+        if isinstance(last_error, str) and self._last_error_matches_live_flat_cleanup(
+            last_error,
+            position_id=pending.position_id,
+            symbol=position.symbol,
+        ):
+            state.last_error = None
         self._journal.append(
             "recovery.flat",
             {
@@ -2134,6 +2250,33 @@ class PassiveCloseExecutor:
             },
         )
         return True
+
+    async def _fetch_live_position_size(self, venue: Venue, symbol: str) -> float:
+        adapter = self._adapter(venue)
+        if adapter is None:
+            return 0.0
+        try:
+            pos = await adapter.fetch_position(symbol)
+            qty = getattr(pos, "quantity", None)
+            if isinstance(qty, (int, float)) and math.isfinite(float(qty)):
+                return float(qty)
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _last_error_matches_live_flat_cleanup(
+        last_error: str,
+        *,
+        position_id: str,
+        symbol: str,
+    ) -> bool:
+        if position_id and position_id in last_error:
+            return True
+        return (
+            symbol in last_error
+            and "reduceonly" in last_error.replace(" ", "").lower()
+        )
 
     async def _fallback_to_aggressive_close(
         self,
@@ -2401,8 +2544,14 @@ class PassiveCloseExecutor:
         long_venue = snapshot.long_venue
         short_venue = snapshot.short_venue
 
-        long_flat = await self._probe_venue_flatness(long_venue, symbol, adapters)
-        short_flat = await self._probe_venue_flatness(short_venue, symbol, adapters)
+        long_probe = await self._probe_venue_flatness_evidence(
+            long_venue, symbol, adapters
+        )
+        short_probe = await self._probe_venue_flatness_evidence(
+            short_venue, symbol, adapters
+        )
+        long_flat = bool(long_probe.get("flat"))
+        short_flat = bool(short_probe.get("flat"))
 
         if long_flat and short_flat:
             self._journal.append(
@@ -2416,6 +2565,44 @@ class PassiveCloseExecutor:
             )
             return True
 
+        decision = (
+            "probe_incomplete"
+            if long_probe.get("error") or short_probe.get("error")
+            else "not_flat"
+        )
+        self._journal.append(
+            "exit.passive_close_recovery_probe_diagnostic",
+            {
+                "position_id": pending.position_id,
+                "symbol": symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "local_quantity": pending.target_quantity,
+                "matched_quantity": getattr(snapshot, "matched_quantity", 0.0),
+                "maker_fill": pending.maker_fill.quantity,
+                "hedge_fill": pending.hedge_fill.quantity,
+                "pending_phase": pending.phase_state.phase.value,
+                "live_long_size": long_probe.get("quantity"),
+                "live_short_size": short_probe.get("quantity"),
+                "live_long_open_orders": None,
+                "live_short_open_orders": None,
+                "client_order_ids": [
+                    cid for cid in (
+                        pending.phase_state.maker_client_order_id,
+                        pending.hedge_fill.client_order_id,
+                    ) if cid
+                ],
+                "live_long_error": long_probe.get("error"),
+                "live_short_error": short_probe.get("error"),
+                "source": "pending_passive_close_live_flat_probe",
+                "decision": decision,
+                "next_action": (
+                    "retry_live_flat_probe"
+                    if decision == "probe_incomplete"
+                    else "continue_pending_passive_close"
+                ),
+            },
+        )
         return False
 
     async def _probe_venue_flatness(
@@ -2425,9 +2612,19 @@ class PassiveCloseExecutor:
         adapters: dict[Venue, VenueAdapter],
     ) -> bool:
         """Check if a single venue reports zero position for symbol."""
+        probe = await self._probe_venue_flatness_evidence(venue, symbol, adapters)
+        return bool(probe.get("flat"))
+
+    async def _probe_venue_flatness_evidence(
+        self,
+        venue: Venue,
+        symbol: str,
+        adapters: dict[Venue, VenueAdapter],
+    ) -> dict[str, Any]:
+        """Check one venue and retain enough evidence to explain the decision."""
         adapter = adapters.get(venue)
         if adapter is None:
-            return False
+            return {"flat": False, "quantity": None, "error": "adapter_missing"}
 
         try:
             pos = await adapter.fetch_position(symbol)
@@ -2435,29 +2632,56 @@ class PassiveCloseExecutor:
             if (
                 isinstance(qty, (int, float))
                 and math.isfinite(float(qty))
-                and abs(float(qty)) < 1e-9
             ):
-                return True
-        except Exception:
-            pass
+                live_qty = abs(float(qty))
+                return {
+                    "flat": live_qty < 1e-9,
+                    "quantity": live_qty,
+                    "error": None,
+                }
+            return {
+                "flat": False,
+                "quantity": None,
+                "error": f"invalid_quantity:{qty!r}",
+            }
+        except Exception as exc:
+            direct_error = str(exc)
+        else:
+            direct_error = ""
 
         try:
             all_positions = await adapter.fetch_all_positions()
             if isinstance(all_positions, (list, tuple)):
+                saw_symbol = False
                 for pos in all_positions:
                     qty = getattr(pos, "quantity", None)
                     if (
                         getattr(pos, "symbol", None) == symbol
                         and isinstance(qty, (int, float))
                         and math.isfinite(float(qty))
-                        and abs(float(qty)) > 1e-9
                     ):
-                        return False
-                return True
-        except Exception:
-            pass
+                        saw_symbol = True
+                        live_qty = abs(float(qty))
+                        if live_qty > 1e-9:
+                            return {
+                                "flat": False,
+                                "quantity": live_qty,
+                                "error": None,
+                            }
+                return {"flat": True, "quantity": 0.0, "error": None}
+        except Exception as exc:
+            fallback_error = str(exc)
+            return {
+                "flat": False,
+                "quantity": None,
+                "error": direct_error or fallback_error,
+            }
 
-        return False
+        return {
+            "flat": False,
+            "quantity": None,
+            "error": direct_error or "position_fetch_unavailable",
+        }
 
     # ------------------------------------------------------------------
     # Price and tick helpers

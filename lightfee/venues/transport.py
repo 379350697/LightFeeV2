@@ -3144,7 +3144,15 @@ class VenueTransport(MarketDataClient):
                     )
                 request = replace(request, quantity=wire_qty, price=limit_px)
             else:
-                preflight = self.preflight_order_request(request)
+                symbol_rule = None
+                if spec.venue_id == Venue.BYBIT:
+                    try:
+                        symbol_rule = await get_symbol_rules_cache().get(
+                            self, spec.venue_id, venue_sym,
+                        )
+                    except Exception:
+                        symbol_rule = None
+                preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
                 request = replace(
                     request,
                     quantity=float(preflight["quantized_qty"]),
@@ -5685,6 +5693,19 @@ class VenueTransport(MarketDataClient):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         spec = self._spec
+        if spec.venue_id == Venue.BYBIT:
+            venue_sym = self._venue_symbol(symbol)
+            try:
+                symbol_rule = await get_symbol_rules_cache().get(self, Venue.BYBIT, venue_sym)
+            except Exception:
+                symbol_rule = None
+            if symbol_rule is not None:
+                return normalize_venue_quantity(
+                    quantity=quantity,
+                    step_size=float(getattr(symbol_rule, "qty_step", 0.0) or 0.0),
+                    contract_size=spec.contract_size,
+                    min_quantity=float(getattr(symbol_rule, "min_qty", 0.0) or 0.0),
+                )
         if spec.venue_id == Venue.OKX:
             venue_sym = self._venue_symbol(symbol)
             metadata = (

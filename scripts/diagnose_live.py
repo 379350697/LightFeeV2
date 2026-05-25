@@ -465,6 +465,12 @@ def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
         elif venue.lower() == "bybit":
             from lightfee.venues.bybit import BybitAdapter
             return BybitAdapter(mode="live", credential=credential)
+        elif venue.lower() == "aster":
+            from lightfee.venues.aster import AsterAdapter
+            return AsterAdapter(mode="live", credential=credential)
+        elif venue.lower() == "okx":
+            from lightfee.venues.okx import OkxAdapter
+            return OkxAdapter(mode="live", credential=credential)
     except Exception:
         pass
     return None
@@ -520,6 +526,19 @@ async def _fetch_venue_open_orders(
                 raw = await transport._request(
                     "GET", "/v5/order/realtime",
                     params={"category": "linear", "symbol": sym, "settleCoin": "USDT"},
+                    private=True,
+                )
+            elif "aster" in venue.lower():
+                raw = await transport._request(
+                    "GET", "/fapi/v1/openOrders",
+                    params={"symbol": sym},
+                    private=True,
+                )
+            elif "okx" in venue.lower():
+                raw = await transport._request(
+                    "GET", "/api/v5/trade/orders-pending",
+                    params={"instId": sym},
+                    private=True,
                 )
             else:
                 succeeded.add(sym)
@@ -550,6 +569,7 @@ async def _fetch_venue_open_orders(
 
 async def _build_exchange_truth_async(
     runtime_dir: str, symbols: list[str],
+    venues: list[str] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     all_positions: dict[str, dict[str, Any]] = {}
@@ -560,7 +580,8 @@ async def _build_exchange_truth_async(
 
     target_symbols = symbols if symbols else []
 
-    for venue in ["binance", "bybit"]:
+    target_venues = venues or ["binance", "bybit"]
+    for venue in target_venues:
         credential = _load_venue_credential(venue)
         if credential is None:
             all_positions[venue] = {"error": "no credentials available"}
@@ -654,7 +675,7 @@ async def _build_exchange_truth_async(
     )
 
     # Confidence: high only if we successfully queried at least one venue and all queries succeeded
-    all_ok = all(
+    all_ok = bool(fetch_status) and all(
         fs.get("status") == "ok"
         for fs in fetch_status.values()
     )
@@ -683,6 +704,7 @@ async def _build_exchange_truth_async(
 
 def _build_exchange_truth(
     runtime_dir: str, symbols: list[str],
+    venues: list[str] | None = None,
 ) -> dict[str, Any]:
     import asyncio
     try:
@@ -692,14 +714,14 @@ def _build_exchange_truth(
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(
                     asyncio.run,
-                    _build_exchange_truth_async(runtime_dir, symbols),
+                    _build_exchange_truth_async(runtime_dir, symbols, venues),
                 )
                 return future.result(timeout=30)
         return loop.run_until_complete(
-            _build_exchange_truth_async(runtime_dir, symbols),
+            _build_exchange_truth_async(runtime_dir, symbols, venues),
         )
     except RuntimeError:
-        return asyncio.run(_build_exchange_truth_async(runtime_dir, symbols))
+        return asyncio.run(_build_exchange_truth_async(runtime_dir, symbols, venues))
     except Exception as exc:
         return {
             "available": False,
@@ -1309,14 +1331,23 @@ def run_diagnose(
     local_state = _build_local_state(state, all_events)
 
     pos_symbols: list[str] = []
+    pos_venues: list[str] = []
     for pos in local_state.get("positions", []):
         sym = pos.get("symbol", "")
         if sym and sym not in pos_symbols:
             pos_symbols.append(sym)
+        for venue_key in ("long_venue", "short_venue"):
+            venue = str(pos.get(venue_key, "") or "").lower()
+            if venue and venue not in pos_venues:
+                pos_venues.append(venue)
     if symbol and symbol not in pos_symbols:
         pos_symbols.append(symbol)
 
-    exchange_truth = _build_exchange_truth(runtime_dir, pos_symbols if pos_symbols else [])
+    exchange_truth = _build_exchange_truth(
+        runtime_dir,
+        pos_symbols if pos_symbols else [],
+        pos_venues if pos_venues else None,
+    )
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
     order_errors = _build_order_error_evidence(all_events, symbol)
@@ -1372,7 +1403,10 @@ def _event_matches_symbol(event: dict[str, Any], symbol: str) -> bool:
     if not isinstance(payload, dict):
         return False
     event_symbol = str(payload.get("symbol", "")).upper()
-    return event_symbol == symbol.upper()
+    target = symbol.upper()
+    if event_symbol == target:
+        return True
+    return target in json.dumps(payload, sort_keys=True).upper()
 
 
 # ---------------------------------------------------------------------------

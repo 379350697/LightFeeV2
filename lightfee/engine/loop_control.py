@@ -161,6 +161,7 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "open_positions": open_positions,
         "pending_entry_count": len(state.pending_entries),
         "pending_close_count": len(state.pending_closes),
+        "pending_passive_close_count": len(state.pending_passive_closes),
         "last_scan": getattr(state, "last_scan", None),
     }
     write_json_atomic(path, data)

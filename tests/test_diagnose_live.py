@@ -33,6 +33,133 @@ def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
 
 
+def test_symbol_filter_matches_position_id_when_symbol_field_missing():
+    from scripts.diagnose_live import _event_matches_symbol
+
+    event = {
+        "kind": "exit.passive_close_dual_taker_drive",
+        "payload": {
+            "position_id": "live-recovered:XCNUSDT:bybit->aster",
+        },
+    }
+
+    assert _event_matches_symbol(event, "XCNUSDT")
+
+
+def test_exchange_truth_targets_aster_for_xcnusdt_pair(monkeypatch):
+    import asyncio
+    from scripts import diagnose_live as dl
+    from lightfee.core.domain import PositionSnapshot, Side, Venue
+
+    monkeypatch.setenv("LIGHTFEE_BYBIT_API_KEY", "bk")
+    monkeypatch.setenv("LIGHTFEE_BYBIT_API_SECRET", "bs")
+    monkeypatch.setenv("LIGHTFEE_ASTER_API_KEY", "ak")
+    monkeypatch.setenv("LIGHTFEE_ASTER_API_SECRET", "as")
+
+    class FakeTransport:
+        def __init__(self, venue):
+            self.venue = venue
+
+        async def _request(self, method, path, **kwargs):
+            if self.venue == "bybit":
+                assert path == "/v5/order/realtime"
+                assert kwargs["params"]["symbol"] == "XCNUSDT"
+                return {"result": {"list": []}}
+            assert path == "/fapi/v1/openOrders"
+            assert kwargs["params"]["symbol"] == "XCNUSDT"
+            return []
+
+    class FakeAdapter:
+        def __init__(self, venue):
+            self.venue = venue
+            self._transport = FakeTransport(venue)
+
+        async def fetch_position(self, symbol):
+            venue = Venue.BYBIT if self.venue == "bybit" else Venue.ASTER
+            return PositionSnapshot(
+                venue=venue, symbol=symbol, side=Side.BUY,
+                quantity=0.0, entry_price=0.0, observed_at_ms=1700000000000,
+            )
+
+        async def shutdown(self):
+            pass
+
+    def fake_create_adapter(venue, credential):
+        assert venue in {"bybit", "aster"}
+        return FakeAdapter(venue)
+
+    monkeypatch.setattr(dl, "_create_readonly_adapter", fake_create_adapter)
+
+    result = asyncio.run(dl._build_exchange_truth_async(
+        runtime_dir="/unused",
+        symbols=["XCNUSDT"],
+        venues=["bybit", "aster"],
+    ))
+
+    assert result["available"] is True
+    assert result["confidence"] == "high"
+    assert result["fetch_status"]["bybit"]["status"] == "ok"
+    assert result["fetch_status"]["aster"]["status"] == "ok"
+    assert result["open_orders"]["aster"]["XCNUSDT"] == []
+
+
+def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "open_positions": [
+                {
+                    "position_id": "live-recovered:XCNUSDT:bybit->aster",
+                    "symbol": "XCNUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "aster",
+                    "quantity": 5070.0,
+                    "matched_quantity": 5070.0,
+                }
+            ],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+        seen = {}
+
+        def fake_exchange_truth(runtime_dir, symbols, venues=None):
+            seen["symbols"] = symbols
+            seen["venues"] = venues
+            return {
+                "available": True,
+                "available_venues": venues or [],
+                "confidence": "high",
+                "positions": {"bybit": {}, "aster": {}},
+                "open_orders": {"bybit": {"XCNUSDT": []}, "aster": {"XCNUSDT": []}},
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "fetch_status": {
+                    "bybit": {"status": "ok", "positions_failed": []},
+                    "aster": {"status": "ok", "positions_failed": []},
+                },
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", fake_exchange_truth)
+
+        run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
+
+        assert seen["symbols"] == ["XCNUSDT"]
+        assert seen["venues"] == ["bybit", "aster"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # HTTP status only, no body -> partial/missing_body
 # ---------------------------------------------------------------------------

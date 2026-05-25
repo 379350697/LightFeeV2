@@ -11,6 +11,7 @@ Rust references:
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -134,6 +135,7 @@ def _mock_adapter_with_tick(venue=Venue.BINANCE, tick=0.01):
     adapter = MagicMock(spec=VenueAdapter)
     adapter.venue = venue
     adapter.price_tick_size = lambda symbol=None, _tick=tick: _tick
+    adapter.normalize_quantity = AsyncMock(side_effect=lambda symbol, quantity: quantity)
     return adapter
 
 
@@ -760,6 +762,81 @@ class TestAdvanceChunkRootInvariant:
 class TestTerminalMakerFillHedgeFail:
     """Test 2: terminal maker FILLED + hedge error → chunk NOT advanced."""
 
+    def test_terminal_maker_filled_bybit_dust_gap_uses_guard_and_live_flat_cleanup(self):
+        """Terminal FILLED UBUSDT gap below Bybit dynamic min qty must not submit hedge."""
+        journal = _open_journal()
+
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE, symbol="UBUSDT", side=Side.SELL,
+            cumulative_quantity=1.0, average_price=0.01,
+            state=PassiveOrderState.FILLED,
+        ))
+        maker_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BINANCE, symbol="UBUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+
+        hedge_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=0.0)
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT, symbol="UBUSDT", side=Side.BUY, quantity=1.0, price=0.01,
+        ))
+        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.01)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-ubusdt",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            matched_quantity=1.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=0.01,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is True
+        hedge_adapter.normalize_quantity.assert_awaited_once_with("UBUSDT", 1.0)
+        hedge_adapter.place_order.assert_not_called()
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_hedge_dust_aborted" in kinds
+        assert "recovery.flat" in kinds
+        assert "runtime.position_drift_corrected" in kinds
+
     def test_maker_filled_hedge_exception_does_not_advance(self):
         """Maker terminal FILLED, hedge adapter raises exception → drive returns False, index=0."""
         journal = _open_journal()
@@ -944,6 +1021,72 @@ class TestTerminalMakerFillHedgeFail:
 
 class TestPartialMakerFillGradualCatchUp:
     """Test 4: non-terminal partial maker fill → gradual hedge catch-up."""
+
+    def test_generic_delta_hedge_bybit_dust_gap_uses_same_guard(self):
+        """Non-terminal delta hedge must reuse the same pre-submit dust guard."""
+        journal = _open_journal()
+
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE, symbol="UBUSDT", side=Side.SELL,
+            cumulative_quantity=1.0, average_price=20.0,
+            state=PassiveOrderState.PARTIALLY_FILLED,
+        ))
+
+        hedge_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=0.0)
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT, symbol="UBUSDT", side=Side.BUY, quantity=1.0, price=20.0,
+        ))
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
+            config_overrides={"small_fill_buffer_notional_quote": 0.0},
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 20.0)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-ubusdt-generic",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=20.0,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is False
+        hedge_adapter.normalize_quantity.assert_awaited_once_with("UBUSDT", 1.0)
+        hedge_adapter.place_order.assert_not_called()
+        assert pending.hedge_fill.quantity == 0.0
+        assert position.position_id in state.pending_passive_closes
+
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_hedge_dust_aborted" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
 
     def test_partial_fill_no_advance_until_both_full(self):
         """Step-by-step: maker partially fills, hedge catches up gradually."""
@@ -2229,6 +2372,283 @@ class TestCancelReplaceQueryFailureFailClosed:
         events = journal.read_all()
         blocked = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_blocked_double_order_risk"]
         assert len(blocked) == 1
+
+
+class TestProcessPendingPassiveCloseLiveFlatReconcile:
+    def _arrange_live_flat_cleanup(self):
+        journal = _open_journal()
+
+        long_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        short_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        for adapter, venue, side in (
+            (long_adapter, Venue.BINANCE, Side.BUY),
+            (short_adapter, Venue.BYBIT, Side.SELL),
+        ):
+            adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+                venue=venue, symbol="UBUSDT", side=side,
+                quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+            ))
+            adapter.place_order = AsyncMock()
+        long_adapter.submit_passive_order = AsyncMock()
+        short_adapter.submit_passive_order = AsyncMock()
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: long_adapter, Venue.BYBIT: short_adapter}, journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.01)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-flat-ubusdt",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            matched_quantity=1.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=1.0, average_price=0.01),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+            next_retry_at_ms=0,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        return state, position, journal, executor, long_adapter, short_adapter
+
+    def test_process_pending_passive_closes_clears_live_flat_state_before_hedge(self):
+        """Pending passive close with both exchange legs flat must be removed locally."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        long_adapter.place_order.assert_not_called()
+        short_adapter.place_order.assert_not_called()
+        long_adapter.submit_passive_order.assert_not_called()
+        short_adapter.submit_passive_order.assert_not_called()
+
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "recovery.flat" in kinds
+        assert "runtime.position_drift_corrected" in kinds
+
+    def test_live_flat_cleanup_records_v1_recovery_payload_fields(self):
+        """V1 recovery logs exact flat-probe position and venue sizing evidence."""
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        drift = next(
+            e for e in journal.read_all()
+            if e.get("kind") == "runtime.position_drift_detected"
+        )
+        data = drift["payload"]
+        assert data["position_id"] == position.position_id
+        assert data["symbol"] == "UBUSDT"
+        assert data["long_venue"] == "binance"
+        assert data["short_venue"] == "bybit"
+        assert data["expected_size"] == 1.0
+        assert data["old_quantity"] == 1.0
+        assert data["actual_long_size"] == 0.0
+        assert data["actual_short_size"] == 0.0
+        assert data["new_quantity"] == 0.0
+        assert data["source"] == "pending_passive_close_flat_probe"
+
+    @pytest.mark.parametrize(
+        "last_error",
+        [
+            "pending passive close failed for entry-flat-ubusdt",
+            "Bybit ReduceOnly Order is rejected for UBUSDT: position is flat",
+        ],
+    )
+    def test_live_flat_cleanup_clears_matching_last_error(self, last_error):
+        state, _, _, executor, *_ = self._arrange_live_flat_cleanup()
+        state.last_error = last_error
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert state.last_error is None
+
+    def test_live_flat_cleanup_syncs_current_state_view_without_position(self):
+        state, position, _, executor, *_ = self._arrange_live_flat_cleanup()
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        from lightfee.engine.loop_control import _export_current_state_snapshot
+
+        path = Path(tempfile.mkdtemp()) / "live-state-current.json"
+        _export_current_state_snapshot(state, str(path))
+        data = json.loads(path.read_text())
+        assert data["open_position_count"] == 0
+        assert all(
+            item["position_id"] != position.position_id
+            for item in data["open_positions"]
+        )
+        assert data["pending_passive_close_count"] == 0
+
+    def test_live_flat_cleanup_persistent_state_view_drops_pending_and_open(self):
+        state, position, _, executor, *_ = self._arrange_live_flat_cleanup()
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        persisted = build_persistent_state_view(state)
+        assert position.position_id not in persisted["open_positions"]
+        assert position.position_id not in persisted["pending_passive_closes"]
+        assert persisted["open_position_count"] == 0
+        assert persisted["pending_passive_close_count"] == 0
+
+    def test_xcnusdt_recovered_live_flat_cleanup_records_diagnostic_payload(self):
+        """XCNUSDT recovered passive close: both venues flat clears with V1 payload."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        position.position_id = "live-recovered:XCNUSDT:bybit->aster"
+        position.symbol = "XCNUSDT"
+        position.long_venue = Venue.BYBIT
+        position.short_venue = Venue.ASTER
+        position.long_quantity = 5070.0
+        position.short_quantity = 5070.0
+        position.matched_quantity = 5070.0
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        pending.target_quantity = 5070.0
+        pending.chunk_quantities = [5070.0]
+        pending.maker_fill.quantity = 0.0
+        pending.hedge_fill.quantity = 0.0
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.SHORT
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        executor._adapters = {Venue.BYBIT: long_adapter, Venue.ASTER: short_adapter}
+        long_adapter.venue = Venue.BYBIT
+        short_adapter.venue = Venue.ASTER
+        long_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="XCNUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+        short_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.ASTER, symbol="XCNUSDT", side=Side.SELL,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert position.position_id not in state.open_positions
+        assert position.position_id not in state.pending_passive_closes
+        drift = next(
+            e for e in journal.read_all()
+            if e.get("kind") == "runtime.position_drift_detected"
+        )
+        assert drift["payload"]["position_id"] == position.position_id
+        assert drift["payload"]["actual_long_size"] == 0.0
+        assert drift["payload"]["actual_short_size"] == 0.0
+
+    def test_xcnusdt_recovered_one_side_live_nonzero_records_diagnostic_event(self):
+        """XCNUSDT one-sided live exposure must not be cleared without evidence."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        position.position_id = "live-recovered:XCNUSDT:bybit->aster"
+        position.symbol = "XCNUSDT"
+        position.long_venue = Venue.BYBIT
+        position.short_venue = Venue.ASTER
+        position.matched_quantity = 5070.0
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        pending.target_quantity = 5070.0
+        pending.chunk_quantities = [5070.0]
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.SHORT
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        executor._adapters = {Venue.BYBIT: long_adapter, Venue.ASTER: short_adapter}
+        long_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="XCNUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+        short_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.ASTER, symbol="XCNUSDT", side=Side.SELL,
+            quantity=-5070.0, entry_price=0.0005, observed_at_ms=3000,
+        ))
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == {position.position_id}
+        assert position.position_id in state.open_positions
+        event = next(
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_recovery_probe_diagnostic"
+        )
+        payload = event["payload"]
+        assert payload["position_id"] == position.position_id
+        assert payload["symbol"] == "XCNUSDT"
+        assert payload["long_venue"] == "bybit"
+        assert payload["short_venue"] == "aster"
+        assert payload["local_quantity"] == 5070.0
+        assert payload["matched_quantity"] == 5070.0
+        assert payload["live_long_size"] == 0.0
+        assert payload["live_short_size"] == 5070.0
+        assert payload["decision"] == "not_flat"
+        assert payload["next_action"] == "continue_pending_passive_close"
+
+    def test_xcnusdt_recovered_live_fetch_partial_failure_records_retry_diagnostic(self):
+        """Partial live fetch failure must retry conservatively and explain why."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        position.position_id = "live-recovered:XCNUSDT:bybit->aster"
+        position.symbol = "XCNUSDT"
+        position.long_venue = Venue.BYBIT
+        position.short_venue = Venue.ASTER
+        position.matched_quantity = 5070.0
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        pending.target_quantity = 5070.0
+        pending.chunk_quantities = [5070.0]
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.SHORT
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        executor._adapters = {Venue.BYBIT: long_adapter, Venue.ASTER: short_adapter}
+        long_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="XCNUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+        short_adapter.fetch_position = AsyncMock(side_effect=RuntimeError("aster timeout"))
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == {position.position_id}
+        assert position.position_id in state.open_positions
+        event = next(
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_recovery_probe_diagnostic"
+        )
+        payload = event["payload"]
+        assert payload["decision"] == "probe_incomplete"
+        assert payload["next_action"] == "retry_live_flat_probe"
+        assert payload["live_long_size"] == 0.0
+        assert payload["live_short_size"] is None
+        assert "aster timeout" in payload["live_short_error"]
 
 
 class TestNonTerminalPartialFillHedgeGapClosure:

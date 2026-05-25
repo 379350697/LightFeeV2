@@ -6312,6 +6312,78 @@ class TestPassivePreflight:
         assert preflight["min_qty"] == 0.0
         assert preflight["quantized_qty"] == pytest.approx(0.01234)
 
+    @pytest.mark.asyncio
+    async def test_bybit_normalize_quantity_uses_dynamic_symbol_rules(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BYBIT
+                assert venue_symbol == "UBUSDT"
+                return SymbolRule(
+                    tick_size=0.00001,
+                    qty_step=10.0,
+                    min_qty=10.0,
+                    min_notional=1.0,
+                    rule_source="instruments-info",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+
+        assert await transport.normalize_quantity("UBUSDT", 1.0) == 0.0
+        assert await transport.normalize_quantity("UBUSDT", 10.0) == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_bybit_place_order_reduce_only_rejects_dynamic_min_qty_without_http(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BYBIT
+                assert venue_symbol == "UBUSDT"
+                return SymbolRule(
+                    tick_size=0.00001,
+                    qty_step=10.0,
+                    min_qty=10.0,
+                    min_notional=1.0,
+                    rule_source="instruments-info",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._request = AsyncMock(side_effect=AssertionError("HTTP should not be sent for dust close"))
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="UBUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=0.01,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="dust-close",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.place_order(req)
+
+        assert exc.value.is_rejected
+        assert (
+            "quantity_step_rejected" in str(exc.value)
+            or "min_qty_rejected" in str(exc.value)
+        )
+        transport._request.assert_not_called()
+
 
 # ===========================================================================
 # Root Fix: Journal Evidence Tests
