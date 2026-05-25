@@ -164,13 +164,15 @@ class OrderReconciler:
         if venue is None:
             return
         endpoint_list = [str(e) for e in (queried_endpoints or []) if str(e)]
-        if not endpoint_list:
-            endpoint_list = ["adapter.fetch_order_fill_reconciliation"]
-        response_summary = raw_exchange_status or status
+        response_summary = (
+            status
+            if not endpoint_list and status == "uncertain"
+            else raw_exchange_status or status
+        )
         payload = {
             "venue": _venue_id(venue),
             "symbol": symbol,
-            "endpoint": endpoint_list[0],
+            "endpoint": endpoint_list[0] if endpoint_list else "fetch_order_status",
             "queried_endpoints": endpoint_list,
             "endpoint_responses": endpoint_responses or [
                 {"endpoint": endpoint, "classification": response_summary}
@@ -296,7 +298,13 @@ class OrderReconciler:
 
         position_qty = abs(float(position.quantity)) if position is not None else 0.0
         has_endpoint_evidence = bool(endpoints or query_payload)
-        if position_qty > 1e-12 and has_endpoint_evidence:
+        explicit_live_position_match = (
+            subtype == "live_position_confirmed"
+            or response_classification == "live_position_confirmed"
+            or bool(meta.get("live_position_confirmed"))
+            or bool(query_payload.get("live_position_confirmed"))
+        )
+        if position_qty > 1e-12 and has_endpoint_evidence and explicit_live_position_match:
             return (
                 "filled",
                 response_classification or "live_position_confirmed",

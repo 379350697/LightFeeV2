@@ -1182,8 +1182,8 @@ class TestOrderReconcileUncertainEvidence:
             diagnostics=[
                 self._diag(
                     Venue.BINANCE,
-                    "execution_not_found",
-                    "order_found_without_execution",
+                    "live_position_confirmed",
+                    "live_position_confirmed",
                     ["/fapi/v1/order", "/fapi/v1/userTrades"],
                 )
             ],
@@ -1203,6 +1203,37 @@ class TestOrderReconcileUncertainEvidence:
         assert payload["uncertain_subtype"] == "live_position_confirmed"
         assert payload["live_position_delta"]["quantity"] == pytest.approx(0.4)
         assert payload["next_action"] == "clear_uncertain_state"
+
+    @pytest.mark.asyncio
+    async def test_nonzero_live_position_without_order_match_stays_uncertain(self):
+        adapter = _EvidenceAdapter(
+            Venue.BINANCE,
+            position_qty=0.4,
+            diagnostics=[
+                self._diag(
+                    Venue.BINANCE,
+                    "execution_not_found",
+                    "order_found_without_execution",
+                    ["/fapi/v1/order", "/fapi/v1/userTrades"],
+                )
+            ],
+        )
+        reconciler = OrderReconciler({Venue.BINANCE: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-1",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            long_client_order_id="cid-1",
+        )
+
+        assert result.long_status == "uncertain"
+        events = reconciler.drain_order_diagnostics()
+        payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_result"][-1]
+        assert payload["uncertain_subtype"] == "execution_not_found"
+        assert payload["live_position_delta"]["quantity"] == pytest.approx(0.4)
+        assert payload["next_action"] != "clear_uncertain_state"
+        assert not [e for e in events if e["kind"] == "order.reconcile_resolution"]
 
     @pytest.mark.asyncio
     async def test_live_no_effect_confirmed_is_terminal_not_generic_uncertain(self):
