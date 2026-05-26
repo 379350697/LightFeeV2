@@ -323,6 +323,16 @@ def _require_bitget_success(raw: dict[str, Any], context: str) -> None:
         )
 
 
+def _require_aster_success(raw: dict[str, Any], context: str) -> None:
+    """Raise REJECTED if Aster FAPI returns a non-success JSON code."""
+    code = str(raw.get("code", "0"))
+    if code not in ("0", "200"):
+        raise OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            f"{context}: aster code={code} msg={raw.get('msg', '')}",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bybit V5 body builders (Task 3)
 # ---------------------------------------------------------------------------
@@ -3583,6 +3593,8 @@ class VenueTransport(MarketDataClient):
                 _require_bybit_success(raw, "bybit order failed")
             elif spec.venue_id == Venue.BITGET:
                 _require_bitget_success(raw, "bitget order failed")
+            elif spec.venue_id == Venue.ASTER:
+                _require_aster_success(raw, "aster order failed")
 
             try:
                 fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
@@ -4849,6 +4861,8 @@ class VenueTransport(MarketDataClient):
                 _require_bybit_success(raw, "bybit passive order failed")
             elif spec.venue_id == Venue.BITGET:
                 _require_bitget_success(raw, "bitget passive order failed")
+            elif spec.venue_id == Venue.ASTER:
+                _require_aster_success(raw, "aster passive order failed")
 
             # --- Parse ack with venue-specific validation ---
             ack_request = request
@@ -6222,7 +6236,7 @@ class VenueTransport(MarketDataClient):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         spec = self._spec
-        if spec.venue_id == Venue.BYBIT:
+        if spec.venue_id == Venue.BYBIT and self.mode == "live":
             venue_sym = self._venue_symbol(symbol)
             try:
                 symbol_rule = await get_symbol_rules_cache().get(self, Venue.BYBIT, venue_sym)

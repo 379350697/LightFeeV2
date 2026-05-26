@@ -2540,16 +2540,27 @@ class TestRealPathAbortCleanupDeadline:
     async def test_cleanup_bybit_duplicate_reconciles_filled_order(self, tmp_path):
         """Bybit 110072 in recovery cleanup must reconcile the original cleanup cid."""
 
+        class DuplicateFilledLiveFlatAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.positions = [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="UBUSDT",
+                        side=Side.SELL,
+                        quantity=400.0,
+                        entry_price=0.011,
+                        observed_at_ms=1000,
+                    ),
+                    None,
+                ]
+
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                return self.positions.pop(0)
+
         runtime = _make_open_runtime(tmp_path)
-        fake = _FakeVenueAdapter(Venue.BYBIT)
-        fake.position = PositionSnapshot(
-            venue=Venue.BYBIT,
-            symbol="UBUSDT",
-            side=Side.SELL,
-            quantity=400.0,
-            entry_price=0.011,
-            observed_at_ms=1000,
-        )
+        fake = DuplicateFilledLiveFlatAdapter()
         fake.place_order_raises = OrderSubmitError(
             SubmitFailureClass.REJECTED,
             "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
@@ -2591,9 +2602,105 @@ class TestRealPathAbortCleanupDeadline:
             "bybit_order_history",
             "bybit_execution_list",
         ]
-        assert payload["live_exposure"]["quantity"] == pytest.approx(400.0)
+        assert payload["live_exposure"]["quantity"] == pytest.approx(0.0)
         assert payload["classification"] == "full"
-        assert payload["decision"] == "clear"
+        assert payload["decision"] == "clear_live_flat"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_full_order_but_live_nonzero_retries_new_id(self, tmp_path):
+        """BIOUSDT: duplicate CID + old order filled is not full if live qty remains."""
+
+        class DuplicateFullButLiveNonzeroAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.positions = [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="BIOUSDT",
+                        side=Side.BUY,
+                        quantity=1444.0,
+                        entry_price=0.03321,
+                        observed_at_ms=1000,
+                    ),
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="BIOUSDT",
+                        side=Side.BUY,
+                        quantity=1444.0,
+                        entry_price=0.03321,
+                        observed_at_ms=1100,
+                    ),
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="BIOUSDT",
+                        side=Side.BUY,
+                        quantity=1444.0,
+                        entry_price=0.03321,
+                        observed_at_ms=1200,
+                    ),
+                ]
+
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                return self.positions.pop(0)
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self._fetch_order_fill_reconciliation_calls.append(
+                    (symbol, order_id, client_order_id)
+                )
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=1444.0,
+                    average_price=0.03320,
+                    order_id="old-cleanup-oid",
+                    client_order_id=client_order_id,
+                    filled_at_ms=1050,
+                )
+
+            async def place_order(self, request):
+                self._place_order_calls.append(request)
+                if len(self._place_order_calls) == 1:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                    )
+                return OrderFill(
+                    venue=request.venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=0.03320,
+                    client_order_id=request.client_order_id,
+                    order_id="fresh-cleanup-oid",
+                )
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = DuplicateFullButLiveNonzeroAdapter()
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "BIOUSDT", "live-recovery:probe:BIOUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is True
+        assert len(fake._place_order_calls) == 2
+        assert fake._place_order_calls[0].client_order_id != fake._place_order_calls[1].client_order_id
+        assert fake._place_order_calls[1].reduce_only is True
+        assert fake._place_order_calls[1].side == Side.SELL
+        assert fake._place_order_calls[1].quantity == pytest.approx(1444.0)
+        events = runtime.journal.read_all()
+        payload = [
+            e["payload"] for e in events
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ][-1]
+        assert payload["classification"] != "full"
+        assert payload["decision"] == "retry_new_client_order_id"
+        assert payload["live_qty"] == pytest.approx(1444.0)
+        assert payload["retry_qty"] == pytest.approx(1444.0)
+        assert not any(e["kind"] == "recovery.live_mismatch_flattened" for e in events)
 
     @pytest.mark.asyncio
     async def test_cleanup_bybit_duplicate_not_found_live_flat_succeeds(self, tmp_path):

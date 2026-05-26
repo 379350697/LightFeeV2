@@ -74,12 +74,11 @@ async def reconcile_bybit_duplicate_client_order(
     live_pos_after = None
     live_fetch_error = ""
     live_fetch_attempted = False
-    if reconciled_qty < max(target_qty - 1e-9, 0.0):
-        try:
-            live_fetch_attempted = True
-            live_pos_after = await adapter.fetch_position(symbol)
-        except Exception as exc:
-            live_fetch_error = str(exc)
+    try:
+        live_fetch_attempted = True
+        live_pos_after = await adapter.fetch_position(symbol)
+    except Exception as exc:
+        live_fetch_error = str(exc)
 
     live_pos = (
         live_pos_after
@@ -90,9 +89,24 @@ async def reconcile_bybit_duplicate_client_order(
     live_side = getattr(getattr(live_pos, "side", None), "value", None)
     live_flat = live_fetch_attempted and live_fetch_error == "" and live_qty <= 1e-9
 
-    if reconciled_qty >= max(target_qty - 1e-9, 0.0) and reconciled_qty > 0.0:
+    if (
+        reconciled_qty >= max(target_qty - 1e-9, 0.0)
+        and reconciled_qty > 0.0
+        and live_fetch_error
+    ):
+        classification = "unknown_transient"
+        decision = "backoff_recheck"
+    elif (
+        reconciled_qty >= max(target_qty - 1e-9, 0.0)
+        and reconciled_qty > 0.0
+        and live_qty > 1e-9
+    ):
+        classification = "stale_full_live_nonzero"
+        decision = "retry_new_client_order_id"
+        remaining_qty = live_qty
+    elif reconciled_qty >= max(target_qty - 1e-9, 0.0) and reconciled_qty > 0.0:
         classification = "full"
-        decision = "clear"
+        decision = "clear_live_flat"
     elif live_flat:
         classification = "none" if reconciled_qty <= 1e-9 else "partial"
         decision = "clear_live_flat"

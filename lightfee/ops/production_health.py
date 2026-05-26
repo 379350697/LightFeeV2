@@ -135,6 +135,114 @@ def analyze_sidecar_snapshot(
     )
 
 
+def _safe_abs_quantity(value: Any) -> float:
+    try:
+        return abs(float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any]]:
+    live: list[dict[str, Any]] = []
+    for venue, positions in (exchange_truth.get("positions") or {}).items():
+        if not isinstance(positions, dict):
+            continue
+        for symbol, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            qty = _safe_abs_quantity(pos.get("quantity"))
+            if qty <= 1e-9:
+                continue
+            live.append({
+                "venue": str(pos.get("venue") or venue).lower(),
+                "symbol": str(pos.get("symbol") or symbol).upper(),
+                "side": str(pos.get("side") or "").lower(),
+                "quantity": qty,
+                "entry_price": pos.get("entry_price"),
+            })
+    return live
+
+
+def _local_expected_legs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    legs: list[dict[str, Any]] = []
+    for pos in state.get("open_positions", []) or state.get("positions", []) or []:
+        if not isinstance(pos, dict):
+            continue
+        symbol = str(pos.get("symbol") or "").upper()
+        qty = _safe_abs_quantity(pos.get("quantity") or pos.get("matched_quantity"))
+        if not symbol or qty <= 1e-9:
+            continue
+        long_venue = str(pos.get("long_venue") or "").lower()
+        short_venue = str(pos.get("short_venue") or "").lower()
+        if long_venue:
+            legs.append({
+                "venue": long_venue,
+                "symbol": symbol,
+                "expected_side": "long",
+                "expected_quantity": qty,
+                "position_id": pos.get("position_id"),
+            })
+        if short_venue:
+            legs.append({
+                "venue": short_venue,
+                "symbol": symbol,
+                "expected_side": "short",
+                "expected_quantity": qty,
+                "position_id": pos.get("position_id"),
+            })
+    return legs
+
+
+def _side_matches(actual: str, expected: str) -> bool:
+    actual = str(actual or "").lower()
+    if expected == "long":
+        return actual in ("buy", "long")
+    if expected == "short":
+        return actual in ("sell", "short")
+    return False
+
+
+def _exchange_truth_position_mismatches(
+    state: dict[str, Any], exchange_truth: dict[str, Any]
+) -> list[dict[str, Any]]:
+    live_positions = _live_position_details(exchange_truth)
+    live_by_key = {
+        (p["venue"], p["symbol"]): p
+        for p in live_positions
+    }
+    expected_legs = _local_expected_legs(state)
+    expected_keys = {(leg["venue"], leg["symbol"]) for leg in expected_legs}
+    mismatches: list[dict[str, Any]] = []
+
+    for leg in expected_legs:
+        key = (leg["venue"], leg["symbol"])
+        live = live_by_key.get(key)
+        live_qty = float(live.get("quantity", 0.0)) if live else 0.0
+        live_side = str(live.get("side", "")) if live else ""
+        expected_qty = float(leg["expected_quantity"])
+        if (
+            abs(live_qty - expected_qty) > 1e-9
+            or not _side_matches(live_side, str(leg["expected_side"]))
+        ):
+            mismatches.append({
+                "check": "local_live_leg_missing_or_quantity_mismatch",
+                **leg,
+                "live_quantity": live_qty,
+                "live_side": live_side,
+            })
+
+    if expected_legs:
+        for live in live_positions:
+            key = (live["venue"], live["symbol"])
+            if key not in expected_keys:
+                mismatches.append({
+                    "check": "unexpected_live_position",
+                    **live,
+                })
+
+    return mismatches
+
+
 def analyze_current_state(
     state: dict[str, Any],
     *,
@@ -157,6 +265,40 @@ def analyze_current_state(
         fingerprints.append("stale_fail_closed_clean_state")
     if state.get("last_scan") is None:
         fingerprints.append("last_scan_missing")
+    exchange_truth = state.get("exchange_truth")
+    exchange_truth_mismatches: list[dict[str, Any]] = []
+    if isinstance(exchange_truth, dict) and exchange_truth.get("available") and exchange_truth.get("confidence") == "high":
+        leg_mismatches = _exchange_truth_position_mismatches(state, exchange_truth)
+        if leg_mismatches:
+            fingerprints.append("exchange_truth_mismatch")
+            fingerprints.append("local_exchange_position_mismatch")
+            if any(m.get("check") == "unexpected_live_position" for m in leg_mismatches):
+                fingerprints.append("nonzero_live_position")
+            exchange_truth_mismatches.extend(leg_mismatches)
+        if clean and exchange_truth.get("has_nonzero_position"):
+            if "exchange_truth_mismatch" not in fingerprints:
+                fingerprints.append("exchange_truth_mismatch")
+            if "nonzero_live_position" not in fingerprints:
+                fingerprints.append("nonzero_live_position")
+            for venue, positions in (exchange_truth.get("positions") or {}).items():
+                if not isinstance(positions, dict):
+                    continue
+                for symbol, pos in positions.items():
+                    if not isinstance(pos, dict):
+                        continue
+                    try:
+                        qty = abs(float(pos.get("quantity") or 0.0))
+                    except (TypeError, ValueError):
+                        qty = 0.0
+                    if qty > 1e-9:
+                        exchange_truth_mismatches.append({
+                            "check": "unexpected_live_position",
+                            "venue": str(pos.get("venue") or venue),
+                            "symbol": str(pos.get("symbol") or symbol),
+                            "side": pos.get("side"),
+                            "quantity": qty,
+                            "entry_price": pos.get("entry_price"),
+                        })
 
     severity = "critical" if any(fp != "last_scan_missing" for fp in fingerprints) else "warning"
     return HealthReport(
@@ -171,6 +313,8 @@ def analyze_current_state(
             "open_position_count": open_count,
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
+            "pending_residual_repair_count": int(state.get("pending_residual_repair_count") or 0),
+            "exchange_truth_mismatches": exchange_truth_mismatches,
         },
     )
 

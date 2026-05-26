@@ -40,6 +40,28 @@ List commands without running them:
 python3 scripts/validate_change.py --profile close --dry-run
 ```
 
+## Documentation-Only Changes
+
+For documentation-only changes, use the `smoke` profile as the default gate:
+
+```bash
+python3 scripts/validate_change.py --profile smoke
+```
+
+This keeps closure cheap while still checking Python import/compile health and
+diff whitespace. Do not run focused pytest profiles for a docs-only patch unless
+the documentation change claims a specific runtime behavior, test result, or
+bug-fix status that needs fresh proof.
+
+Before handoff, confirm tracked and untracked paths are documentation-only:
+
+```bash
+git status --short
+```
+
+If bug-ledger docs were added or materially changed, run `npx gitnexus analyze`
+only when the next workflow needs a fresh GitNexus index.
+
 Run a broad suite with timeout and keep going after failures:
 
 ```bash

@@ -3976,7 +3976,11 @@ class PassiveCloseExecutor:
                 "reason": "normalized_quantity_zero",
                 "price_source": price_source,
             }
-        min_notional = float(min_notional_quote or 0.0)
+        if min_notional_quote is None:
+            min_notional = float(self._config.small_fill_buffer_notional_quote or 0.0)
+            min_notional_source = "passive_close_small_fill_buffer"
+        else:
+            min_notional = float(min_notional_quote or 0.0)
         if venue_reduce_only_close_exempts_min_notional(hedge_venue):
             return None
         if not (math.isfinite(price_hint) and price_hint > 0.0):

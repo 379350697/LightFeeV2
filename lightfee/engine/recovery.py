@@ -140,14 +140,16 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
     has_pending = len(state.pending_entries) > 0
     has_closes = len(state.pending_closes) > 0
     has_passive_closes = len(state.pending_passive_closes) > 0
+    has_residual_repairs = len(getattr(state, "pending_residual_repairs", []) or []) > 0
 
-    ambiguous = has_opens and state.lifecycle == EngineLifecycle.BOOTING
+    ambiguous = (has_opens and state.lifecycle == EngineLifecycle.BOOTING) or has_residual_repairs
 
     return RecoveryWorkSnapshot(
         has_open_positions=has_opens,
         has_pending_entries=has_pending,
         has_pending_closes=has_closes,
         has_pending_passive_closes=has_passive_closes,
+        has_pending_residual_repairs=has_residual_repairs,
         ambiguous_state=ambiguous,
         lifecycle=state.lifecycle,
     )
@@ -1076,7 +1078,13 @@ def needs_reconciliation(state: EngineState) -> bool:
     Rust V1: state_has_recovery_work() — checks all pending/recovery vectors.
     """
     snap = build_recovery_snapshot(state)
-    return snap.has_open_positions or snap.has_pending_entries or snap.has_pending_closes or snap.has_pending_passive_closes
+    return (
+        snap.has_open_positions
+        or snap.has_pending_entries
+        or snap.has_pending_closes
+        or snap.has_pending_passive_closes
+        or snap.has_pending_residual_repairs
+    )
 
 
 def is_safe_to_resume(state: EngineState) -> bool:

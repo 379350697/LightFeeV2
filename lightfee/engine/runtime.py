@@ -146,6 +146,7 @@ class LiveRuntime:
         self._last_private_position_probe_ms: int = 0
         self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
         self._last_position_drift_check_ms: int = 0
+        self._symbol_admission_blocked_until_ms: dict[tuple[str, str], int] = {}
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
@@ -168,12 +169,110 @@ class LiveRuntime:
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
     _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
+    _SYMBOL_ADMISSION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000
 
     @staticmethod
     def _risk_snapshot_ttl_ms(venue: Venue) -> int:
         if venue == Venue.ASTER:
             return LiveRuntime._RISK_SNAPSHOT_TTL_MS_ASTER
         return LiveRuntime._RISK_SNAPSHOT_TTL_MS_DEFAULT
+
+    @staticmethod
+    def _entry_admission_reject_reason(venue: Venue, reason: str) -> str | None:
+        text = str(reason or "").lower()
+        if venue == Venue.BYBIT and (
+            "110126" in text
+            or "110125" in text
+            or "110123" in text
+            or "must sign required agreement" in text
+            or "agree to the trading terms" in text
+        ):
+            return "bybit_trading_terms_required"
+        if venue == Venue.ASTER and (
+            "-2027" in text
+            or "max_leverage_ratio" in text
+            or "maximum allowable position at current leverage" in text
+        ):
+            return "leverage_admission_blocked"
+        return None
+
+    def _candidate_admission_block(self, candidate, now_ms: int) -> str | None:
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        for raw_venue in (
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        ):
+            try:
+                venue = Venue.from_str(str(raw_venue))
+            except ValueError:
+                continue
+            key = (venue.value, symbol)
+            until_ms = self._symbol_admission_blocked_until_ms.get(key, 0)
+            if until_ms > now_ms:
+                return str(
+                    self.state.venue_entry_cooldowns.get(f"{venue.value}:{symbol}", {}).get(
+                        "reason", "symbol_admission_blocked"
+                    )
+                )
+        return None
+
+    def _record_symbol_admission_block(
+        self,
+        *,
+        venue: Venue,
+        symbol: str,
+        reason: str,
+        raw_error: str,
+        now_ms: int,
+    ) -> None:
+        until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
+        key = (venue.value, symbol)
+        self._symbol_admission_blocked_until_ms[key] = until_ms
+        state_key = f"{venue.value}:{symbol}"
+        self.state.venue_entry_cooldowns[state_key] = {
+            "venue": venue.value,
+            "symbol": symbol,
+            "reason": reason,
+            "blocked_until_ms": until_ms,
+            "raw_error": raw_error[:500],
+        }
+        self.journal.append(
+            "runtime.entry_admission_blocked",
+            {
+                "venue": venue.value,
+                "symbol": symbol,
+                "reason": reason,
+                "blocked_until_ms": until_ms,
+                "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
+                "raw_error": raw_error[:500],
+                "official_semantics": (
+                    "bybit_trading_terms_required"
+                    if reason == "bybit_trading_terms_required"
+                    else "aster_leverage_bracket_or_max_position"
+                ),
+                "ts_ms": now_ms,
+            },
+        )
+
+    def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        for raw_venue in (
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        ):
+            try:
+                venue = Venue.from_str(str(raw_venue))
+            except ValueError:
+                continue
+            reason = self._entry_admission_reject_reason(venue, reject_reason)
+            if reason:
+                self._record_symbol_admission_block(
+                    venue=venue,
+                    symbol=symbol,
+                    reason=reason,
+                    raw_error=reject_reason,
+                    now_ms=now_ms,
+                )
 
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._venue_adapters.get(venue)
@@ -868,6 +967,9 @@ class LiveRuntime:
             payload["category"] = category_value
         if status_code:
             payload["status_code"] = status_code
+        if status_code in (418, 429) or ret_code in ("429", "50011", "50061"):
+            payload["classification"] = "rate_limited"
+            payload["cooldown_scope"] = f"venue:{venue.value}:private_positions"
         if "okx_contract_metadata_missing_ct_val" in message:
             if "classification=instrument_missing" in message:
                 payload["classification"] = "instrument_missing"
@@ -1011,6 +1113,13 @@ class LiveRuntime:
                             "recovery.live_position_bulk_probe_metadata_missing",
                             payload,
                         )
+                        return (venue, [])
+                    if payload.get("classification") == "rate_limited":
+                        self.journal.append(
+                            "recovery.live_position_probe_venue_cooldown",
+                            payload,
+                        )
+                        return (venue, [])
                     else:
                         self.journal.append(
                             "recovery.live_position_bulk_probe_error",
@@ -2291,6 +2400,7 @@ class LiveRuntime:
             tradeable = await self._filter_candidates_supported_by_venue_catalog(
                 tradeable,
             )
+            l2_tracking_tradeable = list(tradeable)
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 tradeable,
                 snapshot=snapshot,
@@ -2330,6 +2440,53 @@ class LiveRuntime:
                         )
                         return
 
+            # V1: refresh tracked entry local L2 opportunities from the scan
+            # shortlist before quote freshness can block final entry selection.
+            if self.config.strategy.local_l2_enabled and l2_tracking_tradeable:
+                primary_count = getattr(
+                    self.config.strategy, "entry_local_l2_primary_count", 3,
+                )
+                shadow_count = getattr(
+                    self.config.strategy,
+                    "shadow_entry_opportunity_count",
+                    getattr(self.config.strategy, "entry_local_l2_shadow_count", 2),
+                )
+                from lightfee.engine.entry_local_l2 import select_tracked_opportunities
+
+                tracked = select_tracked_opportunities(
+                    l2_tracking_tradeable, primary_count, shadow_count,
+                )
+                tracked_pair_ids = {t.pair_id for t in tracked}
+                tracked_candidates = [
+                    candidate for candidate in l2_tracking_tradeable
+                    if self._candidate_pair_id(candidate) in tracked_pair_ids
+                ]
+                # V1: activity_local_l2_symbols() follows the tracked
+                # primary+shadow scope, not the whole tradeable shortlist.
+                await self._ensure_l2_active_for_candidates(
+                    tracked_candidates,
+                    now_ms,
+                    tracked_opportunities=tracked,
+                )
+                self._tracked_primary_pair_ids = {
+                    t.pair_id for t in tracked
+                    if t.class_.value == "primary_tracked"
+                }
+                # Refresh session state for all tracked opportunities
+                for t in tracked:
+                    self.entry_l2_sessions.track_opportunity(t, now_ms)
+                # V1 post-shortlist L2 sync after tracking: local books
+                # drive session readiness before the selection blocker.
+                await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                self._refresh_entry_l2_session_readiness(now_ms)
+                # V1: shadow promotion — best shadow replaces worst primary
+                # when score delta, hold window, execution guard, and readiness
+                # all pass (execution_core/engine.rs:2643-2719)
+                self._apply_shadow_promotion_if_eligible(
+                    tracked, now_ms,
+                )
+
+            if tradeable:
                 self.journal.append(
                     "runtime.candidates_tradeable",
                     {"count": len(tradeable), "ts_ms": now_ms},
@@ -2347,51 +2504,6 @@ class LiveRuntime:
                         "ts_ms": now_ms,
                     },
                 )
-                # V1: refresh tracked entry local L2 opportunities per tick
-                # select_tracked_entry_local_l2_opportunities → primary + shadow
-                if self.config.strategy.local_l2_enabled:
-                    primary_count = getattr(
-                        self.config.strategy, "entry_local_l2_primary_count", 3,
-                    )
-                    shadow_count = getattr(
-                        self.config.strategy,
-                        "shadow_entry_opportunity_count",
-                        getattr(self.config.strategy, "entry_local_l2_shadow_count", 2),
-                    )
-                    from lightfee.engine.entry_local_l2 import select_tracked_opportunities
-
-                    tracked = select_tracked_opportunities(
-                        tradeable, primary_count, shadow_count,
-                    )
-                    tracked_pair_ids = {t.pair_id for t in tracked}
-                    tracked_candidates = [
-                        candidate for candidate in tradeable
-                        if self._candidate_pair_id(candidate) in tracked_pair_ids
-                    ]
-                    # V1: activity_local_l2_symbols() follows the tracked
-                    # primary+shadow scope, not the whole tradeable shortlist.
-                    await self._ensure_l2_active_for_candidates(
-                        tracked_candidates,
-                        now_ms,
-                        tracked_opportunities=tracked,
-                    )
-                    self._tracked_primary_pair_ids = {
-                        t.pair_id for t in tracked
-                        if t.class_.value == "primary_tracked"
-                    }
-                    # Refresh session state for all tracked opportunities
-                    for t in tracked:
-                        self.entry_l2_sessions.track_opportunity(t, now_ms)
-                    # V1 post-shortlist L2 sync after tracking: local books
-                    # drive session readiness before the selection blocker.
-                    await self._sync_local_l2_data(now_ms, scan_promoted=True)
-                    self._refresh_entry_l2_session_readiness(now_ms)
-                    # V1: shadow promotion — best shadow replaces worst primary
-                    # when score delta, hold window, execution guard, and readiness
-                    # all pass (execution_core/engine.rs:2643-2719)
-                    self._apply_shadow_promotion_if_eligible(
-                        tracked, now_ms,
-                    )
                 # V1: selected_candidates is a final-entry list, not the raw
                 # shortlist. It excludes candidates still waiting on the final
                 # entry window, primary L2 tracking, or dual-ready books.
@@ -8366,6 +8478,20 @@ class LiveRuntime:
             plan_incremental_entry_execution,
         )
 
+        admission_block = self._candidate_admission_block(candidate, now_ms)
+        if admission_block:
+            self.journal.append(
+                "runtime.entry_admission_blocked",
+                {
+                    "symbol": getattr(candidate, "symbol", ""),
+                    "long_venue": getattr(candidate, "long_venue", ""),
+                    "short_venue": getattr(candidate, "short_venue", ""),
+                    "reason": admission_block,
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
         if not self._candidate_is_tradeable_for_selection(candidate):
             self.journal.append(
                 "runtime.entry_blocked_trading_capability",
@@ -8830,6 +8956,12 @@ class LiveRuntime:
                     "runtime.position_opened",
                     {"position_id": result.open_position.position_id},
                 )
+            if result.route == ExecutionRoute.REJECTED and getattr(result, "reject_reason", ""):
+                self._record_entry_result_admission_blocks(
+                    candidate,
+                    str(result.reject_reason),
+                    now_ms,
+                )
             if result.pending_entry is not None:
                 if getattr(result.pending_entry, "outcome", "") == "rejected":
                     self.journal.append(
@@ -8858,6 +8990,11 @@ class LiveRuntime:
                     },
                 )
         except Exception as e:
+            self._record_entry_result_admission_blocks(
+                candidate,
+                str(e),
+                now_ms,
+            )
             self.journal.append(
                 "runtime.entry_dispatch_error",
                 {"entry_id": ctx.entry_id, "error": str(e)},

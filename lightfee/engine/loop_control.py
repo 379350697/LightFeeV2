@@ -165,6 +165,10 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "pending_entry_count": len(state.pending_entries),
         "pending_close_count": len(state.pending_closes),
         "pending_passive_close_count": len(state.pending_passive_closes),
+        "pending_residual_repair_count": len(getattr(state, "pending_residual_repairs", []) or []),
+        "pending_residual_repairs": list(getattr(state, "pending_residual_repairs", []) or []),
+        "live_recovery_reduce_only_pairs": list(getattr(state, "live_recovery_reduce_only_pairs", []) or []),
+        "venue_entry_cooldowns": dict(getattr(state, "venue_entry_cooldowns", {}) or {}),
         "last_scan": getattr(state, "last_scan", None),
     }
     write_json_atomic(path, data)

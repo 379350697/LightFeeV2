@@ -18,6 +18,24 @@ Expected:
 - sidecar snapshot with 7 venues
 - current state `lifecycle=running`, `risk_mode=running`
 
+## Capture Read-Only Evidence
+
+Before remediation, deploy, restart, or manual state repair, capture read-only
+evidence first. Keep the evidence compact enough to paste into a bug ledger entry:
+
+```bash
+cd /opt/lightfee-v2
+python3 scripts/verify_production_services.py --json
+python3 scripts/check_process_singleton.py --strict
+systemctl show lightfee-live.service lightfee-sidecar.service \
+  --property=Id,ActiveState,SubState,ExecMainStartTimestamp,ExecMainPID
+```
+
+Record the current deploy identity (`git rev-parse --short HEAD` and
+`.deploy_version`), live/sidecar process state, open/pending/recovery counts, and
+the first failing health field. Do not include secrets, raw account identifiers,
+or long journal excerpts in the bug ledger.
+
 ## Remediate Sidecar Config Drift
 
 The sidecar runs as a Python V2 service (not Rust V1 bridge). Install the versioned template:

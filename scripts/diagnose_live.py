@@ -737,6 +737,116 @@ def _build_exchange_truth(
 # state consistency
 # ---------------------------------------------------------------------------
 
+def _safe_abs_quantity(value: Any) -> float:
+    try:
+        return abs(float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any]]:
+    live: list[dict[str, Any]] = []
+    for venue, positions in (exchange_truth.get("positions") or {}).items():
+        if not isinstance(positions, dict):
+            continue
+        for symbol, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            qty = _safe_abs_quantity(pos.get("quantity"))
+            if qty <= 1e-9:
+                continue
+            live.append({
+                "venue": str(pos.get("venue") or venue).lower(),
+                "symbol": str(pos.get("symbol") or symbol).upper(),
+                "side": str(pos.get("side") or "").lower(),
+                "quantity": qty,
+                "entry_price": pos.get("entry_price"),
+            })
+    return live
+
+
+def _local_expected_legs(local_state: dict[str, Any]) -> list[dict[str, Any]]:
+    legs: list[dict[str, Any]] = []
+    for pos in local_state.get("positions", []) or []:
+        if not isinstance(pos, dict):
+            continue
+        symbol = str(pos.get("symbol") or "").upper()
+        qty = _safe_abs_quantity(pos.get("quantity") or pos.get("matched_quantity"))
+        if not symbol or qty <= 1e-9:
+            continue
+        long_venue = str(pos.get("long_venue") or "").lower()
+        short_venue = str(pos.get("short_venue") or "").lower()
+        if long_venue:
+            legs.append({
+                "venue": long_venue,
+                "symbol": symbol,
+                "expected_side": "long",
+                "expected_quantity": qty,
+                "position_id": pos.get("position_id"),
+            })
+        if short_venue:
+            legs.append({
+                "venue": short_venue,
+                "symbol": symbol,
+                "expected_side": "short",
+                "expected_quantity": qty,
+                "position_id": pos.get("position_id"),
+            })
+    return legs
+
+
+def _side_matches(actual: str, expected: str) -> bool:
+    actual = str(actual or "").lower()
+    if expected == "long":
+        return actual in ("buy", "long")
+    if expected == "short":
+        return actual in ("sell", "short")
+    return False
+
+
+def _exchange_truth_position_mismatches(
+    local_state: dict[str, Any], exchange_truth: dict[str, Any]
+) -> list[dict[str, Any]]:
+    live_positions = _live_position_details(exchange_truth)
+    live_by_key = {
+        (p["venue"], p["symbol"]): p
+        for p in live_positions
+    }
+    expected_legs = _local_expected_legs(local_state)
+    expected_keys = {(leg["venue"], leg["symbol"]) for leg in expected_legs}
+    mismatches: list[dict[str, Any]] = []
+
+    for leg in expected_legs:
+        key = (leg["venue"], leg["symbol"])
+        live = live_by_key.get(key)
+        live_qty = float(live.get("quantity", 0.0)) if live else 0.0
+        live_side = str(live.get("side", "")) if live else ""
+        expected_qty = float(leg["expected_quantity"])
+        if (
+            abs(live_qty - expected_qty) > 1e-9
+            or not _side_matches(live_side, str(leg["expected_side"]))
+        ):
+            mismatches.append({
+                "check": "local_live_leg_missing_or_quantity_mismatch",
+                "ok": False,
+                **leg,
+                "live_quantity": live_qty,
+                "live_side": live_side,
+            })
+
+    if expected_legs:
+        for live in live_positions:
+            key = (live["venue"], live["symbol"])
+            if key not in expected_keys:
+                mismatches.append({
+                    "check": "unexpected_live_position",
+                    "ok": False,
+                    **live,
+                })
+
+    return mismatches
+
+
 def _build_state_consistency(
     local_state: dict[str, Any], exchange_truth: dict[str, Any]
 ) -> dict[str, Any]:
@@ -834,7 +944,8 @@ def _build_state_consistency(
     # Confidence high: all queries succeeded — we can reliably compare
     exchange_has_positions = exchange_truth.get("has_nonzero_position", False)
     local_has_positions = local_open > 0
-    state_mismatch = local_has_positions != exchange_has_positions
+    leg_mismatches = _exchange_truth_position_mismatches(local_state, exchange_truth)
+    state_mismatch = (local_has_positions != exchange_has_positions) or bool(leg_mismatches)
     local_open_exchange_flat = local_has_positions and not exchange_has_positions
 
     if local_open_exchange_flat:
@@ -851,12 +962,16 @@ def _build_state_consistency(
             "evidence_source": "local_state.open_positions vs exchange_truth.positions (confidence=high)",
             "local_symbols": local_symbols,
         })
+    if leg_mismatches:
+        details.extend(leg_mismatches)
     if state_mismatch and not local_open_exchange_flat:
+        live_positions = _live_position_details(exchange_truth)
         details.append({
-            "check": "state_mismatch",
+            "check": "nonzero_live_position" if not local_has_positions else "state_mismatch",
             "ok": False,
             "detail": "local and exchange state diverge (exchange has positions not in local)",
             "evidence_source": "local_state vs exchange_truth",
+            "live_positions": live_positions,
         })
 
     if not details:
@@ -867,14 +982,28 @@ def _build_state_consistency(
             "evidence_source": "local_state + exchange_truth (confidence=high)",
         })
 
+    state_verdict = (
+        "local_open_exchange_flat" if local_open_exchange_flat
+        else "consistent" if not state_mismatch
+        else "exchange_truth_mismatch" if exchange_has_positions and not local_has_positions
+        else "exchange_truth_mismatch" if leg_mismatches
+        else "state_mismatch"
+    )
+    fingerprints = []
+    if state_mismatch:
+        fingerprints.append("exchange_truth_mismatch")
+    if exchange_has_positions and not local_has_positions:
+        fingerprints.append("nonzero_live_position")
+    if leg_mismatches:
+        fingerprints.append("local_exchange_position_mismatch")
+    if any(m.get("check") == "unexpected_live_position" for m in leg_mismatches):
+        fingerprints.append("nonzero_live_position")
+
     return {
         "state_mismatch": state_mismatch,
         "local_open_exchange_flat": local_open_exchange_flat,
-        "state_verdict": (
-            "local_open_exchange_flat" if local_open_exchange_flat
-            else "consistent" if not state_mismatch
-            else "state_mismatch"
-        ),
+        "state_verdict": state_verdict,
+        "fingerprints": fingerprints,
         "details": details,
         "confidence": "high",
     }

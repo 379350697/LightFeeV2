@@ -10,6 +10,7 @@ import asyncio
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,9 @@ from lightfee.engine.bootstrap import (
 )
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.engine.entry import EntryState
+from lightfee.engine.entry_sync import EntryExecutionResult
+from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_uncertain_error
@@ -144,6 +148,100 @@ class TestRuntimePreflight:
 
             # Journal is closed after stop
             assert runtime.journal._file is None
+
+    @pytest.mark.asyncio
+    async def test_bybit_trading_terms_reject_blocks_symbol_admission(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            class RejectingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason=(
+                            "bybit order failed: bybit retCode=110126 "
+                            "retMsg=must sign required agreement"
+                        ),
+                    )
+
+            executor = RejectingExecutor()
+            runtime.entry_executor = executor
+            candidate = SimpleNamespace(
+                symbol="LITEUSDT",
+                long_venue="bybit",
+                short_venue="binance",
+                entry_notional_quote=50.0,
+                ranking_edge_bps=10.0,
+                expected_edge_bps=10.0,
+                funding_edge_bps=0.0,
+                worst_case_edge_bps=8.0,
+                blocked=False,
+                blocked_reasons=[],
+            )
+
+            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
+            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+
+            assert first is True
+            assert second is False
+            assert executor.calls == 1
+            key = "bybit:LITEUSDT"
+            assert runtime.state.venue_entry_cooldowns[key]["reason"] == "bybit_trading_terms_required"
+            kinds = [e["kind"] for e in runtime.journal.read_all()]
+            assert "runtime.entry_admission_blocked" in kinds
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_max_leverage_reject_blocks_symbol_admission(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            class RejectingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason=(
+                            "HTTP 400: {\"code\":-2027,\"msg\":\"Exceeded the maximum allowable "
+                            "position at current leverage.\"}"
+                        ),
+                    )
+
+            executor = RejectingExecutor()
+            runtime.entry_executor = executor
+            candidate = SimpleNamespace(
+                symbol="ESPORTSUSDT",
+                long_venue="aster",
+                short_venue="bybit",
+                entry_notional_quote=50.0,
+                ranking_edge_bps=10.0,
+                expected_edge_bps=10.0,
+                funding_edge_bps=0.0,
+                worst_case_edge_bps=8.0,
+                blocked=False,
+                blocked_reasons=[],
+            )
+
+            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
+            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+
+            assert first is True
+            assert second is False
+            assert executor.calls == 1
+            key = "aster:ESPORTSUSDT"
+            assert runtime.state.venue_entry_cooldowns[key]["reason"] == "leverage_admission_blocked"
+            runtime.journal.close()
 
     def test_live_main_wires_production_executors_for_real_runtime(self):
         """The live entrypoint wiring must remain active for real LiveRuntime."""

@@ -2745,8 +2745,27 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert ack.order_id == "12345"
 
     @pytest.mark.asyncio
-    async def test_bybit_live_place_order_quantizes_and_records_sanitized_attempt_result(self):
+    async def test_bybit_live_place_order_quantizes_and_records_sanitized_attempt_result(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
         spec = bybit_spec()
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BYBIT
+                assert venue_symbol == "BTCUSDT"
+                return SymbolRule(
+                    tick_size=spec.price_tick,
+                    qty_step=spec.quantity_step,
+                    min_qty=spec.min_quantity,
+                    min_notional=spec.min_notional,
+                    rule_source="test_spec",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
         transport = VenueTransport(
             spec=spec,
             mode="live",
@@ -6936,7 +6955,11 @@ class TestPassivePreflight:
             "lightfee.venues.transport.get_symbol_rules_cache",
             lambda: FakeRulesCache(),
         )
-        transport = VenueTransport(spec=bybit_spec(), mode="paper")
+        transport = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="key", api_secret="secret"),
+        )
 
         assert await transport.normalize_quantity("UBUSDT", 1.0) == 0.0
         assert await transport.normalize_quantity("UBUSDT", 10.0) == pytest.approx(10.0)

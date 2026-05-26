@@ -1,5 +1,6 @@
 """Tests for engine state, lifecycle, and recovery."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -150,6 +151,52 @@ class TestRecovery:
         rs = build_recovery_snapshot(state)
         assert rs.has_pending_passive_closes
         assert rs.has_open_positions is False
+
+    def test_recovery_snapshot_counts_pending_residual_repairs_as_work(self):
+        """Live exchange exposure retained as residual repair is recovery work."""
+        state = EngineState(lifecycle=EngineLifecycle.RECONCILING)
+        state.pending_residual_repairs.append({
+            "position_id": "entry-biousdt",
+            "pair_id": "biousdt:bybit->okx",
+            "symbol": "BIOUSDT",
+            "repair_venue": "bybit",
+            "repair_side": "sell",
+            "repair_quantity": 1444.0,
+            "origin": "entry_open",
+        })
+
+        rs = build_recovery_snapshot(state)
+
+        assert rs.ambiguous_state
+        assert getattr(rs, "has_pending_residual_repairs") is True
+
+    def test_current_state_export_exposes_pending_residual_repairs(self, tmp_path):
+        from lightfee.config.schema import AppConfig
+        from lightfee.engine.loop_control import _export_current_state_snapshot
+
+        state = EngineState(lifecycle=EngineLifecycle.RUNNING)
+        state.run_id = "run-test"
+        state.last_tick_ms = 1778786999000
+        state.pending_residual_repairs.append({
+            "position_id": "entry-biousdt",
+            "pair_id": "biousdt:bybit->okx",
+            "symbol": "BIOUSDT",
+            "repair_venue": "bybit",
+            "repair_side": "sell",
+            "repair_quantity": 1444.0,
+            "client_order_id": "cleanup-cid",
+            "origin": "entry_open",
+        })
+
+        path = tmp_path / "current.json"
+        _export_current_state_snapshot(state, str(path), AppConfig())
+        data = json.loads(path.read_text())
+
+        assert data["open_position_count"] == 0
+        assert data["pending_entry_count"] == 0
+        assert data["pending_residual_repair_count"] == 1
+        assert data["pending_residual_repairs"][0]["symbol"] == "BIOUSDT"
+        assert data["pending_residual_repairs"][0]["client_order_id"] == "cleanup-cid"
 
     def test_snapshot_restores_local_l2_state(self):
         """Rust V1: local-L2 retained books, books snapshot, session snapshot restore as resume-waiting."""

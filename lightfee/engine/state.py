@@ -550,6 +550,7 @@ class RecoveryWorkSnapshot:
     has_pending_entries: bool = False
     has_pending_closes: bool = False
     has_pending_passive_closes: bool = False
+    has_pending_residual_repairs: bool = False
     ambiguous_state: bool = False
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
 

@@ -10,6 +10,7 @@ from lightfee.ops.production_health import (
     analyze_systemd_unit,
     summarize_reports,
 )
+from scripts.diagnose_live import _build_state_consistency
 
 
 def test_sidecar_unit_rejects_missing_config():
@@ -90,6 +91,194 @@ def test_current_state_flags_stale_fail_closed_clean_state():
     report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
     assert not report.ok
     assert "stale_fail_closed_clean_state" in report.fingerprints
+
+
+def test_current_state_clean_local_exchange_nonzero_is_critical():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "positions": {
+                "bybit": {
+                    "BIOUSDT": {
+                        "venue": "bybit",
+                        "symbol": "BIOUSDT",
+                        "side": "buy",
+                        "quantity": 1444.0,
+                        "entry_price": 0.03321,
+                    }
+                }
+            },
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "exchange_truth_mismatch" in report.fingerprints
+    assert "nonzero_live_position" in report.fingerprints
+    assert report.details["exchange_truth_mismatches"][0]["symbol"] == "BIOUSDT"
+
+
+def test_current_state_local_open_exchange_leg_quantity_mismatch_is_critical():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 1,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "open_positions": [{
+            "position_id": "pos-beat",
+            "symbol": "BEATUSDT",
+            "long_venue": "aster",
+            "short_venue": "bybit",
+            "quantity": 24.0,
+        }],
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "positions": {
+                "aster": {
+                    "BEATUSDT": {
+                        "venue": "aster",
+                        "symbol": "BEATUSDT",
+                        "side": "buy",
+                        "quantity": 0.0,
+                    }
+                },
+                "bybit": {
+                    "BEATUSDT": {
+                        "venue": "bybit",
+                        "symbol": "BEATUSDT",
+                        "side": "sell",
+                        "quantity": 9.0,
+                    },
+                    "BIOUSDT": {
+                        "venue": "bybit",
+                        "symbol": "BIOUSDT",
+                        "side": "buy",
+                        "quantity": 1444.0,
+                    },
+                },
+            },
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "exchange_truth_mismatch" in report.fingerprints
+    assert "local_exchange_position_mismatch" in report.fingerprints
+    checks = {m["check"] for m in report.details["exchange_truth_mismatches"]}
+    assert "local_live_leg_missing_or_quantity_mismatch" in checks
+    assert "unexpected_live_position" in checks
+
+
+def test_diagnose_state_consistency_names_exchange_nonzero_local_flat():
+    local_state = {
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "positions": [],
+    }
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": True,
+        "positions": {
+            "bybit": {
+                "BIOUSDT": {
+                    "venue": "bybit",
+                    "symbol": "BIOUSDT",
+                    "side": "buy",
+                    "quantity": 1444.0,
+                    "entry_price": 0.03321,
+                }
+            }
+        },
+        "fetch_status": {"bybit": {"status": "ok", "positions_failed": []}},
+    }
+
+    consistency = _build_state_consistency(local_state, exchange_truth)
+
+    assert consistency["state_mismatch"] is True
+    assert consistency["state_verdict"] == "exchange_truth_mismatch"
+    assert "exchange_truth_mismatch" in consistency["fingerprints"]
+    assert "nonzero_live_position" in consistency["fingerprints"]
+    detail = consistency["details"][0]
+    assert detail["check"] == "nonzero_live_position"
+    assert detail["live_positions"][0]["symbol"] == "BIOUSDT"
+
+
+def test_diagnose_state_consistency_flags_local_open_live_leg_quantity_mismatch():
+    local_state = {
+        "open_position_count": 1,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "positions": [{
+            "position_id": "pos-beat",
+            "symbol": "BEATUSDT",
+            "long_venue": "aster",
+            "short_venue": "bybit",
+            "quantity": 24.0,
+        }],
+    }
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": True,
+        "positions": {
+            "aster": {
+                "BEATUSDT": {
+                    "venue": "aster",
+                    "symbol": "BEATUSDT",
+                    "side": "buy",
+                    "quantity": 0.0,
+                }
+            },
+            "bybit": {
+                "BEATUSDT": {
+                    "venue": "bybit",
+                    "symbol": "BEATUSDT",
+                    "side": "sell",
+                    "quantity": 9.0,
+                },
+                "BIOUSDT": {
+                    "venue": "bybit",
+                    "symbol": "BIOUSDT",
+                    "side": "buy",
+                    "quantity": 1444.0,
+                },
+            },
+        },
+        "fetch_status": {
+            "aster": {"status": "ok", "positions_failed": []},
+            "bybit": {"status": "ok", "positions_failed": []},
+        },
+    }
+
+    consistency = _build_state_consistency(local_state, exchange_truth)
+
+    assert consistency["state_mismatch"] is True
+    assert consistency["state_verdict"] == "exchange_truth_mismatch"
+    assert "exchange_truth_mismatch" in consistency["fingerprints"]
+    assert "local_exchange_position_mismatch" in consistency["fingerprints"]
+    checks = {d["check"] for d in consistency["details"]}
+    assert "local_live_leg_missing_or_quantity_mismatch" in checks
+    assert "unexpected_live_position" in checks
 
 
 def test_resolver_requires_okx_capable_priority():

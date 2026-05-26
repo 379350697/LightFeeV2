@@ -43,6 +43,18 @@ ADAPTERS = [
 ]
 
 FIXTURE_DIR = "tests/fixtures/venues"
+HL_FIXTURE_PRIVATE_KEY = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+
+
+def _trust_hyperliquid_transport_for_test(transport) -> None:
+    transport._trading_capability_trusted = True
+    transport._trading_preflight_status = {
+        "venue": Venue.HYPERLIQUID.value,
+        "status": "ok",
+        "trading_capability_trusted": True,
+        "authorization_mode": "account_wallet",
+        "authorization_verified": True,
+    }
 
 
 def _load_fixture(venue_name: str, name: str):
@@ -97,14 +109,23 @@ class TestAdapterContract:
         assert fill.symbol
 
     @pytest.mark.asyncio
-    async def test_normalize_quantity_floors_to_step(self, venue_id, adapter_cls):
+    async def test_normalize_quantity_floors_to_step(self, venue_id, adapter_cls, monkeypatch):
         adapter = adapter_cls()
+        public_get_calls = []
+        if venue_id == Venue.BYBIT:
+            async def fail_public_get(*args, **kwargs):
+                public_get_calls.append((args, kwargs))
+                raise AssertionError("paper normalize_quantity must not fetch live rules")
+
+            monkeypatch.setattr(adapter._transport, "_public_get", fail_public_get)
         if venue_id == Venue.OKX:
             adapter._transport.set_symbol_metadata({
                 "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
             })
         qty = await adapter.normalize_quantity("BTCUSDT", 1.7)
         assert qty >= 0
+        if venue_id == Venue.BYBIT:
+            assert public_get_calls == []
 
     @pytest.mark.asyncio
     async def test_no_required_method_raises_not_implemented(self, venue_id, adapter_cls):
@@ -212,7 +233,11 @@ class TestFixtureDrivenMarketSnapshot:
 
         cred = LiveCredential(api_key="k", api_secret="s",
                               api_passphrase="p",
-                              wallet_private_key="0xdead",
+                              wallet_private_key=(
+                                  HL_FIXTURE_PRIVATE_KEY
+                                  if venue_id == Venue.HYPERLIQUID
+                                  else "0xdead"
+                              ),
                               account_address="0xbeef")
         adapter = adapter_cls(mode="live", credential=cred)
 
@@ -248,7 +273,11 @@ class TestFixtureDrivenPosition:
 
         cred = LiveCredential(api_key="k", api_secret="s",
                               api_passphrase="p",
-                              wallet_private_key="0xdead",
+                              wallet_private_key=(
+                                  HL_FIXTURE_PRIVATE_KEY
+                                  if venue_id == Venue.HYPERLIQUID
+                                  else "0xdead"
+                              ),
                               account_address="0xbeef")
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
@@ -258,6 +287,7 @@ class TestFixtureDrivenPosition:
             transport.set_symbol_metadata({
                 "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
             })
+            transport._okx_swap_instruments_loaded = True
 
         try:
             pos = await adapter.fetch_position(symbol)
@@ -284,12 +314,15 @@ class TestFixtureDrivenOrderSuccess:
         fixture = _load_fixture(fixture_name, "place_order_success")
         mock = _build_mock_transport(fixture)
 
-        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(
             api_key="k",
             api_secret="" if venue_id == Venue.HYPERLIQUID else "s",
             api_passphrase="p",
-            wallet_private_key=hl_privkey if venue_id == Venue.HYPERLIQUID else "0xdead",
+            wallet_private_key=(
+                HL_FIXTURE_PRIVATE_KEY
+                if venue_id == Venue.HYPERLIQUID
+                else "0xdead"
+            ),
             account_address="0xbeef",
         )
         adapter = adapter_cls(mode="live", credential=cred)
@@ -301,6 +334,7 @@ class TestFixtureDrivenOrderSuccess:
         # transport (single-response) doesn't need to serve metadata.
         if venue_id == Venue.HYPERLIQUID:
             transport._hl_meta_cache[symbol] = 0
+            _trust_hyperliquid_transport_for_test(transport)
         if venue_id == Venue.OKX:
             class FakeRulesCache:
                 async def get(self, transport, venue, venue_symbol):
@@ -461,9 +495,8 @@ class TestHyperliquidLiveOrderNowSupported:
         fixture = _load_fixture("hyperliquid", "place_order_success")
         mock = _build_mock_transport(fixture)
 
-        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(api_key="k", api_secret="",
-                              wallet_private_key=hl_privkey,
+                              wallet_private_key=HL_FIXTURE_PRIVATE_KEY,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
@@ -471,6 +504,7 @@ class TestHyperliquidLiveOrderNowSupported:
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         # Pre-populate asset index cache to avoid mock needing metadata response
         transport._hl_meta_cache["BTC"] = 0
+        _trust_hyperliquid_transport_for_test(transport)
 
         try:
             req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
@@ -748,15 +782,15 @@ class TestHyperliquidCapabilityConsistency:
         fixture = _load_fixture("hyperliquid", "place_order_success")
         mock = _build_mock_transport(fixture)
 
-        hl_privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(api_key="k", api_secret="",
-                              wallet_private_key=hl_privkey,
+                              wallet_private_key=HL_FIXTURE_PRIVATE_KEY,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
         transport._client = httpx.AsyncClient(transport=mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         transport._hl_meta_cache["BTC"] = 0
+        _trust_hyperliquid_transport_for_test(transport)
 
         try:
             req = OrderRequest(venue=Venue.HYPERLIQUID, symbol="BTC",
@@ -773,7 +807,7 @@ class TestHyperliquidCapabilityConsistency:
         fixture = _load_fixture("hyperliquid", "market_snapshot")
         mock = _build_mock_transport(fixture)
         cred = LiveCredential(api_key="k", api_secret="s",
-                              wallet_private_key="0xdead",
+                              wallet_private_key=HL_FIXTURE_PRIVATE_KEY,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
@@ -793,7 +827,7 @@ class TestHyperliquidCapabilityConsistency:
         fixture = _load_fixture("hyperliquid", "position_snapshot")
         mock = _build_mock_transport(fixture)
         cred = LiveCredential(api_key="k", api_secret="s",
-                              wallet_private_key="0xdead",
+                              wallet_private_key=HL_FIXTURE_PRIVATE_KEY,
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
