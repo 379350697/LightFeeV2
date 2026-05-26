@@ -152,6 +152,9 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "risk_mode": state.risk_mode.value,
         "global_risk_mode": state.risk_mode.value,
         "global_risk_reason": getattr(state, "global_risk_reason", None),
+        "hyperliquid_trading_disabled_reason": getattr(
+            state, "hyperliquid_trading_disabled_reason", None
+        ),
         "recovery_blocked_reason": getattr(state, "recovery_blocked_reason", None),
         "recovery_blocked_at_ms": getattr(state, "recovery_blocked_at_ms", 0),
         "run_id": state.run_id,

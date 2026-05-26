@@ -250,7 +250,12 @@ class LiveRuntime:
             "signature",
             "private_key",
             "headers",
-            "auth",
+        }
+        allowed_auth_diagnostics = {
+            "api_wallet_authorization_verified",
+            "authorization_error",
+            "authorization_mode",
+            "authorization_verified",
         }
         for venue, adapter in sorted(
             self._venue_adapters.items(),
@@ -272,11 +277,38 @@ class LiveRuntime:
             payload: dict[str, object] = {}
             for key, value in dict(raw_payload or {}).items():
                 key_s = str(key)
-                if any(token in key_s.lower() for token in blocked):
+                key_l = key_s.lower()
+                if (
+                    key_l not in allowed_auth_diagnostics
+                    and (
+                        key_l in blocked
+                        or any(
+                            token in key_l
+                            for token in (
+                                "api_key",
+                                "api_secret",
+                                "auth",
+                                "header",
+                                "private_key",
+                                "secret",
+                                "signature",
+                            )
+                        )
+                    )
+                ):
                     continue
                 payload[key_s] = value
             payload.setdefault("venue", venue.value if hasattr(venue, "value") else str(venue))
             payload.setdefault("status", "ok")
+            if venue == Venue.HYPERLIQUID:
+                trusted = bool(payload.get("trading_capability_trusted"))
+                status = str(payload.get("status", "")).lower()
+                if status != "ok" or not trusted:
+                    self.state.hyperliquid_trading_disabled_reason = str(
+                        payload.get("reason") or "trading_preflight_failed"
+                    )
+                else:
+                    self.state.hyperliquid_trading_disabled_reason = None
             self.journal.append("startup.trading_preflight", payload)
 
     # ------------------------------------------------------------------
@@ -313,12 +345,18 @@ class LiveRuntime:
         )
         self._emit_startup_order_path_preflight()
         await self._verify_live_trading_preflights()
+        hyperliquid_trading_disabled_reason = (
+            self.state.hyperliquid_trading_disabled_reason
+        )
 
         # Phase 2 – Resolve runtime symbols (daily-universe integration point)
         symbol_info = await prepare_runtime_symbols(self.config)
 
         # Phase 3 – Recover or start fresh
         self.state = recover_from_snapshot(self.snapshot_store, self.journal)
+        self.state.hyperliquid_trading_disabled_reason = (
+            hyperliquid_trading_disabled_reason
+        )
         self._restore_passive_order_manager_states()
         self.state.run_id = self.journal.run_id
         if self.state.started_at_ms == 0:

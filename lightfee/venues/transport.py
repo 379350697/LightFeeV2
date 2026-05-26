@@ -71,6 +71,7 @@ class LiveCredential:
     api_passphrase: str = ""
     wallet_private_key: str = ""
     account_address: str = ""
+    wallet_mode: str = "account_wallet"
 
 
 def _missing_hyperliquid_signing_dependencies() -> list[str]:
@@ -103,7 +104,28 @@ def _derive_hyperliquid_account_address(wallet_private_key: str) -> str:
         ) from exc
 
 
+def _normalize_hyperliquid_wallet_mode(wallet_mode: str) -> str:
+    mode = str(wallet_mode or "account_wallet").strip().lower().replace("-", "_")
+    if mode in ("account", "account_wallet", "wallet"):
+        return "account_wallet"
+    if mode in ("api", "api_wallet", "agent", "agent_wallet"):
+        return "api_wallet"
+    return mode
+
+
 def _normalize_hyperliquid_credential(credential: LiveCredential) -> LiveCredential:
+    wallet_mode = _normalize_hyperliquid_wallet_mode(credential.wallet_mode)
+    if wallet_mode != credential.wallet_mode:
+        credential = replace(credential, wallet_mode=wallet_mode)
+    if wallet_mode == "account_wallet" and credential.wallet_private_key:
+        return replace(
+            credential,
+            account_address=_derive_hyperliquid_account_address(
+                credential.wallet_private_key
+            ),
+        )
+    if wallet_mode == "api_wallet" and not credential.account_address:
+        return credential
     if credential.account_address or not credential.wallet_private_key:
         return credential
     return replace(
@@ -1273,13 +1295,34 @@ class VenueTransport(MarketDataClient):
         """True only after read-only live preflight trusts order submission."""
         return bool(self._trading_capability_trusted)
 
-    async def verify_live_trading_preflight(self) -> dict[str, Any]:
-        """Run read-only live trading preflight.
+    def _hyperliquid_trading_disabled_reason(self) -> str | None:
+        if self.mode != "live" or self._spec.venue_id != Venue.HYPERLIQUID:
+            return None
+        if self.trading_capability_trusted:
+            return None
+        if not self._trading_preflight_status:
+            return "trading_preflight_not_verified"
+        return str(
+            self._trading_preflight_status.get("reason")
+            or "trading_preflight_failed"
+        )
 
-        Hyperliquid is deliberately conservative: if the configured account
-        address is not the address derived from the signing key, read-only
-        checks cannot prove API-wallet authorization, so trading remains
-        disabled until a stronger admission path is added.
+    def _reject_hyperliquid_trading_if_disabled(self) -> None:
+        reason = self._hyperliquid_trading_disabled_reason()
+        if reason is None:
+            return
+        raise OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            f"hyperliquid_trading_disabled:{reason}",
+        )
+
+    async def verify_live_trading_preflight(self) -> dict[str, Any]:
+        """Run live trading preflight before allowing Hyperliquid orders.
+
+        Account-wallet mode uses V1 direct-wallet semantics: the signing wallet
+        is the account. API-wallet mode proves agent authorization with
+        Hyperliquid's official no-op exchange action, which marks only the
+        nonce as used.
         """
         if self.mode != "live" or self._spec.venue_id != Venue.HYPERLIQUID:
             self._trading_capability_trusted = True
@@ -1294,14 +1337,28 @@ class VenueTransport(MarketDataClient):
             "venue": self._spec.venue_id.value,
             "status": "failed",
             "trading_capability_trusted": False,
+            "authorization_mode": "account_wallet",
             "wallet_matches_account": False,
             "signer_matches_account": False,
+            "authorization_verified": False,
             "api_wallet_authorization_verified": False,
             "clearinghouse_state_readable": False,
         }
         cred = self._credential
         if cred is None or not cred.wallet_private_key:
             payload["reason"] = "missing_wallet_private_key"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
+        authorization_mode = _normalize_hyperliquid_wallet_mode(cred.wallet_mode)
+        payload["authorization_mode"] = (
+            authorization_mode if authorization_mode in ("account_wallet", "api_wallet")
+            else "invalid"
+        )
+        if authorization_mode not in ("account_wallet", "api_wallet"):
+            payload["reason"] = "invalid_hyperliquid_wallet_mode"
+            payload["configured_wallet_mode"] = cred.wallet_mode
             self._trading_capability_trusted = False
             self._trading_preflight_status = payload
             return dict(payload)
@@ -1332,6 +1389,12 @@ class VenueTransport(MarketDataClient):
             self._trading_preflight_status = payload
             return dict(payload)
 
+        if authorization_mode == "account_wallet" and not account_matches_wallet:
+            payload["reason"] = "account_wallet_signer_mismatch"
+            self._trading_capability_trusted = False
+            self._trading_preflight_status = payload
+            return dict(payload)
+
         try:
             raw = await self._request(
                 "POST",
@@ -1353,15 +1416,57 @@ class VenueTransport(MarketDataClient):
             self._trading_preflight_status = payload
             return dict(payload)
 
-        if not account_matches_wallet:
-            payload["reason"] = "api_wallet_authorization_unverified"
-            self._trading_capability_trusted = False
-            self._trading_preflight_status = payload
-            return dict(payload)
+        if authorization_mode == "api_wallet":
+            try:
+                from lightfee.venues.hyperliquid_signing import (
+                    build_hyperliquid_exchange_payload,
+                )
+
+                proof_body = build_hyperliquid_exchange_payload(
+                    action={"type": "noop"},
+                    private_key_hex=cred.wallet_private_key,
+                    vault_address=None,
+                    is_mainnet=True,
+                )
+                proof_raw = await self._request(
+                    "POST",
+                    "/exchange",
+                    body=proof_body,
+                    private=True,
+                )
+            except Exception as exc:
+                payload["reason"] = "api_wallet_authorization_unverified"
+                payload["authorization_error"] = str(exc)[:200]
+                self._trading_capability_trusted = False
+                self._trading_preflight_status = payload
+                return dict(payload)
+
+            if not (
+                isinstance(proof_raw, dict)
+                and proof_raw.get("status") == "ok"
+            ):
+                payload["reason"] = "api_wallet_authorization_unverified"
+                if isinstance(proof_raw, dict):
+                    authorization_error = (
+                        proof_raw.get("response")
+                        or proof_raw.get("error")
+                        or proof_raw.get("message")
+                        or proof_raw
+                    )
+                else:
+                    authorization_error = proof_raw
+                payload["authorization_error"] = str(authorization_error)[:200]
+                self._trading_capability_trusted = False
+                self._trading_preflight_status = payload
+                return dict(payload)
+
+            payload["api_wallet_authorization_verified"] = True
+        else:
+            payload["api_wallet_authorization_verified"] = False
 
         payload["status"] = "ok"
         payload["trading_capability_trusted"] = True
-        payload["api_wallet_authorization_verified"] = True
+        payload["authorization_verified"] = True
         self._trading_capability_trusted = True
         self._trading_preflight_status = payload
         return dict(payload)
@@ -3119,6 +3224,8 @@ class VenueTransport(MarketDataClient):
                 filled_at_ms=now_ms,
             )
 
+        self._reject_hyperliquid_trading_if_disabled()
+
         preflight: dict[str, Any] | None = None
         result_recorded = False
         hl_asset_meta: dict[str, int] | None = None
@@ -4533,6 +4640,8 @@ class VenueTransport(MarketDataClient):
                 accepted_at_ms=now_ms,
                 state=PassiveOrderState.OPEN,
             )
+
+        self._reject_hyperliquid_trading_if_disabled()
 
         result_recorded = False
 

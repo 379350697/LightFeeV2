@@ -61,6 +61,17 @@ from lightfee.venues.transport import (
 )
 
 
+def _trust_hyperliquid_transport_for_test(transport: VenueTransport) -> None:
+    transport._trading_capability_trusted = True
+    transport._trading_preflight_status = {
+        "venue": Venue.HYPERLIQUID.value,
+        "status": "ok",
+        "trading_capability_trusted": True,
+        "authorization_mode": "account_wallet",
+        "authorization_verified": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Paper / live mode construction
 # ---------------------------------------------------------------------------
@@ -571,6 +582,344 @@ class TestHyperliquidLiveOrderNowSupported:
         assert adapter._transport._credential.account_address == expected
         assert adapter._credential.account_address == expected
 
+    def test_registry_account_wallet_uses_v1_wallet_address_over_account_env(self, monkeypatch):
+        from eth_account import Account
+        from lightfee.venues.registry import build_adapter
+
+        wallet_key = "0x" + "1" * 64
+        stale_account = "0x000000000000000000000000000000000000beef"
+        monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
+        monkeypatch.setenv("LF_TEST_HL_ACCOUNT", stale_account)
+        vc = VenueConfig(venue="hyperliquid")
+        vc.live.trade_credentials = TradeCredentials(
+            wallet_private_key_env="LF_TEST_HL_WALLET",
+            account_address_env="LF_TEST_HL_ACCOUNT",
+        )
+
+        adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
+
+        expected = Account.from_key(wallet_key).address
+        assert adapter._transport._credential.wallet_mode == "account_wallet"
+        assert adapter._transport._credential.account_address == expected
+        assert adapter._transport._credential.account_address != stale_account
+
+    def test_registry_preserves_hyperliquid_api_wallet_mode_without_deriving_account(self, monkeypatch):
+        from lightfee.venues.registry import build_adapter
+
+        wallet_key = "0x" + "1" * 64
+        monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
+        vc = VenueConfig(venue="hyperliquid")
+        vc.live.trade_credentials = TradeCredentials(
+            wallet_private_key_env="LF_TEST_HL_WALLET",
+            account_address_env=None,
+            wallet_mode="agent_wallet",
+        )
+
+        adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
+
+        assert adapter._transport._credential.wallet_mode == "api_wallet"
+        assert adapter._transport._credential.account_address == ""
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):
+        from eth_account import Account
+
+        wallet_key = "0x" + "1" * 64
+        account_address = Account.from_key(wallet_key).address
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address=account_address,
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            assert body["type"] == "clearinghouseState"
+            assert body["user"].lower() == account_address.lower()
+            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "ok"
+        assert result["signer_matches_account"] is True
+        assert result["wallet_matches_account"] is True
+        assert result["api_wallet_authorization_verified"] is False
+        assert result["authorization_verified"] is True
+        assert result["clearinghouse_state_readable"] is True
+        assert result["trading_capability_trusted"] is True
+        assert transport.trading_capability_trusted is True
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_readonly_preflight_disables_unverified_api_wallet(self):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address="0x000000000000000000000000000000000000beef",
+            wallet_mode="api_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info":
+                assert body["type"] == "clearinghouseState"
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            assert request.url.path == "/exchange"
+            assert body["action"] == {"type": "noop"}
+            return httpx.Response(
+                200,
+                json={"status": "err", "response": "User or API Wallet does not exist"},
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "failed"
+        assert result["authorization_mode"] == "api_wallet"
+        assert result["wallet_matches_account"] is False
+        assert result["signer_matches_account"] is False
+        assert result["api_wallet_authorization_verified"] is False
+        assert result["clearinghouse_state_readable"] is True
+        assert result["trading_capability_trusted"] is False
+        assert result["reason"] == "api_wallet_authorization_unverified"
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_account_wallet_preflight_uses_v1_signer_account(self):
+        from eth_account import Account
+
+        wallet_key = "0x" + "1" * 64
+        stale_account = "0x000000000000000000000000000000000000beef"
+        signer_account = Account.from_key(wallet_key).address
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address=stale_account,
+            wallet_mode="account_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            assert body == {"type": "clearinghouseState", "user": signer_account}
+            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "ok"
+        assert result["authorization_mode"] == "account_wallet"
+        assert result["wallet_matches_account"] is True
+        assert result["signer_matches_account"] is True
+        assert result["api_wallet_authorization_verified"] is False
+        assert result["authorization_verified"] is True
+        assert result["trading_capability_trusted"] is True
+        assert result["configured_account_address"] == signer_account
+        assert result["signer_address"] == signer_account
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_api_wallet_preflight_passes_when_noop_authorized(self):
+        wallet_key = "0x" + "1" * 64
+        account_address = "0x000000000000000000000000000000000000beef"
+        seen_paths: list[str] = []
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address=account_address,
+            wallet_mode="api_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_paths.append(request.url.path)
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info":
+                assert body == {"type": "clearinghouseState", "user": account_address}
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            assert request.url.path == "/exchange"
+            assert body["action"] == {"type": "noop"}
+            assert body["nonce"] > 0
+            assert set(body["signature"]) == {"r", "s", "v"}
+            return httpx.Response(
+                200,
+                json={"status": "ok", "response": {"type": "default"}},
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "ok"
+        assert seen_paths == ["/info", "/exchange"]
+        assert result["authorization_mode"] == "api_wallet"
+        assert result["wallet_matches_account"] is False
+        assert result["signer_matches_account"] is False
+        assert result["api_wallet_authorization_verified"] is True
+        assert result["clearinghouse_state_readable"] is True
+        assert result["trading_capability_trusted"] is True
+        assert transport.trading_capability_trusted is True
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_api_wallet_preflight_fails_wrong_signing_scheme_with_diagnostics(self):
+        wallet_key = "0x" + "1" * 64
+        account_address = "0x000000000000000000000000000000000000beef"
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address=account_address,
+            wallet_mode="agent_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info":
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            assert body["action"] == {"type": "noop"}
+            return httpx.Response(
+                200,
+                json={
+                    "status": "err",
+                    "response": (
+                        "L1 error: User or API Wallet "
+                        "0x0123000000000000000000000000000000000000 does not exist."
+                    ),
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+        finally:
+            await transport.close()
+
+        assert result["status"] == "failed"
+        assert result["authorization_mode"] == "api_wallet"
+        assert result["configured_account_address"] == account_address
+        assert result["signer_address"].startswith("0x")
+        assert result["reason"] == "api_wallet_authorization_unverified"
+        assert "does not exist" in result["authorization_error"]
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_place_order_rejects_after_failed_trading_preflight(self):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address="0x000000000000000000000000000000000000beef",
+            wallet_mode="api_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        exchange_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal exchange_calls
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info":
+                assert body["type"] == "clearinghouseState"
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            if request.url.path == "/exchange":
+                exchange_calls += 1
+                assert body["action"] == {"type": "noop"}
+                return httpx.Response(
+                    200,
+                    json={"status": "err", "response": "User or API Wallet does not exist"},
+                )
+            raise AssertionError(f"unexpected Hyperliquid request: {request.url.path}")
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await transport.verify_live_trading_preflight()
+            assert result["status"] == "failed"
+
+            req = OrderRequest(
+                venue=Venue.HYPERLIQUID,
+                symbol="BTC",
+                side=Side.BUY,
+                quantity=1.0,
+                price=50000.0,
+                client_order_id="entry-disabled-hl",
+            )
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert "hyperliquid_trading_disabled:api_wallet_authorization_unverified" in str(exc_info.value)
+        assert exchange_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_place_order_rejects_without_trading_preflight(self):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address="0x000000000000000000000000000000000000beef",
+            wallet_mode="api_wallet",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_meta_cache["BTC"] = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(f"unexpected Hyperliquid request: {request.url.path}")
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="BTC",
+            side=Side.BUY,
+            quantity=1.0,
+            price=50000.0,
+            client_order_id="entry-unverified-hl",
+        )
+        try:
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await transport.place_order(req)
+        finally:
+            await transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert "hyperliquid_trading_disabled:trading_preflight_not_verified" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_passive_order_rejects_without_trading_preflight(self):
+        wallet_key = "0x" + "1" * 64
+        cred = LiveCredential(
+            wallet_private_key=wallet_key,
+            account_address="0x000000000000000000000000000000000000beef",
+        )
+        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        transport._hl_meta_cache["SUPER"] = 123
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(f"unexpected Hyperliquid request: {request.url.path}")
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.SELL,
+            quantity=200.0,
+            price=0.16435,
+            post_only=True,
+            client_order_id="entry-unverified-passive-hl",
+        )
+        try:
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await transport.submit_passive_order(req)
+        finally:
+            await transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert "hyperliquid_trading_disabled:trading_preflight_not_verified" in str(exc_info.value)
+
     @pytest.mark.asyncio
     async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):
         from eth_account import Account
@@ -608,12 +957,17 @@ class TestHyperliquidLiveOrderNowSupported:
         cred = LiveCredential(
             wallet_private_key=wallet_key,
             account_address="0x000000000000000000000000000000000000beef",
+            wallet_mode="api_wallet",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
 
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content.decode())
-            assert body["type"] == "clearinghouseState"
+            if request.url.path == "/info":
+                assert body["type"] == "clearinghouseState"
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            assert request.url.path == "/exchange"
+            assert body["action"] == {"type": "noop"}
             return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
 
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -640,6 +994,7 @@ class TestHyperliquidLiveOrderNowSupported:
             account_address="0xbeef",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_meta_cache["BTC"] = 0
 
         captured = {}
@@ -712,6 +1067,7 @@ class TestHyperliquidLiveOrderNowSupported:
             account_address="0xbeef",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_meta_cache["BTC"] = 0
         captured: dict[str, Any] = {}
 
@@ -762,7 +1118,6 @@ class TestHyperliquidLiveOrderNowSupported:
         assert order["c"].startswith("0x")
         assert len(order["c"]) == 34
         assert order["t"]["limit"]["tif"] == "Ioc"
-
     @pytest.mark.asyncio
     async def test_hyperliquid_super_ioc_wire_payload_has_no_trailing_zero_size(self):
         privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
@@ -771,6 +1126,7 @@ class TestHyperliquidLiveOrderNowSupported:
             account_address="0xbeef",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_asset_meta_cache["SUPER"] = {
             "asset_index": 123,
             "sz_decimals": 0,
@@ -829,6 +1185,7 @@ class TestHyperliquidLiveOrderNowSupported:
         privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(wallet_private_key=privkey, account_address="0xbeef")
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_asset_meta_cache["SUPER"] = {
             "asset_index": 123,
             "sz_decimals": 0,
@@ -909,6 +1266,7 @@ class TestHyperliquidLiveOrderNowSupported:
         privkey = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
         cred = LiveCredential(wallet_private_key=privkey, account_address="0xbeef")
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_asset_meta_cache["SUPER"] = {
             "asset_index": 123,
             "sz_decimals": 0,
@@ -964,6 +1322,7 @@ class TestHyperliquidLiveOrderNowSupported:
             account_address="0xbeef",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         transport._hl_asset_meta_cache["SUPER"] = {
             "asset_index": 123,
             "sz_decimals": 0,
@@ -1020,6 +1379,7 @@ class TestHyperliquidLiveOrderNowSupported:
         cred = LiveCredential(api_key="k", api_secret="",
                               wallet_private_key=privkey, account_address="0xbeef")
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        _trust_hyperliquid_transport_for_test(transport)
         # Pre-populate asset index cache to avoid needing metadata response
         transport._hl_meta_cache["BTC"] = 0
         transport._client = httpx.AsyncClient(
@@ -5096,14 +5456,12 @@ class TestVenuePositionParsers:
         assert pos.quantity == 0.1  # 10 contracts * 0.01
 
 
-# ===========================================================================
-# RED-LIGHT: order fill reconciliation parsers (Bybit + Bitget)
+# ====================================================================# RED-LIGHT: order fill reconciliation parsers (Bybit + Bitget)
 #
 # These tests directly call the real _parse_order_status_* functions with
 # mock raw HTTP response dicts. No monkeypatching of target functions.
 # The parser code is the production code being tested.
-# ===========================================================================
-
+# ====================================================================
 
 class TestBybitParseOrderStatusRedLight:
     """RED-LIGHT: _parse_order_status_bybit must follow V1 semantics.
@@ -5252,7 +5610,6 @@ class TestBitgetParseOrderStatusRedLight:
         assert result.order_id == "oid-1"
         assert result.client_order_id == "cid-1"
 
-
 class TestVenueSpecificOrderReconciliationEvidence:
     """CL-001-G: venue query paths must expose endpoint-level evidence."""
 
@@ -5348,7 +5705,6 @@ class TestVenueSpecificOrderReconciliationEvidence:
 # ===========================================================================
 # RED-LIGHT: Bybit adapter real HTTP path — execution side + retCode
 # ===========================================================================
-
 
 class TestBybitAdapterHttpRedLight:
     """RED-LIGHT: BybitAdapter.fetch_order_fill_reconciliation() via real
@@ -5569,10 +5925,8 @@ class TestBybitAdapterHttpRedLight:
         assert result.quantity == pytest.approx(400.0)
 
 
-# ===========================================================================
-# RED-LIGHT: Bitget official UTA field regression
-# ===========================================================================
-
+# ====================================================================# RED-LIGHT: Bitget official UTA field regression
+# ====================================================================
 
 class TestBitgetAdapterHttpRedLight:
     """RED-LIGHT: BitgetAdapter.fetch_order_fill_reconciliation() must
@@ -5773,10 +6127,8 @@ class TestBitgetAdapterHttpRedLight:
         await adapter._transport.close()
 
 
-# ===========================================================================
-# RED-LIGHT: Bitget quantity fallback — every V1 field individually
-# ===========================================================================
-
+# ====================================================================# RED-LIGHT: Bitget quantity fallback — every V1 field individually
+# ====================================================================
 
 class TestBitgetQuantityFallbackRedLight:
     """RED-LIGHT: _parse_order_status_bitget quantity fallback must cover
@@ -5824,10 +6176,8 @@ class TestBitgetQuantityFallbackRedLight:
         )
 
 
-# ===========================================================================
-# RED-LIGHT: Bybit execution side validation — fail-closed, V1 parity
-# ===========================================================================
-
+# ====================================================================# RED-LIGHT: Bybit execution side validation — fail-closed, V1 parity
+# ====================================================================
 
 class TestBybitExecutionSideRedLight:
     """RED-LIGHT: _parse_bybit_execution_list must fail-closed on invalid side.
@@ -5998,10 +6348,8 @@ class TestBybitExecutionSideRedLight:
         assert result is None, f"zero qty should return None even with missing side"
 
 
-# ===========================================================================
-# RED-LIGHT: Bybit order status side validation (parse_order_status_bybit)
-# ===========================================================================
-
+# ====================================================================# RED-LIGHT: Bybit order status side validation (parse_order_status_bybit)
+# ====================================================================
 
 class TestBybitOrderStatusSideRedLight:
     """RED-LIGHT: _parse_order_status_bybit must fail-closed on invalid side.
@@ -6099,10 +6447,8 @@ class TestBybitOrderStatusSideRedLight:
         assert result.side == Side.SELL
 
 
-# ===========================================================================
-# Root Fix: CID Generator Tests
-# ===========================================================================
-
+# ====================================================================# Root Fix: CID Generator Tests
+# ====================================================================
 
 class TestCidGenerator:
     """Verify exchange CIDs are stable, unique, and venue-legal."""
@@ -6165,10 +6511,8 @@ class TestCidGenerator:
         assert not cid_is_valid_for_venue("", Venue.BINANCE)
 
 
-# ===========================================================================
-# Root Fix: Passive Body Builder Tests
-# ===========================================================================
-
+# ====================================================================# Root Fix: Passive Body Builder Tests
+# ====================================================================
 
 class TestPassiveBodyBuilders:
     """Verify venue-specific passive bodies — no generic field pollution."""
@@ -6395,10 +6739,8 @@ class TestPassiveBodyBuilders:
         assert body["price"] != "0.03"
 
 
-# ===========================================================================
-# Root Fix: OKX Passive Response Validation Tests
-# ===========================================================================
-
+# ====================================================================# Root Fix: OKX Passive Response Validation Tests
+# ====================================================================
 
 class TestOkxPassiveAckValidation:
     """OKX passive response must validate code, sCode, and non-empty identifiers."""
@@ -6507,10 +6849,8 @@ class TestOkxPassiveAckValidation:
         assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
 
 
-# ===========================================================================
-# Root Fix: Preflight/Normalization in Passive Path Tests
-# ===========================================================================
-
+# ====================================================================# Root Fix: Preflight/Normalization in Passive Path Tests
+# ====================================================================
 
 class TestPassivePreflight:
     """Passive orders must go through preflight normalization."""
@@ -6709,10 +7049,8 @@ class TestPassivePreflight:
         transport._request.assert_not_called()
 
 
-# ===========================================================================
-# Root Fix: Journal Evidence Tests
-# ===========================================================================
-
+# ====================================================================# Root Fix: Journal Evidence Tests
+# ====================================================================
 
 class TestJournalEvidenceFields:
     """order.rejected and order.submitted journals must carry full evidence."""
@@ -6810,10 +7148,8 @@ class TestJournalEvidenceFields:
             assert "rule_source" in p
 
 
-# ===========================================================================
-# V1 Parity: Cancel absent-order detection (C2)
-# ===========================================================================
-
+# ====================================================================# V1 Parity: Cancel absent-order detection (C2)
+# ====================================================================
 
 class TestCancelAbsentOrderDetection:
     """V1: cancel order returns Ok(()) when order is already absent."""
@@ -7134,10 +7470,8 @@ class TestCancelAbsentOrderDetection:
             )
 
 
-# ===========================================================================
-# V1 Parity: drive_pending_entry_hedge cancel_replace uses passive methods (C1/H1)
-# ===========================================================================
-
+# ====================================================================# V1 Parity: drive_pending_entry_hedge cancel_replace uses passive methods (C1/H1)
+# ====================================================================
 
 class TestDrivePendingEntryHedgeCancelReplace:
     """V1: cancel-replace must use cancel_passive_order + submit_passive_order."""

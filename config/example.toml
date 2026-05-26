@@ -176,6 +176,9 @@ max_notional = 1000.0
 venue = "hyperliquid"
 taker_fee_bps = 0.3
 max_notional = 1000.0
+[venues.live.trade_credentials]
+wallet_private_key_env = "LIGHTFEE_HYPERLIQUID_WALLET_PRIVATE_KEY"
+permission_mode = "trade"
 [venues.live.passive_maker]
 prefer_amend_over_cancel = false
 reprice_threshold_ticks = 4

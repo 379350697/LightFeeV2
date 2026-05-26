@@ -303,6 +303,70 @@ class TestRuntimePreflight:
             assert runtime.journal._file is None
 
     @pytest.mark.asyncio
+    async def test_trading_preflight_logs_authorization_mode_and_exports_hl_disabled_reason(self):
+        class TradingPreflightTransport:
+            async def verify_live_trading_preflight(self):
+                return {
+                    "venue": "hyperliquid",
+                    "status": "failed",
+                    "trading_capability_trusted": False,
+                    "reason": "api_wallet_authorization_unverified",
+                    "authorization_mode": "api_wallet",
+                    "configured_account_address": "0x000000000000000000000000000000000000beef",
+                    "signer_address": "0x1111111111111111111111111111111111111111",
+                    "api_wallet_authorization_verified": False,
+                    "authorization_error": "L1 error: signer mismatch",
+                    "auth_payload": "must-not-leak",
+                    "auth_headers": {"Authorization": "must-not-leak"},
+                    "authorization_header": "must-not-leak",
+                    "signature": "must-not-leak",
+                    "private_key": "must-not-leak",
+                }
+
+        class TradingPreflightAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.HYPERLIQUID)
+                self._transport = TradingPreflightTransport()
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.HYPERLIQUID: TradingPreflightAdapter()},
+            )
+            await runtime.start()
+            await runtime.stop()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            preflight = next(
+                r["payload"] for r in records
+                if r["kind"] == "startup.trading_preflight"
+            )
+            assert preflight["authorization_mode"] == "api_wallet"
+            assert preflight["configured_account_address"].lower().endswith("beef")
+            assert preflight["signer_address"].startswith("0x1111")
+            assert preflight["authorization_error"] == "L1 error: signer mismatch"
+            assert "auth_payload" not in preflight
+            assert "auth_headers" not in preflight
+            assert "authorization_header" not in preflight
+            assert "signature" not in json.dumps(preflight)
+            assert "private_key" not in json.dumps(preflight)
+            assert runtime.state.hyperliquid_trading_disabled_reason == (
+                "api_wallet_authorization_unverified"
+            )
+
+            from lightfee.engine.loop_control import current_state_export_path
+
+            exported = json.loads(Path(current_state_export_path(config)).read_text())
+            assert exported["hyperliquid_trading_disabled_reason"] == (
+                "api_wallet_authorization_unverified"
+            )
+
+    @pytest.mark.asyncio
     async def test_startup_recovers_balanced_live_exchange_positions(self):
         """Startup must not report zero positions when exchanges already hold a pair."""
         with tempfile.TemporaryDirectory() as td:

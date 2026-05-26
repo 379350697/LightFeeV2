@@ -72,6 +72,7 @@ def build_adapter(venue: Venue, vc: VenueConfig, mode: str,
         api_passphrase=_resolve_env(creds.api_passphrase_env or ""),
         wallet_private_key=_resolve_env(creds.wallet_private_key_env or ""),
         account_address=_resolve_env(creds.account_address_env or ""),
+        wallet_mode=creds.wallet_mode,
     )
     return cls(mode="live", credential=credential,
                exchange_http_timeout_ms=exchange_http_timeout_ms,

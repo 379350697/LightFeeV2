@@ -571,6 +571,7 @@ class EngineState:
     # --- Recovery blocked state (V1 recovery_blocked_reason, recovery_blocked_at_ms) ---
     recovery_blocked_reason: str | None = None
     recovery_blocked_at_ms: int = 0
+    hyperliquid_trading_disabled_reason: str | None = None
     # --- Global risk reason (V1 global_risk_reason) ---
     global_risk_reason: str | None = None
     # --- Pending residual repairs (V1 pending_residual_repairs) ---
@@ -611,6 +612,7 @@ class EngineState:
             "global_risk_reason": self.global_risk_reason,
             "recovery_blocked_reason": self.recovery_blocked_reason,
             "recovery_blocked_at_ms": self.recovery_blocked_at_ms,
+            "hyperliquid_trading_disabled_reason": self.hyperliquid_trading_disabled_reason,
             "pending_residual_repairs": self.pending_residual_repairs,
             "live_recovery_reduce_only_pairs": self.live_recovery_reduce_only_pairs,
             "venue_entry_cooldowns": self.venue_entry_cooldowns,
