@@ -355,6 +355,14 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
     assert no_entry[-1]["payload"]["reason"] == "candidate_snapshot_domain_stale"
     assert no_entry[-1]["payload"]["generic_reason"] == "no_tradeable_candidates"
     assert no_entry[-1]["payload"]["snapshot_freshness_blocked_counts"]["quote_stale"] == 1
+    blocked_sample = no_entry[-1]["payload"]["snapshot_freshness_blocked_samples"][0]
+    assert blocked_sample["candidate_symbol"] == "BTCUSDT"
+    assert blocked_sample["candidate_pair_id"] == "btcusdt:binance->bybit"
+    assert blocked_sample["domain"] == "quote"
+    assert blocked_sample["venue"] == "binance"
+    assert blocked_sample["source_age_ms"] == 10000
+    assert blocked_sample["blocked"] is True
+    assert blocked_sample["block_reason"] == "quote_stale"
 
 
 @pytest.mark.asyncio
@@ -979,6 +987,22 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     assert len(executor.contexts) == 1
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
     assert runtime.state.last_scan["no_entry_reason"] is None
+    fallback = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_fallback_last_good"
+    )
+    market_scope = next(
+        sample for sample in fallback["candidate_freshness_scope"]
+        if sample["candidate_symbol"] == "BTCUSDT"
+        and sample["domain"] == "market_observed"
+    )
+    assert market_scope["candidate_pair_id"] == "btcusdt:okx->bybit"
+    assert market_scope["venue"] == "global"
+    assert market_scope["source_age_ms"] == 60000
+    assert market_scope["fallback_duration_ms"] == 55000
+    assert market_scope["blocked"] is False
+    assert market_scope["block_reason"] == ""
     scoped_status = runtime.state.last_scan["snapshot_freshness_status"]
     assert scoped_status[
         "market|global|*|snapshot.market_observed_at_ms"

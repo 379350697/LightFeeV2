@@ -44,6 +44,26 @@ class OkxAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return loaded OKX SWAP symbols, if the instrument catalog is available."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        symbols: set[str] = set()
+        for symbol in metadata:
+            symbol_text = str(symbol)
+            if not symbol_text:
+                continue
+            if "-SWAP" in symbol_text:
+                symbols.add(okx_spec().symbol_from_venue(symbol_text))
+            elif symbol_text.endswith("USDT"):
+                symbols.add(symbol_text)
+        return sorted(symbols)
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate OKX SWAP instrument metadata for recovery catalog gating."""
+        if self._transport._symbol_metadata:
+            return
+        await self._transport._ensure_okx_swap_instrument_metadata_loaded()
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 

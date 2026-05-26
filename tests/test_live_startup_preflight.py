@@ -701,7 +701,7 @@ class TestRuntimePreflight:
 
     @pytest.mark.asyncio
     async def test_startup_probe_symbols_include_static_config_when_resolved_subset(self):
-        """Recovery must still probe configured symbols that drop out of a daily universe."""
+        """Per-symbol fallback must not expand clean startup to the config universe."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.symbols = ["BTCUSDT", "ETHUSDT"]
@@ -711,7 +711,7 @@ class TestRuntimePreflight:
                 {"resolved_symbols": ["BTCUSDT"]}
             )
 
-            assert symbols == ["BTCUSDT", "ETHUSDT"]
+            assert symbols == []
 
     @pytest.mark.asyncio
     async def test_live_position_probe_skips_when_local_recovery_work_exists(self):

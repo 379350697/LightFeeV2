@@ -693,19 +693,46 @@ class LiveRuntime:
         )
 
     def _startup_position_probe_symbols(self, symbol_info: object) -> list[str]:
-        """Symbols to probe for live startup position recovery."""
+        """Symbols to probe for live startup position recovery.
+
+        V1 only probes symbols tied to local recovery work or explicitly recent
+        touched symbols, never the full configured/resolved trading universe.
+        """
         symbols: list[str] = []
-        if isinstance(symbol_info, dict):
-            raw = symbol_info.get("resolved_symbols") or []
-            symbols.extend(str(s) for s in raw if str(s))
-        symbols.extend(str(s) for s in getattr(self.config, "symbols", []) if str(s))
+
+        def add_symbol(value: object) -> None:
+            symbol = str(value or "")
+            if symbol:
+                symbols.append(symbol)
 
         for pos in self.state.open_positions.values():
-            if pos.symbol:
-                symbols.append(pos.symbol)
+            add_symbol(getattr(pos, "symbol", ""))
         for pending in self.state.pending_entries.values():
-            if pending.symbol:
-                symbols.append(pending.symbol)
+            add_symbol(getattr(pending, "symbol", ""))
+        for pending in self.state.pending_closes.values():
+            pos = self.state.open_positions.get(getattr(pending, "position_id", ""))
+            add_symbol(getattr(pos, "symbol", ""))
+        for pending in self.state.pending_passive_closes.values():
+            snapshot = getattr(pending, "position_snapshot", None)
+            add_symbol(getattr(snapshot, "symbol", ""))
+        for repair in getattr(self.state, "pending_residual_repairs", []) or []:
+            if isinstance(repair, dict):
+                add_symbol(repair.get("symbol", ""))
+        for item in getattr(self.state, "live_recovery_reduce_only_pairs", []) or []:
+            if isinstance(item, dict):
+                add_symbol(item.get("symbol", ""))
+        if isinstance(symbol_info, dict):
+            for key in (
+                "recent_touched_symbols",
+                "touched_symbols",
+                "recovery_symbols",
+            ):
+                raw = symbol_info.get(key) or []
+                symbols.extend(str(s) for s in raw if str(s))
+        if isinstance(self.state.last_scan, dict):
+            for key in ("recent_touched_symbols", "touched_symbols"):
+                raw = self.state.last_scan.get(key) or []
+                symbols.extend(str(s) for s in raw if str(s))
 
         seen: set[str] = set()
         result: list[str] = []
@@ -725,7 +752,7 @@ class LiveRuntime:
         """Detect balanced exchange positions that local snapshot/journal missed."""
         if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
             return
-        if not symbols or not self._venue_adapters:
+        if not self._venue_adapters:
             return
         if (
             self.state.open_positions
@@ -923,6 +950,8 @@ class LiveRuntime:
 
         transport = getattr(adapter, "_transport", None)
         to_venue_symbol = getattr(transport, "_venue_symbol", None)
+        spec = getattr(transport, "_spec", None)
+        endpoint = str(getattr(spec, "position_path", "") or "fetch_position")
 
         filtered: list[str] = []
         unsupported: list[dict[str, str]] = []
@@ -975,6 +1004,10 @@ class LiveRuntime:
                 "recovery.live_position_probe_unsupported_symbols",
                 {
                     "venue": venue.value,
+                    "endpoint": endpoint,
+                    "symbol_count": len(symbols),
+                    "requested_symbols": [str(symbol) for symbol in symbols],
+                    "skipped_by_catalog": [item["symbol"] for item in unsupported],
                     "unsupported_count": len(unsupported),
                     "sample_symbols": [item["symbol"] for item in sample],
                     "sample_venue_symbols": [
@@ -1026,6 +1059,18 @@ class LiveRuntime:
         category = getattr(exc, "category", None)
         category_value = str(getattr(category, "value", category) or "")
         status_code = int(getattr(exc, "status_code", 0) or 0)
+        headers = getattr(exc, "headers", {}) or {}
+        retry_after_ms = 0
+        retry_after = ""
+        if isinstance(headers, dict):
+            retry_after = str(
+                headers.get("Retry-After", headers.get("retry-after", "")) or ""
+            )
+        if retry_after:
+            try:
+                retry_after_ms = max(int(float(retry_after) * 1000), 0)
+            except (TypeError, ValueError):
+                retry_after_ms = 0
         if not normalized_symbol and "instId=" in message:
             inst_id = message.split("instId=", 1)[1].split()[0].strip(",;")
             if inst_id:
@@ -1069,6 +1114,14 @@ class LiveRuntime:
         if status_code in (418, 429) or ret_code in ("429", "50011", "50061"):
             payload["classification"] = "rate_limited"
             payload["cooldown_scope"] = f"venue:{venue.value}:private_positions"
+            payload["retry_after_ms"] = retry_after_ms
+            payload["cooldown_ms"] = retry_after_ms or 2000
+            if venue == Venue.OKX and endpoint == "/api/v5/account/positions":
+                payload["rate_limit_budget"] = {
+                    "requests": 10,
+                    "window_ms": 2000,
+                    "scope": "User ID",
+                }
         if "okx_contract_metadata_missing_ct_val" in message:
             if "classification=instrument_missing" in message:
                 payload["classification"] = "instrument_missing"
@@ -1076,6 +1129,8 @@ class LiveRuntime:
                 payload["classification"] = "metadata_missing"
             else:
                 payload["classification"] = "metadata_missing"
+            payload["retryable"] = False
+            payload["skip_reason"] = "catalog_or_metadata_missing"
         return payload
 
     async def _filter_candidates_supported_by_venue_catalog(
@@ -1181,17 +1236,65 @@ class LiveRuntime:
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
     ) -> list[tuple[str, PositionSnapshot]]:
-        timeout_s = max(self.config.runtime.live_recovery_rest_probe_timeout_ms, 1) / 1000.0
+        timeout_s = (
+            max(self.config.runtime.live_recovery_rest_probe_timeout_ms, 1) / 1000.0
+        )
         semaphore = asyncio.Semaphore(8)
-        probe_symbols = {str(symbol) for symbol in symbols}
-
-        def is_active_probe_position(pos: PositionSnapshot) -> bool:
-            return (
-                abs(getattr(pos, "quantity", 0.0)) > 1e-9
-                and str(getattr(pos, "symbol", "")) in probe_symbols
+        requested_symbols = list(
+            dict.fromkeys(str(symbol) for symbol in symbols if str(symbol))
+        )
+        probe_symbols_by_venue: dict[Venue, list[str]] = {}
+        for venue, adapter in self._venue_adapters.items():
+            probe_symbols_by_venue[venue] = await self._position_probe_symbols_for_venue(
+                venue,
+                adapter,
+                requested_symbols,
             )
 
-        async def fetch_all_for_venue(venue: Venue, adapter: VenueAdapter):
+        async def fallback_symbols_for_venue(
+            venue: Venue,
+            adapter: VenueAdapter,
+        ) -> list[str]:
+            symbols_for_venue = probe_symbols_by_venue.get(venue, [])
+            if symbols_for_venue:
+                return symbols_for_venue
+            static_symbols = [
+                str(symbol)
+                for symbol in getattr(self.config, "symbols", [])
+                if str(symbol)
+            ]
+            return await self._position_probe_symbols_for_venue(
+                venue,
+                adapter,
+                static_symbols,
+            )
+
+        def canonical_position_symbol(
+            venue: Venue,
+            adapter: VenueAdapter,
+            symbol: str,
+        ) -> str:
+            transport = getattr(adapter, "_transport", None)
+            spec = getattr(transport, "_spec", None)
+            from_venue_symbol = getattr(spec, "symbol_from_venue", None)
+            if callable(from_venue_symbol):
+                try:
+                    return str(from_venue_symbol(symbol))
+                except Exception:
+                    pass
+            if venue == Venue.OKX:
+                return str(symbol).replace("-USDT-SWAP", "USDT").replace("-SWAP", "")
+            return str(symbol)
+
+        def is_active_bulk_position(pos: PositionSnapshot) -> bool:
+            return abs(getattr(pos, "quantity", 0.0)) > 1e-9
+
+        async def fetch_all_for_venue(
+            venue: Venue,
+            adapter: VenueAdapter,
+            venue_symbols: list[str],
+        ):
+            venue_probe_symbols = set(venue_symbols)
             async with semaphore:
                 try:
                     positions = await asyncio.wait_for(
@@ -1210,7 +1313,9 @@ class LiveRuntime:
                         payload["normalized_symbol"] = "*"
                     if not payload.get("venue_symbol"):
                         payload["venue_symbol"] = "*"
-                    payload["symbols"] = sorted(probe_symbols)
+                    payload["symbols"] = sorted(venue_probe_symbols)
+                    payload["requested_symbols"] = sorted(venue_probe_symbols)
+                    payload["symbol_count"] = len(venue_probe_symbols)
                     if payload.get("classification") in (
                         "instrument_missing",
                         "metadata_missing",
@@ -1226,20 +1331,24 @@ class LiveRuntime:
                             payload,
                         )
                         return (venue, [])
-                    else:
-                        self.journal.append(
-                            "recovery.live_position_bulk_probe_error",
-                            payload,
-                        )
+                    self.journal.append(
+                        "recovery.live_position_bulk_probe_error",
+                        payload,
+                    )
+                    if venue == Venue.OKX:
+                        return (venue, [])
                     return (venue, None)
                 if positions is None:
                     return (venue, None)
                 return (
                     venue,
                     [
-                        (pos.symbol, pos)
+                        (
+                            canonical_position_symbol(venue, adapter, pos.symbol),
+                            pos,
+                        )
                         for pos in positions
-                        if is_active_probe_position(pos)
+                        if is_active_bulk_position(pos)
                     ],
                 )
 
@@ -1273,7 +1382,11 @@ class LiveRuntime:
 
         bulk_results = await asyncio.gather(
             *[
-                fetch_all_for_venue(venue, adapter)
+                fetch_all_for_venue(
+                    venue,
+                    adapter,
+                    probe_symbols_by_venue.get(venue, []),
+                )
                 for venue, adapter in self._venue_adapters.items()
             ]
         )
@@ -1286,11 +1399,12 @@ class LiveRuntime:
                 snapshots.extend(positions)
 
         fallback_probe_symbols: dict[Venue, list[str]] = {}
-        for venue, adapter in self._venue_adapters.items():
+        for venue in self._venue_adapters:
             if venue not in fallback_venues:
                 continue
-            fallback_probe_symbols[venue] = await self._position_probe_symbols_for_venue(
-                venue, adapter, symbols,
+            fallback_probe_symbols[venue] = await fallback_symbols_for_venue(
+                venue,
+                self._venue_adapters[venue],
             )
 
         tasks = [
@@ -3400,8 +3514,8 @@ class LiveRuntime:
         3. maker_try_window_fill_shortfall — cancel if elapsed > 1500ms with
            fill ratio below 25% (zero-fill protection)
         4. maker_entry_rest_timeout — cancel if elapsed > 6000ms
-        5. Post-cancel: zero-fill → abort, partial-fill → hedge → finalize,
-           uncertain → retain for reconciliation
+        5. Post-cancel: zero-fill → V1 retry/repost cycle, partial-fill →
+           hedge → finalize, uncertain → retain for reconciliation
 
         V1 ref: entry_sync.rs:1554 maintain_pending_entry_passive_order()
         """
@@ -3428,10 +3542,6 @@ class LiveRuntime:
 
             # Respect poll interval — V1 next_progress_poll_ms gate
             if pending.next_progress_poll_ms > 0 and now_ms < pending.next_progress_poll_ms:
-                continue
-
-            # Already in reconciliation flow
-            if po.cancel_requested() and po.maker_completed():
                 continue
 
             adapter = self._venue_adapters.get(maker_venue)
@@ -3529,8 +3639,14 @@ class LiveRuntime:
             if po.cancel_requested() and po.maker_completed():
                 cancel_elapsed = now_ms - po.cancel_requested_at_ms
                 if not pending.has_any_fill():
-                    removed = await self._abort_pending_entry_fail_closed(
-                        pending, entry_id,
+                    retained = await self._handle_pending_passive_zero_fill_completion(
+                        pending, entry_id, po, adapter, now_ms
+                    )
+                    if retained:
+                        continue
+                    removed = await self._abort_pending_entry(
+                        pending,
+                        entry_id,
                         f"passive_maker_{po.last_progress_state.value}_zero_fill",
                     )
                     if removed:
@@ -3558,6 +3674,151 @@ class LiveRuntime:
 
         for eid in resolved:
             self.state.pending_entries.pop(eid, None)
+
+    async def _handle_pending_passive_zero_fill_completion(
+        self,
+        pending,
+        entry_id: str,
+        po,
+        adapter,
+        now_ms: int,
+    ) -> bool:
+        """V1 zero-fill passive cycle: record delay, then repost before terminal abort."""
+        strategy = self.config.strategy
+        max_reposts = getattr(strategy, "maker_entry_max_reposts", 0) or 0
+        if max_reposts > 0 and pending.repost_count >= max_reposts:
+            self.journal.append(
+                "passive_maintenance.zero_fill_repost_exhausted",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "repost_count": pending.repost_count,
+                    "max_reposts": max_reposts,
+                    "state": po.last_progress_state.value,
+                },
+            )
+            await self._finalize_pending_entry(pending, entry_id, now_ms)
+            return True
+
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        pending.metadata = metadata
+        retry_pending = bool(metadata.get("passive_zero_fill_retry_pending"))
+
+        if not retry_pending:
+            cycles = int(metadata.get("passive_zero_fill_cycles", 0)) + 1
+            delays = getattr(strategy, "maker_cycle_retry_delays_ms", []) or []
+            if delays:
+                delay_idx = min(max(cycles - 1, 0), len(delays) - 1)
+                retry_delay_ms = int(delays[delay_idx])
+            else:
+                retry_delay_ms = 0
+            metadata["passive_zero_fill_cycles"] = cycles
+            metadata["passive_zero_fill_retry_pending"] = True
+            metadata["passive_zero_fill_retry_at_ms"] = now_ms + retry_delay_ms
+            pending.next_progress_poll_ms = now_ms + retry_delay_ms
+            self.journal.append(
+                "passive_maintenance.zero_fill_cycle",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "cycle_attempt": cycles,
+                    "retry_delay_ms": retry_delay_ms,
+                    "retry_at_ms": pending.next_progress_poll_ms,
+                    "state": po.last_progress_state.value,
+                    "repost_count": pending.repost_count,
+                    "max_reposts": max_reposts,
+                },
+            )
+            return True
+
+        retry_at_ms = int(metadata.get("passive_zero_fill_retry_at_ms", 0) or 0)
+        if retry_at_ms > 0 and now_ms < retry_at_ms:
+            pending.next_progress_poll_ms = retry_at_ms
+            return True
+
+        maker_venue = pending.maker_venue()
+        if not self._try_consume_maker_venue_budget(maker_venue, now_ms):
+            pending.next_progress_poll_ms = (
+                now_ms + self.config.strategy.maker_venue_budget_window_ms
+            )
+            self.journal.append(
+                "passive_maintenance.repost_budget_delayed",
+                {"entry_id": entry_id, "venue": str(maker_venue)},
+            )
+            return True
+
+        from lightfee.core.domain import OrderRequest, PassiveOrderState
+        from lightfee.venues.cid import compact_client_order_id
+
+        quantity = po.target_quantity or pending.target_quantity
+        price = po.limit_price if po.limit_price is not None else pending.maker_price
+        client_order_id = compact_client_order_id(
+            entry_id, f"maker_repost_{pending.repost_count + 1}"
+        )
+        request = OrderRequest(
+            venue=maker_venue,
+            symbol=pending.symbol,
+            side=pending.maker_side(),
+            quantity=quantity,
+            price=price if price and price > 0 else None,
+            client_order_id=client_order_id,
+            post_only=True,
+            reduce_only=False,
+        )
+        try:
+            ack = await adapter.submit_passive_order(request)
+        except Exception as exc:
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            self.journal.append(
+                "passive_maintenance.repost_error",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": str(maker_venue),
+                    "error": str(exc),
+                },
+            )
+            return True
+
+        accepted_at_ms = getattr(ack, "accepted_at_ms", 0) or now_ms
+        order_id = getattr(ack, "order_id", "") or po.order_id
+        client_order_id = getattr(ack, "client_order_id", "") or request.client_order_id or ""
+        ack_price = getattr(ack, "price", 0.0) or price or 0.0
+        ack_quantity = getattr(ack, "quantity", 0.0) or quantity
+        ack_state = getattr(ack, "state", None) or PassiveOrderState.UNKNOWN
+
+        pending.repost_count += 1
+        pending.maker_order_id = order_id
+        pending.maker_client_order_id = client_order_id
+        pending.maker_price = float(ack_price or 0.0)
+        po.order_id = order_id
+        po.client_order_id = client_order_id
+        po.limit_price = float(ack_price) if ack_price and ack_price > 0 else po.limit_price
+        po.target_quantity = float(ack_quantity)
+        po.accepted_at_ms = accepted_at_ms
+        po.timeout_at_ms = accepted_at_ms + (
+            getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000
+        )
+        po.cancel_requested_at_ms = 0
+        po.last_progress_state = ack_state
+        metadata["passive_zero_fill_retry_pending"] = False
+        pending.next_progress_poll_ms = accepted_at_ms + (
+            getattr(strategy, "maker_entry_progress_poll_ms", 500) or 500
+        )
+        self.journal.append(
+            "passive_maintenance.passive_entry_reposted",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": str(maker_venue),
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "repost_count": pending.repost_count,
+                "quantity": po.target_quantity,
+                "price": po.limit_price,
+            },
+        )
+        return True
 
     def _maker_try_window_fill_shortfall(
         self,
@@ -7712,6 +7973,231 @@ class LiveRuntime:
             if decision.get("decision") == "skip_entry"
         ]
 
+    def _snapshot_fallback_duration_ms(
+        self,
+        *,
+        snapshot,
+        now_ms: int,
+        max_age_ms: int | None = None,
+    ) -> int:
+        if snapshot is None:
+            return 0
+        snapshot_max_age_ms = int(
+            max_age_ms
+            if max_age_ms is not None
+            else self.config.runtime.sidecar_snapshot_max_age_ms
+        )
+        market_max_age_ms = int(
+            getattr(self.config.runtime, "max_market_age_ms", snapshot_max_age_ms)
+            or snapshot_max_age_ms
+        )
+        stale_overages: list[int] = []
+        published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
+        market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
+        if published_at_ms > 0:
+            snapshot_publish_age_ms = max(now_ms - published_at_ms, 0)
+            if snapshot_publish_age_ms > snapshot_max_age_ms:
+                stale_overages.append(snapshot_publish_age_ms - snapshot_max_age_ms)
+        if market_observed_at_ms > 0:
+            market_observed_age_ms = max(now_ms - market_observed_at_ms, 0)
+            if market_observed_age_ms > market_max_age_ms:
+                stale_overages.append(market_observed_age_ms - market_max_age_ms)
+        return max(stale_overages) if stale_overages else 0
+
+    def _snapshot_candidate_scope_sample(
+        self,
+        *,
+        candidate,
+        domain: str,
+        venue: str,
+        source: str,
+        source_age_ms: int,
+        fallback_duration_ms: int,
+        blocked: bool,
+        block_reason: str = "",
+    ) -> dict:
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        return {
+            "candidate_symbol": symbol,
+            "candidate_pair_id": self._candidate_pair_id(candidate),
+            "domain": str(domain or "").lower(),
+            "venue": str(venue or "").lower(),
+            "source": str(source or ""),
+            "source_age_ms": int(source_age_ms or 0),
+            "fallback_duration_ms": int(fallback_duration_ms or 0),
+            "blocked": bool(blocked),
+            "block_reason": str(block_reason or "") if blocked else "",
+        }
+
+    @staticmethod
+    def _canonical_degraded_domain(domain: str) -> str:
+        domain_s = str(domain or "").lower()
+        if domain_s == "market_observed_stale":
+            return "market_observed"
+        if domain_s == "snapshot_publish_stale":
+            return "snapshot_publish"
+        if domain_s.endswith("_stale"):
+            return domain_s[:-6]
+        return domain_s
+
+    def _snapshot_health_candidate_freshness_scope(
+        self,
+        *,
+        snapshot,
+        now_ms: int,
+        degraded_domains: list[str],
+        stale_degraded_domains: list[str],
+        fallback_duration_ms: int,
+    ) -> list[dict]:
+        scope: list[dict] = []
+        if snapshot is None:
+            return scope
+
+        candidates = list(getattr(snapshot, "candidates", []) or [])
+        if not candidates:
+            return scope
+
+        seen: set[tuple[str, str, str, str, str]] = set()
+
+        def add_sample(sample: dict) -> None:
+            marker = (
+                str(sample.get("candidate_pair_id", "")),
+                str(sample.get("candidate_symbol", "")),
+                str(sample.get("domain", "")),
+                str(sample.get("venue", "")),
+                str(sample.get("source", "")),
+            )
+            if marker in seen or len(scope) >= 48:
+                return
+            seen.add(marker)
+            scope.append(sample)
+
+        all_domains = [
+            self._canonical_degraded_domain(domain)
+            for domain in list(degraded_domains) + list(stale_degraded_domains)
+        ]
+        market_observed_age_ms = max(
+            now_ms - int(getattr(snapshot, "market_observed_at_ms", 0) or 0),
+            0,
+        )
+        snapshot_publish_age_ms = max(
+            now_ms - int(getattr(snapshot, "published_at_ms", 0) or 0),
+            0,
+        )
+        for candidate in candidates:
+            if "market_observed" in all_domains:
+                add_sample(
+                    self._snapshot_candidate_scope_sample(
+                        candidate=candidate,
+                        domain="market_observed",
+                        venue="global",
+                        source="snapshot.market_observed_at_ms",
+                        source_age_ms=market_observed_age_ms,
+                        fallback_duration_ms=fallback_duration_ms,
+                        blocked=False,
+                    )
+                )
+            if "snapshot_publish" in all_domains:
+                add_sample(
+                    self._snapshot_candidate_scope_sample(
+                        candidate=candidate,
+                        domain="snapshot_publish",
+                        venue="global",
+                        source="snapshot.published_at_ms",
+                        source_age_ms=snapshot_publish_age_ms,
+                        fallback_duration_ms=fallback_duration_ms,
+                        blocked=False,
+                    )
+                )
+
+            for decision in self._candidate_snapshot_freshness_decisions(
+                candidate,
+                snapshot=snapshot,
+                now_ms=now_ms,
+            ):
+                blocked = bool(
+                    decision.get("blocking", False)
+                    or decision.get("decision") == "skip_entry"
+                )
+                add_sample(
+                    self._snapshot_candidate_scope_sample(
+                        candidate=candidate,
+                        domain=str(decision.get("domain", "")),
+                        venue=str(decision.get("venue", "")),
+                        source=str(decision.get("source", "")),
+                        source_age_ms=int(decision.get("age_ms", 0) or 0),
+                        fallback_duration_ms=fallback_duration_ms,
+                        blocked=blocked,
+                        block_reason=str(decision.get("reason", "")),
+                    )
+                )
+
+        if "liquidity" in all_domains:
+            liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
+            degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
+            degraded_venues = {
+                str(venue).lower()
+                for venue in list(getattr(snapshot, "degraded_venues", []) or [])
+            }
+            if isinstance(degraded_symbols, dict):
+                degraded_venues.update(
+                    str(venue).lower()
+                    for venue, symbols in degraded_symbols.items()
+                    if symbols
+                )
+            for candidate in candidates:
+                symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                for venue_attr in ("long_venue", "short_venue"):
+                    venue = str(getattr(candidate, venue_attr, "") or "").lower()
+                    row = liquidity_rows.get(venue)
+                    degraded_reason = (
+                        str(getattr(row, "degraded_reason", "") or "")
+                        if row is not None else ""
+                    )
+                    if venue not in degraded_venues and not degraded_reason:
+                        continue
+                    observed_at_ms = (
+                        int(getattr(row, "observed_at_ms", 0) or 0)
+                        if row is not None else 0
+                    )
+                    source_age_ms = (
+                        max(now_ms - observed_at_ms, 0)
+                        if observed_at_ms > 0 else 0
+                    )
+                    source = (
+                        str(getattr(row, "source", "") or "sidecar_perp_liquidity")
+                        if row is not None else "sidecar_perp_liquidity"
+                    )
+                    degraded_symbols_for_venue = []
+                    if isinstance(degraded_symbols, dict):
+                        degraded_symbols_for_venue = [
+                            str(v).upper()
+                            for v in degraded_symbols.get(venue, []) or []
+                        ]
+                    candidate_hit = (
+                        symbol in degraded_symbols_for_venue
+                        or self._liquidity_degraded_reason_blocks_symbol(
+                            degraded_reason, symbol
+                        )
+                    )
+                    add_sample(
+                        self._snapshot_candidate_scope_sample(
+                            candidate=candidate,
+                            domain="liquidity",
+                            venue=venue,
+                            source=source,
+                            source_age_ms=source_age_ms,
+                            fallback_duration_ms=fallback_duration_ms,
+                            blocked=False,
+                            block_reason=(
+                                "candidate_symbol_degraded"
+                                if candidate_hit else ""
+                            ),
+                        )
+                    )
+
+        return scope
+
     def _filter_candidates_by_snapshot_freshness(
         self,
         candidates: list,
@@ -7726,6 +8212,10 @@ class LiveRuntime:
         filtered = []
         self._last_snapshot_freshness_filter_blockers = Counter()
         self._last_snapshot_freshness_filter_samples = []
+        fallback_duration_ms = self._snapshot_fallback_duration_ms(
+            snapshot=snapshot,
+            now_ms=now_ms,
+        )
         for candidate in candidates:
             decisions = self._candidate_snapshot_freshness_decisions(
                 candidate,
@@ -7752,22 +8242,40 @@ class LiveRuntime:
                 payload = dict(failure)
                 event_kind = str(payload.pop("event_kind", "") or "")
                 payload["ts_ms"] = now_ms
-                payload["pair_id"] = self._candidate_pair_id(candidate)
+                pair_id = self._candidate_pair_id(candidate)
+                symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                blocked = bool(
+                    failure.get("blocking", False)
+                    or failure.get("decision") == "skip_entry"
+                )
+                reason = str(failure.get("reason", "snapshot_domain_stale"))
+                payload["pair_id"] = pair_id
+                payload["candidate_pair_id"] = pair_id
+                payload["candidate_symbol"] = symbol
+                payload["source_age_ms"] = int(failure.get("age_ms", 0) or 0)
+                payload["fallback_duration_ms"] = fallback_duration_ms
+                payload["blocked"] = blocked
+                payload["block_reason"] = reason if blocked else ""
                 self.journal.append("runtime.snapshot_freshness_decision", payload)
                 if event_kind:
                     self.journal.append(event_kind, payload)
                 if failure.get("decision") == "skip_entry":
                     blocking = True
-                    reason = str(failure.get("reason", "snapshot_domain_stale"))
                     self._last_snapshot_freshness_filter_blockers[reason] += 1
                     if len(self._last_snapshot_freshness_filter_samples) < 24:
                         self._last_snapshot_freshness_filter_samples.append({
-                            "pair_id": self._candidate_pair_id(candidate),
+                            "pair_id": pair_id,
+                            "candidate_pair_id": pair_id,
+                            "candidate_symbol": symbol,
                             "venue": str(failure.get("venue", "")),
                             "symbol": str(failure.get("symbol", "")),
                             "domain": str(failure.get("domain", "")),
                             "source": str(failure.get("source", "")),
                             "reason": reason,
+                            "source_age_ms": int(failure.get("age_ms", 0) or 0),
+                            "fallback_duration_ms": fallback_duration_ms,
+                            "blocked": True,
+                            "block_reason": reason,
                             "age_ms": int(failure.get("age_ms", 0) or 0),
                             "budget_ms": int(failure.get("budget_ms", 0) or 0),
                         })
@@ -7842,11 +8350,11 @@ class LiveRuntime:
         config_hash = hashlib.sha256(
             f"{snapshot_path}|{max_age_ms}|{self.config.runtime.mode}".encode()
         ).hexdigest()[:12]
-        stale_overages = []
-        if snapshot_publish_age_ms > max_age_ms:
-            stale_overages.append(snapshot_publish_age_ms - max_age_ms)
-        if market_observed_age_ms > market_max_age_ms:
-            stale_overages.append(market_observed_age_ms - market_max_age_ms)
+        fallback_duration_ms = self._snapshot_fallback_duration_ms(
+            snapshot=snapshot,
+            now_ms=now_ms,
+            max_age_ms=max_age_ms,
+        )
         fresh_source_ages = []
         for quote in getattr(snapshot, "quotes", {}).values():
             observed_at_ms = self._snapshot_quote_direct_observed_at_ms(quote)
@@ -7865,9 +8373,16 @@ class LiveRuntime:
             "top_degraded_symbols": top_degraded_symbols,
             "snapshot_publish_age_ms": max(snapshot_publish_age_ms, 0),
             "market_observed_age_ms": max(market_observed_age_ms, 0),
-            "fallback_duration_ms": max(stale_overages) if stale_overages else 0,
+            "fallback_duration_ms": fallback_duration_ms,
             "last_good_age_ms": max(snapshot_publish_age_ms, 0),
             "fresh_source_age_ms": fresh_source_age_ms,
+            "candidate_freshness_scope": self._snapshot_health_candidate_freshness_scope(
+                snapshot=snapshot,
+                now_ms=now_ms,
+                degraded_domains=degraded_domains,
+                stale_degraded_domains=domains,
+                fallback_duration_ms=fallback_duration_ms,
+            ),
             "per_venue_quote_count": dict(sorted(per_venue_quote_count.items())),
             "per_venue_candidate_count": dict(sorted(per_venue_candidate_count.items())),
             "source_mode": str(getattr(snapshot, "source_mode", "") or ""),

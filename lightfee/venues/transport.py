@@ -1245,6 +1245,7 @@ class VenueTransport(MarketDataClient):
         # V1: position cache populated by fetch_position() / fetch_all_positions()
         # Map of symbol → (PositionSnapshot, cached_at_ms)
         self._position_cache: dict[str, tuple[PositionSnapshot, int]] = {}
+        self._all_positions_cache: tuple[list[PositionSnapshot], int] | None = None
 
         # V1: shared private WS state — order/position caches, health, workers.
         # Each venue transport owns one PrivateWsState. Workers update this
@@ -2775,6 +2776,7 @@ class VenueTransport(MarketDataClient):
             # Populate position cache for supervisor private position confirmation
             for pos in positions:
                 self._position_cache[pos.symbol] = (pos, now_ms)
+            self._all_positions_cache = (positions, now_ms)
             return positions
         except TransportError:
             raise
@@ -2815,6 +2817,24 @@ class VenueTransport(MarketDataClient):
                 cached_at = cached_entry[1]
                 if now_ms - cached_at <= OKX_POSITION_REST_CACHE_MAX_AGE_MS:
                     return cached
+            all_cached = self._all_positions_cache
+            if (
+                all_cached is not None
+                and now_ms - all_cached[1] <= OKX_POSITION_REST_CACHE_MAX_AGE_MS
+            ):
+                for pos in all_cached[0]:
+                    if pos.symbol in {symbol, venue_sym}:
+                        return pos
+                snapshot = PositionSnapshot(
+                    venue=spec.venue_id,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=now_ms,
+                )
+                self._position_cache[symbol] = (snapshot, now_ms)
+                return snapshot
 
         try:
             params: dict[str, Any] = {}

@@ -33,6 +33,514 @@ def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
 
 
+def _flat_exchange_truth(runtime_dir, symbols, venues=None):
+    venues = venues or []
+    return {
+        "available": True,
+        "available_venues": venues,
+        "confidence": "high",
+        "positions": {venue: {} for venue in venues},
+        "open_orders": {venue: {symbol: [] for symbol in symbols} for venue in venues},
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "fetch_status": {
+            venue: {
+                "status": "ok",
+                "positions_succeeded": symbols,
+                "positions_failed": [],
+                "orders_succeeded": symbols,
+                "orders_failed": [],
+            }
+            for venue in venues
+        },
+        "errors": [],
+        "missing_evidence": [],
+    }
+
+
+def test_run_diagnose_emits_fixture_replay_acceptance_gate(monkeypatch):
+    """Production-window fixture replay must expose the final read-only gate."""
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816045100,
+                "kind": "passive_maintenance.cancel_try_window",
+                "payload": {
+                    "symbol": "RIVERUSDT",
+                    "entry_id": "incident-riverusdt-0001",
+                    "fill_ratio": 0.0,
+                    "try_window_ms": 1500,
+                    "min_fill_ratio": 0.25,
+                },
+            },
+            {
+                "ts_ms": 1779816047600,
+                "kind": "entry.aborted",
+                "payload": {
+                    "symbol": "RIVERUSDT",
+                    "entry_id": "incident-riverusdt-0001",
+                    "reason": "passive_maker_canceled_zero_fill",
+                },
+            },
+            {
+                "ts_ms": 1779816047700,
+                "kind": "recovery.live_position_probe_venue_cooldown",
+                "payload": {
+                    "venue": "okx",
+                    "classification": "rate_limited",
+                    "endpoint": "/api/v5/account/positions",
+                },
+            },
+            {
+                "ts_ms": 1779816047800,
+                "kind": "recovery.live_position_probe_unsupported_symbols",
+                "payload": {
+                    "venue": "okx",
+                    "skipped_by_catalog": ["CHIPUSDT", "DELISTEDUSDT", "OLDUSDT"],
+                },
+            },
+            {
+                "ts_ms": 1779816047900,
+                "kind": "runtime.local_l2_sequence_gap_rebuild",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "RIVERUSDT",
+                    "previous_sequence_present": True,
+                    "expected_previous_sequence": 924684113,
+                    "raw_U": 924684120,
+                    "raw_u": 924684126,
+                    "raw_pu": 924684118,
+                    "status_after": "rebuilding",
+                },
+            },
+            {
+                "ts_ms": 1779816048000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "RIVERUSDT",
+                    "domain": "market_observed",
+                    "v1_parity_evidence": "CL-006-snapshot-fallback-degraded-domain-entry-impact",
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "RIVERUSDT",
+                            "domain": "market_observed",
+                            "blocked": True,
+                            "block_reason": "market_observed_stale",
+                        }
+                    ],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="RIVERUSDT",
+            venues=["aster", "okx"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["passive_maker_zero_fill_count"] == 1
+        assert gate["passive_maker_fill_rate"] == 0.0
+        assert gate["abort_fail_closed_count"] == 0
+        assert gate["okx_recovery_probe_rate_limited_count"] == 1
+        assert gate["okx_instrument_missing_skipped_count"] == 3
+        assert gate["local_l2_official_rebuild_count"] == 1
+        assert gate["snapshot_fallback_blocking_count"] == 1
+        assert gate["entry_opened_count"] == 0
+        assert gate["position_opened_count"] == 0
+        assert gate["open_position_count"] == 0
+        assert gate["pending_entry_count"] == 0
+        assert gate["exchange_truth_flat"] is True
+        assert gate["exchange_truth_no_open_orders"] is True
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["unclassified_exceptions"] == []
+        assert gate["insufficient_evidence_exceptions"] == []
+        assert set(gate["exception_conclusions"].values()) <= {
+            "v1_parity",
+            "official_doc",
+            "insufficient_evidence",
+        }
+        assert gate["exception_conclusions"]["passive_maker_zero_fill"] == "v1_parity"
+        assert gate["exception_conclusions"]["local_l2_official_rebuild"] == "official_doc"
+        assert gate["exception_conclusions"]["snapshot_fallback_blocking"] == "v1_parity"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_acceptance_gate_blocks_insufficient_exception_evidence(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "entry.aborted",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "reason": "fail_closed",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["aster", "binance"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["abort_fail_closed_count"] == 1
+        assert gate["exception_conclusions"]["abort_fail_closed"] == "insufficient_evidence"
+        assert gate["insufficient_evidence_exceptions"] == ["abort_fail_closed"]
+        assert gate["blocking_reasons"] == ["diagnostic_exception_insufficient_evidence"]
+        assert gate["gate_passed"] is False
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {"ts_ms": 1779816049000, "kind": "entry.opened", "payload": {"symbol": "BULLAUSDT"}},
+            {"ts_ms": 1779816049100, "kind": "runtime.position_opened", "payload": {"symbol": "BULLAUSDT"}},
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["aster", "binance"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["entry_opened_count"] == 1
+        assert gate["position_opened_count"] == 1
+        assert gate["gate_passed"] is False
+        assert gate["blocking_reasons"] == [
+            "entry_or_position_opened_without_fixture_finalized_evidence",
+        ]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_does_not_count_okx_global_recovery_for_non_okx_venues(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816047700,
+                "kind": "recovery.live_position_probe_venue_cooldown",
+                "payload": {
+                    "venue": "okx",
+                    "classification": "rate_limited",
+                    "endpoint": "/api/v5/account/positions",
+                },
+            },
+            {
+                "ts_ms": 1779816047800,
+                "kind": "recovery.live_position_probe_unsupported_symbols",
+                "payload": {
+                    "venue": "okx",
+                    "requested_symbols": ["RIVERUSDT", "CHIPUSDT"],
+                    "skipped_by_catalog": ["CHIPUSDT"],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["aster", "binance"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert result["event_counts"] == {}
+        assert gate["okx_recovery_probe_rate_limited_count"] == 0
+        assert gate["okx_instrument_missing_skipped_count"] == 0
+        assert "okx_recovery_probe_rate_limited" not in gate["exception_conclusions"]
+        assert "okx_instrument_missing_skipped" not in gate["exception_conclusions"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_replays_okx_noise_skipped_count_from_fixture(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816047700,
+                "kind": "okx_recovery_probe_noise",
+                "payload": {
+                    "probe_symbols": [
+                        "BTCUSDT",
+                        "ETHUSDT",
+                        "CHIPUSDT",
+                        "DELISTEDUSDT",
+                        "OLDUSDT",
+                    ],
+                    "okx_catalog": [
+                        {"instId": "BTC-USDT-SWAP", "state": "live"},
+                        {"instId": "ETH-USDT-SWAP", "state": "live"},
+                    ],
+                    "rate_limit_error": {
+                        "status_code": 429,
+                        "body": "{\"code\":\"50011\",\"msg\":\"Rate limit reached\"}",
+                    },
+                    "instrument_missing_error": (
+                        "okx_contract_metadata_missing_ct_val "
+                        "classification=instrument_missing instId=CHIP-USDT-SWAP"
+                    ),
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="CHIPUSDT",
+            venues=["okx"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["okx_recovery_probe_rate_limited_count"] == 1
+        assert gate["okx_instrument_missing_skipped_count"] == 3
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_gate_fails_when_exchange_truth_unavailable(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        def unavailable_exchange_truth(runtime_dir, symbols, venues=None):
+            return {
+                "available": False,
+                "available_venues": [],
+                "confidence": "low",
+                "positions": {"okx": {"error": "no credentials available"}},
+                "open_orders": {"okx": {"error": "no credentials available"}},
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "fetch_status": {"okx": {"status": "no_credentials"}},
+                "errors": [],
+                "missing_evidence": ["okx_credentials"],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", unavailable_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="RIVERUSDT",
+            venues=["okx"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["exchange_truth_flat"] is False
+        assert gate["exchange_truth_no_open_orders"] is False
+        assert gate["gate_passed"] is False
+        assert gate["blocking_reasons"] == ["exchange_truth_unavailable"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_production_blocker_window_reports_closed_evidence_conclusions(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "window.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779800000000,
+            "kind": "runtime.entry_blocked_local_l2_selection",
+            "payload": {
+                "symbol": "MONUSDT",
+                "reason": "entry_local_l2_waiting_for_dual_ready",
+            },
+        },
+        {
+            "ts_ms": 1779810000000,
+            "kind": "runtime.local_l2_sequence_gap_rebuild",
+            "payload": {
+                "venue": "aster",
+                "symbol": "MONUSDT",
+                "previous_sequence_present": True,
+                "expected_previous_sequence": 10,
+                "raw_U": 12,
+                "raw_u": 13,
+                "raw_pu": 10,
+                "status_after": "rebuilding",
+            },
+        },
+        {
+            "ts_ms": 1779811000000,
+            "kind": "runtime.snapshot_fallback_last_good",
+            "payload": {
+                "symbol": "MONUSDT",
+                "v1_parity_evidence": "CL-006",
+                "candidate_freshness_scope": [{"blocked": True}],
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h", "run_window"],
+    )
+
+    assert result["windows"]["last_2h"]["incident_counts"] == {
+        "local_l2_official_rebuild": 1,
+        "snapshot_fallback_blocking": 1,
+    }
+    assert result["windows"]["last_2h"]["incident_conclusions"] == {
+        "local_l2_official_rebuild": "official_doc",
+        "snapshot_fallback_blocking": "v1_parity",
+    }
+
+
+def test_production_blocker_window_replays_okx_noise_skipped_count(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "okx_noise.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779811000000,
+            "kind": "okx_recovery_probe_noise",
+            "payload": {
+                "probe_symbols": [
+                    "BTCUSDT",
+                    "ETHUSDT",
+                    "CHIPUSDT",
+                    "DELISTEDUSDT",
+                    "OLDUSDT",
+                ],
+                "okx_catalog": [
+                    {"instId": "BTC-USDT-SWAP", "state": "live"},
+                    {"instId": "ETH-USDT-SWAP", "state": "live"},
+                ],
+                "rate_limit_error": {
+                    "status_code": 429,
+                    "body": "{\"code\":\"50011\",\"msg\":\"Rate limit reached\"}",
+                },
+                "instrument_missing_error": (
+                    "okx_contract_metadata_missing_ct_val "
+                    "classification=instrument_missing instId=CHIP-USDT-SWAP"
+                ),
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h"],
+    )
+
+    assert result["windows"]["last_2h"]["incident_counts"] == {
+        "okx_instrument_missing_skipped": 3,
+        "okx_recovery_probe_rate_limited": 1,
+    }
+    assert result["windows"]["last_2h"]["incident_conclusions"] == {
+        "okx_instrument_missing_skipped": "official_doc",
+        "okx_recovery_probe_rate_limited": "official_doc",
+    }
+
+
 def test_symbol_filter_matches_position_id_when_symbol_field_missing():
     from scripts.diagnose_live import _event_matches_symbol
 

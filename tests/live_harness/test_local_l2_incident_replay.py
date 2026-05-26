@@ -6,6 +6,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import pytest
+
+from lightfee.marketdata.l2 import (
+    L2BookStatus,
+    L2PoolAssignment,
+    LocalL2Update,
+    LocalL2UpdateKind,
+    PriceLevel,
+)
+from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
+from lightfee.marketdata.local_l2_runtime import LocalL2Runtime
 
 Classification = Literal[
     "V1 parity drift",
@@ -28,7 +39,19 @@ BINANCE_LOCAL_BOOK_DOC = (
 )
 
 FIXTURE_PATH = Path("tests/fixtures/live_incidents/2026-05-26/local_l2_after_1310.jsonl")
+BINANCE_REPLAY_FIXTURE_PATH = Path(
+    "tests/fixtures/live_incidents/2026-05-27/binance_local_l2_replay_mismatch.jsonl"
+)
 POST_1310_CUTOFF = datetime.fromisoformat("2026-05-26T13:10:00+08:00")
+BINANCE_REPLAY_REQUIRED_FIELDS = {
+    "raw_U",
+    "raw_u",
+    "raw_pu",
+    "expected_previous_sequence",
+    "snapshot_last_update_id",
+    "status_before",
+    "status_after",
+}
 
 
 @dataclass(frozen=True)
@@ -53,11 +76,23 @@ def load_local_l2_incident_samples() -> list[dict]:
     ]
 
 
+def load_binance_replay_samples() -> list[dict]:
+    return [
+        json.loads(line)
+        for line in BINANCE_REPLAY_FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
 def _int_payload(payload: dict, key: str) -> int | None:
     value = payload.get(key)
     if value is None:
         return None
     return int(value)
+
+
+def _has_required_binance_replay_evidence(payload: dict) -> bool:
+    return all(payload.get(field) is not None for field in BINANCE_REPLAY_REQUIRED_FIELDS)
 
 
 def classify_local_l2_incident(sample: dict) -> IncidentClassification:
@@ -110,21 +145,53 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
 
     if kind == "runtime.local_l2_snapshot_error":
         reason = str(payload.get("reason", ""))
+        if venue == "binance" and payload.get("category") == "buffered_replay_failed":
+            if not _has_required_binance_replay_evidence(payload):
+                return IncidentClassification(
+                    event_kind=kind,
+                    classification="insufficient evidence",
+                    evidence="Buffered replay sample lacks required raw sequence/status evidence.",
+                    evidence_gap=True,
+                )
         raw_pu = _int_payload(payload, "raw_pu")
+        raw_u = _int_payload(payload, "raw_u")
+        raw_U = _int_payload(payload, "raw_U")
         expected_previous = _int_payload(payload, "expected_previous_sequence")
         snapshot_last_update_id = _int_payload(payload, "snapshot_last_update_id")
-        has_replay_gap_evidence = (
+        has_previous_link_mismatch_evidence = (
             raw_pu is not None
             and expected_previous is not None
             and snapshot_last_update_id is not None
             and raw_pu != expected_previous
             and expected_previous >= snapshot_last_update_id
         )
-        if venue == "binance" and "previous_link_mismatch" in reason and has_replay_gap_evidence:
+        has_snapshot_boundary_evidence = (
+            raw_U is not None
+            and raw_u is not None
+            and snapshot_last_update_id is not None
+            and raw_U <= raw_u
+            and raw_U > snapshot_last_update_id
+        )
+        if (
+            venue == "binance"
+            and "previous_link_mismatch" in reason
+            and has_previous_link_mismatch_evidence
+        ):
             return IncidentClassification(
                 event_kind=kind,
                 classification="official-doc exchange reset/sequence behavior",
                 evidence="A buffered replay pu mismatch requires local book reinitialization.",
+                official_doc_url=BINANCE_LOCAL_BOOK_DOC,
+            )
+        if (
+            venue == "binance"
+            and "snapshot_boundary" in reason
+            and has_snapshot_boundary_evidence
+        ):
+            return IncidentClassification(
+                event_kind=kind,
+                classification="official-doc exchange reset/sequence behavior",
+                evidence="The first buffered update does not bridge the REST snapshot lastUpdateId.",
                 official_doc_url=BINANCE_LOCAL_BOOK_DOC,
             )
         return IncidentClassification(
@@ -235,3 +302,118 @@ def test_expected_real_gap_is_classified_without_authorizing_threshold_relaxatio
     assert result.official_doc_url == BINANCE_LOCAL_BOOK_DOC
     assert result.data_plane_change_allowed is False
     assert result.stale_threshold_change_allowed is False
+
+
+def test_binance_buffered_replay_samples_require_raw_sequence_and_status_evidence():
+    samples = load_binance_replay_samples()
+    results = [classify_local_l2_incident(sample) for sample in samples]
+
+    assert len(samples) == 3
+    for sample, result in zip(samples, results):
+        payload = sample["payload"]
+        if payload.get("fixture_case") == "missing_required_fields":
+            assert result.classification == "insufficient evidence"
+            assert result.evidence_gap is True
+            continue
+
+        assert _has_required_binance_replay_evidence(payload)
+        assert result.classification == "official-doc exchange reset/sequence behavior"
+        assert result.official_doc_url == BINANCE_LOCAL_BOOK_DOC
+        assert result.evidence_gap is False
+        assert result.data_plane_change_allowed is False
+        assert result.stale_threshold_change_allowed is False
+
+
+class _RecordingJournal:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict]] = []
+
+    def append(self, kind: str, payload: dict, **kwargs):
+        self.records.append((kind, payload))
+        return len(self.records)
+
+
+class _MockL2Adapter:
+    def __init__(self, sequence: int):
+        self.sequence = sequence
+
+    async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+        return LocalL2Update(
+            venue="binance",
+            symbol=symbol,
+            bids=[PriceLevel(100.0, 1.0)],
+            asks=[PriceLevel(101.0, 1.0)],
+            sequence=self.sequence,
+            update_kind=LocalL2UpdateKind.SNAPSHOT,
+        )
+
+
+@pytest.mark.asyncio
+async def test_binance_buffered_replay_mismatch_rebuilds_without_entry_readiness_and_recovers_on_later_snapshot_ok():
+    rt = LocalL2Runtime()
+    journal = _RecordingJournal()
+    dp = LocalL2DataPlane(rt, journal)
+    book = rt.ensure_book("binance", "EDENUSDT")
+    book.status = L2BookStatus.BOOTSTRAPPING
+    rt.assign("binance", "EDENUSDT", L2PoolAssignment.HOT_EXEC, now_ms=1000)
+
+    for now_ms, raw_U, raw_u, raw_pu in (
+        (1100, 101, 102, 100),
+        (1200, 103, 104, 101),
+    ):
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="EDENUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[PriceLevel(101.0, 1.0)],
+                first_sequence=raw_U,
+                sequence=raw_u,
+                previous_sequence=raw_pu,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=now_ms,
+        )
+
+    ok = await dp.bootstrap_book(
+        "binance",
+        "EDENUSDT",
+        _MockL2Adapter(sequence=100),
+        now_ms=2000,
+    )
+
+    assert ok is False
+    assert book.status == L2BookStatus.REBUILDING
+    assert book.is_ready(max_age_ms=5000, now_ms=2000) is False
+    rt.sync(now_ms=2000)
+    assert rt.metrics.active_books == 0
+    assert rt.metrics.hot_exec_not_ready_books == 1
+
+    payload = [
+        payload for kind, payload in journal.records
+        if kind == "runtime.local_l2_snapshot_error"
+        and payload.get("category") == "buffered_replay_failed"
+    ][0]
+    classification = classify_local_l2_incident(
+        {"kind": "runtime.local_l2_snapshot_error", "payload": payload}
+    )
+    assert classification.classification == "official-doc exchange reset/sequence behavior"
+    assert payload["status_after"] == "rebuilding"
+
+    recovered = await dp.bootstrap_book(
+        "binance",
+        "EDENUSDT",
+        _MockL2Adapter(sequence=200),
+        now_ms=3000,
+    )
+
+    assert recovered is True
+    assert book.status == L2BookStatus.HOT
+    assert book.is_ready(max_age_ms=5000, now_ms=3000) is True
+    assert [
+        payload for kind, payload in journal.records
+        if kind == "runtime.local_l2_snapshot_ok"
+        and payload.get("venue") == "binance"
+        and payload.get("symbol") == "EDENUSDT"
+    ]

@@ -659,6 +659,7 @@ class LocalL2DataPlane:
             "venue": venue,
             "symbol": symbol,
             "error": reason,
+            "reason": reason,
             "rebuild_trigger": reason,
             "rebuild_attempt_id": rebuild_attempt_id,
             "snapshot_lastUpdateId": snapshot_last_update_id,

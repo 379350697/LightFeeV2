@@ -1236,6 +1236,274 @@ def _build_top_exchange_errors(
 
 
 # ---------------------------------------------------------------------------
+# production acceptance gate
+# ---------------------------------------------------------------------------
+
+def _payload_dict(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload", {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_snapshot_fallback_blocking(payload: dict[str, Any]) -> bool:
+    if payload.get("blocked") is True or payload.get("block_reason"):
+        return True
+    for item in payload.get("candidate_freshness_scope", []) or []:
+        if isinstance(item, dict) and (
+            item.get("blocked") is True or item.get("block_reason")
+        ):
+            return True
+    return False
+
+
+def _has_official_sequence_rebuild_evidence(payload: dict[str, Any]) -> bool:
+    if str(payload.get("venue", "")).lower() not in {"aster", "binance"}:
+        return False
+    sequence_fields = (
+        "expected_previous_sequence",
+        "raw_U",
+        "raw_u",
+        "raw_pu",
+    )
+    return payload.get("previous_sequence_present") is True and all(
+        payload.get(field) is not None for field in sequence_fields
+    )
+
+
+def _canonical_okx_symbol(value: Any) -> str:
+    raw = str(value or "").upper()
+    if raw.endswith("-USDT-SWAP"):
+        return raw.replace("-USDT-SWAP", "USDT")
+    if raw.endswith("-SWAP"):
+        return raw.replace("-SWAP", "")
+    return raw.replace("-", "")
+
+
+def _okx_catalog_symbols(payload: dict[str, Any]) -> set[str]:
+    symbols: set[str] = set()
+    for row in payload.get("okx_catalog", []) or []:
+        if not isinstance(row, dict):
+            continue
+        inst_id = row.get("instId") or row.get("inst_id") or row.get("symbol")
+        if inst_id:
+            symbols.add(_canonical_okx_symbol(inst_id))
+    return symbols
+
+
+def _payload_symbol_set(payload: dict[str, Any]) -> set[str]:
+    symbols: set[str] = set()
+    for key in ("probe_symbols", "requested_symbols"):
+        values = payload.get(key, []) or []
+        if isinstance(values, str):
+            values = [values]
+        for value in values:
+            if value:
+                symbols.add(_canonical_okx_symbol(value))
+    return symbols
+
+
+def _okx_instrument_missing_skipped_count(payload: dict[str, Any]) -> int:
+    skipped = payload.get("skipped_by_catalog", []) or []
+    if isinstance(skipped, list) and skipped:
+        return len(skipped)
+    if isinstance(skipped, str) and skipped:
+        return 1
+
+    probe_symbols = {
+        _canonical_okx_symbol(symbol)
+        for symbol in (payload.get("probe_symbols", []) or [])
+        if symbol
+    }
+    catalog_symbols = _okx_catalog_symbols(payload)
+    if probe_symbols and catalog_symbols:
+        return len(probe_symbols - catalog_symbols)
+
+    return 1 if payload.get("instrument_missing_error") else 0
+
+
+def _exchange_truth_flat(exchange_truth: dict[str, Any]) -> bool:
+    if not exchange_truth.get("available"):
+        return False
+    if exchange_truth.get("has_nonzero_position"):
+        return False
+    for venue_positions in (exchange_truth.get("positions") or {}).values():
+        if not isinstance(venue_positions, dict):
+            continue
+        for position in venue_positions.values():
+            if isinstance(position, dict) and abs(float(position.get("quantity", 0) or 0)) > 1e-9:
+                return False
+    return True
+
+
+def _exchange_truth_no_open_orders(exchange_truth: dict[str, Any]) -> bool:
+    if not exchange_truth.get("available"):
+        return False
+    if exchange_truth.get("has_open_order"):
+        return False
+    for venue_orders in (exchange_truth.get("open_orders") or {}).values():
+        if not isinstance(venue_orders, dict):
+            continue
+        for orders in venue_orders.values():
+            if isinstance(orders, list) and orders:
+                return False
+            if isinstance(orders, dict) and not orders.get("error"):
+                return False
+    return True
+
+
+def _build_production_acceptance_gate(
+    events: list[dict[str, Any]],
+    local_state: dict[str, Any],
+    exchange_truth: dict[str, Any],
+) -> dict[str, Any]:
+    fill_ratios: list[float] = []
+    passive_maker_zero_fill_count = 0
+    abort_fail_closed_count = 0
+    okx_recovery_probe_rate_limited_count = 0
+    okx_instrument_missing_skipped_count = 0
+    local_l2_official_rebuild_count = 0
+    snapshot_fallback_blocking_count = 0
+    entry_opened_count = 0
+    position_opened_count = 0
+    residual_count = 0
+    exception_conclusions: dict[str, str] = {}
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = _payload_dict(rec)
+        reason = str(payload.get("reason", "") or "")
+        venue = str(payload.get("venue", "") or "").lower()
+        classification = str(payload.get("classification", "") or "")
+
+        if kind == "passive_maintenance.cancel_try_window":
+            try:
+                fill_ratio = float(payload.get("fill_ratio", 0) or 0)
+            except (TypeError, ValueError):
+                fill_ratio = 0.0
+            fill_ratios.append(fill_ratio)
+            if fill_ratio <= 0:
+                passive_maker_zero_fill_count += 1
+                exception_conclusions["passive_maker_zero_fill"] = "v1_parity"
+        elif kind == "entry.aborted" and (
+            "fail_closed" in reason or payload.get("fail_closed") is True
+        ):
+            abort_fail_closed_count += 1
+            exception_conclusions["abort_fail_closed"] = "insufficient_evidence"
+        elif kind == "runtime.fail_closed":
+            abort_fail_closed_count += 1
+            exception_conclusions["abort_fail_closed"] = "insufficient_evidence"
+        elif kind == "recovery.live_position_probe_venue_cooldown" and venue == "okx" and classification == "rate_limited":
+            okx_recovery_probe_rate_limited_count += 1
+            exception_conclusions["okx_recovery_probe_rate_limited"] = "official_doc"
+        elif kind == "recovery.live_position_probe_unsupported_symbols" and venue == "okx":
+            okx_instrument_missing_skipped_count += _okx_instrument_missing_skipped_count(payload)
+            if okx_instrument_missing_skipped_count:
+                exception_conclusions["okx_instrument_missing_skipped"] = "official_doc"
+        elif kind == "okx_recovery_probe_noise":
+            if payload.get("rate_limit_error"):
+                okx_recovery_probe_rate_limited_count += 1
+                exception_conclusions["okx_recovery_probe_rate_limited"] = "official_doc"
+            if payload.get("instrument_missing_error"):
+                okx_instrument_missing_skipped_count += _okx_instrument_missing_skipped_count(payload)
+                exception_conclusions["okx_instrument_missing_skipped"] = "official_doc"
+
+        if kind in ("runtime.local_l2_sequence_gap_rebuild", "runtime.local_l2_snapshot_error"):
+            if _has_official_sequence_rebuild_evidence(payload):
+                local_l2_official_rebuild_count += 1
+                exception_conclusions["local_l2_official_rebuild"] = "official_doc"
+            else:
+                exception_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
+
+        if kind == "runtime.snapshot_fallback_last_good" and _is_snapshot_fallback_blocking(payload):
+            snapshot_fallback_blocking_count += 1
+            if payload.get("v1_parity_evidence"):
+                exception_conclusions["snapshot_fallback_blocking"] = "v1_parity"
+            else:
+                exception_conclusions["snapshot_fallback_blocking"] = "insufficient_evidence"
+
+        if kind == "entry.opened":
+            entry_opened_count += 1
+            exception_conclusions["entry_opened"] = "insufficient_evidence"
+        elif kind == "runtime.position_opened":
+            position_opened_count += 1
+            exception_conclusions["position_opened"] = "insufficient_evidence"
+
+        if "residual" in kind or "residual" in reason:
+            residual_count += 1
+
+    passive_maker_fill_rate = (
+        sum(fill_ratios) / len(fill_ratios)
+        if fill_ratios else 0.0
+    )
+    open_position_count = int(local_state.get("open_position_count", 0) or 0)
+    pending_entry_count = int(local_state.get("pending_entry_count", 0) or 0)
+    pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
+    exchange_truth_flat = _exchange_truth_flat(exchange_truth)
+    exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
+
+    blocking_reasons: list[str] = []
+    if open_position_count:
+        blocking_reasons.append("local_open_positions_present")
+    if pending_entry_count or pending_close_count:
+        blocking_reasons.append("local_pending_entries_or_closes_present")
+    if residual_count:
+        blocking_reasons.append("residual_events_present")
+    if not exchange_truth.get("available"):
+        blocking_reasons.append("exchange_truth_unavailable")
+    else:
+        if not exchange_truth_flat:
+            blocking_reasons.append("exchange_truth_nonzero_position")
+        if not exchange_truth_no_open_orders:
+            blocking_reasons.append("exchange_truth_open_orders_present")
+    if entry_opened_count or position_opened_count:
+        blocking_reasons.append("entry_or_position_opened_without_fixture_finalized_evidence")
+
+    diagnostic_counts = {
+        "passive_maker_zero_fill": passive_maker_zero_fill_count,
+        "abort_fail_closed": abort_fail_closed_count,
+        "okx_recovery_probe_rate_limited": okx_recovery_probe_rate_limited_count,
+        "okx_instrument_missing_skipped": okx_instrument_missing_skipped_count,
+        "local_l2_official_rebuild": local_l2_official_rebuild_count,
+        "snapshot_fallback_blocking": snapshot_fallback_blocking_count,
+    }
+    unclassified_exceptions = [
+        name for name, count in diagnostic_counts.items()
+        if count and name not in exception_conclusions
+    ]
+    insufficient_evidence_exceptions = [
+        name for name, conclusion in exception_conclusions.items()
+        if conclusion == "insufficient_evidence"
+        and name not in {"entry_opened", "position_opened"}
+    ]
+    if unclassified_exceptions:
+        blocking_reasons.append("diagnostic_exception_unclassified")
+    if insufficient_evidence_exceptions:
+        blocking_reasons.append("diagnostic_exception_insufficient_evidence")
+
+    return {
+        "passive_maker_zero_fill_count": passive_maker_zero_fill_count,
+        "passive_maker_fill_rate": passive_maker_fill_rate,
+        "abort_fail_closed_count": abort_fail_closed_count,
+        "okx_recovery_probe_rate_limited_count": okx_recovery_probe_rate_limited_count,
+        "okx_instrument_missing_skipped_count": okx_instrument_missing_skipped_count,
+        "local_l2_official_rebuild_count": local_l2_official_rebuild_count,
+        "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
+        "entry_opened_count": entry_opened_count,
+        "position_opened_count": position_opened_count,
+        "open_position_count": open_position_count,
+        "pending_entry_count": pending_entry_count,
+        "pending_close_count": pending_close_count,
+        "residual_count": residual_count,
+        "exchange_truth_flat": exchange_truth_flat,
+        "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        "exception_conclusions": exception_conclusions,
+        "unclassified_exceptions": unclassified_exceptions,
+        "insufficient_evidence_exceptions": insufficient_evidence_exceptions,
+        "blocking_reasons": blocking_reasons,
+        "gate_passed": not blocking_reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
 # evidence completeness
 # ---------------------------------------------------------------------------
 
@@ -1454,8 +1722,8 @@ def run_diagnose(
     if since_ms > 0:
         all_events = [e for e in all_events if int(e.get("ts_ms", 0) or 0) >= since_ms]
 
-    if symbol:
-        all_events = [e for e in all_events if _event_matches_symbol(e, symbol)]
+    if symbol or venues:
+        all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
 
     health = _build_health(state, service_status)
     local_state = _build_local_state(state, all_events)
@@ -1484,6 +1752,9 @@ def run_diagnose(
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
+    production_acceptance_gate = _build_production_acceptance_gate(
+        all_events, local_state, exchange_truth,
+    )
     evidence_completeness = _build_evidence_completeness(
         order_errors, state_consistency, exchange_truth,
     )
@@ -1524,6 +1795,7 @@ def run_diagnose(
         "event_counts": event_counts,
         "l2_evidence": l2_evidence,
         "runtime_warnings": runtime_warnings,
+        "production_acceptance_gate": production_acceptance_gate,
         "evidence_quality": evidence_completeness,
         "conclusion": conclusion,
     }
@@ -1538,6 +1810,57 @@ def _event_matches_symbol(event: dict[str, Any], symbol: str) -> bool:
     if event_symbol == target:
         return True
     return target in json.dumps(payload, sort_keys=True).upper()
+
+
+def _event_scope_venues(payload: dict[str, Any]) -> set[str]:
+    venues: set[str] = set()
+    for key in ("venue", "maker_venue", "hedge_venue", "long_venue", "short_venue"):
+        value = payload.get(key)
+        if value:
+            venues.add(str(value).lower())
+    raw_venues = payload.get("venues", []) or []
+    if isinstance(raw_venues, str):
+        raw_venues = [raw_venues]
+    for value in raw_venues:
+        if value:
+            venues.add(str(value).lower())
+    return venues
+
+
+def _event_matches_scope(
+    event: dict[str, Any],
+    symbol: str,
+    venues: list[str] | None,
+) -> bool:
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        return False
+
+    requested_venues = {str(venue).lower() for venue in (venues or []) if venue}
+    event_venues = _event_scope_venues(payload)
+
+    if symbol and _event_matches_symbol(event, symbol):
+        return True
+
+    if requested_venues and event_venues and event_venues.isdisjoint(requested_venues):
+        return False
+
+    if not symbol:
+        return True
+
+    kind = str(event.get("kind", "") or "")
+    if kind not in {
+        "recovery.live_position_probe_venue_cooldown",
+        "recovery.live_position_probe_unsupported_symbols",
+        "okx_recovery_probe_noise",
+    }:
+        return False
+
+    scoped_symbols = _payload_symbol_set(payload)
+    if scoped_symbols:
+        return symbol.upper() in scoped_symbols
+
+    return bool(event_venues and (not requested_venues or not event_venues.isdisjoint(requested_venues)))
 
 
 # ---------------------------------------------------------------------------

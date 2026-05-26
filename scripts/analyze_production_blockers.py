@@ -62,6 +62,65 @@ def _inc_symbol_pair(
         top_symbols[symbol] += 1
 
 
+def _snapshot_fallback_blocked(payload: dict[str, Any]) -> bool:
+    if payload.get("blocked") is True or payload.get("block_reason"):
+        return True
+    for item in payload.get("candidate_freshness_scope", []) or []:
+        if isinstance(item, dict) and (
+            item.get("blocked") is True or item.get("block_reason")
+        ):
+            return True
+    return False
+
+
+def _has_official_sequence_evidence(payload: dict[str, Any]) -> bool:
+    if str(payload.get("venue", "")).lower() not in {"aster", "binance"}:
+        return False
+    return payload.get("previous_sequence_present") is True and all(
+        payload.get(field) is not None
+        for field in ("expected_previous_sequence", "raw_U", "raw_u", "raw_pu")
+    )
+
+
+def _canonical_okx_symbol(value: Any) -> str:
+    raw = str(value or "").upper()
+    if raw.endswith("-USDT-SWAP"):
+        return raw.replace("-USDT-SWAP", "USDT")
+    if raw.endswith("-SWAP"):
+        return raw.replace("-SWAP", "")
+    return raw.replace("-", "")
+
+
+def _okx_catalog_symbols(payload: dict[str, Any]) -> set[str]:
+    symbols: set[str] = set()
+    for row in payload.get("okx_catalog", []) or []:
+        if not isinstance(row, dict):
+            continue
+        inst_id = row.get("instId") or row.get("inst_id") or row.get("symbol")
+        if inst_id:
+            symbols.add(_canonical_okx_symbol(inst_id))
+    return symbols
+
+
+def _okx_instrument_missing_skipped_count(payload: dict[str, Any]) -> int:
+    skipped = payload.get("skipped_by_catalog", []) or []
+    if isinstance(skipped, list) and skipped:
+        return len(skipped)
+    if isinstance(skipped, str) and skipped:
+        return 1
+
+    probe_symbols = {
+        _canonical_okx_symbol(symbol)
+        for symbol in (payload.get("probe_symbols", []) or [])
+        if symbol
+    }
+    catalog_symbols = _okx_catalog_symbols(payload)
+    if probe_symbols and catalog_symbols:
+        return len(probe_symbols - catalog_symbols)
+
+    return 1 if payload.get("instrument_missing_error") else 0
+
+
 def _classify_blockers(counts_2h: dict[str, int], counts_24h: dict[str, int],
                        counts_run: dict[str, int]) -> dict[str, str]:
     """Classify each blocker type as current vs historical."""
@@ -167,6 +226,8 @@ def analyze_event_file(
         order_event_counts: Counter[str] = Counter()
         exchange_error_counts: Counter[str] = Counter()
         pending_entry_counts: Counter[str] = Counter()
+        incident_counts: Counter[str] = Counter()
+        incident_conclusions: dict[str, str] = {}
         w_first = 0
         w_last = 0
 
@@ -238,6 +299,51 @@ def analyze_event_file(
                 if reason and reason not in {"attempt", "ack_accepted", "filled"}:
                     exchange_error_counts[reason] += 1
 
+            if kind == "passive_maintenance.cancel_try_window":
+                try:
+                    fill_ratio = float(payload.get("fill_ratio", 0) or 0)
+                except (TypeError, ValueError):
+                    fill_ratio = 0.0
+                if fill_ratio <= 0:
+                    incident_counts["passive_maker_zero_fill"] += 1
+                    incident_conclusions["passive_maker_zero_fill"] = "v1_parity"
+            elif kind == "entry.aborted" and "fail_closed" in str(payload.get("reason", "") or ""):
+                incident_counts["abort_fail_closed"] += 1
+                incident_conclusions["abort_fail_closed"] = "insufficient_evidence"
+            elif kind == "recovery.live_position_probe_venue_cooldown" and str(payload.get("venue", "")).lower() == "okx" and payload.get("classification") == "rate_limited":
+                incident_counts["okx_recovery_probe_rate_limited"] += 1
+                incident_conclusions["okx_recovery_probe_rate_limited"] = "official_doc"
+            elif kind == "recovery.live_position_probe_unsupported_symbols" and str(payload.get("venue", "")).lower() == "okx":
+                count = _okx_instrument_missing_skipped_count(payload)
+                if count:
+                    incident_counts["okx_instrument_missing_skipped"] += count
+                    incident_conclusions["okx_instrument_missing_skipped"] = "official_doc"
+            elif kind == "okx_recovery_probe_noise":
+                if payload.get("rate_limit_error"):
+                    incident_counts["okx_recovery_probe_rate_limited"] += 1
+                    incident_conclusions["okx_recovery_probe_rate_limited"] = "official_doc"
+                count = _okx_instrument_missing_skipped_count(payload)
+                if count:
+                    incident_counts["okx_instrument_missing_skipped"] += count
+                    incident_conclusions["okx_instrument_missing_skipped"] = "official_doc"
+            elif kind in ("runtime.local_l2_sequence_gap_rebuild", "runtime.local_l2_snapshot_error"):
+                if _has_official_sequence_evidence(payload):
+                    incident_counts["local_l2_official_rebuild"] += 1
+                    incident_conclusions["local_l2_official_rebuild"] = "official_doc"
+                else:
+                    incident_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
+            elif kind == "runtime.snapshot_fallback_last_good" and _snapshot_fallback_blocked(payload):
+                incident_counts["snapshot_fallback_blocking"] += 1
+                incident_conclusions["snapshot_fallback_blocking"] = (
+                    "v1_parity" if payload.get("v1_parity_evidence") else "insufficient_evidence"
+                )
+            elif kind == "entry.opened":
+                incident_counts["entry_opened"] += 1
+                incident_conclusions["entry_opened"] = "insufficient_evidence"
+            elif kind == "runtime.position_opened":
+                incident_counts["position_opened"] += 1
+                incident_conclusions["position_opened"] = "insufficient_evidence"
+
         # Build a flat key-value map for blocker reasons vs just event kinds
         blocker_reason_counts: dict[str, int] = dict(sorted(entry_l2_blocker_counts.items()))
         for reason, count in entry_l2_not_ready_reason_counts.items():
@@ -263,6 +369,8 @@ def analyze_event_file(
             "order_event_counts": dict(sorted(order_event_counts.items())),
             "exchange_error_counts": dict(sorted(exchange_error_counts.items())),
             "pending_entry_counts": dict(sorted(pending_entry_counts.items())),
+            "incident_counts": dict(sorted(incident_counts.items())),
+            "incident_conclusions": dict(sorted(incident_conclusions.items())),
             "blocker_reason_counts": blocker_reason_counts,
             "first_ts_ms": w_first,
             "last_ts_ms": w_last,
