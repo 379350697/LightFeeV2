@@ -183,6 +183,86 @@ class TestRuntimePreflight:
             await runtime.stop()
 
     @pytest.mark.asyncio
+    async def test_shutdown_timeout_logs_blocked_adapter_task(self, caplog):
+        """A stuck adapter shutdown is bounded and the blocked task is named."""
+        class HangingShutdownAdapter(FakeVenueAdapter):
+            async def shutdown(self) -> None:
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.shutdown_grace_period_ms = 50
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: HangingShutdownAdapter(Venue.BINANCE)},
+            )
+            await runtime.start()
+
+            with caplog.at_level("ERROR"):
+                await asyncio.wait_for(runtime.stop(), timeout=0.3)
+
+            messages = "\n".join(record.getMessage() for record in caplog.records)
+            assert "shutdown stage=close_network" in messages
+            assert "task=adapter.shutdown:binance" in messages
+            assert "status=timeout" in messages
+
+    @pytest.mark.asyncio
+    async def test_shutdown_timeout_does_not_wait_for_cancel_hostile_adapter(self, caplog):
+        """Timeout must bound a shutdown task even if it delays after cancellation."""
+        release_cancelled_shutdown = asyncio.Event()
+        saw_cancel = asyncio.Event()
+
+        class CancelHostileShutdownAdapter(FakeVenueAdapter):
+            async def shutdown(self) -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    saw_cancel.set()
+                    await release_cancelled_shutdown.wait()
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.shutdown_grace_period_ms = 50
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={
+                    Venue.BINANCE: CancelHostileShutdownAdapter(Venue.BINANCE)
+                },
+            )
+            await runtime.start()
+
+            with caplog.at_level("ERROR"):
+                await asyncio.wait_for(runtime.stop(), timeout=0.3)
+
+            await asyncio.sleep(0)
+            assert saw_cancel.is_set()
+            assert runtime.journal._file is None
+            messages = "\n".join(record.getMessage() for record in caplog.records)
+            assert "task=adapter.shutdown:binance" in messages
+            assert "status=timeout" in messages
+            release_cancelled_shutdown.set()
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stage_logs_follow_runtime_order(self, caplog):
+        """Runtime shutdown phases must be logged in the order they execute."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            with caplog.at_level("INFO"):
+                await runtime.stop()
+
+            stages = [
+                record.getMessage().split("shutdown stage=", 1)[1].split()[0]
+                for record in caplog.records
+                if "shutdown stage=" in record.getMessage()
+            ]
+            assert stages.index("close_network") < stages.index("flush_state")
+            assert stages.index("flush_state") < stages.index("exit_complete")
+
+    @pytest.mark.asyncio
     async def test_startup_emits_order_path_preflight_without_secrets(self):
         class PreflightTransport:
             def startup_preflight(self):
@@ -1333,3 +1413,185 @@ class TestLiveMainStartupShutdownOrder:
         assert "stop" in calls, (
             f"V1 parity violation: stop() must be called even after KeyboardInterrupt, got {calls}"
         )
+
+    @pytest.mark.asyncio
+    async def test_sigterm_shutdown_cancels_background_tasks_and_flushes(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """SIGTERM path must cancel runtime-owned background tasks and flush state."""
+        calls: list[str] = []
+        task_cancelled = asyncio.Event()
+        shutdown_event = asyncio.Event()
+        flush_path = tmp_path / "flushed.txt"
+
+        class MockRuntime:
+            def __init__(self, config, venue_adapters):
+                self.config = config
+                self._running = True
+
+            async def start(self) -> None:
+                calls.append("start")
+
+                async def _mock_background_task() -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        task_cancelled.set()
+
+                asyncio.create_task(
+                    _mock_background_task(),
+                    name="mock:ws-listen-key-sidecar-recovery-scan",
+                )
+
+            async def run_loop(self) -> None:
+                calls.append("run_loop")
+                await shutdown_event.wait()
+
+            async def stop(self) -> None:
+                calls.append("stop")
+                logger = __import__("logging").getLogger("lightfee.engine.runtime")
+                logger.info("shutdown stage=close_network")
+                logger.info("shutdown stage=flush_state")
+                flush_path.write_text("flushed")
+                logger.info("shutdown stage=exit_complete")
+
+        config = make_test_config(str(tmp_path))
+        config.runtime.shutdown_grace_period_ms = 200
+        monkeypatch.setattr("lightfee.apps.live.load_config", lambda _path: config)
+        monkeypatch.setattr("lightfee.apps.live.build_adapter_map", lambda _config: {})
+        monkeypatch.setattr("lightfee.apps.live.LiveRuntime", MockRuntime)
+
+        from lightfee.apps.live import async_main
+
+        async def trigger_shutdown() -> None:
+            await asyncio.sleep(0)
+            shutdown_event.set()
+
+        with caplog.at_level("INFO"):
+            trigger = asyncio.create_task(trigger_shutdown())
+            await asyncio.wait_for(
+                async_main(
+                    "test.toml",
+                    shutdown_event=shutdown_event,
+                    shutdown_signal_name=lambda: "SIGTERM",
+                ),
+                timeout=0.5,
+            )
+            await trigger
+
+        assert calls == ["start", "run_loop", "stop"]
+        assert flush_path.read_text() == "flushed"
+        assert task_cancelled.is_set()
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        for stage in (
+            "signal_received",
+            "cancel_tasks",
+            "flush_state",
+            "close_network",
+            "exit_complete",
+        ):
+            assert f"shutdown stage={stage}" in messages
+        assert messages.index("shutdown stage=close_network") < messages.index(
+            "shutdown stage=flush_state"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sigterm_during_startup_enters_shutdown_path(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """SIGTERM during runtime.start() must not wait for startup to finish."""
+        calls: list[str] = []
+        shutdown_event = asyncio.Event()
+        start_cancelled = asyncio.Event()
+        flush_path = tmp_path / "flushed.txt"
+
+        class MockRuntime:
+            def __init__(self, config, venue_adapters):
+                self.config = config
+                self._running = True
+
+            async def start(self) -> None:
+                calls.append("start")
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    start_cancelled.set()
+
+            async def run_loop(self) -> None:
+                calls.append("run_loop")
+
+            async def stop(self) -> None:
+                calls.append("stop")
+                flush_path.write_text("flushed")
+
+        config = make_test_config(str(tmp_path))
+        config.runtime.shutdown_grace_period_ms = 100
+        monkeypatch.setattr("lightfee.apps.live.load_config", lambda _path: config)
+        monkeypatch.setattr("lightfee.apps.live.build_adapter_map", lambda _config: {})
+        monkeypatch.setattr("lightfee.apps.live.LiveRuntime", MockRuntime)
+
+        from lightfee.apps.live import async_main
+
+        async def trigger_shutdown() -> None:
+            await asyncio.sleep(0)
+            shutdown_event.set()
+
+        with caplog.at_level("INFO"):
+            trigger = asyncio.create_task(trigger_shutdown())
+            await asyncio.wait_for(
+                async_main(
+                    "test.toml",
+                    shutdown_event=shutdown_event,
+                    shutdown_signal_name=lambda: "SIGTERM",
+                ),
+                timeout=0.5,
+            )
+            await trigger
+
+        assert calls == ["start", "stop"]
+        assert start_cancelled.is_set()
+        assert flush_path.read_text() == "flushed"
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "shutdown stage=signal_received signal=SIGTERM" in messages
+
+    def test_main_final_cleanup_does_not_wait_a_second_time_for_stuck_tasks(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """Production main must not add an extra hardcoded wait after async_main."""
+        import sys
+        import time
+
+        calls: list[float] = []
+
+        async def fake_async_main(*args, **kwargs) -> None:
+            async def _cancel_hostile_task() -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.Event().wait()
+
+            asyncio.create_task(_cancel_hostile_task(), name="stuck-after-async-main")
+
+        async def fail_if_waited_again(tasks, *, timeout_s, stage):
+            calls.append(timeout_s)
+            raise AssertionError("main must not wait for pending tasks after async_main")
+
+        monkeypatch.setattr("lightfee.apps.live.async_main", fake_async_main)
+        monkeypatch.setattr(
+            "lightfee.apps.live._cancel_tasks_with_timeout",
+            fail_if_waited_again,
+        )
+        monkeypatch.setattr(sys, "argv", ["lightfee-live", "--config", str(tmp_path / "live.toml")])
+
+        from lightfee.apps.live import main
+
+        started = time.monotonic()
+        with caplog.at_level("WARNING"):
+            main()
+        elapsed = time.monotonic() - started
+
+        assert calls == []
+        assert elapsed < 0.5
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "shutdown stage=cancel_tasks" in messages
+        assert "stuck-after-async-main" in messages

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections import Counter
 from typing import Optional
@@ -62,6 +63,8 @@ from lightfee.venues.transport import (
     TransportErrorCategory,
     is_hyperliquid_non_retryable_auth_signing_error,
 )
+
+logger = logging.getLogger("lightfee.engine.runtime")
 
 
 class LiveRuntime:
@@ -1937,14 +1940,98 @@ class LiveRuntime:
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
         self._running = False
+        shutdown_timeout_s = max(
+            int(getattr(self.config.runtime, "shutdown_grace_period_ms", 3000) or 3000),
+            1,
+        ) / 1000.0
+        loop = asyncio.get_running_loop()
+        shutdown_deadline = loop.time() + shutdown_timeout_s
+
+        def _remaining_shutdown_timeout_s() -> float:
+            return max(shutdown_deadline - loop.time(), 0.001)
+
+        def _journal_shutdown_stage(stage: str, **payload) -> None:
+            try:
+                self.journal.append(
+                    "runtime.shutdown_stage",
+                    {"stage": stage, "ts_ms": wall_clock_now_ms(), **payload},
+                    flush=True,
+                )
+            except Exception:
+                logger.exception("shutdown stage=%s task=journal status=error", stage)
+
+        async def _await_shutdown_task(stage: str, task_name: str, coro) -> bool:
+            timeout_s = _remaining_shutdown_timeout_s()
+
+            def _consume_result(task: asyncio.Task) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "shutdown stage=%s task=%s status=late_error error=%s",
+                        stage,
+                        task_name,
+                        exc,
+                    )
+
+            task = asyncio.create_task(coro, name=f"shutdown:{task_name}")
+            done, pending = await asyncio.wait({task}, timeout=timeout_s)
+            if task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    return False
+                except Exception as exc:
+                    logger.warning(
+                        "shutdown stage=%s task=%s status=error error=%s",
+                        stage,
+                        task_name,
+                        exc,
+                    )
+                    _journal_shutdown_stage(
+                        "error",
+                        blocked_stage=stage,
+                        task=task_name,
+                        error=str(exc),
+                    )
+                    return False
+                return True
+
+            for pending_task in pending:
+                pending_task.cancel()
+                pending_task.add_done_callback(_consume_result)
+            logger.error(
+                "shutdown stage=%s task=%s status=timeout timeout_s=%.3f",
+                stage,
+                task_name,
+                timeout_s,
+            )
+            _journal_shutdown_stage(
+                "timeout",
+                blocked_stage=stage,
+                task=task_name,
+                timeout_s=timeout_s,
+            )
+            return False
+
+        logger.info("shutdown stage=close_network")
+        _journal_shutdown_stage("close_network")
 
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
-        await self.l2_data_plane.stop_ws_streams()
+        await _await_shutdown_task(
+            "close_network",
+            "l2_data_plane.stop_ws_streams",
+            self.l2_data_plane.stop_ws_streams(
+                per_client_timeout_s=_remaining_shutdown_timeout_s(),
+            ),
+        )
 
         # V1: stop private WS workers before adapter shutdown
         for venue, adapter in list(self._venue_adapters.items()):
-            if getattr(adapter, 'supports_private_health', False):
-                transport = getattr(adapter, '_transport', None)
+            if getattr(adapter, "supports_private_health", False):
+                transport = getattr(adapter, "_transport", None)
                 if transport is not None:
                     transport.stop_private_ws()
                     self.journal.append(
@@ -1954,20 +2041,29 @@ class LiveRuntime:
 
         # V1 parity: per-adapter shutdown (cancels workers, flushes state)
         for venue, adapter in list(self._venue_adapters.items()):
-            try:
-                await adapter.shutdown()
-            except Exception as e:
+            ok = await _await_shutdown_task(
+                "close_network",
+                f"adapter.shutdown:{venue.value}",
+                adapter.shutdown(),
+            )
+            if not ok:
                 self.journal.append(
                     "runtime.adapter_shutdown_error",
-                    {"venue": venue.value, "error": str(e)},
+                    {"venue": venue.value, "error": "shutdown timeout or error"},
                 )
+
+        logger.info("shutdown stage=flush_state")
+        _journal_shutdown_stage("flush_state")
 
         # Rate-limit runtime flush
         if self._rate_limit_runtime is not None:
             try:
                 self._rate_limit_runtime.flush_recommendations()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "shutdown stage=flush_state task=rate_limit_runtime.flush_recommendations status=error error=%s",
+                    exc,
+                )
 
         # Final state snapshot
         if self.state:
@@ -1982,7 +2078,9 @@ class LiveRuntime:
         )
 
         self.journal.append("runtime.stopped", {"ts_ms": wall_clock_now_ms()})
+        _journal_shutdown_stage("exit_complete")
         self.journal.close()
+        logger.info("shutdown stage=exit_complete")
 
     # ------------------------------------------------------------------
     # Tick lanes

@@ -15,7 +15,103 @@ from lightfee.venues.registry import build_adapter_map
 logger = logging.getLogger("lightfee.live")
 
 
-async def async_main(config_path: str = "config/example.toml") -> None:
+def _shutdown_timeout_s(config) -> float:
+    timeout_ms = int(getattr(config.runtime, "shutdown_grace_period_ms", 3000) or 3000)
+    return max(timeout_ms, 1) / 1000.0
+
+
+def _task_label(task: asyncio.Task) -> str:
+    try:
+        name = task.get_name()
+    except AttributeError:
+        name = ""
+    if name and not name.startswith("Task-"):
+        return name
+    coro = task.get_coro()
+    qualname = getattr(coro, "__qualname__", None)
+    if qualname:
+        return qualname
+    return repr(task)
+
+
+async def _cancel_tasks_with_timeout(
+    tasks: list[asyncio.Task],
+    *,
+    timeout_s: float,
+    stage: str,
+) -> list[asyncio.Task]:
+    pending = [task for task in tasks if not task.done()]
+    logger.info("shutdown stage=%s task_count=%d", stage, len(pending))
+    if not pending:
+        return []
+
+    for task in pending:
+        logger.info("shutdown stage=%s task=%s action=cancel", stage, _task_label(task))
+        task.cancel()
+
+    done, still_pending = await asyncio.wait(pending, timeout=timeout_s)
+    for task in done:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "shutdown stage=%s task=%s status=error error=%s",
+                stage,
+                _task_label(task),
+                exc,
+            )
+
+    for task in still_pending:
+        logger.error(
+            "shutdown stage=%s task=%s status=timeout timeout_s=%.3f",
+            stage,
+            _task_label(task),
+            timeout_s,
+        )
+    return list(still_pending)
+
+
+def _cancel_tasks_without_wait(tasks: list[asyncio.Task], *, stage: str) -> None:
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    logger.warning(
+        "shutdown stage=%s task_count=%d action=cancel_without_wait",
+        stage,
+        len(pending),
+    )
+    for task in pending:
+        logger.warning(
+            "shutdown stage=%s task=%s action=cancel_without_wait",
+            stage,
+            _task_label(task),
+        )
+        task.cancel()
+
+        def _consume_result(done_task: asyncio.Task, *, label: str = _task_label(task)) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    "shutdown stage=%s task=%s status=late_error error=%s",
+                    stage,
+                    label,
+                    exc,
+                )
+
+        task.add_done_callback(_consume_result)
+
+
+async def async_main(
+    config_path: str = "config/example.toml",
+    *,
+    shutdown_event: asyncio.Event | None = None,
+    shutdown_signal_name=None,
+) -> None:
     """Async entry point for live trading (testable without event-loop side effects).
 
     V1 parity: always calls runtime.start() before the loop, and runtime.stop()
@@ -65,21 +161,109 @@ async def async_main(config_path: str = "config/example.toml") -> None:
     runtime._rate_limit_runtime = rate_limit_rt
 
     _stopped = False
+    shutdown_timeout_s = _shutdown_timeout_s(config)
+    baseline_tasks = set(asyncio.all_tasks())
+    run_loop_task: asyncio.Task | None = None
+    shutdown_wait_task: asyncio.Task | None = None
+    signal_logged = False
+
+    def _signal_name() -> str:
+        if callable(shutdown_signal_name):
+            return str(shutdown_signal_name() or "unknown")
+        if shutdown_signal_name:
+            return str(shutdown_signal_name)
+        return "unknown"
+
+    def _log_signal_received(signal_name: str | None = None) -> None:
+        nonlocal signal_logged
+        if signal_logged:
+            return
+        signal_logged = True
+        logger.info(
+            "shutdown stage=signal_received signal=%s",
+            signal_name or _signal_name(),
+        )
 
     async def _graceful_shutdown() -> None:
         nonlocal _stopped
         if _stopped:
             return
         _stopped = True
-        logger.info("graceful shutdown initiated")
         await runtime.stop()
 
+    async def _cancel_runtime_tasks() -> None:
+        current = asyncio.current_task()
+        candidates = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not current
+            and task not in baseline_tasks
+            and task is not shutdown_wait_task
+        ]
+        await _cancel_tasks_with_timeout(
+            candidates,
+            timeout_s=shutdown_timeout_s,
+            stage="cancel_tasks",
+        )
+
     try:
-        await runtime.start()
-        await runtime.run_loop()
+        if shutdown_event is None:
+            await runtime.start()
+            await runtime.run_loop()
+        else:
+            shutdown_wait_task = asyncio.create_task(
+                shutdown_event.wait(),
+                name="lightfee-live:shutdown_signal_wait",
+            )
+            start_task = asyncio.create_task(
+                runtime.start(),
+                name="lightfee-live:start",
+            )
+            done, _pending = await asyncio.wait(
+                {start_task, shutdown_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_wait_task in done and shutdown_event.is_set():
+                _log_signal_received()
+                await _cancel_tasks_with_timeout(
+                    [start_task],
+                    timeout_s=shutdown_timeout_s,
+                    stage="cancel_tasks",
+                )
+            else:
+                await start_task
+
+            if shutdown_event.is_set():
+                return
+
+            run_loop_task = asyncio.create_task(
+                runtime.run_loop(),
+                name="lightfee-live:run_loop",
+            )
+            done, _pending = await asyncio.wait(
+                {run_loop_task, shutdown_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_wait_task in done and shutdown_event.is_set():
+                _log_signal_received()
+            if run_loop_task in done:
+                await run_loop_task
     except KeyboardInterrupt:
+        _log_signal_received("KeyboardInterrupt")
         pass
+    except asyncio.CancelledError:
+        _log_signal_received("task_cancelled")
+        raise
     finally:
+        if shutdown_wait_task is not None and not shutdown_wait_task.done():
+            shutdown_wait_task.cancel()
+            try:
+                await shutdown_wait_task
+            except asyncio.CancelledError:
+                pass
+        if run_loop_task is not None and not run_loop_task.done():
+            runtime._running = False
+        await _cancel_runtime_tasks()
         await _graceful_shutdown()
 
 
@@ -98,10 +282,14 @@ def main() -> None:
 
     loop = asyncio.new_event_loop()
     main_task: asyncio.Task | None = None
+    shutdown_event: asyncio.Event | None = None
+    shutdown_signal_name = "unknown"
 
-    def _request_shutdown() -> None:
-        if main_task is not None and not main_task.done():
-            main_task.cancel()
+    def _request_shutdown(sig: signal.Signals) -> None:
+        nonlocal shutdown_signal_name
+        shutdown_signal_name = sig.name
+        if shutdown_event is not None:
+            shutdown_event.set()
 
     def _on_sighup() -> None:
         """V1: reload rate-limit config on SIGHUP."""
@@ -117,7 +305,7 @@ def main() -> None:
     # Register signal handlers
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _request_shutdown)
+            loop.add_signal_handler(sig, _request_shutdown, sig)
         except NotImplementedError:
             pass
 
@@ -129,15 +317,49 @@ def main() -> None:
             pass
 
     try:
-        main_task = loop.create_task(async_main(args.config))
+        shutdown_event = asyncio.Event()
+        main_task = loop.create_task(
+            async_main(
+                args.config,
+                shutdown_event=shutdown_event,
+                shutdown_signal_name=lambda: shutdown_signal_name,
+            )
+        )
         loop.run_until_complete(main_task)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("shutdown signal received — exiting")
     finally:
-        # Flush any remaining pending callbacks
-        pending = asyncio.all_tasks(loop)
+        pending = [
+            task for task in asyncio.all_tasks(loop)
+            if task is not main_task and not task.done()
+        ]
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            _cancel_tasks_without_wait(list(pending), stage="cancel_tasks")
+            loop.run_until_complete(asyncio.sleep(0))
+            abandoned_pending = {id(task) for task in pending}
+            previous_exception_handler = loop.get_exception_handler()
+
+            def _shutdown_exception_handler(
+                event_loop: asyncio.AbstractEventLoop,
+                context: dict,
+            ) -> None:
+                task = context.get("task") or context.get("future")
+                if (
+                    context.get("message") == "Task was destroyed but it is pending!"
+                    and task is not None
+                    and id(task) in abandoned_pending
+                ):
+                    logger.debug(
+                        "shutdown stage=cancel_tasks task=%s status=abandoned_after_timeout",
+                        _task_label(task),
+                    )
+                    return
+                if previous_exception_handler is not None:
+                    previous_exception_handler(event_loop, context)
+                    return
+                event_loop.default_exception_handler(context)
+
+            loop.set_exception_handler(_shutdown_exception_handler)
         loop.close()
 
 
