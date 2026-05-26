@@ -55,6 +55,8 @@ from lightfee.venues.symbol_rules import get_symbol_rules_cache
 ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE = 4
 OKX_POSITION_REST_CACHE_MAX_AGE_MS = 30_000
 OKX_CANCEL_ORDER_PATH = "/api/v5/trade/cancel-order"
+OKX_PUBLIC_INSTRUMENTS_PATH = "/api/v5/public/instruments"
+OKX_ACCOUNT_INSTRUMENTS_PATH = "/api/v5/account/instruments"
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1157,7 @@ class VenueTransport(MarketDataClient):
         self._hl_meta_cache: dict[str, int] = {}
         self._hl_asset_meta_cache: dict[str, dict[str, int]] = {}
         self._symbol_metadata: dict[str, dict[str, Any]] = {}  # sym → vendor contract info
+        self._okx_swap_instruments_loaded = False
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
         self._order_diagnostics: list[dict[str, Any]] = []
         self._trading_capability_trusted = not (
@@ -2737,9 +2740,62 @@ class VenueTransport(MarketDataClient):
             )
         return positions
 
+    async def _ensure_okx_swap_instrument_metadata_loaded(self) -> None:
+        """Preload OKX SWAP metadata carrying ctVal/ctType from official instruments APIs."""
+        if self._spec.venue_id != Venue.OKX or self._okx_swap_instruments_loaded:
+            return
+        loaded = False
+        try:
+            raw = await self._public_get(
+                OKX_PUBLIC_INSTRUMENTS_PATH,
+                {"instType": "SWAP"},
+            )
+            loaded = self._okx_cache_instrument_metadata(raw) or loaded
+        except Exception:
+            pass
+        if not loaded and self.mode == "live":
+            try:
+                raw = await self._request(
+                    "GET",
+                    OKX_ACCOUNT_INSTRUMENTS_PATH,
+                    params={"instType": "SWAP"},
+                    private=True,
+                )
+                loaded = self._okx_cache_instrument_metadata(raw) or loaded
+            except Exception:
+                pass
+        if loaded:
+            self._okx_swap_instruments_loaded = True
+
+    def _okx_cache_instrument_metadata(self, raw: Any) -> bool:
+        rows = raw.get("data", []) if isinstance(raw, dict) else raw
+        if not isinstance(rows, list):
+            return False
+        cached = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            inst_id = str(row.get("instId", "") or "")
+            if not inst_id:
+                continue
+            metadata = dict(row)
+            self._symbol_metadata[inst_id] = metadata
+            if self._spec.symbol_from_venue is not None:
+                try:
+                    canonical = self._spec.symbol_from_venue(inst_id)
+                    if canonical:
+                        self._symbol_metadata[canonical] = metadata
+                except Exception:
+                    pass
+            cached = True
+        return cached
+
     async def _okx_contract_size_for_venue_symbol(self, venue_symbol: str) -> float:
         """Resolve OKX ctVal used to convert position contracts into base size."""
         spec = self._spec
+        if self.mode == "live":
+            await self._ensure_okx_swap_instrument_metadata_loaded()
+
         metadata_candidates: list[str] = [venue_symbol]
         if spec.symbol_from_venue is not None:
             try:
@@ -2756,6 +2812,10 @@ class VenueTransport(MarketDataClient):
                 value = _safe_float(metadata.get(field), default=0.0)
                 if value > 0:
                     return value
+            raise self._okx_missing_ct_val_error(venue_symbol, "metadata_missing")
+
+        if self._okx_swap_instruments_loaded:
+            raise self._okx_missing_ct_val_error(venue_symbol, "instrument_missing")
 
         try:
             symbol_rule = await get_symbol_rules_cache().get(self, Venue.OKX, venue_symbol)
@@ -2765,9 +2825,20 @@ class VenueTransport(MarketDataClient):
         except Exception:
             pass
 
-        raise TransportError(
+        raise self._okx_missing_ct_val_error(venue_symbol, "metadata_missing")
+
+    @staticmethod
+    def _okx_missing_ct_val_error(
+        venue_symbol: str,
+        classification: str,
+    ) -> TransportError:
+        return TransportError(
             TransportErrorCategory.NORMALIZATION_FAILURE,
-            "okx_contract_metadata_missing_ct_val",
+            (
+                "okx_contract_metadata_missing_ct_val "
+                f"classification={classification} "
+                f"instId={venue_symbol}"
+            ),
         )
 
     def _parse_position(
@@ -6057,6 +6128,8 @@ class VenueTransport(MarketDataClient):
                 )
         if spec.venue_id == Venue.OKX:
             venue_sym = self._venue_symbol(symbol)
+            if self.mode == "live":
+                await self._ensure_okx_swap_instrument_metadata_loaded()
             metadata = (
                 self._symbol_metadata.get(venue_sym)
                 or self._symbol_metadata.get(symbol)
@@ -6117,10 +6190,14 @@ class VenueTransport(MarketDataClient):
             )
             reject_reason = diagnostics.get("reject_reason")
             if reject_reason == "missing_ct_val":
-                raise TransportError(
-                    TransportErrorCategory.NORMALIZATION_FAILURE,
-                    "okx_contract_metadata_missing_ct_val",
+                classification = (
+                    "metadata_missing"
+                    if metadata
+                    else "instrument_missing"
+                    if self._okx_swap_instruments_loaded
+                    else "metadata_missing"
                 )
+                raise self._okx_missing_ct_val_error(venue_sym, classification)
             if reject_reason in ("contract_qty_zero", "contract_qty_below_min_sz"):
                 return 0.0
             contract_qty = float(diagnostics.get("contract_qty", 0.0) or 0.0)

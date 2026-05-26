@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from collections import Counter
 from typing import Optional
@@ -51,7 +52,10 @@ from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKe
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
-from lightfee.venues.transport import is_hyperliquid_non_retryable_auth_signing_error
+from lightfee.venues.transport import (
+    TransportErrorCategory,
+    is_hyperliquid_non_retryable_auth_signing_error,
+)
 
 
 class LiveRuntime:
@@ -129,6 +133,7 @@ class LiveRuntime:
         self._last_no_entry_diag_ts_ms: int = 0
         self._last_no_entry_diagnostics: dict | None = None
         self._last_private_position_probe_ms: int = 0
+        self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
         self._last_position_drift_check_ms: int = 0
 
         # V1 recovery dedup index: prevents duplicate orders after restart
@@ -151,6 +156,7 @@ class LiveRuntime:
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
+    _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
 
     @staticmethod
     def _risk_snapshot_ttl_ms(venue: Venue) -> int:
@@ -679,6 +685,7 @@ class LiveRuntime:
         to_venue_symbol = getattr(transport, "_venue_symbol", None)
 
         filtered: list[str] = []
+        unsupported: list[dict[str, str]] = []
         for symbol in symbols:
             venue_symbol = str(symbol)
             if callable(to_venue_symbol):
@@ -689,7 +696,14 @@ class LiveRuntime:
             if str(symbol) in supported or venue_symbol in supported:
                 filtered.append(symbol)
             else:
-                if skip_event_kind and getattr(self.journal, "_file", None) is not None:
+                if (
+                    skip_event_kind
+                    == "recovery.live_position_probe_symbol_skipped"
+                ):
+                    unsupported.append(
+                        {"symbol": str(symbol), "venue_symbol": venue_symbol}
+                    )
+                elif skip_event_kind and getattr(self.journal, "_file", None) is not None:
                     self.journal.append(
                         skip_event_kind,
                         {
@@ -699,7 +713,120 @@ class LiveRuntime:
                             "reason": "unsupported_symbol",
                         },
                     )
+        if (
+            unsupported
+            and skip_event_kind == "recovery.live_position_probe_symbol_skipped"
+            and getattr(self.journal, "_file", None) is not None
+        ):
+            now_ms = wall_clock_now_ms()
+            diagnostic_key = (
+                "recovery.live_position_probe_unsupported_symbols",
+                venue.value,
+            )
+            last_ms = self._unsupported_symbol_diagnostic_last_ms.get(diagnostic_key, 0)
+            if (
+                last_ms > 0
+                and now_ms < last_ms + self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS
+            ):
+                return filtered
+            self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
+            sample = unsupported[:10]
+            self.journal.append(
+                "recovery.live_position_probe_unsupported_symbols",
+                {
+                    "venue": venue.value,
+                    "unsupported_count": len(unsupported),
+                    "sample_symbols": [item["symbol"] for item in sample],
+                    "sample_venue_symbols": [
+                        item["venue_symbol"] for item in sample
+                    ],
+                    "reason": "unsupported_symbol",
+                },
+            )
         return filtered
+
+    def _position_probe_exception_payload(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+        exc: Exception,
+        *,
+        symbol: str = "",
+    ) -> dict[str, object]:
+        transport = getattr(adapter, "_transport", None)
+        spec = getattr(transport, "_spec", None)
+        endpoint = str(getattr(spec, "position_path", "") or "")
+        normalized_symbol = str(symbol or "")
+        venue_symbol = normalized_symbol
+        to_venue_symbol = getattr(transport, "_venue_symbol", None)
+        if normalized_symbol and callable(to_venue_symbol):
+            try:
+                venue_symbol = str(to_venue_symbol(normalized_symbol))
+            except Exception:
+                venue_symbol = normalized_symbol
+
+        body = str(getattr(exc, "body", "") or "")
+        ret_code = ""
+        ret_msg = ""
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                ret_code = str(
+                    parsed.get("retCode", parsed.get("code", "")) or ""
+                )
+                ret_msg = str(
+                    parsed.get("retMsg", parsed.get("msg", "")) or ""
+                )
+
+        message = str(exc)
+        exception_class = exc.__class__.__name__
+        category = getattr(exc, "category", None)
+        category_value = str(getattr(category, "value", category) or "")
+        status_code = int(getattr(exc, "status_code", 0) or 0)
+        if not normalized_symbol and "instId=" in message:
+            inst_id = message.split("instId=", 1)[1].split()[0].strip(",;")
+            if inst_id:
+                venue_symbol = inst_id
+                normalized_symbol = inst_id
+                from_venue_symbol = getattr(spec, "symbol_from_venue", None)
+                if callable(from_venue_symbol):
+                    try:
+                        normalized_symbol = str(from_venue_symbol(inst_id))
+                    except Exception:
+                        normalized_symbol = inst_id
+        retryable = (
+            category_value == TransportErrorCategory.TRANSPORT_FAILURE.value
+            or status_code in (408, 418, 429, 500, 502, 503, 504)
+        )
+        error = f"{exception_class}: {message}" if message else exception_class
+        payload: dict[str, object] = {
+            "venue": venue.value,
+            "symbol": normalized_symbol,
+            "normalized_symbol": normalized_symbol,
+            "venue_symbol": venue_symbol,
+            "endpoint": endpoint,
+            "exception_class": exception_class,
+            "error": error,
+            "retCode": ret_code,
+            "retMsg": ret_msg,
+            "body_summary": body[:500],
+            "retryable": retryable,
+        }
+        if category_value:
+            payload["category"] = category_value
+        if status_code:
+            payload["status_code"] = status_code
+        if "okx_contract_metadata_missing_ct_val" in message:
+            if "classification=instrument_missing" in message:
+                payload["classification"] = "instrument_missing"
+            elif "classification=metadata_missing" in message:
+                payload["classification"] = "metadata_missing"
+            else:
+                payload["classification"] = "metadata_missing"
+        return payload
 
     async def _filter_candidates_supported_by_venue_catalog(
         self,
@@ -822,13 +949,24 @@ class LiveRuntime:
                         timeout=timeout_s,
                     )
                 except Exception as e:
-                    self.journal.append(
-                        "recovery.live_position_bulk_probe_error",
-                        {
-                            "venue": venue.value,
-                            "error": str(e),
-                        },
+                    payload = self._position_probe_exception_payload(
+                        venue,
+                        adapter,
+                        e,
                     )
+                    if payload.get("classification") in (
+                        "instrument_missing",
+                        "metadata_missing",
+                    ):
+                        self.journal.append(
+                            "recovery.live_position_bulk_probe_metadata_missing",
+                            payload,
+                        )
+                    else:
+                        self.journal.append(
+                            "recovery.live_position_bulk_probe_error",
+                            payload,
+                        )
                     return (venue, None)
                 if positions is None:
                     return (venue, None)
@@ -850,14 +988,23 @@ class LiveRuntime:
                     )
                     return (symbol, pos)
                 except Exception as e:
-                    self.journal.append(
-                        "recovery.live_position_probe_error",
-                        {
-                            "venue": venue.value,
-                            "symbol": symbol,
-                            "error": str(e),
-                        },
+                    payload = self._position_probe_exception_payload(
+                        venue,
+                        adapter,
+                        e,
+                        symbol=symbol,
                     )
+                    classification = str(payload.get("classification", ""))
+                    if classification in ("instrument_missing", "metadata_missing"):
+                        self.journal.append(
+                            "recovery.live_position_probe_metadata_missing",
+                            payload,
+                        )
+                    else:
+                        self.journal.append(
+                            "recovery.live_position_probe_error",
+                            payload,
+                        )
                     return None
 
         bulk_results = await asyncio.gather(

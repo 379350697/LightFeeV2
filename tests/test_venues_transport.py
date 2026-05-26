@@ -2197,6 +2197,8 @@ class TestOrderSubmitDiagnosticsAndQuantization:
 
         assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
         assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=UB-USDT-SWAP" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_okx_contract_size_lookup_fails_closed_without_ct_val(self, monkeypatch):
@@ -2215,6 +2217,8 @@ class TestOrderSubmitDiagnosticsAndQuantization:
 
         assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
         assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=UB-USDT-SWAP" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_okx_passive_rejects_zero_contract_quantity_without_request(self, monkeypatch):
@@ -2606,6 +2610,7 @@ class TestOrderSubmitDiagnosticsAndQuantization:
             }
 
         transport._request = fake_request
+        transport._public_get = AsyncMock(side_effect=RuntimeError("public catalog unavailable"))
 
         pos = await transport.fetch_position("CHIPUSDT")
 
@@ -2613,6 +2618,164 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert pos.side == Side.BUY
         assert pos.quantity == pytest.approx(500.0)
         assert pos.entry_price == pytest.approx(0.04794)
+
+    @pytest.mark.asyncio
+    async def test_okx_fetch_position_preloads_swap_instrument_metadata(self):
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        public_calls: list[tuple[str, dict[str, str]]] = []
+
+        async def fake_public_get(path, params=None):
+            public_calls.append((path, dict(params or {})))
+            assert path == "/api/v5/public/instruments"
+            assert params == {"instType": "SWAP"}
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "instType": "SWAP",
+                        "ctVal": "100",
+                        "ctType": "linear",
+                        "lotSz": "1",
+                        "minSz": "1",
+                        "state": "live",
+                    }
+                ],
+            }
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            assert path == transport._spec.position_path
+            assert params == {"instId": "CHIP-USDT-SWAP"}
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "pos": "5",
+                        "posSide": "net",
+                        "avgPx": "0.04794",
+                    }
+                ],
+            }
+
+        transport._public_get = fake_public_get
+        transport._request = fake_request
+
+        pos = await transport.fetch_position("CHIPUSDT")
+
+        assert public_calls == [
+            ("/api/v5/public/instruments", {"instType": "SWAP"})
+        ]
+        assert transport._symbol_metadata["CHIP-USDT-SWAP"]["ctVal"] == "100"
+        assert transport._symbol_metadata["CHIPUSDT"]["ctType"] == "linear"
+        assert pos.quantity == pytest.approx(500.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_missing_ct_val_is_metadata_missing_not_blank_probe_error(self):
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+
+        async def fake_public_get(path, params=None):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "instType": "SWAP",
+                        "ctVal": "",
+                        "ctType": "linear",
+                        "state": "live",
+                    }
+                ],
+            }
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "pos": "5",
+                        "posSide": "net",
+                        "avgPx": "0.04794",
+                    }
+                ],
+            }
+
+        transport._public_get = fake_public_get
+        transport._request = fake_request
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport.fetch_position("CHIPUSDT")
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_missing_ct_val_is_classified(self, monkeypatch):
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return type(
+                    "Rule",
+                    (),
+                    {"ct_val": 0.0, "qty_step": 1.0, "min_qty": 1.0},
+                )()
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+
+        async def fake_public_get(path, params=None):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "instType": "SWAP",
+                        "ctVal": "",
+                        "ctType": "linear",
+                        "lotSz": "1",
+                        "minSz": "1",
+                    }
+                ],
+            }
+
+        transport._public_get = fake_public_get
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport.normalize_quantity("CHIPUSDT", 100.0)
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
 
     def test_bybit_preflight_preserves_exact_step_quantity_without_float_slip(self):
         transport = VenueTransport(spec=bybit_spec(), mode="paper")

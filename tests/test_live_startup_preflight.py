@@ -459,6 +459,232 @@ class TestRuntimePreflight:
             assert bitget.fetch_position_symbols == ["BTCUSDT"]
 
     @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_aggregates_unsupported_symbols(self):
+        """Unsupported catalog misses are a single diagnostic, not per-symbol errors."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "DELISTEDUSDT", "OLDUSDT"]
+                )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            unsupported = [
+                r for r in records
+                if r["kind"] == "recovery.live_position_probe_unsupported_symbols"
+            ]
+            assert bitget.fetch_position_symbols == ["BTCUSDT"]
+            assert len(unsupported) == 1
+            assert unsupported[0]["payload"]["venue"] == "bitget"
+            assert unsupported[0]["payload"]["unsupported_count"] == 2
+            assert unsupported[0]["payload"]["sample_symbols"] == [
+                "DELISTEDUSDT",
+                "OLDUSDT",
+            ]
+            assert not any(
+                r["kind"] == "recovery.live_position_probe_symbol_skipped"
+                for r in records
+            )
+            assert not any(
+                r["kind"] == "recovery.live_position_probe_error"
+                and r["payload"].get("reason") == "unsupported_symbol"
+                for r in records
+            )
+
+    @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_rate_limits_unsupported_diagnostics(self):
+        """Repeated unsupported catalog misses must not spam recovery diagnostics."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                for _ in range(2):
+                    await runtime._fetch_startup_live_position_snapshots(
+                        ["BTCUSDT", "DELISTEDUSDT", "OLDUSDT"]
+                    )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            unsupported = [
+                r for r in records
+                if r["kind"] == "recovery.live_position_probe_unsupported_symbols"
+            ]
+            assert bitget.fetch_position_symbols == ["BTCUSDT", "BTCUSDT"]
+            assert len(unsupported) == 1
+            assert unsupported[0]["payload"]["unsupported_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_live_position_probe_error_keeps_context_for_blank_exception(self):
+        """Blank exception strings must still journal class, endpoint, and symbols."""
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class BlankProbeError(Exception):
+                pass
+
+            class FailingAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self._transport = SimpleNamespace(
+                        _spec=SimpleNamespace(position_path="/api/v2/mix/position/single-position"),
+                        _venue_symbol=lambda symbol: f"{symbol}_UMCBL",
+                    )
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    raise BlankProbeError()
+
+            bitget = FailingAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(["BTCUSDT"])
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_probe_error"
+            )
+            assert payload["exception_class"] == "BlankProbeError"
+            assert payload["endpoint"] == "/api/v2/mix/position/single-position"
+            assert payload["normalized_symbol"] == "BTCUSDT"
+            assert payload["venue_symbol"] == "BTCUSDT_UMCBL"
+            assert payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_live_position_bulk_metadata_missing_keeps_inst_id_context(self):
+        """Bulk OKX metadata failures must not lose the failing instId context."""
+        from lightfee.venues.specs import okx_spec
+        from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class BulkMetadataMissingAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.OKX)
+                    self._transport = type(
+                        "Transport",
+                        (),
+                        {
+                            "_spec": okx_spec(),
+                            "_venue_symbol": lambda _self, symbol: (
+                                str(symbol).replace("USDT", "-USDT-SWAP")
+                            ),
+                        },
+                    )()
+
+                def supported_symbols(self) -> list[str]:
+                    return ["CHIP-USDT-SWAP"]
+
+                async def fetch_all_positions(self):
+                    raise TransportError(
+                        TransportErrorCategory.NORMALIZATION_FAILURE,
+                        (
+                            "okx_contract_metadata_missing_ct_val "
+                            "classification=metadata_missing "
+                            "instId=CHIP-USDT-SWAP"
+                        ),
+                    )
+
+            okx = BulkMetadataMissingAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(["CHIPUSDT"])
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_bulk_probe_metadata_missing"
+            )
+            assert payload["classification"] == "metadata_missing"
+            assert payload["normalized_symbol"] == "CHIPUSDT"
+            assert payload["venue_symbol"] == "CHIP-USDT-SWAP"
+            assert payload["error"]
+
+    @pytest.mark.asyncio
     async def test_local_l2_candidate_activation_filters_unsupported_venue_symbols(self):
         """Local-L2 bootstrap must not request books for non-trading contracts."""
         from types import SimpleNamespace
