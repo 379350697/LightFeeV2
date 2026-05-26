@@ -285,7 +285,12 @@ class TestFixtureDrivenPosition:
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         if venue_id == Venue.OKX:
             transport.set_symbol_metadata({
-                "BTC-USDT-SWAP": {"ct_val": "0.01", "lot_sz": "1", "min_sz": "1"}
+                "BTC-USDT-SWAP": {
+                    "ct_val": "0.01",
+                    "ctType": "linear",
+                    "lot_sz": "1",
+                    "min_sz": "1",
+                }
             })
             transport._okx_swap_instruments_loaded = True
 

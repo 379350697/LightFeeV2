@@ -103,6 +103,42 @@ def test_exchange_truth_targets_aster_for_xcnusdt_pair(monkeypatch):
     assert result["open_orders"]["aster"]["XCNUSDT"] == []
 
 
+def test_exchange_truth_uses_private_binance_open_orders_request():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        async def _request(self, method, path, **kwargs):
+            self.calls.append((method, path, kwargs))
+            return []
+
+    class FakeAdapter:
+        venue = "binance"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+    adapter = FakeAdapter()
+
+    orders, succeeded, failed = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, ["OPGUSDT"])
+    )
+
+    assert orders == {"OPGUSDT": []}
+    assert succeeded == {"OPGUSDT"}
+    assert failed == set()
+    assert adapter._transport.calls == [
+        (
+            "GET",
+            "/fapi/v1/openOrders",
+            {"params": {"symbol": "OPGUSDT"}, "private": True},
+        )
+    ]
+
+
 def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):
     from scripts import diagnose_live as dl
 

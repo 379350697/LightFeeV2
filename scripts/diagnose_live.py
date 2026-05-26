@@ -520,7 +520,7 @@ async def _fetch_venue_open_orders(
         try:
             if "binance" in venue.lower():
                 raw = await transport._request(
-                    "GET", "/fapi/v1/openOrders", params={"symbol": sym},
+                    "GET", "/fapi/v1/openOrders", params={"symbol": sym}, private=True,
                 )
             elif "bybit" in venue.lower():
                 raw = await transport._request(
