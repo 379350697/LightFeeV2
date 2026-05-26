@@ -46,6 +46,10 @@ where = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-p no:unraisableexception"
+markers = [
+    "live_harness: offline deterministic incident replay tests using fake adapters",
+    "live_probe: read-only live exchange probes, skipped unless LIGHTFEE_RUN_LIVE_PROBES=1",
+]
 
 [tool.ruff]
 line-length = 100

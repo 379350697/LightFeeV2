@@ -7,7 +7,7 @@ import json
 import logging
 import math
 from collections import Counter
-from typing import Optional
+from typing import Any, Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
@@ -170,6 +170,11 @@ class LiveRuntime:
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
     _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
     _SYMBOL_ADMISSION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000
+    _BYBIT_ERROR_DOC_URL = "https://bybit-exchange.github.io/docs/v5/error"
+    _BINANCE_USDM_ERROR_DOC_URL = (
+        "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
+    )
+    _ASTER_API_DOC_URL = "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation"
 
     @staticmethod
     def _risk_snapshot_ttl_ms(venue: Venue) -> int:
@@ -179,24 +184,85 @@ class LiveRuntime:
 
     @staticmethod
     def _entry_admission_reject_reason(venue: Venue, reason: str) -> str | None:
+        metadata = LiveRuntime._entry_admission_reject_metadata(venue, reason)
+        return str(metadata["reason"]) if metadata else None
+
+    @staticmethod
+    def _entry_admission_reject_metadata(venue: Venue, reason: str) -> dict | None:
         text = str(reason or "").lower()
         if venue == Venue.BYBIT and (
+            "110007" in text
+            or "available balance is insufficient" in text
+            or "insufficient available balance" in text
+        ):
+            return LiveRuntime._entry_admission_evidence(
+                "insufficient_balance_admission_blocked"
+            )
+        if venue == Venue.BYBIT and (
             "110126" in text
-            or "110125" in text
-            or "110123" in text
             or "must sign required agreement" in text
+        ):
+            return LiveRuntime._entry_admission_evidence("bybit_trading_terms_required")
+        if venue == Venue.BYBIT and (
+            "110125" in text
+            or "110123" in text
             or "agree to the trading terms" in text
         ):
-            return "bybit_trading_terms_required"
+            return {
+                **LiveRuntime._entry_admission_evidence("bybit_trading_terms_required"),
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if venue == Venue.BINANCE and (
+            "-2019" in text
+            or "margin is insufficient" in text
+        ):
+            return LiveRuntime._entry_admission_evidence(
+                "insufficient_margin_admission_blocked"
+            )
+        if venue == Venue.BINANCE and LiveRuntime._entry_reject_is_post_only_would_take(reason):
+            return LiveRuntime._entry_admission_evidence("post_only_would_take")
         if venue == Venue.ASTER and (
             "-2027" in text
             or "max_leverage_ratio" in text
             or "maximum allowable position at current leverage" in text
         ):
-            return "leverage_admission_blocked"
+            return LiveRuntime._entry_admission_evidence("leverage_admission_blocked")
+        if venue == Venue.ASTER and (
+            "-5018" in text
+            or "maximum notional value limit" in text
+            or "max notional" in text
+        ):
+            return LiveRuntime._entry_admission_evidence("max_notional_admission_blocked")
         return None
 
-    def _candidate_admission_block(self, candidate, now_ms: int) -> str | None:
+    @staticmethod
+    def _entry_admission_evidence(reason: str) -> dict:
+        if reason == "insufficient_balance_admission_blocked":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason == "bybit_trading_terms_required":
+            return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+        if reason in ("insufficient_margin_admission_blocked", "post_only_would_take"):
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BINANCE_USDM_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason == "leverage_admission_blocked":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._ASTER_API_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason == "max_notional_admission_blocked":
+            return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+        return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+
+    def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
         symbol = str(getattr(candidate, "symbol", "") or "")
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
@@ -207,13 +273,38 @@ class LiveRuntime:
             except ValueError:
                 continue
             key = (venue.value, symbol)
-            until_ms = self._symbol_admission_blocked_until_ms.get(key, 0)
+            state_key = f"{venue.value}:{symbol}"
+            payload = dict(self.state.venue_entry_cooldowns.get(state_key, {}) or {})
+            try:
+                state_until_ms = int(payload.get("blocked_until_ms", 0) or 0)
+            except (TypeError, ValueError):
+                state_until_ms = 0
+            until_ms = max(
+                self._symbol_admission_blocked_until_ms.get(key, 0),
+                state_until_ms,
+            )
             if until_ms > now_ms:
-                return str(
-                    self.state.venue_entry_cooldowns.get(f"{venue.value}:{symbol}", {}).get(
-                        "reason", "symbol_admission_blocked"
-                    )
-                )
+                self._symbol_admission_blocked_until_ms[key] = until_ms
+                if payload:
+                    payload.setdefault("venue", venue.value)
+                    payload.setdefault("symbol", symbol)
+                    payload.setdefault("reason", "symbol_admission_blocked")
+                    payload["blocked_until_ms"] = until_ms
+                    payload.setdefault("ttl_ms", self._SYMBOL_ADMISSION_BLOCK_TTL_MS)
+                    payload.setdefault("raw_error", "")
+                    payload.setdefault("official_doc_url", "")
+                    payload.setdefault("evidence_gap", True)
+                    return payload
+                return {
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "reason": "symbol_admission_blocked",
+                    "blocked_until_ms": until_ms,
+                    "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
+                    "raw_error": "",
+                    "official_doc_url": "",
+                    "evidence_gap": True,
+                }
         return None
 
     def _record_symbol_admission_block(
@@ -227,6 +318,7 @@ class LiveRuntime:
     ) -> None:
         until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         key = (venue.value, symbol)
+        evidence = self._entry_admission_evidence(reason)
         self._symbol_admission_blocked_until_ms[key] = until_ms
         state_key = f"{venue.value}:{symbol}"
         self.state.venue_entry_cooldowns[state_key] = {
@@ -234,7 +326,10 @@ class LiveRuntime:
             "symbol": symbol,
             "reason": reason,
             "blocked_until_ms": until_ms,
+            "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
             "raw_error": raw_error[:500],
+            "official_doc_url": evidence["official_doc_url"],
+            "evidence_gap": evidence["evidence_gap"],
         }
         self.journal.append(
             "runtime.entry_admission_blocked",
@@ -245,11 +340,8 @@ class LiveRuntime:
                 "blocked_until_ms": until_ms,
                 "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
                 "raw_error": raw_error[:500],
-                "official_semantics": (
-                    "bybit_trading_terms_required"
-                    if reason == "bybit_trading_terms_required"
-                    else "aster_leverage_bracket_or_max_position"
-                ),
+                "official_doc_url": evidence["official_doc_url"],
+                "evidence_gap": evidence["evidence_gap"],
                 "ts_ms": now_ms,
             },
         )
@@ -903,7 +995,7 @@ class LiveRuntime:
     ) -> dict[str, object]:
         transport = getattr(adapter, "_transport", None)
         spec = getattr(transport, "_spec", None)
-        endpoint = str(getattr(spec, "position_path", "") or "")
+        endpoint = str(getattr(spec, "position_path", "") or "fetch_position")
         normalized_symbol = str(symbol or "")
         venue_symbol = normalized_symbol
         to_venue_symbol = getattr(transport, "_venue_symbol", None)
@@ -945,8 +1037,13 @@ class LiveRuntime:
                         normalized_symbol = str(from_venue_symbol(inst_id))
                     except Exception:
                         normalized_symbol = inst_id
+        is_timeout = (
+            isinstance(exc, asyncio.TimeoutError)
+            or exception_class == "TimeoutError"
+        )
         retryable = (
-            category_value == TransportErrorCategory.TRANSPORT_FAILURE.value
+            is_timeout
+            or category_value == TransportErrorCategory.TRANSPORT_FAILURE.value
             or status_code in (408, 418, 429, 500, 502, 503, 504)
         )
         error = f"{exception_class}: {message}" if message else exception_class
@@ -967,6 +1064,8 @@ class LiveRuntime:
             payload["category"] = category_value
         if status_code:
             payload["status_code"] = status_code
+        if is_timeout:
+            payload["classification"] = "timeout"
         if status_code in (418, 429) or ret_code in ("429", "50011", "50061"):
             payload["classification"] = "rate_limited"
             payload["cooldown_scope"] = f"venue:{venue.value}:private_positions"
@@ -1105,6 +1204,13 @@ class LiveRuntime:
                         adapter,
                         e,
                     )
+                    if not payload.get("symbol"):
+                        payload["symbol"] = "*"
+                    if not payload.get("normalized_symbol"):
+                        payload["normalized_symbol"] = "*"
+                    if not payload.get("venue_symbol"):
+                        payload["venue_symbol"] = "*"
+                    payload["symbols"] = sorted(probe_symbols)
                     if payload.get("classification") in (
                         "instrument_missing",
                         "metadata_missing",
@@ -6071,15 +6177,17 @@ class LiveRuntime:
             pair_id = task.get("pair_id", "")
             symbol = task.get("symbol", "")
 
-            if bool(task.get("local_entry_paused", False)):
-                continue
+            is_locally_paused = bool(task.get("local_entry_paused", False))
             next_attempt_ms = int(task.get("next_attempt_ms", 0) or 0)
-            if next_attempt_ms > 0 and now_ms < next_attempt_ms:
+            if not is_locally_paused and next_attempt_ms > 0 and now_ms < next_attempt_ms:
                 continue
 
             adapter = self.get_venue_adapter(repair_venue)
             if adapter is None:
-                if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+                if (
+                    is_locally_paused
+                    or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+                ):
                     self._pause_pending_residual_repair(task, now_ms)
                     continue
                 self._reschedule_pending_residual_repair_task(task, now_ms, "adapter_missing")
@@ -6097,13 +6205,64 @@ class LiveRuntime:
                 )
                 continue
 
-            try:
-                live_position = await adapter.fetch_position(symbol)
-            except Exception as e:
-                if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+            probe_venues = [repair_venue]
+            if pair_id and "->" in pair_id:
+                try:
+                    venue_part = pair_id.split(":", 1)[1]
+                except IndexError:
+                    venue_part = ""
+                for raw_venue in venue_part.split("->"):
+                    try:
+                        parsed = Venue.from_str(raw_venue)
+                    except Exception:
+                        continue
+                    if parsed not in probe_venues and self.get_venue_adapter(parsed) is not None:
+                        probe_venues.append(parsed)
+
+            live_positions: dict[Venue, PositionSnapshot | None] = {}
+            open_order_count = 0
+            live_truth_error = ""
+            for probe_venue in probe_venues:
+                probe_adapter = self.get_venue_adapter(probe_venue)
+                if probe_adapter is None:
+                    continue
+                try:
+                    live_positions[probe_venue] = await probe_adapter.fetch_position(symbol)
+                except Exception as e:
+                    live_truth_error = str(e) or e.__class__.__name__
+                    break
+
+                try:
+                    open_orders = await self._fetch_residual_repair_open_orders(
+                        probe_adapter, probe_venue, symbol,
+                    )
+                except Exception as e:
+                    live_truth_error = str(e) or e.__class__.__name__
+                    break
+                open_order_count += len(open_orders)
+
+            if live_truth_error:
+                error = f"residual_repair_live_truth_untrusted:{live_truth_error}"
+                if (
+                    is_locally_paused
+                    or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+                ):
+                    self.journal.append(
+                        "recovery.residual_repair_failed",
+                        {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "repair_venue": repair_venue.value,
+                            "repair_side": repair_side.value,
+                            "repair_quantity": task_repair_quantity,
+                            "error": error,
+                        },
+                    )
+                    task["last_error"] = error
                     self._pause_pending_residual_repair(task, now_ms)
                     continue
-                self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                self._reschedule_pending_residual_repair_task(task, now_ms, error)
                 self.journal.append(
                     "recovery.residual_repair_failed",
                     {
@@ -6113,12 +6272,13 @@ class LiveRuntime:
                         "repair_venue": repair_venue.value,
                         "repair_side": repair_side.value,
                         "repair_quantity": task_repair_quantity,
-                        "error": str(e),
+                        "error": error,
                     },
                 )
                 continue
 
             baseline = self._residual_repair_baseline_size(task, repair_venue)
+            live_position = live_positions.get(repair_venue)
             live_size = self._signed_position_size(live_position)
             if repair_side == Side.SELL:
                 live_excess_quantity = max(live_size - baseline, 0.0)
@@ -6126,6 +6286,35 @@ class LiveRuntime:
                 live_excess_quantity = max(baseline - live_size, 0.0)
 
             if live_excess_quantity <= 1e-9:
+                has_local_position = position_id in self.state.open_positions
+                all_probed_positions_flat = all(
+                    abs(self._signed_position_size(pos)) <= 1e-9
+                    for pos in live_positions.values()
+                )
+                if open_order_count > 0:
+                    error = "residual_repair_live_open_orders_present"
+                    if (
+                        is_locally_paused
+                        or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+                    ):
+                        task["last_error"] = error
+                        self._pause_pending_residual_repair(task, now_ms)
+                        task["last_error"] = error
+                    else:
+                        self._reschedule_pending_residual_repair_task(task, now_ms, error)
+                    continue
+                if not has_local_position and not all_probed_positions_flat:
+                    error = "residual_repair_live_position_nonzero"
+                    if (
+                        is_locally_paused
+                        or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+                    ):
+                        task["last_error"] = error
+                        self._pause_pending_residual_repair(task, now_ms)
+                        task["last_error"] = error
+                    else:
+                        self._reschedule_pending_residual_repair_task(task, now_ms, error)
+                    continue
                 self.state.pending_residual_repairs.remove(task)
                 self._release_residual_repair_pair_gate(pair_id, symbol)
                 repaired += 1
@@ -6143,7 +6332,11 @@ class LiveRuntime:
                 )
                 continue
 
-            if self._residual_repair_deadline_or_attempts_exhausted(task, now_ms):
+            if (
+                is_locally_paused
+                or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+            ):
+                task["last_error"] = "residual_repair_live_position_nonzero"
                 self._pause_pending_residual_repair(task, now_ms)
                 continue
 
@@ -6308,6 +6501,71 @@ class LiveRuntime:
         quantity = abs(float(position.quantity or 0.0))
         return quantity if position.side == Side.BUY else -quantity
 
+    async def _fetch_residual_repair_open_orders(
+        self, adapter: VenueAdapter, venue: Venue, symbol: str,
+    ) -> list[Any]:
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            open_orders = await fetch_open_orders(symbol)
+            if isinstance(open_orders, dict) and open_orders.get("error"):
+                raise RuntimeError(str(open_orders.get("error")))
+            return self._residual_repair_open_order_items(open_orders)
+
+        transport = getattr(adapter, "_transport", None)
+        if transport is None or not hasattr(transport, "_request"):
+            raise RuntimeError("open_orders_truth_unavailable")
+
+        venue_symbol = symbol
+        to_venue_symbol = getattr(transport, "_venue_symbol", None)
+        if callable(to_venue_symbol):
+            venue_symbol = to_venue_symbol(symbol)
+
+        if venue in (Venue.BINANCE, Venue.ASTER):
+            raw = await transport._request(
+                "GET", "/fapi/v1/openOrders",
+                params={"symbol": venue_symbol},
+                private=True,
+            )
+        elif venue == Venue.BYBIT:
+            raw = await transport._request(
+                "GET", "/v5/order/realtime",
+                params={
+                    "category": "linear",
+                    "symbol": venue_symbol,
+                    "settleCoin": "USDT",
+                },
+                private=True,
+            )
+        elif venue == Venue.OKX:
+            raw = await transport._request(
+                "GET", "/api/v5/trade/orders-pending",
+                params={"instId": venue_symbol},
+                private=True,
+            )
+        else:
+            raise RuntimeError(f"open_orders_truth_unsupported:{venue.value}")
+
+        return self._residual_repair_open_order_items(raw)
+
+    @staticmethod
+    def _residual_repair_open_order_items(raw: Any) -> list[Any]:
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return raw
+        if not isinstance(raw, dict):
+            return [raw]
+        if raw.get("error"):
+            raise RuntimeError(str(raw.get("error")))
+        result = raw.get("result")
+        if isinstance(result, dict) and isinstance(result.get("list"), list):
+            return result["list"]
+        if isinstance(raw.get("data"), list):
+            return raw["data"]
+        if isinstance(raw.get("list"), list):
+            return raw["list"]
+        return []
+
     def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
         position_id = task.get("position_id", "")
         position = self.state.open_positions.get(position_id)
@@ -6344,7 +6602,11 @@ class LiveRuntime:
         task["local_entry_paused"] = True
         task["last_attempt_at_ms"] = now_ms
         task["next_attempt_ms"] = 0
-        task["last_error"] = "residual_repair_deadline_or_attempts_exhausted"
+        current_error = str(task.get("last_error", "") or "")
+        if current_error.startswith("residual_repair_live_"):
+            task["last_error"] = current_error
+        else:
+            task["last_error"] = "residual_repair_deadline_or_attempts_exhausted"
         self.journal.append(
             "execution.residual_repair_paused",
             {
@@ -6801,11 +7063,18 @@ class LiveRuntime:
         if venue:
             self._post_only_reject_cooldown_until_ms[(pair_key[0], venue)] = until_ms
         bbo_payload = dict(bbo or {})
+        evidence = self._entry_admission_evidence("post_only_would_take")
         self.journal.append(
             "runtime.entry_post_only_reject_cooldown",
             {
                 "symbol": pair_key[0],
                 "venue": venue,
+                "reason": "post_only_would_take",
+                "raw_error": reason[:500],
+                "blocked_until_ms": until_ms,
+                "ttl_ms": cooldown_ms,
+                "official_doc_url": evidence["official_doc_url"],
+                "evidence_gap": evidence["evidence_gap"],
                 "long_venue": pair_key[1],
                 "short_venue": pair_key[2],
                 "side": side or bbo_payload.get("side", ""),
@@ -6819,7 +7088,6 @@ class LiveRuntime:
                 "cooldown_until_ms": until_ms,
                 "cooldown_until": until_ms,
                 "cooldown_ms": cooldown_ms,
-                "reason": reason[:300],
             },
         )
 
@@ -8480,15 +8748,15 @@ class LiveRuntime:
 
         admission_block = self._candidate_admission_block(candidate, now_ms)
         if admission_block:
+            payload = {
+                **admission_block,
+                "long_venue": getattr(candidate, "long_venue", ""),
+                "short_venue": getattr(candidate, "short_venue", ""),
+                "ts_ms": now_ms,
+            }
             self.journal.append(
                 "runtime.entry_admission_blocked",
-                {
-                    "symbol": getattr(candidate, "symbol", ""),
-                    "long_venue": getattr(candidate, "long_venue", ""),
-                    "short_venue": getattr(candidate, "short_venue", ""),
-                    "reason": admission_block,
-                    "ts_ms": now_ms,
-                },
+                payload,
             )
             return False
 
@@ -8990,14 +9258,26 @@ class LiveRuntime:
                     },
                 )
         except Exception as e:
-            self._record_entry_result_admission_blocks(
-                candidate,
-                str(e),
-                now_ms,
-            )
+            error_text = str(e)
+            if self._entry_reject_is_post_only_would_take(error_text):
+                self._record_post_only_reject_cooldown(
+                    candidate,
+                    now_ms,
+                    error_text,
+                    venue=maker_venue.value,
+                    side=maker_leg.value,
+                    price=price_hint,
+                    bbo=maker_bbo_evidence,
+                )
+            else:
+                self._record_entry_result_admission_blocks(
+                    candidate,
+                    error_text,
+                    now_ms,
+                )
             self.journal.append(
                 "runtime.entry_dispatch_error",
-                {"entry_id": ctx.entry_id, "error": str(e)},
+                {"entry_id": ctx.entry_id, "error": error_text},
             )
             return False
 

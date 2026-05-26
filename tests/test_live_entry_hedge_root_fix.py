@@ -1730,6 +1730,7 @@ class _FakeVenueAdapter:
         self.place_order_raises: Exception | None = None
         self.normalized_quantity: float | None = None
         self.min_notional_quote: float = 0.0
+        self.open_orders: list[dict] = []
         self.order_fill_reconciliation: OrderFillReconciliation | None = None
         self.passive_progress: PassiveOrderProgress | None = None
         self.query_passive_progress_raises: Exception | None = None
@@ -1746,6 +1747,9 @@ class _FakeVenueAdapter:
     async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
         self._fetch_position_calls.append(symbol)
         return self.position
+
+    async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        return list(self.open_orders)
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
         self._place_order_calls.append(request)
@@ -5131,7 +5135,7 @@ class TestResidualRepairExecutionV1Parity:
                     qty_step=1.0,
                     min_qty=1.0,
                     min_notional=0.0,
-                    ct_val=100.0,
+                    ct_val=0.0,
                     rule_source="test_okx_instrument",
                 )
 
@@ -5139,6 +5143,12 @@ class TestResidualRepairExecutionV1Parity:
             def __init__(self):
                 super().__init__(Venue.OKX)
                 self._transport = VenueTransport(spec=okx_spec(), mode="paper")
+                self._transport.set_symbol_metadata({
+                    "UB-USDT-SWAP": {
+                        "ctVal": "100",
+                        "ctType": "linear",
+                    }
+                })
 
             async def normalize_quantity(self, symbol: str, quantity: float) -> float:
                 return await self._transport.normalize_quantity(symbol, quantity)
@@ -5227,7 +5237,7 @@ class TestResidualRepairExecutionV1Parity:
         assert len(runtime.state.pending_residual_repairs) == 1
         task = runtime.state.pending_residual_repairs[0]
         assert task["local_entry_paused"] is True
-        assert task["last_error"] == "residual_repair_deadline_or_attempts_exhausted"
+        assert task["last_error"] == "residual_repair_live_position_nonzero"
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "execution.residual_repair_paused" in kinds
 

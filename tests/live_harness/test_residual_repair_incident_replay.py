@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import pytest
+
+from lightfee.core.domain import PositionSnapshot, Side, Venue
+from tests.test_live_entry_hedge_root_fix import _FakeVenueAdapter, _make_open_runtime
+
+
+class IncidentVenueAdapter(_FakeVenueAdapter):
+    def __init__(self, venue: Venue):
+        super().__init__(venue)
+        self.open_orders: list[dict] = []
+        self.fetch_position_raises: Exception | None = None
+        self.fetch_open_orders_raises: Exception | None = None
+        self._fetch_open_orders_calls: list[str] = []
+
+    async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
+        if self.fetch_position_raises is not None:
+            raise self.fetch_position_raises
+        return await super().fetch_position(symbol)
+
+    async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        self._fetch_open_orders_calls.append(symbol)
+        if self.fetch_open_orders_raises is not None:
+            raise self.fetch_open_orders_raises
+        return list(self.open_orders)
+
+
+class TransportOnlyOpenOrdersAdapter(_FakeVenueAdapter):
+    def __init__(self, venue: Venue, transport):
+        super().__init__(venue)
+        self._transport = transport
+        self.fetch_open_orders = None
+
+
+class RecordingOpenOrdersTransport:
+    def __init__(self, venue: Venue, response: dict | list):
+        self.venue = venue
+        self.response = response
+        self.calls: list[tuple[str, str, dict | None, bool]] = []
+
+    def _venue_symbol(self, symbol: str) -> str:
+        if self.venue == Venue.OKX:
+            return symbol.replace("USDT", "-USDT-SWAP")
+        return symbol
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        body: dict | None = None,
+        private: bool = False,
+    ):
+        self.calls.append((method, path, params, private))
+        return self.response
+
+
+def _flat_position(venue: Venue, symbol: str, now_ms: int) -> PositionSnapshot:
+    return PositionSnapshot(
+        venue=venue,
+        symbol=symbol,
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=now_ms,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exhausted_residual_repair_already_flat_clears_lyn_opg(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.live_recovery_reduce_only_pairs.extend([
+        {"pair_id": "lynusdt:aster->bybit", "symbol": "LYNUSDT"},
+        {"pair_id": "opgusdt:binance->okx", "symbol": "OPGUSDT"},
+    ])
+    runtime.state.pending_residual_repairs.extend([
+        {
+            "position_id": "entry-1779569524920-LYNUSDT",
+            "pair_id": "lynusdt:aster->bybit",
+            "symbol": "LYNUSDT",
+            "origin": "close_residual",
+            "repair_venue": "aster",
+            "repair_side": "sell",
+            "repair_quantity": 532.0,
+            "local_entry_paused": True,
+            "last_error": "residual_repair_deadline_or_attempts_exhausted",
+            "deadline_ms": now_ms - 1,
+            "retry_count": 3,
+            "next_attempt_ms": 0,
+        },
+        {
+            "position_id": "entry-1779594732734-OPGUSDT",
+            "pair_id": "opgusdt:binance->okx",
+            "symbol": "OPGUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "buy",
+            "repair_quantity": 9.0,
+            "local_entry_paused": True,
+            "last_error": "residual_repair_deadline_or_attempts_exhausted",
+            "deadline_ms": now_ms - 1,
+            "retry_count": 3,
+            "next_attempt_ms": 0,
+        },
+    ])
+
+    adapters = {
+        Venue.ASTER: IncidentVenueAdapter(Venue.ASTER),
+        Venue.BYBIT: IncidentVenueAdapter(Venue.BYBIT),
+        Venue.BINANCE: IncidentVenueAdapter(Venue.BINANCE),
+        Venue.OKX: IncidentVenueAdapter(Venue.OKX),
+    }
+    for venue, adapter in adapters.items():
+        symbol = "LYNUSDT" if venue in {Venue.ASTER, Venue.BYBIT} else "OPGUSDT"
+        adapter.position = _flat_position(venue, symbol, now_ms)
+    runtime._venue_adapters = adapters
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert runtime.state.live_recovery_reduce_only_pairs == []
+    events = runtime.journal.read_all()
+    completed = [
+        event for event in events
+        if event["kind"] == "execution.residual_repair_completed"
+    ]
+    assert {event["payload"]["symbol"] for event in completed} == {"LYNUSDT", "OPGUSDT"}
+    assert all(event["payload"]["result"] == "already_flat" for event in completed)
+    assert all(adapter._fetch_open_orders_calls for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_exhausted_residual_repair_live_nonzero_or_untrusted_stays_fail_closed(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    binance = IncidentVenueAdapter(Venue.BINANCE)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx = IncidentVenueAdapter(Venue.OKX)
+    okx.position = PositionSnapshot(
+        venue=Venue.OKX,
+        symbol="OPGUSDT",
+        side=Side.SELL,
+        quantity=9.0,
+        entry_price=0.2,
+        observed_at_ms=now_ms,
+    )
+    runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    task = runtime.state.pending_residual_repairs[0]
+    assert task["local_entry_paused"] is True
+    assert task["last_error"] == "residual_repair_live_position_nonzero"
+    assert runtime.state.live_recovery_reduce_only_pairs
+    events = runtime.journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "execution.residual_repair_paused" in kinds
+    paused = [
+        event for event in events
+        if event["kind"] == "execution.residual_repair_paused"
+    ]
+    assert paused[-1]["payload"]["last_error"] == "residual_repair_live_position_nonzero"
+    assert "execution.residual_repair_completed" not in kinds
+    assert okx._place_order_calls == []
+
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    okx.fetch_open_orders_raises = RuntimeError("open order truth unavailable")
+
+    await runtime._recover_residual_repairs(now_ms + 1)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    assert runtime.state.pending_residual_repairs[0]["last_error"].startswith(
+        "residual_repair_live_truth_untrusted:"
+    )
+    paused_after_untrusted = [
+        event for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_paused"
+    ]
+    assert paused_after_untrusted[-1]["payload"]["last_error"].startswith(
+        "residual_repair_live_truth_untrusted:"
+    )
+    completed_after_untrusted = [
+        event for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_completed"
+    ]
+    assert completed_after_untrusted == []
+
+
+@pytest.mark.asyncio
+async def test_exhausted_residual_repair_uses_transport_open_order_truth(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    binance_transport = RecordingOpenOrdersTransport(Venue.BINANCE, [])
+    okx_transport = RecordingOpenOrdersTransport(Venue.OKX, {"data": []})
+    binance = TransportOnlyOpenOrdersAdapter(Venue.BINANCE, binance_transport)
+    okx = TransportOnlyOpenOrdersAdapter(Venue.OKX, okx_transport)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert runtime.state.live_recovery_reduce_only_pairs == []
+    assert binance_transport.calls == [
+        ("GET", "/fapi/v1/openOrders", {"symbol": "OPGUSDT"}, True)
+    ]
+    assert okx_transport.calls == [
+        ("GET", "/api/v5/trade/orders-pending", {"instId": "OPG-USDT-SWAP"}, True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_residual_repair_transport_open_order_truth_failure_keeps_task(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    class FailingTransport(RecordingOpenOrdersTransport):
+        async def _request(self, *args, **kwargs):
+            await super()._request(*args, **kwargs)
+            raise RuntimeError("open orders unavailable")
+
+    okx_transport = FailingTransport(Venue.OKX, {})
+    okx = TransportOnlyOpenOrdersAdapter(Venue.OKX, okx_transport)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    task = runtime.state.pending_residual_repairs[0]
+    assert task["last_error"].startswith("residual_repair_live_truth_untrusted:")
+    assert "execution.residual_repair_completed" not in [
+        event["kind"] for event in runtime.journal.read_all()
+    ]

@@ -243,6 +243,114 @@ class TestRuntimePreflight:
             assert runtime.state.venue_entry_cooldowns[key]["reason"] == "leverage_admission_blocked"
             runtime.journal.close()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "venue",
+            "symbol",
+            "raw_error",
+            "expected_reason",
+            "official_doc_url",
+            "evidence_gap",
+        ),
+        [
+            (
+                "bybit",
+                "BALUSDT",
+                "bybit retCode=110007 retMsg=Available balance is insufficient",
+                "insufficient_balance_admission_blocked",
+                "https://bybit-exchange.github.io/docs/v5/error",
+                False,
+            ),
+            (
+                "binance",
+                "MARGINUSDT",
+                'HTTP 400: {"code":-2019,"msg":"Margin is insufficient."}',
+                "insufficient_margin_admission_blocked",
+                "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code",
+                False,
+            ),
+            (
+                "binance",
+                "GTXUSDT",
+                (
+                    'HTTP 400: {"code":-5022,"msg":"Due to the order could not be '
+                    'executed as maker, the Post Only order will be rejected."}'
+                ),
+                "post_only_would_take",
+                "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code",
+                False,
+            ),
+            (
+                "aster",
+                "MAXUSDT",
+                'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
+                "max_notional_admission_blocked",
+                "",
+                True,
+            ),
+        ],
+    )
+    async def test_exchange_rule_reject_payload_records_evidence(
+        self,
+        venue,
+        symbol,
+        raw_error,
+        expected_reason,
+        official_doc_url,
+        evidence_gap,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            class RejectingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason=raw_error,
+                    )
+
+            executor = RejectingExecutor()
+            runtime.entry_executor = executor
+            candidate = SimpleNamespace(
+                symbol=symbol,
+                long_venue=venue,
+                short_venue="bybit" if venue != "bybit" else "binance",
+                entry_notional_quote=50.0,
+                ranking_edge_bps=10.0,
+                expected_edge_bps=10.0,
+                funding_edge_bps=0.0,
+                worst_case_edge_bps=8.0,
+                blocked=False,
+                blocked_reasons=[],
+            )
+
+            assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0) is True
+            assert await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0) is False
+            assert executor.calls == 1
+
+            if expected_reason == "post_only_would_take":
+                assert f"{venue}:{symbol}" not in runtime.state.venue_entry_cooldowns
+                payload = [
+                    record["payload"]
+                    for record in runtime.journal.read_all()
+                    if record["kind"] == "runtime.entry_post_only_reject_cooldown"
+                ][-1]
+            else:
+                payload = runtime.state.venue_entry_cooldowns[f"{venue}:{symbol}"]
+            assert payload["reason"] == expected_reason
+            assert payload["raw_error"] == raw_error[:500]
+            assert payload["official_doc_url"] == official_doc_url
+            assert payload["evidence_gap"] is evidence_gap
+            assert payload["blocked_until_ms"] > 1778787000000
+            runtime.journal.close()
+
     def test_live_main_wires_production_executors_for_real_runtime(self):
         """The live entrypoint wiring must remain active for real LiveRuntime."""
         from lightfee.apps.live import _wire_production_executors
@@ -888,6 +996,54 @@ class TestRuntimePreflight:
             assert payload["error"]
 
     @pytest.mark.asyncio
+    async def test_live_position_probe_timeout_has_explicit_classification(self):
+        """Timeout probe errors must not depend on vague exception text."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class TimeoutAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self._transport = SimpleNamespace(
+                        _spec=SimpleNamespace(position_path="/api/v2/mix/position/single-position"),
+                        _venue_symbol=lambda symbol: f"{symbol}_UMCBL",
+                    )
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    raise asyncio.TimeoutError()
+
+            bitget = TimeoutAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(["BTCUSDT"])
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_probe_error"
+            )
+            assert payload["venue"] == "bitget"
+            assert payload["normalized_symbol"] == "BTCUSDT"
+            assert payload["venue_symbol"] == "BTCUSDT_UMCBL"
+            assert payload["endpoint"] == "/api/v2/mix/position/single-position"
+            assert payload["classification"] == "timeout"
+            assert payload["exception_class"] == "TimeoutError"
+            assert payload["error"]
+
+    @pytest.mark.asyncio
     async def test_live_position_bulk_metadata_missing_keeps_inst_id_context(self):
         """Bulk OKX metadata failures must not lose the failing instId context."""
         from lightfee.venues.specs import okx_spec
@@ -941,9 +1097,12 @@ class TestRuntimePreflight:
                 if r["kind"] == "recovery.live_position_bulk_probe_metadata_missing"
             )
             assert payload["classification"] == "metadata_missing"
+            assert payload["venue"] == "okx"
+            assert payload["endpoint"] == "/api/v5/account/positions"
+            assert payload["exception_class"] == "TransportError"
             assert payload["normalized_symbol"] == "CHIPUSDT"
+            assert payload["symbol"] == "CHIPUSDT"
             assert payload["venue_symbol"] == "CHIP-USDT-SWAP"
-
             assert payload["error"]
 
     @pytest.mark.asyncio

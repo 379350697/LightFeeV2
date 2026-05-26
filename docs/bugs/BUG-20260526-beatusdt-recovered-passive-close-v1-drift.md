@@ -54,6 +54,7 @@ Implemented behavior:
 | 2026-05-26 | local | `pytest tests/test_engine_recovery.py tests/test_live_full_closure.py::TestLiveFullClosure::test_housekeeping_clears_clean_recovery_block_after_passive_orphan_cleanup -q` | `17 passed` |
 | 2026-05-26 | local | `python3 -m py_compile lightfee/engine/passive_close.py tests/test_passive_close.py` | passed |
 | 2026-05-26 | local | `git diff --check -- lightfee/engine/passive_close.py tests/test_passive_close.py` | passed |
+| 2026-05-26 | local live harness | `python3 -m pytest -q tests/live_harness/test_recovered_close_and_duplicate_incidents.py` | `2 passed`; BEATUSDT recovered local open/pending with both venues live-flat clears before order submission, and BIOUSDT Bybit duplicate CID with old fill plus live nonzero retries a fresh reduce-only CID instead of clearing from historical fill evidence |
 
 Regression coverage added:
 
@@ -62,6 +63,7 @@ Regression coverage added:
 - Missing price evidence is classified as `price_unavailable_for_min_notional`.
 - Bybit instrument `minNotionalValue` is used instead of local small-fill buffer.
 - OKX market snapshot matching accepts `BEAT-USDT-SWAP` for canonical `BEATUSDT`.
+- Independent live-harness coverage for the production incident pair: BEATUSDT recovered passive close emits `recovery.flat` / `runtime.position_drift_corrected` and clears stale recovery block without order submission; BIOUSDT duplicate `110072` classifies old full-fill evidence as `stale_full_live_nonzero` when live quantity remains nonzero and retries with a fresh CID.
 
 ## Regression Watch
 

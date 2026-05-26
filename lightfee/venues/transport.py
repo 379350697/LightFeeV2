@@ -582,6 +582,47 @@ def _is_post_only_would_take_reject(venue: "Venue", error: Exception) -> bool:
     )
 
 
+def _passive_submit_reject_classification(venue: "Venue", error: Exception) -> str:
+    message = _transport_error_text(error)
+    if venue == Venue.BYBIT and (
+        "110007" in message
+        or "available balance is insufficient" in message
+        or "insufficient available balance" in message
+    ):
+        return "insufficient_balance_admission_blocked"
+    if venue == Venue.BYBIT and (
+        "110126" in message
+        or "110125" in message
+        or "110123" in message
+        or "must sign required agreement" in message
+        or "agree to the trading terms" in message
+    ):
+        return "bybit_trading_terms_required"
+    if venue == Venue.BINANCE and (
+        "-2019" in message
+        or "margin is insufficient" in message
+    ):
+        return "insufficient_margin_admission_blocked"
+    if venue == Venue.BINANCE and _is_post_only_would_take_reject(venue, error):
+        return "post_only_would_take"
+    if venue == Venue.ASTER and (
+        "-2027" in message
+        or "max_leverage_ratio" in message
+        or "maximum allowable position at current leverage" in message
+    ):
+        return "leverage_admission_blocked"
+    if venue == Venue.ASTER and _is_aster_max_notional_error(error):
+        return "max_notional_admission_blocked"
+    if _is_post_only_would_take_reject(venue, error):
+        return "post_only_would_take"
+    return "rejected"
+
+
+def _okx_symbol_rule_has_trusted_contract_source(symbol_rule: Any) -> bool:
+    source = str(getattr(symbol_rule, "rule_source", "") or "").lower()
+    return source == "instrument" or source.endswith("_instrument")
+
+
 def is_hyperliquid_non_retryable_auth_signing_error(error: Exception) -> bool:
     """Classify Hyperliquid auth/signing failures that must not be retried."""
     message = _transport_error_text(error)
@@ -2923,22 +2964,26 @@ class VenueTransport(MarketDataClient):
             metadata = self._symbol_metadata.get(key)
             if not isinstance(metadata, dict):
                 continue
+            ct_type = str(
+                metadata.get(
+                    "ctType",
+                    metadata.get("ct_type", metadata.get("contractType", "")),
+                )
+                or ""
+            )
+            has_contract_type_evidence = bool(ct_type)
             for field in ("ct_val", "ctVal", "contract_size", "contractSize"):
                 value = _safe_float(metadata.get(field), default=0.0)
-                if value > 0:
+                if value > 0 and has_contract_type_evidence:
                     return value
+                if value > 0 and self.mode == "paper":
+                    return value
+            if not has_contract_type_evidence:
+                raise self._okx_missing_ct_val_error(venue_symbol, "metadata_missing")
             raise self._okx_missing_ct_val_error(venue_symbol, "metadata_missing")
 
         if self._okx_swap_instruments_loaded:
             raise self._okx_missing_ct_val_error(venue_symbol, "instrument_missing")
-
-        try:
-            symbol_rule = await get_symbol_rules_cache().get(self, Venue.OKX, venue_symbol)
-            ct_val = float(getattr(symbol_rule, "ct_val", 0.0) or 0.0)
-            if ct_val > 0:
-                return ct_val
-        except Exception:
-            pass
 
         raise self._okx_missing_ct_val_error(venue_symbol, "metadata_missing")
 
@@ -4901,11 +4946,7 @@ class VenueTransport(MarketDataClient):
                 and is_hyperliquid_non_retryable_auth_signing_error(e)
             ):
                 self._trading_capability_trusted = False
-            classification = (
-                "post_only_would_take"
-                if _is_post_only_would_take_reject(spec.venue_id, e)
-                else "rejected"
-            )
+            classification = _passive_submit_reject_classification(spec.venue_id, e)
             if not result_recorded:
                 self._record_passive_diagnostic_failure(
                     request, venue_sym, e.status_code, str(e),
@@ -4918,11 +4959,7 @@ class VenueTransport(MarketDataClient):
                 and is_hyperliquid_non_retryable_auth_signing_error(e)
             ):
                 self._trading_capability_trusted = False
-            classification = (
-                "post_only_would_take"
-                if _is_post_only_would_take_reject(spec.venue_id, e)
-                else "rejected"
-            )
+            classification = _passive_submit_reject_classification(spec.venue_id, e)
             if not result_recorded:
                 self._record_passive_diagnostic_failure(
                     request, venue_sym, 0, str(e),
@@ -6258,6 +6295,13 @@ class VenueTransport(MarketDataClient):
                 or self._symbol_metadata.get(symbol)
                 or {}
             )
+            ct_type = str(
+                metadata.get(
+                    "ctType",
+                    metadata.get("ct_type", metadata.get("contractType", "")),
+                )
+                or ""
+            )
             ct_val = _safe_float(
                 metadata.get("ct_val", metadata.get("ctVal", metadata.get("contract_size", 0.0))),
                 default=0.0,
@@ -6270,16 +6314,13 @@ class VenueTransport(MarketDataClient):
                 metadata.get("min_sz", metadata.get("minSz", metadata.get("min_qty", 0.0))),
                 default=0.0,
             )
+            symbol_rule = None
             if ct_val <= 0.0 or lot_sz <= 0.0 or min_sz <= 0.0:
                 try:
                     symbol_rule = await get_symbol_rules_cache().get(self, Venue.OKX, venue_sym)
                 except Exception:
                     symbol_rule = None
                 if symbol_rule is not None:
-                    rule_ct_val = _safe_float(
-                        getattr(symbol_rule, "ct_val", 0.0),
-                        default=0.0,
-                    )
                     rule_lot_sz = _safe_float(
                         getattr(symbol_rule, "qty_step", 0.0),
                         default=0.0,
@@ -6288,13 +6329,11 @@ class VenueTransport(MarketDataClient):
                         getattr(symbol_rule, "min_qty", 0.0),
                         default=0.0,
                     )
-                    if ct_val <= 0.0 and rule_ct_val > 0.0:
-                        ct_val = rule_ct_val
                     if lot_sz <= 0.0 and rule_lot_sz > 0.0:
                         lot_sz = rule_lot_sz
                     if min_sz <= 0.0 and rule_min_sz > 0.0:
                         min_sz = rule_min_sz
-                    if ct_val > 0.0 or lot_sz > 0.0 or min_sz > 0.0:
+                    if metadata and (ct_val > 0.0 or lot_sz > 0.0 or min_sz > 0.0):
                         merged = dict(metadata)
                         if ct_val > 0.0:
                             merged["ct_val"] = ct_val

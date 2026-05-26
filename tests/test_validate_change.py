@@ -33,3 +33,26 @@ def test_validate_change_close_dry_run_shows_segmented_commands():
     assert "git diff --check" in result.stdout
     assert "tests/test_passive_close.py" in result.stdout
     assert "timeout=" in result.stdout
+
+
+def test_validate_change_live_harness_profile_is_independent():
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "--profile", "live-harness", "--dry-run"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "tests/live_harness" in result.stdout
+    assert "tests/probes" not in result.stdout
+
+
+def test_validate_change_full_profile_excludes_live_probes():
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "--profile", "full", "--dry-run"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "tests/probes" not in result.stdout

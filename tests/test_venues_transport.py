@@ -2443,7 +2443,7 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert await transport.normalize_quantity("UBUSDT", 150.0) == pytest.approx(100.0)
 
     @pytest.mark.asyncio
-    async def test_okx_normalize_quantity_uses_symbol_rules_cache_without_metadata(
+    async def test_okx_normalize_quantity_uses_symbol_rules_cache_for_lot_rules_only(
         self, monkeypatch,
     ):
         from lightfee.venues.symbol_rules import SymbolRule
@@ -2466,6 +2466,12 @@ class TestOrderSubmitDiagnosticsAndQuantization:
             lambda: FakeRulesCache(),
         )
         transport = VenueTransport(spec=okx_spec(), mode="paper")
+        transport.set_symbol_metadata({
+            "UB-USDT-SWAP": {
+                "ctVal": "100",
+                "ctType": "linear",
+            }
+        })
 
         assert await transport.normalize_quantity("UBUSDT", 50.0) == 0.0
         assert await transport.normalize_quantity("UBUSDT", 100.0) == pytest.approx(100.0)
@@ -2914,6 +2920,22 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         )
 
         async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            if path == "/api/v5/account/instruments":
+                assert method == "GET"
+                assert private is True
+                assert params == {"instType": "SWAP"}
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "CHIP-USDT-SWAP",
+                            "instType": "SWAP",
+                            "ctVal": "100",
+                            "ctType": "linear",
+                            "state": "live",
+                        }
+                    ],
+                }
             assert path == transport._spec.position_path
             assert params == {"instId": "CHIP-USDT-SWAP"}
             return {
@@ -3045,6 +3067,165 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
         assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
         assert "classification=metadata_missing" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_contract_size_requires_official_ct_type_metadata(self):
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+
+        async def fake_public_get(path, params=None):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "CHIP-USDT-SWAP",
+                        "instType": "SWAP",
+                        "ctVal": "100",
+                        "state": "live",
+                    }
+                ],
+            }
+
+        transport._public_get = fake_public_get
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport._okx_contract_size_for_venue_symbol("CHIP-USDT-SWAP")
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_contract_size_rejects_symbol_rule_ct_val_without_official_metadata(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_cache_without_ct_type",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport._okx_contract_size_for_venue_symbol("CHIP-USDT-SWAP")
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_contract_size_rejects_trusted_cache_ct_val_without_metadata(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport._okx_contract_size_for_venue_symbol("CHIP-USDT-SWAP")
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_rejects_symbol_rule_ct_val_without_official_metadata(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_cache_without_ct_type",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport.normalize_quantity("CHIPUSDT", 100.0)
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_okx_normalize_quantity_rejects_trusted_cache_ct_val_without_metadata(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+
+        with pytest.raises(TransportError) as exc_info:
+            await transport.normalize_quantity("CHIPUSDT", 100.0)
+
+        assert exc_info.value.category == TransportErrorCategory.NORMALIZATION_FAILURE
+        assert "okx_contract_metadata_missing_ct_val" in str(exc_info.value)
+        assert "classification=metadata_missing" in str(exc_info.value)
+        assert "instId=CHIP-USDT-SWAP" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_okx_normalize_quantity_missing_ct_val_is_classified(self, monkeypatch):
@@ -4188,6 +4369,299 @@ class TestV1PassiveBusinessFlowParity:
         assert exc.value.class_ == SubmitFailureClass.REJECTED
         result = transport.order_diagnostics[-1]["payload"]
         assert result["response_classification"] == "post_only_would_take"
+
+    @pytest.mark.asyncio
+    async def test_bybit_110007_balance_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_bybit_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="bybit-key", api_secret="bybit-secret"),
+        )
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "bybit retCode=110007 retMsg=Available balance is insufficient",
+                status_code=400,
+                body='{"retCode":110007,"retMsg":"Available balance is insufficient"}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="BALUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price=1.5,
+            post_only=True,
+            client_order_id="bybit-maker-1",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "insufficient_balance_admission_blocked"
+
+    @pytest.mark.asyncio
+    async def test_bybit_110126_trading_terms_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_bybit_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="bybit-key", api_secret="bybit-secret"),
+        )
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "bybit retCode=110126 retMsg=must sign required agreement",
+                status_code=400,
+                body='{"retCode":110126,"retMsg":"must sign required agreement"}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="LITEUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price=1.5,
+            post_only=True,
+            client_order_id="bybit-maker-terms",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "bybit_trading_terms_required"
+
+    @pytest.mark.asyncio
+    async def test_binance_2019_margin_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_binance_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: margin is insufficient",
+                status_code=400,
+                body='{"code":-2019,"msg":"Margin is insufficient."}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="MARGINUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price=1.5,
+            post_only=True,
+            client_order_id="binance-maker-2",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "insufficient_margin_admission_blocked"
+
+    @pytest.mark.asyncio
+    async def test_aster_5018_max_notional_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_aster_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "300"}
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: max notional",
+                status_code=400,
+                body='{"code":-5018,"msg":"maximum notional value limit"}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="MAXUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-3",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "max_notional_admission_blocked"
+
+    @pytest.mark.asyncio
+    async def test_aster_2027_leverage_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_aster_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: max leverage ratio",
+                status_code=400,
+                body=(
+                    '{"code":-2027,"msg":"Exceeded the maximum allowable '
+                    'position at current leverage."}'
+                ),
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="ESPORTSUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-2027",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "leverage_admission_blocked"
 
     @pytest.mark.asyncio
     async def test_okx_fetch_position_reuses_fresh_cache_to_reduce_private_rest(self):

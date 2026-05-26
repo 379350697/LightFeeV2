@@ -1,0 +1,34 @@
+{
+  "run_id": "lightfee-1779803978233-1531592",
+  "lifecycle": "risk_only",
+  "risk_mode": "fail_closed",
+  "open_position_count": 0,
+  "pending_entry_count": 0,
+  "pending_close_count": 0,
+  "pending_passive_close_count": 0,
+  "pending_residual_repair_count": 2,
+  "pending_residual_repairs": [
+    {
+      "position_id": "entry-1779569524920-LYNUSDT",
+      "pair_id": "lynusdt:aster->bybit",
+      "symbol": "LYNUSDT",
+      "origin": "close_residual",
+      "repair_venue": "aster",
+      "repair_side": "sell",
+      "repair_quantity": 532.0,
+      "local_entry_paused": true,
+      "last_error": "residual_repair_deadline_or_attempts_exhausted"
+    },
+    {
+      "position_id": "entry-1779594732734-OPGUSDT",
+      "pair_id": "opgusdt:binance->okx",
+      "symbol": "OPGUSDT",
+      "origin": "entry_open",
+      "repair_venue": "okx",
+      "repair_side": "buy",
+      "repair_quantity": 9.0,
+      "local_entry_paused": true,
+      "last_error": "residual_repair_deadline_or_attempts_exhausted"
+    }
+  ]
+}

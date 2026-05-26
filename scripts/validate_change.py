@@ -112,6 +112,13 @@ PROFILES: dict[str, tuple[Step, ...]] = {
             timeout_s=420,
         ),
     ),
+    "live-harness": (
+        *BASE_STEPS,
+        pytest("tests/live_harness", timeout_s=300),
+    ),
+    "live-probe": (
+        pytest("tests/probes", timeout_s=300),
+    ),
     "full": (
         *BASE_STEPS,
         pytest("tests/test_passive_close.py", timeout_s=300),
