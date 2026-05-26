@@ -196,6 +196,66 @@ def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkey
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_allows_explicit_exchange_truth_venues(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+        seen = {}
+
+        def fake_exchange_truth(runtime_dir, symbols, venues=None):
+            seen["symbols"] = symbols
+            seen["venues"] = venues
+            return {
+                "available": True,
+                "available_venues": venues or [],
+                "confidence": "high",
+                "positions": {venue: {} for venue in (venues or [])},
+                "open_orders": {venue: {"OPGUSDT": []} for venue in (venues or [])},
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "fetch_status": {
+                    venue: {
+                        "status": "ok",
+                        "positions_succeeded": ["OPGUSDT"],
+                        "positions_failed": [],
+                        "orders_succeeded": ["OPGUSDT"],
+                        "orders_failed": [],
+                    }
+                    for venue in (venues or [])
+                },
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", fake_exchange_truth)
+
+        dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="OPGUSDT",
+            venues=["binance", "okx"],
+            now_ms=1700000005000,
+        )
+
+        assert seen["symbols"] == ["OPGUSDT"]
+        assert seen["venues"] == ["binance", "okx"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # HTTP status only, no body -> partial/missing_body
 # ---------------------------------------------------------------------------

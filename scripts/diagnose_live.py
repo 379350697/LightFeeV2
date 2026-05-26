@@ -1421,6 +1421,7 @@ def run_diagnose(
     max_events: int = DEFAULT_MAX_EVENTS,
     now_ms: int = 0,
     since_deploy: bool = False,
+    venues: list[str] | None = None,
 ) -> dict[str, Any]:
     generated_at_ms = now_ms or _now_ms()
 
@@ -1475,7 +1476,7 @@ def run_diagnose(
     exchange_truth = _build_exchange_truth(
         runtime_dir,
         pos_symbols if pos_symbols else [],
-        pos_venues if pos_venues else None,
+        venues if venues is not None else (pos_venues if pos_venues else None),
     )
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
@@ -1501,6 +1502,7 @@ def run_diagnose(
         "generated_at_ms": generated_at_ms,
         "scope": {
             "symbol": symbol or "*",
+            "venues": venues or [],
             "since_deploy": since_deploy,
             "max_events": max_events,
             "event_files": [str(ef) for ef in event_files],
@@ -1548,6 +1550,8 @@ def main() -> None:
                        help="Output JSON (default)")
     parser.add_argument("--symbol", type=str, default="",
                        help="Filter by symbol")
+    parser.add_argument("--venues", type=str, default="",
+                       help="Comma-separated venues for exchange-truth checks")
     parser.add_argument("--since-deploy", action="store_true", default=False,
                        help="Limit to events since last deploy")
     parser.add_argument("--runtime-dir", type=str, default=DEFAULT_RUNTIME_DIR,
@@ -1565,6 +1569,11 @@ def main() -> None:
     parser.add_argument("--now-ms", type=int, default=0,
                        help="Override current time in ms (testing)")
     args = parser.parse_args()
+    venues = [
+        venue.strip().lower()
+        for venue in args.venues.split(",")
+        if venue.strip()
+    ] or None
 
     result = run_diagnose(
         runtime_dir=args.runtime_dir,
@@ -1576,6 +1585,7 @@ def main() -> None:
         max_events=args.max_events,
         now_ms=args.now_ms,
         since_deploy=args.since_deploy,
+        venues=venues,
     )
 
     if args.json:
