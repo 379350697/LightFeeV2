@@ -1247,3 +1247,324 @@ class TestOkxReplayLinkClassification:
             bid_count=1, ask_count=1,
         )
         assert kind is ReplayLinkKind.INVALID
+
+
+class TestLocalL2HotFreshnessThirtyMinuteSimulation:
+    async def _sync(self, dp, adapters, now_ms: int):
+        return await dp.sync_snapshots(adapters, now_ms=now_ms, scan_promoted=True)
+
+    def test_valid_delta_refreshes_hot_book_even_when_top_levels_do_not_change(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "UNCHANGEDUSDT")
+        book.status = L2BookStatus.HOT
+        book.observed_at_ms = 1_000
+        book.sequence = 10
+        book.last_update_id = 10
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="UNCHANGEDUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[PriceLevel(101.0, 1.0)],
+                sequence=11,
+                previous_sequence=10,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2_000,
+        )
+
+        assert events
+        assert book.status == L2BookStatus.HOT
+        assert book.observed_at_ms == 2_000
+
+    @pytest.mark.asyncio
+    async def test_ws_authoritative_heartbeat_keeps_hot_book_fresh_for_30_minutes(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "HEARTUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.last_snapshot_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "HEARTUSDT")] = FakeClient()
+
+        for now_ms in range(1_000, 30 * 60 * 1000 + 30_001, 30_000):
+            dp.note_ws_keepalive("bybit", "HEARTUSDT", now_ms=now_ms)
+            await self._sync(dp, {}, now_ms)
+
+        assert book.status == L2BookStatus.HOT
+        assert book.observed_at_ms >= 30 * 60 * 1000
+        assert not [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rest_buffered_replay_proactive_refresh_stays_before_stale_threshold_for_30_minutes(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "RESTFRESHUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.last_snapshot_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 5_000
+        dp.hot_refresh_interval_ms = 30_000
+
+        class FreshAdapter(MockL2Adapter):
+            def __init__(self):
+                super().__init__("binance", sequence=1)
+                self.now_ms = 1_000
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+                update = await super().fetch_l2_snapshot(symbol, depth)
+                update.event_time_ms = self.now_ms
+                update.received_at_ms = self.now_ms
+                update.sequence = self.call_count
+                return update
+
+        adapter = FreshAdapter()
+        from lightfee.core.domain import Venue
+
+        for now_ms in range(1_000, 30 * 60 * 1000 + 1_001, 1_000):
+            adapter.now_ms = now_ms
+            await self._sync(dp, {Venue.BINANCE: adapter}, now_ms)
+            assert book.status == L2BookStatus.HOT
+            assert now_ms - book.observed_at_ms <= dp.hot_stale_after_ms
+
+        assert adapter.call_count >= 300
+        assert not [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_missing_ws_subscription_is_the_rebuild_reason_after_30_minutes(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "MISSWSUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        assert book.status == L2BookStatus.REBUILDING
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "subscription_missing"
+
+    @pytest.mark.asyncio
+    async def test_connected_ws_without_subscription_confirmation_is_subscription_missing(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "CONNECTEDMISSUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "CONNECTEDMISSUSDT")] = FakeClient()
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "subscription_missing"
+
+    @pytest.mark.asyncio
+    async def test_connected_ws_with_subscription_but_no_delta_is_no_ws_delta(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "NODELTAUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "NODELTAUSDT")] = FakeClient()
+        dp.note_ws_subscription_confirmed("bybit", "NODELTAUSDT", now_ms=1_000)
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "no_ws_delta"
+
+    @pytest.mark.asyncio
+    async def test_real_delta_proves_subscription_was_not_missing(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "DELTAONLYUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "DELTAONLYUSDT")] = FakeClient()
+        dp.note_ws_delta("bybit", "DELTAONLYUSDT", now_ms=1_000)
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "no_keepalive"
+
+    @pytest.mark.asyncio
+    async def test_connected_ws_with_stale_keepalive_is_no_keepalive(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "NOKEEPALIVEUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "NOKEEPALIVEUSDT")] = FakeClient()
+        dp.note_ws_subscription_confirmed("bybit", "NOKEEPALIVEUSDT", now_ms=1_000)
+        dp.note_ws_delta("bybit", "NOKEEPALIVEUSDT", now_ms=1_000)
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "no_keepalive"
+
+    @pytest.mark.asyncio
+    async def test_rest_hot_book_without_proactive_adapter_is_rest_refresh_late(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "RESTLATEUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.last_snapshot_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        await self._sync(dp, {}, now_ms=30 * 60 * 1000 + 1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "rest_refresh_late"
+
+    @pytest.mark.asyncio
+    async def test_future_observed_timestamp_is_clock_skew_rebuild_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "SKEWUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 120_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "SKEWUSDT")] = FakeClient()
+
+        await self._sync(dp, {}, now_ms=1_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 1
+        assert payloads[0]["reason"] == "clock_skew"
+
+    @pytest.mark.asyncio
+    async def test_hot_stale_rebuild_events_are_rate_limited_per_symbol_and_reason(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "RATELIMITUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 1_000
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.hot_stale_after_ms = 60_000
+        dp.state_event_rate_limit_ms = 60_000
+
+        await self._sync(dp, {}, now_ms=70_000)
+        book.status = L2BookStatus.HOT
+        await self._sync(dp, {}, now_ms=70_500)
+        book.status = L2BookStatus.HOT
+        await self._sync(dp, {}, now_ms=131_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_stale_rebuild"
+        ]
+        assert len(payloads) == 2
+        assert payloads[0]["reason"] == "subscription_missing"
+        assert "suppressed_count" not in payloads[0]
+        assert payloads[1]["reason"] == "subscription_missing"
+        assert payloads[1]["suppressed_count"] == 1

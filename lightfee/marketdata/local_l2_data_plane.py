@@ -82,6 +82,17 @@ class _BookSnapshotState:
     snapshot_in_flight: bool = False
 
 
+@dataclass
+class _BookFreshnessState:
+    """Tracks non-book-changing evidence that a HOT book is still authoritative."""
+
+    last_ws_delta_ms: int = 0
+    last_ws_keepalive_ms: int = 0
+    last_book_confirmation_ms: int = 0
+    last_subscription_confirmed_ms: int = 0
+    last_rest_refresh_ms: int = 0
+
+
 # Default snapshot intervals per book status
 SNAPSHOT_INTERVAL_COLD_MS = 0  # Immediate on cold
 SNAPSHOT_INTERVAL_BOOTSTRAPPING_MS = 2_000
@@ -136,6 +147,11 @@ class LocalL2DataPlane:
         self.buffered_replay_failure_alert_threshold: int = 3
         self._buffered_replay_failure_counts: dict[str, int] = {}
         self._rebuild_attempt_ids: dict[str, int] = {}
+        self._freshness_states: dict[LocalL2BookKey, _BookFreshnessState] = {}
+        self._state_event_last_ms: dict[tuple[str, str, str, str], int] = {}
+        self._state_event_suppressed: dict[tuple[str, str, str, str], int] = {}
+        self.state_event_rate_limit_ms: int = 60_000
+        self.clock_skew_tolerance_ms: int = 5_000
 
     # ------------------------------------------------------------------
     # Bootstrap: initial snapshot population for target books
@@ -276,6 +292,7 @@ class LocalL2DataPlane:
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
             ss.last_error = ""
+            self._freshness_state(venue, symbol).last_rest_refresh_ms = now_ms
             self._buffered_replay_failure_counts.pop(f"{venue}:{symbol}", None)
             self._journal.append(
                 "runtime.local_l2_snapshot_ok",
@@ -384,6 +401,219 @@ class LocalL2DataPlane:
     @staticmethod
     def _status_value(status) -> str:
         return status.value if hasattr(status, "value") else str(status)
+
+    def _freshness_state(self, venue: str, symbol: str) -> _BookFreshnessState:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        state = self._freshness_states.get(key)
+        if state is None:
+            state = _BookFreshnessState()
+            self._freshness_states[key] = state
+        return state
+
+    def _append_rate_limited_state_event(
+        self,
+        kind: str,
+        payload: dict,
+        now_ms: int,
+        *,
+        reason: str = "",
+    ) -> bool:
+        venue = str(payload.get("venue", ""))
+        symbol = str(payload.get("symbol", ""))
+        event_key = (kind, venue, symbol, reason)
+        last_ms = self._state_event_last_ms.get(event_key, 0)
+        if (
+            last_ms > 0
+            and now_ms > 0
+            and (now_ms - last_ms) < self.state_event_rate_limit_ms
+        ):
+            self._state_event_suppressed[event_key] = (
+                self._state_event_suppressed.get(event_key, 0) + 1
+            )
+            return False
+
+        suppressed = self._state_event_suppressed.pop(event_key, 0)
+        if suppressed:
+            payload = dict(payload)
+            payload["suppressed_count"] = suppressed
+        self._state_event_last_ms[event_key] = now_ms
+        self._journal.append(kind, payload)
+        return True
+
+    def _mark_book_fresh_from_evidence(
+        self,
+        venue: str,
+        symbol: str,
+        evidence_ms: int,
+    ) -> None:
+        if evidence_ms <= 0:
+            return
+        book = self._runtime.get_book(venue, symbol)
+        if book is None or book.status != L2BookStatus.HOT:
+            return
+        if book.bids and book.asks and evidence_ms > int(getattr(book, "observed_at_ms", 0) or 0):
+            book.observed_at_ms = evidence_ms
+
+    def _record_freshness_evidence(
+        self,
+        venue: str,
+        symbol: str,
+        now_ms: int,
+        field_name: str,
+        event_name: str,
+        observed_at_ms: int = 0,
+    ) -> None:
+        evidence_ms = int(observed_at_ms or now_ms or time.time() * 1000)
+        state = self._freshness_state(venue, symbol)
+        setattr(state, field_name, max(int(getattr(state, field_name, 0) or 0), evidence_ms))
+        self._mark_book_fresh_from_evidence(venue, symbol, evidence_ms)
+        self._append_rate_limited_state_event(
+            "runtime.local_l2_freshness_state",
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "event": event_name,
+                "evidence_at_ms": evidence_ms,
+                "ts_ms": now_ms,
+            },
+            now_ms,
+            reason=event_name,
+        )
+
+    def note_ws_delta(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        observed_at_ms: int = 0,
+    ) -> None:
+        self._record_freshness_evidence(
+            venue, symbol, now_ms, "last_ws_delta_ms", "ws_delta", observed_at_ms,
+        )
+
+    def note_ws_keepalive(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        observed_at_ms: int = 0,
+    ) -> None:
+        self._record_freshness_evidence(
+            venue, symbol, now_ms, "last_ws_keepalive_ms", "ws_keepalive", observed_at_ms,
+        )
+
+    def note_ws_book_confirmation(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        observed_at_ms: int = 0,
+    ) -> None:
+        self._record_freshness_evidence(
+            venue, symbol, now_ms, "last_book_confirmation_ms", "book_confirmation", observed_at_ms,
+        )
+
+    def note_ws_subscription_confirmed(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> None:
+        self._record_freshness_evidence(
+            venue, symbol, now_ms, "last_subscription_confirmed_ms", "subscription_confirmed",
+        )
+
+    def _ws_client_connected(self, key: LocalL2BookKey) -> bool:
+        client = self._ws_clients.get(key)
+        return bool(client is not None and getattr(client, "is_connected", False))
+
+    def _effective_hot_freshness_ms(
+        self,
+        key: LocalL2BookKey,
+        book,
+    ) -> int:
+        state = self._freshness_states.get(key)
+        evidence_ms = 0
+        if state is not None:
+            evidence_ms = max(
+                state.last_ws_delta_ms,
+                state.last_ws_keepalive_ms,
+                state.last_book_confirmation_ms,
+                state.last_subscription_confirmed_ms,
+                state.last_rest_refresh_ms,
+            )
+        return max(int(getattr(book, "observed_at_ms", 0) or 0), evidence_ms)
+
+    def _hot_proactive_refresh_interval_ms(self, stale_after_ms: int) -> int:
+        configured = int(getattr(self, "hot_refresh_interval_ms", 0) or 0)
+        if stale_after_ms <= 0:
+            return configured
+        proactive = max(250, (stale_after_ms * 3) // 4)
+        if configured <= 0:
+            return proactive
+        return min(configured, proactive)
+
+    def _hot_refresh_due(self, key: LocalL2BookKey, book, now_ms: int, stale_after_ms: int) -> bool:
+        interval_ms = self._hot_proactive_refresh_interval_ms(stale_after_ms)
+        if interval_ms <= 0:
+            return False
+        ss = self._snap_states.get(key)
+        state = self._freshness_states.get(key)
+        last_refresh_ms = max(
+            int(getattr(book, "last_snapshot_ms", 0) or 0),
+            int(getattr(ss, "last_snapshot_ms", 0) or 0) if ss is not None else 0,
+            int(getattr(state, "last_rest_refresh_ms", 0) or 0) if state is not None else 0,
+        )
+        return last_refresh_ms <= 0 or (now_ms - last_refresh_ms) >= interval_ms
+
+    def _classify_hot_stale_reason(
+        self,
+        key: LocalL2BookKey,
+        book,
+        now_ms: int,
+        stale_after_ms: int,
+        policy,
+    ) -> str:
+        observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+        if observed_at_ms > now_ms + self.clock_skew_tolerance_ms:
+            return "clock_skew"
+
+        if policy.bridge_mode in (
+            BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
+            BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
+        ):
+            if self._hot_refresh_due(key, book, now_ms, stale_after_ms):
+                return "rest_refresh_late"
+
+        if policy.bridge_mode in (BridgeMode.WS_SNAPSHOT_AUTHORITATIVE, BridgeMode.STREAM_ONLY):
+            if not self._ws_client_connected(key):
+                return "subscription_missing"
+            state = self._freshness_states.get(key)
+            if state is None:
+                return "subscription_missing"
+            has_ws_evidence = max(
+                state.last_subscription_confirmed_ms,
+                state.last_ws_delta_ms,
+                state.last_ws_keepalive_ms,
+                state.last_book_confirmation_ms,
+            ) > 0
+            if not has_ws_evidence:
+                return "subscription_missing"
+            if state.last_ws_delta_ms <= 0:
+                return "no_ws_delta"
+            keepalive_ms = max(
+                state.last_ws_keepalive_ms,
+                state.last_book_confirmation_ms,
+                state.last_subscription_confirmed_ms,
+            )
+            if keepalive_ms <= 0 or (now_ms - keepalive_ms) > stale_after_ms:
+                return "no_keepalive"
+
+        return "unknown"
 
     @staticmethod
     def _buffer_age_ms(buf: deque[_BufferedUpdate], now_ms: int) -> int:
@@ -544,6 +774,11 @@ class LocalL2DataPlane:
             book = self._runtime.get_book(update.venue, update.symbol)
             if result.applied and not result.rebuild_required and book is not None:
                 book.transition_to_hot()
+                self.note_ws_book_confirmation(
+                    update.venue,
+                    update.symbol,
+                    now_ms=now_ms,
+                )
             return result.events
 
         if book is not None and book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
@@ -574,7 +809,14 @@ class LocalL2DataPlane:
             if not replay.ok:
                 return []
 
-        return self._runtime.record_update(update, now_ms)
+        result = self._runtime.record_update_result(update, now_ms)
+        if result.applied and not result.rebuild_required:
+            self.note_ws_delta(
+                update.venue,
+                update.symbol,
+                now_ms=now_ms,
+            )
+        return result.events
 
     def _range_update_requires_rebuild(
         self,
@@ -982,37 +1224,80 @@ class LocalL2DataPlane:
             # V1: HOT books rely on WS deltas, but stale HOT books must be
             # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
-                stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
-                if stale_after_ms <= 0 or not book.is_stale(stale_after_ms, now_ms):
-                    continue
-                status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
-                pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
-                book.fault_reason = "stale_hot_book"
-                book.transition_to_rebuilding(now_ms)
-                status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
                 policy = policy_for_venue(key.venue)
-                self._journal.append(
-                    "runtime.local_l2_hot_stale_rebuild",
-                    {
-                        "venue": key.venue,
-                        "symbol": key.symbol,
-                        "book_status": status_before,
-                        "status_before": status_before,
-                        "status_after": status_after,
-                        "pool": pool_before,
-                        "pool_before": pool_before,
-                        "age_ms": book.age_ms(now_ms),
-                        "observed_at_ms": book.observed_at_ms,
-                        "stale_after_ms": stale_after_ms,
-                        "last_update_id": book.last_update_id,
-                        "sequence": book.sequence,
-                        "bid_count": len(book.bids) if book.bids else 0,
-                        "ask_count": len(book.asks) if book.asks else 0,
-                        "ts_ms": now_ms,
-                        "policy_bridge_mode": policy.bridge_mode.value,
-                        "reason_class": "hot_stale",
-                    },
+                stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
+                effective_freshness_ms = self._effective_hot_freshness_ms(key, book)
+                observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+                clock_skew = observed_at_ms > now_ms + self.clock_skew_tolerance_ms
+                effective_stale = (
+                    clock_skew
+                    or stale_after_ms > 0
+                    and (
+                        effective_freshness_ms <= 0
+                        or (now_ms - effective_freshness_ms) > stale_after_ms
+                    )
                 )
+                if stale_after_ms <= 0 or not effective_stale:
+                    self._mark_book_fresh_from_evidence(
+                        key.venue,
+                        key.symbol,
+                        effective_freshness_ms,
+                    )
+                    if policy.bridge_mode not in (
+                        BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
+                        BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
+                    ):
+                        continue
+                    if not self._hot_refresh_due(key, book, now_ms, stale_after_ms):
+                        continue
+                reason = self._classify_hot_stale_reason(
+                    key, book, now_ms, stale_after_ms, policy,
+                )
+                if (
+                    policy.bridge_mode in (
+                        BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
+                        BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
+                    )
+                    and not effective_stale
+                ):
+                    pass
+                else:
+                    status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
+                    pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
+                    book.fault_reason = f"stale_hot_book:{reason}"
+                    book.transition_to_rebuilding(now_ms)
+                    status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
+                    self._append_rate_limited_state_event(
+                        "runtime.local_l2_hot_stale_rebuild",
+                        {
+                            "venue": key.venue,
+                            "symbol": key.symbol,
+                            "book_status": status_before,
+                            "status_before": status_before,
+                            "status_after": status_after,
+                            "pool": pool_before,
+                            "pool_before": pool_before,
+                            "age_ms": book.age_ms(now_ms),
+                            "effective_age_ms": (
+                                now_ms - effective_freshness_ms if effective_freshness_ms > 0 else 0
+                            ),
+                            "observed_at_ms": book.observed_at_ms,
+                            "effective_freshness_ms": effective_freshness_ms,
+                            "stale_after_ms": stale_after_ms,
+                            "last_update_id": book.last_update_id,
+                            "sequence": book.sequence,
+                            "bid_count": len(book.bids) if book.bids else 0,
+                            "ask_count": len(book.asks) if book.asks else 0,
+                            "ts_ms": now_ms,
+                            "policy_bridge_mode": policy.bridge_mode.value,
+                            "reason": reason,
+                            "reason_class": reason,
+                        },
+                        now_ms,
+                        reason=reason,
+                    )
+                    if policy.bridge_mode is BridgeMode.STREAM_ONLY:
+                        continue
 
             if policy_for_venue(key.venue).bridge_mode is BridgeMode.STREAM_ONLY:
                 continue
@@ -1023,6 +1308,10 @@ class LocalL2DataPlane:
                 continue
 
             interval_ms = self._snapshot_interval_for_status(book.status)
+            if book.status == L2BookStatus.HOT:
+                interval_ms = self._hot_proactive_refresh_interval_ms(
+                    int(getattr(self, "hot_stale_after_ms", 0) or 0)
+                )
             if interval_ms > 0 and book.last_snapshot_ms > 0:
                 if (now_ms - book.last_snapshot_ms) < interval_ms:
                     continue
@@ -1076,6 +1365,13 @@ class LocalL2DataPlane:
             key = LocalL2BookKey(venue=item["venue"], symbol=item["symbol"])
             self.stop_worker(key)
             self._snap_states.pop(key, None)
+            self._freshness_states.pop(key, None)
+            for event_key in list(self._state_event_last_ms):
+                if event_key[1] == key.venue and event_key[2] == key.symbol:
+                    self._state_event_last_ms.pop(event_key, None)
+            for event_key in list(self._state_event_suppressed):
+                if event_key[1] == key.venue and event_key[2] == key.symbol:
+                    self._state_event_suppressed.pop(event_key, None)
             self._pre_snapshot_buffers.pop(f"{key.venue}:{key.symbol}", None)
             self._stream_generations.pop(f"{key.venue}:{key.symbol}", None)
 

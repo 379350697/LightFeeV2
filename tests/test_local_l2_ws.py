@@ -159,6 +159,61 @@ class TestBinanceL2WsClientParsing:
         _close_data_plane(dp, _)
 
 
+class TestLocalL2WsFreshnessEvidence:
+    @pytest.mark.asyncio
+    async def test_subscription_confirmation_refreshes_hot_book_without_depth_change(self):
+        dp, rt, journal = _make_data_plane()
+        try:
+            book = rt.ensure_book("bybit", "BTCUSDT")
+            book.status = L2BookStatus.HOT
+            book.observed_at_ms = 1_000
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+
+            await client._handle_message('{"op":"subscribe","success":true,"ret_msg":"subscribe"}')
+
+            assert book.observed_at_ms > 1_000
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_subscription_confirmation_does_not_refresh_hot_book(self):
+        dp, rt, journal = _make_data_plane()
+        try:
+            book = rt.ensure_book("bybit", "BTCUSDT")
+            book.status = L2BookStatus.HOT
+            book.observed_at_ms = 1_000
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+
+            await client._handle_message(
+                '{"event":"subscribe","success":false,"error":"subscribe failed"}'
+            )
+
+            assert book.observed_at_ms == 1_000
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_keepalive_refreshes_hot_book_without_depth_change(self):
+        dp, rt, journal = _make_data_plane()
+        try:
+            book = rt.ensure_book("bybit", "ETHUSDT")
+            book.status = L2BookStatus.HOT
+            book.observed_at_ms = 1_000
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            client = BybitL2WsClient(venue="bybit", symbol="ETHUSDT", data_plane=dp)
+
+            await client._handle_message('{"op":"pong"}')
+
+            assert book.observed_at_ms > 1_000
+        finally:
+            journal.close()
+
+
 class TestOkxL2WsClientParsing:
     def test_parses_snapshot(self):
         dp, rt, _ = _make_data_plane()

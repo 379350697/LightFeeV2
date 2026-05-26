@@ -260,12 +260,23 @@ class LocalL2WsClient(ABC):
         except json.JSONDecodeError:
             return
 
+        now_ms = int(time.time() * 1000)
+        if self._is_subscription_confirmation(payload):
+            self.data_plane.note_ws_subscription_confirmed(
+                self.venue, self.symbol, now_ms=now_ms,
+            )
+            return
+        if self._is_keepalive_message(payload):
+            self.data_plane.note_ws_keepalive(
+                self.venue, self.symbol, now_ms=now_ms,
+            )
+            return
+
         # Venue-specific parsing
         update = self.parse_depth_message(payload)
         if update is None:
             return
 
-        now_ms = int(time.time() * 1000)
         self._message_count += 1
         self._last_message_ms = now_ms
 
@@ -273,6 +284,63 @@ class LocalL2WsClient(ABC):
             self.data_plane.ingest_external_update(update, now_ms)
         except Exception:
             self._error_count += 1
+
+    def _is_subscription_confirmation(self, payload: dict) -> bool:
+        event = str(payload.get("event", "")).lower()
+        op = str(payload.get("op", "")).lower()
+        ret_msg = str(payload.get("ret_msg", "")).lower()
+        channel = str(payload.get("channel", "")).lower()
+
+        if self._is_subscription_failure(payload):
+            return False
+        if event == "subscribe":
+            return True
+        if op == "subscribe" and payload.get("success") is True:
+            return True
+        if "subscribe" in ret_msg and payload.get("success") is True:
+            return True
+        if channel in {"subscriptionresponse", "subscription_response"}:
+            return True
+        return False
+
+    @staticmethod
+    def _is_subscription_failure(payload: dict) -> bool:
+        if payload.get("success") is False:
+            return True
+        if payload.get("error") is not None:
+            return True
+
+        for field in ("code", "retCode", "sCode"):
+            value = payload.get(field)
+            if value in (None, "", 0, "0"):
+                continue
+            return True
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get("sCode")
+                if value not in (None, "", 0, "0"):
+                    return True
+        return False
+
+    def _is_keepalive_message(self, payload: dict) -> bool:
+        event = str(payload.get("event", "")).lower()
+        op = str(payload.get("op", "")).lower()
+        channel = str(payload.get("channel", "")).lower()
+        ret_msg = str(payload.get("ret_msg", "")).lower()
+
+        if event in {"ping", "pong"} or op in {"ping", "pong"}:
+            return True
+        if channel in {"pong", "heartbeat"}:
+            return True
+        if "pong" in ret_msg or "heartbeat" in ret_msg:
+            return True
+        if "ping" in payload or "pong" in payload:
+            return True
+        return False
 
     async def _close_ws(self) -> None:
         if self._ws is not None:
