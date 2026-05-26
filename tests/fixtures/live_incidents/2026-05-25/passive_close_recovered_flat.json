@@ -1,0 +1,68 @@
+{
+  "source": "docs/bugs/daily/2026-05-25.md",
+  "classification": "recovered_passive_close_live_flat_and_under_min_guard",
+  "incidents": [
+    {
+      "case_id": "xcnusdt_recovered_bybit_aster_live_flat",
+      "source": "docs/bugs/daily/2026-05-25.md#cluster-cl-002-xcnusdt-recovered-passive-close-evidence-and-diagnostics",
+      "position_id": "live-recovered:XCNUSDT:bybit->aster",
+      "symbol": "XCNUSDT",
+      "long_venue": "bybit",
+      "short_venue": "aster",
+      "matched_quantity": 5070.0,
+      "pending_position_snapshot_present": true,
+      "active_maker_leg": "short",
+      "recovery_blocked_reason": "startup_recovery_pending_work_without_open_positions",
+      "live_positions": {
+        "bybit": 0.0,
+        "aster": 0.0
+      },
+      "open_orders": {
+        "bybit": 0,
+        "aster": 0
+      },
+      "expected_events": [
+        "exit.passive_close_recovery_probe_flat",
+        "recovery.flat",
+        "runtime.position_drift_corrected"
+      ]
+    },
+    {
+      "case_id": "ubusdt_terminal_maker_filled_bybit_under_min",
+      "source": "docs/bugs/daily/2026-05-25.md#cluster-cl-001-passive-close-bybit-hedge-min-quantity-terminal-maker-v1-drift",
+      "symbol": "UBUSDT",
+      "long_venue": "binance",
+      "short_venue": "bybit",
+      "matched_quantity": 1.0,
+      "pending_position_snapshot_present": true,
+      "active_maker_leg": "long",
+      "maker_order_id": "oid-maker",
+      "maker_client_order_id": "cid-maker",
+      "maker_cumulative_quantity": 1.0,
+      "maker_average_price": 0.01,
+      "hedge_venue": "bybit",
+      "hedge_requested_quantity": 1.0,
+      "hedge_normalized_quantity": 0.0,
+      "bybit_public_metadata": {
+        "tickSize": "0.000010",
+        "qtyStep": "10",
+        "minOrderQty": "10",
+        "minNotionalValue": "5"
+      },
+      "live_positions": {
+        "binance": 0.0,
+        "bybit": 0.0
+      },
+      "open_orders": {
+        "binance": 0,
+        "bybit": 0
+      },
+      "observed_reject": "bybit retCode=10001 The number of contracts exceeds minimum limit allowed",
+      "expected_events": [
+        "exit.passive_close_hedge_dust_aborted",
+        "recovery.flat",
+        "runtime.position_drift_corrected"
+      ]
+    }
+  ]
+}

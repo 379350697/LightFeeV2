@@ -1,0 +1,61 @@
+{
+  "source": "docs/bugs/daily/2026-05-23.md#cluster-cl-002-passive-close-terminal-flat-probe-snapshot-fallback-drift",
+  "run_id": "lightfee-1779546833786-1438044",
+  "classification": "recovered_pending_passive_close_terminal_flat",
+  "incidents": [
+    {
+      "case_id": "gmtusdt_missing_pending_snapshot_live_flat",
+      "position_id": "entry-1779540996545-GMTUSDT",
+      "symbol": "GMTUSDT",
+      "long_venue": "bybit",
+      "short_venue": "aster",
+      "matched_quantity": 1874.0,
+      "pending_position_snapshot_present": false,
+      "active_maker_leg": "long",
+      "live_positions": {
+        "bybit": 0.0,
+        "aster": 0.0
+      },
+      "open_orders": {
+        "bybit": 0,
+        "aster": 0
+      },
+      "observed_terminal_errors": [
+        "bybit retCode=110017 current position is zero",
+        "HTTP 400 {\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}"
+      ],
+      "expected_events": [
+        "exit.passive_close_recovery_probe_flat",
+        "recovery.flat",
+        "runtime.position_drift_corrected"
+      ]
+    },
+    {
+      "case_id": "lynusdt_missing_pending_snapshot_live_flat",
+      "position_id": "entry-1779540996545-LYNUSDT",
+      "symbol": "LYNUSDT",
+      "long_venue": "bybit",
+      "short_venue": "aster",
+      "matched_quantity": 533.0,
+      "pending_position_snapshot_present": false,
+      "active_maker_leg": "long",
+      "live_positions": {
+        "bybit": 0.0,
+        "aster": 0.0
+      },
+      "open_orders": {
+        "bybit": 0,
+        "aster": 0
+      },
+      "observed_terminal_errors": [
+        "bybit retCode=110017 current position is zero",
+        "HTTP 400 {\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}"
+      ],
+      "expected_events": [
+        "exit.passive_close_recovery_probe_flat",
+        "recovery.flat",
+        "runtime.position_drift_corrected"
+      ]
+    }
+  ]
+}

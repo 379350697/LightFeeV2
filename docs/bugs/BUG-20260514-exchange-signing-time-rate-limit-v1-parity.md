@@ -115,6 +115,7 @@ V1 applies `BYBIT_AUTH_TIMESTAMP_BACKOFF_MS = 1500` to private auth timestamps. 
 | 2026-05-14 | Server-time 418 applies exponential backoff | Behavioral test: mocked 418 (no Retry-After) → `host:fapi.binance.com` cooldown > 0 | PASS |
 | 2026-05-14 | Binance private query order = recvWindow BEFORE timestamp | Behavioral test: `_build_signed_request_async` → `...&recvWindow=10000&timestamp=...&signature=...`; signature verified by re-computing HMAC on pre-sign payload | PASS |
 | 2026-05-14 | Aster private query order = recvWindow BEFORE timestamp | Behavioral test: `_build_signed_request_async` (aster_spec) → same order; signature recompute verified | PASS |
+| 2026-05-27 | Historical rate-limit/signing recheck | `python3 -m pytest -q tests/test_v1_parity_rate_limit_signing_red.py::TestServerTime429Cooldown tests/test_v1_parity_rate_limit_signing_red.py::TestBinanceAsterParamOrderV1` | `4 passed`; uses mocked server-time 429/418 responses and signed-request construction, which is the real failure surface for this bug without hitting private exchange endpoints |
 | 2026-05-14 | Binance host capacity = 2280 (not 2166) | Runtime probe: `capacity=2280.0` | PASS |
 | 2026-05-14 | Binance request does not drain OKX/Bybit/Gate buckets | Runtime probe: OKX 600→600, Bybit 600→600, Gate 900→900 | PASS |
 | 2026-05-14 | 429 cooldown blocks subsequent requests | Runtime probe: `RateLimitError(cooldown, retry_in_ms=3000)` at T+2000 with 5000ms cooldown | PASS |

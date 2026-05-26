@@ -55,6 +55,7 @@ Implemented behavior:
 | 2026-05-26 | local | `python3 -m py_compile lightfee/engine/passive_close.py tests/test_passive_close.py` | passed |
 | 2026-05-26 | local | `git diff --check -- lightfee/engine/passive_close.py tests/test_passive_close.py` | passed |
 | 2026-05-26 | local live harness | `python3 -m pytest -q tests/live_harness/test_recovered_close_and_duplicate_incidents.py` | `2 passed`; BEATUSDT recovered local open/pending with both venues live-flat clears before order submission, and BIOUSDT Bybit duplicate CID with old fill plus live nonzero retries a fresh reduce-only CID instead of clearing from historical fill evidence |
+| 2026-05-27 | local live harness recheck | `python3 scripts/validate_change.py --profile live-harness --keep-going` | passed: compileall, `git diff --check`, and `pytest -q tests/live_harness` with `31 passed`; this includes the BEATUSDT recovered live-flat and BIOUSDT duplicate-CID stale-fill/live-nonzero incident harness plus older fixture-driven GMT/LYN/XCN/UBUSDT passive-close replays |
 
 Regression coverage added:
 
