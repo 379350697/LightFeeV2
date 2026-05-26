@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 import pytest
 
@@ -16,6 +17,7 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
     SnapshotFreshness,
+    TransferLifecycle,
 )
 
 
@@ -100,6 +102,52 @@ def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
     )
 
 
+def test_runtime_no_tradeable_diagnostics_classifies_edge_window_and_domain():
+    assert LiveRuntime._no_tradeable_reason_from_candidate_blockers(
+        Counter({"funding_edge_below_floor": 2}),
+        Counter(),
+    ) == "candidate_edge_insufficient"
+    assert LiveRuntime._no_tradeable_reason_from_candidate_blockers(
+        Counter({"outside_scan_window": 1}),
+        Counter(),
+    ) == "candidate_window_mismatch"
+    assert LiveRuntime._no_tradeable_reason_from_candidate_blockers(
+        Counter(),
+        Counter({"quote_stale": 1}),
+    ) == "candidate_snapshot_domain_stale"
+
+
+def test_runtime_snapshot_freshness_status_includes_transfer_domain(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = SidecarSnapshot(
+        transfer_lifecycle=[
+            TransferLifecycle(
+                from_venue="okx",
+                to_venue="bybit",
+                observed_at_ms=65000,
+                coverage_usable=1,
+            )
+        ],
+    )
+
+    *_unused, statuses = runtime._snapshot_freshness_observability(
+        snapshot=snapshot,
+        candidates=[_freshness_candidate()],
+        now_ms=70000,
+    )
+
+    key = "transfer|okx->bybit|BTCUSDT|sidecar_transfer"
+    assert statuses[key]["status"] == "fresh"
+    assert statuses[key]["age_ms"] == 5000
+
+
 @pytest.mark.asyncio
 async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
     config = AppConfig(
@@ -148,7 +196,7 @@ async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_runtime_last_good_fallback_requires_revalidate_before_entry(tmp_path, monkeypatch):
+async def test_runtime_last_good_fallback_emits_non_blocking_revalidate_diagnostics(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -203,9 +251,26 @@ async def test_runtime_last_good_fallback_requires_revalidate_before_entry(tmp_p
     finally:
         runtime.journal.close()
 
-    assert runtime.state.last_scan["no_entry_reason"] == (
-        "live_scan_revalidate_required:last_good_sidecar"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    fallback = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_fallback_last_good"
     )
+    assert "fallback_duration_ms" in fallback
+    assert "last_good_age_ms" in fallback
+    assert "fresh_source_age_ms" in fallback
+    revalidate = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.live_scan_revalidate_required"
+    )
+    assert revalidate["blocking"] is False
+    assert runtime.state.last_scan["no_entry_reason"] is None
 
 
 @pytest.mark.asyncio
@@ -287,7 +352,9 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
         record for record in records
         if record["kind"] == "scan.no_entry_diagnostics"
     ]
-    assert no_entry[-1]["payload"]["reason"] == "no_tradeable_candidates"
+    assert no_entry[-1]["payload"]["reason"] == "candidate_snapshot_domain_stale"
+    assert no_entry[-1]["payload"]["generic_reason"] == "no_tradeable_candidates"
+    assert no_entry[-1]["payload"]["snapshot_freshness_blocked_counts"]["quote_stale"] == 1
 
 
 @pytest.mark.asyncio
@@ -838,6 +905,91 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
     assert len(executor.contexts) == 1
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
     assert runtime.state.last_scan["snapshot_freshness_metrics"]["okx|BTCUSDT|liquidity"]["fresh"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_globally_filter_candidate_when_market_observed_stale_but_quote_and_l2_fresh(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=5000,
+            max_order_quote_age_ms=5000,
+            live_scan_last_good_max_age_ms=600000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=True,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+            max_liquidity_snapshot_age_ms=5000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
+    okx_quote = _quote("okx", "BTCUSDT", 100.0, 101.0)
+    bybit_quote = _quote("bybit", "BTCUSDT", 100.2, 101.2)
+    okx_quote.observed_at_ms = 69000
+    bybit_quote.observed_at_ms = 69000
+    okx_quote.source = "sidecar_quote"
+    bybit_quote.source = "sidecar_quote"
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=10000,
+        acquisition_mode="last_good_sidecar",
+        degraded_domains=["market_observed_stale"],
+        quotes={
+            "okx:BTCUSDT": okx_quote,
+            "bybit:BTCUSDT": bybit_quote,
+        },
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(executor.contexts) == 1
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
+    assert runtime.state.last_scan["no_entry_reason"] is None
+    scoped_status = runtime.state.last_scan["snapshot_freshness_status"]
+    assert scoped_status[
+        "market|global|*|snapshot.market_observed_at_ms"
+    ]["status"] == "stale"
+    assert scoped_status["quote|okx|BTCUSDT|sidecar_quote"]["status"] == "fresh"
+    assert scoped_status["quote|bybit|BTCUSDT|sidecar_quote"]["status"] == "fresh"
+    assert not any(
+        record["kind"] == "scan.no_entry_diagnostics"
+        and record["payload"]["reason"] == "no_tradeable_candidates"
+        for record in records
+    )
 
 
 def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch):

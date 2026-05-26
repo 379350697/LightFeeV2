@@ -574,6 +574,8 @@ class EngineState:
     hyperliquid_trading_disabled_reason: str | None = None
     # --- Global risk reason (V1 global_risk_reason) ---
     global_risk_reason: str | None = None
+    # --- Hyperliquid trading admission (disabled until signer/account auth is proven) ---
+    hyperliquid_trading_disabled_reason: str | None = None
     # --- Pending residual repairs (V1 pending_residual_repairs) ---
     pending_residual_repairs: list = field(default_factory=list)
     # --- Live recovery reduce-only pairs (V1 live_recovery_reduce_only_pairs) ---
@@ -610,6 +612,7 @@ class EngineState:
             "pending_close_count": len(self.pending_closes),
             "pending_passive_close_count": len(self.pending_passive_closes),
             "global_risk_reason": self.global_risk_reason,
+            "hyperliquid_trading_disabled_reason": self.hyperliquid_trading_disabled_reason,
             "recovery_blocked_reason": self.recovery_blocked_reason,
             "recovery_blocked_at_ms": self.recovery_blocked_at_ms,
             "hyperliquid_trading_disabled_reason": self.hyperliquid_trading_disabled_reason,

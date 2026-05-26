@@ -87,6 +87,8 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "symbol": q.symbol,
                 "bid": q.bid,
                 "ask": q.ask,
+                "observed_at_ms": q.observed_at_ms,
+                "source": q.source,
                 "bid_size": q.bid_size,
                 "ask_size": q.ask_size,
                 "funding_rate_bps": q.funding_rate_bps,

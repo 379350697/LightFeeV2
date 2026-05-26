@@ -108,6 +108,10 @@ class SidecarService:
                 fallback = self._inject_last_good(venue_name, symbols)
                 if fallback:
                     for key, q in fallback.items():
+                        if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
+                            q.observed_at_ms = int(self._last_good_at_ms or 0)
+                        if not str(getattr(q, "source", "") or ""):
+                            q.source = "sidecar_quote"
                         quotes[key] = q
                 funding_lifecycle.append(FundingLifecycle(
                     venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
@@ -127,6 +131,10 @@ class SidecarService:
 
             if venue_quotes:
                 for key, q in venue_quotes.items():
+                    if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
+                        q.observed_at_ms = observed_ms
+                    if not str(getattr(q, "source", "") or ""):
+                        q.source = "sidecar_quote"
                     quotes[key] = q
 
             funding_lifecycle.append(FundingLifecycle(

@@ -826,6 +826,7 @@ class TestRuntimePreflight:
             assert payload["classification"] == "metadata_missing"
             assert payload["normalized_symbol"] == "CHIPUSDT"
             assert payload["venue_symbol"] == "CHIP-USDT-SWAP"
+
             assert payload["error"]
 
     @pytest.mark.asyncio
@@ -1489,6 +1490,7 @@ class TestLiveMainStartupShutdownOrder:
         flush_path = tmp_path / "flushed.txt"
 
         class MockRuntime:
+
             def __init__(self, config, venue_adapters):
                 self.config = config
                 self._running = True
@@ -1509,6 +1511,7 @@ class TestLiveMainStartupShutdownOrder:
 
             async def run_loop(self) -> None:
                 calls.append("run_loop")
+
                 await shutdown_event.wait()
 
             async def stop(self) -> None:
@@ -1521,6 +1524,7 @@ class TestLiveMainStartupShutdownOrder:
 
         config = make_test_config(str(tmp_path))
         config.runtime.shutdown_grace_period_ms = 200
+
         monkeypatch.setattr("lightfee.apps.live.load_config", lambda _path: config)
         monkeypatch.setattr("lightfee.apps.live.build_adapter_map", lambda _config: {})
         monkeypatch.setattr("lightfee.apps.live.LiveRuntime", MockRuntime)
@@ -1541,6 +1545,7 @@ class TestLiveMainStartupShutdownOrder:
                 ),
                 timeout=0.5,
             )
+
             await trigger
 
         assert calls == ["start", "run_loop", "stop"]
@@ -1567,6 +1572,7 @@ class TestLiveMainStartupShutdownOrder:
         calls: list[str] = []
         shutdown_event = asyncio.Event()
         start_cancelled = asyncio.Event()
+
         flush_path = tmp_path / "flushed.txt"
 
         class MockRuntime:
@@ -1590,6 +1596,7 @@ class TestLiveMainStartupShutdownOrder:
 
         config = make_test_config(str(tmp_path))
         config.runtime.shutdown_grace_period_ms = 100
+
         monkeypatch.setattr("lightfee.apps.live.load_config", lambda _path: config)
         monkeypatch.setattr("lightfee.apps.live.build_adapter_map", lambda _config: {})
         monkeypatch.setattr("lightfee.apps.live.LiveRuntime", MockRuntime)
@@ -1610,6 +1617,7 @@ class TestLiveMainStartupShutdownOrder:
                 ),
                 timeout=0.5,
             )
+
             await trigger
 
         assert calls == ["start", "stop"]

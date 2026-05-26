@@ -35,6 +35,8 @@ class ExchangeSource:
             symbol=ft.symbol,
             bid=ft.bid,
             ask=ft.ask,
+            observed_at_ms=int(time.time() * 1000),
+            source="sidecar_quote",
             bid_size=ft.bid_size,
             ask_size=ft.ask_size,
             funding_rate_bps=ft.funding_rate_bps,

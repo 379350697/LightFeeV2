@@ -141,6 +141,8 @@ class LiveRuntime:
         self._last_no_entry_diag_fingerprint: str = ""
         self._last_no_entry_diag_ts_ms: int = 0
         self._last_no_entry_diagnostics: dict | None = None
+        self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
+        self._last_snapshot_freshness_filter_samples: list[dict] = []
         self._last_private_position_probe_ms: int = 0
         self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
         self._last_position_drift_check_ms: int = 0
@@ -2210,6 +2212,7 @@ class LiveRuntime:
             snapshot_freshness_ages,
             snapshot_freshness_budgets,
             snapshot_freshness_publish_intervals,
+            snapshot_freshness_status,
         ) = (
             self._snapshot_freshness_observability(
                 snapshot=snapshot,
@@ -2223,19 +2226,18 @@ class LiveRuntime:
         self.state.last_scan["snapshot_freshness_publish_interval_ms"] = (
             snapshot_freshness_publish_intervals
         )
+        self.state.last_scan["snapshot_freshness_status"] = snapshot_freshness_status
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
-            reason = "live_scan_revalidate_required:last_good_sidecar"
-            self.state.last_scan["no_entry_reason"] = reason
             self.journal.append(
                 "runtime.live_scan_revalidate_required",
                 {
-                    "reason": reason,
+                    "reason": "live_scan_revalidate_required:last_good_sidecar",
                     "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
                     "edge_buffer_bps": self.config.runtime.live_scan_revalidate_edge_buffer_bps,
+                    "blocking": False,
                     "ts_ms": now_ms,
                 },
             )
-            return
 
         # V1 pre-scan L2 sync: refresh execution-owned books only (scan_promoted=False)
         await self._sync_local_l2_data(now_ms, scan_promoted=False)
@@ -6961,12 +6963,56 @@ class LiveRuntime:
             "blocking": decision == "skip_entry",
         }
 
+    @staticmethod
+    def _snapshot_quote_direct_observed_at_ms(quote) -> int:
+        return int(getattr(quote, "observed_at_ms", 0) or 0)
+
+    @staticmethod
+    def _snapshot_quote_source(quote) -> str:
+        return str(getattr(quote, "source", "") or "sidecar_quote")
+
     def _snapshot_quote_observed_at_ms(self, snapshot, quote) -> int:
         return (
-            int(getattr(quote, "observed_at_ms", 0) or 0)
+            self._snapshot_quote_direct_observed_at_ms(quote)
             or int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
             or int(getattr(snapshot, "published_at_ms", 0) or 0)
         )
+
+    @staticmethod
+    def _snapshot_scoped_status_key(
+        domain: str,
+        venue: str,
+        symbol: str,
+        source: str,
+    ) -> str:
+        return (
+            f"{str(domain).lower()}|{str(venue).lower()}|"
+            f"{str(symbol).upper()}|{str(source).lower()}"
+        )
+
+    def _record_snapshot_scoped_status(
+        self,
+        statuses: dict[str, dict],
+        *,
+        domain: str,
+        venue: str,
+        symbol: str,
+        source: str,
+        observed_at_ms: int,
+        age_ms: int,
+        budget_ms: int,
+        fresh: bool,
+    ) -> None:
+        statuses[self._snapshot_scoped_status_key(domain, venue, symbol, source)] = {
+            "domain": str(domain).lower(),
+            "venue": str(venue).lower(),
+            "symbol": str(symbol).upper(),
+            "source": str(source).lower(),
+            "status": "fresh" if fresh else "stale",
+            "observed_at_ms": int(observed_at_ms),
+            "age_ms": int(age_ms),
+            "budget_ms": int(budget_ms),
+        }
 
     def _snapshot_lifecycle_rows_by_venue(self, snapshot, domain: str) -> dict[str, object]:
         attr = {
@@ -6995,13 +7041,36 @@ class LiveRuntime:
         dict[str, int],
         dict[str, int],
         dict[str, int],
+        dict[str, dict],
     ]:
         metrics: dict[str, dict[str, int]] = {}
         ages: dict[str, int] = {}
         budgets: dict[str, int] = {}
         publish_intervals: dict[str, int] = {}
+        statuses: dict[str, dict] = {}
         if snapshot is None:
-            return metrics, ages, budgets, publish_intervals
+            return metrics, ages, budgets, publish_intervals, statuses
+
+        market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
+        market_age_ms = (
+            max(now_ms - market_observed_at_ms, 0)
+            if market_observed_at_ms > 0 else 0
+        )
+        market_budget_ms = int(
+            getattr(self.config.runtime, "max_market_age_ms", 0)
+            or self._snapshot_domain_budget_ms("market")
+        )
+        self._record_snapshot_scoped_status(
+            statuses,
+            domain="market",
+            venue="global",
+            symbol="*",
+            source="snapshot.market_observed_at_ms",
+            observed_at_ms=market_observed_at_ms,
+            age_ms=market_age_ms,
+            budget_ms=market_budget_ms,
+            fresh=market_observed_at_ms > 0 and market_age_ms <= market_budget_ms,
+        )
 
         for quote in getattr(snapshot, "quotes", {}).values():
             venue = str(getattr(quote, "venue", "") or "").lower()
@@ -7012,9 +7081,24 @@ class LiveRuntime:
             age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
             budget_ms = self._snapshot_domain_budget_ms("quote")
             key = self._snapshot_metric_key(venue, symbol, "quote")
-            self._record_snapshot_metric(metrics, key, observed_at_ms > 0 and age_ms <= budget_ms)
+            fresh = observed_at_ms > 0 and age_ms <= budget_ms
+            self._record_snapshot_metric(metrics, key, fresh)
             ages[key] = age_ms
             budgets[key] = budget_ms
+            source = self._snapshot_quote_source(quote)
+            if self._snapshot_quote_direct_observed_at_ms(quote) <= 0:
+                source = "snapshot.market_observed_at_ms"
+            self._record_snapshot_scoped_status(
+                statuses,
+                domain="quote",
+                venue=venue,
+                symbol=symbol,
+                source=source,
+                observed_at_ms=observed_at_ms,
+                age_ms=age_ms,
+                budget_ms=budget_ms,
+                fresh=fresh,
+            )
 
         lifecycle_by_domain = {
             "market": self._snapshot_lifecycle_rows_by_venue(snapshot, "market"),
@@ -7040,19 +7124,57 @@ class LiveRuntime:
                     age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
                     budget_ms = self._snapshot_domain_budget_ms(domain, row)
                     key = self._snapshot_metric_key(venue, symbol, domain)
-                    self._record_snapshot_metric(
-                        metrics,
-                        key,
-                        observed_at_ms > 0 and age_ms <= budget_ms,
-                    )
+                    fresh = observed_at_ms > 0 and age_ms <= budget_ms
+                    self._record_snapshot_metric(metrics, key, fresh)
                     ages[key] = age_ms
                     budgets[key] = budget_ms
+                    self._record_snapshot_scoped_status(
+                        statuses,
+                        domain=domain,
+                        venue=venue,
+                        symbol=symbol,
+                        source=str(
+                            getattr(row, "source", f"sidecar_{domain}") or f"sidecar_{domain}"
+                        ),
+                        observed_at_ms=observed_at_ms,
+                        age_ms=age_ms,
+                        budget_ms=budget_ms,
+                        fresh=fresh,
+                    )
                     if domain == "liquidity":
                         publish_intervals[key] = int(
                             getattr(row, "publish_interval_ms", 0) or 0
                         )
 
-        return metrics, ages, budgets, publish_intervals
+        transfer_rows = getattr(snapshot, "transfer_lifecycle", []) or []
+        candidate_symbols = {
+            str(getattr(candidate, "symbol", "") or "").upper()
+            for candidate in candidates
+            if str(getattr(candidate, "symbol", "") or "")
+        } or {"*"}
+        for row in transfer_rows:
+            from_venue = str(getattr(row, "from_venue", "") or "").lower()
+            to_venue = str(getattr(row, "to_venue", "") or "").lower()
+            if not from_venue or not to_venue:
+                continue
+            observed_at_ms = int(getattr(row, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+            budget_ms = self._snapshot_domain_budget_ms("transfer", row)
+            venue = f"{from_venue}->{to_venue}"
+            for symbol in sorted(candidate_symbols):
+                self._record_snapshot_scoped_status(
+                    statuses,
+                    domain="transfer",
+                    venue=venue,
+                    symbol=symbol,
+                    source=str(getattr(row, "source", "") or "sidecar_transfer"),
+                    observed_at_ms=observed_at_ms,
+                    age_ms=age_ms,
+                    budget_ms=budget_ms,
+                    fresh=observed_at_ms > 0 and age_ms <= budget_ms,
+                )
+
+        return metrics, ages, budgets, publish_intervals, statuses
 
     def _candidate_snapshot_freshness_decisions(
         self,
@@ -7096,6 +7218,9 @@ class LiveRuntime:
             else:
                 observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
                 age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+                source = self._snapshot_quote_source(quote)
+                if self._snapshot_quote_direct_observed_at_ms(quote) <= 0:
+                    source = "snapshot.market_observed_at_ms"
                 bid = float(getattr(quote, "bid", 0.0) or 0.0)
                 ask = float(getattr(quote, "ask", 0.0) or 0.0)
                 if (
@@ -7109,7 +7234,7 @@ class LiveRuntime:
                         "venue": venue,
                         "symbol": symbol,
                         "domain": "quote",
-                        "source": "sidecar_quote",
+                        "source": source,
                         "observed_at_ms": observed_at_ms,
                         "age_ms": age_ms,
                         "budget_ms": quote_budget_ms,
@@ -7201,6 +7326,8 @@ class LiveRuntime:
         publish_intervals: dict | None = None,
     ) -> list:
         filtered = []
+        self._last_snapshot_freshness_filter_blockers = Counter()
+        self._last_snapshot_freshness_filter_samples = []
         for candidate in candidates:
             decisions = self._candidate_snapshot_freshness_decisions(
                 candidate,
@@ -7233,6 +7360,19 @@ class LiveRuntime:
                     self.journal.append(event_kind, payload)
                 if failure.get("decision") == "skip_entry":
                     blocking = True
+                    reason = str(failure.get("reason", "snapshot_domain_stale"))
+                    self._last_snapshot_freshness_filter_blockers[reason] += 1
+                    if len(self._last_snapshot_freshness_filter_samples) < 24:
+                        self._last_snapshot_freshness_filter_samples.append({
+                            "pair_id": self._candidate_pair_id(candidate),
+                            "venue": str(failure.get("venue", "")),
+                            "symbol": str(failure.get("symbol", "")),
+                            "domain": str(failure.get("domain", "")),
+                            "source": str(failure.get("source", "")),
+                            "reason": reason,
+                            "age_ms": int(failure.get("age_ms", 0) or 0),
+                            "budget_ms": int(failure.get("budget_ms", 0) or 0),
+                        })
             if not blocking:
                 filtered.append(candidate)
         return filtered
@@ -7266,6 +7406,9 @@ class LiveRuntime:
         market_observed_age_ms = (
             now_ms - market_observed_at_ms if market_observed_at_ms > 0 else 0
         )
+        market_max_age_ms = int(
+            getattr(self.config.runtime, "max_market_age_ms", max_age_ms) or max_age_ms
+        )
         degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
         degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
         degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
@@ -7284,7 +7427,7 @@ class LiveRuntime:
         domains = list(degraded_domains)
         if snapshot_publish_age_ms > max_age_ms:
             domains.append("snapshot_publish_stale")
-        if market_observed_age_ms > max_age_ms:
+        if market_observed_age_ms > market_max_age_ms:
             domains.append("market_observed_stale")
         for lifecycle_name, rows in (
             ("market", getattr(snapshot, "market_lifecycle", []) or []),
@@ -7301,6 +7444,20 @@ class LiveRuntime:
         config_hash = hashlib.sha256(
             f"{snapshot_path}|{max_age_ms}|{self.config.runtime.mode}".encode()
         ).hexdigest()[:12]
+        stale_overages = []
+        if snapshot_publish_age_ms > max_age_ms:
+            stale_overages.append(snapshot_publish_age_ms - max_age_ms)
+        if market_observed_age_ms > market_max_age_ms:
+            stale_overages.append(market_observed_age_ms - market_max_age_ms)
+        fresh_source_ages = []
+        for quote in getattr(snapshot, "quotes", {}).values():
+            observed_at_ms = self._snapshot_quote_direct_observed_at_ms(quote)
+            if observed_at_ms > 0:
+                age_ms = max(now_ms - observed_at_ms, 0)
+                if age_ms <= self._snapshot_domain_budget_ms("quote"):
+                    fresh_source_ages.append(age_ms)
+        fresh_source_age_ms = min(fresh_source_ages) if fresh_source_ages else 0
+
         return {
             "freshness": freshness,
             "venues": degraded_venues,
@@ -7310,6 +7467,9 @@ class LiveRuntime:
             "top_degraded_symbols": top_degraded_symbols,
             "snapshot_publish_age_ms": max(snapshot_publish_age_ms, 0),
             "market_observed_age_ms": max(market_observed_age_ms, 0),
+            "fallback_duration_ms": max(stale_overages) if stale_overages else 0,
+            "last_good_age_ms": max(snapshot_publish_age_ms, 0),
+            "fresh_source_age_ms": fresh_source_age_ms,
             "per_venue_quote_count": dict(sorted(per_venue_quote_count.items())),
             "per_venue_candidate_count": dict(sorted(per_venue_candidate_count.items())),
             "source_mode": str(getattr(snapshot, "source_mode", "") or ""),
@@ -7478,6 +7638,34 @@ class LiveRuntime:
             return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
         return "tradeable_candidates_blocked_by_entry_local_l2_readiness"
 
+    @staticmethod
+    def _no_tradeable_reason_from_candidate_blockers(
+        blocked_reason_counts: Counter,
+        snapshot_freshness_blockers: Counter,
+    ) -> str:
+        if snapshot_freshness_blockers:
+            return "candidate_snapshot_domain_stale"
+        blockers = {
+            str(key) for key, count in blocked_reason_counts.items()
+            if int(count) > 0
+        }
+        if blockers & {
+            "funding_edge_below_floor",
+            "expected_edge_below_floor",
+            "worst_case_edge_below_floor",
+            "zero_order_size",
+        }:
+            return "candidate_edge_insufficient"
+        if blockers & {
+            "funding_window_passed",
+            "outside_scan_window",
+            "no_near_term_settlement",
+            "stagger_gap_too_wide",
+            "missing_candidate_identity_or_funding_timestamp",
+        }:
+            return "candidate_window_mismatch"
+        return "no_tradeable_candidates"
+
     def _emit_scan_no_entry_diagnostics(
         self,
         *,
@@ -7500,6 +7688,14 @@ class LiveRuntime:
         for candidate in getattr(snapshot, "candidates", []) or []:
             for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
                 blocked_reason_counts[str(blocked_reason)] += 1
+        snapshot_freshness_blockers = Counter(
+            getattr(self, "_last_snapshot_freshness_filter_blockers", Counter())
+        )
+        if reason == "no_tradeable_candidates":
+            reason = self._no_tradeable_reason_from_candidate_blockers(
+                blocked_reason_counts,
+                snapshot_freshness_blockers,
+            )
 
         readiness = self._entry_l2_readiness_diagnostics_payload()
         candidate_samples = []
@@ -7545,6 +7741,15 @@ class LiveRuntime:
 
         payload = {
             "reason": reason,
+            "generic_reason": (
+                "no_tradeable_candidates"
+                if reason in {
+                    "candidate_snapshot_domain_stale",
+                    "candidate_edge_insufficient",
+                    "candidate_window_mismatch",
+                }
+                else reason
+            ),
             "candidate_count": len(getattr(snapshot, "candidates", []) or []),
             "tradeable_count": len(tradeable),
             "selected_candidate_count": selected_candidate_count,
@@ -7552,6 +7757,12 @@ class LiveRuntime:
             "remaining_slots": max(int(remaining_slots), 0),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
+            "snapshot_freshness_blocked_counts": dict(
+                sorted(snapshot_freshness_blockers.items())
+            ),
+            "snapshot_freshness_blocked_samples": list(
+                getattr(self, "_last_snapshot_freshness_filter_samples", []) or []
+            )[:24],
             "execution_liquidity_blocked_counts": dict(
                 sorted(execution_liquidity_blocked_counts.items())
             ),

@@ -68,6 +68,34 @@ class TestPublisher:
             assert len(loaded.candidates) == 1
             assert loaded.candidates[0].symbol == "BTCUSDT"
 
+    def test_quote_freshness_provenance_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "snap.json"
+            snap = SidecarSnapshot(
+                published_at_ms=2000,
+                quotes={
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=50000,
+                        ask=50001,
+                        observed_at_ms=1234,
+                        source="sidecar_quote",
+                    )
+                },
+            )
+
+            publish_snapshot(snap, path)
+            raw = json.loads(path.read_text())
+            assert raw["quotes"]["binance:BTCUSDT"]["observed_at_ms"] == 1234
+            assert raw["quotes"]["binance:BTCUSDT"]["source"] == "sidecar_quote"
+
+            loaded = load_snapshot(path)
+            assert loaded is not None
+            quote = loaded.quotes["binance:BTCUSDT"]
+            assert quote.observed_at_ms == 1234
+            assert quote.source == "sidecar_quote"
+
     def test_load_missing_returns_none(self):
         assert load_snapshot("/tmp/nonexistent/snap.json") is None
 

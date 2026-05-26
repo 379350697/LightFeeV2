@@ -620,6 +620,7 @@ class TestHyperliquidLiveOrderNowSupported:
         assert adapter._transport._credential.wallet_mode == "api_wallet"
         assert adapter._transport._credential.account_address == ""
 
+
     @pytest.mark.asyncio
     async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):
         from eth_account import Account
@@ -670,6 +671,7 @@ class TestHyperliquidLiveOrderNowSupported:
                 return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
             assert request.url.path == "/exchange"
             assert body["action"] == {"type": "noop"}
+
             return httpx.Response(
                 200,
                 json={"status": "err", "response": "User or API Wallet does not exist"},
@@ -862,7 +864,6 @@ class TestHyperliquidLiveOrderNowSupported:
         cred = LiveCredential(
             wallet_private_key=wallet_key,
             account_address="0x000000000000000000000000000000000000beef",
-            wallet_mode="api_wallet",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
         transport._hl_meta_cache["BTC"] = 0
@@ -896,7 +897,11 @@ class TestHyperliquidLiveOrderNowSupported:
             account_address="0x000000000000000000000000000000000000beef",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
-        transport._hl_meta_cache["SUPER"] = 123
+        transport._hl_asset_meta_cache["SUPER"] = {
+            "asset_index": 123,
+            "sz_decimals": 0,
+            "price_decimals": 6,
+        }
 
         def handler(request: httpx.Request) -> httpx.Response:
             raise AssertionError(f"unexpected Hyperliquid request: {request.url.path}")
@@ -919,71 +924,6 @@ class TestHyperliquidLiveOrderNowSupported:
 
         assert exc_info.value.class_ == SubmitFailureClass.REJECTED
         assert "hyperliquid_trading_disabled:trading_preflight_not_verified" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):
-        from eth_account import Account
-
-        wallet_key = "0x" + "1" * 64
-        account_address = Account.from_key(wallet_key).address
-        cred = LiveCredential(
-            wallet_private_key=wallet_key,
-            account_address=account_address,
-        )
-        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content.decode())
-            assert body["type"] == "clearinghouseState"
-            assert body["user"].lower() == account_address.lower()
-            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
-
-        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            result = await transport.verify_live_trading_preflight()
-        finally:
-            await transport.close()
-
-        assert result["status"] == "ok"
-        assert result["signer_matches_account"] is True
-        assert result["wallet_matches_account"] is True
-        assert result["clearinghouse_state_readable"] is True
-        assert result["trading_capability_trusted"] is True
-        assert transport.trading_capability_trusted is True
-
-    @pytest.mark.asyncio
-    async def test_hyperliquid_readonly_preflight_disables_unverified_api_wallet(self):
-        wallet_key = "0x" + "1" * 64
-        cred = LiveCredential(
-            wallet_private_key=wallet_key,
-            account_address="0x000000000000000000000000000000000000beef",
-            wallet_mode="api_wallet",
-        )
-        transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content.decode())
-            if request.url.path == "/info":
-                assert body["type"] == "clearinghouseState"
-                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
-            assert request.url.path == "/exchange"
-            assert body["action"] == {"type": "noop"}
-            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
-
-        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            result = await transport.verify_live_trading_preflight()
-        finally:
-            await transport.close()
-
-        assert result["status"] == "failed"
-        assert result["wallet_matches_account"] is False
-        assert result["signer_matches_account"] is False
-        assert result["api_wallet_authorization_verified"] is False
-        assert result["clearinghouse_state_readable"] is True
-        assert result["trading_capability_trusted"] is False
-        assert transport.trading_capability_trusted is False
-        assert result["reason"] == "api_wallet_authorization_unverified"
 
     @pytest.mark.asyncio
     async def test_live_place_order_signs_with_wallet_private_key_not_api_secret(self, monkeypatch):

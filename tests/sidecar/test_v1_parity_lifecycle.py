@@ -261,6 +261,8 @@ class TestRefreshPublicationSemantics:
         assert snapshot.market_observed_at_ms == 1000
         assert snapshot.published_at_ms == 7000
         assert svc._last_good_at_ms == 7000
+        assert snapshot.quotes["binance:BTCUSDT"].observed_at_ms == 1000
+        assert snapshot.quotes["binance:BTCUSDT"].source == "sidecar_quote"
         assert snapshot.liquidity_lifecycle[0].observed_at_ms == 1000
         assert snapshot.liquidity_lifecycle[0].published_at_ms == 7000
         assert snapshot.liquidity_lifecycle[0].publish_interval_ms == 6000

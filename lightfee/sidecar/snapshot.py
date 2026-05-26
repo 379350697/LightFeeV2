@@ -83,6 +83,8 @@ class QuoteSnapshot:
     symbol: str
     bid: float
     ask: float
+    observed_at_ms: int = 0
+    source: str = "sidecar_quote"
     bid_size: float = 0.0
     ask_size: float = 0.0
     funding_rate_bps: float = 0.0
