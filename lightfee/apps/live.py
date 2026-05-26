@@ -106,6 +106,42 @@ def _cancel_tasks_without_wait(tasks: list[asyncio.Task], *, stage: str) -> None
         task.add_done_callback(_consume_result)
 
 
+def _wire_production_executors(runtime, venue_adapters) -> bool:
+    """Wire live-only executor dependencies when runtime has the production contract."""
+
+    journal = getattr(runtime, "journal", None)
+    supervisor = getattr(runtime, "supervisor", None)
+    missing = [
+        name
+        for name, value in (
+            ("journal", journal),
+            ("supervisor", supervisor),
+        )
+        if value is None
+    ]
+    if missing:
+        logger.debug(
+            "production executor wiring skipped runtime_type=%s missing=%s",
+            type(runtime).__name__,
+            ",".join(missing),
+        )
+        return False
+
+    from lightfee.engine.close_executor import CloseExecutor
+    from lightfee.engine.entry_sync import EntrySyncExecutor
+    from lightfee.engine.reconciliation import OrderReconciler
+
+    runtime.entry_executor = EntrySyncExecutor(
+        adapters=venue_adapters, journal=journal,
+    )
+    runtime.close_executor = CloseExecutor(
+        adapters=venue_adapters, journal=journal,
+    )
+    supervisor.close_executor = runtime.close_executor
+    runtime.reconciler = OrderReconciler(adapters=venue_adapters)
+    return True
+
+
 async def async_main(
     config_path: str = "config/example.toml",
     *,
@@ -126,19 +162,8 @@ async def async_main(
     )
     runtime = LiveRuntime(config, venue_adapters=venue_adapters)
 
-    # Wire production executors (V1 live closure — Fix 2)
-    from lightfee.engine.close_executor import CloseExecutor
-    from lightfee.engine.entry_sync import EntrySyncExecutor
-    from lightfee.engine.reconciliation import OrderReconciler
-
-    runtime.entry_executor = EntrySyncExecutor(
-        adapters=venue_adapters, journal=runtime.journal,
-    )
-    runtime.close_executor = CloseExecutor(
-        adapters=venue_adapters, journal=runtime.journal,
-    )
-    runtime.supervisor.close_executor = runtime.close_executor
-    runtime.reconciler = OrderReconciler(adapters=venue_adapters)
+    # Wire production executors (V1 live closure - Fix 2)
+    _wire_production_executors(runtime, venue_adapters)
 
     # Initialize global rate-limit runtime for SIGHUP and periodic reload
     from lightfee.rate_limit.engine import (
@@ -223,17 +248,21 @@ async def async_main(
                 {start_task, shutdown_wait_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            start_completed = start_task in done
             if shutdown_wait_task in done and shutdown_event.is_set():
                 _log_signal_received()
-                await _cancel_tasks_with_timeout(
-                    [start_task],
-                    timeout_s=shutdown_timeout_s,
-                    stage="cancel_tasks",
-                )
-            else:
+                if not start_completed:
+                    await _cancel_tasks_with_timeout(
+                        [start_task],
+                        timeout_s=shutdown_timeout_s,
+                        stage="cancel_tasks",
+                    )
+            if start_completed:
+                await start_task
+            elif not shutdown_event.is_set():
                 await start_task
 
-            if shutdown_event.is_set():
+            if shutdown_event.is_set() and not start_completed:
                 return
 
             run_loop_task = asyncio.create_task(

@@ -145,6 +145,25 @@ class TestRuntimePreflight:
             # Journal is closed after stop
             assert runtime.journal._file is None
 
+    def test_live_main_wires_production_executors_for_real_runtime(self):
+        """The live entrypoint wiring must remain active for real LiveRuntime."""
+        from lightfee.apps.live import _wire_production_executors
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.entry_sync import EntrySyncExecutor
+        from lightfee.engine.reconciliation import OrderReconciler
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config, venue_adapters={})
+
+            wired = _wire_production_executors(runtime, {})
+
+            assert wired is True
+            assert isinstance(runtime.entry_executor, EntrySyncExecutor)
+            assert isinstance(runtime.close_executor, CloseExecutor)
+            assert isinstance(runtime.reconciler, OrderReconciler)
+            assert runtime.supervisor.close_executor is runtime.close_executor
+
     @pytest.mark.asyncio
     async def test_shutdown_calls_per_adapter_shutdown(self):
         """V1 parity: LiveRuntime.stop() calls shutdown() on each venue adapter."""

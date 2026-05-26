@@ -4333,6 +4333,7 @@ class LiveRuntime:
             return generate_exchange_cid(seed, "c", venue)
 
         max_attempts = 3
+        retry_quantity_by_attempt: dict[int, float] = {}
         for attempt in range(1, max_attempts + 1):
             cleanup_client_order_id = cleanup_client_order_id_for_attempt(attempt)
             try:
@@ -4347,6 +4348,13 @@ class LiveRuntime:
             # V2 PositionSnapshot.quantity is always abs(size); side carries direction.
             # side=BUY (long) → cleanup SELL; side=SELL (short) → cleanup BUY
             cleanup_side = pos.side.opposite()
+            live_quantity = abs(pos.quantity)
+            cleanup_quantity = live_quantity
+            retry_quantity = retry_quantity_by_attempt.get(attempt)
+            if retry_quantity is not None:
+                cleanup_quantity = min(live_quantity, retry_quantity)
+                if cleanup_quantity <= 1e-9:
+                    return True
 
             event_kind = (
                 "entry.cleanup_leg_exposure"
@@ -4363,6 +4371,7 @@ class LiveRuntime:
                     "venue": venue.value,
                     "symbol": symbol,
                     "size": pos.quantity,
+                    "target_qty": cleanup_quantity,
                     "side": pos.side.value,
                     "cleanup_side": cleanup_side.value,
                     "cleanup_client_order_id": cleanup_client_order_id,
@@ -4377,7 +4386,7 @@ class LiveRuntime:
                     venue=venue,
                     symbol=symbol,
                     side=cleanup_side,
-                    quantity=abs(pos.quantity),
+                    quantity=cleanup_quantity,
                     price=None,
                     post_only=False,
                     reduce_only=True,  # V1: cleanup always reduce-only
@@ -4389,7 +4398,7 @@ class LiveRuntime:
 
                 # V1: cleanup success needs EITHER fill covering target qty
                 # OR verified-flat position after partial/ambiguous fill.
-                target_qty = abs(pos.quantity)
+                target_qty = cleanup_quantity
                 if fill.quantity >= target_qty - 1e-9:
                     return True
 
@@ -4420,7 +4429,7 @@ class LiveRuntime:
                         max_attempts=max_attempts,
                         client_order_id=cleanup_client_order_id,
                         next_client_order_id=next_client_order_id,
-                        target_qty=abs(pos.quantity),
+                        target_qty=cleanup_quantity,
                         live_pos_before=pos,
                         original_error=str(e),
                     )
@@ -4430,6 +4439,7 @@ class LiveRuntime:
                         return False
                     if attempt >= max_attempts:
                         return False
+                    retry_quantity_by_attempt[attempt + 1] = duplicate_reconcile.retry_qty
                     self.journal.append(
                         "entry.cleanup_leg_exposure_retry_scheduled",
                         {
@@ -4440,9 +4450,17 @@ class LiveRuntime:
                             "venue": venue.value,
                             "symbol": symbol,
                             "client_order_id": cleanup_client_order_id,
+                            "original_client_order_id": cleanup_client_order_id,
                             "next_client_order_id": next_client_order_id,
                             "reason": "duplicate_client_order_id_partial",
+                            "target_qty": duplicate_reconcile.target_qty,
+                            "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                            "live_qty": duplicate_reconcile.live_qty,
+                            "remaining_qty": duplicate_reconcile.remaining_qty,
+                            "retry_qty": duplicate_reconcile.retry_qty,
                             "retry_quantity": duplicate_reconcile.retry_qty,
+                            "decision": duplicate_reconcile.decision,
+                            "classification": duplicate_reconcile.classification,
                         },
                     )
                     continue

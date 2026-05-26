@@ -2713,9 +2713,25 @@ class TestRealPathAbortCleanupDeadline:
         second_cid = fake._place_order_calls[1].client_order_id
         assert first_cid != second_cid
         assert fake._place_order_calls[1].reduce_only is True
+        assert fake._place_order_calls[1].time_in_force == TimeInForce.IOC
+        assert fake._place_order_calls[1].side == Side.BUY
+        assert fake._place_order_calls[1].quantity == pytest.approx(300.0)
         assert fake._fetch_order_fill_reconciliation_calls == [
             ("UBUSDT", "", first_cid)
         ]
+        retry_scheduled = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "entry.cleanup_leg_exposure_retry_scheduled"
+        ][-1]
+        assert retry_scheduled["client_order_id"] == first_cid
+        assert retry_scheduled["next_client_order_id"] == second_cid
+        assert retry_scheduled["target_qty"] == pytest.approx(400.0)
+        assert retry_scheduled["reconciled_qty"] == pytest.approx(100.0)
+        assert retry_scheduled["live_qty"] == pytest.approx(400.0)
+        assert retry_scheduled["remaining_qty"] == pytest.approx(300.0)
+        assert retry_scheduled["retry_qty"] == pytest.approx(300.0)
+        assert retry_scheduled["decision"] == "retry_new_client_order_id"
+        assert retry_scheduled["classification"] == "partial"
         payload = [
             e["payload"] for e in runtime.journal.read_all()
             if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
@@ -2779,6 +2795,71 @@ class TestRealPathAbortCleanupDeadline:
         ][-1]
         assert unified["status"] == "none"
         assert unified["next_action"] == "backoff_recheck"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_bybit_duplicate_zero_fill_live_fetch_error_backs_off(self, tmp_path):
+        """No fill evidence plus live fetch failure must not blind-retry a new cid."""
+
+        class DuplicateNoEvidenceLiveFetchFailsAdapter(_FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self._fetched_initial_position = False
+
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                if not self._fetched_initial_position:
+                    self._fetched_initial_position = True
+                    return PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol=symbol,
+                        side=Side.SELL,
+                        quantity=400.0,
+                        entry_price=0.011,
+                        observed_at_ms=1000,
+                    )
+                raise RuntimeError("live position unavailable")
+
+            async def place_order(self, request):
+                self._place_order_calls.append(request)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self._fetch_order_fill_reconciliation_calls.append(
+                    (symbol, order_id, client_order_id)
+                )
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    average_price=0.0,
+                    order_id="",
+                    client_order_id=client_order_id,
+                    filled_at_ms=1100,
+                )
+
+        runtime = _make_open_runtime(tmp_path)
+        fake = DuplicateNoEvidenceLiveFetchFailsAdapter()
+        runtime._venue_adapters[Venue.BYBIT] = fake
+
+        result = await runtime._cleanup_failed_leg_exposure(
+            Venue.BYBIT, "UBUSDT", "live-recovery:probe:UBUSDT:bybit",
+            "live_recovery_mismatch",
+        )
+
+        assert result is False
+        assert len(fake._place_order_calls) == 1
+        payload = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
+        ][-1]
+        assert payload["classification"] == "unknown_transient"
+        assert payload["decision"] == "backoff_recheck"
+        assert payload["reconciled_qty"] == pytest.approx(0.0)
+        assert payload["live_fetch_error"] == "live position unavailable"
 
     # ── Bug 3: _abort_pending_entry returns bool; resolved pop conditional ──
 

@@ -106,7 +106,9 @@ async def reconcile_bybit_duplicate_client_order(
         classification = "none"
         decision = "backoff_recheck"
 
-    retry_qty = live_qty if decision == "retry_new_client_order_id" and live_qty > 1e-9 else remaining_qty
+    retry_qty = remaining_qty
+    if decision == "retry_new_client_order_id" and live_qty > 1e-9:
+        retry_qty = min(remaining_qty, live_qty)
 
     return BybitDuplicateReconcileResult(
         classification=classification,
