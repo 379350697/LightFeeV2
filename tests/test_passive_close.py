@@ -31,6 +31,8 @@ from lightfee.core.domain import (
     Side,
     TimeInForce,
     Venue,
+    VenueMarketQuote,
+    VenueMarketSnapshot,
 )
 from lightfee.engine.close_executor import CloseExecutionLeg
 from lightfee.engine.exit import CloseExecution
@@ -147,6 +149,41 @@ def _mock_adapter_passive_ok(venue=Venue.BINANCE):
     ))
     adapter.query_passive_order_progress = AsyncMock(return_value=None)
     adapter.place_order = AsyncMock(return_value=_make_order_fill(venue=venue))
+    return adapter
+
+
+def _attach_bybit_min_notional_transport(adapter, min_notional="5"):
+    """Attach a Bybit instruments-info stub with an explicit minNotionalValue."""
+    from lightfee.venues.specs import get_spec
+    from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+    class FakeBybitTransport:
+        _spec = get_spec(Venue.BYBIT)
+
+        def _venue_symbol(self, symbol):
+            return symbol
+
+        async def _public_get(self, path, params=None):
+            assert path == "/v5/market/instruments-info"
+            symbol = (params or {}).get("symbol", "BEATUSDT")
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": symbol,
+                            "priceFilter": {"tickSize": "0.0001"},
+                            "lotSizeFilter": {
+                                "qtyStep": "1",
+                                "minOrderQty": "1",
+                                "minNotionalValue": str(min_notional),
+                            },
+                        }
+                    ]
+                }
+            }
+
+    get_symbol_rules_cache().clear()
+    adapter._transport = FakeBybitTransport()
     return adapter
 
 
@@ -597,6 +634,61 @@ class TestStartPendingPassiveClose:
         )
         assert pending is None
 
+    def test_beatusdt_recovered_start_clears_live_flat_before_orders(self):
+        """Recovered passive close must prove live flat before hedge/maker work."""
+        journal = _open_journal()
+        long_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        short_adapter = _mock_adapter_passive_ok(Venue.BYBIT)
+        long_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+        short_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.SELL,
+            quantity=0.0, entry_price=0.0, observed_at_ms=3000,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.OKX: long_adapter, Venue.BYBIT: short_adapter}, journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+        state = EngineState()
+        position = _make_position(
+            position_id="live-recovered:BEATUSDT:okx->bybit",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=6_000.0,
+            short_quantity=6_000.0,
+            matched_quantity=6_000.0,
+        )
+        state.open_positions[position.position_id] = position
+        state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
+        state.recovery_blocked_at_ms = 1234
+
+        pending = asyncio.run(
+            executor.start_pending_passive_close(
+                state, position, "funding_capture",
+                long_price_hint=0.0, short_price_hint=0.0,
+            )
+        )
+
+        assert pending is None
+        assert position.position_id not in state.open_positions
+        assert position.position_id not in state.pending_passive_closes
+        long_adapter.submit_passive_order.assert_not_called()
+        short_adapter.submit_passive_order.assert_not_called()
+        long_adapter.place_order.assert_not_called()
+        short_adapter.place_order.assert_not_called()
+
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "recovery.flat" in kinds
+        assert "runtime.position_drift_corrected" in kinds
+        assert "runtime.stale_recovery_block_cleared" in kinds
+        assert "order.submit_attempt" not in kinds
+        assert "exit.passive_close_hedge_dust_aborted" not in kinds
+        assert state.recovery_blocked_reason is None
+        assert state.recovery_blocked_at_ms == 0
+
 
 # ---------------------------------------------------------------------------
 # Multi-chunk
@@ -830,6 +922,7 @@ class TestTerminalMakerFillHedgeFail:
             Venue.BYBIT,
             [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
         )
+        _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
         executor = PassiveCloseExecutor(adapters, journal)
         executor.set_close_executor(CloseExecutor(adapters, journal))
@@ -1139,6 +1232,238 @@ class TestTerminalMakerFillHedgeFail:
 class TestPartialMakerFillGradualCatchUp:
     """Test 4: non-terminal partial maker fill → gradual hedge catch-up."""
 
+    def test_delta_hedge_resolves_market_price_when_local_hint_zero(self):
+        """price_hint=0 must not become a fake min_notional_rejected notional=0."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE, symbol="BEATUSDT", side=Side.SELL,
+            cumulative_quantity=6_000.0, average_price=0.0,
+            state=PassiveOrderState.FILLED,
+        ))
+        hedge_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=6_000.0)
+        hedge_adapter.fetch_market_snapshot = AsyncMock(return_value=VenueMarketSnapshot(
+            venue=Venue.BYBIT,
+            observed_at_ms=3000,
+            quotes=(VenueMarketQuote(symbol="BEATUSDT", bid=0.0019, ask=0.0021),),
+        ))
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=6_000.0, price=0.0021,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
+            config_overrides={"small_fill_buffer_notional_quote": 10.0},
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-beatusdt-price",
+            symbol="BEATUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=6_000.0,
+            short_quantity=6_000.0,
+            matched_quantity=6_000.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=6_000.0,
+            chunk_quantities=[6_000.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=0.002,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is True
+        hedge_adapter.fetch_market_snapshot.assert_awaited_once_with(["BEATUSDT"])
+        hedge_adapter.place_order.assert_awaited_once()
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_hedge_dust_aborted" not in kinds
+
+    def test_delta_hedge_classifies_missing_price_separately_from_min_notional(self):
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE, symbol="BEATUSDT", side=Side.SELL,
+            cumulative_quantity=6_000.0, average_price=0.0,
+            state=PassiveOrderState.FILLED,
+        ))
+        hedge_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=6_000.0)
+        hedge_adapter.fetch_market_snapshot = AsyncMock(side_effect=RuntimeError("ticker unavailable"))
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=6_000.0, price=0.0,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
+            config_overrides={"small_fill_buffer_notional_quote": 10.0},
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-beatusdt-price-missing",
+            symbol="BEATUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=6_000.0,
+            short_quantity=6_000.0,
+            matched_quantity=6_000.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=6_000.0,
+            chunk_quantities=[6_000.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=0.002,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        hedge_adapter.place_order.assert_not_called()
+        dust = next(
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_hedge_dust_aborted"
+        )
+        assert dust["payload"]["reason"] == "price_unavailable_for_min_notional"
+        assert dust["payload"]["reason"] != "min_notional_rejected"
+
+    def test_delta_hedge_uses_bybit_instrument_min_notional_not_buffer(self):
+        """Bybit hard min-notional comes from instruments-info, not local buffer."""
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        class FakeBybitTransport:
+            _spec = get_spec(Venue.BYBIT)
+
+            def _venue_symbol(self, symbol):
+                return symbol
+
+            async def _public_get(self, path, params=None):
+                assert path == "/v5/market/instruments-info"
+                assert params == {"category": "linear", "symbol": "BEATUSDT"}
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BEATUSDT",
+                                "priceFilter": {"tickSize": "0.0001"},
+                                "lotSizeFilter": {
+                                    "qtyStep": "1",
+                                    "minOrderQty": "1",
+                                    "minNotionalValue": "1",
+                                },
+                            }
+                        ]
+                    }
+                }
+
+        get_symbol_rules_cache().clear()
+        journal = _open_journal()
+        hedge_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge_adapter._transport = FakeBybitTransport()
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=2.0)
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=2.0, price=1.0,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BYBIT: hedge_adapter}, journal,
+            config_overrides={"small_fill_buffer_notional_quote": 10.0},
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+
+        position = _make_position(
+            position_id="entry-beatusdt-dynamic-min",
+            symbol="BEATUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            matched_quantity=2.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=2.0,
+            chunk_quantities=[2.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=2.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                EngineState(), pending, position, 2.0, maker_terminal=True,
+            )
+        )
+
+        assert result.success is True
+        hedge_adapter.place_order.assert_awaited_once()
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_hedge_dust_aborted" not in kinds
+
+    def test_okx_market_snapshot_matches_swap_inst_id_for_price(self):
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.OKX)
+        adapter.fetch_market_snapshot = AsyncMock(return_value=VenueMarketSnapshot(
+            venue=Venue.OKX,
+            observed_at_ms=3000,
+            quotes=(
+                VenueMarketQuote(symbol="OTHER-USDT-SWAP", bid=1.0, ask=1.1),
+                VenueMarketQuote(symbol="BEAT-USDT-SWAP", bid=0.0019, ask=0.0021),
+            ),
+        ))
+        executor = PassiveCloseExecutor({Venue.OKX: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+
+        price, source = asyncio.run(
+            executor._resolve_hedge_reference_price(
+                Venue.OKX, "BEATUSDT", Side.BUY, 0.0,
+            )
+        )
+
+        assert price == pytest.approx(0.0021)
+        assert source == "market_snapshot_best_ask"
+
     def test_generic_delta_hedge_bybit_dust_gap_uses_same_guard(self):
         """Non-terminal delta hedge must reuse the same pre-submit dust guard."""
         journal = _open_journal()
@@ -1305,6 +1630,7 @@ class TestFallbackResidualReal:
             Venue.BYBIT,
             [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
         )
+        _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
         executor = PassiveCloseExecutor(adapters, journal)
         executor.set_close_executor(CloseExecutor(adapters, journal))
@@ -1522,6 +1848,7 @@ class TestFallbackResidualReal:
                 (0.0, Side.SELL),
             ],
         )
+        _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
         executor = PassiveCloseExecutor(adapters, journal)
         executor.set_close_executor(CloseExecutor(adapters, journal))
@@ -1959,6 +2286,319 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_hedge_duplicate_client_order_reconciled" in kinds
         assert "exit.passive_close_resolved" in kinds
         assert "exit.passive_close_hedge_error" not in kinds
+
+    def test_ubusdt_bybit_duplicate_partial_retries_remaining_with_new_cid(self):
+        """UBUSDT regression: partial duplicate evidence retries remaining reduce-only."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class FilledMakerAdapter(VenueAdapter):
+            @property
+            def venue(self):
+                return Venue.BINANCE
+
+            async def place_order(self, request):
+                return _make_order_fill(
+                    venue=Venue.BINANCE,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0,
+                )
+
+            async def fetch_position(self, symbol):
+                return None
+
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return PassiveOrderProgress(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=side,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    cumulative_quantity=400.0,
+                    average_price=1.0,
+                    fee_quote=0.0,
+                    last_fill_time_ms=1500,
+                    state=PassiveOrderState.FILLED,
+                    observed_at_ms=1500,
+                )
+
+        class PartialDuplicateBybitAdapter(VenueAdapter):
+            def __init__(self):
+                self.place_order_calls = []
+                self.reconciliation_lookups = []
+
+            @property
+            def venue(self):
+                return Venue.BYBIT
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                if len(self.place_order_calls) == 1:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                    )
+                return _make_order_fill(
+                    venue=Venue.BYBIT,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0,
+                    order_id="retry-oid",
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=100.0,
+                    average_price=1.0,
+                    order_id="partial-oid",
+                    client_order_id=client_order_id,
+                    filled_at_ms=1600,
+                )
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=400.0,
+                    entry_price=1.0,
+                    observed_at_ms=1700,
+                )
+
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return None
+
+        binance = FilledMakerAdapter()
+        bybit = PartialDuplicateBybitAdapter()
+        adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-ubusdt-passive-partial",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=400.0,
+            short_quantity=400.0,
+            matched_quantity=400.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=400.0,
+            chunk_quantities=[400.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=400.0,
+                average_price=1.0,
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+            ),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is True
+        assert len(bybit.place_order_calls) == 2
+        assert bybit.place_order_calls[0].client_order_id != bybit.place_order_calls[1].client_order_id
+        assert bybit.place_order_calls[1].reduce_only is True
+        assert bybit.place_order_calls[1].quantity == pytest.approx(300.0)
+        assert pending.hedge_fill.quantity == pytest.approx(400.0)
+        assert pending.hedge_fill.client_order_id == bybit.place_order_calls[1].client_order_id
+        assert pending.short_legs[-1].client_order_id == bybit.place_order_calls[1].client_order_id
+        assert position.position_id not in state.pending_passive_closes
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "order.reconcile_result"
+        ][-1]
+        assert payload["status"] == "partial"
+        assert payload["target_qty"] == pytest.approx(400.0)
+        assert payload["reconciled_qty"] == pytest.approx(100.0)
+        assert payload["live_qty"] == pytest.approx(400.0)
+        assert payload["remaining_qty"] == pytest.approx(300.0)
+
+    def test_ubusdt_bybit_duplicate_partial_retry_failure_backs_off(self):
+        """Partial evidence followed by retry failure must not escape the state machine."""
+        journal = _open_journal()
+
+        class PartialDuplicateRetryFailsAdapter(VenueAdapter):
+            def __init__(self):
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return Venue.BYBIT
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                if len(self.place_order_calls) == 1:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                    )
+                raise OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "retry submit timed out after duplicate reconciliation",
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=100.0,
+                    average_price=1.0,
+                    order_id="partial-oid",
+                    client_order_id=client_order_id,
+                    filled_at_ms=1600,
+                )
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=400.0,
+                    entry_price=1.0,
+                    observed_at_ms=1700,
+                )
+
+        bybit = PartialDuplicateRetryFailsAdapter()
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        position = _make_position(
+            position_id="entry-ubusdt-passive-retry-fails",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=400.0,
+            short_quantity=400.0,
+            matched_quantity=400.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=400.0,
+            chunk_quantities=[400.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=400.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                EngineState(), pending, position, 400.0, maker_terminal=True,
+            )
+        )
+
+        assert result.success is False
+        assert result.filled == pytest.approx(100.0)
+        assert result.residual == pytest.approx(300.0)
+        assert result.error == "duplicate_client_order_id_retry_failed"
+        assert len(bybit.place_order_calls) == 2
+        assert pending.hedge_fill.quantity == pytest.approx(100.0)
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_hedge_duplicate_client_order_retry_failed" in kinds
+
+    def test_ubusdt_bybit_duplicate_no_evidence_backs_off_no_blind_retry(self):
+        """UBUSDT regression: no duplicate evidence must not place a new cid."""
+        journal = _open_journal()
+
+        class DuplicateNoEvidenceBybitAdapter(VenueAdapter):
+            def __init__(self):
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return Venue.BYBIT
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return None
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=400.0,
+                    entry_price=1.0,
+                    observed_at_ms=1700,
+                )
+
+        bybit = DuplicateNoEvidenceBybitAdapter()
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        position = _make_position(
+            position_id="entry-ubusdt-passive-none",
+            symbol="UBUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=400.0,
+            short_quantity=400.0,
+            matched_quantity=400.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=400.0,
+            chunk_quantities=[400.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=400.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                EngineState(), pending, position, 400.0, maker_terminal=True,
+            )
+        )
+
+        assert result.success is False
+        assert result.error == "duplicate_client_order_id_backoff"
+        assert len(bybit.place_order_calls) == 1
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "order.reconcile_result"
+        ][-1]
+        assert payload["status"] == "none"
+        assert payload["next_action"] == "backoff_recheck"
 
     def test_fallback_paired_terminal_reduceonly_rechecks_flat_and_clears(self):
         """Paired fallback must not loop when both close legs report already-flat terminal rejects."""

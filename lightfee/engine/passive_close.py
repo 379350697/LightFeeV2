@@ -15,7 +15,7 @@ import asyncio
 import math
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
@@ -38,6 +38,10 @@ from lightfee.core.domain import (
     TimeInForce,
     Venue,
 )
+from lightfee.engine.bybit_duplicate_reconcile import (
+    build_order_reconcile_result_payload,
+    reconcile_bybit_duplicate_client_order,
+)
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
     _is_bybit_duplicate_order_link_id,
@@ -45,7 +49,7 @@ from lightfee.engine.close_executor import (
     close_leg_exchange_min_notional_violation,
     compute_close_chunks,
 )
-from lightfee.venues.cid import compact_client_order_id
+from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
     ActiveMakerLeg,
@@ -58,10 +62,15 @@ from lightfee.engine.state import (
     PersistedCloseExecutionLeg,
 )
 from lightfee.persistence.journal import Journal
-from lightfee.venues.common import align_passive_price_to_tick, resolve_price_tick
+from lightfee.venues.common import (
+    align_passive_price_to_tick,
+    resolve_price_tick,
+    venue_reduce_only_close_exempts_min_notional,
+)
 from lightfee.venues.capabilities import get_capability_flags
 from lightfee.venues.specs import get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
+from lightfee.engine.recovery import clear_stale_recovery_block_if_recovery_clean
 
 # ---------------------------------------------------------------------------
 # V1 constants
@@ -285,6 +294,24 @@ class PassiveCloseExecutor:
         target = quantity or position.matched_quantity
         if target <= 0.0:
             return None
+
+        if self._is_recovered_position(position):
+            probe_pending = PendingPassiveClose(
+                position_id=pid,
+                reason=reason,
+                position_snapshot=position,
+                short_stage=short_stage or "exit_short",
+                long_stage=long_stage or "exit_long",
+                target_quantity=target,
+                chunk_quantities=[target],
+            )
+            if await self._clear_if_live_flat(
+                state,
+                probe_pending,
+                position,
+                source="recovered_passive_close_start_flat_probe",
+            ):
+                return None
 
         chunk_quantities = compute_close_chunks(
             total_quantity=target,
@@ -611,10 +638,26 @@ class PassiveCloseExecutor:
                 # V1 exit.rs:2297-2348 — normalize quantity, check min_notional_violation
                 # BEFORE submitting the hedge. If below min_notional and maker can still
                 # accumulate, track attempt without submitting.
+                hedge_side_for_notional = (
+                    Side.BUY if maker_leg == ActiveMakerLeg.LONG else Side.SELL
+                )
+                hedge_price_hint, hedge_price_source = await self._resolve_hedge_reference_price(
+                    hedge_venue_for_notional,
+                    position.symbol,
+                    hedge_side_for_notional,
+                    hedge_price_hint,
+                )
+                hedge_min_notional, hedge_min_notional_source = await self._resolve_hedge_min_notional_quote(
+                    hedge_venue_for_notional,
+                    position.symbol,
+                )
                 min_notional_violation = self._check_hedge_min_notional(
                     hedge_venue_for_notional, position.symbol,
-                    Side.BUY if maker_leg == ActiveMakerLeg.LONG else Side.SELL,
+                    hedge_side_for_notional,
                     unhedged_gap, hedge_price_hint,
+                    price_source=hedge_price_source,
+                    min_notional_quote=hedge_min_notional,
+                    min_notional_source=hedge_min_notional_source,
                 )
                 if min_notional_violation is not None and can_accumulate:
                     # Hedge is below min notional and maker may still accumulate →
@@ -1258,6 +1301,9 @@ class PassiveCloseExecutor:
             hedge_leg_label = "long"
             price_hint = self._resolve_local_l2_mid(position.long_venue, position.symbol)
 
+        price_hint, price_source = await self._resolve_hedge_reference_price(
+            hedge_venue, position.symbol, hedge_side, price_hint,
+        )
         hedge_price = price_hint if price_hint > 0 else None
         adapter = self._adapter(hedge_venue)
         if adapter is None:
@@ -1284,15 +1330,22 @@ class PassiveCloseExecutor:
                 error=f"normalize_quantity_failed: {e}",
             )
 
+        min_notional_quote, min_notional_source = await self._resolve_hedge_min_notional_quote(
+            hedge_venue,
+            position.symbol,
+        )
         min_notional_violation = self._check_hedge_min_notional(
             hedge_venue, position.symbol, hedge_side,
             normalized_delta, price_hint,
+            price_source=price_source,
+            min_notional_quote=min_notional_quote,
+            min_notional_source=min_notional_source,
         )
         dust_reason = ""
         if normalized_delta <= 1e-12:
             dust_reason = "normalized_quantity_zero"
         elif min_notional_violation is not None:
-            dust_reason = "min_notional_rejected"
+            dust_reason = str(min_notional_violation.get("reason") or "min_notional_rejected")
 
         if dust_reason:
             payload = {
@@ -1302,6 +1355,7 @@ class PassiveCloseExecutor:
                 "requested": delta,
                 "normalized_quantity": normalized_delta,
                 "price_hint": price_hint,
+                "price_source": price_source,
                 "reason": dust_reason,
                 "maker_terminal": maker_terminal,
             }
@@ -1330,6 +1384,15 @@ class PassiveCloseExecutor:
                 )
 
             if maker_terminal:
+                if dust_reason == "price_unavailable_for_min_notional":
+                    pending.next_retry_at_ms = self._now_ms() + 5_000
+                    return HedgeDeltaResult(
+                        requested=delta,
+                        filled=0.0,
+                        residual=delta,
+                        success=False,
+                        error=dust_reason,
+                    )
                 leg_notional = 0.0
                 min_notional = 0.0
                 if min_notional_violation is not None:
@@ -1390,6 +1453,7 @@ class PassiveCloseExecutor:
         )
 
         def record_hedge_fill(fill: OrderFill) -> None:
+            fill_client_order_id = fill.client_order_id or hedge_cid
             previous_qty = pending.hedge_fill.quantity
             new_qty = previous_qty + fill.quantity
             pending.hedge_fill.quantity = new_qty
@@ -1401,11 +1465,11 @@ class PassiveCloseExecutor:
             pending.hedge_fill.fee_quote += fill.fee_quote or 0.0
             pending.hedge_fill.last_fill_time_ms = fill.filled_at_ms
             pending.hedge_fill.order_id = fill.order_id
-            pending.hedge_fill.client_order_id = hedge_cid
+            pending.hedge_fill.client_order_id = fill_client_order_id
 
             leg = PersistedCloseExecutionLeg(
                 fill=fill,
-                client_order_id=hedge_cid,
+                client_order_id=fill_client_order_id,
                 submit_started_at_ms=self._now_ms(),
             )
             if hedge_leg_label == "long":
@@ -1440,6 +1504,181 @@ class PassiveCloseExecutor:
                 hedge_venue == Venue.BYBIT
                 and _is_bybit_duplicate_order_link_id(str(e))
             )
+            if is_bybit_duplicate:
+                duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                    adapter=adapter,
+                    symbol=position.symbol,
+                    client_order_id=hedge_cid,
+                    target_qty=normalized_delta,
+                )
+                self._journal.append(
+                    "order.reconcile_result",
+                    build_order_reconcile_result_payload(
+                        result=duplicate_reconcile,
+                        symbol=position.symbol,
+                        client_order_id=hedge_cid,
+                        reason="duplicate_client_id",
+                    ),
+                )
+
+                recon_fill_qty = duplicate_reconcile.reconciled_qty
+                if recon_fill_qty > 1e-12:
+                    recon_price = duplicate_reconcile.average_price or hedge_price or 0.0
+                    fill = OrderFill(
+                        venue=hedge_venue,
+                        symbol=position.symbol,
+                        side=hedge_side,
+                        quantity=recon_fill_qty,
+                        price=recon_price,
+                        order_id=duplicate_reconcile.order_id,
+                        client_order_id=duplicate_reconcile.client_order_id or hedge_cid,
+                        filled_at_ms=self._now_ms(),
+                    )
+                    record_hedge_fill(fill)
+
+                self._journal.append(
+                    "exit.passive_close_hedge_duplicate_client_order_reconcile_result",
+                    {
+                        "position_id": position.position_id,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_leg": hedge_leg_label,
+                        "client_order_id": hedge_cid,
+                        "classification": duplicate_reconcile.classification,
+                        "decision": duplicate_reconcile.decision,
+                        "target_qty": duplicate_reconcile.target_qty,
+                        "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                        "live_qty": duplicate_reconcile.live_qty,
+                        "remaining_qty": duplicate_reconcile.remaining_qty,
+                        "retry_qty": duplicate_reconcile.retry_qty,
+                        "order_id": duplicate_reconcile.order_id,
+                        "original_error": str(e),
+                    },
+                )
+
+                if duplicate_reconcile.clear_state:
+                    residual = 0.0 if duplicate_reconcile.decision == "clear_live_flat" else max(delta - recon_fill_qty, 0.0)
+                    self._journal.append(
+                        "exit.passive_close_hedge_duplicate_client_order_reconciled",
+                        {
+                            "position_id": position.position_id,
+                            "hedge_venue": hedge_venue.value,
+                            "hedge_leg": hedge_leg_label,
+                            "client_order_id": hedge_cid,
+                            "order_id": duplicate_reconcile.order_id,
+                            "requested": delta,
+                            "filled": recon_fill_qty,
+                            "residual": residual,
+                            "original_error": str(e),
+                            "classification": duplicate_reconcile.classification,
+                        },
+                    )
+                    return HedgeDeltaResult(
+                        requested=delta,
+                        filled=recon_fill_qty,
+                        residual=residual,
+                        success=residual < 1e-12,
+                        error=None if residual < 1e-12 else "partial_fill",
+                        order_id=duplicate_reconcile.order_id,
+                    )
+
+                if duplicate_reconcile.should_retry_with_new_client_id:
+                    retry_quantity = duplicate_reconcile.remaining_qty
+                    if duplicate_reconcile.live_qty > 1e-9:
+                        retry_quantity = min(retry_quantity, duplicate_reconcile.live_qty)
+                    retry_cid = generate_exchange_cid(
+                        f"{position.position_id}:{stage}:{self._now_ms()}",
+                        "dup",
+                        hedge_venue,
+                    )
+                    retry_request = OrderRequest(
+                        venue=hedge_venue,
+                        symbol=position.symbol,
+                        side=hedge_side,
+                        quantity=retry_quantity,
+                        price=hedge_price,
+                        reduce_only=True,
+                        time_in_force=TimeInForce.IOC,
+                        client_order_id=retry_cid,
+                    )
+                    try:
+                        retry_fill = await adapter.place_order(retry_request)
+                    except Exception as retry_error:
+                        residual = max(delta - recon_fill_qty, 0.0)
+                        self._journal.append(
+                            "exit.passive_close_hedge_duplicate_client_order_retry_failed",
+                            {
+                                "position_id": position.position_id,
+                                "hedge_venue": hedge_venue.value,
+                                "hedge_leg": hedge_leg_label,
+                                "client_order_id": hedge_cid,
+                                "next_client_order_id": retry_cid,
+                                "requested": delta,
+                                "retry_quantity": retry_quantity,
+                                "filled": recon_fill_qty,
+                                "residual": residual,
+                                "error": str(retry_error),
+                            },
+                        )
+                        return HedgeDeltaResult(
+                            requested=delta,
+                            filled=recon_fill_qty,
+                            residual=residual,
+                            success=False,
+                            error="duplicate_client_order_id_retry_failed",
+                            order_id=duplicate_reconcile.order_id,
+                        )
+                    if retry_fill.quantity > 0:
+                        retry_fill = replace(
+                            retry_fill,
+                            client_order_id=retry_fill.client_order_id or retry_cid,
+                        )
+                        record_hedge_fill(retry_fill)
+                    total_filled = recon_fill_qty + max(float(retry_fill.quantity or 0.0), 0.0)
+                    residual = max(delta - total_filled, 0.0)
+                    self._journal.append(
+                        "exit.passive_close_hedge_duplicate_client_order_retry",
+                        {
+                            "position_id": position.position_id,
+                            "hedge_venue": hedge_venue.value,
+                            "hedge_leg": hedge_leg_label,
+                            "client_order_id": hedge_cid,
+                            "next_client_order_id": retry_cid,
+                            "requested": delta,
+                            "retry_quantity": retry_quantity,
+                            "filled": total_filled,
+                            "residual": residual,
+                        },
+                    )
+                    return HedgeDeltaResult(
+                        requested=delta,
+                        filled=total_filled,
+                        residual=residual,
+                        success=residual < 1e-12,
+                        error=None if residual < 1e-12 else "partial_fill",
+                        order_id=retry_fill.order_id or duplicate_reconcile.order_id,
+                    )
+
+                self._journal.append(
+                    "exit.passive_close_hedge_duplicate_client_order_pending_reconcile",
+                    {
+                        "position_id": position.position_id,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_leg": hedge_leg_label,
+                        "client_order_id": hedge_cid,
+                        "classification": duplicate_reconcile.classification,
+                        "decision": duplicate_reconcile.decision,
+                        "error": str(e),
+                    },
+                )
+                return HedgeDeltaResult(
+                    requested=delta,
+                    filled=recon_fill_qty,
+                    residual=max(delta - recon_fill_qty, 0.0),
+                    success=False,
+                    error="duplicate_client_order_id_backoff",
+                    order_id=duplicate_reconcile.order_id,
+                )
+
             should_reconcile = isinstance(e, OrderSubmitError) or is_bybit_duplicate
             if should_reconcile:
                 reconciliation = None
@@ -2222,10 +2461,11 @@ class PassiveCloseExecutor:
         *,
         source: str,
         extra: dict[str, Any] | None = None,
+        adapters: dict[Venue, VenueAdapter] | None = None,
     ) -> bool:
         if not await self._probe_live_flatness(
             pending,
-            self._adapters,
+            adapters or self._adapters,
             position_snapshot=position,
         ):
             return False
@@ -2305,6 +2545,11 @@ class PassiveCloseExecutor:
                 "source": source,
             },
         )
+        clear_stale_recovery_block_if_recovery_clean(state, self._journal)
+
+    @staticmethod
+    def _is_recovered_position(position: OpenPosition) -> bool:
+        return str(position.position_id).startswith("live-recovered:")
 
     async def _fetch_live_position_size(self, venue: Venue, symbol: str) -> float:
         adapter = self._adapter(venue)
@@ -2515,12 +2760,22 @@ class PassiveCloseExecutor:
             return False
 
         price_hint = self._resolve_local_l2_mid(venue, position.symbol)
+        price_hint, price_source = await self._resolve_hedge_reference_price(
+            venue, position.symbol, close_side, price_hint,
+        )
+        min_notional_quote, min_notional_source = await self._resolve_hedge_min_notional_quote(
+            venue,
+            position.symbol,
+        )
         min_notional_violation = self._check_hedge_min_notional(
             venue,
             position.symbol,
             close_side,
             normalized_qty,
             price_hint,
+            price_source=price_source,
+            min_notional_quote=min_notional_quote,
+            min_notional_source=min_notional_source,
         )
         if normalized_qty <= 1e-12 or min_notional_violation is not None:
             leg_notional = 0.0
@@ -2528,6 +2783,11 @@ class PassiveCloseExecutor:
             if min_notional_violation is not None:
                 leg_notional = min_notional_violation["leg_notional"]
                 min_notional = min_notional_violation["min_notional"]
+            reason = (
+                "normalized_quantity_zero"
+                if normalized_qty <= 1e-12
+                else str(min_notional_violation.get("reason") or "min_notional_rejected")
+            )
             self._journal.append(
                 "exit.passive_close_hedge_dust_aborted",
                 {
@@ -2537,16 +2797,16 @@ class PassiveCloseExecutor:
                     "requested": live_qty,
                     "normalized_quantity": normalized_qty,
                     "price_hint": price_hint,
-                    "reason": (
-                        "normalized_quantity_zero"
-                        if normalized_qty <= 1e-12
-                        else "min_notional_rejected"
-                    ),
+                    "price_source": price_source,
+                    "reason": reason,
                     "maker_terminal": True,
                     "leg_notional_quote": leg_notional,
                     "venue_min_notional_quote": min_notional,
                 },
             )
+            if reason == "price_unavailable_for_min_notional":
+                pending.next_retry_at_ms = self._now_ms() + 5_000
+                return False
             return await self._abort_and_compensate_min_notional(
                 state,
                 pending,
@@ -2763,12 +3023,22 @@ class PassiveCloseExecutor:
             return False
 
         price_hint = self._resolve_local_l2_mid(excess_venue, position.symbol)
+        price_hint, price_source = await self._resolve_hedge_reference_price(
+            excess_venue, position.symbol, close_side, price_hint,
+        )
+        min_notional_quote, min_notional_source = await self._resolve_hedge_min_notional_quote(
+            excess_venue,
+            position.symbol,
+        )
         min_notional_violation = self._check_hedge_min_notional(
             excess_venue,
             position.symbol,
             close_side,
             normalized_excess,
             price_hint,
+            price_source=price_source,
+            min_notional_quote=min_notional_quote,
+            min_notional_source=min_notional_source,
         )
         self._journal.append(
             "exit.passive_close_live_imbalanced",
@@ -2783,6 +3053,7 @@ class PassiveCloseExecutor:
                 "excess_quantity": excess_qty,
                 "normalized_excess_quantity": normalized_excess,
                 "excess_notional_quote": normalized_excess * max(price_hint, 0.0),
+                "price_source": price_source,
                 "min_notional_rejected": min_notional_violation is not None,
             },
         )
@@ -2793,6 +3064,11 @@ class PassiveCloseExecutor:
             if min_notional_violation is not None:
                 leg_notional = min_notional_violation["leg_notional"]
                 min_notional = min_notional_violation["min_notional"]
+            reason = (
+                "normalized_quantity_zero"
+                if normalized_excess <= 1e-12
+                else str(min_notional_violation.get("reason") or "min_notional_rejected")
+            )
             self._journal.append(
                 "exit.passive_close_hedge_dust_aborted",
                 {
@@ -2802,16 +3078,16 @@ class PassiveCloseExecutor:
                     "requested": excess_qty,
                     "normalized_quantity": normalized_excess,
                     "price_hint": price_hint,
-                    "reason": (
-                        "normalized_quantity_zero"
-                        if normalized_excess <= 1e-12
-                        else "min_notional_rejected"
-                    ),
+                    "price_source": price_source,
+                    "reason": reason,
                     "maker_terminal": True,
                     "leg_notional_quote": leg_notional,
                     "venue_min_notional_quote": min_notional,
                 },
             )
+            if reason == "price_unavailable_for_min_notional":
+                pending.next_retry_at_ms = self._now_ms() + 5_000
+                return False
             return await self._abort_and_compensate_min_notional(
                 state,
                 pending,
@@ -3133,7 +3409,6 @@ class PassiveCloseExecutor:
         position = state.open_positions.get(position_id)
         if position is None:
             # Check if position exists live on venues
-            snapshot = pending.position_snapshot
             flat = await self._probe_live_flatness(pending, adapters)
             if flat:
                 state.pending_passive_closes.pop(position_id, None)
@@ -3144,6 +3419,15 @@ class PassiveCloseExecutor:
                 return "cleared_flat"
             # Not flat but no open position in state → ambiguous
             return "ambiguous"
+
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source="passive_close_recovery_flat_probe",
+            adapters=adapters,
+        ):
+            return "cleared_flat"
 
         # Still open — resume or mark as ambiguous
         if position is not None and position.matched_quantity > 0:
@@ -3510,6 +3794,146 @@ class PassiveCloseExecutor:
             return best_bid, best_ask
         return None
 
+    async def _resolve_hedge_reference_price(
+        self,
+        venue: Venue,
+        symbol: str,
+        side: Side,
+        price_hint: float,
+    ) -> tuple[float, str]:
+        try:
+            candidate = float(price_hint)
+        except (TypeError, ValueError):
+            candidate = 0.0
+        if math.isfinite(candidate) and candidate > 0.0:
+            return candidate, "price_hint"
+
+        quote = self._resolve_local_l2_quote(venue, symbol)
+        if quote is not None:
+            price = quote[1] if side == Side.BUY else quote[0]
+            if math.isfinite(price) and price > 0.0:
+                source = "local_l2_best_ask" if side == Side.BUY else "local_l2_best_bid"
+                return price, source
+
+        local_mid = self._resolve_local_l2_mid(venue, symbol)
+        if math.isfinite(local_mid) and local_mid > 0.0:
+            return local_mid, "local_l2_mid"
+
+        adapter = self._adapter(venue)
+        if adapter is None:
+            return 0.0, "price_unavailable_for_min_notional"
+
+        try:
+            snapshot = await adapter.fetch_market_snapshot([symbol])
+        except Exception:
+            return 0.0, "price_unavailable_for_min_notional"
+
+        price, source = self._reference_price_from_market_snapshot(snapshot, symbol, side)
+        if math.isfinite(price) and price > 0.0:
+            return price, source
+        return 0.0, "price_unavailable_for_min_notional"
+
+    @staticmethod
+    def _reference_price_from_market_snapshot(
+        snapshot: Any,
+        symbol: str,
+        side: Side,
+    ) -> tuple[float, str]:
+        quotes = getattr(snapshot, "quotes", None)
+        if not quotes:
+            return 0.0, "price_unavailable_for_min_notional"
+
+        target_keys = PassiveCloseExecutor._canonical_symbol_keys(symbol)
+        selected = None
+        for quote in quotes:
+            quote_symbol = getattr(quote, "symbol", "")
+            if PassiveCloseExecutor._canonical_symbol_keys(quote_symbol) & target_keys:
+                selected = quote
+                break
+        if selected is None and len(quotes) == 1:
+            selected = quotes[0]
+        if selected is None:
+            return 0.0, "price_unavailable_for_min_notional"
+
+        bid = PassiveCloseExecutor._positive_float(getattr(selected, "bid", 0.0))
+        ask = PassiveCloseExecutor._positive_float(getattr(selected, "ask", 0.0))
+        if side == Side.BUY and ask > 0.0:
+            return ask, "market_snapshot_best_ask"
+        if side == Side.SELL and bid > 0.0:
+            return bid, "market_snapshot_best_bid"
+        if bid > 0.0 and ask > 0.0:
+            return (bid + ask) / 2.0, "market_snapshot_mid"
+
+        mark = PassiveCloseExecutor._positive_float(getattr(selected, "mark_price", 0.0))
+        if mark > 0.0:
+            return mark, "market_snapshot_mark"
+        index = PassiveCloseExecutor._positive_float(getattr(selected, "index_price", 0.0))
+        if index > 0.0:
+            return index, "market_snapshot_index"
+        return 0.0, "price_unavailable_for_min_notional"
+
+    @staticmethod
+    def _positive_float(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if math.isfinite(parsed) and parsed > 0.0 else 0.0
+
+    @staticmethod
+    def _canonical_symbol_key(symbol: Any) -> str:
+        return "".join(ch for ch in str(symbol).upper() if ch.isalnum())
+
+    @staticmethod
+    def _canonical_symbol_keys(symbol: Any) -> set[str]:
+        key = PassiveCloseExecutor._canonical_symbol_key(symbol)
+        keys = {key} if key else set()
+        for suffix in ("SWAP", "PERP"):
+            if key.endswith(suffix):
+                keys.add(key[:-len(suffix)])
+        return {item for item in keys if item}
+
+    async def _resolve_hedge_min_notional_quote(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[float, str]:
+        spec_min_notional = 0.0
+        try:
+            spec = get_spec(venue)
+            spec_min_notional = float(getattr(spec, "min_notional", 0.0) or 0.0)
+        except Exception:
+            spec_min_notional = 0.0
+
+        adapter = self._adapter(venue)
+        transport = getattr(adapter, "_transport", None) if adapter is not None else None
+        if transport is not None and venue in (Venue.BYBIT, Venue.OKX):
+            venue_symbol = symbol
+            venue_symbol_fn = getattr(transport, "_venue_symbol", None)
+            if callable(venue_symbol_fn):
+                try:
+                    venue_symbol = venue_symbol_fn(symbol)
+                except Exception:
+                    venue_symbol = symbol
+            try:
+                symbol_rule = await get_symbol_rules_cache().get(
+                    transport, venue, venue_symbol,
+                )
+                rule_source = str(getattr(symbol_rule, "rule_source", "") or "")
+                rule_min_notional = float(
+                    getattr(symbol_rule, "min_notional", 0.0) or 0.0
+                )
+                if rule_source and rule_source != "spec_fallback" and rule_min_notional > 0.0:
+                    return rule_min_notional, rule_source
+            except Exception:
+                pass
+
+        if venue in (Venue.BYBIT, Venue.OKX):
+            return spec_min_notional, "venue_spec"
+
+        buffer_min_notional = float(self._config.small_fill_buffer_notional_quote or 0.0)
+        return max(spec_min_notional, buffer_min_notional), "venue_spec_or_buffer"
+
     def _maker_cycle_retry_delay(self, zero_fill_cycles: int) -> int:
         """V1 maker_cycle_retry_delay_ms: exponential backoff for zero-fill cycles."""
         delays = self._config.maker_cycle_retry_delays_ms
@@ -3534,6 +3958,10 @@ class PassiveCloseExecutor:
         side: Side,
         quantity: float,
         price_hint: float,
+        *,
+        price_source: str = "price_hint",
+        min_notional_quote: float | None = None,
+        min_notional_source: str = "venue_spec",
     ) -> Optional[dict[str, Any]]:
         """V1: check if hedge quantity is below venue min notional.
 
@@ -3541,16 +3969,27 @@ class PassiveCloseExecutor:
         Returns dict with violation details if below min notional.
         """
         if quantity <= 1e-12:
-            return {"venue": hedge_venue, "leg_notional": 0.0, "min_notional": 0.0}
-        # Use venue min notional from spec if available, else buffer threshold
-        from lightfee.venues.specs import get_spec
-        min_notional = self._config.small_fill_buffer_notional_quote
-        try:
-            spec = get_spec(hedge_venue)
-            if hasattr(spec, 'min_notional') and spec.min_notional:
-                min_notional = max(min_notional, float(spec.min_notional))
-        except Exception:
-            pass
+            return {
+                "venue": hedge_venue,
+                "leg_notional": 0.0,
+                "min_notional": 0.0,
+                "reason": "normalized_quantity_zero",
+                "price_source": price_source,
+            }
+        min_notional = float(min_notional_quote or 0.0)
+        if venue_reduce_only_close_exempts_min_notional(hedge_venue):
+            return None
+        if not (math.isfinite(price_hint) and price_hint > 0.0):
+            return {
+                "venue": hedge_venue,
+                "leg_notional": 0.0,
+                "min_notional": min_notional,
+                "quantity": quantity,
+                "price_hint": price_hint,
+                "reason": "price_unavailable_for_min_notional",
+                "price_source": price_source,
+                "min_notional_source": min_notional_source,
+            }
         violation = close_leg_exchange_min_notional_violation(
             hedge_venue, symbol, side, quantity,
             reduce_only=True, price_hint=price_hint,
@@ -3564,6 +4003,9 @@ class PassiveCloseExecutor:
                 "min_notional": min_notional_val,
                 "quantity": quantity,
                 "price_hint": price_hint,
+                "reason": "min_notional_rejected",
+                "price_source": price_source,
+                "min_notional_source": min_notional_source,
             }
         return None
 
