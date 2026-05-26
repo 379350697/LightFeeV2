@@ -7,6 +7,8 @@ import pytest
 from lightfee.core.domain import Venue
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
+from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -38,6 +40,10 @@ class OkxMetadataAdapter:
     trading_capability_trusted = True
 
 
+class BybitMetadataAdapter:
+    trading_capability_trusted = True
+
+
 def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
     return CandidateInput(
         long_venue="okx",
@@ -51,6 +57,36 @@ def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
         entry_notional_quote=50.0,
         first_funding_timestamp_ms=400000,
     )
+
+
+def _sidecar_liquidity_required_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
+    return CandidateInput(
+        long_venue="okx",
+        short_venue="bybit",
+        symbol=symbol,
+        funding_diff_bps=10.0,
+        funding_edge_bps=10.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=10.0,
+        entry_notional_quote=50.0,
+        first_funding_timestamp_ms=400000,
+        sizing_liquidity_source="sidecar_perp_liquidity",
+    )
+
+
+def _install_l2_books(runtime: LiveRuntime, candidate: CandidateInput, *, observed_at_ms: int) -> None:
+    for venue in (candidate.long_venue, candidate.short_venue):
+        runtime.local_l2_runtime.books[
+            LocalL2BookKey(venue=venue, symbol=candidate.symbol)
+        ] = LocalL2Book(
+            venue=venue,
+            symbol=candidate.symbol,
+            bids=[PriceLevel(price=100.0, quantity=10.0)],
+            asks=[PriceLevel(price=101.0, quantity=10.0)],
+            status=L2BookStatus.HOT,
+            observed_at_ms=observed_at_ms,
+        )
 
 
 def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
@@ -243,6 +279,7 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
     kinds = [record["kind"] for record in records]
     assert "runtime.order_quote_stale_skipped" in kinds
     assert "runtime.snapshot_freshness_decision" in kinds
+    assert "runtime.quote_stale" in kinds
     assert "runtime.entry_skipped_no_quote" not in kinds
     assert runtime.state.last_scan["selected_candidate_count"] == 0
     assert runtime.state.last_scan["dispatched_candidate_count"] == 0
@@ -254,7 +291,7 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
 
 
 @pytest.mark.asyncio
-async def test_runtime_blocks_entry_when_last_good_liquidity_domain_is_stale(tmp_path, monkeypatch):
+async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -293,7 +330,7 @@ async def test_runtime_blocks_entry_when_last_good_liquidity_domain_is_stale(tmp
         liquidity_lifecycle=[
             LiquidityLifecycle(
                 venue="okx",
-                observed_at_ms=40000,
+                observed_at_ms=35000,
                 symbol_count=1,
                 coverage_usable=1,
                 degraded_reason="last_good",
@@ -317,9 +354,9 @@ async def test_runtime_blocks_entry_when_last_good_liquidity_domain_is_stale(tmp
     finally:
         runtime.journal.close()
 
-    assert executor.contexts == []
-    assert runtime.state.last_scan["selected_candidate_count"] == 0
-    assert runtime.state.last_scan["snapshot_freshness_metrics"]["okx|BTCUSDT|liquidity"]["stale"] == 1
+    assert len(executor.contexts) == 1
+    assert runtime.state.last_scan["selected_candidate_count"] == 1
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
 
     records = [
         json.loads(line)
@@ -335,10 +372,413 @@ async def test_runtime_blocks_entry_when_last_good_liquidity_domain_is_stale(tmp
         d["venue"] == "okx"
         and d["symbol"] == "BTCUSDT"
         and d["domain"] == "liquidity"
-        and d["decision"] == "skip_entry"
-        and d["age_ms"] == 30000
-        and d["budget_ms"] == 3000
+        and d["decision"] == "continue"
+        and d["age_ms"] == 35000
+        and d["reason"] == "perp_liquidity_stale_advisory"
         and d["fallback_source"] == "last_good_sidecar"
+        for d in decisions
+    )
+    assert "runtime.perp_liquidity_stale_advisory" in [
+        record["kind"] for record in records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires_it(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            sidecar_perp_liquidity_budget_ms=3000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _sidecar_liquidity_required_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote("okx", "BTCUSDT", 100.0, 101.0),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=35000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert executor.contexts == []
+    assert runtime.state.last_scan["selected_candidate_count"] == 0
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert "runtime.perp_liquidity_stale_blocking" in [
+        record["kind"] for record in records
+    ]
+    decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert any(
+        d["reason"] == "perp_liquidity_stale_blocking"
+        and d["decision"] == "skip_entry"
+        and d["source"] == "sidecar_perp_liquidity"
+        and d["observed_at_ms"] == 35000
+        for d in decisions
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_required_sidecar_liquidity_when_current_row_has_no_usable_coverage(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            sidecar_perp_liquidity_budget_ms=30000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _sidecar_liquidity_required_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote("okx", "BTCUSDT", 100.0, 101.0),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=0,
+                coverage_usable=0,
+                degraded_reason="liquidity timeout 10.0s",
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert executor.contexts == []
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert any(
+        d["reason"] == "perp_liquidity_stale_blocking"
+        and d["decision"] == "skip_entry"
+        and d["age_ms"] == 1000
+        and d["coverage_usable"] == 0
+        and d["degraded_reason"] == "liquidity timeout 10.0s"
+        for d in decisions
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbol_degradation(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            sidecar_perp_liquidity_budget_ms=30000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _sidecar_liquidity_required_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote("okx", "BTCUSDT", 100.0, 101.0),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=2,
+                coverage_usable=1,
+                degraded_reason="ETHUSDT: fetch failed",
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert len(executor.contexts) == 1
+    assert runtime.state.last_scan["selected_candidate_count"] == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert not any(
+        d["reason"] == "perp_liquidity_stale_blocking"
+        for d in decisions
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_skip_fresh_quote_and_l2_for_20s_perp_liquidity_age(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            sidecar_perp_liquidity_budget_ms=3000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=True,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+            max_liquidity_snapshot_age_ms=5000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote("okx", "BTCUSDT", 100.0, 101.0),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=50000,
+                symbol_count=1,
+                coverage_usable=1,
+                publish_interval_ms=20000,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=50000,
+                symbol_count=1,
+                coverage_usable=1,
+                publish_interval_ms=20000,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert len(executor.contexts) == 1
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    key = "okx|BTCUSDT|liquidity"
+    assert runtime.state.last_scan["snapshot_freshness_observed_age_ms"][key] == 20000
+    assert runtime.state.last_scan["snapshot_freshness_publish_interval_ms"][key] == 20000
+    assert runtime.state.last_scan["snapshot_freshness_budget_ms"][key] >= 20000
+    decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert not any(
+        d["reason"] == "perp_liquidity_stale_blocking"
+        for d in decisions
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_only_when_execution_l2_needed_by_sizing_is_stale(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            local_l2_enabled=True,
+            max_liquidity_snapshot_age_ms=5000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidate = _freshness_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=50000)
+
+    runtime.journal.open()
+    try:
+        dispatched = await runtime._dispatch_entry(candidate, now_ms=70000, price_hint=100.5)
+    finally:
+        runtime.journal.close()
+
+    assert dispatched is False
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert "runtime.execution_l2_stale" in [record["kind"] for record in records]
+    decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert any(
+        d["reason"] == "execution_l2_stale"
+        and d["decision"] == "skip_entry"
+        and d["age_ms"] == 20000
+        and d["budget_ms"] == 5000
         for d in decisions
     )
 

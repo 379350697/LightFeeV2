@@ -6,6 +6,7 @@ opportunity_input_mode = "coarse_sidecar"
 sidecar_snapshot_path = "runtime/opportunity-input-snapshot.json"
 sidecar_snapshot_max_age_ms = 10000
 sidecar_refresh_ms = 3000
+sidecar_perp_liquidity_budget_ms = 30000
 live_scan_last_good_max_age_ms = 600000
 live_scan_recovery_success_count = 3
 live_scan_revalidate_edge_buffer_bps = 2.0

@@ -71,6 +71,10 @@ class LiquidityLifecycle:
     symbol_count: int
     coverage_usable: int = 0
     degraded_reason: str = ""
+    domain: str = "perp_liquidity"
+    source: str = "sidecar_perp_liquidity"
+    publish_interval_ms: int = 0
+    published_at_ms: int = 0
 
 
 @dataclass
@@ -120,6 +124,9 @@ class CandidateInput:
     # V2: direction consistency and interval alignment (V1 fix)
     direction_consistent: bool = False
     interval_aligned: bool = False
+    # Optional execution dependency marker. Empty means sizing/execution uses quote
+    # and local-L2 gates rather than coarse sidecar perp liquidity.
+    sizing_liquidity_source: str = ""
 
 
 @dataclass

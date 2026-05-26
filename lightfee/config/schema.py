@@ -56,7 +56,10 @@ class RuntimeConfig:
     sidecar_snapshot_path: str = "runtime/opportunity-input-snapshot.json"
     sidecar_snapshot_max_age_ms: int = 10000
     sidecar_refresh_ms: int = 3000
-    sidecar_perp_liquidity_budget_ms: int = 3000
+    sidecar_perp_liquidity_budget_ms: int = 30000
+    sidecar_funding_timeout_s: float = 30.0
+    sidecar_liquidity_timeout_s: float = 10.0
+    sidecar_transfer_timeout_s: float = 5.0
     sidecar_hint_budget_ms: int = 500
     sidecar_transfer_budget_ms: int = 1000
     live_scan_last_good_max_age_ms: int = 600000

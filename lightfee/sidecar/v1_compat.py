@@ -156,6 +156,7 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         # V1 parity: preserve direction_consistent and interval_aligned (V1 computes both)
         "direction_consistent": bool(raw.get("direction_consistent", False)),
         "interval_aligned": bool(raw.get("interval_aligned", False)),
+        "sizing_liquidity_source": str(raw.get("sizing_liquidity_source", "") or ""),
     }
 
 

@@ -2063,7 +2063,12 @@ class LiveRuntime:
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
-        snapshot_freshness_metrics, snapshot_freshness_ages = (
+        (
+            snapshot_freshness_metrics,
+            snapshot_freshness_ages,
+            snapshot_freshness_budgets,
+            snapshot_freshness_publish_intervals,
+        ) = (
             self._snapshot_freshness_observability(
                 snapshot=snapshot,
                 candidates=list(getattr(snapshot, "candidates", []) or []),
@@ -2072,6 +2077,10 @@ class LiveRuntime:
         )
         self.state.last_scan["snapshot_freshness_metrics"] = snapshot_freshness_metrics
         self.state.last_scan["snapshot_freshness_observed_age_ms"] = snapshot_freshness_ages
+        self.state.last_scan["snapshot_freshness_budget_ms"] = snapshot_freshness_budgets
+        self.state.last_scan["snapshot_freshness_publish_interval_ms"] = (
+            snapshot_freshness_publish_intervals
+        )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             reason = "live_scan_revalidate_required:last_good_sidecar"
             self.state.last_scan["no_entry_reason"] = reason
@@ -2144,6 +2153,8 @@ class LiveRuntime:
                 now_ms=now_ms,
                 metrics=snapshot_freshness_metrics,
                 ages=snapshot_freshness_ages,
+                budgets=snapshot_freshness_budgets,
+                publish_intervals=snapshot_freshness_publish_intervals,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
@@ -6685,16 +6696,44 @@ class LiveRuntime:
                 return value
         return 300_000
 
-    def _snapshot_domain_budget_ms(self, domain: str) -> int:
+    def _snapshot_domain_budget_ms(self, domain: str, row=None) -> int:
         domain_s = str(domain or "").lower()
         if domain_s == "liquidity":
-            return int(
+            configured_ms = int(
                 getattr(
                     self.config.runtime,
                     "sidecar_perp_liquidity_budget_ms",
                     self.config.strategy.max_liquidity_snapshot_age_ms,
                 )
-                or self.config.strategy.max_liquidity_snapshot_age_ms
+                or 0
+            )
+            refresh_ms = int(
+                getattr(self.config.runtime, "sidecar_refresh_ms", 0) or 0
+            )
+            timeout_ms = int(
+                float(
+                    getattr(
+                        self.config.runtime,
+                        "sidecar_liquidity_timeout_s",
+                        10.0,
+                    )
+                    or 0.0
+                )
+                * 1000.0
+            )
+            publish_interval_ms = (
+                int(getattr(row, "publish_interval_ms", 0) or 0)
+                if row is not None else 0
+            )
+            return int(
+                max(
+                    configured_ms,
+                    int(self.config.strategy.max_liquidity_snapshot_age_ms or 0),
+                    refresh_ms * 3 if refresh_ms > 0 else 0,
+                    refresh_ms + timeout_ms * 2 if timeout_ms > 0 else 0,
+                    publish_interval_ms * 2 if publish_interval_ms > 0 else 0,
+                    30_000,
+                )
             )
         if domain_s == "quote":
             return int(
@@ -6723,6 +6762,100 @@ class LiveRuntime:
     def _snapshot_fallback_source(self, snapshot) -> str:
         source = str(getattr(snapshot, "acquisition_mode", "") or "")
         return source or "fresh_sidecar"
+
+    @staticmethod
+    def _candidate_requires_sidecar_perp_liquidity(candidate) -> bool:
+        for field_name in (
+            "liquidity_source",
+            "entry_liquidity_source",
+            "sizing_liquidity_source",
+            "execution_liquidity_source",
+        ):
+            source = str(getattr(candidate, field_name, "") or "").lower()
+            if source in {
+                "sidecar",
+                "coarse_sidecar",
+                "perp_liquidity",
+                "sidecar_perp_liquidity",
+            }:
+                return True
+        return False
+
+    @staticmethod
+    def _liquidity_degraded_reason_blocks_symbol(reason: str, symbol: str) -> bool:
+        reason_upper = str(reason or "").upper()
+        symbol_upper = str(symbol or "").upper()
+        if not reason_upper or not symbol_upper:
+            return False
+        return symbol_upper in reason_upper
+
+    def _liquidity_lifecycle_payload(
+        self,
+        *,
+        row,
+        venue: str,
+        symbol: str,
+        now_ms: int,
+        decision: str,
+        reason: str,
+        fallback_source: str,
+    ) -> dict:
+        observed_at_ms = (
+            int(getattr(row, "observed_at_ms", 0) or 0)
+            if row is not None else 0
+        )
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        budget_ms = self._snapshot_domain_budget_ms("liquidity", row)
+        source_domain = (
+            str(getattr(row, "domain", "perp_liquidity") or "perp_liquidity")
+            if row is not None else "perp_liquidity"
+        )
+        source = (
+            str(
+                getattr(
+                    row,
+                    "source",
+                    "sidecar_perp_liquidity",
+                )
+                or "sidecar_perp_liquidity"
+            )
+            if row is not None else "sidecar_perp_liquidity"
+        )
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "domain": "liquidity",
+            "source_domain": source_domain,
+            "source": source,
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+            "budget_ms": budget_ms,
+            "publish_interval_ms": (
+                int(getattr(row, "publish_interval_ms", 0) or 0)
+                if row is not None else 0
+            ),
+            "published_at_ms": (
+                int(getattr(row, "published_at_ms", 0) or 0)
+                if row is not None else 0
+            ),
+            "coverage_usable": (
+                int(getattr(row, "coverage_usable", 0) or 0)
+                if row is not None else 0
+            ),
+            "symbol_count": (
+                int(getattr(row, "symbol_count", 0) or 0)
+                if row is not None else 0
+            ),
+            "degraded_reason": (
+                str(getattr(row, "degraded_reason", "") or "")
+                if row is not None else "missing_liquidity_lifecycle"
+            ),
+            "decision": decision,
+            "fallback_source": fallback_source,
+            "reason": reason,
+            "event_kind": f"runtime.{reason}",
+            "blocking": decision == "skip_entry",
+        }
 
     def _snapshot_quote_observed_at_ms(self, snapshot, quote) -> int:
         return (
@@ -6753,11 +6886,18 @@ class LiveRuntime:
         snapshot,
         candidates: list,
         now_ms: int,
-    ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    ) -> tuple[
+        dict[str, dict[str, int]],
+        dict[str, int],
+        dict[str, int],
+        dict[str, int],
+    ]:
         metrics: dict[str, dict[str, int]] = {}
         ages: dict[str, int] = {}
+        budgets: dict[str, int] = {}
+        publish_intervals: dict[str, int] = {}
         if snapshot is None:
-            return metrics, ages
+            return metrics, ages, budgets, publish_intervals
 
         for quote in getattr(snapshot, "quotes", {}).values():
             venue = str(getattr(quote, "venue", "") or "").lower()
@@ -6770,6 +6910,7 @@ class LiveRuntime:
             key = self._snapshot_metric_key(venue, symbol, "quote")
             self._record_snapshot_metric(metrics, key, observed_at_ms > 0 and age_ms <= budget_ms)
             ages[key] = age_ms
+            budgets[key] = budget_ms
 
         lifecycle_by_domain = {
             "market": self._snapshot_lifecycle_rows_by_venue(snapshot, "market"),
@@ -6793,7 +6934,7 @@ class LiveRuntime:
                     seen.add(marker)
                     observed_at_ms = int(getattr(row, "observed_at_ms", 0) or 0)
                     age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
-                    budget_ms = self._snapshot_domain_budget_ms(domain)
+                    budget_ms = self._snapshot_domain_budget_ms(domain, row)
                     key = self._snapshot_metric_key(venue, symbol, domain)
                     self._record_snapshot_metric(
                         metrics,
@@ -6801,10 +6942,15 @@ class LiveRuntime:
                         observed_at_ms > 0 and age_ms <= budget_ms,
                     )
                     ages[key] = age_ms
+                    budgets[key] = budget_ms
+                    if domain == "liquidity":
+                        publish_intervals[key] = int(
+                            getattr(row, "publish_interval_ms", 0) or 0
+                        )
 
-        return metrics, ages
+        return metrics, ages, budgets, publish_intervals
 
-    def _candidate_snapshot_freshness_failures(
+    def _candidate_snapshot_freshness_decisions(
         self,
         candidate,
         *,
@@ -6816,8 +6962,11 @@ class LiveRuntime:
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
         liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
         fallback_source = self._snapshot_fallback_source(snapshot)
-        failures: list[dict] = []
+        decisions: list[dict] = []
         symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        requires_sidecar_liquidity = (
+            self._candidate_requires_sidecar_perp_liquidity(candidate)
+        )
 
         for venue_attr in ("long_venue", "short_venue"):
             venue = str(getattr(candidate, venue_attr, "") or "").lower()
@@ -6827,51 +6976,114 @@ class LiveRuntime:
             quote = quote_lookup.get((venue, symbol))
             quote_budget_ms = self._snapshot_domain_budget_ms("quote")
             if quote is None:
-                failures.append({
+                decisions.append({
                     "venue": venue,
                     "symbol": symbol,
                     "domain": "quote",
+                    "source": "sidecar_quote",
+                    "observed_at_ms": 0,
                     "age_ms": 0,
                     "budget_ms": quote_budget_ms,
                     "decision": "skip_entry",
                     "fallback_source": fallback_source,
                     "reason": "missing_quote",
+                    "blocking": True,
                 })
             else:
                 observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
                 age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
                 bid = float(getattr(quote, "bid", 0.0) or 0.0)
                 ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                if observed_at_ms <= 0 or age_ms > quote_budget_ms or bid <= 0.0 or ask <= 0.0:
-                    failures.append({
+                if (
+                    observed_at_ms <= 0
+                    or age_ms > quote_budget_ms
+                    or bid <= 0.0
+                    or ask <= 0.0
+                ):
+                    reason = "quote_stale" if age_ms > quote_budget_ms else "invalid_quote"
+                    payload = {
                         "venue": venue,
                         "symbol": symbol,
                         "domain": "quote",
+                        "source": "sidecar_quote",
+                        "observed_at_ms": observed_at_ms,
                         "age_ms": age_ms,
                         "budget_ms": quote_budget_ms,
                         "decision": "skip_entry",
                         "fallback_source": fallback_source,
-                        "reason": "stale_quote" if age_ms > quote_budget_ms else "invalid_quote",
-                    })
+                        "reason": reason,
+                        "blocking": True,
+                    }
+                    if reason == "quote_stale":
+                        payload["event_kind"] = "runtime.quote_stale"
+                    decisions.append(payload)
 
             liquidity = liquidity_rows.get(venue)
-            if liquidity is not None:
-                liq_budget_ms = self._snapshot_domain_budget_ms("liquidity")
-                observed_at_ms = int(getattr(liquidity, "observed_at_ms", 0) or 0)
-                age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
-                if observed_at_ms <= 0 or age_ms > liq_budget_ms:
-                    failures.append({
-                        "venue": venue,
-                        "symbol": symbol,
-                        "domain": "liquidity",
-                        "age_ms": age_ms,
-                        "budget_ms": liq_budget_ms,
-                        "decision": "skip_entry",
-                        "fallback_source": fallback_source,
-                        "reason": "stale_liquidity",
-                    })
+            liq_budget_ms = self._snapshot_domain_budget_ms("liquidity", liquidity)
+            liq_observed_at_ms = (
+                int(getattr(liquidity, "observed_at_ms", 0) or 0)
+                if liquidity is not None else 0
+            )
+            liq_coverage_usable = (
+                int(getattr(liquidity, "coverage_usable", 0) or 0)
+                if liquidity is not None else 0
+            )
+            liq_degraded_reason = (
+                str(getattr(liquidity, "degraded_reason", "") or "")
+                if liquidity is not None else ""
+            )
+            liq_degraded_blocks_symbol = (
+                self._liquidity_degraded_reason_blocks_symbol(
+                    liq_degraded_reason, symbol
+                )
+            )
+            liq_age_ms = (
+                max(now_ms - liq_observed_at_ms, 0)
+                if liq_observed_at_ms > 0 else 0
+            )
+            liq_stale_or_missing = (
+                liquidity is None
+                or liq_observed_at_ms <= 0
+                or liq_age_ms > liq_budget_ms
+                or liq_coverage_usable <= 0
+                or liq_degraded_blocks_symbol
+            )
+            if liq_stale_or_missing:
+                reason = (
+                    "perp_liquidity_stale_blocking"
+                    if requires_sidecar_liquidity
+                    else "perp_liquidity_stale_advisory"
+                )
+                decisions.append(
+                    self._liquidity_lifecycle_payload(
+                        row=liquidity,
+                        venue=venue,
+                        symbol=symbol,
+                        now_ms=now_ms,
+                        decision="skip_entry" if requires_sidecar_liquidity else "continue",
+                        reason=reason,
+                        fallback_source=fallback_source,
+                    )
+                )
 
-        return failures
+        return decisions
+
+    def _candidate_snapshot_freshness_failures(
+        self,
+        candidate,
+        *,
+        snapshot,
+        now_ms: int,
+    ) -> list[dict]:
+        return [
+            decision
+            for decision in self._candidate_snapshot_freshness_decisions(
+                candidate,
+                snapshot=snapshot,
+                now_ms=now_ms,
+            )
+            if decision.get("decision") == "skip_entry"
+        ]
 
     def _filter_candidates_by_snapshot_freshness(
         self,
@@ -6881,18 +7093,21 @@ class LiveRuntime:
         now_ms: int,
         metrics: dict,
         ages: dict,
+        budgets: dict | None = None,
+        publish_intervals: dict | None = None,
     ) -> list:
         filtered = []
         for candidate in candidates:
-            failures = self._candidate_snapshot_freshness_failures(
+            decisions = self._candidate_snapshot_freshness_decisions(
                 candidate,
                 snapshot=snapshot,
                 now_ms=now_ms,
             )
-            if not failures:
+            if not decisions:
                 filtered.append(candidate)
                 continue
-            for failure in failures:
+            blocking = False
+            for failure in decisions:
                 key = self._snapshot_metric_key(
                     failure["venue"],
                     failure["symbol"],
@@ -6901,10 +7116,21 @@ class LiveRuntime:
                 if key not in metrics:
                     self._record_snapshot_metric(metrics, key, False)
                 ages[key] = int(failure.get("age_ms", 0) or 0)
+                if budgets is not None:
+                    budgets[key] = int(failure.get("budget_ms", 0) or 0)
+                if publish_intervals is not None and "publish_interval_ms" in failure:
+                    publish_intervals[key] = int(failure.get("publish_interval_ms", 0) or 0)
                 payload = dict(failure)
+                event_kind = str(payload.pop("event_kind", "") or "")
                 payload["ts_ms"] = now_ms
                 payload["pair_id"] = self._candidate_pair_id(candidate)
                 self.journal.append("runtime.snapshot_freshness_decision", payload)
+                if event_kind:
+                    self.journal.append(event_kind, payload)
+                if failure.get("decision") == "skip_entry":
+                    blocking = True
+            if not blocking:
+                filtered.append(candidate)
         return filtered
 
     def _snapshot_health_payload(
@@ -7944,42 +8170,110 @@ class LiveRuntime:
             short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
 
             not_ready_reasons: list[str] = []
+            l2_stale_decisions: list[dict] = []
             max_age_ms = self.config.strategy.max_liquidity_snapshot_age_ms
             if long_book is None:
                 not_ready_reasons.append(
                     f"long book missing: {long_venue.value}:{candidate.symbol} "
                     f"max_age_ms={max_age_ms}"
                 )
+                l2_stale_decisions.append({
+                    "venue": long_venue.value,
+                    "symbol": candidate.symbol,
+                    "domain": "execution_l2",
+                    "source": "local_l2",
+                    "observed_at_ms": 0,
+                    "age_ms": 0,
+                    "budget_ms": max_age_ms,
+                    "decision": "skip_entry",
+                    "fallback_source": "none",
+                    "reason": "execution_l2_stale",
+                    "l2_reason": "missing_book",
+                    "blocking": True,
+                })
             else:
                 liq = execution_liquidity_from_local_l2(
                     long_book, max_age_ms=max_age_ms,
                     now_ms=now_ms, require_ready=True,
                 )
+                long_age_ms = long_book.age_ms(now_ms)
                 if not liq.book_ready:
                     not_ready_reasons.append(
                         f"long leg not ready: {long_venue.value}:{candidate.symbol} "
                         f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
-                        f"age={long_book.age_ms(now_ms)}ms max_age_ms={max_age_ms}"
+                        f"age={long_age_ms}ms max_age_ms={max_age_ms}"
                     )
+                    l2_stale_decisions.append({
+                        "venue": long_venue.value,
+                        "symbol": candidate.symbol,
+                        "domain": "execution_l2",
+                        "source": "local_l2",
+                        "observed_at_ms": int(getattr(long_book, "observed_at_ms", 0) or 0),
+                        "age_ms": int(long_age_ms),
+                        "budget_ms": max_age_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": "none",
+                        "reason": "execution_l2_stale",
+                        "l2_reason": liq.fallback_reason or "book_not_ready",
+                        "book_status": long_book.status.value,
+                        "blocking": True,
+                    })
 
             if short_book is None:
                 not_ready_reasons.append(
                     f"short book missing: {short_venue.value}:{candidate.symbol} "
                     f"max_age_ms={max_age_ms}"
                 )
+                l2_stale_decisions.append({
+                    "venue": short_venue.value,
+                    "symbol": candidate.symbol,
+                    "domain": "execution_l2",
+                    "source": "local_l2",
+                    "observed_at_ms": 0,
+                    "age_ms": 0,
+                    "budget_ms": max_age_ms,
+                    "decision": "skip_entry",
+                    "fallback_source": "none",
+                    "reason": "execution_l2_stale",
+                    "l2_reason": "missing_book",
+                    "blocking": True,
+                })
             else:
                 liq = execution_liquidity_from_local_l2(
                     short_book, max_age_ms=max_age_ms,
                     now_ms=now_ms, require_ready=True,
                 )
+                short_age_ms = short_book.age_ms(now_ms)
                 if not liq.book_ready:
                     not_ready_reasons.append(
                         f"short leg not ready: {short_venue.value}:{candidate.symbol} "
                         f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
-                        f"age={short_book.age_ms(now_ms)}ms max_age_ms={max_age_ms}"
+                        f"age={short_age_ms}ms max_age_ms={max_age_ms}"
                     )
+                    l2_stale_decisions.append({
+                        "venue": short_venue.value,
+                        "symbol": candidate.symbol,
+                        "domain": "execution_l2",
+                        "source": "local_l2",
+                        "observed_at_ms": int(getattr(short_book, "observed_at_ms", 0) or 0),
+                        "age_ms": int(short_age_ms),
+                        "budget_ms": max_age_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": "none",
+                        "reason": "execution_l2_stale",
+                        "l2_reason": liq.fallback_reason or "book_not_ready",
+                        "book_status": short_book.status.value,
+                        "blocking": True,
+                    })
 
             if not_ready_reasons:
+                pair_id = self._candidate_pair_id(candidate)
+                for payload in l2_stale_decisions:
+                    payload = dict(payload)
+                    payload["pair_id"] = pair_id
+                    payload["ts_ms"] = now_ms
+                    self.journal.append("runtime.snapshot_freshness_decision", payload)
+                    self.journal.append("runtime.execution_l2_stale", payload)
                 self.journal.append(
                     "runtime.entry_blocked_local_l2_not_ready",
                     {

@@ -70,7 +70,10 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
         ],
         "liquidity_lifecycle": [
             {"venue": ll.venue, "observed_at_ms": ll.observed_at_ms, "symbol_count": ll.symbol_count,
-             "coverage_usable": ll.coverage_usable, "degraded_reason": ll.degraded_reason}
+             "coverage_usable": ll.coverage_usable, "degraded_reason": ll.degraded_reason,
+             "domain": ll.domain, "source": ll.source,
+             "publish_interval_ms": ll.publish_interval_ms,
+             "published_at_ms": ll.published_at_ms}
             for ll in s.liquidity_lifecycle
         ],
         "degraded_venues": list(s.degraded_venues),
@@ -119,6 +122,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "first_funding_leg": c.first_funding_leg,
                 "direction_consistent": c.direction_consistent,
                 "interval_aligned": c.interval_aligned,
+                "sizing_liquidity_source": c.sizing_liquidity_source,
             }
             for c in s.candidates
         ],

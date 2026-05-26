@@ -69,6 +69,8 @@ class SidecarService:
         # V1 parity: last-good fallback cache
         self._last_good_quotes: dict[str, QuoteSnapshot] = {}
         self._last_good_at_ms: int = 0
+        self._last_liquidity_publish_at_ms: int = 0
+        self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
 
     async def close(self) -> None:
         for src in self._exchange_sources.values():
@@ -176,6 +178,37 @@ class SidecarService:
         # --- Build candidates ---
         candidates = build_same_symbol_pairs(quotes, symbols)
         published_ms = int(time.time() * 1000)
+        legacy_liquidity_publish_ms = int(getattr(self, "_last_liquidity_publish_at_ms", 0) or 0)
+        liquidity_publish_by_key = getattr(self, "_last_liquidity_publish_at_ms_by_key", None)
+        if not isinstance(liquidity_publish_by_key, dict):
+            liquidity_publish_by_key = {}
+        use_legacy_liquidity_publish_ms = (
+            not liquidity_publish_by_key and legacy_liquidity_publish_ms > 0
+        )
+        liquidity_successful_publish = False
+        for row in liquidity_lifecycle:
+            row.domain = "perp_liquidity"
+            row.source = "sidecar_perp_liquidity"
+            key = (row.domain, row.source, row.venue)
+            previous_publish_ms = int(liquidity_publish_by_key.get(key, 0) or 0)
+            if previous_publish_ms <= 0 and use_legacy_liquidity_publish_ms:
+                previous_publish_ms = legacy_liquidity_publish_ms
+            has_usable_publish = int(getattr(row, "coverage_usable", 0) or 0) > 0
+            if has_usable_publish:
+                row.publish_interval_ms = (
+                    max(published_ms - previous_publish_ms, 0)
+                    if previous_publish_ms > 0
+                    else 0
+                )
+                row.published_at_ms = published_ms
+                liquidity_publish_by_key[key] = published_ms
+                liquidity_successful_publish = True
+            else:
+                row.publish_interval_ms = 0
+                row.published_at_ms = previous_publish_ms
+        self._last_liquidity_publish_at_ms_by_key = liquidity_publish_by_key
+        if liquidity_successful_publish:
+            self._last_liquidity_publish_at_ms = published_ms
 
         # --- Cache last-good quotes ---
         if quotes:
