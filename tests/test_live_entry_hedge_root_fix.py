@@ -2303,6 +2303,14 @@ class TestRealPathAbortCleanupDeadline:
             "sz_decimals": 0,
             "price_decimals": 6,
         }
+        transport._trading_capability_trusted = True
+        transport._trading_preflight_status = {
+            "venue": Venue.HYPERLIQUID.value,
+            "status": "ok",
+            "trading_capability_trusted": True,
+            "authorization_mode": "account_wallet",
+            "authorization_verified": True,
+        }
         seen: list[str] = []
         captured: dict[str, object] = {}
 
@@ -2584,7 +2592,8 @@ class TestRealPathAbortCleanupDeadline:
             "bybit_execution_list",
         ]
         assert payload["live_exposure"]["quantity"] == pytest.approx(400.0)
-        assert payload["decision"] == "filled"
+        assert payload["classification"] == "full"
+        assert payload["decision"] == "clear"
 
     @pytest.mark.asyncio
     async def test_cleanup_bybit_duplicate_not_found_live_flat_succeeds(self, tmp_path):
@@ -2628,14 +2637,14 @@ class TestRealPathAbortCleanupDeadline:
             e["payload"] for e in runtime.journal.read_all()
             if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
         ][-1]
-        assert payload["decision"] == "live_flat"
+        assert payload["decision"] == "clear_live_flat"
         assert payload["live_exposure"]["quantity"] == pytest.approx(0.0)
 
     @pytest.mark.asyncio
-    async def test_cleanup_bybit_duplicate_not_found_live_nonzero_uses_new_id(self, tmp_path):
-        """Unresolved duplicate with live exposure must retry with a new cleanup cid."""
+    async def test_cleanup_bybit_duplicate_partial_live_nonzero_uses_new_id(self, tmp_path):
+        """UBUSDT regression: duplicate + partial evidence retries residual safely."""
 
-        class DuplicateThenFilledAdapter(_FakeVenueAdapter):
+        class DuplicatePartialThenFilledAdapter(_FakeVenueAdapter):
             def __init__(self):
                 super().__init__(Venue.BYBIT)
                 self.positions = [
@@ -2657,6 +2666,21 @@ class TestRealPathAbortCleanupDeadline:
                 self._fetch_position_calls.append(symbol)
                 return self.positions.pop(0)
 
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self._fetch_order_fill_reconciliation_calls.append(
+                    (symbol, order_id, client_order_id)
+                )
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=100.0,
+                    average_price=0.011,
+                    order_id="cleanup-partial-oid",
+                    client_order_id=client_order_id,
+                    filled_at_ms=1100,
+                )
+
             async def place_order(self, request):
                 self._place_order_calls.append(request)
                 if len(self._place_order_calls) == 1:
@@ -2675,7 +2699,7 @@ class TestRealPathAbortCleanupDeadline:
                 )
 
         runtime = _make_open_runtime(tmp_path)
-        fake = DuplicateThenFilledAdapter()
+        fake = DuplicatePartialThenFilledAdapter()
         runtime._venue_adapters[Venue.BYBIT] = fake
 
         result = await runtime._cleanup_failed_leg_exposure(
@@ -2688,6 +2712,7 @@ class TestRealPathAbortCleanupDeadline:
         first_cid = fake._place_order_calls[0].client_order_id
         second_cid = fake._place_order_calls[1].client_order_id
         assert first_cid != second_cid
+        assert fake._place_order_calls[1].reduce_only is True
         assert fake._fetch_order_fill_reconciliation_calls == [
             ("UBUSDT", "", first_cid)
         ]
@@ -2695,12 +2720,23 @@ class TestRealPathAbortCleanupDeadline:
             e["payload"] for e in runtime.journal.read_all()
             if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
         ][-1]
+        assert payload["classification"] == "partial"
         assert payload["decision"] == "retry_new_client_order_id"
+        assert payload["target_qty"] == pytest.approx(400.0)
+        assert payload["reconciled_qty"] == pytest.approx(100.0)
+        assert payload["live_qty"] == pytest.approx(400.0)
+        assert payload["remaining_qty"] == pytest.approx(300.0)
         assert payload["next_client_order_id"] == second_cid
+        unified = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "order.reconcile_result"
+        ][-1]
+        assert unified["status"] == "partial"
+        assert unified["client_order_id"] == first_cid
 
     @pytest.mark.asyncio
-    async def test_cleanup_bybit_duplicate_retries_never_reuse_duplicate_id(self, tmp_path):
-        """Three duplicate retries must not blindly resubmit the same orderLinkId."""
+    async def test_cleanup_bybit_duplicate_no_evidence_backs_off_no_blind_retry(self, tmp_path):
+        """Duplicate without order/fill evidence must back off, not place a new cid."""
 
         class AlwaysDuplicateAdapter(_FakeVenueAdapter):
             async def place_order(self, request):
@@ -2729,14 +2765,20 @@ class TestRealPathAbortCleanupDeadline:
 
         assert result is False
         cids = [req.client_order_id for req in fake._place_order_calls]
-        assert len(cids) == 3
-        assert len(set(cids)) == 3
+        assert len(cids) == 1
         payloads = [
             e["payload"] for e in runtime.journal.read_all()
             if e["kind"] == "entry.cleanup_duplicate_client_order_reconcile_result"
         ]
-        assert [p["attempt"] for p in payloads] == [1, 2, 3]
-        assert payloads[-1]["decision"] == "failed_live_exposure_remaining"
+        assert len(payloads) == 1
+        assert payloads[-1]["classification"] == "none"
+        assert payloads[-1]["decision"] == "backoff_recheck"
+        unified = [
+            e["payload"] for e in runtime.journal.read_all()
+            if e["kind"] == "order.reconcile_result"
+        ][-1]
+        assert unified["status"] == "none"
+        assert unified["next_action"] == "backoff_recheck"
 
     # ── Bug 3: _abort_pending_entry returns bool; resolved pop conditional ──
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
@@ -26,6 +26,10 @@ from lightfee.core.exchange_errors import (
     build_fallback_evidence,
 )
 from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.bybit_duplicate_reconcile import (
+    build_order_reconcile_result_payload,
+    reconcile_bybit_duplicate_client_order,
+)
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
@@ -1214,11 +1218,14 @@ class CloseExecutor:
                 reason = result.get("reason", "")
                 if request.venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(reason):
                     adapter = self.adapters.get(request.venue)
-                    reconciliation = None
+                    duplicate_reconcile = None
                     if adapter is not None:
                         try:
-                            reconciliation = await adapter.fetch_order_fill_reconciliation(
-                                request.symbol, "", request.client_order_id,
+                            duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                                adapter=adapter,
+                                symbol=request.symbol,
+                                client_order_id=request.client_order_id or "",
+                                target_qty=request.quantity,
                             )
                         except Exception as exc:
                             self.journal.append(
@@ -1230,28 +1237,39 @@ class CloseExecutor:
                                     "error": str(exc),
                                 },
                             )
-                    recon_qty = getattr(reconciliation, "quantity", 0.0) or 0.0
-                    if recon_qty > 1e-12:
+
+                    if duplicate_reconcile is not None:
+                        self.journal.append(
+                            "order.reconcile_result",
+                            build_order_reconcile_result_payload(
+                                result=duplicate_reconcile,
+                                symbol=request.symbol,
+                                client_order_id=request.client_order_id or "",
+                                reason="duplicate_client_id",
+                            ),
+                        )
+
+                    recon_qty = (
+                        duplicate_reconcile.reconciled_qty
+                        if duplicate_reconcile is not None
+                        else 0.0
+                    )
+                    if (
+                        duplicate_reconcile is not None
+                        and duplicate_reconcile.clear_state
+                    ):
                         fill = OrderFill(
                             venue=request.venue,
                             symbol=request.symbol,
                             side=request.side,
                             quantity=float(recon_qty),
-                            price=float(
-                                getattr(
-                                    reconciliation,
-                                    "price",
-                                    getattr(reconciliation, "average_price", request.price or 0.0),
-                                )
-                                or 0.0
-                            ),
-                            order_id=getattr(reconciliation, "order_id", "") or "",
+                            price=float(duplicate_reconcile.average_price or request.price or 0.0),
+                            order_id=duplicate_reconcile.order_id,
                             client_order_id=(
-                                getattr(reconciliation, "client_order_id", None)
+                                duplicate_reconcile.client_order_id
                                 or request.client_order_id
                             ),
-                            fee_quote=getattr(reconciliation, "fee_quote", None),
-                            filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+                            filled_at_ms=now_ms,
                         )
                         self.journal.append(
                             "order.filled",
@@ -1268,9 +1286,72 @@ class CloseExecutor:
                                 "fee_quote": fill.fee_quote,
                                 "filled_at_ms": fill.filled_at_ms,
                                 "reason": "duplicate_client_order_reconciled",
+                                "classification": duplicate_reconcile.classification,
                             },
                         )
                         return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
+
+                    if (
+                        duplicate_reconcile is not None
+                        and duplicate_reconcile.classification == "partial"
+                        and recon_qty > 1e-12
+                        and attempt >= self.config.max_close_retries
+                    ):
+                        fill = OrderFill(
+                            venue=request.venue,
+                            symbol=request.symbol,
+                            side=request.side,
+                            quantity=float(recon_qty),
+                            price=float(duplicate_reconcile.average_price or request.price or 0.0),
+                            order_id=duplicate_reconcile.order_id,
+                            client_order_id=(
+                                duplicate_reconcile.client_order_id
+                                or request.client_order_id
+                            ),
+                            filled_at_ms=now_ms,
+                        )
+                        self.journal.append(
+                            "order.filled",
+                            {
+                                "position_id": position_id,
+                                "leg": leg,
+                                "venue": request.venue.value,
+                                "symbol": request.symbol,
+                                "side": request.side.value,
+                                "order_id": fill.order_id,
+                                "client_order_id": fill.client_order_id,
+                                "quantity": fill.quantity,
+                                "price": fill.price,
+                                "fee_quote": fill.fee_quote,
+                                "filled_at_ms": fill.filled_at_ms,
+                                "reason": "duplicate_client_order_reconciled_partial",
+                                "classification": duplicate_reconcile.classification,
+                            },
+                        )
+                        return {
+                            "outcome": "filled",
+                            "fill": fill,
+                            "order_id": fill.order_id,
+                            "reason": "duplicate_client_order_reconciled_partial",
+                        }
+
+                    if (
+                        duplicate_reconcile is not None
+                        and duplicate_reconcile.should_retry_with_new_client_id
+                        and attempt < self.config.max_close_retries
+                    ):
+                        retry_quantity = duplicate_reconcile.remaining_qty
+                        if duplicate_reconcile.live_qty > 1e-9:
+                            retry_quantity = min(retry_quantity, duplicate_reconcile.live_qty)
+                        retry_request = replace(
+                            request,
+                            quantity=retry_quantity,
+                            client_order_id=compact_client_order_id(
+                                position_id, f"{leg}_duplicate_{attempt + 1}",
+                            ),
+                        )
+                        request = retry_request
+                        continue
 
                     self.journal.append(
                         "exit.close_duplicate_client_order_pending_reconcile",
@@ -1279,6 +1360,11 @@ class CloseExecutor:
                             "leg": leg,
                             "client_order_id": request.client_order_id,
                             "reason": reason,
+                            "classification": (
+                                duplicate_reconcile.classification
+                                if duplicate_reconcile is not None
+                                else "unknown_transient"
+                            ),
                         },
                     )
                     return {

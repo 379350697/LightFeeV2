@@ -17,7 +17,15 @@ import pytest
 import tempfile
 from pathlib import Path
 
-from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderFillReconciliation,
+    OrderRequest,
+    PositionSnapshot,
+    Side,
+    TimeInForce,
+    Venue,
+)
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.close_executor import (
     CloseBalance,
@@ -769,8 +777,8 @@ class TestCloseChunkExecutor:
         assert "exit.partial_closed" not in kinds
 
     @pytest.mark.asyncio
-    async def test_bybit_duplicate_close_id_registers_pending_reconciliation(self):
-        """V1 idempotency: duplicate orderLinkId is uncertain until reconciled."""
+    async def test_bybit_duplicate_close_id_live_flat_allows_other_leg_close(self):
+        """Duplicate orderLinkId with live-flat evidence clears that close leg."""
         from lightfee.engine.close_executor import CloseExecutor
         from lightfee.engine.state import EngineState
         from lightfee.venues.cid import compact_client_order_id
@@ -821,21 +829,93 @@ class TestCloseChunkExecutor:
         )
 
         assert close is not None
-        assert close.long_close_qty == 0.0
+        assert close.long_close_qty == 82.0
         assert close.short_close_qty == 0.0
         assert short_adapter.reconciliation_lookups == [
             ("PROVEUSDT", "", expected_short_cid)
         ]
-        assert long_adapter.place_order_call_count == 0
-        assert len(state.pending_closes) == 1
-        pending_close = next(iter(state.pending_closes.values()))
-        assert pending_close.short_uncertain is True
-        assert pending_close.short_client_order_id == expected_short_cid
+        assert long_adapter.place_order_call_count == 1
+        assert len(state.pending_closes) == 0
 
         kinds = [record["kind"] for record in journal.read_all()]
-        assert "exit.pending_close_registered" in kinds
-        assert "exit.closed" not in kinds
-        assert "exit.partial_closed" not in kinds
+        assert "order.reconcile_result" in kinds
+        assert "exit.pending_close_registered" not in kinds
+        assert "exit.close_residual_detected" in kinds
+
+    @pytest.mark.asyncio
+    async def test_bybit_duplicate_close_partial_returns_reconciled_fill_at_retry_ceiling(self):
+        """Duplicate partial evidence must not be dropped when no retry budget remains."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class PartialDuplicateBybitAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT, default_fill_price=0.2911)
+                self.reconciliation_lookups = []
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=40.0,
+                    average_price=0.2911,
+                    order_id="partial-close-oid",
+                    client_order_id=client_order_id,
+                    filled_at_ms=2100,
+                )
+
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=42.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+        adapter = PartialDuplicateBybitAdapter()
+        adapter.place_order_outcomes = [
+            _make_rejected_error(
+                "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate"
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        client_order_id = compact_client_order_id("p001", "exit_short")
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="PROVEUSDT",
+            side=Side.BUY,
+            quantity=82.0,
+            price=0.2911,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "filled"
+        assert result["fill"].quantity == pytest.approx(40.0)
+        assert result["fill"].client_order_id == client_order_id
+        assert adapter.reconciliation_lookups == [
+            ("PROVEUSDT", "", client_order_id)
+        ]
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "order.reconcile_result"
+        ][-1]
+        assert payload["status"] == "partial"
 
     @pytest.mark.asyncio
     async def test_multichunk_pnl_aggregation_correct(self):

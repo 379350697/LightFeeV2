@@ -12,6 +12,12 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError
+from lightfee.engine.bybit_duplicate_reconcile import (
+    BYBIT_DUPLICATE_RECONCILE_ENDPOINTS,
+    BybitDuplicateReconcileResult,
+    build_order_reconcile_result_payload,
+    reconcile_bybit_duplicate_client_order,
+)
 from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
@@ -4267,7 +4273,7 @@ class LiveRuntime:
                         if attempt < max_attempts
                         else ""
                     )
-                    reconciled = await self._reconcile_bybit_duplicate_cleanup_order(
+                    duplicate_reconcile = await self._reconcile_bybit_duplicate_cleanup_order(
                         adapter=adapter,
                         symbol=symbol,
                         entry_id=entry_id,
@@ -4280,8 +4286,10 @@ class LiveRuntime:
                         live_pos_before=pos,
                         original_error=str(e),
                     )
-                    if reconciled is True:
+                    if duplicate_reconcile.clear_state:
                         return True
+                    if not duplicate_reconcile.should_retry_with_new_client_id:
+                        return False
                     if attempt >= max_attempts:
                         return False
                     self.journal.append(
@@ -4295,7 +4303,8 @@ class LiveRuntime:
                             "symbol": symbol,
                             "client_order_id": cleanup_client_order_id,
                             "next_client_order_id": next_client_order_id,
-                            "reason": "duplicate_client_order_id_unresolved",
+                            "reason": "duplicate_client_order_id_partial",
+                            "retry_quantity": duplicate_reconcile.retry_qty,
                         },
                     )
                     continue
@@ -4337,72 +4346,20 @@ class LiveRuntime:
         target_qty: float,
         live_pos_before: PositionSnapshot,
         original_error: str,
-    ) -> bool:
+    ) -> BybitDuplicateReconcileResult:
         """Reconcile Bybit duplicate cleanup order ids before retrying.
 
         This intentionally uses the same adapter.fetch_order_fill_reconciliation
         contract as passive close/close execution so Bybit endpoint semantics
         stay centralized in the venue adapter.
         """
-        endpoints = [
-            "bybit_order_realtime",
-            "bybit_order_history",
-            "bybit_execution_list",
-        ]
-        reconciliation = None
-        reconcile_error = ""
-        try:
-            reconciliation = await adapter.fetch_order_fill_reconciliation(
-                symbol, "", client_order_id,
-            )
-        except Exception as exc:
-            reconcile_error = str(exc)
-
-        recon_qty_raw = (
-            getattr(reconciliation, "quantity", 0.0)
-            if reconciliation is not None
-            else 0.0
+        result = await reconcile_bybit_duplicate_client_order(
+            adapter=adapter,
+            symbol=symbol,
+            client_order_id=client_order_id,
+            target_qty=target_qty,
+            live_pos_before=live_pos_before,
         )
-        recon_qty = (
-            float(recon_qty_raw)
-            if isinstance(recon_qty_raw, (int, float))
-            else 0.0
-        )
-
-        live_pos_after = None
-        live_fetch_error = ""
-        live_fetch_attempted = False
-        if recon_qty < max(target_qty - 1e-9, 0.0):
-            try:
-                live_fetch_attempted = True
-                live_pos_after = await adapter.fetch_position(symbol)
-            except Exception as exc:
-                live_fetch_error = str(exc)
-
-        live_pos = (
-            live_pos_after
-            if live_fetch_attempted and not live_fetch_error
-            else live_pos_before
-        )
-        live_qty = (
-            abs(getattr(live_pos, "quantity", 0.0) or 0.0)
-            if live_pos is not None
-            else 0.0
-        )
-        live_side = getattr(getattr(live_pos, "side", None), "value", None)
-
-        if recon_qty >= target_qty - 1e-9 and recon_qty > 0.0:
-            decision = "filled"
-            success = True
-        elif live_fetch_attempted and not live_fetch_error and live_qty <= 1e-9:
-            decision = "live_flat"
-            success = True
-        elif attempt >= max_attempts:
-            decision = "failed_live_exposure_remaining"
-            success = False
-        else:
-            decision = "retry_new_client_order_id"
-            success = False
 
         payload = {
             "entry_id": entry_id,
@@ -4413,31 +4370,42 @@ class LiveRuntime:
             "symbol": symbol,
             "client_order_id": client_order_id,
             "next_client_order_id": next_client_order_id,
-            "reconcile_endpoints": endpoints,
-            "reconciled_quantity": recon_qty,
-            "target_quantity": target_qty,
-            "order_id": (
-                getattr(reconciliation, "order_id", "")
-                if reconciliation is not None
-                else ""
-            ),
+            "reconcile_endpoints": list(BYBIT_DUPLICATE_RECONCILE_ENDPOINTS),
+            "classification": result.classification,
+            "reconciled_quantity": result.reconciled_qty,
+            "target_quantity": result.target_qty,
+            "reconciled_qty": result.reconciled_qty,
+            "target_qty": result.target_qty,
+            "live_qty": result.live_qty,
+            "remaining_qty": result.remaining_qty,
+            "retry_qty": result.retry_qty,
+            "order_id": result.order_id,
             "live_exposure": {
-                "quantity": live_qty,
-                "side": live_side,
+                "quantity": result.live_qty,
+                "side": result.live_side,
             },
-            "decision": decision,
+            "decision": result.decision,
             "original_error": original_error,
         }
-        if reconcile_error:
-            payload["reconcile_error"] = reconcile_error
-        if live_fetch_error:
-            payload["live_fetch_error"] = live_fetch_error
+        if result.reconcile_error:
+            payload["reconcile_error"] = result.reconcile_error
+        if result.live_fetch_error:
+            payload["live_fetch_error"] = result.live_fetch_error
 
+        self.journal.append(
+            "order.reconcile_result",
+            build_order_reconcile_result_payload(
+                result=result,
+                symbol=symbol,
+                client_order_id=client_order_id,
+                reason="duplicate_client_id",
+            ),
+        )
         self.journal.append(
             "entry.cleanup_duplicate_client_order_reconcile_result",
             payload,
         )
-        return success
+        return result
 
     async def _reconcile_pending_entries_force(self, now_ms: int) -> None:
         """Force-reconcile pending entries ignoring backoff windows.
