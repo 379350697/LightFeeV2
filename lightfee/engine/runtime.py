@@ -4006,7 +4006,11 @@ class LiveRuntime:
             pending.reconcile_attempt += 1
             try:
                 # V1: prefer hedge_inflight CID for reconciliation queries
-                hedge_lookup_cid = pending.hedge_inflight.client_order_id if pending.hedge_inflight else pending.hedge_client_order_id
+                hedge_lookup_cid = (
+                    pending.hedge_inflight.client_order_id
+                    if pending.hedge_inflight
+                    else ""
+                )
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -4062,21 +4066,51 @@ class LiveRuntime:
             # Also update from position snapshots if fill data wasn't available
             if result.long_position is not None and abs(result.long_position.quantity) > 0:
                 pos_qty = abs(result.long_position.quantity)
+                pos_price = float(getattr(result.long_position, "entry_price", 0.0) or 0.0)
                 if pending.maker_leg == "long" and pos_qty > pending.maker_leg_filled:
                     pending.maker_leg_filled = pos_qty
                     maker_filled_updated = True
                 elif pending.maker_leg == "short" and pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
                     hedge_filled_updated = True
+                if pending.maker_leg == "long":
+                    if pos_price > 0 and pending.maker_fill_price <= 0:
+                        pending.maker_fill_price = pos_price
+                        maker_filled_updated = True
+                    if not pending.maker_order_id:
+                        pending.maker_order_id = f"{entry_id}-recovery-long"
+                        maker_filled_updated = True
+                else:
+                    if pos_price > 0 and pending.hedge_fill_price <= 0:
+                        pending.hedge_fill_price = pos_price
+                        hedge_filled_updated = True
+                    if not pending.hedge_order_id:
+                        pending.hedge_order_id = f"{entry_id}-recovery-long"
+                        hedge_filled_updated = True
 
             if result.short_position is not None and abs(result.short_position.quantity) > 0:
                 pos_qty = abs(result.short_position.quantity)
+                pos_price = float(getattr(result.short_position, "entry_price", 0.0) or 0.0)
                 if pending.maker_leg == "short" and pos_qty > pending.maker_leg_filled:
                     pending.maker_leg_filled = pos_qty
                     maker_filled_updated = True
                 elif pending.maker_leg == "long" and pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
                     hedge_filled_updated = True
+                if pending.maker_leg == "short":
+                    if pos_price > 0 and pending.maker_fill_price <= 0:
+                        pending.maker_fill_price = pos_price
+                        maker_filled_updated = True
+                    if not pending.maker_order_id:
+                        pending.maker_order_id = f"{entry_id}-recovery-short"
+                        maker_filled_updated = True
+                else:
+                    if pos_price > 0 and pending.hedge_fill_price <= 0:
+                        pending.hedge_fill_price = pos_price
+                        hedge_filled_updated = True
+                    if not pending.hedge_order_id:
+                        pending.hedge_order_id = f"{entry_id}-recovery-short"
+                        hedge_filled_updated = True
 
             if maker_filled_updated:
                 self.journal.append(
@@ -4377,10 +4411,6 @@ class LiveRuntime:
             "cancelled",
             "expired",
             "rejected",
-            "not_found",
-            "missing",
-            "notfound",
-            "not_found_or_closed",
         }
 
     @staticmethod
@@ -5059,7 +5089,11 @@ class LiveRuntime:
                 continue
 
             try:
-                hedge_lookup_cid = pending.hedge_inflight.client_order_id if pending.hedge_inflight else pending.hedge_client_order_id
+                hedge_lookup_cid = (
+                    pending.hedge_inflight.client_order_id
+                    if pending.hedge_inflight
+                    else ""
+                )
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -6034,12 +6068,8 @@ class LiveRuntime:
         missing: list[str] = []
         if float(getattr(pending, "maker_fill_price", 0.0) or 0.0) <= 0.0:
             missing.append("maker_fill_price")
-        if not getattr(pending, "maker_order_id", ""):
-            missing.append("maker_order_id")
         if float(getattr(pending, "hedge_fill_price", 0.0) or 0.0) <= 0.0:
             missing.append("hedge_fill_price")
-        if not getattr(pending, "hedge_order_id", ""):
-            missing.append("hedge_order_id")
 
         if not missing:
             return True

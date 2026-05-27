@@ -4308,7 +4308,7 @@ class TestZeroFillFinalizeV1ParityGate:
 
     @pytest.mark.asyncio
     async def test_balanced_quantity_with_missing_hedge_details_defers_open(self, tmp_path):
-        """Balanced qty alone is insufficient: price/order id must reconcile first."""
+        """Balanced qty alone is insufficient: V1 requires prices before open."""
         runtime = _make_open_runtime(tmp_path)
         hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
@@ -4347,7 +4347,6 @@ class TestZeroFillFinalizeV1ParityGate:
         ]
         assert deferred
         assert "hedge_fill_price" in deferred[0]["payload"]["missing_fields"]
-        assert "hedge_order_id" in deferred[0]["payload"]["missing_fields"]
         assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
             ("HYPEUSDT", "", "hedge-cid")
         ]

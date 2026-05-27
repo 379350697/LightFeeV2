@@ -109,6 +109,18 @@ def _live_position_delta(position: Optional[PositionSnapshot]) -> dict[str, Any]
     }
 
 
+def _endpoint_evidence_proves_no_effect(subtype: str, response_classification: str) -> bool:
+    text = f"{subtype} {response_classification}".lower()
+    if "accepted" in text or "stale_accepted" in text:
+        return False
+    return (
+        subtype in {"execution_not_found", "open_order_not_found", "closed_order_not_found"}
+        or "execution_not_found" in text
+        or "no_execution" in text
+        or ("not_found" in text and "accepted" not in text)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Order reconciler
 # ---------------------------------------------------------------------------
@@ -314,7 +326,12 @@ class OrderReconciler:
                 [e for e in endpoint_responses if isinstance(e, dict)],
                 "clear_uncertain_state",
             )
-        if position is not None and position_qty <= 1e-12 and has_endpoint_evidence:
+        if (
+            position is not None
+            and position_qty <= 1e-12
+            and has_endpoint_evidence
+            and _endpoint_evidence_proves_no_effect(subtype, response_classification)
+        ):
             return (
                 "not_found",
                 response_classification or "live_no_effect_confirmed",
