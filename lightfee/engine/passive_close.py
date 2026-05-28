@@ -509,9 +509,40 @@ class PassiveCloseExecutor:
                             return False
                         # Chunk advance invariant: hedge must have caught up to maker fill
                         if pending.hedge_fill.quantity + 1e-9 >= pending.maker_fill.quantity:
-                            if await self._advance_chunk(state, pending):
-                                continue
-                            # advance blocked — will retry
+                            chunk_quantity = pending.current_chunk_quantity()
+                            if pending.maker_fill.quantity + 1e-9 >= chunk_quantity:
+                                # V1 exit.rs:1826 — maker met chunk → normal advance
+                                if await self._advance_chunk(state, pending):
+                                    continue
+                                # advance blocked (hedge check) — will retry
+                                return False
+                            # V1: maker_fill < chunk but maker terminal + hedge matched.
+                            # V1 continues cycling → phase exhaustion → DUAL_TAKER.
+                            # V2: try live flat first, then escalate to DUAL_TAKER.
+                            self._journal.append(
+                                "exit.passive_close_maker_filled_under_chunk",
+                                {
+                                    "position_id": position_id,
+                                    "symbol": position.symbol,
+                                    "long_venue": position.long_venue.value,
+                                    "short_venue": position.short_venue.value,
+                                    "phase": pending.phase_state.phase.value,
+                                    "chunk_quantity": chunk_quantity,
+                                    "maker_fill": pending.maker_fill.quantity,
+                                    "hedge_fill": pending.hedge_fill.quantity,
+                                    "chunk_index": pending.active_chunk_index,
+                                    "decision": "try_live_flat_then_dual_taker",
+                                    "reason": "maker terminal FILLED but under-filled chunk",
+                                    "source": "passive_close_filled_handler",
+                                },
+                            )
+                            if await self._clear_if_live_flat(
+                                state, pending, position,
+                                source="passive_close_maker_filled_under_chunk_live_flat",
+                            ):
+                                return True  # cleared via live flat truth
+                            # Escalate to DUAL_TAKER (V1: phase exhaustion → DUAL_TAKER)
+                            pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
                             return False
                         # Hedge not caught up — record unhedged residual, retry
                         unhedged = pending.maker_fill.quantity - pending.hedge_fill.quantity
@@ -2470,12 +2501,34 @@ class PassiveCloseExecutor:
         ):
             return False
 
-        actual_long_size = await self._fetch_live_position_size(
+        # Second confirmation: use _fetch_live_position_snapshot which
+        # returns (None, error) on failure, NOT 0.0.  This prevents
+        # false-flat when adapter is missing or API throws.
+        long_snap, long_err = await self._fetch_live_position_snapshot(
             position.long_venue, position.symbol
         )
-        actual_short_size = await self._fetch_live_position_size(
+        short_snap, short_err = await self._fetch_live_position_snapshot(
             position.short_venue, position.symbol
         )
+        if long_err or short_err:
+            self._journal.append(
+                "exit.passive_close_clear_flat_untrusted",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "long_error": long_err,
+                    "short_error": short_err,
+                    "live_truth_trusted": False,
+                    "decision": "retain_pending",
+                    "source": source,
+                },
+            )
+            return False
+
+        actual_long_size = abs(float(getattr(long_snap, "quantity", 0.0)))
+        actual_short_size = abs(float(getattr(short_snap, "quantity", 0.0)))
 
         self._clear_live_flat_state(
             state,
@@ -3507,6 +3560,34 @@ class PassiveCloseExecutor:
         short_flat = bool(short_probe.get("flat"))
 
         if long_flat and short_flat:
+            # Position truth is flat. Verify open-order truth to prevent
+            # false-green when exchange has resting orders not yet filled.
+            long_oo_flat, long_oo_evidence = await self._probe_venue_open_orders_flat(
+                long_venue, symbol, adapters
+            )
+            short_oo_flat, short_oo_evidence = await self._probe_venue_open_orders_flat(
+                short_venue, symbol, adapters
+            )
+            if not long_oo_flat or not short_oo_flat:
+                self._journal.append(
+                    "exit.passive_close_recovery_probe_diagnostic",
+                    {
+                        "position_id": pending.position_id,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "local_quantity": pending.target_quantity,
+                        "live_long_size": long_probe.get("quantity"),
+                        "live_short_size": short_probe.get("quantity"),
+                        "live_long_open_orders": long_oo_evidence,
+                        "live_short_open_orders": short_oo_evidence,
+                        "open_order_truth_trusted": long_oo_flat is not None and short_oo_flat is not None,
+                        "decision": "position_flat_but_open_orders_untrusted",
+                        "next_action": "retry_live_flat_probe",
+                        "source": "pending_passive_close_live_flat_probe",
+                    },
+                )
+                return False
             self._journal.append(
                 "exit.passive_close_recovery_probe_flat",
                 {
@@ -3514,6 +3595,7 @@ class PassiveCloseExecutor:
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
                     "symbol": symbol,
+                    "open_order_truth_trusted": True,
                 },
             )
             return True
@@ -3635,6 +3717,94 @@ class PassiveCloseExecutor:
             "quantity": None,
             "error": direct_error or "position_fetch_unavailable",
         }
+
+    async def _probe_venue_open_orders_flat(
+        self,
+        venue: Venue,
+        symbol: str,
+        adapters: dict[Venue, VenueAdapter],
+    ) -> tuple[bool | None, str | None]:
+        """Check if a venue has no open orders for a symbol.
+
+        Returns:
+            (True, None) — no open orders (trusted flat)
+            (False, evidence) — has open orders (trusted non-flat)
+            (None, error) — query failed (untrusted)
+        """
+        adapter = adapters.get(venue)
+        if adapter is None:
+            return None, "adapter_missing"
+
+        # Try adapter.fetch_open_orders(symbol) duck-type first
+        fetch_fn = getattr(adapter, "fetch_open_orders", None)
+        if callable(fetch_fn):
+            try:
+                orders = await fetch_fn(symbol)
+                if isinstance(orders, dict) and orders.get("error"):
+                    return None, str(orders["error"])
+                items = orders if isinstance(orders, list) else []
+                if items:
+                    return False, f"open_orders_count={len(items)}"
+                return True, None
+            except Exception as exc:
+                return None, str(exc)
+
+        # Fallback: try transport._request for known venues
+        transport = getattr(adapter, "_transport", None)
+        if transport is None or not hasattr(transport, "_request"):
+            # No way to query open orders — conservatively treat as untrusted (None)
+            # to preserve pending state, unless proven safe.
+            return None, "open_orders_query_unsupported"
+
+        venue_symbol = symbol
+        to_venue_symbol = getattr(transport, "_venue_symbol", None)
+        if callable(to_venue_symbol):
+            venue_symbol = to_venue_symbol(symbol)
+
+        try:
+            if venue in (Venue.BINANCE, Venue.ASTER):
+                raw = await transport._request(
+                    "GET", "/fapi/v1/openOrders",
+                    params={"symbol": venue_symbol},
+                    private=True,
+                )
+            elif venue == Venue.BYBIT:
+                raw = await transport._request(
+                    "GET", "/v5/order/realtime",
+                    params={
+                        "category": "linear",
+                        "symbol": venue_symbol,
+                        "settleCoin": "USDT",
+                    },
+                    private=True,
+                )
+            elif venue == Venue.OKX:
+                raw = await transport._request(
+                    "GET", "/api/v5/trade/orders-pending",
+                    params={"instId": venue_symbol},
+                    private=True,
+                )
+            else:
+                # Unsupported venue — conservatively treat as untrusted
+                return None, "open_orders_query_unsupported"
+
+            # Parse response to list of orders
+            items: list[Any] = []
+            if isinstance(raw, list):
+                items = raw
+            elif isinstance(raw, dict):
+                result = raw.get("result")
+                if isinstance(result, dict) and isinstance(result.get("list"), list):
+                    items = result["list"]
+                elif isinstance(raw.get("data"), list):
+                    items = raw["data"]
+                elif isinstance(raw.get("list"), list):
+                    items = raw["list"]
+            if items:
+                return False, f"open_orders_count={len(items)}"
+            return True, None
+        except Exception as exc:
+            return None, str(exc)
 
     # ------------------------------------------------------------------
     # Price and tick helpers

@@ -52,6 +52,9 @@ class _HistoricalFlatAdapter:
         self.submit_passive_order_calls: list[object] = []
         self.query_passive_order_progress_calls: list[tuple[str, str, str | None]] = []
 
+    async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        return []
+
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         self.fetch_position_calls.append(symbol)
         return PositionSnapshot(

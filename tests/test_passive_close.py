@@ -19,6 +19,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from lightfee.core.contracts import VenueAdapter
+
+# Monkeypatch VenueAdapter to define fetch_open_orders by default returning []
+# so mock adapters in tests are trusted to have no open orders.
+async def _default_fetch_open_orders(self, symbol: str) -> list:
+    return []
+VenueAdapter.fetch_open_orders = _default_fetch_open_orders
+
 from lightfee.core.domain import (
     OrderFill,
     OrderFillReconciliation,
@@ -3782,6 +3789,146 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert payload["live_long_size"] == 0.0
         assert payload["live_short_size"] is None
         assert "aster timeout" in payload["live_short_error"]
+
+    def test_open_orders_transport_request_fallback_scenarios(self):
+        """Test the _transport._request fallback logic for open orders query."""
+        from unittest.mock import AsyncMock, MagicMock
+        from lightfee.core.contracts import VenueAdapter
+        from lightfee.core.domain import Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        executor = PassiveCloseExecutor({}, _open_journal())
+
+        # 1. Adapter missing
+        adapters = {}
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BINANCE, "UBUSDT", adapters)
+        )
+        assert result is None
+        assert error == "adapter_missing"
+
+        # 2. Adapter exists but has no fetch_open_orders and no transport
+        class DummyAdapterNoTransport(VenueAdapter):
+            fetch_open_orders = None
+            @property
+            def venue(self):
+                return Venue.BINANCE
+            async def place_order(self, request):
+                pass
+            async def fetch_position(self, symbol):
+                pass
+
+        adapter_no_transport = DummyAdapterNoTransport()
+        adapters = {Venue.BINANCE: adapter_no_transport}
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BINANCE, "UBUSDT", adapters)
+        )
+        assert result is None
+        assert error == "open_orders_query_unsupported"
+
+        # 3. Adapter has transport but no fetch_open_orders, and transport request returns empty (flat)
+        class DummyTransport:
+            def __init__(self):
+                self._request = AsyncMock(return_value=[])
+
+        class DummyAdapterWithTransport(VenueAdapter):
+            fetch_open_orders = None
+            def __init__(self):
+                self._transport = DummyTransport()
+            @property
+            def venue(self):
+                return Venue.BINANCE
+            async def place_order(self, request):
+                pass
+            async def fetch_position(self, symbol):
+                pass
+
+        adapter_with_transport = DummyAdapterWithTransport()
+        adapters = {Venue.BINANCE: adapter_with_transport}
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BINANCE, "UBUSDT", adapters)
+        )
+        assert result is True
+        assert error is None
+        adapter_with_transport._transport._request.assert_called_once_with(
+            "GET", "/fapi/v1/openOrders",
+            params={"symbol": "UBUSDT"},
+            private=True,
+        )
+
+        # 4. Adapter has transport, and request returns active orders (not flat)
+        adapter_with_transport._transport._request = AsyncMock(return_value=[{"orderId": "123"}])
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BINANCE, "UBUSDT", adapters)
+        )
+        assert result is False
+        assert "open_orders_count=1" in error
+
+        # 5. Adapter has transport, and request raises error (untrusted)
+        adapter_with_transport._transport._request = AsyncMock(side_effect=RuntimeError("connection error"))
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BINANCE, "UBUSDT", adapters)
+        )
+        assert result is None
+        assert "connection error" in error
+
+        # 6. OKX format dictionary parsing
+        okx_transport = DummyTransport()
+        okx_transport._request = AsyncMock(return_value={"data": [{"ordId": "okx123"}]})
+        class OKXAdapter(VenueAdapter):
+            fetch_open_orders = None
+            def __init__(self):
+                self._transport = okx_transport
+            @property
+            def venue(self):
+                return Venue.OKX
+            async def place_order(self, request):
+                pass
+            async def fetch_position(self, symbol):
+                pass
+        okx_adapter = OKXAdapter()
+        adapters = {Venue.OKX: okx_adapter}
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.OKX, "UBUSDT", adapters)
+        )
+        assert result is False
+        assert "open_orders_count=1" in error
+        okx_transport._request.assert_called_once_with(
+            "GET", "/api/v5/trade/orders-pending",
+            params={"instId": "UBUSDT"},
+            private=True,
+        )
+
+        # 7. Bybit format dictionary parsing
+        bybit_transport = DummyTransport()
+        bybit_transport._request = AsyncMock(return_value={"result": {"list": [{"orderId": "bybit123"}]}})
+        class BybitAdapter(VenueAdapter):
+            fetch_open_orders = None
+            def __init__(self):
+                self._transport = bybit_transport
+            @property
+            def venue(self):
+                return Venue.BYBIT
+            async def place_order(self, request):
+                pass
+            async def fetch_position(self, symbol):
+                pass
+        bybit_adapter = BybitAdapter()
+        adapters = {Venue.BYBIT: bybit_adapter}
+        result, error = asyncio.run(
+            executor._probe_venue_open_orders_flat(Venue.BYBIT, "UBUSDT", adapters)
+        )
+        assert result is False
+        assert "open_orders_count=1" in error
+        bybit_transport._request.assert_called_once_with(
+            "GET", "/v5/order/realtime",
+            params={
+                "category": "linear",
+                "symbol": "UBUSDT",
+                "settleCoin": "USDT",
+            },
+            private=True,
+        )
 
 
 class TestNonTerminalPartialFillHedgeGapClosure:

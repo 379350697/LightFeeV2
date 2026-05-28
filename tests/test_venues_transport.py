@@ -8423,3 +8423,82 @@ class TestPassiveAmendWireContracts:
         finally:
             await transport.close()
         assert calls == []
+
+
+class TestBinanceAsterPrecisionFix:
+    """Validate that VenueTransport.normalize_quantity for Binance/Aster in live mode
+    properly queries the SymbolRulesCache, correctly handles dynamic rules like HIGHUSDT step=1,
+    and resolves NameError issues.
+    """
+
+    @pytest.mark.asyncio
+    async def test_binance_normalize_quantity_uses_dynamic_symbol_rules(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+        from lightfee.venues.specs import binance_spec
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BINANCE
+                assert venue_symbol == "HIGHUSDT"
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,  # step=1.0 precision
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            spec=binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="key", api_secret="secret"),
+        )
+
+        # 357.8 should normalize to 357.0 with step=1.0
+        normalized = await transport.normalize_quantity("HIGHUSDT", 357.8)
+        assert normalized == pytest.approx(357.0)
+
+        # 0.5 should normalize to 0.0 because it's below min_qty=1.0
+        normalized_below_min = await transport.normalize_quantity("HIGHUSDT", 0.5)
+        assert normalized_below_min == 0.0
+
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_normalize_quantity_uses_dynamic_symbol_rules(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+        from lightfee.venues.specs import aster_spec
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.ASTER
+                assert venue_symbol == "HIGHUSDT"
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            spec=aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="key", api_secret="secret"),
+        )
+
+        # 357.8 should normalize to 357.0 with step=1.0
+        normalized = await transport.normalize_quantity("HIGHUSDT", 357.8)
+        assert normalized == pytest.approx(357.0)
+
+        await transport.close()

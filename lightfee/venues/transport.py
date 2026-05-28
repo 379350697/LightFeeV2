@@ -6293,8 +6293,8 @@ class VenueTransport(MarketDataClient):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         spec = self._spec
+        venue_sym = self._venue_symbol(symbol)
         if spec.venue_id == Venue.BYBIT and self.mode == "live":
-            venue_sym = self._venue_symbol(symbol)
             try:
                 symbol_rule = await get_symbol_rules_cache().get(self, Venue.BYBIT, venue_sym)
             except Exception:
@@ -6384,6 +6384,25 @@ class VenueTransport(MarketDataClient):
                 return 0.0
             contract_qty = float(diagnostics.get("contract_qty", 0.0) or 0.0)
             return contract_qty * ct_val
+
+        # Binance/Aster live mode: use dynamic exchangeInfo rules
+        # to get per-symbol qty_step/min_qty instead of static VenueSpec
+        # defaults, preventing -1111 LOT_SIZE errors on symbols with
+        # non-standard precision (e.g. HIGHUSDT step=1).
+        if spec.venue_id in (Venue.BINANCE, Venue.ASTER) and self.mode == "live":
+            try:
+                cache = get_symbol_rules_cache()
+                rule = await cache.get(self, spec.venue_id, venue_sym)
+                if rule and getattr(rule, "rule_source", "") == "exchangeInfo":
+                    return normalize_venue_quantity(
+                        quantity=quantity,
+                        step_size=rule.qty_step,
+                        contract_size=spec.contract_size,
+                        min_quantity=rule.min_qty,
+                    )
+            except Exception:
+                pass  # Fall through to static default
+
         return normalize_venue_quantity(
             quantity=quantity,
             step_size=spec.quantity_step,

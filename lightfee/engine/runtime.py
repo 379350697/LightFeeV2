@@ -1527,7 +1527,12 @@ class LiveRuntime:
 
         for position in list(self.state.open_positions.values()):
             if position.position_id in self.state.pending_passive_closes:
-                continue
+                ppc = self.state.pending_passive_closes[position.position_id]
+                # Only skip drift check if maker order is still actively managed.
+                # When maker is terminal (order ID empty), allow drift check to
+                # detect exchange-flat and break stuck passive close states.
+                if getattr(ppc.phase_state, "maker_order_id", ""):
+                    continue
             if any(
                 pending.position_id == position.position_id
                 for pending in self.state.pending_closes.values()
@@ -4701,6 +4706,37 @@ class LiveRuntime:
                 abandoned = await self._try_abandon_stale_entry(pending, entry_id)
                 if abandoned:
                     self.state.pending_entries.pop(entry_id, None)
+                    return True
+
+            # P6: if there are actual fills (not repair-state), give
+            # reconcile a chance before abort. This prevents discarding
+            # fill evidence. Zero-fill or repair-state entries abort directly.
+            if pending.has_any_fill() and not pending.repair_state:
+                hard_ceiling_ms = getattr(
+                    self.config.strategy, "pending_entry_hard_ceiling_ms", 120000
+                )
+                reconcile_extension_ms = getattr(
+                    self.config.strategy,
+                    "pending_entry_reconcile_extension_ms",
+                    30000,
+                )
+                extension_budget = budget["lifetime_ms"] - hard_ceiling_ms
+                if extension_budget < reconcile_extension_ms:
+                    self.journal.append(
+                        "pending_entry.hard_ceiling_reconcile_before_abort",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "has_fill": True,
+                            "maker_leg_filled": pending.maker_leg_filled,
+                            "hedge_leg_filled": pending.hedge_leg_filled,
+                            "extension_budget_ms": extension_budget,
+                            "reconcile_extension_ms": reconcile_extension_ms,
+                            "reason": final_reason,
+                        },
+                    )
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
                     return True
 
             await self._abort_pending_entry(pending, entry_id, final_reason)

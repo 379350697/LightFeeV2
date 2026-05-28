@@ -3188,7 +3188,7 @@ class TestRealPathAbortCleanupDeadline:
             target_quantity=425.0,
             long_side=Side.BUY,
             short_side=Side.SELL,
-            created_at_ms=now_ms - hard_ceiling_ms - 5000,  # past hard ceiling
+            created_at_ms=now_ms - hard_ceiling_ms - 31000,  # past hard ceiling + reconcile extension
             maker_leg="long",
             maker_leg_filled=425.0,
             maker_fill_price=1.0,
@@ -3895,7 +3895,7 @@ class TestLegacyInflightTerminalPath:
             target_quantity=425.0,
             long_side=Side.BUY,
             short_side=Side.SELL,
-            created_at_ms=now_ms - hard_ceiling_ms - 5000,
+            created_at_ms=now_ms - hard_ceiling_ms - 31000,  # past hard ceiling + reconcile extension
             maker_leg="long",
             maker_leg_filled=425.0,
             maker_fill_price=1.0,
@@ -3941,7 +3941,7 @@ class TestLegacyInflightTerminalPath:
             target_quantity=425.0,
             long_side=Side.BUY,
             short_side=Side.SELL,
-            created_at_ms=now_ms - hard_ceiling_ms - 5000,
+            created_at_ms=now_ms - hard_ceiling_ms - 31000,  # past hard ceiling + reconcile extension
             maker_leg="long",
             maker_leg_filled=425.0,
             maker_fill_price=1.0,
@@ -4110,6 +4110,104 @@ class TestStartupZeroFillNoDirectPop:
         # Cleanup succeeded (full fill) → pending removed
         assert "entry-startup-zero-cleanup-ok" not in runtime.state.pending_entries
         assert len(fake_long._place_order_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_has_fill_past_hard_ceiling_gets_reconcile_extension_retained(self, tmp_path):
+        """When a pending entry has fills, is past the hard ceiling by less than
+        reconcile_extension_ms, it is not aborted immediately, but gets a
+        reconcile extension and is retained.
+        """
+        from lightfee.engine.runtime import LiveRuntime
+
+        hard_ceiling_ms = 120000
+        reconcile_extension_ms = 30000
+        runtime = _make_open_runtime(
+            tmp_path,
+            pending_entry_hard_ceiling_ms=hard_ceiling_ms,
+            pending_entry_reconcile_extension_ms=reconcile_extension_ms,
+        )
+        runtime.reconciler = _FakeReconciler()
+        # Fake adapters with flat position
+        for ven in (Venue.BYBIT, Venue.HYPERLIQUID):
+            fake = _FakeVenueAdapter(ven)
+            fake.position = None
+            runtime._venue_adapters[ven] = fake
+
+        now_ms = 1778985600000
+        pending = PendingEntry(
+            pending_id="entry-extension-retained",
+            symbol="POLYXUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=425.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - hard_ceiling_ms - 5000,  # 5s past hard ceiling (< 30s)
+            maker_leg="long",
+            maker_leg_filled=425.0,  # has fills
+            maker_fill_price=1.0,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries["entry-extension-retained"] = pending
+
+        # Run reconcile
+        await runtime._reconcile_pending_state(now_ms)
+
+        # Assertion: it gets reconcile extension, so it is retained in state
+        assert "entry-extension-retained" in runtime.state.pending_entries
+        # reconcile_attempt must be incremented
+        assert pending.reconcile_attempt >= 1
+
+        # Check journal events
+        events = runtime.journal.read_all()
+        kinds = [e["kind"] for e in events]
+        assert "pending_entry.hard_ceiling_reconcile_before_abort" in kinds
+
+    @pytest.mark.asyncio
+    async def test_has_fill_past_hard_ceiling_extension_exhausted_aborts(self, tmp_path):
+        """When a pending entry has fills, is past the hard ceiling by more than
+        reconcile_extension_ms, it is aborted and cleaned up.
+        """
+        from lightfee.engine.runtime import LiveRuntime
+
+        hard_ceiling_ms = 120000
+        reconcile_extension_ms = 30000
+        runtime = _make_open_runtime(
+            tmp_path,
+            pending_entry_hard_ceiling_ms=hard_ceiling_ms,
+            pending_entry_reconcile_extension_ms=reconcile_extension_ms,
+        )
+        runtime.reconciler = _FakeReconciler()
+        # Fake adapters with flat position (so cleanup succeeds)
+        for ven in (Venue.BYBIT, Venue.HYPERLIQUID):
+            fake = _FakeVenueAdapter(ven)
+            fake.position = None
+            runtime._venue_adapters[ven] = fake
+
+        now_ms = 1778985600000
+        pending = PendingEntry(
+            pending_id="entry-extension-exhausted",
+            symbol="POLYXUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=425.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - hard_ceiling_ms - 35000,  # 35s past hard ceiling (> 30s)
+            maker_leg="long",
+            maker_leg_filled=425.0,  # has fills
+            maker_fill_price=1.0,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries["entry-extension-exhausted"] = pending
+
+        # Run reconcile
+        await runtime._reconcile_pending_state(now_ms)
+
+        # Assertion: extension exhausted, so it is aborted and removed
+        assert "entry-extension-exhausted" not in runtime.state.pending_entries
 
 
 class TestZeroFillFinalizeV1ParityGate:

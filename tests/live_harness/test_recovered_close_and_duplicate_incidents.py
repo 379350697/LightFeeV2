@@ -43,6 +43,9 @@ class _RecoveredFlatAdapter:
         self.place_order_calls: list[OrderRequest] = []
         self.submit_passive_order_calls: list[OrderRequest] = []
 
+    async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        return []
+
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         self.fetch_position_calls.append(symbol)
         return PositionSnapshot(
