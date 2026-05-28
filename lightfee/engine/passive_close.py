@@ -2816,6 +2816,13 @@ class PassiveCloseExecutor:
         price_hint, price_source = await self._resolve_hedge_reference_price(
             venue, position.symbol, close_side, price_hint,
         )
+        if price_hint <= 0.0:
+            live_entry_price = self._positive_float(
+                getattr(live_snapshot, "entry_price", 0.0)
+            )
+            if live_entry_price > 0.0:
+                price_hint = live_entry_price
+                price_source = "live_position_entry_price"
         min_notional_quote, min_notional_source = await self._resolve_hedge_min_notional_quote(
             venue,
             position.symbol,

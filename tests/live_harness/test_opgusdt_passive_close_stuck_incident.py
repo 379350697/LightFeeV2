@@ -535,3 +535,68 @@ class TestOpgUsdtIncident:
         assert "exit.passive_close_live_one_sided_flatten" in kinds
         assert "exit.passive_close_fallback_terminal_flat" in kinds
 
+    @pytest.mark.asyncio
+    async def test_opgusdt_live_one_sided_uses_live_entry_price_without_l2(self):
+        """Production OPGUSDT replay: OKX is one-sided short, local L2/market
+        price is unavailable, but live position entry_price is enough evidence
+        for reduce-only min-notional admission.
+        """
+        journal = _open_journal()
+        long_adapter = _OneSidedResidualAdapter(Venue.BINANCE, flat=True)
+        short_adapter = _OneSidedResidualAdapter(Venue.OKX, flat=False)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal,
+        )
+
+        state = EngineState()
+        position = _make_opgusdt_position()
+        state.open_positions[position.position_id] = position
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=13.0,
+            chunk_quantities=[13.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                preferred_maker_leg=ActiveMakerLeg.LONG,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0, average_price=0.95),
+            hedge_fill=PendingPassiveLegFill(quantity=10.0, average_price=0.96),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        orig_place_order = short_adapter.place_order
+
+        async def mock_place_order(request):
+            short_adapter._flat = True
+            return await orig_place_order(request)
+
+        short_adapter.place_order = mock_place_order
+        live_short = await short_adapter.fetch_position("OPGUSDT")
+
+        res = await executor._flatten_live_one_sided_position(
+            state,
+            pending,
+            position,
+            venue=Venue.OKX,
+            live_snapshot=live_short,
+            leg_label="short",
+        )
+
+        assert res is True
+        assert len(short_adapter._place_order_calls) == 1
+        close_req = short_adapter._place_order_calls[0]
+        assert close_req.side == Side.BUY
+        assert close_req.quantity == 10.0
+        assert close_req.reduce_only is True
+        assert close_req.price == pytest.approx(0.96)
+
+        events = journal.read_all()
+        kinds = [e["kind"] for e in events]
+        assert "exit.passive_close_hedge_dust_aborted" not in kinds
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
