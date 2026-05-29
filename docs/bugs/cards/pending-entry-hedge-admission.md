@@ -1,0 +1,60 @@
+# Bug Card: Pending Entry Hedge Admission
+
+Purpose: keep the reusable memory for deterministic hedge-leg admission rejects.
+Daily ledgers keep the full incident evidence; this card keeps the next-debug
+decision path short.
+
+## Stable Fingerprints
+
+- `pending_entry.hedge_submit_result` with `outcome=error` and deterministic exchange reject text.
+- `order.submit_result` rejected with `response_classification`.
+- Bybit trading-terms family: `110126`, `110125`, `110123`, `must sign required agreement`.
+- Aster max-notional family: `-5018`, `maximum notional value limit`, `max_notional_admission_blocked`.
+- Recurrence shape: maker leg has fill/exposure, hedge venue rejects deterministically, same pending keeps retrying until max lifetime or cleanup.
+
+## Current Effective Rule
+
+Deterministic hedge admission reject must:
+
+1. Reuse the same admission classifier as initial entry dispatch.
+2. Record `runtime.entry_admission_blocked`.
+3. Emit `pending_entry.hedge_admission_blocked`.
+4. Clear `hedge_inflight`.
+5. Abort through the existing pending-entry cleanup path so maker exposure is flattened or retained fail-closed if cleanup cannot prove flat.
+6. Prevent repeated same-pending hedge attempts for the same deterministic admission blocker.
+
+## V1 / Exchange Semantics
+
+- Aster `-5018`: V1 detects max-notional submit reject and starts venue entry cooldown with reason `aster_max_notional_limit`. V2 should keep symbol evidence and also create venue-scope cooldown for this family.
+- Bybit trading-terms rejects: no matching V1 definition found. Treat as exchange-documented admission/permission block, not as V1 copy work.
+- Transport-level classification alone is insufficient unless runtime consumes it in the pending hedge branch.
+
+## Attempts Ledger
+
+| Date | Attempt | Status | Why |
+|---|---|---|---|
+| 2026-05-20/26 | Transport `response_classification` for Bybit/Aster admission rejects | partial | Correctly classified reject payloads but did not stop pending-hedge runtime retries. |
+| 2026-05-29 | Pending hedge admission consumer + cleanup/abort | effective | Cloud harness/probe passed; BZUSDT/LABUSDT flat/no-open-orders; post-deploy reject counts empty. |
+
+## Recurrences
+
+| Date | Symbols / Venues | Commit / Fix | Result | Detail |
+|---|---|---|---|---|
+| 2026-05-29 | `BZUSDT` Aster maker / Bybit hedge, `LABUSDT` Binance maker / Aster hedge | `6987fc8`; deployed through `bbcd7b9` docs sync | closed | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
+
+## Regression Harness
+
+- `tests/live_harness/test_exchange_admission_incidents.py`
+- `tests/test_live_startup_preflight.py`
+- `tests/test_venues_transport.py -k 'aster or bybit_110126 or bybit_trading_terms or max_notional'`
+- `tests/test_pending_entry_v1_semantic_drift.py`
+
+## Next Recurrence Checklist
+
+1. Count `order.submit_result` rejected events by venue, symbol, and `response_classification`.
+2. Check whether `pending_entry.hedge_admission_blocked` appears after the hedge reject.
+3. Check `runtime.entry_admission_blocked` and `state.venue_entry_cooldowns`.
+4. For Aster `-5018`, check `runtime.venue_cooldown_started` reason `aster_max_notional_limit`.
+5. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
+6. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+

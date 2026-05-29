@@ -6,6 +6,13 @@ The goal is to preserve enough context for future debugging, GitNexus search, an
 
 ## File Layout
 
+Use short bug cards for recurring bug families. A card is not an incident log;
+it is the compact reusable memory for future root-cause work:
+
+```text
+docs/bugs/cards/<family-fingerprint>.md
+```
+
 Use one daily ledger file for normal work:
 
 ```text
@@ -19,6 +26,39 @@ docs/bugs/BUG-YYYYMMDD-topic-fingerprint.md
 ```
 
 Keep `docs/bugs/BUG_INDEX.md` as the cross-day index. The index should list daily clusters or standalone bug files, not duplicate full investigations.
+
+## Bug Cards
+
+Bug cards are for recurring families such as pending-entry admission, Local-L2
+continuity, passive-close terminality, or live-truth false flat. Keep cards
+short enough to read during an incident, roughly 100-180 lines. Do not paste
+full daily evidence into a card.
+
+Required card sections:
+
+```md
+# Bug Card: Family Name
+
+## Stable Fingerprints
+## Current Effective Rule
+## V1 / Exchange Semantics
+## Attempts Ledger
+## Recurrences
+## Regression Harness
+## Next Recurrence Checklist
+```
+
+Card rules:
+
+- Add a card when the same failure family has recurred or is likely to recur.
+- A daily entry owns the full incident evidence; the card owns reusable
+  conclusions.
+- Every same-family recurrence gets one row in `Recurrences`.
+- Every partial or ineffective fix gets one row in `Attempts Ledger`.
+- Update `Current Effective Rule` only when the actual decision rule changes.
+- Keep commands as compact harness/probe names, not raw output.
+- If a card grows beyond quick-read size, split by root decision boundary, not
+  by date.
 
 ## Daily Ledger Structure
 
@@ -88,6 +128,7 @@ Do store:
 - Verification commands and short result summaries.
 - Regression watch indicators.
 - Links or paths to source files and commits.
+- Bug-card recurrence rows for same-family incidents.
 
 Do not store:
 
@@ -115,6 +156,7 @@ When a fix is incomplete, say so explicitly in `Fix Status` and keep the item in
 ## Maintenance
 
 - Update the ledger in the same branch as the code fix whenever possible.
+- For same-family incidents, update both the daily entry and the matching card.
 - After adding or changing bug docs, run `npx gitnexus analyze` when a fresh GitNexus index is needed.
 - Keep `BUG_INDEX.md` small and index-like. The daily or standalone ledger owns the details.
 
@@ -122,6 +164,7 @@ When a fix is incomplete, say so explicitly in `Fix Status` and keep the item in
 
 Before handing off a bug-ledger-only update:
 
+- Confirm any same-family issue has an updated card in `docs/bugs/cards/`.
 - Confirm the daily or standalone bug entry has a stable `Fingerprint`, exact
   `Components`, exact `Symbols`, exact `Files`, and concrete `Watch` indicators.
 - Confirm `docs/bugs/BUG_INDEX.md` links to the entry and keeps only index-level
