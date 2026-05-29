@@ -493,6 +493,38 @@ def test_production_blocker_window_reports_closed_evidence_conclusions(tmp_path)
     }
 
 
+def test_production_blocker_window_requires_actual_official_sequence_break(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "window_no_sequence_break.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779810000000,
+            "kind": "runtime.local_l2_sequence_gap_rebuild",
+            "payload": {
+                "venue": "aster",
+                "symbol": "LABUSDT",
+                "previous_sequence_present": True,
+                "expected_previous_sequence": 468889077688,
+                "raw_U": 468889077689,
+                "raw_u": 468889077847,
+                "raw_pu": 468889077688,
+                "status_after": "rebuilding",
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h"],
+    )
+
+    window = result["windows"]["last_2h"]
+    assert "local_l2_official_rebuild" not in window["incident_counts"]
+    assert window["incident_conclusions"]["local_l2_official_rebuild"] == "insufficient_evidence"
+
+
 def test_production_blocker_window_replays_okx_noise_skipped_count(tmp_path):
     from scripts.analyze_production_blockers import analyze_event_file
 

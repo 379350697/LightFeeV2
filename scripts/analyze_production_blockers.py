@@ -22,6 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from lightfee.marketdata.local_l2_incident_classification import (
+    has_official_sequence_rebuild_evidence,
+)
+
 
 def _parse_since_ms(value: str | None) -> int:
     if not value:
@@ -74,12 +78,7 @@ def _snapshot_fallback_blocked(payload: dict[str, Any]) -> bool:
 
 
 def _has_official_sequence_evidence(payload: dict[str, Any]) -> bool:
-    if str(payload.get("venue", "")).lower() not in {"aster", "binance"}:
-        return False
-    return payload.get("previous_sequence_present") is True and all(
-        payload.get(field) is not None
-        for field in ("expected_previous_sequence", "raw_U", "raw_u", "raw_pu")
-    )
+    return has_official_sequence_rebuild_evidence(payload)
 
 
 def _canonical_okx_symbol(value: Any) -> str:

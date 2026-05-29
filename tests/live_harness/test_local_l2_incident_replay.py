@@ -16,6 +16,12 @@ from lightfee.marketdata.l2 import (
     PriceLevel,
 )
 from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
+from lightfee.marketdata.local_l2_incident_classification import (
+    ASTER_LOCAL_BOOK_DOC,
+    BINANCE_LOCAL_BOOK_DOC,
+    official_local_book_doc_url,
+    official_sequence_rebuild_reason,
+)
 from lightfee.marketdata.local_l2_runtime import LocalL2Runtime
 
 Classification = Literal[
@@ -32,11 +38,6 @@ ALLOWED_CLASSIFICATIONS: set[str] = {
     "expected real gap",
     "insufficient evidence",
 }
-
-BINANCE_LOCAL_BOOK_DOC = (
-    "https://developers.binance.com/docs/derivatives/usds-margined-futures/"
-    "websocket-market-streams/How-to-manage-a-local-order-book-correctly"
-)
 
 FIXTURE_PATH = Path("tests/fixtures/live_incidents/2026-05-26/local_l2_after_1310.jsonl")
 BINANCE_REPLAY_FIXTURE_PATH = Path(
@@ -122,19 +123,21 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
             and raw_U > expected_previous + 1
             and raw_U <= raw_u
         )
-        if venue == "binance" and payload.get("previous_sequence_present") and has_real_gap_evidence:
+        doc_url = official_local_book_doc_url(venue)
+        official_reason = official_sequence_rebuild_reason(payload)
+        if doc_url and official_reason == "expected_real_gap" and has_real_gap_evidence:
             return IncidentClassification(
                 event_kind=kind,
                 classification="expected real gap",
-                evidence="Binance diff-depth stream skipped at least one update after the known previous sequence.",
-                official_doc_url=BINANCE_LOCAL_BOOK_DOC,
+                evidence="Diff-depth stream skipped at least one update after the known previous sequence.",
+                official_doc_url=doc_url,
             )
-        if venue == "binance" and payload.get("previous_sequence_present") and has_strict_gap_evidence:
+        if doc_url and official_reason == "previous_link_mismatch" and has_strict_gap_evidence:
             return IncidentClassification(
                 event_kind=kind,
                 classification="official-doc exchange reset/sequence behavior",
-                evidence="Binance diff-depth updates require strict pu-to-previous-u continuity.",
-                official_doc_url=BINANCE_LOCAL_BOOK_DOC,
+                evidence="Diff-depth updates require strict pu-to-previous-u continuity.",
+                official_doc_url=doc_url,
             )
         return IncidentClassification(
             event_kind=kind,
@@ -144,7 +147,6 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
         )
 
     if kind == "runtime.local_l2_snapshot_error":
-        reason = str(payload.get("reason", ""))
         if venue == "binance" and payload.get("category") == "buffered_replay_failed":
             if not _has_required_binance_replay_evidence(payload):
                 return IncidentClassification(
@@ -172,27 +174,21 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
             and raw_U <= raw_u
             and raw_U > snapshot_last_update_id
         )
-        if (
-            venue == "binance"
-            and "previous_link_mismatch" in reason
-            and has_previous_link_mismatch_evidence
-        ):
+        doc_url = official_local_book_doc_url(venue)
+        official_reason = official_sequence_rebuild_reason(payload)
+        if doc_url and official_reason == "previous_link_mismatch" and has_previous_link_mismatch_evidence:
             return IncidentClassification(
                 event_kind=kind,
                 classification="official-doc exchange reset/sequence behavior",
                 evidence="A buffered replay pu mismatch requires local book reinitialization.",
-                official_doc_url=BINANCE_LOCAL_BOOK_DOC,
+                official_doc_url=doc_url,
             )
-        if (
-            venue == "binance"
-            and "snapshot_boundary" in reason
-            and has_snapshot_boundary_evidence
-        ):
+        if doc_url and official_reason == "snapshot_boundary" and has_snapshot_boundary_evidence:
             return IncidentClassification(
                 event_kind=kind,
                 classification="official-doc exchange reset/sequence behavior",
                 evidence="The first buffered update does not bridge the REST snapshot lastUpdateId.",
-                official_doc_url=BINANCE_LOCAL_BOOK_DOC,
+                official_doc_url=doc_url,
             )
         return IncidentClassification(
             event_kind=kind,
@@ -322,6 +318,34 @@ def test_binance_buffered_replay_samples_require_raw_sequence_and_status_evidenc
         assert result.evidence_gap is False
         assert result.data_plane_change_allowed is False
         assert result.stale_threshold_change_allowed is False
+
+
+def test_aster_buffered_replay_previous_link_mismatch_uses_official_doc_classification():
+    sample = {
+        "kind": "runtime.local_l2_snapshot_error",
+        "payload": {
+            "venue": "aster",
+            "symbol": "LABUSDT",
+            "category": "buffered_replay_failed",
+            "reason": "buffered_replay_previous_link_mismatch: expected 468889077688 got 468889077062",
+            "previous_sequence_present": True,
+            "snapshot_last_update_id": 468889077688,
+            "expected_previous_sequence": 468889077688,
+            "raw_U": 468889077553,
+            "raw_u": 468889077847,
+            "raw_pu": 468889077062,
+            "status_before": "bootstrapping",
+            "status_after": "rebuilding",
+        },
+    }
+
+    result = classify_local_l2_incident(sample)
+
+    assert result.classification == "official-doc exchange reset/sequence behavior"
+    assert result.official_doc_url == ASTER_LOCAL_BOOK_DOC
+    assert result.evidence_gap is False
+    assert result.data_plane_change_allowed is False
+    assert result.stale_threshold_change_allowed is False
 
 
 class _RecordingJournal:

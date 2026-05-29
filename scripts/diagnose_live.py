@@ -23,6 +23,10 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from lightfee.marketdata.local_l2_incident_classification import (
+    has_official_sequence_rebuild_evidence,
+)
+
 # Schema version — bump when output shape changes
 SCHEMA_VERSION = 2
 
@@ -1256,17 +1260,7 @@ def _is_snapshot_fallback_blocking(payload: dict[str, Any]) -> bool:
 
 
 def _has_official_sequence_rebuild_evidence(payload: dict[str, Any]) -> bool:
-    if str(payload.get("venue", "")).lower() not in {"aster", "binance"}:
-        return False
-    sequence_fields = (
-        "expected_previous_sequence",
-        "raw_U",
-        "raw_u",
-        "raw_pu",
-    )
-    return payload.get("previous_sequence_present") is True and all(
-        payload.get(field) is not None for field in sequence_fields
-    )
+    return has_official_sequence_rebuild_evidence(payload)
 
 
 def _canonical_okx_symbol(value: Any) -> str:
