@@ -1415,15 +1415,6 @@ class PassiveCloseExecutor:
                 )
 
             if maker_terminal:
-                if dust_reason == "price_unavailable_for_min_notional":
-                    pending.next_retry_at_ms = self._now_ms() + 5_000
-                    return HedgeDeltaResult(
-                        requested=delta,
-                        filled=0.0,
-                        residual=delta,
-                        success=False,
-                        error=dust_reason,
-                    )
                 leg_notional = 0.0
                 min_notional = 0.0
                 if min_notional_violation is not None:

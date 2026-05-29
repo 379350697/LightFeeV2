@@ -6,7 +6,15 @@ from typing import Any
 
 import pytest
 
-from lightfee.core.domain import OrderFill, OrderRequest, PositionSnapshot, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderRequest,
+    PassiveOrderProgress,
+    PassiveOrderState,
+    PositionSnapshot,
+    Side,
+    Venue,
+)
 from lightfee.engine.close_executor import CloseExecutor
 from lightfee.engine.passive_close import PassiveCloseExecutor
 from lightfee.engine.state import (
@@ -52,9 +60,16 @@ def _position(
 
 
 class _LiveOneSidedAdapter:
-    def __init__(self, venue: Venue, position: PositionSnapshot | None):
+    def __init__(
+        self,
+        venue: Venue,
+        position: PositionSnapshot | None,
+        *,
+        passive_progress: PassiveOrderProgress | None = None,
+    ):
         self._venue = venue
         self.position = position
+        self.passive_progress = passive_progress
         self.place_order_calls: list[OrderRequest] = []
         self.fetch_position_calls: list[str] = []
         self.fetch_market_snapshot_calls: list[list[str]] = []
@@ -73,6 +88,15 @@ class _LiveOneSidedAdapter:
     async def fetch_market_snapshot(self, symbols: list[str]) -> Any:
         self.fetch_market_snapshot_calls.append(symbols)
         raise RuntimeError("ticker unavailable")
+
+    async def query_passive_order_progress(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str,
+        side: Side,
+    ) -> PassiveOrderProgress | None:
+        return self.passive_progress
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
@@ -94,6 +118,105 @@ class _LiveOneSidedAdapter:
             order_id="jct-compensate-fill",
             filled_at_ms=1780033201000,
         )
+
+
+@pytest.mark.asyncio
+async def test_jctusdt_terminal_maker_missing_price_compensates_in_real_drive_path():
+    journal = _open_journal()
+    bybit = _LiveOneSidedAdapter(
+        Venue.BYBIT,
+        _position(
+            venue=Venue.BYBIT,
+            symbol="JCTUSDT",
+            side=Side.BUY,
+            quantity=5900.0,
+            entry_price=0.0,
+        ),
+    )
+    binance = _LiveOneSidedAdapter(
+        Venue.BINANCE,
+        _position(
+            venue=Venue.BINANCE,
+            symbol="JCTUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+        ),
+        passive_progress=PassiveOrderProgress(
+            venue=Venue.BINANCE,
+            symbol="JCTUSDT",
+            side=Side.BUY,
+            order_id="short-maker-filled",
+            client_order_id="short-maker-cid",
+            cumulative_quantity=5900.0,
+            average_price=0.004026,
+            fee_quote=0.0,
+            last_fill_time_ms=1780033200000,
+            state=PassiveOrderState.FILLED,
+            observed_at_ms=1780033200000,
+        ),
+    )
+    adapters = {Venue.BYBIT: bybit, Venue.BINANCE: binance}
+    executor = PassiveCloseExecutor(adapters, journal)
+    executor.set_close_executor(CloseExecutor(adapters, journal))
+    executor.set_l2_mid_resolver(lambda _venue, _symbol: 0.0)
+
+    state = EngineState()
+    position = OpenPosition(
+        position_id="entry-1779998121561-JCTUSDT",
+        symbol="JCTUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        long_quantity=5900.0,
+        short_quantity=5900.0,
+        long_entry_price=0.004024,
+        short_entry_price=0.0040263149153,
+        opened_at_ms=1779998236737,
+        matched_quantity=5900.0,
+    )
+    pending = PendingPassiveClose(
+        position_id=position.position_id,
+        reason="funding_capture",
+        position_snapshot=position,
+        target_quantity=5900.0,
+        chunk_quantities=[5900.0],
+        phase_state=PassivePhaseState(
+            phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+            active_maker_leg=ActiveMakerLeg.SHORT,
+            maker_order_id="short-maker-filled",
+            maker_client_order_id="short-maker-cid",
+            maker_resting_limit_price=0.004026,
+        ),
+        maker_fill=PendingPassiveLegFill(quantity=0.0),
+        hedge_fill=PendingPassiveLegFill(quantity=0.0),
+    )
+    state.open_positions[position.position_id] = position
+    state.pending_passive_closes[position.position_id] = pending
+
+    result = await executor.drive_pending_passive_close(
+        state,
+        position.position_id,
+        wait_until_terminal=False,
+    )
+
+    assert result is True
+    assert len(bybit.place_order_calls) == 1
+    close_req = bybit.place_order_calls[0]
+    assert close_req.side == Side.SELL
+    assert close_req.quantity == pytest.approx(5900.0)
+    assert close_req.reduce_only is True
+    assert close_req.price is None
+    assert position.position_id not in state.open_positions
+    assert position.position_id not in state.pending_passive_closes
+
+    events = journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "exit.passive_close_hedge_dust_aborted" in kinds
+    assert "execution.min_notional_abort_and_flatten" in kinds
+    assert "exit.compensated" in kinds
+    assert "exit.passive_close_fallback_terminal_flat" in kinds
+    assert "recovery.flat" in kinds
+    assert pending.next_retry_at_ms == 0
 
 
 @pytest.mark.asyncio
