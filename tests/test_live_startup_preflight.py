@@ -286,8 +286,8 @@ class TestRuntimePreflight:
                 "MAXUSDT",
                 'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
                 "max_notional_admission_blocked",
-                "",
-                True,
+                "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+                False,
             ),
         ],
     )

@@ -175,6 +175,10 @@ class LiveRuntime:
         "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
     )
     _ASTER_API_DOC_URL = "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation"
+    _ASTER_OPENABLE_NOTIONAL_DOC_URL = (
+        "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
+        "#remaining-openable-notional-value-user_data"
+    )
 
     @staticmethod
     def _risk_snapshot_ttl_ms(venue: Venue) -> int:
@@ -245,7 +249,11 @@ class LiveRuntime:
                 "evidence_gap": False,
             }
         if reason == "bybit_trading_terms_required":
-            return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
         if reason in ("insufficient_margin_admission_blocked", "post_only_would_take"):
             return {
                 "reason": reason,
@@ -259,8 +267,19 @@ class LiveRuntime:
                 "evidence_gap": False,
             }
         if reason == "max_notional_admission_blocked":
-            return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._ASTER_OPENABLE_NOTIONAL_DOC_URL,
+                "evidence_gap": False,
+            }
         return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
+
+    @staticmethod
+    def _entry_admission_block_state_keys(venue: Venue, symbol: str, reason: str) -> list[str]:
+        keys = [f"{venue.value}:{symbol}"]
+        if venue == Venue.ASTER and reason == "max_notional_admission_blocked":
+            keys.append(f"{venue.value}:*")
+        return keys
 
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
         symbol = str(getattr(candidate, "symbol", "") or "")
@@ -273,12 +292,21 @@ class LiveRuntime:
             except ValueError:
                 continue
             key = (venue.value, symbol)
-            state_key = f"{venue.value}:{symbol}"
-            payload = dict(self.state.venue_entry_cooldowns.get(state_key, {}) or {})
-            try:
-                state_until_ms = int(payload.get("blocked_until_ms", 0) or 0)
-            except (TypeError, ValueError):
-                state_until_ms = 0
+            payload = {}
+            state_until_ms = 0
+            for state_key in (f"{venue.value}:{symbol}", f"{venue.value}:*"):
+                candidate_payload = dict(
+                    self.state.venue_entry_cooldowns.get(state_key, {}) or {}
+                )
+                try:
+                    candidate_until_ms = int(
+                        candidate_payload.get("blocked_until_ms", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    candidate_until_ms = 0
+                if candidate_until_ms > state_until_ms:
+                    state_until_ms = candidate_until_ms
+                    payload = candidate_payload
             until_ms = max(
                 self._symbol_admission_blocked_until_ms.get(key, 0),
                 state_until_ms,
@@ -287,7 +315,11 @@ class LiveRuntime:
                 self._symbol_admission_blocked_until_ms[key] = until_ms
                 if payload:
                     payload.setdefault("venue", venue.value)
-                    payload.setdefault("symbol", symbol)
+                    if payload.get("block_scope") == "venue":
+                        payload["blocked_symbol"] = payload.get("symbol", "*")
+                        payload["symbol"] = symbol
+                    else:
+                        payload.setdefault("symbol", symbol)
                     payload.setdefault("reason", "symbol_admission_blocked")
                     payload["blocked_until_ms"] = until_ms
                     payload.setdefault("ttl_ms", self._SYMBOL_ADMISSION_BLOCK_TTL_MS)
@@ -320,8 +352,7 @@ class LiveRuntime:
         key = (venue.value, symbol)
         evidence = self._entry_admission_evidence(reason)
         self._symbol_admission_blocked_until_ms[key] = until_ms
-        state_key = f"{venue.value}:{symbol}"
-        self.state.venue_entry_cooldowns[state_key] = {
+        base_payload = {
             "venue": venue.value,
             "symbol": symbol,
             "reason": reason,
@@ -331,20 +362,89 @@ class LiveRuntime:
             "official_doc_url": evidence["official_doc_url"],
             "evidence_gap": evidence["evidence_gap"],
         }
+        for state_key in self._entry_admission_block_state_keys(venue, symbol, reason):
+            payload = dict(base_payload)
+            if state_key.endswith(":*"):
+                payload["symbol"] = "*"
+                payload["block_scope"] = "venue"
+            else:
+                payload["block_scope"] = "symbol"
+            self.state.venue_entry_cooldowns[state_key] = payload
         self.journal.append(
             "runtime.entry_admission_blocked",
             {
-                "venue": venue.value,
-                "symbol": symbol,
-                "reason": reason,
-                "blocked_until_ms": until_ms,
-                "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
-                "raw_error": raw_error[:500],
-                "official_doc_url": evidence["official_doc_url"],
-                "evidence_gap": evidence["evidence_gap"],
+                **base_payload,
+                "block_scope": (
+                    "venue"
+                    if f"{venue.value}:*" in self._entry_admission_block_state_keys(venue, symbol, reason)
+                    else "symbol"
+                ),
                 "ts_ms": now_ms,
             },
         )
+        if f"{venue.value}:*" in self._entry_admission_block_state_keys(venue, symbol, reason):
+            self.journal.append(
+                "runtime.venue_cooldown_started",
+                {
+                    "venue": venue.value,
+                    "reason": "aster_max_notional_limit",
+                    "blocked_until_ms": until_ms,
+                    "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
+                    "raw_error": raw_error[:500],
+                    "official_doc_url": evidence["official_doc_url"],
+                    "evidence_gap": evidence["evidence_gap"],
+                    "ts_ms": now_ms,
+                },
+            )
+        return None
+
+    async def _handle_pending_hedge_admission_reject(
+        self,
+        *,
+        pending,
+        entry_id: str,
+        hedge_venue: Venue,
+        error_text: str,
+        hedge_client_order_id: str,
+        hedge_attempt: int,
+        now_ms: int,
+    ) -> bool:
+        metadata = self._entry_admission_reject_metadata(hedge_venue, error_text)
+        if not metadata:
+            return False
+
+        reason = str(metadata["reason"])
+        self._record_symbol_admission_block(
+            venue=hedge_venue,
+            symbol=pending.symbol,
+            reason=reason,
+            raw_error=error_text,
+            now_ms=now_ms,
+        )
+        pending.hedge_inflight = None
+        pending.repair_state = f"hedge_admission_blocked:{reason}"
+        self.journal.append(
+            "pending_entry.hedge_admission_blocked",
+            {
+                "venue": hedge_venue.value,
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "hedge_venue": hedge_venue.value,
+                "hedge_client_order_id": hedge_client_order_id,
+                "hedge_attempt": hedge_attempt,
+                "reason": reason,
+                "raw_error": error_text[:500],
+                "official_doc_url": metadata["official_doc_url"],
+                "evidence_gap": metadata["evidence_gap"],
+                "ts_ms": now_ms,
+            },
+        )
+        await self._abort_pending_entry(
+            pending,
+            entry_id,
+            f"hedge_admission_blocked:{reason}",
+        )
+        return True
 
     def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
         symbol = str(getattr(candidate, "symbol", "") or "")
@@ -5976,6 +6076,18 @@ class LiveRuntime:
             if e.is_rejected:
                 pending.hedge_inflight = None
             self._flush_adapter_order_diagnostics(adapter)
+            if e.is_rejected and await self._handle_pending_hedge_admission_reject(
+                pending=pending,
+                entry_id=entry_id,
+                hedge_venue=hedge_venue,
+                error_text=str(e),
+                hedge_client_order_id=(
+                    submitted_inflight.client_order_id if submitted_inflight else hedge_cloid
+                ),
+                hedge_attempt=attempt,
+                now_ms=now_ms,
+            ):
+                return False
             self.journal.append(
                 "pending_entry.hedge_submit_result",
                 {

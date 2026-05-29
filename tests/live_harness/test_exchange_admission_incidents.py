@@ -9,6 +9,8 @@ from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.state import PendingEntry
+from lightfee.core.domain import PositionSnapshot, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from tests.test_live_startup_preflight import make_test_config
 
@@ -69,8 +71,8 @@ class RejectingExecutor:
             "LITEUSDT",
             "bybit retCode=110126 retMsg=must sign required agreement",
             "bybit_trading_terms_required",
-            "",
-            True,
+            "https://bybit-exchange.github.io/docs/v5/error",
+            False,
         ),
         (
             "binance",
@@ -104,8 +106,8 @@ class RejectingExecutor:
             "MAXUSDT",
             'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
             "max_notional_admission_blocked",
-            "",
-            True,
+            "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+            False,
         ),
     ],
 )
@@ -168,6 +170,143 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         assert event_payload["official_doc_url"] == official_doc_url
         assert event_payload["evidence_gap"] is evidence_gap
 
+        runtime.journal.close()
+
+
+class FlatAdapter:
+    async def fetch_position(self, symbol: str):
+        return None
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        return quantity
+
+
+class RejectingHedgeAdapter(FlatAdapter):
+    def __init__(self, message: str):
+        self.message = message
+        self.place_order_calls = 0
+
+    async def place_order(self, request):
+        self.place_order_calls += 1
+        raise OrderSubmitError(SubmitFailureClass.REJECTED, self.message)
+
+    async def fetch_order_fill_reconciliation(self, symbol: str, order_id: str, client_order_id: str):
+        return PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=0,
+        )
+
+
+def _pending_for_hedge_reject(
+    *,
+    entry_id: str,
+    symbol: str,
+    long_venue: Venue,
+    short_venue: Venue,
+    maker_leg: str,
+) -> PendingEntry:
+    return PendingEntry(
+        pending_id=entry_id,
+        symbol=symbol,
+        long_venue=long_venue,
+        short_venue=short_venue,
+        target_quantity=4.0,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=1778787000000,
+        maker_leg=maker_leg,
+        maker_leg_filled=4.0,
+        hedge_leg_filled=0.0,
+        maker_price=1.0,
+        maker_fill_price=1.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
+    with tempfile.TemporaryDirectory() as td:
+        bybit = RejectingHedgeAdapter(
+            "bybit retCode=110126 retMsg=must sign required agreement"
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.ASTER: FlatAdapter(), Venue.BYBIT: bybit},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-bz",
+            symbol="BZUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert bybit.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == "hedge_admission_blocked:bybit_trading_terms_required"
+        assert runtime.state.venue_entry_cooldowns["bybit:BZUSDT"]["reason"] == (
+            "bybit_trading_terms_required"
+        )
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]["reason"] == "bybit_trading_terms_required"
+        assert [
+            record for record in records
+            if record["kind"] == "entry.aborted"
+        ][-1]["payload"]["reason"] == "hedge_admission_blocked:bybit_trading_terms_required"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingHedgeAdapter(
+            'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}'
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-lab",
+            symbol="LABUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert aster.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert runtime.state.venue_entry_cooldowns["aster:LABUSDT"]["block_scope"] == "symbol"
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == "venue"
+        assert runtime._candidate_admission_block(
+            _candidate("OTHERUSDT", "aster", "binance"),
+            1778787002000,
+        )["reason"] == "max_notional_admission_blocked"
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "runtime.venue_cooldown_started"
+        ][-1]["payload"]["reason"] == "aster_max_notional_limit"
         runtime.journal.close()
 
 

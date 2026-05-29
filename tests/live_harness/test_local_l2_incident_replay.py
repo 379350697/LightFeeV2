@@ -125,6 +125,17 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
         )
         doc_url = official_local_book_doc_url(venue)
         official_reason = official_sequence_rebuild_reason(payload)
+        if doc_url and venue == "okx" and official_reason in {
+            "previous_link_mismatch",
+            "sequence_reset",
+            "checksum_mismatch",
+        }:
+            return IncidentClassification(
+                event_kind=kind,
+                classification="official-doc exchange reset/sequence behavior",
+                evidence="OKX documents seqId/prevSeqId continuity and checksum data-integrity semantics.",
+                official_doc_url=doc_url,
+            )
         if doc_url and official_reason == "expected_real_gap" and has_real_gap_evidence:
             return IncidentClassification(
                 event_kind=kind,
@@ -176,6 +187,17 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
         )
         doc_url = official_local_book_doc_url(venue)
         official_reason = official_sequence_rebuild_reason(payload)
+        if doc_url and venue == "okx" and official_reason in {
+            "previous_link_mismatch",
+            "sequence_reset",
+            "checksum_mismatch",
+        }:
+            return IncidentClassification(
+                event_kind=kind,
+                classification="official-doc exchange reset/sequence behavior",
+                evidence="OKX documents seqId/prevSeqId continuity and checksum data-integrity semantics.",
+                official_doc_url=doc_url,
+            )
         if doc_url and official_reason == "previous_link_mismatch" and has_previous_link_mismatch_evidence:
             return IncidentClassification(
                 event_kind=kind,
