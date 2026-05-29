@@ -2864,9 +2864,11 @@ class PassiveCloseExecutor:
                     "venue_min_notional_quote": min_notional,
                 },
             )
-            if reason == "price_unavailable_for_min_notional":
-                pending.next_retry_at_ms = self._now_ms() + 5_000
-                return False
+            compensation_source = (
+                "fallback_live_one_sided_price_unavailable"
+                if reason == "price_unavailable_for_min_notional"
+                else "fallback_live_one_sided_min_notional"
+            )
             return await self._abort_and_compensate_min_notional(
                 state,
                 pending,
@@ -2878,11 +2880,11 @@ class PassiveCloseExecutor:
                 leg_notional_quote=leg_notional,
                 venue_min_notional_quote=min_notional,
                 failed_stage=(
-                    pending.short_stage or "exit_short"
+                    (pending.short_stage or "exit_short")
                     if leg_label == "short"
-                    else pending.long_stage or "exit_long"
+                    else (pending.long_stage or "exit_long")
                 ),
-                source="fallback_live_one_sided_min_notional",
+                source=compensation_source,
             )
 
         stage = "exit_live_one_sided_short" if leg_label == "short" else "exit_live_one_sided_long"
@@ -3145,9 +3147,11 @@ class PassiveCloseExecutor:
                     "venue_min_notional_quote": min_notional,
                 },
             )
-            if reason == "price_unavailable_for_min_notional":
-                pending.next_retry_at_ms = self._now_ms() + 5_000
-                return False
+            compensation_source = (
+                "fallback_live_imbalanced_price_unavailable"
+                if reason == "price_unavailable_for_min_notional"
+                else "fallback_live_imbalanced_min_notional"
+            )
             return await self._abort_and_compensate_min_notional(
                 state,
                 pending,
@@ -3159,7 +3163,7 @@ class PassiveCloseExecutor:
                 leg_notional_quote=leg_notional,
                 venue_min_notional_quote=min_notional,
                 failed_stage=failed_stage,
-                source="fallback_live_imbalanced_min_notional",
+                source=compensation_source,
             )
 
         client_order_id = compact_client_order_id(

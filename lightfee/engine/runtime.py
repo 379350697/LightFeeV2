@@ -6506,7 +6506,7 @@ class LiveRuntime:
 
             is_locally_paused = bool(task.get("local_entry_paused", False))
             next_attempt_ms = int(task.get("next_attempt_ms", 0) or 0)
-            if not is_locally_paused and next_attempt_ms > 0 and now_ms < next_attempt_ms:
+            if next_attempt_ms > 0 and now_ms < next_attempt_ms:
                 continue
 
             adapter = self.get_venue_adapter(repair_venue)
@@ -6630,7 +6630,32 @@ class LiveRuntime:
                     else:
                         self._reschedule_pending_residual_repair_task(task, now_ms, error)
                     continue
-                if not has_local_position and not all_probed_positions_flat:
+                if (
+                    not has_local_position
+                    and abs(live_size) > 1e-9
+                    and live_position is not None
+                ):
+                    original_repair_side = repair_side
+                    repair_side = Side.SELL if live_size > 0.0 else Side.BUY
+                    live_excess_quantity = abs(live_size)
+                    task["repair_side"] = repair_side.value
+                    task["repair_quantity"] = live_excess_quantity
+                    self.journal.append(
+                        "execution.residual_repair_side_rebuilt_from_live_truth",
+                        {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "origin": task.get("origin", ""),
+                            "repair_venue": repair_venue.value,
+                            "original_repair_side": original_repair_side.value,
+                            "repair_side": repair_side.value,
+                            "live_size": live_size,
+                            "live_excess_quantity": live_excess_quantity,
+                            "baseline_quantity": baseline,
+                        },
+                    )
+                elif not has_local_position and not all_probed_positions_flat:
                     error = "residual_repair_live_position_nonzero"
                     if (
                         is_locally_paused
@@ -6642,30 +6667,23 @@ class LiveRuntime:
                     else:
                         self._reschedule_pending_residual_repair_task(task, now_ms, error)
                     continue
-                self.state.pending_residual_repairs.remove(task)
-                self._release_residual_repair_pair_gate(pair_id, symbol)
-                repaired += 1
-                self.journal.append(
-                    "execution.residual_repair_completed",
-                    {
-                        "position_id": position_id,
-                        "pair_id": pair_id,
-                        "symbol": symbol,
-                        "origin": task.get("origin", ""),
-                        "repair_venue": repair_venue.value,
-                        "repair_side": repair_side.value,
-                        "result": "already_flat",
-                    },
-                )
-                continue
-
-            if (
-                is_locally_paused
-                or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
-            ):
-                task["last_error"] = "residual_repair_live_position_nonzero"
-                self._pause_pending_residual_repair(task, now_ms)
-                continue
+                else:
+                    self.state.pending_residual_repairs.remove(task)
+                    self._release_residual_repair_pair_gate(pair_id, symbol)
+                    repaired += 1
+                    self.journal.append(
+                        "execution.residual_repair_completed",
+                        {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "origin": task.get("origin", ""),
+                            "repair_venue": repair_venue.value,
+                            "repair_side": repair_side.value,
+                            "result": "already_flat",
+                        },
+                    )
+                    continue
 
             repair_quantity = live_excess_quantity
             if hasattr(adapter, "normalize_quantity"):
@@ -6737,6 +6755,29 @@ class LiveRuntime:
                 )
                 continue
 
+            if (
+                is_locally_paused
+                or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
+            ):
+                self.journal.append(
+                    "execution.residual_repair_resumed",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "origin": task.get("origin", ""),
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "live_excess_quantity": live_excess_quantity,
+                        "repair_quantity": repair_quantity,
+                        "baseline_quantity": baseline,
+                        "live_size": live_size,
+                        "open_order_count": open_order_count,
+                        "previous_error": task.get("last_error", ""),
+                        "retry_count": self._residual_repair_attempt_count(task),
+                    },
+                )
+
             req = OrderRequest(
                 venue=repair_venue,
                 symbol=symbol,
@@ -6763,6 +6804,10 @@ class LiveRuntime:
                         "repair_venue": repair_venue.value,
                         "repair_side": repair_side.value,
                         "repair_quantity": repair_quantity,
+                        "live_excess_quantity": live_excess_quantity,
+                        "baseline_quantity": baseline,
+                        "live_size": live_size,
+                        "open_order_count": open_order_count,
                         "error": str(e),
                     },
                 )
@@ -6928,9 +6973,10 @@ class LiveRuntime:
     def _pause_pending_residual_repair(self, task: dict, now_ms: int) -> None:
         task["local_entry_paused"] = True
         task["last_attempt_at_ms"] = now_ms
-        task["next_attempt_ms"] = 0
+        retry_count = self._residual_repair_attempt_count(task)
+        task["next_attempt_ms"] = now_ms + self._residual_repair_retry_delay_ms(retry_count)
         current_error = str(task.get("last_error", "") or "")
-        if current_error.startswith("residual_repair_live_"):
+        if current_error:
             task["last_error"] = current_error
         else:
             task["last_error"] = "residual_repair_deadline_or_attempts_exhausted"

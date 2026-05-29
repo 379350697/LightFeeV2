@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from lightfee.core.domain import PositionSnapshot, Side, Venue
+from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from tests.test_live_entry_hedge_root_fix import _FakeVenueAdapter, _make_open_runtime
 
 
@@ -132,7 +132,7 @@ async def test_exhausted_residual_repair_already_flat_clears_lyn_opg(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_exhausted_residual_repair_live_nonzero_or_untrusted_stays_fail_closed(tmp_path):
+async def test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed(tmp_path):
     runtime = _make_open_runtime(tmp_path)
     now_ms = 1779803978233
     runtime.state.live_recovery_reduce_only_pairs.append({
@@ -165,26 +165,51 @@ async def test_exhausted_residual_repair_live_nonzero_or_untrusted_stays_fail_cl
         entry_price=0.2,
         observed_at_ms=now_ms,
     )
+    okx.place_order_fill = OrderFill(
+        venue=Venue.OKX,
+        symbol="OPGUSDT",
+        side=Side.BUY,
+        quantity=9.0,
+        price=0.2,
+        order_id="opg-residual-repair",
+        filled_at_ms=now_ms,
+    )
     runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
 
     await runtime._recover_residual_repairs(now_ms)
 
-    assert len(runtime.state.pending_residual_repairs) == 1
-    task = runtime.state.pending_residual_repairs[0]
-    assert task["local_entry_paused"] is True
-    assert task["last_error"] == "residual_repair_live_position_nonzero"
-    assert runtime.state.live_recovery_reduce_only_pairs
+    assert runtime.state.pending_residual_repairs == []
+    assert runtime.state.live_recovery_reduce_only_pairs == []
     events = runtime.journal.read_all()
     kinds = [event["kind"] for event in events]
-    assert "execution.residual_repair_paused" in kinds
-    paused = [
+    assert "execution.residual_repair_resumed" in kinds
+    assert "execution.residual_repair_completed" in kinds
+    assert "execution.residual_repair_paused" not in kinds
+    assert len(okx._place_order_calls) == 1
+    assert okx._place_order_calls[0].side == Side.BUY
+    completed_before_untrusted = len([
         event for event in events
-        if event["kind"] == "execution.residual_repair_paused"
-    ]
-    assert paused[-1]["payload"]["last_error"] == "residual_repair_live_position_nonzero"
-    assert "execution.residual_repair_completed" not in kinds
-    assert okx._place_order_calls == []
+        if event["kind"] == "execution.residual_repair_completed"
+    ])
 
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
     okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
     okx.fetch_open_orders_raises = RuntimeError("open order truth unavailable")
 
@@ -205,7 +230,7 @@ async def test_exhausted_residual_repair_live_nonzero_or_untrusted_stays_fail_cl
         event for event in runtime.journal.read_all()
         if event["kind"] == "execution.residual_repair_completed"
     ]
-    assert completed_after_untrusted == []
+    assert len(completed_after_untrusted) == completed_before_untrusted
 
 
 @pytest.mark.asyncio

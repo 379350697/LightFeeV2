@@ -5331,12 +5331,18 @@ class TestResidualRepairExecutionV1Parity:
 
         await runtime._recover_residual_repairs(now_ms)
 
+        assert len(okx._place_order_calls) == 1
         assert len(runtime.state.pending_residual_repairs) == 1
         task = runtime.state.pending_residual_repairs[0]
         assert task["local_entry_paused"] is True
-        assert task["last_error"] == "residual_repair_live_position_nonzero"
+        assert task["last_error"] == "exchange temporarily unavailable"
+        assert task["next_attempt_ms"] > now_ms
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "execution.residual_repair_paused" in kinds
+
+        await runtime._recover_residual_repairs(now_ms + 1)
+
+        assert len(okx._place_order_calls) == 1
 
     def test_pending_residual_symbols_are_tracked_by_private_ws(self, tmp_path):
         runtime = _make_open_runtime(tmp_path)

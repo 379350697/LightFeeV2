@@ -42,6 +42,72 @@ This project is indexed by GitNexus as **LightFeeV2** (18470 symbols, 31622 rela
 
 <!-- gitnexus:end -->
 
+<!-- lightfee-v1-contract:start -->
+# LightFee V1 Recovery / Close Semantic Contract
+
+When a production bug is a V2/V1 semantic drift, V1 is authoritative. Do not
+replace these rules with wider thresholds, manual state edits, or approximate
+V2-only shortcuts.
+
+## Passive Close / Recovery
+
+- Exchange truth outranks local recovered state. Local matched quantities are
+  evidence, not authority, once live position probes disagree.
+- Before retrying a pending passive close from recovered or fallback state,
+  probe both live legs and trusted open-order truth when available.
+- If both live legs are flat and there are no trusted open orders, clear the
+  pending passive close, local open position, and related last-error/recovery
+  latch. Persist only after both pending and open state are removed.
+- If live truth is one-sided, close the actual live nonzero exposure with
+  reduce-only taker semantics. Do not derive the close target from stale local
+  matched deltas.
+- Terminal under-minimum or normalized-zero hedge branches must not schedule an
+  identical retry loop. V1 buffers small fills while the maker is still live;
+  once the maker is terminal or attempts are exhausted, it emits the terminal
+  min-notional path and compensates/flattens from live exchange truth.
+- Missing price evidence is not allowed to become an infinite retry loop. Use a
+  V1-compatible live-truth compensation path when there is confirmed live
+  one-sided exposure; if compensation cannot prove flat, remain fail-closed with
+  structured evidence.
+
+## Residual Repair
+
+- Residual repair is normal runtime housekeeping, not a startup-only cleanup.
+- Fetch live position for the repair venue. V2 may also fetch counter venue and
+  open-order truth, but that safety check must not block a tradeable repair on
+  the repair venue.
+- Compute live excess relative to the V1 baseline. If live excess is zero and
+  trusted open-order truth is clear, complete the repair and release the pair
+  gate.
+- If live excess is tradeable, submit one reduce-only IOC repair for the live
+  excess even when the task was previously paused or attempts were exhausted.
+- A paused or attempt-exhausted repair may be resumed only when live position
+  truth and open-order truth are trusted, and repeated submit failures must still
+  respect `next_attempt_ms` backoff.
+- When no local open position remains but the repair venue has trusted nonzero
+  live exposure, rebuild the close side from the signed live position before
+  submitting reduce-only IOC. This is a V2 root-fix extension over V1's
+  conservative paused-task behavior, not a reason to keep stale local repair
+  side authoritative.
+- If live excess is below official venue quantity/notional rules, terminalize
+  the residual as dust and release the pair gate with the official metadata
+  source in the evidence.
+- If live truth or open-order truth is unavailable, keep fail-closed and emit a
+  non-empty structured reason. Do not clear or mark green from missing truth.
+
+## Required Closure Evidence
+
+- Every production P0 must have a sanitized production fixture or fake-adapter
+  harness that fails before the fix and passes after it.
+- Branches that depend on real exchange state must have a read-only probe path.
+  Probes may fetch positions, open orders, instrument metadata, account/risk
+  metadata, and public market data; they must not submit, cancel, or mutate.
+- A fix is not complete until the focused harness and the relevant probe/default
+  probe guard both pass, and production current state no longer shows the stale
+  open/pending/residual condition or has an explicitly documented dust terminal.
+
+<!-- lightfee-v1-contract:end -->
+
 <!-- rtk-skills:start -->
 # RTK Skills — Auto-Invoke Rules
 
