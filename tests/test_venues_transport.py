@@ -4543,6 +4543,67 @@ class TestV1PassiveBusinessFlowParity:
         assert result["response_classification"] == "insufficient_margin_admission_blocked"
 
     @pytest.mark.asyncio
+    async def test_binance_2027_leverage_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_binance_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        transport._fapi_position_hedge_mode_cache = False
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: max leverage ratio",
+                status_code=400,
+                body=(
+                    '{"code":-2027,"msg":"Exceeded the maximum allowable '
+                    'position at current leverage."}'
+                ),
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="HMSTRUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="binance-maker-2027",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "leverage_admission_blocked"
+
+    @pytest.mark.asyncio
     async def test_aster_5018_max_notional_reject_is_classified_as_admission(
         self, monkeypatch,
     ):

@@ -224,6 +224,16 @@ class LiveRuntime:
             return LiveRuntime._entry_admission_evidence(
                 "insufficient_margin_admission_blocked"
             )
+        if venue == Venue.BINANCE and (
+            "-2027" in text
+            or "max_leverage_ratio" in text
+            or "maximum allowable position at current leverage" in text
+        ):
+            return {
+                "reason": "leverage_admission_blocked",
+                "official_doc_url": LiveRuntime._BINANCE_USDM_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
         if venue == Venue.BINANCE and LiveRuntime._entry_reject_is_post_only_would_take(reason):
             return LiveRuntime._entry_admission_evidence("post_only_would_take")
         if venue == Venue.ASTER and (
@@ -347,10 +357,11 @@ class LiveRuntime:
         reason: str,
         raw_error: str,
         now_ms: int,
+        evidence: dict | None = None,
     ) -> None:
         until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         key = (venue.value, symbol)
-        evidence = self._entry_admission_evidence(reason)
+        evidence = dict(evidence or self._entry_admission_evidence(reason))
         self._symbol_admission_blocked_until_ms[key] = until_ms
         base_payload = {
             "venue": venue.value,
@@ -420,6 +431,7 @@ class LiveRuntime:
             reason=reason,
             raw_error=error_text,
             now_ms=now_ms,
+            evidence=metadata,
         )
         pending.hedge_inflight = None
         pending.repair_state = f"hedge_admission_blocked:{reason}"
@@ -456,14 +468,16 @@ class LiveRuntime:
                 venue = Venue.from_str(str(raw_venue))
             except ValueError:
                 continue
-            reason = self._entry_admission_reject_reason(venue, reject_reason)
-            if reason:
+            metadata = self._entry_admission_reject_metadata(venue, reject_reason)
+            if metadata:
+                reason = str(metadata["reason"])
                 self._record_symbol_admission_block(
                     venue=venue,
                     symbol=symbol,
                     reason=reason,
                     raw_error=reject_reason,
                     now_ms=now_ms,
+                    evidence=metadata,
                 )
 
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
@@ -6660,6 +6674,7 @@ class LiveRuntime:
 
             live_positions: dict[Venue, PositionSnapshot | None] = {}
             open_order_count = 0
+            open_order_counts_by_venue: dict[str, int] = {}
             live_truth_error = ""
             for probe_venue in probe_venues:
                 probe_adapter = self.get_venue_adapter(probe_venue)
@@ -6678,7 +6693,9 @@ class LiveRuntime:
                 except Exception as e:
                     live_truth_error = str(e) or e.__class__.__name__
                     break
-                open_order_count += len(open_orders)
+                venue_open_order_count = len(open_orders)
+                open_order_count += venue_open_order_count
+                open_order_counts_by_venue[probe_venue.value] = venue_open_order_count
 
             if live_truth_error:
                 error = f"residual_repair_live_truth_untrusted:{live_truth_error}"
@@ -6732,12 +6749,20 @@ class LiveRuntime:
                 )
                 if open_order_count > 0:
                     error = "residual_repair_live_open_orders_present"
+                    pause_evidence = {
+                        "open_order_count": open_order_count,
+                        "open_order_counts_by_venue": open_order_counts_by_venue,
+                        "live_truth_venues": [venue.value for venue in probe_venues],
+                        "live_excess_quantity": live_excess_quantity,
+                        "baseline_quantity": baseline,
+                        "live_size": live_size,
+                    }
                     if (
                         is_locally_paused
                         or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
                     ):
                         task["last_error"] = error
-                        self._pause_pending_residual_repair(task, now_ms)
+                        self._pause_pending_residual_repair(task, now_ms, pause_evidence)
                         task["last_error"] = error
                     else:
                         self._reschedule_pending_residual_repair_task(task, now_ms, error)
@@ -6885,6 +6910,7 @@ class LiveRuntime:
                         "baseline_quantity": baseline,
                         "live_size": live_size,
                         "open_order_count": open_order_count,
+                        "open_order_counts_by_venue": open_order_counts_by_venue,
                         "previous_error": task.get("last_error", ""),
                         "retry_count": self._residual_repair_attempt_count(task),
                     },
@@ -6920,6 +6946,7 @@ class LiveRuntime:
                         "baseline_quantity": baseline,
                         "live_size": live_size,
                         "open_order_count": open_order_count,
+                        "open_order_counts_by_venue": open_order_counts_by_venue,
                         "error": str(e),
                     },
                 )
@@ -7082,7 +7109,9 @@ class LiveRuntime:
         attempts = self._residual_repair_attempt_count(task)
         return (deadline_ms > 0 and now_ms >= deadline_ms) or attempts >= 3
 
-    def _pause_pending_residual_repair(self, task: dict, now_ms: int) -> None:
+    def _pause_pending_residual_repair(
+        self, task: dict, now_ms: int, evidence: dict[str, Any] | None = None
+    ) -> None:
         task["local_entry_paused"] = True
         task["last_attempt_at_ms"] = now_ms
         retry_count = self._residual_repair_attempt_count(task)
@@ -7092,19 +7121,22 @@ class LiveRuntime:
             task["last_error"] = current_error
         else:
             task["last_error"] = "residual_repair_deadline_or_attempts_exhausted"
+        payload = {
+            "position_id": task.get("position_id", ""),
+            "pair_id": task.get("pair_id", ""),
+            "symbol": task.get("symbol", ""),
+            "repair_venue": task.get("repair_venue", task.get("exposure_venue", "")),
+            "repair_side": task.get("repair_side", task.get("exposure_side", "")),
+            "retry_count": self._residual_repair_attempt_count(task),
+            "deadline_ms": int(task.get("deadline_ms", 0) or 0),
+            "ts_ms": now_ms,
+            "last_error": task["last_error"],
+        }
+        if evidence:
+            payload.update(evidence)
         self.journal.append(
             "execution.residual_repair_paused",
-            {
-                "position_id": task.get("position_id", ""),
-                "pair_id": task.get("pair_id", ""),
-                "symbol": task.get("symbol", ""),
-                "repair_venue": task.get("repair_venue", task.get("exposure_venue", "")),
-                "repair_side": task.get("repair_side", task.get("exposure_side", "")),
-                "retry_count": self._residual_repair_attempt_count(task),
-                "deadline_ms": int(task.get("deadline_ms", 0) or 0),
-                "ts_ms": now_ms,
-                "last_error": task["last_error"],
-            },
+            payload,
         )
 
     def _release_residual_repair_pair_gate(self, pair_id: str, symbol: str) -> None:

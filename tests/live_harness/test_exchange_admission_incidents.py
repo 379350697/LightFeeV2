@@ -94,6 +94,14 @@ class RejectingExecutor:
             False,
         ),
         (
+            "binance",
+            "HMSTRUSDT",
+            'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}',
+            "leverage_admission_blocked",
+            "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code",
+            False,
+        ),
+        (
             "aster",
             "ESPORTSUSDT",
             'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}',
@@ -266,6 +274,51 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
             record for record in records
             if record["kind"] == "entry.aborted"
         ][-1]["payload"]["reason"] == "hedge_admission_blocked:bybit_trading_terms_required"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_binance_leverage_reject_aborts_without_retry():
+    with tempfile.TemporaryDirectory() as td:
+        binance = RejectingHedgeAdapter(
+            'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}'
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.BINANCE: binance},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-hmstr",
+            symbol="HMSTRUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BINANCE,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert binance.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == "hedge_admission_blocked:leverage_admission_blocked"
+        cooldown = runtime.state.venue_entry_cooldowns["binance:HMSTRUSDT"]
+        assert cooldown["reason"] == "leverage_admission_blocked"
+        assert cooldown["official_doc_url"] == (
+            "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
+        )
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]["reason"] == "leverage_admission_blocked"
+        assert [
+            record for record in records
+            if record["kind"] == "entry.aborted"
+        ][-1]["payload"]["reason"] == "hedge_admission_blocked:leverage_admission_blocked"
         runtime.journal.close()
 
 

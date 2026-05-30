@@ -29,12 +29,14 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 | 2026-05-17 | Pending hedge inflight metadata / deadline / cleanup parity | effective locally | Fixed direct-pop and cleanup semantics but later live truth exposed additional false-flat cases. |
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
+| 2026-05-30 | ORCA/NOM/RAVE post-deploy live-truth watch | effective so far | Current probes are flat/no-open-orders; no local false-flat state found, but RAVE/ORCA need fixture classification if repeated. |
 
 ## Recurrences
 
 | Date | Symbols / Venues | Commit / Fix | Result | Detail |
 |---|---|---|---|---|
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
+| 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | deployed `bbcd7b9`; no code fix selected | open watch; current exchange truth flat | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 
 ## Regression Harness
 
@@ -50,4 +52,3 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 3. Verify whether any live position proof contains enough quantity and price evidence to hydrate pending fills.
 4. If local is flat and exchange nonzero, treat as critical false-green until reduce-only cleanup or fail-closed retention proves safe.
 5. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
-

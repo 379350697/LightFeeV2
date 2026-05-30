@@ -36,6 +36,7 @@ Classify as official when:
 | 2026-05-18 | Preserve fault reason through rebuild/bootstrapping | effective | Fixed V2 state-machine evidence loss for readiness arming. |
 | 2026-05-29 | Shared strict Binance/Aster classifier | effective for Binance/Aster | Closed Aster evidence gap and prevented over-classifying field-complete non-breaks. |
 | 2026-05-29 | OKX `seqId/prevSeqId` and checksum classification | effective for evidence classification | Cloud post-deploy Local-L2 classification had `L2_INSUFFICIENT=[]`. |
+| 2026-05-30 | Post-`bbcd7b9` high rebuild/snapshot watch | effective so far | Current evidence remains official continuity/rebuild behavior; no Local-L2 readiness relaxation is allowed without new docs or V1 proof. |
 
 ## Recurrences
 
@@ -43,6 +44,7 @@ Classify as official when:
 |---|---|---|---|---|
 | 2026-05-29 | Binance/Aster `LABUSDT`, Binance `IOUSDT` | `7ee4c72` | closed for Binance/Aster | [daily/2026-05-29.md#cluster-cl-016-post-deploy-official-local-l2-and-terminal-order-reject-watch](../daily/2026-05-29.md#cluster-cl-016-post-deploy-official-local-l2-and-terminal-order-reject-watch) |
 | 2026-05-29 | OKX `LABUSDT` evidence gap | `6987fc8` | closed for classification | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
+| 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT` | deployed `bbcd7b9`; no code fix selected | open watch; no dirty trading state | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 
 ## Regression Harness
 
@@ -59,4 +61,3 @@ Classify as official when:
 4. Run public Local-L2 probe for the affected venue/symbol.
 5. Do not change data-plane readiness until official docs or V1 behavior proves the current rule wrong.
 6. Closure requires local harness plus cloud classification showing no unexplained entry-blocking Local-L2 samples.
-

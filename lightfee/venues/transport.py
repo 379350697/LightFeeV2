@@ -605,7 +605,7 @@ def _passive_submit_reject_classification(venue: "Venue", error: Exception) -> s
         return "insufficient_margin_admission_blocked"
     if venue == Venue.BINANCE and _is_post_only_would_take_reject(venue, error):
         return "post_only_would_take"
-    if venue == Venue.ASTER and (
+    if venue in (Venue.BINANCE, Venue.ASTER) and (
         "-2027" in message
         or "max_leverage_ratio" in message
         or "maximum allowable position at current leverage" in message

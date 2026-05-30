@@ -313,3 +313,49 @@ async def test_exhausted_residual_repair_transport_open_order_truth_failure_keep
     assert "execution.residual_repair_completed" not in [
         event["kind"] for event in runtime.journal.read_all()
     ]
+
+
+@pytest.mark.asyncio
+async def test_hmstr_open_orders_present_pause_records_truth_evidence(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1780084367773
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "hmstrusdt:bybit->okx",
+        "symbol": "HMSTRUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1780084367773-HMSTRUSDT",
+        "pair_id": "hmstrusdt:bybit->okx",
+        "symbol": "HMSTRUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 142090.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_live_open_orders_present",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = _flat_position(Venue.BYBIT, "HMSTRUSDT", now_ms)
+    bybit.open_orders = [{"orderId": "hmstr-live-open-order"}]
+    okx = IncidentVenueAdapter(Venue.OKX)
+    okx.position = _flat_position(Venue.OKX, "HMSTRUSDT", now_ms)
+    runtime._venue_adapters = {Venue.BYBIT: bybit, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    paused = [
+        event["payload"]
+        for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_paused"
+    ]
+    assert paused
+    assert paused[-1]["last_error"] == "residual_repair_live_open_orders_present"
+    assert paused[-1]["open_order_count"] == 1
+    assert paused[-1]["open_order_counts_by_venue"] == {"okx": 0, "bybit": 1}
+    assert paused[-1]["live_truth_venues"] == ["okx", "bybit"]
+    assert paused[-1]["live_excess_quantity"] == pytest.approx(0.0)
