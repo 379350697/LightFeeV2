@@ -292,6 +292,41 @@ class TestOpenPositionFieldCompleteness:
         assert d["protection_realized_price_pnl_quote"] == 5.0
         assert d["exit_reason"] == "manual"
 
+    def test_enginestate_to_dict_preserves_open_position_funding_semantics(self):
+        from lightfee.core.domain import Venue
+
+        state = EngineState()
+        state.open_positions["entry-magma"] = OpenPosition(
+            position_id="entry-magma",
+            symbol="MAGMAUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=100.0,
+            short_quantity=100.0,
+            long_entry_price=0.275,
+            short_entry_price=0.274,
+            opened_at_ms=1780163908797,
+            funding_timestamp_ms=1780167600000,
+            second_funding_timestamp_ms=1780171200000,
+            opportunity_type="staggered",
+            second_stage_enabled_at_entry=True,
+            exit_after_first_stage=False,
+            funding_edge_bps_entry=7.45,
+            total_funding_edge_bps_entry=7.45,
+            expected_edge_bps_entry=6.9,
+        )
+
+        pos = state.to_dict()["open_positions"]["entry-magma"]
+
+        assert pos["funding_timestamp_ms"] == 1780167600000
+        assert pos["second_funding_timestamp_ms"] == 1780171200000
+        assert pos["opportunity_type"] == "staggered"
+        assert pos["second_stage_enabled_at_entry"] is True
+        assert pos["exit_after_first_stage"] is False
+        assert pos["funding_edge_bps_entry"] == pytest.approx(7.45)
+        assert pos["total_funding_edge_bps_entry"] == pytest.approx(7.45)
+        assert pos["expected_edge_bps_entry"] == pytest.approx(6.9)
+
 
 # ---------------------------------------------------------------------------
 # STATE-002: PendingEntry field completeness
@@ -325,6 +360,17 @@ V1_PENDINGENTRY_REQUIRED_FIELDS = {
     "outcome",
     # Recovery dedup
     "run_id",
+    # Funding semantics copied from selected candidate until entry finalizes
+    "opportunity_type",
+    "funding_timestamp_ms",
+    "first_funding_timestamp_ms",
+    "long_funding_timestamp_ms",
+    "short_funding_timestamp_ms",
+    "second_funding_timestamp_ms",
+    "first_funding_leg",
+    "funding_edge_bps_entry",
+    "total_funding_edge_bps_entry",
+    "expected_edge_bps_entry",
 }
 
 
@@ -362,6 +408,58 @@ class TestPendingEntryFieldCompleteness:
             run_id="run-123",
         )
         assert pe.run_id == "run-123"
+
+    def test_pending_entry_funding_semantics_roundtrip(self):
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        state = EngineState()
+        state.pending_entries["entry-magma"] = PendingEntry(
+            pending_id="entry-magma",
+            symbol="MAGMAUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            target_quantity=100.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1780163908797,
+            opportunity_type="staggered",
+            funding_timestamp_ms=1780167600000,
+            first_funding_timestamp_ms=1780167600000,
+            long_funding_timestamp_ms=1780167600000,
+            short_funding_timestamp_ms=1780171200000,
+            second_funding_timestamp_ms=1780171200000,
+            first_funding_leg="long",
+            funding_edge_bps_entry=7.45,
+            total_funding_edge_bps_entry=7.45,
+            expected_edge_bps_entry=6.9,
+        )
+
+        snap = state.to_dict()
+        pending = snap["pending_entries"]["entry-magma"]
+        assert pending["opportunity_type"] == "staggered"
+        assert pending["funding_timestamp_ms"] == 1780167600000
+        assert pending["first_funding_timestamp_ms"] == 1780167600000
+        assert pending["long_funding_timestamp_ms"] == 1780167600000
+        assert pending["short_funding_timestamp_ms"] == 1780171200000
+        assert pending["second_funding_timestamp_ms"] == 1780171200000
+        assert pending["first_funding_leg"] == "long"
+        assert pending["funding_edge_bps_entry"] == pytest.approx(7.45)
+        assert pending["total_funding_edge_bps_entry"] == pytest.approx(7.45)
+        assert pending["expected_edge_bps_entry"] == pytest.approx(6.9)
+
+        restored = _restore_state_from_snapshot_dict(snap)
+        restored_pending = restored.pending_entries["entry-magma"]
+        assert restored_pending.opportunity_type == "staggered"
+        assert restored_pending.funding_timestamp_ms == 1780167600000
+        assert restored_pending.first_funding_timestamp_ms == 1780167600000
+        assert restored_pending.long_funding_timestamp_ms == 1780167600000
+        assert restored_pending.short_funding_timestamp_ms == 1780171200000
+        assert restored_pending.second_funding_timestamp_ms == 1780171200000
+        assert restored_pending.first_funding_leg == "long"
+        assert restored_pending.funding_edge_bps_entry == pytest.approx(7.45)
+        assert restored_pending.total_funding_edge_bps_entry == pytest.approx(7.45)
+        assert restored_pending.expected_edge_bps_entry == pytest.approx(6.9)
 
 
 # ---------------------------------------------------------------------------

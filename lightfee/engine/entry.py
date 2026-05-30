@@ -70,6 +70,39 @@ class EntryContext:
     reprice_action: str = ""
     # --- V1 planner output ---
     planned_route: ExecutionRoute = ExecutionRoute.PASSIVE_INCREMENTAL
+    # --- V1 funding lifecycle semantics selected with the candidate ---
+    opportunity_type: str = "aligned"
+    funding_timestamp_ms: int = 0
+    first_funding_timestamp_ms: int = 0
+    long_funding_timestamp_ms: int = 0
+    short_funding_timestamp_ms: int = 0
+    second_funding_timestamp_ms: int = 0
+    first_funding_leg: str = ""
+    funding_edge_bps_entry: float = 0.0
+    total_funding_edge_bps_entry: float = 0.0
+    expected_edge_bps_entry: float = 0.0
+    exit_after_first_stage: bool = False
+
+
+def normalize_opportunity_type(value: str | None) -> str:
+    """Map legacy/non-stage labels onto V1 close-stage labels."""
+    return "staggered" if value == "staggered" else "aligned"
+
+
+def _positive_int(value: object) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _first_positive(values: list[object]) -> int:
+    for value in values:
+        parsed = _positive_int(value)
+        if parsed > 0:
+            return parsed
+    return 0
 
 
 def advance_entry_state(ctx: EntryContext, next_state: EntryState) -> EntryContext:
@@ -176,6 +209,30 @@ def build_open_position(
         long_entry_price = hedge_fill.price
         short_entry_price = maker_fill.price
 
+    long_funding_timestamp_ms = _positive_int(ctx.long_funding_timestamp_ms)
+    short_funding_timestamp_ms = _positive_int(ctx.short_funding_timestamp_ms)
+    inferred_first_funding_ms = _first_positive(
+        [
+            ctx.funding_timestamp_ms,
+            ctx.first_funding_timestamp_ms,
+            min(
+                ts for ts in (long_funding_timestamp_ms, short_funding_timestamp_ms)
+                if ts > 0
+            ) if long_funding_timestamp_ms > 0 or short_funding_timestamp_ms > 0 else 0,
+        ]
+    )
+    inferred_second_funding_ms = _positive_int(ctx.second_funding_timestamp_ms)
+    if inferred_second_funding_ms <= 0 and long_funding_timestamp_ms > 0 and short_funding_timestamp_ms > 0:
+        later_funding_ms = max(long_funding_timestamp_ms, short_funding_timestamp_ms)
+        if later_funding_ms > inferred_first_funding_ms:
+            inferred_second_funding_ms = later_funding_ms
+    opportunity_type = normalize_opportunity_type(ctx.opportunity_type)
+    second_stage_enabled = (
+        opportunity_type == "staggered"
+        and inferred_first_funding_ms > 0
+        and inferred_second_funding_ms > inferred_first_funding_ms
+    )
+
     return OpenPosition(
         position_id=ctx.entry_id,
         symbol=ctx.symbol,
@@ -189,4 +246,14 @@ def build_open_position(
         review_id=review_id,
         long_fill=long_fill,
         short_fill=short_fill,
+        funding_timestamp_ms=inferred_first_funding_ms,
+        second_funding_timestamp_ms=inferred_second_funding_ms,
+        opportunity_type=opportunity_type,
+        second_stage_enabled_at_entry=second_stage_enabled,
+        exit_after_first_stage=bool(ctx.exit_after_first_stage),
+        funding_edge_bps_entry=float(ctx.funding_edge_bps_entry or 0.0),
+        total_funding_edge_bps_entry=float(
+            ctx.total_funding_edge_bps_entry or ctx.funding_edge_bps_entry or 0.0
+        ),
+        expected_edge_bps_entry=float(ctx.expected_edge_bps_entry or 0.0),
     )

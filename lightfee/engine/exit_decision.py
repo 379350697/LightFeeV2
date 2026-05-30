@@ -197,6 +197,8 @@ def remaining_close_delay_active(
     """
     # Aligned position: delay from funding_timestamp_ms
     if position.opportunity_type == "aligned" and position.matched_quantity > 0:
+        if position.funding_timestamp_ms <= 0:
+            return False
         if now_ms < position.funding_timestamp_ms + delay_ms:
             return True
 
@@ -221,6 +223,8 @@ def aligned_settlement_delay_elapsed(
         return False
     if position.matched_quantity <= 0:
         return False
+    if position.funding_timestamp_ms <= 0:
+        return False
     return now_ms >= position.funding_timestamp_ms + delay_ms
 
 
@@ -236,6 +240,8 @@ def force_close_due(
     if position.opportunity_type != "aligned":
         return False
     if position.matched_quantity <= 0:
+        return False
+    if position.funding_timestamp_ms <= 0:
         return False
     force_ms = config.settlement_force_close_delay_secs * 1000
     return now_ms >= position.funding_timestamp_ms + force_ms
@@ -257,6 +263,8 @@ def update_position_funding_capture_state(
     second_stage_funding_quote, and peak_net_quote on capture events.
     """
     # Stage 1: primary funding
+    if position.funding_timestamp_ms <= 0:
+        return
     hold_deadline = position.funding_timestamp_ms + post_funding_hold_ms
     if not position.funding_captured and now_ms >= hold_deadline:
         position.funding_captured = True

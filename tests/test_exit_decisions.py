@@ -112,6 +112,22 @@ class TestStandardCloseReason:
         result = standard_close_reason(pos, cfg, 2000000)
         assert result == ExitReason.FUNDING_CAPTURE
 
+    def test_zero_funding_timestamp_does_not_trigger_funding_capture(self):
+        """Missing funding time is not evidence that settlement already passed."""
+        pos = _make_position(
+            funding_timestamp_ms=0,
+            current_net_quote=5.0,
+            matched_quantity=0.01,
+        )
+        cfg = _config(
+            settlement_remainder_close_delay_secs=300,
+            profit_take_quote=100.0,
+        )
+        now_ms = 1780163920476
+
+        assert aligned_settlement_delay_elapsed(pos, now_ms, 300_000) is False
+        assert standard_close_reason(pos, cfg, now_ms) is None
+
     def test_trailing_exit_armed_and_drawn_down(self):
         """V1: peak >= profit_take AND drawdown >= trailing → trailing_exit."""
         # Use staggered to bypass aligned settlement delay check
@@ -319,6 +335,15 @@ class TestRemainingCloseDelayActive:
         delay_ms = 300_000
         assert remaining_close_delay_active(pos, 2000000, delay_ms) is False
 
+    def test_zero_funding_timestamp_not_active(self):
+        pos = _make_position(
+            opportunity_type="aligned",
+            matched_quantity=0.01,
+            funding_timestamp_ms=0,
+        )
+        delay_ms = 300_000
+        assert remaining_close_delay_active(pos, 1000, delay_ms) is False
+
     def test_staggered_not_affected_by_aligned_delay(self):
         """V1: delay only applies to aligned positions."""
         pos = _make_position(
@@ -384,6 +409,15 @@ class TestAlignedSettlementDelayElapsed:
         delay_ms = 300_000
         assert aligned_settlement_delay_elapsed(pos, 2000000, delay_ms) is False
 
+    def test_zero_funding_timestamp_not_elapsed(self):
+        pos = _make_position(
+            opportunity_type="aligned",
+            matched_quantity=0.01,
+            funding_timestamp_ms=0,
+        )
+        delay_ms = 300_000
+        assert aligned_settlement_delay_elapsed(pos, 2000000, delay_ms) is False
+
 
 class TestForceCloseDue:
     def test_aligned_past_force_deadline(self):
@@ -410,6 +444,15 @@ class TestForceCloseDue:
             opportunity_type="staggered",
             matched_quantity=0.01,
             funding_timestamp_ms=1000000,
+        )
+        cfg = _config(settlement_force_close_delay_secs=1200)
+        assert force_close_due(pos, cfg, 2200001) is False
+
+    def test_zero_funding_timestamp_not_due(self):
+        pos = _make_position(
+            opportunity_type="aligned",
+            matched_quantity=0.01,
+            funding_timestamp_ms=0,
         )
         cfg = _config(settlement_force_close_delay_secs=1200)
         assert force_close_due(pos, cfg, 2200001) is False
@@ -441,6 +484,14 @@ class TestUpdateFundingCaptureState:
             funding_captured=False,
         )
         update_position_funding_capture_state(pos, 1001000, post_funding_hold_ms=30000)
+        assert pos.funding_captured is False
+
+    def test_stage1_not_captured_without_funding_timestamp(self):
+        pos = _make_position(
+            funding_timestamp_ms=0,
+            funding_captured=False,
+        )
+        update_position_funding_capture_state(pos, 30001, post_funding_hold_ms=30000)
         assert pos.funding_captured is False
 
     def test_stage1_already_captured_noop(self):

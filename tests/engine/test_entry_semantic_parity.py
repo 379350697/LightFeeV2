@@ -346,6 +346,69 @@ class TestEntryExecutionIdempotency:
         assert pos.symbol == "BTC-USDT"
         assert pos.matched_quantity == min(maker_fill.quantity, hedge_fill.quantity)
 
+    def test_build_open_position_preserves_funding_semantics(self):
+        """Entry-selected funding timestamps must survive into close decisions."""
+        from lightfee.config.schema import StrategyConfig
+        from lightfee.engine.exit_decision import standard_close_reason
+
+        first_funding_ms = 1780167600000
+        second_funding_ms = 1780171200000
+        ctx = EntryContext(
+            entry_id="entry-1780163908797-MAGMAUSDT",
+            symbol="MAGMAUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=100.0,
+            short_quantity=100.0,
+            long_price_hint=0.275,
+            short_price_hint=0.275,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+            opportunity_type="staggered",
+            funding_timestamp_ms=first_funding_ms,
+            first_funding_timestamp_ms=first_funding_ms,
+            long_funding_timestamp_ms=first_funding_ms,
+            short_funding_timestamp_ms=second_funding_ms,
+            second_funding_timestamp_ms=second_funding_ms,
+            first_funding_leg="long",
+            funding_edge_bps_entry=7.45,
+            total_funding_edge_bps_entry=7.45,
+            expected_edge_bps_entry=6.9,
+        )
+        maker_fill = OrderFill(
+            venue=Venue.ASTER,
+            symbol="MAGMAUSDT",
+            side=Side.BUY,
+            quantity=100.0,
+            price=0.275,
+            order_id="magma-maker",
+            filled_at_ms=1780163908797,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="MAGMAUSDT",
+            side=Side.SELL,
+            quantity=100.0,
+            price=0.274,
+            order_id="magma-hedge",
+            filled_at_ms=1780163908798,
+        )
+
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1780163908797)
+
+        assert pos.opportunity_type == "staggered"
+        assert pos.funding_timestamp_ms == first_funding_ms
+        assert pos.second_funding_timestamp_ms == second_funding_ms
+        assert pos.second_stage_enabled_at_entry is True
+        assert pos.funding_edge_bps_entry == pytest.approx(7.45)
+        assert pos.total_funding_edge_bps_entry == pytest.approx(7.45)
+        assert pos.expected_edge_bps_entry == pytest.approx(6.9)
+        assert standard_close_reason(
+            pos,
+            StrategyConfig(settlement_remainder_close_delay_secs=300),
+            1780163920476,
+        ) is None
+
 
 class TestEntryContextFields:
     """V1 EntryContext preserves all necessary semantic fields."""

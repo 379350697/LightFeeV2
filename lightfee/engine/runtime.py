@@ -3518,6 +3518,17 @@ class LiveRuntime:
             created_at_ms=now_ms,
             parent_entry_id=entry_id,
             reprice_action=action,
+            opportunity_type=pending.opportunity_type,
+            funding_timestamp_ms=pending.funding_timestamp_ms,
+            first_funding_timestamp_ms=pending.first_funding_timestamp_ms,
+            long_funding_timestamp_ms=pending.long_funding_timestamp_ms,
+            short_funding_timestamp_ms=pending.short_funding_timestamp_ms,
+            second_funding_timestamp_ms=pending.second_funding_timestamp_ms,
+            first_funding_leg=pending.first_funding_leg,
+            funding_edge_bps_entry=pending.funding_edge_bps_entry,
+            total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
+            expected_edge_bps_entry=pending.expected_edge_bps_entry,
+            exit_after_first_stage=pending.exit_after_first_stage,
         )
         await self.entry_executor.execute(ctx)
         self.journal.append(
@@ -6611,6 +6622,17 @@ class LiveRuntime:
             maker_leg=maker_side,
             entry_type=EntryType(pending.entry_type) if pending.entry_type else EntryType.STANDARD_DUAL_TAKER,
             created_at_ms=pending.created_at_ms,
+            opportunity_type=pending.opportunity_type,
+            funding_timestamp_ms=pending.funding_timestamp_ms,
+            first_funding_timestamp_ms=pending.first_funding_timestamp_ms,
+            long_funding_timestamp_ms=pending.long_funding_timestamp_ms,
+            short_funding_timestamp_ms=pending.short_funding_timestamp_ms,
+            second_funding_timestamp_ms=pending.second_funding_timestamp_ms,
+            first_funding_leg=pending.first_funding_leg,
+            funding_edge_bps_entry=pending.funding_edge_bps_entry,
+            total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
+            expected_edge_bps_entry=pending.expected_edge_bps_entry,
+            exit_after_first_stage=pending.exit_after_first_stage,
         )
 
         position = build_open_position(ctx, maker_fill, hedge_fill, now_ms)
@@ -6641,6 +6663,14 @@ class LiveRuntime:
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": pending.maker_client_order_id,
                 "hedge_client_order_id": pending.hedge_client_order_id,
+                "funding_timestamp_ms": position.funding_timestamp_ms,
+                "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                "opportunity_type": position.opportunity_type,
+                "second_stage_enabled_at_entry": position.second_stage_enabled_at_entry,
+                "exit_after_first_stage": position.exit_after_first_stage,
+                "funding_edge_bps_entry": position.funding_edge_bps_entry,
+                "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
+                "expected_edge_bps_entry": position.expected_edge_bps_entry,
                 "quantity_source": "matched_fill_open_position",
                 "long_venue_metadata": long_venue_metadata,
                 "short_venue_metadata": short_venue_metadata,
@@ -6661,6 +6691,14 @@ class LiveRuntime:
                 "raw_hedge_leg_filled": raw_hedge_leg_filled,
                 "open_maker_fill_quantity": open_maker_fill_quantity,
                 "open_hedge_fill_quantity": open_hedge_fill_quantity,
+                "funding_timestamp_ms": position.funding_timestamp_ms,
+                "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                "opportunity_type": position.opportunity_type,
+                "second_stage_enabled_at_entry": position.second_stage_enabled_at_entry,
+                "exit_after_first_stage": position.exit_after_first_stage,
+                "funding_edge_bps_entry": position.funding_edge_bps_entry,
+                "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
+                "expected_edge_bps_entry": position.expected_edge_bps_entry,
                 "quantity_source": "matched_fill_open_position",
                 "long_venue_metadata": long_venue_metadata,
                 "short_venue_metadata": short_venue_metadata,
@@ -9964,7 +10002,7 @@ class LiveRuntime:
         Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
         """
         from lightfee.core.domain import Side, Venue
-        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
         from lightfee.engine.execution_planner import (
             ExecutionRoute,
             plan_incremental_entry_execution,
@@ -10367,6 +10405,52 @@ class LiveRuntime:
                 )
                 return False
 
+        def _positive_ms(value) -> int:
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+            return parsed if parsed > 0 else 0
+
+        opportunity_type = normalize_opportunity_type(
+            str(getattr(candidate, "opportunity_type", "aligned") or "aligned")
+        )
+        long_funding_timestamp_ms = _positive_ms(
+            getattr(candidate, "long_funding_timestamp_ms", 0)
+        )
+        short_funding_timestamp_ms = _positive_ms(
+            getattr(candidate, "short_funding_timestamp_ms", 0)
+        )
+        funding_timestamp_ms = _positive_ms(getattr(candidate, "funding_timestamp_ms", 0))
+        first_funding_timestamp_ms = _positive_ms(
+            getattr(candidate, "first_funding_timestamp_ms", 0)
+        )
+        if first_funding_timestamp_ms <= 0 and (long_funding_timestamp_ms > 0 or short_funding_timestamp_ms > 0):
+            first_funding_timestamp_ms = min(
+                ts for ts in (long_funding_timestamp_ms, short_funding_timestamp_ms)
+                if ts > 0
+            )
+        if funding_timestamp_ms <= 0:
+            funding_timestamp_ms = first_funding_timestamp_ms
+        second_funding_timestamp_ms = _positive_ms(
+            getattr(candidate, "second_funding_timestamp_ms", 0)
+        )
+        if (
+            second_funding_timestamp_ms <= 0
+            and opportunity_type == "staggered"
+            and long_funding_timestamp_ms > 0
+            and short_funding_timestamp_ms > 0
+        ):
+            later_funding_ms = max(long_funding_timestamp_ms, short_funding_timestamp_ms)
+            if later_funding_ms > first_funding_timestamp_ms:
+                second_funding_timestamp_ms = later_funding_ms
+        funding_edge_bps_entry = float(getattr(candidate, "funding_edge_bps", 0.0) or 0.0)
+        total_funding_edge_bps_entry = float(
+            getattr(candidate, "total_funding_edge_bps", 0.0) or funding_edge_bps_entry
+        )
+        expected_edge_bps_entry = float(getattr(candidate, "expected_edge_bps", 0.0) or 0.0)
+        first_funding_leg = str(getattr(candidate, "first_funding_leg", "") or "")
+
         ctx = EntryContext(
             entry_id=entry_id,
             symbol=candidate.symbol,
@@ -10379,6 +10463,16 @@ class LiveRuntime:
             maker_leg=maker_leg,
             entry_type=entry_type,
             created_at_ms=now_ms,
+            opportunity_type=opportunity_type,
+            funding_timestamp_ms=funding_timestamp_ms,
+            first_funding_timestamp_ms=first_funding_timestamp_ms,
+            long_funding_timestamp_ms=long_funding_timestamp_ms,
+            short_funding_timestamp_ms=short_funding_timestamp_ms,
+            second_funding_timestamp_ms=second_funding_timestamp_ms,
+            first_funding_leg=first_funding_leg,
+            funding_edge_bps_entry=funding_edge_bps_entry,
+            total_funding_edge_bps_entry=total_funding_edge_bps_entry,
+            expected_edge_bps_entry=expected_edge_bps_entry,
         )
 
         # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
@@ -10392,6 +10486,13 @@ class LiveRuntime:
                 "expected_edge_bps": candidate.expected_edge_bps,
                 "funding_edge_bps": candidate.funding_edge_bps,
                 "worst_case_edge_bps": candidate.worst_case_edge_bps,
+                "opportunity_type": opportunity_type,
+                "funding_timestamp_ms": funding_timestamp_ms,
+                "first_funding_timestamp_ms": first_funding_timestamp_ms,
+                "long_funding_timestamp_ms": long_funding_timestamp_ms,
+                "short_funding_timestamp_ms": short_funding_timestamp_ms,
+                "second_funding_timestamp_ms": second_funding_timestamp_ms,
+                "first_funding_leg": first_funding_leg,
                 "entry_notional_quote": candidate.entry_notional_quote,
                 "route": route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
@@ -10412,6 +10513,16 @@ class LiveRuntime:
                     "route": route.value,
                     "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                     "price_hint": price_hint,
+                    "opportunity_type": opportunity_type,
+                    "funding_timestamp_ms": funding_timestamp_ms,
+                    "first_funding_timestamp_ms": first_funding_timestamp_ms,
+                    "long_funding_timestamp_ms": long_funding_timestamp_ms,
+                    "short_funding_timestamp_ms": short_funding_timestamp_ms,
+                    "second_funding_timestamp_ms": second_funding_timestamp_ms,
+                    "first_funding_leg": first_funding_leg,
+                    "funding_edge_bps_entry": funding_edge_bps_entry,
+                    "total_funding_edge_bps_entry": total_funding_edge_bps_entry,
+                    "expected_edge_bps_entry": expected_edge_bps_entry,
                     "ts_ms": now_ms,
                 },
             )
@@ -10479,6 +10590,13 @@ class LiveRuntime:
                         "outcome": result.pending_entry.outcome,
                         "maker_client_order_id": result.pending_entry.maker_client_order_id,
                         "hedge_client_order_id": result.pending_entry.hedge_client_order_id,
+                        "opportunity_type": result.pending_entry.opportunity_type,
+                        "funding_timestamp_ms": result.pending_entry.funding_timestamp_ms,
+                        "first_funding_timestamp_ms": result.pending_entry.first_funding_timestamp_ms,
+                        "long_funding_timestamp_ms": result.pending_entry.long_funding_timestamp_ms,
+                        "short_funding_timestamp_ms": result.pending_entry.short_funding_timestamp_ms,
+                        "second_funding_timestamp_ms": result.pending_entry.second_funding_timestamp_ms,
+                        "first_funding_leg": result.pending_entry.first_funding_leg,
                     },
                 )
         except Exception as e:

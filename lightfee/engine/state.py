@@ -209,6 +209,18 @@ class PendingEntry:
     # --- V1 entry route and outcome tracking ---
     entry_route: str = ""
     outcome: str = ""  # "filled", "rejected", "uncertain", "partial"
+    # --- V1 funding lifecycle semantics retained until pending finalization ---
+    opportunity_type: str = "aligned"
+    funding_timestamp_ms: int = 0
+    first_funding_timestamp_ms: int = 0
+    long_funding_timestamp_ms: int = 0
+    short_funding_timestamp_ms: int = 0
+    second_funding_timestamp_ms: int = 0
+    first_funding_leg: str = ""
+    funding_edge_bps_entry: float = 0.0
+    total_funding_edge_bps_entry: float = 0.0
+    expected_edge_bps_entry: float = 0.0
+    exit_after_first_stage: bool = False
     # --- V1 maker entry repost tracking ---
     repost_count: int = 0
     # --- V1 zero-fill terminal cooldown ---
@@ -678,6 +690,13 @@ class EngineState:
                     "risk_delever_step_count": pos.risk_delever_step_count,
                     "last_risk_reason": pos.last_risk_reason,
                     "single_side_protection_triggered": pos.single_side_protection_triggered,
+                    "funding_timestamp_ms": pos.funding_timestamp_ms,
+                    "exit_after_first_stage": pos.exit_after_first_stage,
+                    "opportunity_type": pos.opportunity_type,
+                    "second_stage_enabled_at_entry": pos.second_stage_enabled_at_entry,
+                    "second_funding_timestamp_ms": pos.second_funding_timestamp_ms,
+                    "second_stage_funding_captured": pos.second_stage_funding_captured,
+                    "second_stage_funding_quote": pos.second_stage_funding_quote,
                 }
                 for pid, pos in self.open_positions.items()
             },
@@ -711,6 +730,17 @@ class EngineState:
                     "short_quantity": p.short_quantity,
                     "maker_leg": p.maker_leg,
                     "outcome": p.outcome,
+                    "opportunity_type": p.opportunity_type,
+                    "funding_timestamp_ms": p.funding_timestamp_ms,
+                    "first_funding_timestamp_ms": p.first_funding_timestamp_ms,
+                    "long_funding_timestamp_ms": p.long_funding_timestamp_ms,
+                    "short_funding_timestamp_ms": p.short_funding_timestamp_ms,
+                    "second_funding_timestamp_ms": p.second_funding_timestamp_ms,
+                    "first_funding_leg": p.first_funding_leg,
+                    "funding_edge_bps_entry": p.funding_edge_bps_entry,
+                    "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
+                    "expected_edge_bps_entry": p.expected_edge_bps_entry,
+                    "exit_after_first_stage": p.exit_after_first_stage,
                 }
                 for pid, p in self.pending_entries.items()
             },

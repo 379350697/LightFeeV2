@@ -543,6 +543,75 @@ class TestPlannerDispatchIntegration:
         assert selected["payload"]["quantity"] == pytest.approx(100.0)
 
     @pytest.mark.asyncio
+    async def test_dispatch_entry_preserves_candidate_funding_semantics(self, config, tmp_journal):
+        binance = FakeVenueAdapter(Venue.ASTER)
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        adapters = {Venue.ASTER: binance, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        first_funding_ms = 1780167600000
+        second_funding_ms = 1780171200000
+        candidate = CandidateInput(
+            long_venue="aster",
+            short_venue="bybit",
+            symbol="MAGMAUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=7.45,
+            expected_edge_bps=6.9,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=7.45,
+            transfer_bias_bps=0.0,
+            opportunity_type="staggered",
+            blocked=False,
+            entry_notional_quote=500.0,
+            funding_timestamp_ms=first_funding_ms,
+            first_funding_timestamp_ms=first_funding_ms,
+            long_funding_timestamp_ms=first_funding_ms,
+            short_funding_timestamp_ms=second_funding_ms,
+            second_funding_timestamp_ms=second_funding_ms,
+            first_funding_leg="long",
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 1780163908797, price_hint=0.275)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.opportunity_type == "staggered"
+        assert executor.ctx.funding_timestamp_ms == first_funding_ms
+        assert executor.ctx.first_funding_timestamp_ms == first_funding_ms
+        assert executor.ctx.long_funding_timestamp_ms == first_funding_ms
+        assert executor.ctx.short_funding_timestamp_ms == second_funding_ms
+        assert executor.ctx.second_funding_timestamp_ms == second_funding_ms
+        assert executor.ctx.first_funding_leg == "long"
+        assert executor.ctx.funding_edge_bps_entry == pytest.approx(7.45)
+        assert executor.ctx.total_funding_edge_bps_entry == pytest.approx(7.45)
+        assert executor.ctx.expected_edge_bps_entry == pytest.approx(6.9)
+
+        selected = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "execution.entry_selected"
+        ][-1]
+        assert selected["payload"]["opportunity_type"] == "staggered"
+        assert selected["payload"]["funding_timestamp_ms"] == first_funding_ms
+        assert selected["payload"]["second_funding_timestamp_ms"] == second_funding_ms
+
+    @pytest.mark.asyncio
     async def test_dispatch_entry_does_not_register_rejected_pending(self, config, tmp_journal):
         """V1: deterministic maker rejection is terminal, not pending exposure."""
         binance = FakeVenueAdapter(Venue.BINANCE)
