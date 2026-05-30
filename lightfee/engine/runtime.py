@@ -1066,6 +1066,8 @@ class LiveRuntime:
         to_venue_symbol = getattr(transport, "_venue_symbol", None)
         spec = getattr(transport, "_spec", None)
         endpoint = str(getattr(spec, "position_path", "") or "fetch_position")
+        catalog_supported_count = len(supported)
+        sample_supported_symbols = sorted(supported)[:10]
 
         filtered: list[str] = []
         unsupported: list[dict[str, str]] = []
@@ -1119,6 +1121,9 @@ class LiveRuntime:
                 {
                     "venue": venue.value,
                     "endpoint": endpoint,
+                    "catalog_source": "adapter.supported_symbols",
+                    "catalog_supported_count": catalog_supported_count,
+                    "sample_supported_symbols": sample_supported_symbols,
                     "symbol_count": len(symbols),
                     "requested_symbols": [str(symbol) for symbol in symbols],
                     "skipped_by_catalog": [item["symbol"] for item in unsupported],
@@ -1127,6 +1132,15 @@ class LiveRuntime:
                     "sample_venue_symbols": [
                         item["venue_symbol"] for item in sample
                     ],
+                    "symbol_mapping_samples": [
+                        {
+                            "symbol": item["symbol"],
+                            "venue_symbol": item["venue_symbol"],
+                        }
+                        for item in sample
+                    ],
+                    "diagnostic_key": list(diagnostic_key),
+                    "diagnostic_rate_limit_ms": self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
                     "reason": "unsupported_symbol",
                 },
             )
@@ -1151,6 +1165,20 @@ class LiveRuntime:
                 venue_symbol = str(to_venue_symbol(normalized_symbol))
             except Exception:
                 venue_symbol = normalized_symbol
+
+        try:
+            supported_raw = adapter.supported_symbols()
+        except Exception:
+            supported_raw = []
+        supported = {str(item) for item in supported_raw if str(item)}
+        catalog_supported_count = len(supported)
+        catalog_supported = (
+            bool(supported)
+            and (
+                normalized_symbol in supported
+                or venue_symbol in supported
+            )
+        )
 
         body = str(getattr(exc, "body", "") or "")
         ret_code = ""
@@ -1212,6 +1240,13 @@ class LiveRuntime:
             "normalized_symbol": normalized_symbol,
             "venue_symbol": venue_symbol,
             "endpoint": endpoint,
+            "probe_category": "private_positions",
+            "catalog_source": "adapter.supported_symbols" if supported else "",
+            "catalog_supported": catalog_supported,
+            "catalog_supported_count": catalog_supported_count,
+            "sample_supported_symbols": sorted(supported)[:10],
+            "cooldown_scope": f"symbol:{venue.value}:{normalized_symbol or '*'}:private_positions",
+            "cooldown_ms": 0,
             "exception_class": exception_class,
             "error": error,
             "retCode": ret_code,

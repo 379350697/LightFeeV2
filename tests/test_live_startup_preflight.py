@@ -882,6 +882,15 @@ class TestRuntimePreflight:
                 "DELISTEDUSDT",
                 "OLDUSDT",
             ]
+            assert unsupported[0]["payload"]["endpoint"] == "fetch_position"
+            assert unsupported[0]["payload"]["catalog_source"] == "adapter.supported_symbols"
+            assert unsupported[0]["payload"]["catalog_supported_count"] == 1
+            assert unsupported[0]["payload"]["sample_supported_symbols"] == ["BTCUSDT"]
+            assert unsupported[0]["payload"]["symbol_mapping_samples"] == [
+                {"symbol": "DELISTEDUSDT", "venue_symbol": "DELISTEDUSDT"},
+                {"symbol": "OLDUSDT", "venue_symbol": "OLDUSDT"},
+            ]
+            assert unsupported[0]["payload"]["diagnostic_rate_limit_ms"] > 0
             assert not any(
                 r["kind"] == "recovery.live_position_probe_symbol_skipped"
                 for r in records
@@ -1041,6 +1050,12 @@ class TestRuntimePreflight:
             assert payload["endpoint"] == "/api/v2/mix/position/single-position"
             assert payload["classification"] == "timeout"
             assert payload["exception_class"] == "TimeoutError"
+            assert payload["probe_category"] == "private_positions"
+            assert payload["catalog_source"] == "adapter.supported_symbols"
+            assert payload["catalog_supported"] is True
+            assert payload["catalog_supported_count"] == 1
+            assert payload["cooldown_scope"] == "symbol:bitget:BTCUSDT:private_positions"
+            assert payload["cooldown_ms"] == 0
             assert payload["error"]
 
     @pytest.mark.asyncio

@@ -194,6 +194,38 @@ def _attach_bybit_min_notional_transport(adapter, min_notional="5"):
     return adapter
 
 
+def _attach_okx_instrument_transport(adapter, *, venue_symbol="SPACE-USDT-SWAP"):
+    """Attach an OKX instruments stub with official sizing metadata."""
+    from lightfee.venues.specs import get_spec
+    from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+    class FakeOkxTransport:
+        _spec = get_spec(Venue.OKX)
+
+        def _venue_symbol(self, symbol):
+            return venue_symbol
+
+        async def _public_get(self, path, params=None):
+            assert path == "/api/v5/public/instruments"
+            assert params == {"instType": "SWAP", "instId": venue_symbol}
+            return {
+                "data": [
+                    {
+                        "instId": venue_symbol,
+                        "tickSz": "0.000001",
+                        "lotSz": "1",
+                        "minSz": "1",
+                        "ctVal": "100",
+                        "maxMktSz": "100000",
+                    }
+                ]
+            }
+
+    get_symbol_rules_cache().clear()
+    adapter._transport = FakeOkxTransport()
+    return adapter
+
+
 # ---------------------------------------------------------------------------
 # Passive contract + progress tests (kept from original — testing real behavior)
 # ---------------------------------------------------------------------------
@@ -1053,6 +1085,90 @@ class TestTerminalMakerFillHedgeFail:
         assert "exit.passive_close_hedge_dust_aborted" in kinds
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
+
+    def test_terminal_maker_filled_okx_dust_logs_official_rule_source(self):
+        """OKX normalized-zero dust must carry instrument metadata evidence."""
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        journal = _open_journal()
+
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE, symbol="SPACEUSDT", side=Side.SELL,
+            cumulative_quantity=39.0, average_price=0.006,
+            state=PassiveOrderState.FILLED,
+        ))
+        maker_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BINANCE, symbol="SPACEUSDT", side=Side.BUY,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+
+        hedge_adapter = _mock_adapter_with_tick(Venue.OKX)
+        _attach_okx_instrument_transport(hedge_adapter)
+        hedge_adapter.normalize_quantity = AsyncMock(return_value=0.0)
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.OKX, symbol="SPACEUSDT", side=Side.BUY, quantity=39.0, price=0.006,
+        ))
+        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX, symbol="SPACEUSDT", side=Side.SELL,
+            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
+        ))
+
+        try:
+            executor = PassiveCloseExecutor(
+                {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            )
+            executor.set_l2_mid_resolver(lambda venue, symbol: 0.006)
+
+            state = EngineState()
+            position = _make_position(
+                position_id="entry-spaceusdt",
+                symbol="SPACEUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=39.0,
+                short_quantity=39.0,
+                matched_quantity=39.0,
+            )
+            pending = PendingPassiveClose(
+                position_id=position.position_id,
+                reason="funding_capture",
+                position_snapshot=position,
+                target_quantity=39.0,
+                chunk_quantities=[39.0],
+                active_chunk_index=0,
+                phase_state=PassivePhaseState(
+                    phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                    active_maker_leg=ActiveMakerLeg.LONG,
+                    maker_order_id="oid-maker",
+                    maker_client_order_id="cid-maker",
+                    maker_resting_limit_price=0.006,
+                ),
+                maker_fill=PendingPassiveLegFill(),
+                hedge_fill=PendingPassiveLegFill(),
+            )
+            state.open_positions[position.position_id] = position
+            state.pending_passive_closes[position.position_id] = pending
+
+            result = asyncio.run(
+                executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+            )
+        finally:
+            get_symbol_rules_cache().clear()
+
+        assert result is True
+        hedge_adapter.place_order.assert_not_called()
+        dust = next(
+            e["payload"] for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_hedge_dust_aborted"
+        )
+        assert dust["symbol"] == "SPACEUSDT"
+        assert dust["venue_symbol"] == "SPACE-USDT-SWAP"
+        assert dust["min_notional_source"] == "instrument"
+        assert dust["rule_source"] == "instrument"
+        assert dust["rule_min_quantity"] == 1.0
+        assert dust["rule_qty_step"] == 1.0
+        assert dust["rule_ct_val"] == 100.0
 
     def test_maker_filled_hedge_exception_does_not_advance(self):
         """Maker terminal FILLED, hedge adapter raises exception → drive returns False, index=0."""

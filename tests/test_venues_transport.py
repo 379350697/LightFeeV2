@@ -2231,6 +2231,18 @@ class TestOrderAckNotFill:
         assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
         assert "order accepted" in str(exc_info.value).lower()
         assert "fill not confirmed" in str(exc_info.value).lower()
+        assert getattr(exc_info.value, "accepted_order_id", "") == "xyz789"
+        assert getattr(exc_info.value, "accepted_client_order_id", "") == "client_1"
+        assert getattr(exc_info.value, "order_ack_only", False) is True
+        assert getattr(exc_info.value, "fill_confirmation_missing_fields", []) == [
+            "executedQty",
+            "cumExecQty",
+            "cumQty",
+            "fillSz",
+            "filledQty",
+            "filled_size",
+        ]
+        assert json.loads(getattr(exc_info.value, "exchange_response_body", "{}")) == raw
 
     def test_bitget_ack_only_raises_uncertain(self):
         spec = bitget_spec()
@@ -2240,6 +2252,8 @@ class TestOrderAckNotFill:
         with pytest.raises(OrderSubmitError) as exc_info:
             transport._parse_order_fill(raw, req, "BTCUSDT", 1000)
         assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert getattr(exc_info.value, "accepted_order_id", "") == "bg123"
+        assert getattr(exc_info.value, "accepted_client_order_id", "") == "client_1"
 
     def test_filled_response_still_returns_fill(self):
         spec = binance_spec()

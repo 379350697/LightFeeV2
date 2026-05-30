@@ -336,6 +336,39 @@ def build_evidence_from_order_submit_error(
 
     # No transport error in chain — build from string
     err_str = str(error)
+    ack_body = str(getattr(error, "exchange_response_body", "") or "")
+    if ack_body:
+        evidence = ExchangeErrorEvidence(
+            venue=venue,
+            operation=operation,
+            endpoint=endpoint,
+            transport_error_type=TransportErrorType.UNKNOWN,
+            raw_body=ack_body[:2000],
+            raw_body_truncated=len(ack_body) > 2000,
+            request_context=request_context or RequestContext(),
+        )
+        _extract_exchange_fields(evidence)
+        _extract_exchange_fields_from_string(evidence, err_str)
+        evidence.assess_completeness()
+        if bool(getattr(error, "order_ack_only", False)):
+            missing = list(evidence.missing_evidence)
+            if "fill_confirmation" not in missing:
+                missing.append("fill_confirmation")
+            evidence.missing_evidence = missing
+            evidence.evidence_completeness = EvidenceCompleteness.PARTIAL
+            evidence.confidence = "medium"
+            evidence.extra["order_ack_only"] = True
+            evidence.extra["accepted_order_id"] = str(
+                getattr(error, "accepted_order_id", "") or ""
+            )
+            evidence.extra["accepted_client_order_id"] = str(
+                getattr(error, "accepted_client_order_id", "") or ""
+            )
+            evidence.extra["fill_confirmation_missing_fields"] = list(
+                getattr(error, "fill_confirmation_missing_fields", []) or []
+            )
+        return evidence
+
     evidence = ExchangeErrorEvidence(
         venue=venue,
         operation=operation,

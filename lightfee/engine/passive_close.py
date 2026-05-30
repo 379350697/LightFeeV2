@@ -1379,8 +1379,14 @@ class PassiveCloseExecutor:
             dust_reason = str(min_notional_violation.get("reason") or "min_notional_rejected")
 
         if dust_reason:
+            rule_evidence = await self._hedge_rule_diagnostic_payload(
+                hedge_venue,
+                position.symbol,
+                min_notional_source=min_notional_source,
+            )
             payload = {
                 "position_id": position.position_id,
+                "symbol": position.symbol,
                 "hedge_venue": hedge_venue.value,
                 "hedge_leg": hedge_leg_label,
                 "requested": delta,
@@ -1389,6 +1395,7 @@ class PassiveCloseExecutor:
                 "price_source": price_source,
                 "reason": dust_reason,
                 "maker_terminal": maker_terminal,
+                **rule_evidence,
             }
             if min_notional_violation is not None:
                 payload.update({
@@ -1430,6 +1437,7 @@ class PassiveCloseExecutor:
                     normalized_quantity=normalized_delta,
                     leg_notional_quote=leg_notional,
                     venue_min_notional_quote=min_notional,
+                    min_notional_source=min_notional_source,
                     failed_stage=(
                         pending.short_stage or "exit_short"
                         if hedge_leg_label == "short"
@@ -2686,6 +2694,7 @@ class PassiveCloseExecutor:
         normalized_quantity: float,
         leg_notional_quote: float,
         venue_min_notional_quote: float,
+        min_notional_source: str,
         failed_stage: str,
         source: str,
     ) -> bool:
@@ -2706,6 +2715,7 @@ class PassiveCloseExecutor:
             "normalized_quantity": normalized_quantity,
             "leg_notional_quote": leg_notional_quote,
             "venue_min_notional_quote": venue_min_notional_quote,
+            "min_notional_source": min_notional_source,
             "source": source,
         }
         self._journal.append("execution.min_notional_accumulating", accumulating_payload)
@@ -2720,6 +2730,7 @@ class PassiveCloseExecutor:
             "normalized_quantity": normalized_quantity,
             "leg_notional_quote": leg_notional_quote,
             "venue_min_notional_quote": venue_min_notional_quote,
+            "min_notional_source": min_notional_source,
             "source": source,
         }
         self._journal.append("execution.min_notional_abort_and_flatten", abort_payload)
@@ -2829,6 +2840,11 @@ class PassiveCloseExecutor:
             min_notional_source=min_notional_source,
         )
         if normalized_qty <= 1e-12 or min_notional_violation is not None:
+            rule_evidence = await self._hedge_rule_diagnostic_payload(
+                venue,
+                position.symbol,
+                min_notional_source=min_notional_source,
+            )
             leg_notional = 0.0
             min_notional = 0.0
             if min_notional_violation is not None:
@@ -2843,6 +2859,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_hedge_dust_aborted",
                 {
                     "position_id": position.position_id,
+                    "symbol": position.symbol,
                     "hedge_venue": venue.value,
                     "hedge_leg": leg_label,
                     "requested": live_qty,
@@ -2853,6 +2870,7 @@ class PassiveCloseExecutor:
                     "maker_terminal": True,
                     "leg_notional_quote": leg_notional,
                     "venue_min_notional_quote": min_notional,
+                    **rule_evidence,
                 },
             )
             compensation_source = (
@@ -2870,6 +2888,7 @@ class PassiveCloseExecutor:
                 normalized_quantity=normalized_qty,
                 leg_notional_quote=leg_notional,
                 venue_min_notional_quote=min_notional,
+                min_notional_source=min_notional_source,
                 failed_stage=(
                     (pending.short_stage or "exit_short")
                     if leg_label == "short"
@@ -3112,6 +3131,11 @@ class PassiveCloseExecutor:
         )
 
         if normalized_excess <= 1e-12 or min_notional_violation is not None:
+            rule_evidence = await self._hedge_rule_diagnostic_payload(
+                excess_venue,
+                position.symbol,
+                min_notional_source=min_notional_source,
+            )
             leg_notional = 0.0
             min_notional = 0.0
             if min_notional_violation is not None:
@@ -3126,6 +3150,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_hedge_dust_aborted",
                 {
                     "position_id": position.position_id,
+                    "symbol": position.symbol,
                     "hedge_venue": excess_venue.value,
                     "hedge_leg": excess_leg,
                     "requested": excess_qty,
@@ -3136,6 +3161,7 @@ class PassiveCloseExecutor:
                     "maker_terminal": True,
                     "leg_notional_quote": leg_notional,
                     "venue_min_notional_quote": min_notional,
+                    **rule_evidence,
                 },
             )
             compensation_source = (
@@ -3153,6 +3179,7 @@ class PassiveCloseExecutor:
                 normalized_quantity=normalized_excess,
                 leg_notional_quote=leg_notional,
                 venue_min_notional_quote=min_notional,
+                min_notional_source=min_notional_source,
                 failed_stage=failed_stage,
                 source=compensation_source,
             )
@@ -4095,7 +4122,11 @@ class PassiveCloseExecutor:
                 rule_min_notional = float(
                     getattr(symbol_rule, "min_notional", 0.0) or 0.0
                 )
-                if rule_source and rule_source != "spec_fallback" and rule_min_notional > 0.0:
+                if (
+                    rule_source
+                    and rule_source != "spec_fallback"
+                    and (rule_min_notional > 0.0 or venue == Venue.OKX)
+                ):
                     return rule_min_notional, rule_source
             except Exception:
                 pass
@@ -4105,6 +4136,51 @@ class PassiveCloseExecutor:
 
         buffer_min_notional = float(self._config.small_fill_buffer_notional_quote or 0.0)
         return max(spec_min_notional, buffer_min_notional), "venue_spec_or_buffer"
+
+    async def _hedge_rule_diagnostic_payload(
+        self,
+        venue: Venue,
+        symbol: str,
+        *,
+        min_notional_source: str,
+    ) -> dict[str, Any]:
+        adapter = self._adapter(venue)
+        transport = getattr(adapter, "_transport", None) if adapter is not None else None
+        venue_symbol = symbol
+        venue_symbol_fn = getattr(transport, "_venue_symbol", None)
+        if callable(venue_symbol_fn):
+            try:
+                venue_symbol = str(venue_symbol_fn(symbol))
+            except Exception:
+                venue_symbol = symbol
+
+        payload: dict[str, Any] = {
+            "venue_symbol": venue_symbol,
+            "min_notional_source": min_notional_source,
+        }
+        if transport is None:
+            return payload
+
+        # Do not fetch here; dust diagnostics must not add public metadata I/O
+        # to the close execution path.
+        cache = get_symbol_rules_cache()
+        rule = getattr(cache, "_rules", {}).get((venue, venue_symbol))
+        if rule is None:
+            return payload
+
+        rule_source = str(getattr(rule, "rule_source", "") or "")
+        if rule_source:
+            payload["rule_source"] = rule_source
+        payload["rule_qty_step"] = float(getattr(rule, "qty_step", 0.0) or 0.0)
+        payload["rule_min_quantity"] = float(getattr(rule, "min_qty", 0.0) or 0.0)
+        payload["rule_min_notional_quote"] = float(
+            getattr(rule, "min_notional", 0.0) or 0.0
+        )
+        payload["rule_ct_val"] = float(getattr(rule, "ct_val", 0.0) or 0.0)
+        payload["rule_max_market_qty"] = float(
+            getattr(rule, "max_market_qty", 0.0) or 0.0
+        )
+        return payload
 
     def _maker_cycle_retry_delay(self, zero_fill_cycles: int) -> int:
         """V1 maker_cycle_retry_delay_ms: exponential backoff for zero-fill cycles."""

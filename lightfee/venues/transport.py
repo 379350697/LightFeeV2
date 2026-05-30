@@ -3920,11 +3920,36 @@ class VenueTransport(MarketDataClient):
             exec_qty = abs(float(data.get("size", data.get("quantity", 0))))
             exec_price = float(data.get("price", data.get("avgPrice", 0)))
         elif order_id:
-            raise OrderSubmitError(
+            err = OrderSubmitError(
                 SubmitFailureClass.UNCERTAIN,
                 f"order accepted (id={order_id}) but fill not confirmed — "
                 "no executedQty/cumQty/fillSz in response",
             )
+            missing_fill_fields = [
+                "executedQty",
+                "cumExecQty",
+                "cumQty",
+                "fillSz",
+                "filledQty",
+                "filled_size",
+            ]
+            accepted_client_order_id = str(
+                data.get(
+                    "orderLinkId",
+                    data.get(
+                        "clientOrderId",
+                        data.get("clOrdId", request.client_order_id),
+                    ),
+                )
+                or request.client_order_id
+                or ""
+            )
+            err.order_ack_only = True
+            err.accepted_order_id = order_id
+            err.accepted_client_order_id = accepted_client_order_id
+            err.fill_confirmation_missing_fields = missing_fill_fields
+            err.exchange_response_body = json.dumps(raw, separators=(",", ":"))
+            raise err
         else:
             raise OrderSubmitError(
                 SubmitFailureClass.UNCERTAIN,

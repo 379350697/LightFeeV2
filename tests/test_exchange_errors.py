@@ -279,6 +279,40 @@ def test_build_evidence_from_ose_without_transport_cause():
     )
 
 
+def test_build_evidence_from_ack_only_ose_preserves_fill_gap_context():
+    err = OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN,
+        "order accepted (id=xyz789) but fill not confirmed",
+    )
+    err.order_ack_only = True
+    err.accepted_order_id = "xyz789"
+    err.accepted_client_order_id = "client_1"
+    err.fill_confirmation_missing_fields = ["executedQty", "cumQty", "fillSz"]
+    err.exchange_response_body = (
+        '{"retCode":0,"retMsg":"OK","result":{"orderId":"xyz789","orderLinkId":"client_1"}}'
+    )
+
+    evidence = build_evidence_from_order_submit_error(
+        err,
+        venue="bybit",
+        operation="place_order",
+        request_context=RequestContext(symbol="BTCUSDT", side="buy", quantity=0.01),
+    )
+
+    assert evidence.raw_body
+    assert evidence.extra["order_ack_only"] is True
+    assert evidence.extra["accepted_order_id"] == "xyz789"
+    assert evidence.extra["accepted_client_order_id"] == "client_1"
+    assert evidence.extra["fill_confirmation_missing_fields"] == [
+        "executedQty",
+        "cumQty",
+        "fillSz",
+    ]
+    assert "fill_confirmation" in evidence.missing_evidence
+    assert evidence.evidence_completeness == EvidenceCompleteness.PARTIAL
+    assert evidence.confidence == "medium"
+
+
 # ---------------------------------------------------------------------------
 # Factory: build fallback evidence from generic exception
 # ---------------------------------------------------------------------------
