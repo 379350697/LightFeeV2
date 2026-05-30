@@ -4,6 +4,88 @@ This directory is the lightweight, long-term bug ledger for LightFeeV2.
 
 The goal is to preserve enough context for future debugging, GitNexus search, and regression review without storing large logs or raw command output.
 
+## Quick Workflow
+
+When debugging or documenting a bug, follow this order:
+
+1. Search existing cards first: `rg "<event|error|symbol|fingerprint>" docs/bugs/cards docs/bugs/BUG_INDEX.md`.
+2. If the failure matches an existing card, update that card's `Recurrences` and, if needed, `Attempts Ledger`.
+3. Record the full incident in `docs/bugs/daily/YYYY-MM-DD.md`.
+4. Add or update only an index-level row in `docs/bugs/BUG_INDEX.md`; do not duplicate the full investigation there.
+5. Mark a bug `closed` only after the card/daily entry records the required harness/probe evidence. Local tests alone are `local green`, not closure, unless the bug is explicitly non-production.
+
+If no existing card matches, write the daily entry first. Add a new card only
+when the failure family has recurred, is likely to recur, or contains a partial
+or ineffective fix that future debugging must not repeat.
+
+## Minimal Templates
+
+Use these short templates when speed matters. Keep details compact and link to
+the daily entry for full evidence.
+
+### Daily Cluster
+
+```md
+## Cluster CL-XXX-short-topic
+
+### GitNexus Keys
+- Fingerprint: `stable.failure.fingerprint`
+- Components: `component-a`, `component-b`
+- Symbols: `SymbolName`, `Class.method_name`
+- Files: `path/to/file.py`
+- Commits: `abc1234`
+- Watch: `event.kind`, `error_code`, `log_fingerprint`
+- Card: [card-name](../cards/card-name.md) or `none yet`
+
+### Summary
+Observed behavior, affected symbols/venues, and whether local/exchange state had open positions or orders.
+
+### Root Cause
+Concrete cause. State whether it is V1 drift, exchange semantics, missing evidence, or operational/deploy issue.
+
+### V1 / Exchange Decision
+- V1 copy: what was copied, with source if known.
+- Exchange docs: what official rule/error code controls the fix.
+- Not allowed: any rejected direction that would cause semantic drift.
+
+### Attempts
+| Attempt | Status | Why |
+|---|---|---|
+| short attempt name | effective / partial / ineffective | one-line reason |
+
+### Fix
+Behavioral change, not just file names.
+
+### Verification
+| Environment | Evidence | Result |
+|---|---|---|
+| local | harness/test/probe | short result |
+| cloud | harness/probe/state truth | short result |
+
+### Acceptance
+Closed / local green / deployed pending probe / blocked, with the exact remaining evidence needed.
+```
+
+### Card Row Updates
+
+```md
+## Attempts Ledger
+| Date | Attempt | Status | Why |
+|---|---|---|---|
+| YYYY-MM-DD | attempted fix or diagnostic | effective / partial / ineffective | why it did or did not close the family |
+
+## Recurrences
+| Date | Symbols / Venues | Commit / Fix | Result | Detail |
+|---|---|---|---|---|
+| YYYY-MM-DD | `SYMBOL` venue pair | `commit` or `working tree` | closed / open / partial | [daily link](../daily/YYYY-MM-DD.md#cluster-anchor) |
+```
+
+### BUG_INDEX Row
+
+```md
+| [CL-XXX-topic](daily/YYYY-MM-DD.md#cluster-cl-xxx-topic) | status | severity | `component-a`, `component-b` | `stable.failure.fingerprint` | YYYY-MM-DD | first evidence commit/run | fixed commit or working tree | latest short verification | related rule/card | one-sentence current outcome |
+```
+
 ## File Layout
 
 Use short bug cards for recurring bug families. A card is not an incident log;
