@@ -19,7 +19,7 @@ from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.reconciliation import OrderReconciler
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import EngineState, PendingEntry
+from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
 from lightfee.persistence.journal import Journal
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -610,6 +610,194 @@ class TestPlannerDispatchIntegration:
         assert selected["payload"]["opportunity_type"] == "staggered"
         assert selected["payload"]["funding_timestamp_ms"] == first_funding_ms
         assert selected["payload"]["second_funding_timestamp_ms"] == second_funding_ms
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_sets_first_stage_exit_from_v1_config(self, config, tmp_journal):
+        config.strategy.staggered_exit_mode = "after_first_stage"
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+        adapters = {Venue.BINANCE: binance, Venue.ASTER: aster}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        first_funding_ms = 1780167600000
+        second_funding_ms = 1780171200000
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="aster",
+            symbol="PRLUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=12.9,
+            expected_edge_bps=12.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=12.9,
+            transfer_bias_bps=0.0,
+            opportunity_type="staggered",
+            blocked=False,
+            entry_notional_quote=30.0,
+            funding_timestamp_ms=first_funding_ms,
+            first_funding_timestamp_ms=first_funding_ms,
+            long_funding_timestamp_ms=first_funding_ms,
+            short_funding_timestamp_ms=second_funding_ms,
+            second_funding_timestamp_ms=second_funding_ms,
+            first_funding_leg="long",
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 1780167385971, price_hint=0.2068)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.exit_after_first_stage is True
+        selected = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "execution.entry_selected"
+        ][-1]
+        assert selected["payload"]["exit_after_first_stage"] is True
+
+    @pytest.mark.asyncio
+    async def test_normal_exit_updates_funding_state_and_routes_first_stage_capture(
+        self, config, tmp_journal,
+    ):
+        config.strategy.post_funding_hold_secs = 0
+        config.strategy.staggered_exit_mode = "after_first_stage"
+        config.strategy.profit_take_quote = 100.0
+        config.strategy.net_stop_loss_quote = 20.0
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        class CapturingPassiveClose:
+            def __init__(self):
+                self.start_calls = []
+                self.drive_calls = []
+
+            async def start_pending_passive_close(self, state, position, reason, **kwargs):
+                self.start_calls.append((position.position_id, reason, kwargs))
+                return object()
+
+            async def drive_pending_passive_close(
+                self, state, position_id, wait_until_terminal=False,
+            ):
+                self.drive_calls.append((position_id, wait_until_terminal))
+
+        passive = CapturingPassiveClose()
+        runtime.passive_close_executor = passive
+        first_funding_ms = 1780167600000
+        second_funding_ms = 1780171200000
+        position = OpenPosition(
+            position_id="entry-1780167287526-PRLUSDT",
+            symbol="PRLUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=116.0,
+            short_quantity=116.0,
+            long_entry_price=0.2068,
+            short_entry_price=0.2063,
+            opened_at_ms=1780167385971,
+            matched_quantity=116.0,
+            funding_timestamp_ms=first_funding_ms,
+            second_funding_timestamp_ms=second_funding_ms,
+            opportunity_type="staggered",
+            second_stage_enabled_at_entry=True,
+            exit_after_first_stage=True,
+            funding_captured=False,
+            second_stage_funding_captured=False,
+            current_net_quote=0.0,
+            peak_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+
+        await runtime._maybe_process_normal_exits(first_funding_ms)
+
+        assert position.funding_captured is True
+        assert position.second_stage_funding_captured is False
+        assert passive.start_calls == [
+            (
+                position.position_id,
+                "first_stage_capture",
+                {
+                    "long_price_hint": 0.0,
+                    "short_price_hint": 0.0,
+                    "short_stage": "exit_short",
+                    "long_stage": "exit_long",
+                },
+            )
+        ]
+        assert passive.drive_calls == [(position.position_id, False)]
+        kinds = [r["kind"] for r in runtime.journal.read_all()]
+        assert "runtime.funding_capture_state_updated" in kinds
+        assert "runtime.normal_close_routing_passive" in kinds
+
+    @pytest.mark.asyncio
+    async def test_normal_exit_backfills_recovered_first_stage_exit_semantics(
+        self, config, tmp_journal,
+    ):
+        config.strategy.post_funding_hold_secs = 0
+        config.strategy.staggered_exit_mode = "after_first_stage"
+        config.strategy.profit_take_quote = 100.0
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        class CapturingPassiveClose:
+            def __init__(self):
+                self.reasons = []
+
+            async def start_pending_passive_close(self, state, position, reason, **kwargs):
+                self.reasons.append(reason)
+                return object()
+
+            async def drive_pending_passive_close(
+                self, state, position_id, wait_until_terminal=False,
+            ):
+                return None
+
+        passive = CapturingPassiveClose()
+        runtime.passive_close_executor = passive
+        first_funding_ms = 1780167600000
+        second_funding_ms = 1780171200000
+        position = OpenPosition(
+            position_id="entry-1780167287526-PRLUSDT",
+            symbol="PRLUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=116.0,
+            short_quantity=116.0,
+            long_entry_price=0.2068,
+            short_entry_price=0.2063,
+            opened_at_ms=1780167385971,
+            matched_quantity=116.0,
+            funding_timestamp_ms=first_funding_ms,
+            second_funding_timestamp_ms=second_funding_ms,
+            opportunity_type="staggered",
+            second_stage_enabled_at_entry=True,
+            exit_after_first_stage=False,
+            funding_captured=False,
+            second_stage_funding_captured=False,
+            current_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+
+        await runtime._maybe_process_normal_exits(first_funding_ms)
+
+        assert position.exit_after_first_stage is True
+        assert position.funding_captured is True
+        assert passive.reasons == ["first_stage_capture"]
+        kinds = [r["kind"] for r in runtime.journal.read_all()]
+        assert "runtime.staggered_exit_mode_backfilled" in kinds
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_does_not_register_rejected_pending(self, config, tmp_journal):

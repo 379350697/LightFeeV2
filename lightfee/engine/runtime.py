@@ -10450,6 +10450,11 @@ class LiveRuntime:
         )
         expected_edge_bps_entry = float(getattr(candidate, "expected_edge_bps", 0.0) or 0.0)
         first_funding_leg = str(getattr(candidate, "first_funding_leg", "") or "")
+        exit_after_first_stage = (
+            opportunity_type == "staggered"
+            and str(getattr(self.config.strategy, "staggered_exit_mode", "") or "").lower()
+            == "after_first_stage"
+        )
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -10473,6 +10478,7 @@ class LiveRuntime:
             funding_edge_bps_entry=funding_edge_bps_entry,
             total_funding_edge_bps_entry=total_funding_edge_bps_entry,
             expected_edge_bps_entry=expected_edge_bps_entry,
+            exit_after_first_stage=exit_after_first_stage,
         )
 
         # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
@@ -10493,6 +10499,7 @@ class LiveRuntime:
                 "short_funding_timestamp_ms": short_funding_timestamp_ms,
                 "second_funding_timestamp_ms": second_funding_timestamp_ms,
                 "first_funding_leg": first_funding_leg,
+                "exit_after_first_stage": exit_after_first_stage,
                 "entry_notional_quote": candidate.entry_notional_quote,
                 "route": route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
@@ -10520,6 +10527,7 @@ class LiveRuntime:
                     "short_funding_timestamp_ms": short_funding_timestamp_ms,
                     "second_funding_timestamp_ms": second_funding_timestamp_ms,
                     "first_funding_leg": first_funding_leg,
+                    "exit_after_first_stage": exit_after_first_stage,
                     "funding_edge_bps_entry": funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": expected_edge_bps_entry,
@@ -10698,6 +10706,7 @@ class LiveRuntime:
         from lightfee.engine.exit_decision import (
             normal_close_reason_uses_passive_maker_taker,
             standard_close_reason,
+            update_position_funding_capture_state,
         )
 
         if not self.state.open_positions:
@@ -10707,6 +10716,62 @@ class LiveRuntime:
             # Skip positions already in passive close
             if position.position_id in self.state.pending_passive_closes:
                 continue
+
+            staggered_exit_mode = str(
+                getattr(self.config.strategy, "staggered_exit_mode", "") or ""
+            ).lower()
+            if (
+                position.opportunity_type == "staggered"
+                and staggered_exit_mode == "after_first_stage"
+                and not position.exit_after_first_stage
+            ):
+                position.exit_after_first_stage = True
+                self.journal.append(
+                    "runtime.staggered_exit_mode_backfilled",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "opportunity_type": position.opportunity_type,
+                        "staggered_exit_mode": staggered_exit_mode,
+                        "exit_after_first_stage": True,
+                        "source": "strategy_config",
+                        "ts_ms": now_ms,
+                    },
+                )
+
+            funding_captured_before = position.funding_captured
+            second_stage_before = position.second_stage_funding_captured
+            post_funding_hold_ms = int(
+                getattr(self.config.strategy, "post_funding_hold_secs", 0) or 0
+            ) * 1000
+            update_position_funding_capture_state(
+                position,
+                now_ms,
+                post_funding_hold_ms,
+            )
+            if (
+                position.funding_captured != funding_captured_before
+                or position.second_stage_funding_captured != second_stage_before
+            ):
+                self.journal.append(
+                    "runtime.funding_capture_state_updated",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "opportunity_type": position.opportunity_type,
+                        "funding_timestamp_ms": position.funding_timestamp_ms,
+                        "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                        "post_funding_hold_ms": post_funding_hold_ms,
+                        "funding_captured_before": funding_captured_before,
+                        "funding_captured_after": position.funding_captured,
+                        "second_stage_funding_captured_before": second_stage_before,
+                        "second_stage_funding_captured_after": (
+                            position.second_stage_funding_captured
+                        ),
+                        "exit_after_first_stage": position.exit_after_first_stage,
+                        "ts_ms": now_ms,
+                    },
+                )
 
             reason = standard_close_reason(position, self.config.strategy, now_ms)
             if reason is None:
