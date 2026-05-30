@@ -985,6 +985,12 @@ class LiveRuntime:
                     "source": source,
                     "flattened_positions": flattened,
                     "failed_positions": failed,
+                    "flattened_count": len(flattened),
+                    "failed_count": len(failed),
+                    "live_truth_venues": sorted({
+                        str(item.get("venue", "")) for item in flattened + failed
+                        if item.get("venue")
+                    }),
                     "ts_ms": now_ms,
                 },
             )
@@ -995,6 +1001,12 @@ class LiveRuntime:
             {
                 "source": source,
                 "positions": flattened,
+                "flattened_count": len(flattened),
+                "failed_count": 0,
+                "live_truth_venues": sorted({
+                    str(item.get("venue", "")) for item in flattened
+                    if item.get("venue")
+                }),
                 "ts_ms": now_ms,
             },
         )
@@ -5667,13 +5679,65 @@ class LiveRuntime:
             if live_balanced <= current_balanced + 1e-9:
                 return False
 
-            # Apply recovered fills (quantities already positive per side check above)
-            long_delta = min(live_balanced, long_pos.quantity) - pending.maker_leg_filled
-            short_delta = min(live_balanced, short_pos.quantity) - pending.hedge_leg_filled
-            if long_delta > 1e-9:
-                pending.maker_leg_filled += long_delta
-            if short_delta > 1e-9:
-                pending.hedge_leg_filled += short_delta
+            before_maker = float(pending.maker_leg_filled or 0.0)
+            before_hedge = float(pending.hedge_leg_filled or 0.0)
+            before_maker_price = float(pending.maker_fill_price or 0.0)
+            before_hedge_price = float(pending.hedge_fill_price or 0.0)
+
+            if pending.maker_leg == "short":
+                maker_live_position = short_pos
+                hedge_live_position = long_pos
+                recovered_maker_qty = min(live_balanced, short_pos.quantity)
+                recovered_hedge_qty = min(live_balanced, long_pos.quantity)
+                maker_price_source = short_pos.entry_price
+                hedge_price_source = long_pos.entry_price
+            else:
+                maker_live_position = long_pos
+                hedge_live_position = short_pos
+                recovered_maker_qty = min(live_balanced, long_pos.quantity)
+                recovered_hedge_qty = min(live_balanced, short_pos.quantity)
+                maker_price_source = long_pos.entry_price
+                hedge_price_source = short_pos.entry_price
+
+            if recovered_maker_qty > pending.maker_leg_filled + 1e-9:
+                pending.maker_leg_filled = recovered_maker_qty
+            if recovered_hedge_qty > pending.hedge_leg_filled + 1e-9:
+                pending.hedge_leg_filled = recovered_hedge_qty
+            if pending.maker_fill_price <= 0 and maker_price_source > 0:
+                pending.maker_fill_price = float(maker_price_source)
+            if pending.hedge_fill_price <= 0 and hedge_price_source > 0:
+                pending.hedge_fill_price = float(hedge_price_source)
+
+            self.journal.append(
+                "pending_entry.live_position_hydrated",
+                {
+                    "entry_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "long_venue": pending.long_venue.value,
+                    "short_venue": pending.short_venue.value,
+                    "maker_leg": pending.maker_leg,
+                    "before_maker_leg_filled": before_maker,
+                    "before_hedge_leg_filled": before_hedge,
+                    "after_maker_leg_filled": pending.maker_leg_filled,
+                    "after_hedge_leg_filled": pending.hedge_leg_filled,
+                    "before_maker_fill_price": before_maker_price,
+                    "before_hedge_fill_price": before_hedge_price,
+                    "after_maker_fill_price": pending.maker_fill_price,
+                    "after_hedge_fill_price": pending.hedge_fill_price,
+                    "live_balanced_quantity": live_balanced,
+                    "live_positions": {
+                        "long": self._position_snapshot_evidence(long_pos),
+                        "short": self._position_snapshot_evidence(short_pos),
+                    },
+                    "maker_live_position": self._position_snapshot_evidence(
+                        maker_live_position
+                    ),
+                    "hedge_live_position": self._position_snapshot_evidence(
+                        hedge_live_position
+                    ),
+                    "quantity_source": "live_exchange_position_truth",
+                },
+            )
 
             # If both legs now filled, mark as resolved
             if pending.maker_completed() and pending.missing_hedge_quantity() <= 1e-9:
@@ -6044,6 +6108,7 @@ class LiveRuntime:
             # V1: retain inflight on UNCERTAIN so reconciliation can query it;
             # only clear on REJECTED where we know the order never reached the exchange.
             submitted_inflight = pending.hedge_inflight
+            reconciliation_error_text = ""
             try:
                 reconciliation = await adapter.fetch_order_fill_reconciliation(
                     pending.symbol,
@@ -6052,6 +6117,7 @@ class LiveRuntime:
                 )
             except Exception as reconcile_error:
                 reconciliation = None
+                reconciliation_error_text = str(reconcile_error)
                 self.journal.append(
                     "pending_entry.hedge_submit_reconcile_error",
                     {
@@ -6061,8 +6127,13 @@ class LiveRuntime:
                         "error": str(reconcile_error),
                     },
                 )
-            if reconciliation is not None and getattr(reconciliation, "quantity", 0.0) > 0:
-                fill_qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+            reconciliation_quantity = (
+                float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+                if reconciliation is not None
+                else 0.0
+            )
+            if reconciliation is not None and reconciliation_quantity > 0:
+                fill_qty = reconciliation_quantity
                 pending.hedge_leg_filled += fill_qty
                 pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
                 pending.hedge_fill_price = float(
@@ -6137,17 +6208,41 @@ class LiveRuntime:
                 now_ms=now_ms,
             ):
                 return False
+            error_payload = {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "outcome": "error",
+                "error": str(e),
+                "is_rejected": e.is_rejected,
+                "hedge_client_order_id": submitted_inflight.client_order_id if submitted_inflight else "",
+                "hedge_attempt": attempt,
+                "fill_reconciliation_attempted": True,
+                "fill_reconciliation_result": (
+                    "error" if reconciliation_error_text else "missing_or_zero_fill"
+                ),
+                "fill_reconciliation_error": reconciliation_error_text,
+                "fill_reconciliation_order_id": (
+                    getattr(reconciliation, "order_id", "") if reconciliation is not None else ""
+                ),
+                "fill_reconciliation_client_order_id": hedge_cloid,
+                "fill_reconciliation_quantity": reconciliation_quantity,
+            }
+            error_payload.update(
+                self._order_submit_error_runtime_evidence(
+                    e,
+                    venue=hedge_venue,
+                    operation="place_order",
+                    request=req,
+                    default_client_order_id=(
+                        submitted_inflight.client_order_id
+                        if submitted_inflight
+                        else hedge_cloid
+                    ),
+                )
+            )
             self.journal.append(
                 "pending_entry.hedge_submit_result",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "outcome": "error",
-                    "error": str(e),
-                    "is_rejected": e.is_rejected,
-                    "hedge_client_order_id": submitted_inflight.client_order_id if submitted_inflight else "",
-                    "hedge_attempt": attempt,
-                },
+                error_payload,
             )
             return False
         except Exception as e:
@@ -6324,6 +6419,23 @@ class LiveRuntime:
         ):
             return
 
+        raw_maker_leg_filled = float(pending.maker_leg_filled or 0.0)
+        raw_hedge_leg_filled = float(pending.hedge_leg_filled or 0.0)
+        raw_long_fill_quantity = (
+            raw_maker_leg_filled if maker_is_long else raw_hedge_leg_filled
+        )
+        raw_short_fill_quantity = (
+            raw_hedge_leg_filled if maker_is_long else raw_maker_leg_filled
+        )
+        long_venue_metadata = self._venue_symbol_metadata_evidence(
+            pending.long_venue,
+            pending.symbol,
+        )
+        short_venue_metadata = self._venue_symbol_metadata_evidence(
+            pending.short_venue,
+            pending.symbol,
+        )
+
         # V1: build_residual_task is computed before branching, but only after
         # order/fill reconciliation has made pending quantities authoritative.
         maker_fill = OrderFill(
@@ -6374,6 +6486,20 @@ class LiveRuntime:
 
         balanced_quantity = min(pending.maker_leg_filled, pending.hedge_leg_filled)
         balanced_quantity = max(balanced_quantity, 0.0)
+        residual_evidence = {
+            "raw_maker_leg_filled": raw_maker_leg_filled,
+            "raw_hedge_leg_filled": raw_hedge_leg_filled,
+            "raw_long_fill_quantity": raw_long_fill_quantity,
+            "raw_short_fill_quantity": raw_short_fill_quantity,
+            "matched_quantity": balanced_quantity,
+            "maker_order_id": pending.maker_order_id,
+            "hedge_order_id": pending.hedge_order_id,
+            "maker_client_order_id": pending.maker_client_order_id,
+            "hedge_client_order_id": pending.hedge_client_order_id,
+            "quantity_source": "finalized_pending_entry_reconciled_fills",
+            "long_venue_metadata": long_venue_metadata,
+            "short_venue_metadata": short_venue_metadata,
+        }
 
         if balanced_quantity <= 0.0:
             if not pending.has_any_fill():
@@ -6414,6 +6540,7 @@ class LiveRuntime:
                 self._queue_pending_residual_repair(
                     residual_task,
                     "incremental_entry_open_unmatched_residual",
+                    residual_evidence,
                 )
 
             self.journal.append(
@@ -6445,11 +6572,19 @@ class LiveRuntime:
             return
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
+        open_maker_fill_quantity = min(
+            float(pending.maker_leg_filled or 0.0),
+            balanced_quantity,
+        )
+        open_hedge_fill_quantity = min(
+            float(pending.hedge_leg_filled or 0.0),
+            balanced_quantity,
+        )
         maker_fill = OrderFill(
             venue=pending.maker_venue(),
             symbol=pending.symbol,
             side=maker_side,
-            quantity=pending.maker_leg_filled,
+            quantity=open_maker_fill_quantity,
             price=pending.maker_fill_price,
             order_id=pending.maker_order_id,
             filled_at_ms=now_ms,
@@ -6458,7 +6593,7 @@ class LiveRuntime:
             venue=pending.hedge_venue(),
             symbol=pending.symbol,
             side=pending.hedge_side(),
-            quantity=pending.hedge_leg_filled,
+            quantity=open_hedge_fill_quantity,
             price=pending.hedge_fill_price,
             order_id=pending.hedge_order_id,
             filled_at_ms=now_ms,
@@ -6498,10 +6633,17 @@ class LiveRuntime:
                 "opened_at_ms": position.opened_at_ms,
                 "matched_quantity": position.matched_quantity,
                 "balanced_quantity": balanced_quantity,
+                "raw_maker_leg_filled": raw_maker_leg_filled,
+                "raw_hedge_leg_filled": raw_hedge_leg_filled,
+                "open_maker_fill_quantity": open_maker_fill_quantity,
+                "open_hedge_fill_quantity": open_hedge_fill_quantity,
                 "maker_order_id": maker_fill.order_id,
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": pending.maker_client_order_id,
                 "hedge_client_order_id": pending.hedge_client_order_id,
+                "quantity_source": "matched_fill_open_position",
+                "long_venue_metadata": long_venue_metadata,
+                "short_venue_metadata": short_venue_metadata,
             },
         )
 
@@ -6515,6 +6657,13 @@ class LiveRuntime:
                 "maker_fill_price": pending.maker_fill_price,
                 "hedge_fill_price": pending.hedge_fill_price,
                 "balanced_quantity": balanced_quantity,
+                "raw_maker_leg_filled": raw_maker_leg_filled,
+                "raw_hedge_leg_filled": raw_hedge_leg_filled,
+                "open_maker_fill_quantity": open_maker_fill_quantity,
+                "open_hedge_fill_quantity": open_hedge_fill_quantity,
+                "quantity_source": "matched_fill_open_position",
+                "long_venue_metadata": long_venue_metadata,
+                "short_venue_metadata": short_venue_metadata,
             },
         )
 
@@ -6532,9 +6681,15 @@ class LiveRuntime:
             self._queue_pending_residual_repair(
                 residual_task,
                 "incremental_entry_open_partially_matched",
+                residual_evidence,
             )
 
-    def _queue_pending_residual_repair(self, residual_task, reason: str) -> None:
+    def _queue_pending_residual_repair(
+        self,
+        residual_task,
+        reason: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
         """Persist a residual repair task using the V1 runtime field contract."""
         from lightfee.engine.close_executor import _residual_task_to_dict
 
@@ -6553,6 +6708,8 @@ class LiveRuntime:
         self.state.pending_residual_repairs.append(task_dict)
         payload = dict(task_dict)
         payload["reason"] = reason
+        if evidence:
+            payload.update(evidence)
         self.journal.append("execution.residual_repair_queued", payload)
 
     def _finalize_startup_recovery(self) -> None:
@@ -6853,6 +7010,13 @@ class LiveRuntime:
                             "repair_venue": repair_venue.value,
                             "repair_side": repair_side.value,
                             "result": "already_flat",
+                            "open_order_count": open_order_count,
+                            "open_order_counts_by_venue": open_order_counts_by_venue,
+                            "live_truth_venues": [venue.value for venue in probe_venues],
+                            "live_positions": self._live_positions_evidence(live_positions),
+                            "live_excess_quantity": live_excess_quantity,
+                            "baseline_quantity": baseline,
+                            "live_size": live_size,
                         },
                     )
                     continue
@@ -7016,6 +7180,15 @@ class LiveRuntime:
                     "requested_quantity": repair_quantity,
                     "filled_quantity": float(fill.quantity or 0.0),
                     "remaining_quantity": remaining_quantity,
+                    "open_order_count": open_order_count,
+                    "open_order_counts_by_venue": open_order_counts_by_venue,
+                    "live_truth_venues": [venue.value for venue in probe_venues],
+                    "live_positions": self._live_positions_evidence(live_positions),
+                    "live_excess_quantity": live_excess_quantity,
+                    "baseline_quantity": baseline,
+                    "live_size": live_size,
+                    "fill_order_id": getattr(fill, "order_id", ""),
+                    "fill_price": float(getattr(fill, "price", 0.0) or 0.0),
                 },
             )
 
@@ -7046,6 +7219,247 @@ class LiveRuntime:
             return 0.0
         quantity = abs(float(position.quantity or 0.0))
         return quantity if position.side == Side.BUY else -quantity
+
+    @staticmethod
+    def _position_snapshot_evidence(position: PositionSnapshot | None) -> dict[str, Any]:
+        if position is None:
+            return {
+                "available": False,
+                "quantity": 0.0,
+            }
+        return {
+            "available": True,
+            "venue": position.venue.value,
+            "symbol": position.symbol,
+            "side": position.side.value,
+            "quantity": float(position.quantity or 0.0),
+            "entry_price": float(position.entry_price or 0.0),
+            "observed_at_ms": int(position.observed_at_ms or 0),
+        }
+
+    def _live_positions_evidence(
+        self,
+        live_positions: dict[Venue, PositionSnapshot | None],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            venue.value: self._position_snapshot_evidence(position)
+            for venue, position in live_positions.items()
+        }
+
+    def _venue_symbol_metadata_evidence(self, venue: Venue, symbol: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "available": False,
+            "venue": venue.value,
+            "symbol": symbol,
+            "venue_symbol": symbol,
+            "metadata_source": "unavailable",
+        }
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return payload
+
+        transport = getattr(adapter, "_transport", adapter)
+        venue_symbol = symbol
+        to_venue_symbol = getattr(transport, "_venue_symbol", None)
+        if not callable(to_venue_symbol):
+            to_venue_symbol = getattr(adapter, "_venue_symbol", None)
+        if callable(to_venue_symbol):
+            try:
+                venue_symbol = str(to_venue_symbol(symbol) or symbol)
+            except Exception:
+                venue_symbol = symbol
+        payload["venue_symbol"] = venue_symbol
+
+        metadata_map = getattr(transport, "_symbol_metadata", {}) or {}
+        metadata = {}
+        if isinstance(metadata_map, dict):
+            for key in (symbol, venue_symbol):
+                candidate = metadata_map.get(key)
+                if isinstance(candidate, dict):
+                    metadata = candidate
+                    break
+        if metadata:
+            payload["available"] = True
+            payload["metadata_source"] = "transport_symbol_metadata"
+            payload["raw_metadata_keys"] = sorted(str(key) for key in metadata.keys())[:40]
+            for output_key, source_keys in {
+                "instrument_id": ("instId", "instrument_id", "id"),
+                "ct_type": ("ct_type", "ctType"),
+                "contract_type": ("contractType", "contract_type"),
+                "status": ("status", "contractStatus", "state"),
+            }.items():
+                for source_key in source_keys:
+                    value = metadata.get(source_key)
+                    if value not in (None, ""):
+                        payload[output_key] = str(value)
+                        break
+            for output_key, source_keys in {
+                "ct_val": ("ct_val", "ctVal", "contract_size", "contractSize"),
+                "contract_size": ("contract_size", "contractSize"),
+                "lot_size": ("lotSz", "lot_size", "qtyStep", "stepSize"),
+                "min_size": ("minSz", "min_size", "minOrderQty"),
+                "quantity_step": ("qtyStep", "stepSize", "lotSz"),
+                "min_notional": ("minNotionalValue", "min_notional", "minNotional"),
+            }.items():
+                for source_key in source_keys:
+                    parsed = self._safe_positive_float(metadata.get(source_key))
+                    if parsed > 0:
+                        payload[output_key] = parsed
+                        break
+            filters = metadata.get("filters")
+            if isinstance(filters, list):
+                for item in filters:
+                    if not isinstance(item, dict):
+                        continue
+                    filter_type = str(item.get("filterType", ""))
+                    if filter_type in {"LOT_SIZE", "MARKET_LOT_SIZE"} and "quantity_step" not in payload:
+                        step = self._safe_positive_float(item.get("stepSize"))
+                        if step > 0:
+                            payload["quantity_step"] = step
+                    if filter_type in {"MIN_NOTIONAL", "NOTIONAL"} and "min_notional" not in payload:
+                        notional = self._safe_positive_float(
+                            item.get("notional") or item.get("minNotional")
+                        )
+                        if notional > 0:
+                            payload["min_notional"] = notional
+
+        passive_metadata = getattr(adapter, "passive_metadata", None)
+        if callable(passive_metadata):
+            try:
+                passive = passive_metadata(symbol) or {}
+            except Exception:
+                passive = {}
+            if isinstance(passive, dict) and passive:
+                if not payload["available"]:
+                    payload["available"] = True
+                    payload["metadata_source"] = "adapter_passive_metadata"
+                for output_key, source_keys in {
+                    "min_notional": ("min_notional", "min_notional_quote"),
+                    "quantity_step": ("quantity_step", "qty_step"),
+                    "price_tick": ("price_tick", "tick_size"),
+                    "max_quantity": ("max_quantity", "max_qty"),
+                }.items():
+                    if output_key in payload:
+                        continue
+                    for source_key in source_keys:
+                        parsed = self._safe_positive_float(passive.get(source_key))
+                        if parsed > 0:
+                            payload[output_key] = parsed
+                            break
+
+        spec = getattr(transport, "_spec", None)
+        if spec is not None:
+            for output_key, attr in {
+                "spec_contract_size": "contract_size",
+                "spec_quantity_step": "quantity_step",
+                "spec_min_notional": "min_notional",
+            }.items():
+                parsed = self._safe_positive_float(getattr(spec, attr, 0.0))
+                if parsed > 0:
+                    payload[output_key] = parsed
+            if not payload["available"] and any(
+                key in payload
+                for key in ("spec_contract_size", "spec_quantity_step", "spec_min_notional")
+            ):
+                payload["available"] = True
+                payload["metadata_source"] = "venue_spec"
+        return payload
+
+    def _order_submit_error_runtime_evidence(
+        self,
+        error: OrderSubmitError,
+        *,
+        venue: Venue | None = None,
+        operation: str = "",
+        request: Any = None,
+        default_client_order_id: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        try:
+            from lightfee.core.exchange_errors import (
+                RequestContext,
+                build_evidence_from_order_submit_error,
+            )
+
+            request_context = (
+                RequestContext.from_order_request(request)
+                if request is not None
+                else RequestContext(client_order_id=default_client_order_id)
+            )
+            exchange_evidence = build_evidence_from_order_submit_error(
+                error,
+                venue=venue.value if venue is not None else "",
+                operation=operation,
+                endpoint="",
+                request_context=request_context,
+            )
+            payload["exchange_error"] = exchange_evidence.to_dict()
+            payload["missing_evidence"] = list(exchange_evidence.missing_evidence)
+            payload["evidence_completeness"] = exchange_evidence.evidence_completeness
+        except Exception:
+            pass
+        if bool(getattr(error, "order_ack_only", False)):
+            payload["order_ack_only"] = True
+            payload["accepted_order_id"] = str(
+                getattr(error, "accepted_order_id", "") or ""
+            )
+            payload["accepted_client_order_id"] = str(
+                getattr(error, "accepted_client_order_id", "")
+                or default_client_order_id
+                or ""
+            )
+            missing = getattr(error, "fill_confirmation_missing_fields", []) or []
+            payload["fill_confirmation_missing_fields"] = [
+                str(field) for field in missing
+            ]
+            raw_body = str(getattr(error, "exchange_response_body", "") or "")
+            if raw_body:
+                payload["exchange_response_body"] = raw_body[:4000]
+            if "missing_evidence" not in payload:
+                payload["missing_evidence"] = []
+            for item in (
+                "fill_confirmation",
+                "order_realtime_status",
+                "private_ws_execution",
+                "open_order_truth",
+            ):
+                if item not in payload["missing_evidence"]:
+                    payload["missing_evidence"].append(item)
+            payload["order_truth_probe_paths"] = self._order_truth_probe_paths(venue)
+            payload["next_action"] = (
+                "reconcile_accepted_order_or_probe_live_position"
+            )
+        return payload
+
+    @staticmethod
+    def _order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
+        if venue == Venue.BYBIT:
+            return {
+                "rest_order_status": "GET /v5/order/realtime",
+                "open_order_truth": "GET /v5/order/realtime",
+                "private_ws_order_topic": "order",
+                "private_ws_execution_topic": "execution",
+                "live_position_probe": "GET /v5/position/list",
+            }
+        if venue == Venue.OKX:
+            return {
+                "rest_order_status": "GET /api/v5/trade/order",
+                "open_order_truth": "GET /api/v5/trade/orders-pending",
+                "private_ws_order_topic": "orders",
+                "live_position_probe": "GET /api/v5/account/positions",
+            }
+        if venue in (Venue.BINANCE, Venue.ASTER):
+            return {
+                "rest_order_status": "GET /fapi/v1/order",
+                "open_order_truth": "GET /fapi/v1/openOrders",
+                "private_ws_order_topic": "ORDER_TRADE_UPDATE",
+                "live_position_probe": "GET /fapi/v2/positionRisk",
+            }
+        return {
+            "rest_order_status": "adapter.fetch_order_fill_reconciliation",
+            "open_order_truth": "adapter.fetch_open_orders",
+            "live_position_probe": "adapter.fetch_position",
+        }
 
     async def _fetch_residual_repair_open_orders(
         self, adapter: VenueAdapter, venue: Venue, symbol: str,
@@ -7227,6 +7641,10 @@ class LiveRuntime:
                 "notional": repair_quantity * live_price,
                 "min_notional": min_notional,
                 "terminal_reason": terminal_reason,
+                "repair_venue_metadata": self._venue_symbol_metadata_evidence(
+                    repair_venue,
+                    symbol,
+                ),
                 "ts_ms": now_ms,
             },
         )

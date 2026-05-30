@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -76,6 +77,39 @@ class _NoFillReconciliationAdapter:
 
     def drain_order_diagnostics(self):
         return []
+
+
+class _LivePositionAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, position: PositionSnapshot):
+        self.position = position
+
+    async def fetch_position(self, symbol):
+        return self.position
+
+
+class _MetadataAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, venue: Venue, metadata: dict, *, venue_symbol: str | None = None):
+        self.venue = venue
+        self.venue_symbol = venue_symbol
+        self._transport = SimpleNamespace(
+            _symbol_metadata=metadata,
+            _spec=SimpleNamespace(
+                venue_id=venue,
+                contract_size=1.0,
+                quantity_step=0.001,
+                min_notional=0.0,
+            ),
+        )
+
+    def passive_metadata(self, symbol):
+        return {
+            "min_notional": 0.0,
+            "quantity_step": 0.001,
+            "price_tick": 0.0001,
+        }
+
+    def _venue_symbol(self, symbol: str) -> str:
+        return self.venue_symbol or symbol
 
 
 def _runtime(config, tmp_journal, reconciler):
@@ -291,3 +325,211 @@ async def test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_
     assert opened.short_entry_price == pytest.approx(0.1631)
     kinds = [event["kind"] for event in tmp_journal.read_all()]
     assert "pending_entry.finalize_deferred_incomplete_fill" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_finalize_partially_matched_entry_caps_open_position_fills_and_records_residual_evidence(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(config)
+    runtime.journal = tmp_journal
+    runtime._venue_adapters = {
+        Venue.OKX: _MetadataAdapter(
+            Venue.OKX,
+            {
+                "APR-USDT-SWAP": {
+                    "instId": "APR-USDT-SWAP",
+                    "ctVal": "1",
+                    "ctType": "linear",
+                    "lotSz": "1",
+                    "minSz": "1",
+                },
+                "APRUSDT": {
+                    "instId": "APR-USDT-SWAP",
+                    "ctVal": "1",
+                    "ctType": "linear",
+                    "lotSz": "1",
+                    "minSz": "1",
+                },
+            },
+            venue_symbol="APR-USDT-SWAP",
+        ),
+        Venue.BINANCE: _MetadataAdapter(
+            Venue.BINANCE,
+            {
+                "APRUSDT": {
+                    "symbol": "APRUSDT",
+                    "contractType": "PERPETUAL",
+                    "status": "TRADING",
+                    "quantityPrecision": 0,
+                },
+            },
+        ),
+    }
+    pending = _pending_entry(
+        pending_id="entry-apr-partial",
+        symbol="APRUSDT",
+        target_quantity=108.0,
+        long_venue=Venue.OKX,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=10.0,
+        hedge_leg_filled=100.0,
+        maker_fill_price=0.2204,
+        hedge_fill_price=0.2207069,
+        maker_order_id="okx-maker-oid",
+        hedge_order_id="binance-hedge-oid",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._finalize_pending_entry(pending, pending.pending_id, 3000)
+
+    position = runtime.state.open_positions[pending.pending_id]
+    assert position.matched_quantity == pytest.approx(10.0)
+    assert position.long_quantity == pytest.approx(10.0)
+    assert position.short_quantity == pytest.approx(10.0)
+    assert position.long_fill.quantity == pytest.approx(10.0)
+    assert position.short_fill.quantity == pytest.approx(10.0)
+    assert len(runtime.state.pending_residual_repairs) == 1
+    residual = runtime.state.pending_residual_repairs[0]
+    assert residual["repair_venue"] == "binance"
+    assert residual["repair_side"] == "buy"
+    assert residual["repair_quantity"] == pytest.approx(90.0)
+
+    events = tmp_journal.read_all()
+    opened = [event for event in events if event["kind"] == "entry.opened"][-1]["payload"]
+    assert opened["raw_maker_leg_filled"] == pytest.approx(10.0)
+    assert opened["raw_hedge_leg_filled"] == pytest.approx(100.0)
+    assert opened["open_maker_fill_quantity"] == pytest.approx(10.0)
+    assert opened["open_hedge_fill_quantity"] == pytest.approx(10.0)
+    assert opened["long_venue_metadata"]["metadata_source"] == "transport_symbol_metadata"
+    assert opened["long_venue_metadata"]["ct_val"] == pytest.approx(1.0)
+    assert opened["long_venue_metadata"]["ct_type"] == "linear"
+    assert opened["short_venue_metadata"]["metadata_source"] == "transport_symbol_metadata"
+    assert opened["short_venue_metadata"]["contract_type"] == "PERPETUAL"
+    queued = [
+        event for event in events
+        if event["kind"] == "execution.residual_repair_queued"
+    ][-1]["payload"]
+    assert queued["raw_long_fill_quantity"] == pytest.approx(10.0)
+    assert queued["raw_short_fill_quantity"] == pytest.approx(100.0)
+    assert queued["matched_quantity"] == pytest.approx(10.0)
+    assert queued["long_venue_metadata"]["ct_val"] == pytest.approx(1.0)
+    assert queued["short_venue_metadata"]["contract_type"] == "PERPETUAL"
+
+
+@pytest.mark.asyncio
+async def test_live_position_hydration_records_before_after_exchange_truth_evidence(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="APRUSDT",
+                side=Side.BUY,
+                quantity=100.0,
+                entry_price=0.2204,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="APRUSDT",
+                side=Side.SELL,
+                quantity=100.0,
+                entry_price=0.2207069,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-apr-live-hydrate",
+        symbol="APRUSDT",
+        target_quantity=108.0,
+        long_venue=Venue.OKX,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=10.0,
+        hedge_leg_filled=0.0,
+        maker_fill_price=0.2204,
+        hedge_fill_price=0.0,
+    )
+
+    hydrated = await runtime._recover_hydrate_from_live_positions(pending)
+
+    assert hydrated is True
+    events = tmp_journal.read_all()
+    payload = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.live_position_hydrated"
+    ][-1]
+    assert payload["entry_id"] == "entry-apr-live-hydrate"
+    assert payload["symbol"] == "APRUSDT"
+    assert payload["before_maker_leg_filled"] == pytest.approx(10.0)
+    assert payload["before_hedge_leg_filled"] == pytest.approx(0.0)
+    assert payload["after_maker_leg_filled"] == pytest.approx(100.0)
+    assert payload["after_hedge_leg_filled"] == pytest.approx(100.0)
+    assert payload["live_balanced_quantity"] == pytest.approx(100.0)
+    assert payload["live_positions"]["long"]["venue"] == "okx"
+    assert payload["live_positions"]["short"]["venue"] == "binance"
+
+
+@pytest.mark.asyncio
+async def test_live_position_hydration_maps_short_maker_to_short_live_truth(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BINANCE: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="MIRRORUSDT",
+                side=Side.BUY,
+                quantity=40.0,
+                entry_price=2.01,
+                observed_at_ms=3000,
+            )),
+            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="MIRRORUSDT",
+                side=Side.SELL,
+                quantity=40.0,
+                entry_price=1.99,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-short-maker-live-hydrate",
+        symbol="MIRRORUSDT",
+        target_quantity=40.0,
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        maker_leg="short",
+        maker_leg_filled=5.0,
+        hedge_leg_filled=0.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.0,
+    )
+
+    hydrated = await runtime._recover_hydrate_from_live_positions(pending)
+
+    assert hydrated is True
+    assert pending.maker_leg_filled == pytest.approx(40.0)
+    assert pending.hedge_leg_filled == pytest.approx(40.0)
+    assert pending.maker_fill_price == pytest.approx(1.99)
+    assert pending.hedge_fill_price == pytest.approx(2.01)
+    payload = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.live_position_hydrated"
+    ][-1]
+    assert payload["maker_leg"] == "short"
+    assert payload["maker_live_position"]["venue"] == "okx"
+    assert payload["maker_live_position"]["side"] == "sell"
+    assert payload["hedge_live_position"]["venue"] == "binance"
+    assert payload["hedge_live_position"]["side"] == "buy"

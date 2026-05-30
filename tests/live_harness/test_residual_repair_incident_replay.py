@@ -132,6 +132,52 @@ async def test_exhausted_residual_repair_already_flat_clears_lyn_opg(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_residual_repair_completed_records_live_truth_evidence(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    binance = IncidentVenueAdapter(Venue.BINANCE)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx = IncidentVenueAdapter(Venue.OKX)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    events = runtime.journal.read_all()
+    completed = [
+        event["payload"] for event in events
+        if event["kind"] == "execution.residual_repair_completed"
+    ][-1]
+    assert completed["result"] == "already_flat"
+    assert completed["open_order_count"] == 0
+    assert completed["open_order_counts_by_venue"] == {"okx": 0, "binance": 0}
+    assert completed["live_truth_venues"] == ["okx", "binance"]
+    assert completed["live_positions"]["okx"]["quantity"] == pytest.approx(0.0)
+    assert completed["live_positions"]["binance"]["quantity"] == pytest.approx(0.0)
+    assert completed["baseline_quantity"] == pytest.approx(0.0)
+    assert completed["live_excess_quantity"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
 async def test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed(tmp_path):
     runtime = _make_open_runtime(tmp_path)
     now_ms = 1779803978233

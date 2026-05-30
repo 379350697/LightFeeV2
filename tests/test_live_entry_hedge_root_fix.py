@@ -1908,6 +1908,80 @@ class TestRealPathAbortCleanupDeadline:
         ]
 
     @pytest.mark.asyncio
+    async def test_ack_only_hedge_submit_logs_fill_confirmation_gap_evidence(self, tmp_path):
+        """Accepted order acks are not fills; the pending event must preserve proof."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=111247c6) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "111247c6"
+        error.accepted_client_order_id = "accepted-client-id"
+        error.fill_confirmation_missing_fields = [
+            "executedQty",
+            "cumQty",
+            "fillSz",
+        ]
+        error.exchange_response_body = (
+            '{"retCode":0,"result":{"orderId":"111247c6","orderLinkId":"accepted-client-id"}}'
+        )
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        pending = PendingEntry(
+            pending_id="entry-space-ack-only",
+            symbol="SPACEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=3942.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=3942.0,
+            maker_fill_price=0.006087,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-space",
+            maker_client_order_id="maker-cid-space",
+        )
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+
+        assert driven is False
+        assert pending.hedge_inflight is not None
+        events = runtime.journal.read_all()
+        payload = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "pending_entry.hedge_submit_result"
+        ][-1]
+        assert payload["outcome"] == "error"
+        assert payload["order_ack_only"] is True
+        assert payload["accepted_order_id"] == "111247c6"
+        assert payload["accepted_client_order_id"] == "accepted-client-id"
+        assert payload["fill_confirmation_missing_fields"] == [
+            "executedQty",
+            "cumQty",
+            "fillSz",
+        ]
+        assert payload["exchange_response_body"].startswith('{"retCode":0')
+        assert payload["fill_reconciliation_attempted"] is True
+        assert payload["fill_reconciliation_result"] == "missing_or_zero_fill"
+        assert payload["fill_reconciliation_client_order_id"] == pending.hedge_client_order_id
+        assert "fill_confirmation" in payload["missing_evidence"]
+        assert payload["exchange_error"]["extra"]["order_ack_only"] is True
+        assert payload["exchange_error"]["extra"]["accepted_order_id"] == "111247c6"
+        assert payload["order_truth_probe_paths"]["rest_order_status"] == "GET /v5/order/realtime"
+        assert payload["order_truth_probe_paths"]["private_ws_execution_topic"] == "execution"
+        assert payload["order_truth_probe_paths"]["open_order_truth"] == "GET /v5/order/realtime"
+        assert payload["next_action"] == "reconcile_accepted_order_or_probe_live_position"
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_auth_signing_reject_is_non_retryable(self, tmp_path):
         """HL auth/signing rejection fails closed and does not spin retries."""
 
@@ -5167,6 +5241,8 @@ class TestResidualRepairExecutionV1Parity:
         ]
         assert terminal
         assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_notional_dust"
+        assert terminal[-1]["payload"]["repair_venue_metadata"]["min_notional"] == pytest.approx(1.0)
+        assert terminal[-1]["payload"]["repair_venue_metadata"]["metadata_source"] == "adapter_passive_metadata"
 
     @pytest.mark.asyncio
     async def test_okx_residual_below_contract_min_terminalizes_and_releases_gate(self, tmp_path):
@@ -5298,6 +5374,8 @@ class TestResidualRepairExecutionV1Parity:
         assert terminal
         assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_quantity_dust"
         assert terminal[-1]["payload"]["repair_quantity"] == pytest.approx(50.0)
+        assert terminal[-1]["payload"]["repair_venue_metadata"]["ct_val"] == pytest.approx(100.0)
+        assert terminal[-1]["payload"]["repair_venue_metadata"]["ct_type"] == "linear"
 
     @pytest.mark.asyncio
     async def test_residual_deadline_pauses_task_instead_of_retrying_forever(self, tmp_path):
