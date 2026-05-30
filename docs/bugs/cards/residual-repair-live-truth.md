@@ -42,7 +42,7 @@ release the gate with rule-source evidence.
 | 2026-05-22 | V1 residual contract and excess-only repair | effective locally | One-sided and partial-match residuals repair only live excess instead of full-closing matched positions. |
 | 2026-05-25/26 | Exhausted residual already-flat cleanup and open-order truth | effective | LYN/OPG style tasks clear only after trusted live flat plus open-order empty truth. |
 | 2026-05-29 | Paused/exhausted live-nonzero resume, side rebuild, dust terminality | effective | PARTI/JCT production closure showed tradeable live residuals resume and complete; untrusted truth stays fail-closed. |
-| 2026-05-30 | HMSTR open-order-present pause evidence | effective locally | RED/GREEN harness now requires paused-event payload to include aggregate and per-venue open-order truth evidence. |
+| 2026-05-30 | HMSTR open-order-present pause evidence | fixed, deployed, probe verified | RED/GREEN harness now requires paused-event payload to include aggregate and per-venue open-order truth evidence; `0fd9a74` deployed and affected-symbol probes are flat/no-open-orders. |
 
 ## Recurrences
 
@@ -51,7 +51,7 @@ release the gate with rule-source evidence.
 | 2026-05-22 | `PROVEUSDT`, `XCNUSDT` residual contract family | local CL-005 | closed locally | [daily/2026-05-22.md#cluster-cl-005-zero-fill-ghost-open-position-v1-parity-drift](../daily/2026-05-22.md#cluster-cl-005-zero-fill-ghost-open-position-v1-parity-drift) |
 | 2026-05-25/26 | `LYNUSDT`, `OPGUSDT` exhausted residuals | `30a8ddc` family | closed by harness/probe | [daily/2026-05-26.md#cluster-cl-007-biousdt-exchange-truth-false-green-root-fix](../daily/2026-05-26.md#cluster-cl-007-biousdt-exchange-truth-false-green-root-fix) |
 | 2026-05-29 | `PARTIUSDT` OKX/Binance | `9cdb9df` | closed by cloud probe | [daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression](../daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression) |
-| 2026-05-30 | `HMSTRUSDT` Bybit/OKX, `RAVEUSDT` Bybit/OKX | working tree evidence fix; production deploy pending | local evidence fix green; current exchange truth flat | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-05-30 | `HMSTRUSDT` Bybit/OKX, `RAVEUSDT` Bybit/OKX, post-fix `HOMEUSDT`/`POWERUSDT` residual completions | `0fd9a74` | fixed, deployed, final probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 
 ## Regression Harness
 

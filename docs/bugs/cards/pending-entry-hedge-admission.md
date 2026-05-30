@@ -35,14 +35,14 @@ Deterministic hedge admission reject must:
 |---|---|---|---|
 | 2026-05-20/26 | Transport `response_classification` for Bybit/Aster admission rejects | partial | Correctly classified reject payloads but did not stop pending-hedge runtime retries. |
 | 2026-05-29 | Pending hedge admission consumer + cleanup/abort | effective | Cloud harness/probe passed; BZUSDT/LABUSDT flat/no-open-orders; post-deploy reject counts empty. |
-| 2026-05-30 | Binance `-2027` leverage-cap classification | effective locally | Binance USD-M official `-2027 MAX_LEVERAGE_RATIO` now blocks initial entry and pending hedge like the existing Aster family, using Binance's official error-code doc URL. |
+| 2026-05-30 | Binance `-2027` leverage-cap classification | fixed, deployed, probe verified | Binance USD-M official `-2027 MAX_LEVERAGE_RATIO` now blocks initial entry and pending hedge like the existing Aster family, using Binance's official error-code doc URL. Cloud `HEIUSDT` reproduced the family and aborted cleanly. |
 
 ## Recurrences
 
 | Date | Symbols / Venues | Commit / Fix | Result | Detail |
 |---|---|---|---|---|
 | 2026-05-29 | `BZUSDT` Aster maker / Bybit hedge, `LABUSDT` Binance maker / Aster hedge | `6987fc8`; deployed through `bbcd7b9` docs sync | closed | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
-| 2026-05-30 | `LITEUSDT`, `AVGOUSDT`, `HMSTRUSDT` | working tree Binance `-2027` fix; production deploy pending | local admission/transport fix green; current state flat | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-05-30 | `LITEUSDT`, `AVGOUSDT`, `HMSTRUSDT`, `HEIUSDT`, `GENIUSUSDT` | `0fd9a74` | admission/transport harness green; cloud targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 
 ## Regression Harness
 
