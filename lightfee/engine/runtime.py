@@ -6531,6 +6531,8 @@ class LiveRuntime:
                     "pending_entry.pending_entry_finalized",
                     {
                         "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "pair_id": pair_id,
                         "position_id": None,
                         "maker_leg_filled": pending.maker_leg_filled,
                         "hedge_leg_filled": pending.hedge_leg_filled,
@@ -6570,6 +6572,8 @@ class LiveRuntime:
                 "pending_entry.pending_entry_finalized",
                 {
                     "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "pair_id": pair_id,
                     "position_id": None,
                     "maker_leg_filled": pending.maker_leg_filled,
                     "hedge_leg_filled": pending.hedge_leg_filled,
@@ -6681,6 +6685,8 @@ class LiveRuntime:
             "pending_entry.pending_entry_finalized",
             {
                 "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "pair_id": pair_id,
                 "position_id": position.position_id,
                 "maker_leg_filled": pending.maker_leg_filled,
                 "hedge_leg_filled": pending.hedge_leg_filled,
@@ -6699,6 +6705,7 @@ class LiveRuntime:
                 "funding_edge_bps_entry": position.funding_edge_bps_entry,
                 "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
                 "expected_edge_bps_entry": position.expected_edge_bps_entry,
+                "finalized_as": "open_position",
                 "quantity_source": "matched_fill_open_position",
                 "long_venue_metadata": long_venue_metadata,
                 "short_venue_metadata": short_venue_metadata,
@@ -8649,6 +8656,14 @@ class LiveRuntime:
                         "reason": reason,
                         "blocking": True,
                     }
+                    payload.update(
+                        self._snapshot_quote_evidence(
+                            quote=quote,
+                            observed_at_ms=observed_at_ms,
+                            age_ms=age_ms,
+                            budget_ms=quote_budget_ms,
+                        )
+                    )
                     if reason == "quote_stale":
                         payload["event_kind"] = "runtime.quote_stale"
                     decisions.append(payload)
@@ -8702,6 +8717,58 @@ class LiveRuntime:
                 )
 
         return decisions
+
+    @staticmethod
+    def _snapshot_quote_evidence(
+        *,
+        quote,
+        observed_at_ms: int,
+        age_ms: int,
+        budget_ms: int,
+    ) -> dict:
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        bid_size = float(getattr(quote, "bid_size", 0.0) or 0.0)
+        ask_size = float(getattr(quote, "ask_size", 0.0) or 0.0)
+        invalid_fields: list[str] = []
+        if observed_at_ms <= 0:
+            invalid_fields.append("observed_at_ms")
+        if age_ms > budget_ms:
+            invalid_fields.append("age_ms")
+        if bid <= 0.0:
+            invalid_fields.append("bid")
+        if ask <= 0.0:
+            invalid_fields.append("ask")
+        if bid_size <= 0.0:
+            invalid_fields.append("bid_size")
+        if ask_size <= 0.0:
+            invalid_fields.append("ask_size")
+        return {
+            "quote_bid": bid,
+            "quote_ask": ask,
+            "quote_bid_size": bid_size,
+            "quote_ask_size": ask_size,
+            "quote_mark_price": float(getattr(quote, "mark_price", 0.0) or 0.0),
+            "quote_index_price": float(getattr(quote, "index_price", 0.0) or 0.0),
+            "quote_funding_timestamp_ms": int(
+                getattr(quote, "funding_timestamp_ms", 0) or 0
+            ),
+            "invalid_quote_fields": invalid_fields,
+        }
+
+    @staticmethod
+    def _snapshot_freshness_evidence_fields(decision: dict) -> dict:
+        keys = (
+            "quote_bid",
+            "quote_ask",
+            "quote_bid_size",
+            "quote_ask_size",
+            "quote_mark_price",
+            "quote_index_price",
+            "quote_funding_timestamp_ms",
+            "invalid_quote_fields",
+        )
+        return {key: decision[key] for key in keys if key in decision}
 
     def _candidate_snapshot_freshness_failures(
         self,
@@ -8866,18 +8933,18 @@ class LiveRuntime:
                     decision.get("blocking", False)
                     or decision.get("decision") == "skip_entry"
                 )
-                add_sample(
-                    self._snapshot_candidate_scope_sample(
-                        candidate=candidate,
-                        domain=str(decision.get("domain", "")),
-                        venue=str(decision.get("venue", "")),
-                        source=str(decision.get("source", "")),
-                        source_age_ms=int(decision.get("age_ms", 0) or 0),
-                        fallback_duration_ms=fallback_duration_ms,
-                        blocked=blocked,
-                        block_reason=str(decision.get("reason", "")),
-                    )
+                sample = self._snapshot_candidate_scope_sample(
+                    candidate=candidate,
+                    domain=str(decision.get("domain", "")),
+                    venue=str(decision.get("venue", "")),
+                    source=str(decision.get("source", "")),
+                    source_age_ms=int(decision.get("age_ms", 0) or 0),
+                    fallback_duration_ms=fallback_duration_ms,
+                    blocked=blocked,
+                    block_reason=str(decision.get("reason", "")),
                 )
+                sample.update(self._snapshot_freshness_evidence_fields(decision))
+                add_sample(sample)
 
         if "liquidity" in all_domains:
             liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
@@ -9010,7 +9077,7 @@ class LiveRuntime:
                     blocking = True
                     self._last_snapshot_freshness_filter_blockers[reason] += 1
                     if len(self._last_snapshot_freshness_filter_samples) < 24:
-                        self._last_snapshot_freshness_filter_samples.append({
+                        sample = {
                             "pair_id": pair_id,
                             "candidate_pair_id": pair_id,
                             "candidate_symbol": symbol,
@@ -9025,7 +9092,9 @@ class LiveRuntime:
                             "block_reason": reason,
                             "age_ms": int(failure.get("age_ms", 0) or 0),
                             "budget_ms": int(failure.get("budget_ms", 0) or 0),
-                        })
+                        }
+                        sample.update(self._snapshot_freshness_evidence_fields(failure))
+                        self._last_snapshot_freshness_filter_samples.append(sample)
             if not blocking:
                 filtered.append(candidate)
         return filtered

@@ -663,13 +663,14 @@ def test_exchange_truth_uses_private_binance_open_orders_request():
 
     adapter = FakeAdapter()
 
-    orders, succeeded, failed = asyncio.run(
+    orders, succeeded, failed, evidence = asyncio.run(
         dl._fetch_venue_open_orders(adapter, ["OPGUSDT"])
     )
 
     assert orders == {"OPGUSDT": []}
     assert succeeded == {"OPGUSDT"}
     assert failed == set()
+    assert evidence["OPGUSDT"]["classification"] == "open_order_probe_succeeded"
     assert adapter._transport.calls == [
         (
             "GET",
@@ -677,6 +678,97 @@ def test_exchange_truth_uses_private_binance_open_orders_request():
             {"params": {"symbol": "OPGUSDT"}, "private": True},
         )
     ]
+
+
+def test_exchange_truth_uses_okx_venue_symbol_for_open_orders():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        def _venue_symbol(self, symbol):
+            assert symbol == "PRLUSDT"
+            return "PRL-USDT-SWAP"
+
+        async def _request(self, method, path, **kwargs):
+            self.calls.append((method, path, kwargs))
+            return {"data": []}
+
+    class FakeAdapter:
+        venue = "okx"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+    adapter = FakeAdapter()
+
+    orders, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, ["PRLUSDT"])
+    )
+
+    assert orders == {"PRLUSDT": []}
+    assert succeeded == {"PRLUSDT"}
+    assert failed == set()
+    assert evidence["PRLUSDT"]["venue_symbol"] == "PRL-USDT-SWAP"
+    assert adapter._transport.calls == [
+        (
+            "GET",
+            "/api/v5/trade/orders-pending",
+            {"params": {"instId": "PRL-USDT-SWAP"}, "private": True},
+        )
+    ]
+
+
+def test_exchange_truth_classifies_unsupported_open_order_symbol_as_empty_with_evidence():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        async def _request(self, method, path, **kwargs):
+            raise RuntimeError("HTTP 400: invalid symbol")
+
+    class FakeAdapter:
+        venue = "aster"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+    adapter = FakeAdapter()
+
+    orders, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, ["CROSSUSDT"])
+    )
+
+    assert orders == {"CROSSUSDT": []}
+    assert succeeded == {"CROSSUSDT"}
+    assert failed == set()
+    assert evidence["CROSSUSDT"]["classification"] == "unsupported_symbol_no_open_orders"
+    assert "invalid symbol" in evidence["CROSSUSDT"]["error"]
+
+
+def test_exchange_truth_classifies_unsupported_position_symbol_as_flat_with_evidence():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeAdapter:
+        venue = "okx"
+
+        async def fetch_position(self, symbol):
+            raise RuntimeError("Instrument ID does not exist")
+
+    adapter = FakeAdapter()
+
+    positions, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_positions(adapter, ["PRLUSDT"])
+    )
+
+    assert positions == {}
+    assert succeeded == {"PRLUSDT"}
+    assert failed == set()
+    assert evidence["PRLUSDT"]["classification"] == "unsupported_symbol_flat"
+    assert "Instrument ID does not exist" in evidence["PRLUSDT"]["error"]
 
 
 def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):

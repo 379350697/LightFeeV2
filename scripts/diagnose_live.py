@@ -480,13 +480,45 @@ def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
     return None
 
 
+def _probe_venue_symbol(adapter: Any, symbol: str) -> str:
+    transport = getattr(adapter, "_transport", None)
+    convert = getattr(transport, "_venue_symbol", None)
+    if callable(convert):
+        try:
+            return str(convert(symbol))
+        except Exception:
+            return symbol
+    return symbol
+
+
+def _unsupported_symbol_probe_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "invalid symbol",
+            "symbol is invalid",
+            "unknown symbol",
+            "instrument id does not exist",
+            "instrument_id does not exist",
+            "instrument does not exist",
+            "invalid instid",
+            "instid does not exist",
+            "symbol not found",
+            "not listed",
+            "-1121",
+        )
+    )
+
+
 async def _fetch_venue_positions(
     adapter: Any, symbols: list[str],
-) -> tuple[dict[str, Any], set[str], set[str]]:
-    """Fetch positions. Returns (positions, succeeded_symbols, failed_symbols)."""
+) -> tuple[dict[str, Any], set[str], set[str], dict[str, Any]]:
+    """Fetch positions. Returns positions, succeeded/failed symbols, evidence."""
     positions: dict[str, Any] = {}
     succeeded: set[str] = set()
     failed: set[str] = set()
+    evidence: dict[str, Any] = {}
     for sym in symbols:
         try:
             pos = await adapter.fetch_position(sym)
@@ -499,54 +531,82 @@ async def _fetch_venue_positions(
                     "side": str(getattr(pos, "side", "")),
                 }
             succeeded.add(sym)
+            evidence[sym] = {
+                "classification": "position_probe_succeeded",
+                "venue_symbol": _probe_venue_symbol(adapter, sym),
+            }
         except Exception as exc:
+            if _unsupported_symbol_probe_error(exc):
+                succeeded.add(sym)
+                evidence[sym] = {
+                    "classification": "unsupported_symbol_flat",
+                    "venue_symbol": _probe_venue_symbol(adapter, sym),
+                    "error": str(exc)[:200],
+                }
+                continue
             positions[sym] = {"symbol": sym, "error": str(exc)[:200]}
             failed.add(sym)
-    return positions, succeeded, failed
+            evidence[sym] = {
+                "classification": "position_probe_failed",
+                "venue_symbol": _probe_venue_symbol(adapter, sym),
+                "error": str(exc)[:200],
+            }
+    return positions, succeeded, failed, evidence
 
 
 async def _fetch_venue_open_orders(
     adapter: Any, symbols: list[str],
-) -> tuple[dict[str, Any], set[str], set[str]]:
-    """Fetch open orders. Returns (orders, succeeded_symbols, failed_symbols)."""
+) -> tuple[dict[str, Any], set[str], set[str], dict[str, Any]]:
+    """Fetch open orders. Returns orders, succeeded/failed symbols, evidence."""
     orders: dict[str, Any] = {}
     succeeded: set[str] = set()
     failed: set[str] = set()
+    evidence: dict[str, Any] = {}
     transport = getattr(adapter, "_transport", None)
     if transport is None:
         for sym in symbols:
             orders[sym] = {"error": "no transport available"}
             failed.add(sym)
-        return orders, succeeded, failed
+            evidence[sym] = {
+                "classification": "open_order_probe_failed",
+                "venue_symbol": sym,
+                "error": "no transport available",
+            }
+        return orders, succeeded, failed, evidence
 
     venue = str(getattr(adapter, "venue", ""))
     for sym in symbols:
+        venue_symbol = _probe_venue_symbol(adapter, sym)
         try:
             if "binance" in venue.lower():
                 raw = await transport._request(
-                    "GET", "/fapi/v1/openOrders", params={"symbol": sym}, private=True,
+                    "GET", "/fapi/v1/openOrders", params={"symbol": venue_symbol}, private=True,
                 )
             elif "bybit" in venue.lower():
                 raw = await transport._request(
                     "GET", "/v5/order/realtime",
-                    params={"category": "linear", "symbol": sym, "settleCoin": "USDT"},
+                    params={"category": "linear", "symbol": venue_symbol, "settleCoin": "USDT"},
                     private=True,
                 )
             elif "aster" in venue.lower():
                 raw = await transport._request(
                     "GET", "/fapi/v1/openOrders",
-                    params={"symbol": sym},
+                    params={"symbol": venue_symbol},
                     private=True,
                 )
             elif "okx" in venue.lower():
                 raw = await transport._request(
                     "GET", "/api/v5/trade/orders-pending",
-                    params={"instId": sym},
+                    params={"instId": venue_symbol},
                     private=True,
                 )
             else:
                 succeeded.add(sym)
                 orders[sym] = []
+                evidence[sym] = {
+                    "classification": "open_order_probe_unsupported_venue_assumed_empty",
+                    "venue_symbol": venue_symbol,
+                }
                 continue
 
             order_list = raw if isinstance(raw, list) else raw.get("result", {}).get("list", raw.get("data", []))
@@ -565,10 +625,28 @@ async def _fetch_venue_open_orders(
             else:
                 orders[sym] = []
             succeeded.add(sym)
+            evidence[sym] = {
+                "classification": "open_order_probe_succeeded",
+                "venue_symbol": venue_symbol,
+            }
         except Exception as exc:
+            if _unsupported_symbol_probe_error(exc):
+                orders[sym] = []
+                succeeded.add(sym)
+                evidence[sym] = {
+                    "classification": "unsupported_symbol_no_open_orders",
+                    "venue_symbol": venue_symbol,
+                    "error": str(exc)[:200],
+                }
+                continue
             orders[sym] = {"error": str(exc)[:200]}
             failed.add(sym)
-    return orders, succeeded, failed
+            evidence[sym] = {
+                "classification": "open_order_probe_failed",
+                "venue_symbol": venue_symbol,
+                "error": str(exc)[:200],
+            }
+    return orders, succeeded, failed, evidence
 
 
 async def _build_exchange_truth_async(
@@ -578,6 +656,8 @@ async def _build_exchange_truth_async(
     errors: list[str] = []
     all_positions: dict[str, dict[str, Any]] = {}
     all_open_orders: dict[str, dict[str, Any]] = {}
+    all_position_probe_evidence: dict[str, dict[str, Any]] = {}
+    all_open_order_probe_evidence: dict[str, dict[str, Any]] = {}
     available_venues: list[str] = []
     fetch_status: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
@@ -590,6 +670,8 @@ async def _build_exchange_truth_async(
         if credential is None:
             all_positions[venue] = {"error": "no credentials available"}
             all_open_orders[venue] = {"error": "no credentials available"}
+            all_position_probe_evidence[venue] = {}
+            all_open_order_probe_evidence[venue] = {}
             fetch_status[venue] = {
                 "status": "no_credentials",
                 "positions_succeeded": [],
@@ -603,6 +685,8 @@ async def _build_exchange_truth_async(
         adapter = _create_readonly_adapter(venue, credential)
         if adapter is None:
             errors.append("failed to create {} adapter".format(venue))
+            all_position_probe_evidence[venue] = {}
+            all_open_order_probe_evidence[venue] = {}
             fetch_status[venue] = {
                 "status": "adapter_creation_failed",
                 "positions_succeeded": [],
@@ -616,26 +700,32 @@ async def _build_exchange_truth_async(
         # Fetch positions
         pos_succeeded: set[str] = set()
         pos_failed: set[str] = set()
+        pos_evidence: dict[str, Any] = {}
         try:
-            positions, pos_succeeded, pos_failed = await _fetch_venue_positions(
+            positions, pos_succeeded, pos_failed, pos_evidence = await _fetch_venue_positions(
                 adapter, target_symbols,
             )
             all_positions[venue] = positions
         except Exception as exc:
             all_positions[venue] = {"error": str(exc)[:300]}
             pos_failed = set(target_symbols)
+            pos_evidence = {}
+        all_position_probe_evidence[venue] = pos_evidence
 
         # Fetch open orders
         ord_succeeded: set[str] = set()
         ord_failed: set[str] = set()
+        ord_evidence: dict[str, Any] = {}
         try:
-            orders, ord_succeeded, ord_failed = await _fetch_venue_open_orders(
+            orders, ord_succeeded, ord_failed, ord_evidence = await _fetch_venue_open_orders(
                 adapter, target_symbols,
             )
             all_open_orders[venue] = orders
         except Exception as exc:
             all_open_orders[venue] = {"error": str(exc)[:300]}
             ord_failed = set(target_symbols)
+            ord_evidence = {}
+        all_open_order_probe_evidence[venue] = ord_evidence
 
         try:
             await adapter.shutdown()
@@ -654,6 +744,14 @@ async def _build_exchange_truth_async(
             "positions_failed": sorted(pos_failed),
             "orders_succeeded": sorted(ord_succeeded),
             "orders_failed": sorted(ord_failed),
+            "positions_unsupported_symbols": sorted(
+                sym for sym, item in pos_evidence.items()
+                if item.get("classification") == "unsupported_symbol_flat"
+            ),
+            "orders_unsupported_symbols": sorted(
+                sym for sym, item in ord_evidence.items()
+                if item.get("classification") == "unsupported_symbol_no_open_orders"
+            ),
         }
 
         if any_success:
@@ -698,6 +796,8 @@ async def _build_exchange_truth_async(
         "confidence": confidence,
         "positions": all_positions,
         "open_orders": all_open_orders,
+        "position_probe_evidence": all_position_probe_evidence,
+        "open_order_probe_evidence": all_open_order_probe_evidence,
         "has_nonzero_position": has_any_position,
         "has_open_order": has_any_open_order,
         "fetch_status": fetch_status,

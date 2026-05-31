@@ -366,6 +366,93 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
 
 
 @pytest.mark.asyncio
+async def test_runtime_invalid_quote_decision_carries_sanitized_quote_evidence(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=0.0,
+                ask=101.0,
+                bid_size=0.0,
+                ask_size=12.5,
+                mark_price=100.5,
+                index_price=100.25,
+                funding_timestamp_ms=400000,
+            ),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        candidates=[candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    decision = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "invalid_quote"
+    )
+    assert decision["quote_bid"] == 0.0
+    assert decision["quote_ask"] == 101.0
+    assert decision["quote_bid_size"] == 0.0
+    assert decision["quote_ask_size"] == 12.5
+    assert decision["quote_mark_price"] == 100.5
+    assert decision["quote_index_price"] == 100.25
+    assert decision["quote_funding_timestamp_ms"] == 400000
+    assert decision["invalid_quote_fields"] == ["bid", "bid_size"]
+
+    no_entry = [
+        record for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    ][-1]["payload"]
+    sample = no_entry["snapshot_freshness_blocked_samples"][0]
+    assert sample["quote_bid"] == 0.0
+    assert sample["quote_ask"] == 101.0
+    assert sample["invalid_quote_fields"] == ["bid", "bid_size"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(

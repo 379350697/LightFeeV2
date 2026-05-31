@@ -4376,6 +4376,13 @@ class TestZeroFillFinalizeV1ParityGate:
         assert unfilled[0].get("payload", {}).get("reason") == "zero_fill_unfilled_removal"
         assert unfilled[0].get("payload", {}).get("maker_leg_filled") == 0.0
         assert unfilled[0].get("payload", {}).get("hedge_leg_filled") == 0.0
+        finalized = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.pending_entry_finalized"
+        ][-1]["payload"]
+        assert finalized["symbol"] == "XCNUSDT"
+        assert finalized["pair_id"] == "xcnusdt:binance->bybit"
+        assert finalized["finalized_as"] == "unfilled_zero_balanced"
         runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -4436,6 +4443,13 @@ class TestZeroFillFinalizeV1ParityGate:
         assert len(unfilled) == 0, (
             "One-sided fill MUST NOT emit entry.passive_unfilled"
         )
+        finalized = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.pending_entry_finalized"
+        ][-1]["payload"]
+        assert finalized["symbol"] == "IRYSUSDT"
+        assert finalized["pair_id"] == "irysusdt:binance->bybit"
+        assert finalized["finalized_as"] == "unmatched_residual"
         runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -4476,6 +4490,13 @@ class TestZeroFillFinalizeV1ParityGate:
         events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
         assert len(events) >= 1
         assert events[0].get("payload", {}).get("balanced_quantity") == 0.1
+        finalized = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.pending_entry_finalized"
+        ][-1]["payload"]
+        assert finalized["symbol"] == "BTCUSDT"
+        assert finalized["pair_id"] == "btcusdt:binance->bybit"
+        assert finalized["finalized_as"] == "open_position"
         runtime.journal.close()
 
     @pytest.mark.asyncio
