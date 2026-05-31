@@ -73,7 +73,12 @@ class LiveRuntime:
     def __init__(self, config: AppConfig, venue_adapters: Optional[dict[Venue, VenueAdapter]] = None) -> None:
         self.config = config
         self.state = EngineState()
-        self.journal = Journal(config.persistence.event_log_path)
+        self.journal = Journal(
+            config.persistence.event_log_path,
+            max_bytes=config.persistence.event_log_compaction_max_bytes,
+            archive_count=config.persistence.event_log_archive_count,
+            retention_hours=config.persistence.event_log_retention_hours,
+        )
         self.snapshot_store = SnapshotStore(config.persistence.snapshot_path)
         self.supervisor = Supervisor(config, self.state, self.journal)
         self._running = False
@@ -140,9 +145,15 @@ class LiveRuntime:
         self._last_entry_l2_readiness_diag_ts_ms: int = 0
         self._last_no_entry_diag_fingerprint: str = ""
         self._last_no_entry_diag_ts_ms: int = 0
+        self._last_no_entry_full_diag_ts_ms: int = 0
+        self._last_no_entry_full_diag_reason: str = ""
+        self._last_no_entry_summary_fingerprint: str = ""
+        self._no_entry_suppressed_full_payload_count: int = 0
         self._last_no_entry_diagnostics: dict | None = None
         self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
         self._last_snapshot_freshness_filter_samples: list[dict] = []
+        self._snapshot_freshness_decision_last_emit_ms: dict[tuple[str, str, str, str], int] = {}
+        self._snapshot_freshness_decision_suppressed: Counter[tuple[str, str, str, str]] = Counter()
         self._last_private_position_probe_ms: int = 0
         self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
         self._last_position_drift_check_ms: int = 0
@@ -170,6 +181,9 @@ class LiveRuntime:
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
     _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
     _SYMBOL_ADMISSION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000
+    _SNAPSHOT_FRESHNESS_DECISION_LOG_INTERVAL_MS = 60_000
+    _NO_ENTRY_DIAGNOSTICS_COMPACT_INTERVAL_MS = 60_000
+    _NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS = 5 * 60_000
     _BYBIT_ERROR_DOC_URL = "https://bybit-exchange.github.io/docs/v5/error"
     _BINANCE_USDM_ERROR_DOC_URL = (
         "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
@@ -9012,6 +9026,47 @@ class LiveRuntime:
 
         return scope
 
+    def _snapshot_freshness_decision_log_key(
+        self,
+        payload: dict,
+    ) -> tuple[str, str, str, str]:
+        return (
+            str(payload.get("venue", "") or "").lower(),
+            str(payload.get("symbol", "") or "").upper(),
+            str(payload.get("domain", "") or ""),
+            str(payload.get("reason", "") or payload.get("decision", "") or ""),
+        )
+
+    def _append_snapshot_freshness_decision_event(
+        self,
+        *,
+        payload: dict,
+        event_kind: str,
+        now_ms: int,
+    ) -> None:
+        key = self._snapshot_freshness_decision_log_key(payload)
+        last_emit_ms = self._snapshot_freshness_decision_last_emit_ms.get(key)
+        suppressed = int(self._snapshot_freshness_decision_suppressed.get(key, 0))
+        due = (
+            last_emit_ms is None
+            or now_ms - last_emit_ms >= self._SNAPSHOT_FRESHNESS_DECISION_LOG_INTERVAL_MS
+        )
+        if not due:
+            self._snapshot_freshness_decision_suppressed[key] += 1
+            return
+
+        event_payload = dict(payload)
+        if suppressed > 0:
+            event_payload["compact"] = True
+            event_payload["suppressed_count"] = suppressed
+        else:
+            event_payload["suppressed_count"] = 0
+        self._snapshot_freshness_decision_last_emit_ms[key] = now_ms
+        self._snapshot_freshness_decision_suppressed.pop(key, None)
+        self.journal.append("runtime.snapshot_freshness_decision", event_payload)
+        if event_kind:
+            self.journal.append(event_kind, event_payload)
+
     def _filter_candidates_by_snapshot_freshness(
         self,
         candidates: list,
@@ -9070,9 +9125,11 @@ class LiveRuntime:
                 payload["fallback_duration_ms"] = fallback_duration_ms
                 payload["blocked"] = blocked
                 payload["block_reason"] = reason if blocked else ""
-                self.journal.append("runtime.snapshot_freshness_decision", payload)
-                if event_kind:
-                    self.journal.append(event_kind, payload)
+                self._append_snapshot_freshness_decision_event(
+                    payload=payload,
+                    event_kind=event_kind,
+                    now_ms=now_ms,
+                )
                 if failure.get("decision") == "skip_entry":
                     blocking = True
                     self._last_snapshot_freshness_filter_blockers[reason] += 1
@@ -9395,6 +9452,37 @@ class LiveRuntime:
             return "candidate_window_mismatch"
         return "no_tradeable_candidates"
 
+    def _compact_scan_no_entry_diagnostics_payload(
+        self,
+        payload: dict,
+        *,
+        suppressed_full_payload_count: int,
+    ) -> dict:
+        compact_keys = (
+            "reason",
+            "generic_reason",
+            "candidate_count",
+            "tradeable_count",
+            "selected_candidate_count",
+            "dispatched_candidate_count",
+            "remaining_slots",
+            "blocked_reason_counts",
+            "entry_candidate_blocked_counts",
+            "snapshot_freshness_blocked_counts",
+            "execution_liquidity_blocked_counts",
+            "entry_final_gate_blocked_counts",
+            "tradeable_selection_blocker_counts",
+            "selection_bucket_counts",
+            "entry_local_l2_primary_ready_filter_active",
+            "entry_local_l2_primary_not_ready_reason_counts",
+            "entry_local_l2_primary_not_ready_reason_totals",
+            "ts_ms",
+        )
+        compact = {key: payload[key] for key in compact_keys if key in payload}
+        compact["compact"] = True
+        compact["suppressed_full_payload_count"] = suppressed_full_payload_count
+        return compact
+
     def _emit_scan_no_entry_diagnostics(
         self,
         *,
@@ -9529,15 +9617,51 @@ class LiveRuntime:
                 for c in payload["candidates"]
             ],
         })
-        if (
-            fingerprint == self._last_no_entry_diag_fingerprint
-            and now_ms - self._last_no_entry_diag_ts_ms < 60_000
-        ):
+        summary_fingerprint = self._payload_fingerprint({
+            "reason": payload["reason"],
+            "generic_reason": payload["generic_reason"],
+            "blocked_reason_keys": sorted(payload["blocked_reason_counts"].keys()),
+            "snapshot_freshness_blocker_keys": sorted(
+                payload["snapshot_freshness_blocked_counts"].keys()
+            ),
+            "tradeable_selection_blocker_keys": sorted(
+                payload["tradeable_selection_blocker_counts"].keys()
+            ),
+            "entry_local_l2_primary_not_ready_reason_keys": sorted(
+                payload["entry_local_l2_primary_not_ready_reason_totals"].keys()
+            ),
+        })
+        full_due = (
+            self._last_no_entry_full_diag_reason != payload["reason"]
+            or self._last_no_entry_full_diag_ts_ms <= 0
+            or now_ms - self._last_no_entry_full_diag_ts_ms
+            >= self._NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS
+            or summary_fingerprint != self._last_no_entry_summary_fingerprint
+        )
+        if full_due:
+            self._last_no_entry_full_diag_reason = str(payload["reason"])
+            self._last_no_entry_full_diag_ts_ms = now_ms
+            self._last_no_entry_summary_fingerprint = summary_fingerprint
+            self._last_no_entry_diag_fingerprint = fingerprint
+            self._last_no_entry_diag_ts_ms = now_ms
+            self._no_entry_suppressed_full_payload_count = 0
+            self._last_no_entry_diagnostics = payload
+            self.journal.append("scan.no_entry_diagnostics", payload)
             return
-        self._last_no_entry_diag_fingerprint = fingerprint
+
+        self._no_entry_suppressed_full_payload_count += 1
+        if now_ms - self._last_no_entry_diag_ts_ms < self._NO_ENTRY_DIAGNOSTICS_COMPACT_INTERVAL_MS:
+            return
+
+        self._last_no_entry_diag_fingerprint = summary_fingerprint
         self._last_no_entry_diag_ts_ms = now_ms
         self._last_no_entry_diagnostics = payload
-        self.journal.append("scan.no_entry_diagnostics", payload)
+        compact_payload = self._compact_scan_no_entry_diagnostics_payload(
+            payload,
+            suppressed_full_payload_count=self._no_entry_suppressed_full_payload_count,
+        )
+        self._no_entry_suppressed_full_payload_count = 0
+        self.journal.append("scan.no_entry_diagnostics", compact_payload)
 
     # ------------------------------------------------------------------
     # Entry dispatch

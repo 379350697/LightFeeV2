@@ -25,15 +25,26 @@ class Journal:
     domains (u64 seq, i64 ts_ms, u64/Decimal quantities) without range loss.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_bytes: int = 0,
+        archive_count: int = 0,
+        retention_hours: int = 0,
+    ) -> None:
         self.path = Path(path)
         self._seq = 0
         self._run_id = f"lightfee-{int(time.time() * 1000)}-{os.getpid()}"
         self._file = None
+        self._max_bytes = max(int(max_bytes or 0), 0)
+        self._archive_count = max(int(archive_count or 0), 0)
+        self._retention_hours = max(int(retention_hours or 0), 0)
 
     def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.path, "a")
+        self._prune_expired_archives()
+        self._file = open(self.path, "a", encoding="utf-8")
 
     def close(self) -> None:
         if self._file:
@@ -64,11 +75,66 @@ class Journal:
             "kind": kind,
             "payload": payload,
         }
-        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        self._rotate_if_needed(len(line.encode("utf-8")))
+        self._file.write(line)
         self._file.flush()
         if flush:
             os.fsync(self._file.fileno())
         return self._seq
+
+    def _archive_path(self, index: int) -> Path:
+        return self.path.with_name(f"{self.path.name}.{index}")
+
+    def _prune_expired_archives(self) -> None:
+        if self._retention_hours <= 0:
+            return
+        cutoff = time.time() - (self._retention_hours * 3600)
+        archive_limit = max(self._archive_count, 1)
+        for index in range(1, archive_limit + 1):
+            archive = self._archive_path(index)
+            try:
+                if archive.exists() and archive.stat().st_mtime < cutoff:
+                    archive.unlink()
+            except OSError:
+                continue
+
+    def _rotate_if_needed(self, upcoming_bytes: int) -> None:
+        if self._max_bytes <= 0:
+            return
+        try:
+            current_size = self.path.stat().st_size if self.path.exists() else 0
+        except OSError:
+            current_size = 0
+        if current_size <= 0 or current_size + upcoming_bytes <= self._max_bytes:
+            return
+
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+            self._file = None
+
+        archive_limit = max(self._archive_count, 1)
+        oldest = self._archive_path(archive_limit)
+        try:
+            if oldest.exists():
+                oldest.unlink()
+        except OSError:
+            pass
+        for index in range(archive_limit - 1, 0, -1):
+            source = self._archive_path(index)
+            destination = self._archive_path(index + 1)
+            try:
+                if source.exists():
+                    source.replace(destination)
+            except OSError:
+                continue
+        try:
+            if self.path.exists():
+                self.path.replace(self._archive_path(1))
+        finally:
+            self._prune_expired_archives()
+            self._file = open(self.path, "a", encoding="utf-8")
 
     def append_critical(
         self,

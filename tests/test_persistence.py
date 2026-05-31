@@ -113,6 +113,45 @@ class TestJournal:
             with pytest.raises(RuntimeError, match="not open"):
                 j.append("test", {})
 
+    def test_rotates_jsonl_when_configured_size_is_exceeded(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            j = Journal(path, max_bytes=700, archive_count=2)
+            j.open()
+            for idx in range(5):
+                j.append("runtime.snapshot_freshness_decision", {"idx": idx, "value": "x" * 120})
+            j.close()
+
+            archive = path.with_name(f"{path.name}.1")
+            assert archive.exists()
+            assert path.exists()
+            assert path.stat().st_size <= 700
+
+            records = []
+            older_archive = path.with_name(f"{path.name}.2")
+            for candidate in (older_archive, archive, path):
+                if not candidate.exists():
+                    continue
+                records.extend(
+                    json.loads(line)
+                    for line in candidate.read_text().splitlines()
+                    if line.strip()
+                )
+            assert [record["seq"] for record in records] == list(range(1, len(records) + 1))
+
+    def test_rotation_keeps_configured_archive_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            j = Journal(path, max_bytes=500, archive_count=2)
+            j.open()
+            for idx in range(30):
+                j.append("scan.no_entry_diagnostics", {"idx": idx, "value": "x" * 100})
+            j.close()
+
+            assert path.with_name(f"{path.name}.1").exists()
+            assert path.with_name(f"{path.name}.2").exists()
+            assert not path.with_name(f"{path.name}.3").exists()
+
 
 class TestSnapshotStore:
     def test_atomic_write_and_read(self):

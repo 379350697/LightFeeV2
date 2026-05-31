@@ -102,6 +102,14 @@ def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
     )
 
 
+def _read_journal_records(path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
 def test_runtime_no_tradeable_diagnostics_classifies_edge_window_and_domain():
     assert LiveRuntime._no_tradeable_reason_from_candidate_blockers(
         Counter({"funding_edge_below_floor": 2}),
@@ -115,6 +123,140 @@ def test_runtime_no_tradeable_diagnostics_classifies_edge_window_and_domain():
         Counter(),
         Counter({"quote_stale": 1}),
     ) == "candidate_snapshot_domain_stale"
+
+
+def test_snapshot_freshness_decisions_are_rate_limited_by_source_domain(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate_a = _freshness_candidate()
+    candidate_a.pair_id = "btcusdt:okx->bybit:a"
+    candidate_b = _freshness_candidate()
+    candidate_b.pair_id = "btcusdt:okx->bybit:b"
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=0.0,
+                ask=101.0,
+                bid_size=0.0,
+                ask_size=12.5,
+            ),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.2, 101.2),
+        },
+        candidates=[candidate_a, candidate_b],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate_a, candidate_b],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+        assert filtered == []
+
+        first_records = _read_journal_records(tmp_path / "events.jsonl")
+        first_decisions = [
+            record for record in first_records
+            if record["kind"] == "runtime.snapshot_freshness_decision"
+            and record["payload"]["reason"] == "invalid_quote"
+        ]
+        assert len(first_decisions) == 1
+        assert first_decisions[0]["payload"]["reason"] == "invalid_quote"
+        assert first_decisions[0]["payload"].get("suppressed_count", 0) == 0
+
+        runtime._filter_candidates_by_snapshot_freshness(
+            [candidate_a, candidate_b],
+            snapshot=snapshot,
+            now_ms=131000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    decisions = [
+        record for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "invalid_quote"
+    ]
+    assert len(decisions) == 2
+    assert decisions[-1]["payload"]["compact"] is True
+    assert decisions[-1]["payload"]["suppressed_count"] == 1
+
+
+def test_scan_no_entry_diagnostics_compacts_repeated_high_level_reason(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+
+    first_candidates = [_freshness_candidate(f"AAA{idx}USDT") for idx in range(6)]
+    second_candidates = [_freshness_candidate(f"BBB{idx}USDT") for idx in range(7)]
+    first_snapshot = SidecarSnapshot(candidates=first_candidates)
+    second_snapshot = SidecarSnapshot(candidates=second_candidates)
+
+    runtime.journal.open()
+    try:
+        runtime._emit_scan_no_entry_diagnostics(
+            reason="tradeable_candidates_waiting_for_entry_finalization_window_too_early",
+            snapshot=first_snapshot,
+            tradeable=first_candidates,
+            selected_candidate_count=0,
+            dispatched_candidate_count=0,
+            remaining_slots=1,
+            tradeable_selection_blocker_counts=Counter({"funding_window_too_early": 7}),
+            candidate_blockers={},
+            now_ms=70000,
+        )
+        runtime._emit_scan_no_entry_diagnostics(
+            reason="tradeable_candidates_waiting_for_entry_finalization_window_too_early",
+            snapshot=second_snapshot,
+            tradeable=second_candidates,
+            selected_candidate_count=0,
+            dispatched_candidate_count=0,
+            remaining_slots=1,
+            tradeable_selection_blocker_counts=Counter({"funding_window_too_early": 6}),
+            candidate_blockers={},
+            now_ms=131000,
+        )
+    finally:
+        runtime.journal.close()
+
+    diagnostics = [
+        record["payload"]
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "scan.no_entry_diagnostics"
+    ]
+    assert len(diagnostics) == 2
+    assert diagnostics[0].get("compact") is not True
+    assert len(diagnostics[0]["candidates"]) == 6
+    assert diagnostics[1]["compact"] is True
+    assert diagnostics[1]["tradeable_count"] == 7
+    assert "candidates" not in diagnostics[1]
+    assert diagnostics[1]["suppressed_full_payload_count"] == 1
 
 
 def test_runtime_snapshot_freshness_status_includes_transfer_domain(tmp_path):
