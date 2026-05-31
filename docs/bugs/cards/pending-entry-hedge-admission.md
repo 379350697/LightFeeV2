@@ -43,6 +43,7 @@ Deterministic hedge admission reject must:
 |---|---|---|---|---|
 | 2026-05-29 | `BZUSDT` Aster maker / Bybit hedge, `LABUSDT` Binance maker / Aster hedge | `6987fc8`; deployed through `bbcd7b9` docs sync | closed | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
 | 2026-05-30 | `LITEUSDT`, `AVGOUSDT`, `HMSTRUSDT`, `HEIUSDT`, `GENIUSUSDT` | `0fd9a74` | admission/transport harness green; cloud targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-05-31 | `AVGOUSDT` Bybit `110126`; attempted `STGUSDT`/`LABUSDT` Aster `-2027`/`-5018` admission blocks | existing admission classification | contained; no stuck pending entry or live exposure after read-only probes | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 
 ## Regression Harness
 

@@ -45,6 +45,7 @@ Classify as official when:
 | 2026-05-29 | Binance/Aster `LABUSDT`, Binance `IOUSDT` | `7ee4c72` | closed for Binance/Aster | [daily/2026-05-29.md#cluster-cl-016-post-deploy-official-local-l2-and-terminal-order-reject-watch](../daily/2026-05-29.md#cluster-cl-016-post-deploy-official-local-l2-and-terminal-order-reject-watch) |
 | 2026-05-29 | OKX `LABUSDT` evidence gap | `6987fc8` | closed for classification | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
 | 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT`; post-fix `HEIUSDT` snapshot errors | `0fd9a74`; no Local-L2 code change selected | no dirty trading state; final affected-symbol probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 
 ## Regression Harness
 

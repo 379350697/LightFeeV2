@@ -52,6 +52,7 @@ release the gate with rule-source evidence.
 | 2026-05-25/26 | `LYNUSDT`, `OPGUSDT` exhausted residuals | `30a8ddc` family | closed by harness/probe | [daily/2026-05-26.md#cluster-cl-007-biousdt-exchange-truth-false-green-root-fix](../daily/2026-05-26.md#cluster-cl-007-biousdt-exchange-truth-false-green-root-fix) |
 | 2026-05-29 | `PARTIUSDT` OKX/Binance | `9cdb9df` | closed by cloud probe | [daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression](../daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression) |
 | 2026-05-30 | `HMSTRUSDT` Bybit/OKX, `RAVEUSDT` Bybit/OKX, post-fix `HOMEUSDT`/`POWERUSDT` residual completions | `0fd9a74` | fixed, deployed, final probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-05-31 | `HOMEUSDT` Binance residual repair before passive close | existing residual-repair live-truth path | completed; final local state and read-only exchange truth flat/no-open-orders | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 
 ## Regression Harness
 

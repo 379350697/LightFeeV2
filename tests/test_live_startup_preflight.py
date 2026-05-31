@@ -954,6 +954,112 @@ class TestRuntimePreflight:
             assert unsupported[0]["payload"]["unsupported_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_position_probe_catalog_unavailable_is_journaled(self):
+        """If the catalog cannot load, keep fallback behavior but record why."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class CatalogUnavailableAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.fetch_position_symbols: list[str] = []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    raise RuntimeError("catalog load timed out")
+
+                def supported_symbols(self) -> list[str]:
+                    return []
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = CatalogUnavailableAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(["BTCUSDT", "ETHUSDT"])
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_probe_catalog_unavailable"
+            )
+            assert bitget.fetch_position_symbols == ["BTCUSDT", "ETHUSDT"]
+            assert payload["venue"] == "bitget"
+            assert payload["catalog_source"] == "adapter.supported_symbols"
+            assert payload["catalog_available"] is False
+            assert payload["catalog_unavailable_reason"] == "ensure_supported_symbols_loaded_failed"
+            assert payload["ensure_supported_symbols_available"] is True
+            assert payload["supported_symbols_available"] is True
+            assert payload["catalog_supported_count"] == 0
+            assert payload["requested_symbols"] == ["BTCUSDT", "ETHUSDT"]
+            assert payload["symbol_count"] == 2
+            assert payload["decision"] == "probe_unfiltered"
+            assert "catalog load timed out" in payload["catalog_error"]
+
+    @pytest.mark.asyncio
+    async def test_live_position_probe_error_records_catalog_unavailable_reason(self):
+        """Probe errors must say whether missing catalog evidence is itself the gap."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class CatalogErrorAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+
+                def supported_symbols(self) -> list[str]:
+                    raise RuntimeError("catalog cache failed")
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    raise asyncio.TimeoutError()
+
+            bitget = CatalogErrorAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(["BTCUSDT"])
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_probe_error"
+            )
+            assert payload["classification"] == "timeout"
+            assert payload["catalog_available"] is False
+            assert payload["catalog_source"] == "adapter.supported_symbols"
+            assert payload["catalog_unavailable_reason"] == "supported_symbols_failed"
+            assert payload["supported_symbols_available"] is True
+            assert payload["ensure_supported_symbols_available"] is False
+            assert payload["catalog_supported_count"] == 0
+            assert "catalog cache failed" in payload["catalog_error"]
+
+    @pytest.mark.asyncio
     async def test_live_position_probe_error_keeps_context_for_blank_exception(self):
         """Blank exception strings must still journal class, endpoint, and symbols."""
         from types import SimpleNamespace

@@ -442,6 +442,14 @@ class PassiveCloseExecutor:
             maker_client_id = pending.phase_state.maker_client_order_id
 
             if not maker_order_id:
+                if await self._resolve_flat_maker_leg_from_live_truth(
+                    state,
+                    pending,
+                    position,
+                    maker_leg_label=maker_leg_label,
+                ):
+                    return True
+
                 # Submit initial maker order
                 success = await self._submit_maker_order(state, pending, position,
                                                           maker_venue, maker_side,
@@ -2656,6 +2664,82 @@ class PassiveCloseExecutor:
         if isinstance(qty, (int, float)) and math.isfinite(float(qty)):
             return abs(float(qty))
         return 0.0
+
+    async def _resolve_flat_maker_leg_from_live_truth(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        maker_leg_label: str,
+    ) -> bool:
+        """Avoid submitting a reduce-only maker order to a leg live truth says is flat."""
+        live_long, live_long_error = await self._fetch_live_position_snapshot(
+            position.long_venue,
+            position.symbol,
+        )
+        live_short, live_short_error = await self._fetch_live_position_snapshot(
+            position.short_venue,
+            position.symbol,
+        )
+        if live_long_error or live_short_error:
+            self._journal.append(
+                "exit.passive_close_maker_leg_live_precheck_untrusted",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "long_error": live_long_error,
+                    "short_error": live_short_error,
+                    "decision": "continue_pending_passive_close",
+                },
+            )
+            return False
+
+        live_long_qty = self._live_position_quantity(live_long)
+        live_short_qty = self._live_position_quantity(live_short)
+        maker_qty = live_long_qty if maker_leg_label == "long" else live_short_qty
+        other_qty = live_short_qty if maker_leg_label == "long" else live_long_qty
+        if maker_qty > 1e-9:
+            return False
+
+        other_venue = position.short_venue if maker_leg_label == "long" else position.long_venue
+        other_snapshot = live_short if maker_leg_label == "long" else live_long
+        other_leg_label = "short" if maker_leg_label == "long" else "long"
+        decision = "clear_live_flat" if other_qty <= 1e-9 else "flatten_other_live_leg"
+        self._journal.append(
+            "exit.passive_close_maker_leg_live_flat_precheck",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "maker_leg": maker_leg_label,
+                "live_long_size": live_long_qty,
+                "live_short_size": live_short_qty,
+                "decision": decision,
+            },
+        )
+
+        if other_qty <= 1e-9:
+            return await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_maker_leg_live_flat_precheck",
+                extra={"maker_leg": maker_leg_label},
+            )
+
+        return await self._flatten_live_one_sided_position(
+            state,
+            pending,
+            position,
+            venue=other_venue,
+            live_snapshot=other_snapshot,
+            leg_label=other_leg_label,
+        )
 
     def _pending_runtime_close_legs(
         self,

@@ -1076,20 +1076,77 @@ class LiveRuntime:
     ) -> list[str]:
         """Filter symbols through a venue-provided trading catalog when present."""
         ensure_loaded = getattr(adapter, "ensure_supported_symbols_loaded", None)
+        ensure_available = callable(ensure_loaded)
+        catalog_error = ""
+        catalog_unavailable_reason = ""
         if callable(ensure_loaded):
             try:
                 maybe_coro = ensure_loaded()
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
-            except Exception:
-                pass
+            except Exception as exc:
+                catalog_error = str(exc)
+                catalog_unavailable_reason = "ensure_supported_symbols_loaded_failed"
 
+        supported_fn = getattr(adapter, "supported_symbols", None)
+        supported_available = callable(supported_fn)
         try:
-            supported_raw = adapter.supported_symbols()
-        except Exception:
+            supported_raw = supported_fn() if supported_available else []
+        except Exception as exc:
             supported_raw = []
+            catalog_error = str(exc)
+            catalog_unavailable_reason = "supported_symbols_failed"
         supported = {str(symbol) for symbol in supported_raw if str(symbol)}
         if not supported:
+            if not catalog_unavailable_reason:
+                catalog_unavailable_reason = (
+                    "supported_symbols_empty"
+                    if supported_available
+                    else "supported_symbols_unavailable"
+                )
+            if (
+                skip_event_kind == "recovery.live_position_probe_symbol_skipped"
+                and getattr(self.journal, "_file", None) is not None
+            ):
+                now_ms = wall_clock_now_ms()
+                diagnostic_key = (
+                    "recovery.live_position_probe_catalog_unavailable",
+                    venue.value,
+                    catalog_unavailable_reason,
+                )
+                last_ms = self._unsupported_symbol_diagnostic_last_ms.get(
+                    diagnostic_key,
+                    0,
+                )
+                if (
+                    last_ms <= 0
+                    or now_ms >= last_ms + self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS
+                ):
+                    self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
+                    self.journal.append(
+                        "recovery.live_position_probe_catalog_unavailable",
+                        {
+                            "venue": venue.value,
+                            "catalog_source": (
+                                "adapter.supported_symbols"
+                                if supported_available
+                                else ""
+                            ),
+                            "catalog_available": False,
+                            "catalog_unavailable_reason": catalog_unavailable_reason,
+                            "catalog_error": catalog_error,
+                            "ensure_supported_symbols_available": ensure_available,
+                            "supported_symbols_available": supported_available,
+                            "catalog_supported_count": 0,
+                            "sample_supported_symbols": [],
+                            "symbol_count": len(symbols),
+                            "requested_symbols": [str(symbol) for symbol in symbols],
+                            "diagnostic_key": list(diagnostic_key),
+                            "diagnostic_rate_limit_ms": self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
+                            "decision": "probe_unfiltered",
+                            "reason": "catalog_unavailable",
+                        },
+                    )
             return symbols
 
         transport = getattr(adapter, "_transport", None)
@@ -1196,11 +1253,24 @@ class LiveRuntime:
             except Exception:
                 venue_symbol = normalized_symbol
 
+        supported_fn = getattr(adapter, "supported_symbols", None)
+        supported_available = callable(supported_fn)
+        ensure_available = callable(getattr(adapter, "ensure_supported_symbols_loaded", None))
+        catalog_error = ""
+        catalog_unavailable_reason = ""
         try:
-            supported_raw = adapter.supported_symbols()
-        except Exception:
+            supported_raw = supported_fn() if supported_available else []
+        except Exception as catalog_exc:
             supported_raw = []
+            catalog_error = str(catalog_exc)
+            catalog_unavailable_reason = "supported_symbols_failed"
         supported = {str(item) for item in supported_raw if str(item)}
+        if not supported and not catalog_unavailable_reason:
+            catalog_unavailable_reason = (
+                "supported_symbols_empty"
+                if supported_available
+                else "supported_symbols_unavailable"
+            )
         catalog_supported_count = len(supported)
         catalog_supported = (
             bool(supported)
@@ -1271,7 +1341,16 @@ class LiveRuntime:
             "venue_symbol": venue_symbol,
             "endpoint": endpoint,
             "probe_category": "private_positions",
-            "catalog_source": "adapter.supported_symbols" if supported else "",
+            "catalog_source": (
+                "adapter.supported_symbols" if supported_available else ""
+            ),
+            "catalog_available": bool(supported),
+            "catalog_unavailable_reason": (
+                "" if supported else catalog_unavailable_reason
+            ),
+            "catalog_error": "" if supported else catalog_error,
+            "ensure_supported_symbols_available": ensure_available,
+            "supported_symbols_available": supported_available,
             "catalog_supported": catalog_supported,
             "catalog_supported_count": catalog_supported_count,
             "sample_supported_symbols": sorted(supported)[:10],

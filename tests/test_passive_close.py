@@ -4238,6 +4238,116 @@ class TestNonTerminalPartialFillHedgeGapClosure:
 # ===========================================================================
 
 
+class TestPassiveCloseMakerLegLiveTruthPrecheck:
+    """Live-truth precheck before first maker submit."""
+
+    def test_flat_maker_leg_flattens_other_live_leg_without_submit(self):
+        """If the chosen maker leg is already flat, do not submit a doomed maker order."""
+        journal = _open_journal()
+
+        class LiveTruthAdapter(VenueAdapter):
+            def __init__(self, venue, side, quantity):
+                self._venue = venue
+                self._side = side
+                self._quantity = quantity
+                self.place_order_calls = []
+                self.submit_passive_order = AsyncMock(
+                    side_effect=OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit retCode=110017 retMsg=current position is zero, cannot fix reduce-only order qty",
+                    )
+                )
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=self._quantity,
+                    entry_price=0.02 if self._quantity else 0.0,
+                    observed_at_ms=1779970000000,
+                )
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                self._quantity = 0.0
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 0.02,
+                    order_id=f"{self._venue.value}-flatten",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=1779970000001,
+                )
+
+        long_adapter = LiveTruthAdapter(Venue.BINANCE, Side.BUY, 780.0)
+        short_adapter = LiveTruthAdapter(Venue.BYBIT, Side.SELL, 0.0)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: long_adapter, Venue.BYBIT: short_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.02)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.0199, 0.0201))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-home-maker-flat",
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=780.0,
+            short_quantity=780.0,
+            matched_quantity=780.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=780.0,
+            chunk_quantities=[780.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+            next_retry_at_ms=0,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is True
+        short_adapter.submit_passive_order.assert_not_called()
+        assert len(long_adapter.place_order_calls) == 1
+        request = long_adapter.place_order_calls[0]
+        assert request.side == Side.SELL
+        assert request.quantity == 780.0
+        assert request.reduce_only is True
+        assert request.time_in_force == TimeInForce.IOC
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        assert "exit.passive_close_maker_submit_error" not in kinds
+
+
 class TestDualTakerDriveConsumption:
     """Test that drive_pending_passive_close consumes DUAL_TAKER state."""
 
