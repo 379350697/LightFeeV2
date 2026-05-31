@@ -1568,3 +1568,83 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
         assert "suppressed_count" not in payloads[0]
         assert payloads[1]["reason"] == "subscription_missing"
         assert payloads[1]["suppressed_count"] == 1
+
+
+class TestLocalL2DiagnosticCompaction:
+    def test_freshness_state_events_use_longer_compact_window(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "FRESHCOMPACTUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        dp.note_ws_delta("bybit", "FRESHCOMPACTUSDT", now_ms=1_000)
+        dp.note_ws_delta("bybit", "FRESHCOMPACTUSDT", now_ms=61_000)
+        dp.note_ws_delta("bybit", "FRESHCOMPACTUSDT", now_ms=301_000)
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_freshness_state"
+        ]
+        assert len(payloads) == 2
+        assert payloads[0]["event"] == "ws_delta"
+        assert "compact" not in payloads[0]
+        assert payloads[1]["event"] == "ws_delta"
+        assert payloads[1]["compact"] is True
+        assert payloads[1]["suppressed_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ws_authoritative_rest_bootstrap_deferred_events_are_compacted(self):
+        rt = LocalL2Runtime()
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        adapter = MockL2Adapter("bybit", sequence=100)
+
+        class FakeClient:
+            is_connected = True
+
+        dp._ws_clients[LocalL2BookKey("bybit", "DEFERCOMPACTUSDT")] = FakeClient()
+
+        assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=1_000) is False
+        assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=2_000) is False
+        assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=61_000) is False
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot"
+        ]
+        assert len(payloads) == 2
+        assert "compact" not in payloads[0]
+        assert payloads[1]["compact"] is True
+        assert payloads[1]["suppressed_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshot_ok_events_are_compacted_until_recovery_success(self):
+        rt = LocalL2Runtime()
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        assert await dp.bootstrap_book("binance", "OKCOMPACTUSDT", MockL2Adapter("binance", sequence=100), now_ms=1_000) is True
+        assert await dp.bootstrap_book("binance", "OKCOMPACTUSDT", MockL2Adapter("binance", sequence=101), now_ms=7_000) is True
+        assert await dp.bootstrap_book("binance", "OKCOMPACTUSDT", MockL2Adapter("binance", sequence=102), now_ms=301_000) is True
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_ok"
+        ]
+        assert len(payloads) == 2
+        assert "compact" not in payloads[0]
+        assert payloads[1]["compact"] is True
+        assert payloads[1]["suppressed_count"] == 1
+
+        assert await dp.bootstrap_book("binance", "OKCOMPACTUSDT", MockL2Adapter("binance", should_fail=True), now_ms=307_000) is False
+        assert await dp.bootstrap_book("binance", "OKCOMPACTUSDT", MockL2Adapter("binance", sequence=103), now_ms=308_000) is True
+
+        payloads = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_ok"
+        ]
+        assert len(payloads) == 3
+        assert "compact" not in payloads[-1]

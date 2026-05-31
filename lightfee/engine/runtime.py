@@ -154,6 +154,8 @@ class LiveRuntime:
         self._last_snapshot_freshness_filter_samples: list[dict] = []
         self._snapshot_freshness_decision_last_emit_ms: dict[tuple[str, str, str, str], int] = {}
         self._snapshot_freshness_decision_suppressed: Counter[tuple[str, str, str, str]] = Counter()
+        self._runtime_diagnostic_event_last_emit_ms: dict[tuple[str, ...], int] = {}
+        self._runtime_diagnostic_event_suppressed: Counter[tuple[str, ...]] = Counter()
         self._last_private_position_probe_ms: int = 0
         self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
         self._last_position_drift_check_ms: int = 0
@@ -184,6 +186,8 @@ class LiveRuntime:
     _SNAPSHOT_FRESHNESS_DECISION_LOG_INTERVAL_MS = 60_000
     _NO_ENTRY_DIAGNOSTICS_COMPACT_INTERVAL_MS = 60_000
     _NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS = 5 * 60_000
+    _ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS = 60_000
+    _CANDIDATE_SYMBOL_SKIPPED_LOG_INTERVAL_MS = 60_000
     _BYBIT_ERROR_DOC_URL = "https://bybit-exchange.github.io/docs/v5/error"
     _BINANCE_USDM_ERROR_DOC_URL = (
         "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
@@ -1308,6 +1312,32 @@ class LiveRuntime:
             payload["skip_reason"] = "catalog_or_metadata_missing"
         return payload
 
+    def _append_runtime_diagnostic_event(
+        self,
+        kind: str,
+        payload: dict,
+        *,
+        now_ms: int,
+        key_parts: tuple,
+        interval_ms: int,
+    ) -> bool:
+        event_key = (kind, *tuple(str(part) for part in key_parts))
+        last_emit_ms = self._runtime_diagnostic_event_last_emit_ms.get(event_key)
+        suppressed = int(self._runtime_diagnostic_event_suppressed.get(event_key, 0))
+        due = last_emit_ms is None or now_ms <= 0 or now_ms - last_emit_ms >= interval_ms
+        if not due:
+            self._runtime_diagnostic_event_suppressed[event_key] += 1
+            return False
+
+        event_payload = dict(payload)
+        if suppressed > 0:
+            event_payload["compact"] = True
+            event_payload["suppressed_count"] = suppressed
+        self._runtime_diagnostic_event_last_emit_ms[event_key] = now_ms
+        self._runtime_diagnostic_event_suppressed.pop(event_key, None)
+        self.journal.append(kind, event_payload)
+        return True
+
     async def _filter_candidates_supported_by_venue_catalog(
         self,
         candidates: list,
@@ -1376,7 +1406,7 @@ class LiveRuntime:
 
             skipped += 1
             if getattr(self.journal, "_file", None) is not None:
-                self.journal.append(
+                self._append_runtime_diagnostic_event(
                     skip_event_kind,
                     {
                         "symbol": symbol,
@@ -1395,6 +1425,15 @@ class LiveRuntime:
                         "short_supported": short_supported,
                         "reason": "unsupported_symbol",
                     },
+                    now_ms=wall_clock_now_ms(),
+                    key_parts=(
+                        symbol,
+                        self._candidate_pair_id(candidate),
+                        "unsupported_symbol",
+                        str(long_supported),
+                        str(short_supported),
+                    ),
+                    interval_ms=self._CANDIDATE_SYMBOL_SKIPPED_LOG_INTERVAL_MS,
                 )
 
         if skipped > 0 and getattr(self.journal, "_file", None) is not None:
@@ -9975,7 +10014,7 @@ class LiveRuntime:
                     "entry_waiting_for_finalization_window_too_early",
                     "entry_finalization_window_expired",
                 }:
-                    self.journal.append(
+                    self._append_runtime_diagnostic_event(
                         "runtime.entry_blocked_local_l2_selection",
                         {
                             "symbol": symbol,
@@ -9983,6 +10022,9 @@ class LiveRuntime:
                             "reason": blocker_str,
                             "ts_ms": now_ms,
                         },
+                        now_ms=now_ms,
+                        key_parts=(symbol, pair_id, blocker_str),
+                        interval_ms=self._ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS,
                     )
                 continue
             ranked.append(candidate)

@@ -151,6 +151,8 @@ class LocalL2DataPlane:
         self._state_event_last_ms: dict[tuple[str, str, str, str], int] = {}
         self._state_event_suppressed: dict[tuple[str, str, str, str], int] = {}
         self.state_event_rate_limit_ms: int = 60_000
+        self.freshness_state_event_rate_limit_ms: int = 300_000
+        self.snapshot_ok_event_rate_limit_ms: int = 300_000
         self.clock_skew_tolerance_ms: int = 5_000
 
     # ------------------------------------------------------------------
@@ -227,11 +229,13 @@ class LocalL2DataPlane:
                 ws_key = LocalL2BookKey(venue=venue, symbol=symbol)
                 ws_client = self._ws_clients.get(ws_key)
                 if ws_client is not None and getattr(ws_client, "is_connected", False):
-                    self._journal.append(
+                    self._append_rate_limited_state_event(
                         "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
                         {"venue": venue, "symbol": symbol,
                          "snapshot_seq": update.sequence, "book_seq": getattr(book, "last_update_id", 0) if book else 0,
                          "policy": policy.bridge_mode.value},
+                        now_ms,
+                        reason=policy.bridge_mode.value,
                     )
                     return False
 
@@ -239,6 +243,12 @@ class LocalL2DataPlane:
             if not apply_result.applied or apply_result.rebuild_required:
                 ss.consecutive_failures += 1
                 ss.last_error = apply_result.fault_reason or "snapshot_apply_failed"
+                self._clear_rate_limited_state_event(
+                    "runtime.local_l2_snapshot_ok",
+                    venue,
+                    symbol,
+                    reason="ok",
+                )
                 self._journal.append(
                     "runtime.local_l2_snapshot_error",
                     {
@@ -268,6 +278,12 @@ class LocalL2DataPlane:
                     book.fault_reason if book is not None and book.fault_reason
                     else "buffered_replay_failed"
                 )
+                self._clear_rate_limited_state_event(
+                    "runtime.local_l2_snapshot_ok",
+                    venue,
+                    symbol,
+                    reason="ok",
+                )
                 self._journal.append(
                     "runtime.local_l2_snapshot_error",
                     {
@@ -294,9 +310,12 @@ class LocalL2DataPlane:
             ss.last_error = ""
             self._freshness_state(venue, symbol).last_rest_refresh_ms = now_ms
             self._buffered_replay_failure_counts.pop(f"{venue}:{symbol}", None)
-            self._journal.append(
+            self._append_rate_limited_state_event(
                 "runtime.local_l2_snapshot_ok",
                 {"venue": venue, "symbol": symbol},
+                now_ms,
+                reason="ok",
+                interval_ms=self.snapshot_ok_event_rate_limit_ms,
             )
             return True
         except TransportError as e:
@@ -313,6 +332,12 @@ class LocalL2DataPlane:
                 RuntimeFaultKind.TRANSPORT_FAILURE,
                 f"snapshot_bootstrap: {e}", now_ms,
             )
+            self._clear_rate_limited_state_event(
+                "runtime.local_l2_snapshot_ok",
+                venue,
+                symbol,
+                reason="ok",
+            )
             self._journal.append(
                 "runtime.local_l2_snapshot_error",
                 {"venue": venue, "symbol": symbol, "error": str(e), "category": str(e.category)},
@@ -328,6 +353,12 @@ class LocalL2DataPlane:
                 venue, symbol,
                 RuntimeFaultKind.TRANSPORT_FAILURE,
                 f"snapshot_bootstrap: {e}", now_ms,
+            )
+            self._clear_rate_limited_state_event(
+                "runtime.local_l2_snapshot_ok",
+                venue,
+                symbol,
+                reason="ok",
             )
             self._journal.append(
                 "runtime.local_l2_snapshot_error",
@@ -417,15 +448,17 @@ class LocalL2DataPlane:
         now_ms: int,
         *,
         reason: str = "",
+        interval_ms: int | None = None,
     ) -> bool:
         venue = str(payload.get("venue", ""))
         symbol = str(payload.get("symbol", ""))
         event_key = (kind, venue, symbol, reason)
         last_ms = self._state_event_last_ms.get(event_key, 0)
+        rate_limit_ms = self.state_event_rate_limit_ms if interval_ms is None else interval_ms
         if (
             last_ms > 0
             and now_ms > 0
-            and (now_ms - last_ms) < self.state_event_rate_limit_ms
+            and (now_ms - last_ms) < rate_limit_ms
         ):
             self._state_event_suppressed[event_key] = (
                 self._state_event_suppressed.get(event_key, 0) + 1
@@ -435,10 +468,23 @@ class LocalL2DataPlane:
         suppressed = self._state_event_suppressed.pop(event_key, 0)
         if suppressed:
             payload = dict(payload)
+            payload["compact"] = True
             payload["suppressed_count"] = suppressed
         self._state_event_last_ms[event_key] = now_ms
         self._journal.append(kind, payload)
         return True
+
+    def _clear_rate_limited_state_event(
+        self,
+        kind: str,
+        venue: str,
+        symbol: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        event_key = (kind, str(venue), str(symbol), reason)
+        self._state_event_last_ms.pop(event_key, None)
+        self._state_event_suppressed.pop(event_key, None)
 
     def _mark_book_fresh_from_evidence(
         self,
@@ -478,6 +524,7 @@ class LocalL2DataPlane:
             },
             now_ms,
             reason=event_name,
+            interval_ms=self.freshness_state_event_rate_limit_ms,
         )
 
     def note_ws_delta(

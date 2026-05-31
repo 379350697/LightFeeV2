@@ -864,6 +864,107 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         )
         assert pair_id == "btcusdt:binance->bybit"
 
+    def test_entry_blocked_local_l2_selection_events_are_compacted(
+        self, runtime_with_l2,
+        monkeypatch,
+    ):
+        import json
+        from collections import Counter
+
+        rt = runtime_with_l2
+        c = self._make_real_candidate(
+            pair_id="btcusdt:binance->bybit",
+            first_funding_timestamp_ms=900_000,
+            entry_notional_quote=50.0,
+        )
+        monkeypatch.setattr(
+            rt,
+            "_entry_local_l2_selection_blocker",
+            lambda _candidate, _now_ms: "entry_local_l2_waiting_for_dual_ready",
+        )
+
+        rt.journal.open()
+        try:
+            for now_ms in (1_000, 2_000, 61_000):
+                selected = rt._select_entry_candidates(
+                    [c],
+                    now_ms=now_ms,
+                    remaining_slots=1,
+                    selection_blocker_counts=Counter(),
+                    candidate_blockers={},
+                )
+                assert selected == []
+        finally:
+            rt.journal.close()
+
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payloads = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ]
+        assert len(payloads) == 2
+        assert payloads[0]["pair_id"] == "btcusdt:binance->bybit"
+        assert "compact" not in payloads[0]
+        assert payloads[1]["compact"] is True
+        assert payloads[1]["suppressed_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_candidate_symbol_skipped_events_are_compacted(
+        self, runtime_with_l2,
+        monkeypatch,
+    ):
+        import json
+        from lightfee.core.domain import Venue
+
+        rt = runtime_with_l2
+        c = self._make_real_candidate(
+            symbol="SKIPCOMPACTUSDT",
+            pair_id="skipcompactusdt:binance->bybit",
+        )
+        monkeypatch.setattr(rt, "get_venue_adapter", lambda _venue: object())
+
+        async def fake_supported_symbols(venue, _adapter, symbols, *, skip_event_kind=""):
+            if venue == Venue.BYBIT:
+                return []
+            return list(symbols)
+
+        monkeypatch.setattr(
+            rt,
+            "_filter_symbols_supported_by_venue",
+            fake_supported_symbols,
+        )
+        times = iter([1_000, 2_000, 61_000])
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: next(times),
+        )
+
+        rt.journal.open()
+        try:
+            for _ in range(3):
+                assert await rt._filter_candidates_supported_by_venue_catalog([c]) == []
+        finally:
+            rt.journal.close()
+
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payloads = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.candidate_symbol_skipped"
+        ]
+        assert len(payloads) == 2
+        assert payloads[0]["pair_id"] == "skipcompactusdt:binance->bybit"
+        assert "compact" not in payloads[0]
+        assert payloads[1]["compact"] is True
+        assert payloads[1]["suppressed_count"] == 1
+
     # ------------------------------------------------------------------
     # Non-red-light: tests that should already pass (smoke)
     # ------------------------------------------------------------------
