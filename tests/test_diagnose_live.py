@@ -771,6 +771,40 @@ def test_exchange_truth_classifies_unsupported_position_symbol_as_flat_with_evid
     assert "Instrument ID does not exist" in evidence["PRLUSDT"]["error"]
 
 
+def test_exchange_truth_classifies_okx_instrument_missing_metadata_as_flat():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        def _venue_symbol(self, symbol):
+            assert symbol == "PRLUSDT"
+            return "PRL-USDT-SWAP"
+
+    class FakeAdapter:
+        venue = "okx"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+        async def fetch_position(self, symbol):
+            raise RuntimeError(
+                "okx_contract_metadata_missing_ct_val "
+                "classification=instrument_missing instId=PRL-USDT-SWAP"
+            )
+
+    adapter = FakeAdapter()
+
+    positions, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_positions(adapter, ["PRLUSDT"])
+    )
+
+    assert positions == {}
+    assert succeeded == {"PRLUSDT"}
+    assert failed == set()
+    assert evidence["PRLUSDT"]["classification"] == "unsupported_symbol_flat"
+    assert evidence["PRLUSDT"]["venue_symbol"] == "PRL-USDT-SWAP"
+
+
 def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):
     from scripts import diagnose_live as dl
 
