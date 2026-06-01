@@ -546,6 +546,50 @@ class LiveRuntime:
                 budgets.append(parsed)
         return min(budgets) if budgets else 0
 
+    def _entry_ws_bbo_subscription_blocker(
+        self,
+        candidate: Any,
+    ) -> tuple[str | None, dict[str, Any]]:
+        if (
+            not self._entry_readiness_provider_uses_ws_bbo()
+            or self.config.runtime.mode != "live"
+        ):
+            return None, {}
+
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+        long_venue = str(getattr(candidate, "long_venue", "") or "").strip().lower()
+        short_venue = str(getattr(candidate, "short_venue", "") or "").strip().lower()
+        if not symbol or not long_venue or not short_venue:
+            return None, {}
+
+        cache = getattr(self, "ws_bbo_cache", None)
+        data_plane = getattr(self, "ws_bbo_data_plane", None)
+        if data_plane is None or not hasattr(data_plane, "stream_state"):
+            return None, {}
+
+        long_quote = cache.get_quote(long_venue, symbol) if cache is not None else None
+        short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
+        long_state = data_plane.stream_state(long_venue, symbol)
+        short_state = data_plane.stream_state(short_venue, symbol)
+        missing_long_subscription = (
+            long_quote is None and not bool(long_state.get("tracked"))
+        )
+        missing_short_subscription = (
+            short_quote is None and not bool(short_state.get("tracked"))
+        )
+        if not missing_long_subscription and not missing_short_subscription:
+            return None, {}
+
+        return "entry_ws_bbo_quote_lease_waiting_for_subscription", {
+            "provider": "ws_bbo_quote_lease",
+            "source": "ws_bbo_subscription",
+            "symbol": symbol,
+            "missing_long_subscription": missing_long_subscription,
+            "missing_short_subscription": missing_short_subscription,
+            "long_stream_state": long_state,
+            "short_stream_state": short_state,
+        }
+
     def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
         """Return the minimum notional value for a venue/symbol pair.
 
@@ -10618,15 +10662,19 @@ class LiveRuntime:
                 else None
             )
             if not blocker:
-                readiness = self.entry_readiness_provider.decide(
-                    candidate,
-                    now_ms,
-                    market_quotes=market_quotes,
+                blocker, readiness_evidence = (
+                    self._entry_ws_bbo_subscription_blocker(candidate)
                 )
-                readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
-                blocker = None if readiness.allowed else (
-                    readiness.reason or "entry_readiness_provider_denied"
-                )
+                if not blocker:
+                    readiness = self.entry_readiness_provider.decide(
+                        candidate,
+                        now_ms,
+                        market_quotes=market_quotes,
+                    )
+                    readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
+                    blocker = None if readiness.allowed else (
+                        readiness.reason or "entry_readiness_provider_denied"
+                    )
             if blocker:
                 blocker_str = str(blocker)
                 # Admission buckets (not primary tracked) vs readiness failures

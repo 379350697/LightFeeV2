@@ -223,7 +223,7 @@ class StrategyConfig:
     maker_leg_default: str = "buy"
     entry_readiness_provider: str = "local_l2"
     entry_quote_lease_ttl_ms: int = 1500
-    entry_ws_bbo_per_venue_budget: int = 4
+    entry_ws_bbo_per_venue_budget: int = 10
     local_l2_enabled: bool = True
     local_l2_ws_enabled: bool = True  # WS L2 delta streaming
     bybit_local_l2_depth: int = 50

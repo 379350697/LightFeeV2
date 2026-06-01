@@ -2891,6 +2891,78 @@ class TestEntryReadinessProviderFactory:
         assert evidence["provider"] == "ws_bbo_quote_lease"
         assert evidence["long_stream_state"]["last_error"] == "ConnectionError: test-stream-down"
 
+    def test_ws_bbo_quote_lease_blocks_untracked_candidate_before_provider_missing_quote(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        provider_calls = []
+        original_decide = rt.entry_readiness_provider.decide
+
+        def capture_decide(*args, **kwargs):
+            provider_calls.append(args)
+            return original_decide(*args, **kwargs)
+
+        rt.entry_readiness_provider.decide = capture_decide
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert provider_calls == []
+        assert selection == Counter({
+            "entry_ws_bbo_quote_lease_waiting_for_subscription": 1,
+        })
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": (
+                "entry_ws_bbo_quote_lease_waiting_for_subscription"
+            ),
+        }
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        assert payload["reason"] == "entry_ws_bbo_quote_lease_waiting_for_subscription"
+        evidence = payload["readiness_evidence"]
+        assert evidence["provider"] == "ws_bbo_quote_lease"
+        assert evidence["missing_long_subscription"] is True
+        assert evidence["missing_short_subscription"] is True
+        assert evidence["long_stream_state"]["tracked"] is False
+        assert evidence["short_stream_state"]["tracked"] is False
+
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_activation_does_not_create_local_l2_books(
         self,

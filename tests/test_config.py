@@ -169,6 +169,9 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert any("entry_ws_bbo_per_venue_budget" in i for i in issues)
 
+    def test_ws_bbo_per_venue_budget_default_is_ten(self):
+        assert StrategyConfig().entry_ws_bbo_per_venue_budget == 10
+
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])
         issues = validate_config(config)
