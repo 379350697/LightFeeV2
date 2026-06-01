@@ -39,6 +39,9 @@ price and finalize by V1 quantity+price semantics.
   recovery unreachable on restart. Retry startup recovery for old blocks when
   recovery work still exists, while preserving operator-requested fail-closed
   and blocks created by the current startup probe.
+- Drift cleanup submit/fill evidence is not enough to declare correction
+  failure when live truth already proves both legs are back to the target
+  balanced quantity.
 
 ## Attempts Ledger
 
@@ -48,7 +51,7 @@ price and finalize by V1 quantity+price semantics.
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
 | 2026-05-30 | ORCA/NOM/RAVE post-deploy live-truth watch | deployed/probe verified | Current probes are flat/no-open-orders; no local false-flat state found. Future recurrence still needs fixture classification instead of widening local heuristics. |
-| 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, planned hedge CID finalize query, and stale recovery-block retry | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; stale fail-closed recovery blocks no longer make pending-entry recovery unreachable; finalize no longer queries a planned-only hedge CID. |
+| 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, stale recovery-block retry, drift false-negative verification, and planned hedge CID finalize query | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; stale fail-closed recovery blocks no longer make pending-entry recovery unreachable; post-cleanup live truth can verify drift correction when synchronous fill evidence is incomplete; finalize no longer queries a planned-only hedge CID. |
 
 ## Recurrences
 
@@ -56,7 +59,7 @@ price and finalize by V1 quantity+price semantics.
 |---|---|---|---|---|
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
-| 2026-06-01 | `ARIAUSDT` Bybit/Binance | local fix pending deploy | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable until startup recovery gating was corrected | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
+| 2026-06-01 | `ARIAUSDT` Bybit/Binance | local fix pending deploy | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
 
 ## Regression Harness
 
@@ -71,5 +74,6 @@ price and finalize by V1 quantity+price semantics.
 2. Search for stale accepted maker evidence and planned hedge CID lookups.
 3. Verify whether any live position proof contains enough quantity and price evidence to hydrate pending fills.
 4. Check whether `recovery_blocked_reason` is preventing startup recovery from running against retained pending work.
-5. If local is flat and exchange nonzero, treat as critical false-green until reduce-only cleanup or fail-closed retention proves safe.
-6. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
+5. After reduce-only cleanup failure/uncertain evidence, re-probe live truth before accepting a fail-closed drift latch.
+6. If local is flat and exchange nonzero, treat as critical false-green until reduce-only cleanup or fail-closed retention proves safe.
+7. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.

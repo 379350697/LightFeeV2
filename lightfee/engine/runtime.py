@@ -1920,15 +1920,28 @@ class LiveRuntime:
 
             expected_long = abs(position.long_quantity or position.matched_quantity)
             expected_short = abs(position.short_quantity or position.matched_quantity)
-            long_valid_qty = (
-                abs(long_pos.quantity)
-                if long_pos.side == Side.BUY and abs(long_pos.quantity) > 1e-9
-                else 0.0
-            )
-            short_valid_qty = (
-                abs(short_pos.quantity)
-                if short_pos.side == Side.SELL and abs(short_pos.quantity) > 1e-9
-                else 0.0
+
+            def valid_live_quantities(
+                long_snapshot: PositionSnapshot,
+                short_snapshot: PositionSnapshot,
+            ) -> tuple[float, float]:
+                long_qty = (
+                    abs(long_snapshot.quantity)
+                    if long_snapshot.side == Side.BUY
+                    and abs(long_snapshot.quantity) > 1e-9
+                    else 0.0
+                )
+                short_qty = (
+                    abs(short_snapshot.quantity)
+                    if short_snapshot.side == Side.SELL
+                    and abs(short_snapshot.quantity) > 1e-9
+                    else 0.0
+                )
+                return long_qty, short_qty
+
+            long_valid_qty, short_valid_qty = valid_live_quantities(
+                long_pos,
+                short_pos,
             )
 
             if (
@@ -1986,6 +1999,53 @@ class LiveRuntime:
                     position.position_id,
                     "runtime_drift_flatten_short",
                 )
+
+            if long_ok is not True or short_ok is not True:
+                try:
+                    refreshed_long_pos = await long_adapter.fetch_position(
+                        position.symbol
+                    )
+                    refreshed_short_pos = await short_adapter.fetch_position(
+                        position.symbol
+                    )
+                    refreshed_long_qty, refreshed_short_qty = valid_live_quantities(
+                        refreshed_long_pos,
+                        refreshed_short_pos,
+                    )
+                    if (
+                        abs(refreshed_long_qty - balanced_quantity) <= 1e-9
+                        and abs(refreshed_short_qty - balanced_quantity) <= 1e-9
+                    ):
+                        long_pos = refreshed_long_pos
+                        short_pos = refreshed_short_pos
+                        long_valid_qty = refreshed_long_qty
+                        short_valid_qty = refreshed_short_qty
+                        long_ok = True
+                        short_ok = True
+                        self.journal.append(
+                            "runtime.position_drift_correction_verified",
+                            {
+                                "position_id": position.position_id,
+                                "symbol": position.symbol,
+                                "source": "post_flatten_live_truth",
+                                "balanced_quantity": balanced_quantity,
+                                "long_flatten_result": long_ok,
+                                "short_flatten_result": short_ok,
+                                "live_long_quantity": long_valid_qty,
+                                "live_short_quantity": short_valid_qty,
+                                "ts_ms": now_ms,
+                            },
+                        )
+                except Exception as e:
+                    self.journal.append(
+                        "runtime.position_drift_correction_verify_error",
+                        {
+                            "position_id": position.position_id,
+                            "symbol": position.symbol,
+                            "error": str(e),
+                            "ts_ms": now_ms,
+                        },
+                    )
 
             if long_ok is not True or short_ok is not True:
                 enter_fail_closed(self.state)

@@ -31,7 +31,7 @@ from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from tests.fake_adapters import FakeVenueAdapter, make_uncertain_error
+from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
 
 
 def make_test_config(temp_dir: str) -> AppConfig:
@@ -1704,6 +1704,89 @@ class TestRuntimePreflight:
             assert binance.last_request.price is None
             assert binance.last_request.client_order_id
             assert okx.place_order_call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_active_position_drift_verifies_live_truth_after_false_negative_flatten(self):
+        """A reduce-only cleanup can be live-effective before fill evidence is complete."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+            await runtime.start()
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.03,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010500,
+                ),
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010500,
+                ),
+            ]
+            binance.place_order_outcomes = [
+                make_fake_fill(
+                    Venue.BINANCE,
+                    "BTCUSDT",
+                    Side.SELL,
+                    quantity=0.0,
+                    price=65000.0,
+                )
+            ]
+            runtime.state.open_positions["pos-1"] = OpenPosition(
+                position_id="pos-1",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.05,
+                short_quantity=0.05,
+                long_entry_price=65000.0,
+                short_entry_price=65010.0,
+                opened_at_ms=1700000000000,
+                matched_quantity=0.05,
+            )
+
+            await runtime.tick_active_positions()
+            await runtime.stop()
+
+            pos = runtime.state.open_positions["pos-1"]
+            assert pos.matched_quantity == pytest.approx(0.03)
+            assert pos.long_quantity == pytest.approx(0.03)
+            assert pos.short_quantity == pytest.approx(0.03)
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            kinds = [event["kind"] for event in runtime.journal.read_all()]
+            assert "runtime.position_drift_correction_verified" in kinds
+            assert "runtime.position_drift_correction_failed" not in kinds
 
     @pytest.mark.asyncio
     async def test_active_position_drift_removes_position_when_exchange_flat(self):
