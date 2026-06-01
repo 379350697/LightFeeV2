@@ -6084,8 +6084,10 @@ class LiveRuntime:
         still fill). We approximate this by checking for an active hedge
         order id with uncertain outcome.
         """
-        # V1: skip hydration while hedge is inflight
-        if pending.uncertain_outcome and pending.hedge_order_id:
+        # V1: skip hydration while a hedge is actively inflight. A restored
+        # hedge order id alone is not active-order evidence; live/open-order
+        # truth below decides whether it is safe to hydrate.
+        if pending.uncertain_outcome and pending.hedge_inflight is not None:
             return False
 
         try:
@@ -6112,6 +6114,114 @@ class LiveRuntime:
 
             live_balanced = min(long_pos.quantity, short_pos.quantity)
             current_balanced = min(pending.maker_leg_filled, pending.hedge_leg_filled)
+            live_imbalanced = abs(long_pos.quantity - short_pos.quantity) > 1e-9
+            local_overstates_live = (
+                pending.maker_leg_filled > live_balanced + 1e-9
+                or pending.hedge_leg_filled > live_balanced + 1e-9
+            )
+            if live_imbalanced and local_overstates_live and live_balanced > 1e-9:
+                try:
+                    long_open_orders = await self._fetch_residual_repair_open_orders(
+                        long_adapter,
+                        pending.long_venue,
+                        pending.symbol,
+                    )
+                    short_open_orders = await self._fetch_residual_repair_open_orders(
+                        short_adapter,
+                        pending.short_venue,
+                        pending.symbol,
+                    )
+                except Exception as exc:
+                    self.journal.append(
+                        "pending_entry.live_position_imbalanced_hydration_blocked",
+                        {
+                            "entry_id": pending.pending_id,
+                            "symbol": pending.symbol,
+                            "reason": "open_order_truth_unavailable",
+                            "error": str(exc),
+                        },
+                    )
+                    return False
+                if long_open_orders or short_open_orders:
+                    self.journal.append(
+                        "pending_entry.live_position_imbalanced_hydration_blocked",
+                        {
+                            "entry_id": pending.pending_id,
+                            "symbol": pending.symbol,
+                            "reason": "open_orders_present",
+                            "long_open_order_count": len(long_open_orders),
+                            "short_open_order_count": len(short_open_orders),
+                        },
+                    )
+                    return False
+
+                before_maker = float(pending.maker_leg_filled or 0.0)
+                before_hedge = float(pending.hedge_leg_filled or 0.0)
+                before_target = float(pending.target_quantity or 0.0)
+                before_maker_price = float(pending.maker_fill_price or 0.0)
+                before_hedge_price = float(pending.hedge_fill_price or 0.0)
+
+                if pending.maker_leg == "short":
+                    maker_live_position = short_pos
+                    hedge_live_position = long_pos
+                    maker_price_source = short_pos.entry_price
+                    hedge_price_source = long_pos.entry_price
+                else:
+                    maker_live_position = long_pos
+                    hedge_live_position = short_pos
+                    maker_price_source = long_pos.entry_price
+                    hedge_price_source = short_pos.entry_price
+
+                pending.maker_leg_filled = live_balanced
+                pending.hedge_leg_filled = live_balanced
+                pending.target_quantity = live_balanced
+                if pending.maker_fill_price <= 0:
+                    if maker_price_source > 0:
+                        pending.maker_fill_price = float(maker_price_source)
+                    elif float(getattr(pending, "maker_price", 0.0) or 0.0) > 0:
+                        pending.maker_fill_price = float(pending.maker_price)
+                if pending.hedge_fill_price <= 0 and hedge_price_source > 0:
+                    pending.hedge_fill_price = float(hedge_price_source)
+                pending.uncertain_outcome = False
+                pending.outcome = "filled"
+
+                self.journal.append(
+                    "pending_entry.live_position_imbalanced_hydrated",
+                    {
+                        "entry_id": pending.pending_id,
+                        "symbol": pending.symbol,
+                        "long_venue": pending.long_venue.value,
+                        "short_venue": pending.short_venue.value,
+                        "maker_leg": pending.maker_leg,
+                        "before_maker_leg_filled": before_maker,
+                        "before_hedge_leg_filled": before_hedge,
+                        "before_target_quantity": before_target,
+                        "after_maker_leg_filled": pending.maker_leg_filled,
+                        "after_hedge_leg_filled": pending.hedge_leg_filled,
+                        "after_target_quantity": pending.target_quantity,
+                        "before_maker_fill_price": before_maker_price,
+                        "before_hedge_fill_price": before_hedge_price,
+                        "after_maker_fill_price": pending.maker_fill_price,
+                        "after_hedge_fill_price": pending.hedge_fill_price,
+                        "live_balanced_quantity": live_balanced,
+                        "live_long_excess_quantity": max(0.0, long_pos.quantity - live_balanced),
+                        "live_short_excess_quantity": max(0.0, short_pos.quantity - live_balanced),
+                        "live_positions": {
+                            "long": self._position_snapshot_evidence(long_pos),
+                            "short": self._position_snapshot_evidence(short_pos),
+                        },
+                        "maker_live_position": self._position_snapshot_evidence(
+                            maker_live_position
+                        ),
+                        "hedge_live_position": self._position_snapshot_evidence(
+                            hedge_live_position
+                        ),
+                        "open_order_truth": "flat",
+                        "quantity_source": "live_exchange_position_truth_imbalanced",
+                    },
+                )
+                return True
+
             if live_balanced <= current_balanced + 1e-9:
                 return False
 

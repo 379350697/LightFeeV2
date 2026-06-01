@@ -24,6 +24,10 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 - A balanced pending entry with only an untradeable hedge dust residual must
   terminalize the dust and finalize the balanced open position; otherwise
   live-truth drift repair cannot act on exchange excess.
+- If startup live truth is imbalanced but both legs have trusted positions and
+  no open orders, hydrate/finalize the balanced quantity and let live-truth
+  drift repair close the excess side. Do not treat the excess as new missing
+  hedge demand.
 - Planned hedge client IDs are not submitted-order evidence. They must not be
   queried during finalize unless the hedge has an order id, inflight record,
   attempt count, or fill evidence.
@@ -36,7 +40,7 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
 | 2026-05-30 | ORCA/NOM/RAVE post-deploy live-truth watch | deployed/probe verified | Current probes are flat/no-open-orders; no local false-flat state found. Future recurrence still needs fixture classification instead of widening local heuristics. |
-| 2026-06-01 | ARIA under-min hedge dust and planned hedge CID finalize query | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; finalize no longer queries a planned-only hedge CID. |
+| 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, and planned hedge CID finalize query | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; finalize no longer queries a planned-only hedge CID. |
 
 ## Recurrences
 

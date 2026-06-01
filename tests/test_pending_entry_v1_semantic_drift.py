@@ -87,6 +87,11 @@ class _LivePositionAdapter(_NoFillReconciliationAdapter):
         return self.position
 
 
+class _LivePositionOpenOrdersAdapter(_LivePositionAdapter):
+    async def fetch_open_orders(self, symbol):
+        return []
+
+
 class _NormalizingAdapter(_NoFillReconciliationAdapter):
     def __init__(self, *, normalized_quantity: float):
         self.normalized_quantity = normalized_quantity
@@ -651,6 +656,68 @@ async def test_startup_recovery_under_min_hedge_residual_finalizes_balanced_posi
         if event["kind"] == "pending_entry.hedge_residual_below_min_notional_terminalized"
     ][-1]
     assert payload["source"] == "startup_recovery"
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_imbalanced_live_truth_finalizes_balanced_position(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ARIAUSDT",
+                side=Side.BUY,
+                quantity=1238.0,
+                entry_price=0.0,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="ARIAUSDT",
+                side=Side.SELL,
+                quantity=619.0,
+                entry_price=0.0387,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-aria-live-imbalanced",
+        symbol="ARIAUSDT",
+        target_quantity=619.0353366004643,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=1238.0,
+        hedge_leg_filled=619.0,
+        maker_price=0.03883,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.0387,
+        maker_order_id="bybit-maker-filled",
+        hedge_order_id="entry-aria-live-imbalanced-recovery-short",
+        uncertain_outcome=True,
+        created_at_ms=1000,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._recover_pending_entry_hedges(now_ms=200_000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(619.0)
+    assert opened.long_quantity == pytest.approx(619.0)
+    assert opened.short_quantity == pytest.approx(619.0)
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "pending_entry.live_position_imbalanced_hydrated" in kinds
+    finalized = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.pending_entry_finalized"
+    ][-1]
+    assert finalized["finalized_as"] == "open_position"
 
 
 @pytest.mark.asyncio
