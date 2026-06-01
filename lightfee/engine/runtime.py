@@ -139,6 +139,8 @@ class LiveRuntime:
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
+        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
+        self.entry_readiness_provider = LocalL2EntryReadinessProvider(self)
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
         self._last_entry_l2_readiness_diag_fingerprint: str = ""
@@ -10079,7 +10081,17 @@ class LiveRuntime:
                 continue
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._candidate_pair_id(candidate)
-            blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
+            first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
+            blocker = (
+                self._entry_finalization_window_blocker(first_funding_ts, now_ms)
+                if first_funding_ts > 0
+                else None
+            )
+            if not blocker:
+                readiness = self.entry_readiness_provider.decide(candidate, now_ms)
+                blocker = None if readiness.allowed else (
+                    readiness.reason or "entry_readiness_provider_denied"
+                )
             if blocker:
                 blocker_str = str(blocker)
                 # Admission buckets (not primary tracked) vs readiness failures

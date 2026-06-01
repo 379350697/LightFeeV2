@@ -874,7 +874,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt = runtime_with_l2
         c = self._make_real_candidate(
             pair_id="btcusdt:binance->bybit",
-            first_funding_timestamp_ms=900_000,
+            first_funding_timestamp_ms=400_000,
             entry_notional_quote=50.0,
         )
         monkeypatch.setattr(
@@ -2257,6 +2257,176 @@ class TestPrimaryTrackingAdmission:
         assert admission.get("entry_local_l2_waiting_for_primary_tracking", 0) == 1
         # The tracked candidate is blocked by dual_ready (readiness failure)
         assert selection.get("entry_local_l2_waiting_for_dual_ready", 0) == 1
+        rt.journal.close()
+
+
+class TestEntryReadinessProviderBoundary:
+    """Entry selection must depend on an injectable readiness provider boundary."""
+
+    def test_select_entry_candidates_uses_injected_provider(self, tmp_path):
+        """A non-local-L2 provider can approve a candidate without primary tracking."""
+        from collections import Counter
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
+        from lightfee.engine.runtime import LiveRuntime
+
+        class AllowProvider:
+            def __init__(self):
+                self.calls = []
+
+            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+                self.calls.append((candidate, now_ms))
+                return EntryReadinessDecision.allow(
+                    symbol=str(getattr(candidate, "symbol", "")),
+                    pair_id=str(getattr(candidate, "pair_id", "")),
+                )
+
+        journal = tmp_path / "events.jsonl"
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(journal),
+        )
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        provider = AllowProvider()
+        rt.entry_readiness_provider = provider
+
+        now_ms = 1778985600000
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+
+        admission: Counter = Counter()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=selection,
+            candidate_blockers=blockers,
+            admission_blocker_counts=admission,
+        )
+
+        assert selected == [candidate]
+        assert provider.calls == [(candidate, now_ms)]
+        assert admission == Counter()
+        assert selection == Counter()
+        assert blockers == {}
+        rt.journal.close()
+
+    def test_injected_provider_cannot_bypass_finalization_window(self, tmp_path):
+        """Strategy timing gates stay outside the replaceable readiness provider."""
+        from collections import Counter
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
+        from lightfee.engine.runtime import LiveRuntime
+
+        class AllowProvider:
+            def __init__(self):
+                self.calls = []
+
+            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+                self.calls.append((candidate, now_ms))
+                return EntryReadinessDecision.allow(
+                    symbol=str(getattr(candidate, "symbol", "")),
+                    pair_id=str(getattr(candidate, "pair_id", "")),
+                )
+
+        journal = tmp_path / "events.jsonl"
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(journal),
+        )
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        provider = AllowProvider()
+        rt.entry_readiness_provider = provider
+
+        now_ms = 1778985600000
+        too_early_ms = (
+            now_ms + (int(config.strategy.entry_window_secs) * 1000) + 1
+        )
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=too_early_ms,
+        )
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=selection,
+            candidate_blockers=blockers,
+        )
+
+        assert selected == []
+        assert provider.calls == []
+        assert selection == Counter({
+            "entry_waiting_for_finalization_window_too_early": 1,
+        })
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": (
+                "entry_waiting_for_finalization_window_too_early"
+            ),
+        }
+        rt.journal.close()
+
+    def test_provider_denial_without_reason_fails_closed(self, tmp_path):
+        """Provider mistakes must not silently approve an entry candidate."""
+        from collections import Counter
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
+        from lightfee.engine.runtime import LiveRuntime
+
+        class EmptyReasonDenyProvider:
+            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+                return EntryReadinessDecision(
+                    allowed=False,
+                    symbol=str(getattr(candidate, "symbol", "")),
+                    pair_id=str(getattr(candidate, "pair_id", "")),
+                )
+
+        journal = tmp_path / "events.jsonl"
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(journal),
+        )
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        rt.entry_readiness_provider = EmptyReasonDenyProvider()
+
+        now_ms = 1778985600000
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=selection,
+            candidate_blockers=blockers,
+        )
+
+        assert selected == []
+        assert selection == Counter({"entry_readiness_provider_denied": 1})
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": "entry_readiness_provider_denied",
+        }
         rt.journal.close()
 
 
