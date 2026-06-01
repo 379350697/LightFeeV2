@@ -442,6 +442,63 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         }
 
 
+class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
+    """Readiness provider backed by independent per-venue WS BBO quotes."""
+
+    provider_name = "ws_bbo_quote_lease"
+    reason_prefix = "entry_ws_bbo_quote_lease"
+
+    def _validate_quotes(
+        self,
+        candidate: Any,
+        now_ms: int,
+        market_quotes: Any,
+    ) -> EntryReadinessDecision | tuple[str, str, Any, Any]:
+        if self._runtime.config.runtime.mode != "live":
+            symbol = str(getattr(candidate, "symbol", ""))
+            pair_id = self._runtime._candidate_pair_id(candidate)
+            return EntryReadinessDecision.allow(
+                symbol=symbol,
+                pair_id=pair_id,
+                evidence={"provider": self.provider_name, "mode": "paper"},
+            )
+
+        symbol = str(getattr(candidate, "symbol", ""))
+        pair_id = self._runtime._candidate_pair_id(candidate)
+        long_venue = str(getattr(candidate, "long_venue", ""))
+        short_venue = str(getattr(candidate, "short_venue", ""))
+        cache = getattr(self._runtime, "ws_bbo_cache", None)
+        long_quote = cache.get_quote(long_venue, symbol) if cache is not None else None
+        short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
+        if long_quote is None or short_quote is None:
+            return EntryReadinessDecision.block(
+                self._reason("missing_quote"),
+                symbol=symbol,
+                pair_id=pair_id,
+                evidence={
+                    "provider": self.provider_name,
+                    "missing_long_quote": long_quote is None,
+                    "missing_short_quote": short_quote is None,
+                    "source": "ws_bbo_cache",
+                },
+            )
+
+        quote_error = (
+            self._quote_error(long_quote, "ask", now_ms)
+            or self._quote_error(short_quote, "bid", now_ms)
+        )
+        if quote_error:
+            reason, evidence = quote_error
+            evidence.update({"provider": self.provider_name, "source": "ws_bbo_cache"})
+            return EntryReadinessDecision.block(
+                reason,
+                symbol=symbol,
+                pair_id=pair_id,
+                evidence=evidence,
+            )
+        return symbol, pair_id, long_quote, short_quote
+
+
 def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
     provider = str(
         getattr(runtime.config.strategy, "entry_readiness_provider", "local_l2") or "local_l2"
@@ -454,6 +511,8 @@ def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
         return QuoteLeaseEntryReadinessProvider(runtime)
     if provider == "ws_top_book":
         return WsTopBookEntryReadinessProvider(runtime)
+    if provider == "ws_bbo_quote_lease":
+        return WsBboQuoteLeaseEntryReadinessProvider(runtime)
     raise ValueError(
         "unknown entry_readiness_provider "
         f"{provider!r}; expected one of {list(ENTRY_READINESS_PROVIDERS)}"

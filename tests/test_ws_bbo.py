@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+
+def test_ws_bbo_cache_returns_fresh_quote_and_rejects_stale():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=50000.0,
+            ask=50001.0,
+            bid_size=2.0,
+            ask_size=3.0,
+            observed_at_ms=1000,
+            received_at_ms=1001,
+            source="binance_book_ticker",
+        )
+    )
+
+    fresh = cache.fresh_quote("BINANCE", "btcusdt", now_ms=1200, max_age_ms=500)
+    stale = cache.fresh_quote("binance", "BTCUSDT", now_ms=1800, max_age_ms=500)
+
+    assert fresh is not None
+    assert fresh.bid == 50000.0
+    assert stale is None
+
+
+def test_binance_book_ticker_parser_uses_best_bid_and_ask():
+    from lightfee.marketdata.ws_bbo import BinanceBboWsClient, VenueBboCache
+
+    client = BinanceBboWsClient("binance", "BTCUSDT", VenueBboCache())
+    quote = client.parse_bbo_message(
+        {
+            "e": "bookTicker",
+            "E": 1568014460893,
+            "s": "BTCUSDT",
+            "b": "25.35190000",
+            "B": "31.21000000",
+            "a": "25.36520000",
+            "A": "40.66000000",
+        },
+        received_at_ms=1568014460900,
+    )
+
+    assert quote is not None
+    assert quote.venue == "binance"
+    assert quote.symbol == "BTCUSDT"
+    assert quote.bid == 25.3519
+    assert quote.ask == 25.3652
+    assert quote.observed_at_ms == 1568014460893
+
+
+def test_okx_tickers_parser_uses_venue_symbol_mapping():
+    from lightfee.marketdata.ws_bbo import OkxBboWsClient, VenueBboCache
+
+    client = OkxBboWsClient(
+        "okx",
+        "BTCUSDT",
+        VenueBboCache(),
+        venue_symbol="BTC-USDT-SWAP",
+    )
+    quote = client.parse_bbo_message(
+        {
+            "arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+            "data": [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "bidPx": "8888.88",
+                    "bidSz": "11",
+                    "askPx": "8889.99",
+                    "askSz": "8",
+                    "ts": "1597026383085",
+                }
+            ],
+        },
+        received_at_ms=1597026383090,
+    )
+
+    assert quote is not None
+    assert quote.symbol == "BTCUSDT"
+    assert quote.bid == 8888.88
+    assert quote.ask == 8889.99
+    assert quote.observed_at_ms == 1597026383085
+
+
+def test_bybit_ticker_delta_keeps_previous_bid_or_ask_until_both_present():
+    from lightfee.marketdata.ws_bbo import BybitBboWsClient, VenueBboCache
+
+    client = BybitBboWsClient("bybit", "BTCUSDT", VenueBboCache())
+    snapshot = client.parse_bbo_message(
+        {
+            "topic": "tickers.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1672326490000,
+            "data": {
+                "symbol": "BTCUSDT",
+                "bid1Price": "16600.0",
+                "bid1Size": "5",
+                "ask1Price": "16601.0",
+                "ask1Size": "4",
+            },
+        },
+        received_at_ms=1672326490001,
+    )
+    delta = client.parse_bbo_message(
+        {
+            "topic": "tickers.BTCUSDT",
+            "type": "delta",
+            "ts": 1672326490100,
+            "data": {"symbol": "BTCUSDT", "ask1Price": "16602.0"},
+        },
+        received_at_ms=1672326490101,
+    )
+
+    assert snapshot is not None
+    assert delta is not None
+    assert delta.bid == 16600.0
+    assert delta.ask == 16602.0
+
+
+def test_bitget_ticker_parser_accepts_classic_contract_fields():
+    from lightfee.marketdata.ws_bbo import BitgetBboWsClient, VenueBboCache
+
+    client = BitgetBboWsClient("bitget", "BTCUSDT", VenueBboCache())
+    quote = client.parse_bbo_message(
+        {
+            "arg": {"instType": "USDT-FUTURES", "channel": "ticker", "instId": "BTCUSDT"},
+            "data": [
+                {
+                    "instId": "BTCUSDT",
+                    "bidPr": "87673.6",
+                    "bidSz": "6.9129",
+                    "askPr": "87673.7",
+                    "askSz": "14.333",
+                    "ts": "1766674540816",
+                }
+            ],
+        },
+        received_at_ms=1766674540817,
+    )
+
+    assert quote is not None
+    assert quote.bid == 87673.6
+    assert quote.ask == 87673.7
+
+
+def test_gate_book_ticker_parser_uses_futures_contract_symbol():
+    from lightfee.marketdata.ws_bbo import GateBboWsClient, VenueBboCache
+
+    client = GateBboWsClient(
+        "gate",
+        "BTCUSDT",
+        VenueBboCache(),
+        venue_symbol="BTC_USDT",
+    )
+    quote = client.parse_bbo_message(
+        {
+            "time": 1615366379,
+            "time_ms": 1615366379123,
+            "channel": "futures.book_ticker",
+            "event": "update",
+            "result": {
+                "t": 1615366379123,
+                "s": "BTC_USDT",
+                "b": "54696.6",
+                "B": 37000,
+                "a": "54696.7",
+                "A": 47061,
+            },
+        },
+        received_at_ms=1615366379124,
+    )
+
+    assert quote is not None
+    assert quote.symbol == "BTCUSDT"
+    assert quote.bid == 54696.6
+    assert quote.ask == 54696.7
+
+
+def test_hyperliquid_bbo_parser_uses_bbo_channel():
+    from lightfee.marketdata.ws_bbo import HyperliquidBboWsClient, VenueBboCache
+
+    client = HyperliquidBboWsClient(
+        "hyperliquid",
+        "BTCUSDT",
+        VenueBboCache(),
+        venue_symbol="BTC",
+    )
+    quote = client.parse_bbo_message(
+        {
+            "channel": "bbo",
+            "data": {
+                "coin": "BTC",
+                "time": 1754450974231,
+                "bbo": [
+                    {"px": "113377.0", "sz": "7.6699"},
+                    {"px": "113397.0", "sz": "0.11543"},
+                ],
+            },
+        },
+        received_at_ms=1754450974232,
+    )
+
+    assert quote is not None
+    assert quote.bid == 113377.0
+    assert quote.ask == 113397.0

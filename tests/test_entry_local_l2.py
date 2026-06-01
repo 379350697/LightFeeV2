@@ -2727,6 +2727,163 @@ class TestEntryReadinessProviderFactory:
             "bananausdt:bybit->hyperliquid": "entry_ws_top_book_missing_ws_evidence",
         }
 
+    def test_ws_bbo_quote_lease_provider_uses_independent_cache_without_local_l2_book(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        from lightfee.engine.entry_readiness import WsBboQuoteLeaseEntryReadinessProvider
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        for venue, bid, ask in (
+            ("bybit", 99.0, 100.0),
+            ("hyperliquid", 101.0, 102.0),
+        ):
+            rt.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BANANAUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=now_ms - 100,
+                    received_at_ms=now_ms - 100,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+        )
+
+        assert isinstance(rt.entry_readiness_provider, WsBboQuoteLeaseEntryReadinessProvider)
+        assert rt.local_l2_runtime.get_book("bybit", "BANANAUSDT") is None
+        assert selected == [candidate]
+        lease = rt.entry_readiness_provider.get_lease("bananausdt:bybit->hyperliquid")
+        assert lease is not None
+        assert lease.provider == "ws_bbo_quote_lease"
+        assert lease.long_ask == 100.0
+        assert lease.short_bid == 101.0
+
+    def test_ws_bbo_quote_lease_provider_blocks_stale_cache_quote(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.runtime.max_market_age_ms = 3000
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        for venue, bid, ask, age_ms in (
+            ("bybit", 99.0, 100.0, 100),
+            ("hyperliquid", 101.0, 102.0, 5000),
+        ):
+            rt.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BANANAUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=now_ms - age_ms,
+                    received_at_ms=now_ms - age_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_ws_bbo_quote_lease_stale_quote": 1})
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_stale_quote",
+        }
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_activation_does_not_create_local_l2_books(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+
+        async def fake_connect_ws_streams():
+            return len(rt.ws_bbo_data_plane._clients)
+
+        monkeypatch.setattr(
+            rt.ws_bbo_data_plane,
+            "connect_ws_streams",
+            fake_connect_ws_streams,
+        )
+        try:
+            await rt._ensure_entry_bbo_active_for_candidates([candidate], now_ms)
+        finally:
+            rt.journal.close()
+
+        assert rt.local_l2_runtime.get_book("bybit", "BANANAUSDT") is None
+        assert rt.local_l2_runtime.get_book("hyperliquid", "BANANAUSDT") is None
+        assert set(rt.ws_bbo_data_plane._clients) == {
+            ("bybit", "BANANAUSDT"),
+            ("hyperliquid", "BANANAUSDT"),
+        }
+
 
 # ===========================================================================
 # Dual-ready book state reason taxonomy

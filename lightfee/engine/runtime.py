@@ -136,6 +136,13 @@ class LiveRuntime:
         )
         self.l2_data_plane.hot_stale_after_ms = self._configured_entry_l2_stale_after_ms(config)
 
+        from lightfee.marketdata.ws_bbo import VenueBboCache, VenueBboDataPlane
+        self.ws_bbo_cache = VenueBboCache()
+        self.ws_bbo_data_plane = VenueBboDataPlane(
+            cache=self.ws_bbo_cache,
+            journal=self.journal,
+        )
+
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
@@ -505,6 +512,18 @@ class LiveRuntime:
 
     def get_venue_adapters(self) -> dict[Venue, VenueAdapter]:
         return dict(self._venue_adapters)
+
+    def _entry_readiness_provider_name(self) -> str:
+        return str(
+            getattr(self.config.strategy, "entry_readiness_provider", "local_l2")
+            or "local_l2"
+        ).strip().lower()
+
+    def _entry_readiness_provider_uses_local_l2(self) -> bool:
+        return self._entry_readiness_provider_name() in {"local_l2", "ws_top_book"}
+
+    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
+        return self._entry_readiness_provider_name() == "ws_bbo_quote_lease"
 
     def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
         """Return the minimum notional value for a venue/symbol pair.
@@ -2462,6 +2481,104 @@ class LiveRuntime:
             retained_max_age_ms=max(stale_after_ms, 300_000),
         )
 
+    async def _ensure_entry_bbo_active_for_candidates(
+        self,
+        candidates,
+        now_ms: int,
+    ) -> None:
+        """Start independent per-venue BBO streams for entry candidates.
+
+        This is separate from LocalL2Runtime: it does not create books, bootstrap
+        snapshots, replay deltas, or update entry L2 sessions.
+        """
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return
+        if self.config.runtime.mode == "paper":
+            return
+
+        needed: dict[str, set[str]] = {}
+        tracked_keys: set[tuple[str, str]] = set()
+        for candidate in list(candidates or []):
+            symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+            if not symbol:
+                continue
+            for raw_venue in (
+                getattr(candidate, "long_venue", ""),
+                getattr(candidate, "short_venue", ""),
+            ):
+                venue = str(raw_venue or "").strip().lower()
+                if not venue:
+                    continue
+                needed.setdefault(venue, set()).add(symbol)
+                tracked_keys.add((venue, symbol))
+
+        if not needed:
+            self.ws_bbo_data_plane.prune_untracked_quotes(
+                tracked_keys,
+                now_ms,
+                retained_max_age_ms=300_000,
+            )
+            return
+
+        per_venue_budget = max(
+            getattr(self.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
+            1,
+        )
+        registered_total = 0
+        registered_venues: set[str] = set()
+        for venue_str, symbols in needed.items():
+            symbols_list = sorted(symbols)[:per_venue_budget]
+            if not symbols_list:
+                continue
+            adapter = None
+            venue_enum = None
+            try:
+                venue_enum = Venue.from_str(venue_str)
+                adapter = (
+                    self.get_venue_adapter(venue_enum)
+                    if venue_enum in self._venue_adapters
+                    else None
+                )
+            except (ValueError, KeyError):
+                adapter = None
+
+            if adapter is not None and venue_enum is not None:
+                symbols_list = await self._filter_symbols_supported_by_venue(
+                    venue_enum,
+                    adapter,
+                    symbols_list,
+                    skip_event_kind="runtime.ws_bbo_symbol_skipped",
+                )
+            if not symbols_list:
+                continue
+
+            registered = self.ws_bbo_data_plane.start_ws_streams(
+                venue_str,
+                symbols_list,
+                adapter=adapter,
+            )
+            if registered > 0:
+                registered_total += registered
+                registered_venues.add(venue_str)
+
+        if registered_total > 0:
+            connected = await self.ws_bbo_data_plane.connect_ws_streams()
+            self.journal.append(
+                "runtime.ws_bbo_dynamic_ws_started",
+                {
+                    "registered_stream_count": registered_total,
+                    "connected_stream_count": connected,
+                    "venues": sorted(registered_venues),
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
+
+        self.ws_bbo_data_plane.prune_untracked_quotes(
+            tracked_keys,
+            now_ms,
+            retained_max_age_ms=300_000,
+        )
+
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot.
 
@@ -2685,15 +2802,36 @@ class LiveRuntime:
             )
             return False
 
+        def _stop_ws_streams_coro(owner, timeout_s: float):
+            stop_fn = getattr(owner, "stop_ws_streams")
+            try:
+                return stop_fn(per_client_timeout_s=timeout_s)
+            except TypeError as exc:
+                if "per_client_timeout_s" not in str(exc):
+                    raise
+                return stop_fn()
+
         logger.info("shutdown stage=close_network")
         _journal_shutdown_stage("close_network")
+
+        ws_bbo_data_plane = getattr(self, "ws_bbo_data_plane", None)
+        if ws_bbo_data_plane is not None:
+            await _await_shutdown_task(
+                "close_network",
+                "ws_bbo_data_plane.stop_ws_streams",
+                _stop_ws_streams_coro(
+                    ws_bbo_data_plane,
+                    _remaining_shutdown_timeout_s(),
+                ),
+            )
 
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
         await _await_shutdown_task(
             "close_network",
             "l2_data_plane.stop_ws_streams",
-            self.l2_data_plane.stop_ws_streams(
-                per_client_timeout_s=_remaining_shutdown_timeout_s(),
+            _stop_ws_streams_coro(
+                self.l2_data_plane,
+                _remaining_shutdown_timeout_s(),
             ),
         )
 
@@ -2962,7 +3100,11 @@ class LiveRuntime:
 
             # V1: refresh tracked entry local L2 opportunities from the scan
             # shortlist before quote freshness can block final entry selection.
-            if self.config.strategy.local_l2_enabled and l2_tracking_tradeable:
+            if (
+                self.config.strategy.local_l2_enabled
+                and self._entry_readiness_provider_uses_local_l2()
+                and l2_tracking_tradeable
+            ):
                 primary_count = getattr(
                     self.config.strategy, "entry_local_l2_primary_count", 3,
                 )
@@ -3005,6 +3147,8 @@ class LiveRuntime:
                 self._apply_shadow_promotion_if_eligible(
                     tracked, now_ms,
                 )
+            if self._entry_readiness_provider_uses_ws_bbo() and tradeable:
+                await self._ensure_entry_bbo_active_for_candidates(tradeable, now_ms)
 
             if tradeable:
                 self.journal.append(
@@ -8263,7 +8407,47 @@ class LiveRuntime:
             "stale_after_ms": stale_after_ms,
             "freshness": "not_checked_local_l2_disabled",
             "would_cross": False,
+            "source": "local_l2",
         }
+        if self._entry_readiness_provider_uses_ws_bbo():
+            payload["source"] = "ws_bbo_quote_lease"
+            quote = self.ws_bbo_cache.get_quote(venue_str, symbol)
+            if quote is None:
+                payload["freshness"] = "missing"
+                return False, "missing_bbo", payload
+            best_bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            best_ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+            fresh = observed_at_ms > 0 and age_ms <= stale_after_ms
+            valid_bbo = best_bid > 0.0 and best_ask > best_bid
+            would_cross = (
+                valid_bbo
+                and price > 0.0
+                and (
+                    (side == Side.BUY and price >= best_ask)
+                    or (side == Side.SELL and price <= best_bid)
+                )
+            )
+            payload.update(
+                {
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "book_age_ms": age_ms,
+                    "observed_at_ms": observed_at_ms,
+                    "freshness": "fresh" if fresh else "stale",
+                    "would_cross": would_cross,
+                }
+            )
+            if not valid_bbo:
+                payload["freshness"] = "invalid_bbo"
+                return False, "invalid_bbo", payload
+            if not fresh:
+                return False, "stale_bbo", payload
+            if would_cross:
+                return False, "would_cross_bbo", payload
+            return True, "", payload
+
         if not self.config.strategy.local_l2_enabled:
             return True, "", payload
 
@@ -10482,7 +10666,10 @@ class LiveRuntime:
 
         # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
         # but either leg's book is not ready (stale, degraded, cold, etc.)
-        if self.config.strategy.local_l2_enabled:
+        if (
+            self.config.strategy.local_l2_enabled
+            and self._entry_readiness_provider_uses_local_l2()
+        ):
             from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
             long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)

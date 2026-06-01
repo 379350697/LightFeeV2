@@ -8,7 +8,13 @@ from typing import Optional
 
 # V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
 _GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
-ENTRY_READINESS_PROVIDERS = ("local_l2", "rest_top_book", "quote_lease", "ws_top_book")
+ENTRY_READINESS_PROVIDERS = (
+    "local_l2",
+    "rest_top_book",
+    "quote_lease",
+    "ws_top_book",
+    "ws_bbo_quote_lease",
+)
 
 
 def _is_valid_generate_time(s: str) -> bool:

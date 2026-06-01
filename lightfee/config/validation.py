@@ -144,7 +144,10 @@ def validate_config(config: AppConfig) -> list[str]:
         )
     except (TypeError, ValueError):
         quote_lease_ttl_ms = 0
-    if provider in {"quote_lease", "ws_top_book"} and quote_lease_ttl_ms <= 0:
+    if (
+        provider in {"quote_lease", "ws_top_book", "ws_bbo_quote_lease"}
+        and quote_lease_ttl_ms <= 0
+    ):
         issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
 
     # V1 local-L2 resource budget validation
