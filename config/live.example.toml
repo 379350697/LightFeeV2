@@ -47,6 +47,8 @@ risk_monitor_enabled = false
 execution_liquidity_enabled = true
 max_entry_slippage_bps = 25.0
 max_delever_slippage_bps = 50.0
+entry_readiness_provider = "local_l2"  # local_l2 | rest_top_book | quote_lease | ws_top_book
+entry_quote_lease_ttl_ms = 1500
 
 [persistence]
 event_log_path = "runtime/events.jsonl"

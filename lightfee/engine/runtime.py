@@ -139,8 +139,8 @@ class LiveRuntime:
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
-        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
-        self.entry_readiness_provider = LocalL2EntryReadinessProvider(self)
+        from lightfee.engine.entry_readiness import build_entry_readiness_provider
+        self.entry_readiness_provider = build_entry_readiness_provider(self)
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
         self._last_entry_l2_readiness_diag_fingerprint: str = ""
@@ -10088,7 +10088,11 @@ class LiveRuntime:
                 else None
             )
             if not blocker:
-                readiness = self.entry_readiness_provider.decide(candidate, now_ms)
+                readiness = self.entry_readiness_provider.decide(
+                    candidate,
+                    now_ms,
+                    market_quotes=market_quotes,
+                )
                 blocker = None if readiness.allowed else (
                     readiness.reason or "entry_readiness_provider_denied"
                 )

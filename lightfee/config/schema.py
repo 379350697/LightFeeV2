@@ -8,6 +8,7 @@ from typing import Optional
 
 # V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
 _GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+ENTRY_READINESS_PROVIDERS = ("local_l2", "rest_top_book", "quote_lease", "ws_top_book")
 
 
 def _is_valid_generate_time(s: str) -> bool:
@@ -214,6 +215,8 @@ class StrategyConfig:
     maker_initial_slice_ratio: float = 0.5
     entry_max_initial_clip_ratio: float = 0.8
     maker_leg_default: str = "buy"
+    entry_readiness_provider: str = "local_l2"
+    entry_quote_lease_ttl_ms: int = 1500
     local_l2_enabled: bool = True
     local_l2_ws_enabled: bool = True  # WS L2 delta streaming
     bybit_local_l2_depth: int = 50

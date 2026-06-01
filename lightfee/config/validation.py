@@ -7,6 +7,7 @@ from typing import Any
 from lightfee.config.compatibility import REMOVED_FIELD_MESSAGES, VALID_OPPORTUNITY_INPUT_MODES
 from lightfee.config.schema import (
     AppConfig,
+    ENTRY_READINESS_PROVIDERS,
     _is_valid_generate_time,
 )
 from lightfee.config.universe import validate_directed_pairs
@@ -128,6 +129,23 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
         )
+
+    provider = str(
+        getattr(config.strategy, "entry_readiness_provider", "local_l2") or ""
+    ).strip().lower()
+    if provider not in ENTRY_READINESS_PROVIDERS:
+        issues.append(
+            "strategy.entry_readiness_provider must be one of "
+            f"{list(ENTRY_READINESS_PROVIDERS)}, got: {provider}"
+        )
+    try:
+        quote_lease_ttl_ms = int(
+            getattr(config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
+        )
+    except (TypeError, ValueError):
+        quote_lease_ttl_ms = 0
+    if provider in {"quote_lease", "ws_top_book"} and quote_lease_ttl_ms <= 0:
+        issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
 
     # V1 local-L2 resource budget validation
     if config.strategy.local_l2_global_max_books <= 0:

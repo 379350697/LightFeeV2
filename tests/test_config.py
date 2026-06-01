@@ -114,6 +114,19 @@ class TestConfigValidation:
         assert any("max_market_age_ms" in i for i in issues)
         assert any("max_order_quote_age_ms" in i for i in issues)
 
+    def test_entry_readiness_provider_must_be_known(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "unknown_provider"
+        issues = validate_config(config)
+        assert any("entry_readiness_provider" in i for i in issues)
+
+    def test_quote_lease_ttl_must_be_positive(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 0
+        issues = validate_config(config)
+        assert any("entry_quote_lease_ttl_ms" in i for i in issues)
+
     def test_shadow_entry_opportunity_count_default_is_v1_explicit(self):
         assert StrategyConfig().shadow_entry_opportunity_count == 2
 
@@ -122,6 +135,19 @@ class TestConfigValidation:
         config.runtime.opportunity_input_mode = "sidecar_backed"
         issues = validate_config(config)
         assert len(issues) == 0
+
+    def test_accepts_ws_top_book_entry_readiness_provider(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "ws_top_book"
+        issues = validate_config(config)
+        assert len(issues) == 0
+
+    def test_ws_top_book_ttl_must_be_positive(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "ws_top_book"
+        config.strategy.entry_quote_lease_ttl_ms = 0
+        issues = validate_config(config)
+        assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])

@@ -2273,7 +2273,13 @@ class TestEntryReadinessProviderBoundary:
             def __init__(self):
                 self.calls = []
 
-            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+            def decide(
+                self,
+                candidate,
+                now_ms: int,
+                *,
+                market_quotes=None,
+            ) -> EntryReadinessDecision:
                 self.calls.append((candidate, now_ms))
                 return EntryReadinessDecision.allow(
                     symbol=str(getattr(candidate, "symbol", "")),
@@ -2329,7 +2335,13 @@ class TestEntryReadinessProviderBoundary:
             def __init__(self):
                 self.calls = []
 
-            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+            def decide(
+                self,
+                candidate,
+                now_ms: int,
+                *,
+                market_quotes=None,
+            ) -> EntryReadinessDecision:
                 self.calls.append((candidate, now_ms))
                 return EntryReadinessDecision.allow(
                     symbol=str(getattr(candidate, "symbol", "")),
@@ -2387,7 +2399,13 @@ class TestEntryReadinessProviderBoundary:
         from lightfee.engine.runtime import LiveRuntime
 
         class EmptyReasonDenyProvider:
-            def decide(self, candidate, now_ms: int) -> EntryReadinessDecision:
+            def decide(
+                self,
+                candidate,
+                now_ms: int,
+                *,
+                market_quotes=None,
+            ) -> EntryReadinessDecision:
                 return EntryReadinessDecision(
                     allowed=False,
                     symbol=str(getattr(candidate, "symbol", "")),
@@ -2428,6 +2446,286 @@ class TestEntryReadinessProviderBoundary:
             "bananausdt:bybit->hyperliquid": "entry_readiness_provider_denied",
         }
         rt.journal.close()
+
+
+class TestEntryReadinessProviderFactory:
+    """Runtime config selects the readiness provider without changing entry flow."""
+
+    def test_default_provider_is_local_l2(self, tmp_path):
+        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
+        from lightfee.engine.runtime import LiveRuntime
+
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        rt = LiveRuntime(config)
+
+        assert config.strategy.entry_readiness_provider == "local_l2"
+        assert isinstance(rt.entry_readiness_provider, LocalL2EntryReadinessProvider)
+
+    def test_rest_top_book_provider_selects_candidate_from_fresh_quotes(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.entry_readiness import RestTopBookEntryReadinessProvider
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.sidecar.snapshot import QuoteSnapshot
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "rest_top_book"
+        rt = LiveRuntime(config)
+
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        quotes = {
+            "bybit:BANANAUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="BANANAUSDT",
+                bid=99.0,
+                ask=100.0,
+                observed_at_ms=now_ms - 100,
+            ),
+            "hyperliquid:BANANAUSDT": QuoteSnapshot(
+                venue="hyperliquid",
+                symbol="BANANAUSDT",
+                bid=101.0,
+                ask=102.0,
+                observed_at_ms=now_ms - 100,
+            ),
+        }
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+            market_quotes=quotes,
+        )
+
+        assert isinstance(rt.entry_readiness_provider, RestTopBookEntryReadinessProvider)
+        assert selected == [candidate]
+
+    def test_rest_top_book_provider_blocks_missing_quote(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.sidecar.snapshot import QuoteSnapshot
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "rest_top_book"
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        quotes = {
+            "bybit:BANANAUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="BANANAUSDT",
+                bid=99.0,
+                ask=100.0,
+                observed_at_ms=now_ms - 100,
+            ),
+        }
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+                market_quotes=quotes,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_rest_top_book_missing_quote": 1})
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": "entry_rest_top_book_missing_quote",
+        }
+
+    def test_quote_lease_provider_records_selected_quote_lease(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.entry_readiness import QuoteLeaseEntryReadinessProvider
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.sidecar.snapshot import QuoteSnapshot
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        quotes = {
+            "bybit:BANANAUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="BANANAUSDT",
+                bid=99.0,
+                ask=100.0,
+                observed_at_ms=now_ms - 100,
+            ),
+            "hyperliquid:BANANAUSDT": QuoteSnapshot(
+                venue="hyperliquid",
+                symbol="BANANAUSDT",
+                bid=101.0,
+                ask=102.0,
+                observed_at_ms=now_ms - 100,
+            ),
+        }
+
+        selected = rt._select_entry_candidates(
+            [candidate],
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=Counter(),
+            candidate_blockers={},
+            market_quotes=quotes,
+        )
+
+        assert isinstance(rt.entry_readiness_provider, QuoteLeaseEntryReadinessProvider)
+        assert selected == [candidate]
+        lease = rt.entry_readiness_provider.get_lease("bananausdt:bybit->hyperliquid")
+        assert lease is not None
+        assert lease.provider == "quote_lease"
+        assert lease.expires_at_ms == now_ms + 1500
+        assert lease.long_ask == 100.0
+        assert lease.short_bid == 101.0
+
+    def test_ws_top_book_provider_uses_fresh_ws_bbo_without_entry_l2_session(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.entry_readiness import WsTopBookEntryReadinessProvider
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_top_book"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        for venue, bid, ask in (
+            ("bybit", 99.0, 100.0),
+            ("hyperliquid", 101.0, 102.0),
+        ):
+            book = rt.local_l2_runtime.ensure_book(venue, "BANANAUSDT")
+            book.status = L2BookStatus.HOT
+            book.bids = [PriceLevel(price=bid, quantity=5.0)]
+            book.asks = [PriceLevel(price=ask, quantity=5.0)]
+            book.observed_at_ms = now_ms - 100
+            rt.l2_data_plane.note_ws_delta(
+                venue,
+                "BANANAUSDT",
+                now_ms=now_ms - 100,
+                observed_at_ms=now_ms - 100,
+            )
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=Counter(),
+                candidate_blockers={},
+            )
+        finally:
+            rt.journal.close()
+
+        assert isinstance(rt.entry_readiness_provider, WsTopBookEntryReadinessProvider)
+        assert selected == [candidate]
+        lease = rt.entry_readiness_provider.get_lease("bananausdt:bybit->hyperliquid")
+        assert lease is not None
+        assert lease.provider == "ws_top_book"
+        assert lease.expires_at_ms == now_ms + 1200
+        assert lease.long_ask == 100.0
+        assert lease.short_bid == 101.0
+
+    def test_ws_top_book_provider_blocks_when_ws_evidence_missing(self, tmp_path):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_top_book"
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        for venue, bid, ask in (
+            ("bybit", 99.0, 100.0),
+            ("hyperliquid", 101.0, 102.0),
+        ):
+            book = rt.local_l2_runtime.ensure_book(venue, "BANANAUSDT")
+            book.status = L2BookStatus.HOT
+            book.bids = [PriceLevel(price=bid, quantity=5.0)]
+            book.asks = [PriceLevel(price=ask, quantity=5.0)]
+            book.observed_at_ms = now_ms - 100
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_ws_top_book_missing_ws_evidence": 1})
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": "entry_ws_top_book_missing_ws_evidence",
+        }
 
 
 # ===========================================================================
