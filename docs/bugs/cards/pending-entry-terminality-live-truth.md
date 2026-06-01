@@ -13,7 +13,11 @@ orders, planned hedge CID misuse, and balanced live-position hydration.
 
 ## Current Effective Rule
 
-Pending entry terminality must be decided by real terminal exchange evidence, not by stale accepted maker state, planned hedge IDs, or momentary flat probes. Live exchange truth dominates local false-flat state. Balanced live-position evidence can hydrate pending fills with quantity and price and finalize by V1 quantity+price semantics.
+Pending entry terminality must be decided by real terminal exchange evidence,
+not by stale accepted maker state, planned hedge IDs, stale recovery blocks, or
+momentary flat probes. Live exchange truth dominates local false-flat state.
+Balanced live-position evidence can hydrate pending fills with quantity and
+price and finalize by V1 quantity+price semantics.
 
 ## V1 / Exchange Semantics
 
@@ -31,6 +35,10 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 - Planned hedge client IDs are not submitted-order evidence. They must not be
   queried during finalize unless the hedge has an order id, inflight record,
   attempt count, or fill evidence.
+- A stale fail-closed recovery block must not make existing pending-entry
+  recovery unreachable on restart. Retry startup recovery for old blocks when
+  recovery work still exists, while preserving operator-requested fail-closed
+  and blocks created by the current startup probe.
 
 ## Attempts Ledger
 
@@ -40,7 +48,7 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
 | 2026-05-30 | ORCA/NOM/RAVE post-deploy live-truth watch | deployed/probe verified | Current probes are flat/no-open-orders; no local false-flat state found. Future recurrence still needs fixture classification instead of widening local heuristics. |
-| 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, and planned hedge CID finalize query | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; finalize no longer queries a planned-only hedge CID. |
+| 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, planned hedge CID finalize query, and stale recovery-block retry | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; stale fail-closed recovery blocks no longer make pending-entry recovery unreachable; finalize no longer queries a planned-only hedge CID. |
 
 ## Recurrences
 
@@ -48,7 +56,7 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 |---|---|---|---|---|
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
-| 2026-06-01 | `ARIAUSDT` Bybit/Binance | local fix pending deploy | pending-entry live truth mismatch reproduced from production evidence | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
+| 2026-06-01 | `ARIAUSDT` Bybit/Binance | local fix pending deploy | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable until startup recovery gating was corrected | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
 
 ## Regression Harness
 
@@ -62,5 +70,6 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 1. Compare local `open_positions` / `pending_entries` against explicit exchange truth on all possible venues.
 2. Search for stale accepted maker evidence and planned hedge CID lookups.
 3. Verify whether any live position proof contains enough quantity and price evidence to hydrate pending fills.
-4. If local is flat and exchange nonzero, treat as critical false-green until reduce-only cleanup or fail-closed retention proves safe.
-5. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
+4. Check whether `recovery_blocked_reason` is preventing startup recovery from running against retained pending work.
+5. If local is flat and exchange nonzero, treat as critical false-green until reduce-only cleanup or fail-closed retention proves safe.
+6. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.

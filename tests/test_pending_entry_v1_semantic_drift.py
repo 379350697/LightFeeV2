@@ -11,6 +11,8 @@ from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliati
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
 from lightfee.persistence.journal import Journal
+from lightfee.persistence.snapshot_store import SnapshotStore
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
 @pytest.fixture
@@ -73,6 +75,9 @@ class _EvidenceAdapter:
 
 class _NoFillReconciliationAdapter:
     async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return None
+
+    async def shutdown(self):
         return None
 
     def drain_order_diagnostics(self):
@@ -718,6 +723,80 @@ async def test_startup_recovery_imbalanced_live_truth_finalizes_balanced_positio
         if event["kind"] == "pending_entry.pending_entry_finalized"
     ][-1]
     assert finalized["finalized_as"] == "open_position"
+
+
+@pytest.mark.asyncio
+async def test_startup_blocked_pending_entry_retries_live_truth_recovery(
+    config,
+):
+    SnapshotStore(config.persistence.snapshot_path).write({
+        "lifecycle": "risk_only",
+        "risk_mode": "fail_closed",
+        "recovery_blocked_reason": "position_drift_correction_failed",
+        "recovery_blocked_at_ms": 1234,
+        "open_positions": {},
+        "pending_entries": {
+            "entry-aria-blocked": {
+                "pending_id": "entry-aria-blocked",
+                "symbol": "ARIAUSDT",
+                "long_venue": "bybit",
+                "short_venue": "binance",
+                "target_quantity": 619.0353366004643,
+                "long_side": "buy",
+                "short_side": "sell",
+                "created_at_ms": 1000,
+                "uncertain_outcome": True,
+                "maker_order_id": "bybit-maker-filled",
+                "maker_client_order_id": "maker-cid",
+                "hedge_order_id": "entry-aria-blocked-recovery-short",
+                "hedge_client_order_id": "hedge-cid",
+                "maker_leg": "long",
+                "maker_leg_filled": 1238.0,
+                "hedge_leg_filled": 619.0,
+                "maker_price": 0.03883,
+                "maker_fill_price": 0.0,
+                "hedge_fill_price": 0.0387,
+                "outcome": "filled",
+            },
+        },
+        "pending_closes": {},
+        "pending_passive_closes": {},
+        "pending_residual_repairs": [],
+    })
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ARIAUSDT",
+                side=Side.BUY,
+                quantity=1238.0,
+                entry_price=0.0,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="ARIAUSDT",
+                side=Side.SELL,
+                quantity=619.0,
+                entry_price=0.0387,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+
+    await runtime.start()
+    await runtime.stop()
+
+    assert runtime.state.pending_entries == {}
+    opened = runtime.state.open_positions["entry-aria-blocked"]
+    assert opened.matched_quantity == pytest.approx(619.0)
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    assert runtime.state.recovery_blocked_reason is None
+    kinds = [event["kind"] for event in runtime.journal.read_all()]
+    assert "pending_entry.live_position_imbalanced_hydrated" in kinds
+    assert "runtime.recovery_blocked" not in kinds
 
 
 @pytest.mark.asyncio

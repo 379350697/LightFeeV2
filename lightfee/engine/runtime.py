@@ -755,11 +755,36 @@ class LiveRuntime:
         ):
             classified_recovery_state = "clean"
 
-        recovery_class = (
-            "blocked"
-            if self.state.recovery_blocked_reason
-            else classified_recovery_state
+        stale_block_with_recovery_work = (
+            bool(self.state.recovery_blocked_reason)
+            and classified_recovery_state == "recovery_needed"
+            and not current_startup_recovery_block
+            and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
         )
+        if stale_block_with_recovery_work:
+            self.journal.append(
+                "runtime.recovery_block_reconcile_attempt",
+                {
+                    "previous_recovery_blocked_reason": (
+                        self.state.recovery_blocked_reason
+                    ),
+                    "pending_entries": len(self.state.pending_entries),
+                    "open_positions": len(self.state.open_positions),
+                    "pending_closes": len(self.state.pending_closes),
+                    "pending_passive_closes": len(self.state.pending_passive_closes),
+                    "pending_residual_repairs": len(
+                        getattr(self.state, "pending_residual_repairs", []) or []
+                    ),
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
+            recovery_class = "recovery_needed"
+        else:
+            recovery_class = (
+                "blocked"
+                if self.state.recovery_blocked_reason
+                else classified_recovery_state
+            )
 
         if recovery_class == "clean":
             set_lifecycle(self.state, EngineLifecycle.RUNNING)
