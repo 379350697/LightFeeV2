@@ -21,6 +21,12 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 - V1 does not query a planned hedge CID before that hedge is submitted.
 - V1 can finalize balanced entries from live-position quantity and price evidence, even if local order ids are missing after recovery.
 - Duplicate client-id cleanup must be reconciled against live position truth before treating an old filled order as full cleanup.
+- A balanced pending entry with only an untradeable hedge dust residual must
+  terminalize the dust and finalize the balanced open position; otherwise
+  live-truth drift repair cannot act on exchange excess.
+- Planned hedge client IDs are not submitted-order evidence. They must not be
+  queried during finalize unless the hedge has an order id, inflight record,
+  attempt count, or fill evidence.
 
 ## Attempts Ledger
 
@@ -30,6 +36,7 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
 | 2026-05-30 | ORCA/NOM/RAVE post-deploy live-truth watch | deployed/probe verified | Current probes are flat/no-open-orders; no local false-flat state found. Future recurrence still needs fixture classification instead of widening local heuristics. |
+| 2026-06-01 | ARIA under-min hedge dust and planned hedge CID finalize query | local fix | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; finalize no longer queries a planned-only hedge CID. |
 
 ## Recurrences
 
@@ -37,6 +44,7 @@ Pending entry terminality must be decided by real terminal exchange evidence, no
 |---|---|---|---|---|
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
+| 2026-06-01 | `ARIAUSDT` Bybit/Binance | local fix pending deploy | pending-entry live truth mismatch reproduced from production evidence | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
 
 ## Regression Harness
 

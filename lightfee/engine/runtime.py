@@ -4141,6 +4141,13 @@ class LiveRuntime:
                 elif pending.missing_hedge_quantity() <= 1e-9:
                     await self._finalize_pending_entry(pending, entry_id, now_ms)
                     resolved.append(entry_id)
+                elif await self._maybe_finalize_pending_entry_terminal_hedge_dust(
+                    pending,
+                    entry_id,
+                    now_ms,
+                    source="passive_maintenance",
+                ):
+                    resolved.append(entry_id)
                 elif cancel_elapsed > 30_000:
                     # Stale cancel with partial fill — force finalize what we have
                     await self._finalize_pending_entry(pending, entry_id, now_ms)
@@ -4718,6 +4725,14 @@ class LiveRuntime:
                         "hedge_venue": pending.hedge_venue().value,
                     },
                 )
+                if await self._maybe_finalize_pending_entry_terminal_hedge_dust(
+                    pending,
+                    entry_id,
+                    now_ms,
+                    source="reconciliation",
+                ):
+                    resolved_entry_ids.append(entry_id)
+                    continue
                 hedge_driven = await self._drive_missing_hedge_live(pending, entry_id, now_ms)
                 if hedge_driven:
                     if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
@@ -5006,6 +5021,89 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
+
+    async def _maybe_finalize_pending_entry_terminal_hedge_dust(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+        *,
+        source: str,
+    ) -> bool:
+        """Finalize balanced fills when only an untradeable hedge dust remains."""
+        missing = float(pending.missing_hedge_quantity() or 0.0)
+        if missing <= 1e-9:
+            return False
+        if getattr(pending, "hedge_inflight", None) is not None:
+            return False
+
+        balanced_quantity = min(
+            float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
+            float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0),
+        )
+        if balanced_quantity <= 1e-9:
+            return False
+
+        hedge_venue = pending.hedge_venue()
+        adapter = self.get_venue_adapter(hedge_venue)
+        if adapter is None:
+            return False
+
+        normalized = missing
+        try:
+            if hasattr(adapter, "normalize_quantity"):
+                normalized = await adapter.normalize_quantity(pending.symbol, missing)
+        except Exception as exc:
+            self.journal.append(
+                "pending_entry.hedge_dust_terminalization_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "hedge_venue": hedge_venue.value,
+                    "raw_missing_hedge_quantity": missing,
+                    "error": str(exc),
+                    "source": source,
+                },
+            )
+            return False
+
+        normalized = float(normalized or 0.0)
+        hedge_price = float(
+            getattr(pending, "maker_fill_price", 0.0)
+            or getattr(pending, "maker_price", 0.0)
+            or 0.0
+        )
+        min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
+        hedge_notional = abs(normalized * hedge_price)
+        terminal_by_quantity = normalized <= 1e-9
+        terminal_by_notional = (
+            min_notional > 0.0
+            and hedge_price > 0.0
+            and hedge_notional + 1e-12 < min_notional
+        )
+        if not terminal_by_quantity and not terminal_by_notional:
+            return False
+
+        pending.repair_state = "hedge_residual_below_min_notional"
+        self.journal.append(
+            "pending_entry.hedge_residual_below_min_notional_terminalized",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "hedge_venue": hedge_venue.value,
+                "raw_missing_hedge_quantity": missing,
+                "normalized_quantity": normalized,
+                "balanced_quantity": balanced_quantity,
+                "hedge_price": hedge_price,
+                "hedge_notional": hedge_notional,
+                "hedge_min_notional": min_notional,
+                "terminal_by_quantity": terminal_by_quantity,
+                "terminal_by_notional": terminal_by_notional,
+                "source": source,
+            },
+        )
+        await self._finalize_pending_entry(pending, entry_id, now_ms)
+        return True
 
     # ------------------------------------------------------------------
     # V1 parity: hedge deadline, terminalization budget, abort/cleanup
@@ -5744,6 +5842,23 @@ class LiveRuntime:
 
             # Re-check after hydration: if no longer needs recovery, skip
             if not pending.startup_recovery_ready():
+                continue
+
+            if await self._maybe_finalize_pending_entry_terminal_hedge_dust(
+                pending,
+                entry_id,
+                now_ms,
+                source="startup_recovery",
+            ):
+                self.state.pending_entries.pop(entry_id, None)
+                self.journal.append(
+                    "recovery.pending_entry_finalized",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": "terminal_hedge_dust_after_live_truth",
+                    },
+                )
                 continue
 
             # --- Step 3: Terminalization budget (shared helper) ---
@@ -6667,7 +6782,8 @@ class LiveRuntime:
         if (
             float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0) > 0.0
             or getattr(pending, "hedge_order_id", "")
-            or getattr(pending, "hedge_client_order_id", "")
+            or getattr(pending, "hedge_inflight", None) is not None
+            or int(getattr(pending, "hedge_attempt_count", 0) or 0) > 0
         ):
             await _reconcile_leg("hedge", pending.hedge_venue())
 

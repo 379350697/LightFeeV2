@@ -87,6 +87,27 @@ class _LivePositionAdapter(_NoFillReconciliationAdapter):
         return self.position
 
 
+class _NormalizingAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, *, normalized_quantity: float):
+        self.normalized_quantity = normalized_quantity
+
+    async def normalize_quantity(self, symbol, quantity):
+        return self.normalized_quantity
+
+
+class _RecordingFillAdapter(_NoFillReconciliationAdapter):
+    def __init__(self):
+        self.fill_reconciliation_calls: list[dict] = []
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        self.fill_reconciliation_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
+        return None
+
+
 class _MetadataAdapter(_NoFillReconciliationAdapter):
     def __init__(self, venue: Venue, metadata: dict, *, venue_symbol: str | None = None):
         self.venue = venue
@@ -533,3 +554,135 @@ async def test_live_position_hydration_maps_short_maker_to_short_live_truth(
     assert payload["maker_live_position"]["side"] == "sell"
     assert payload["hedge_live_position"]["venue"] == "binance"
     assert payload["hedge_live_position"]["side"] == "buy"
+
+
+@pytest.mark.asyncio
+async def test_pending_entry_under_min_hedge_residual_finalizes_balanced_position(
+    config, tmp_journal,
+):
+    result = PositionReconciliationResult(
+        position_id="entry-aria-under-min",
+        symbol="ARIAUSDT",
+        long_status="uncertain",
+        short_status="uncertain",
+        is_flat=False,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.BINANCE: _NormalizingAdapter(normalized_quantity=0.0),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(result)
+    pending = _pending_entry(
+        pending_id="entry-aria-under-min",
+        symbol="ARIAUSDT",
+        target_quantity=619.0353366004643,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=619.0353366004643,
+        hedge_leg_filled=619.0,
+        maker_fill_price=0.0387,
+        hedge_fill_price=0.0387,
+        maker_order_id="bybit-maker-filled",
+        hedge_order_id="1340395910",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=4000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(619.0)
+    assert opened.long_quantity == pytest.approx(619.0)
+    assert opened.short_quantity == pytest.approx(619.0)
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.hedge_residual_below_min_notional_terminalized" in kinds
+    finalized = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.pending_entry_finalized"
+    ][-1]
+    assert finalized["finalized_as"] == "open_position"
+    assert finalized["balanced_quantity"] == pytest.approx(619.0)
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_under_min_hedge_residual_finalizes_balanced_position(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.BINANCE: _NormalizingAdapter(normalized_quantity=0.0),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-aria-startup-under-min",
+        symbol="ARIAUSDT",
+        target_quantity=619.0353366004643,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=619.0353366004643,
+        hedge_leg_filled=619.0,
+        maker_fill_price=0.0387,
+        hedge_fill_price=0.0387,
+        maker_order_id="bybit-maker-filled",
+        hedge_order_id="1340395910",
+        uncertain_outcome=True,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._recover_pending_entry_hedges(now_ms=4000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(619.0)
+    payload = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.hedge_residual_below_min_notional_terminalized"
+    ][-1]
+    assert payload["source"] == "startup_recovery"
+
+
+@pytest.mark.asyncio
+async def test_finalize_zero_fill_does_not_query_planned_hedge_client_order_id(
+    config, tmp_journal,
+):
+    maker_adapter = _RecordingFillAdapter()
+    hedge_adapter = _RecordingFillAdapter()
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BINANCE: maker_adapter,
+            Venue.BYBIT: hedge_adapter,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-planned-hedge-not-submitted",
+        symbol="BEATUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        maker_leg="long",
+        maker_order_id="maker-order",
+        maker_client_order_id="maker-cid",
+        hedge_order_id="",
+        hedge_client_order_id="planned-hedge-cid",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._finalize_pending_entry(pending, pending.pending_id, 4000)
+
+    assert maker_adapter.fill_reconciliation_calls
+    assert hedge_adapter.fill_reconciliation_calls == []
