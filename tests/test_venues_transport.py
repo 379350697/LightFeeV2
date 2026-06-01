@@ -3358,6 +3358,36 @@ class TestOrderSubmitDiagnosticsAndQuantization:
 class TestHyperliquidSigningDependencyPreflight:
     """Live Hyperliquid startup must expose missing signing deps without secrets."""
 
+    def test_hyperliquid_signing_dependencies_are_declared(self):
+        import tomllib
+        from pathlib import Path
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        dependencies = {
+            str(dep).split(">=", 1)[0].split("==", 1)[0].lower()
+            for dep in tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+        }
+
+        assert {"pycryptodome", "eth-account", "msgpack"}.issubset(dependencies)
+
+    def test_missing_crypto_dependency_is_preflight_visible(self, monkeypatch):
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name in {"Crypto", "Crypto.Hash"}:
+                raise ModuleNotFoundError("No module named 'Crypto'")
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+        from lightfee.venues.transport import _missing_hyperliquid_signing_dependencies
+
+        missing = _missing_hyperliquid_signing_dependencies()
+        assert missing[0] == "pycryptodome"
+        assert "pycryptodome" in missing
+
     def test_missing_eth_account_dependency_is_preflight_visible_and_redacted(self, monkeypatch):
         import importlib.util
 

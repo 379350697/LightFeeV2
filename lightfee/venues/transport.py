@@ -84,7 +84,11 @@ def _missing_hyperliquid_signing_dependencies() -> list[str]:
     ]
     missing: list[str] = []
     for module_name, package_name in required:
-        if importlib.util.find_spec(module_name) is None:
+        try:
+            available = importlib.util.find_spec(module_name) is not None
+        except ModuleNotFoundError:
+            available = False
+        if not available:
             missing.append(package_name)
     return missing
 
