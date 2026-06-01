@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 
 def test_ws_bbo_cache_returns_fresh_quote_and_rejects_stale():
     from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
@@ -50,6 +52,15 @@ def test_binance_book_ticker_parser_uses_best_bid_and_ask():
     assert quote.bid == 25.3519
     assert quote.ask == 25.3652
     assert quote.observed_at_ms == 1568014460893
+
+
+def test_binance_bbo_url_uses_official_public_route():
+    from lightfee.marketdata.ws_bbo import binance_bbo_stream_url
+
+    assert (
+        binance_bbo_stream_url("BTCUSDT")
+        == "wss://fstream.binance.com/public/ws/btcusdt@bookTicker"
+    )
 
 
 def test_okx_tickers_parser_uses_venue_symbol_mapping():
@@ -206,3 +217,22 @@ def test_hyperliquid_bbo_parser_uses_bbo_channel():
     assert quote is not None
     assert quote.bid == 113377.0
     assert quote.ask == 113397.0
+
+
+@pytest.mark.asyncio
+async def test_bbo_ws_client_records_subscription_error_control_message():
+    from lightfee.marketdata.ws_bbo import OkxBboWsClient, VenueBboCache
+
+    client = OkxBboWsClient(
+        "okx",
+        "BTCUSDT",
+        VenueBboCache(),
+        venue_symbol="BTC-USDT-SWAP",
+    )
+
+    await client._handle_message(
+        '{"event":"error","code":"60012","msg":"Invalid request: bad instId"}'
+    )
+
+    state = client.state_snapshot()
+    assert state["last_error"] == "ws_control_error code=60012 msg=Invalid request: bad instId"

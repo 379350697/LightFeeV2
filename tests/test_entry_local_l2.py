@@ -2990,6 +2990,143 @@ class TestEntryReadinessProviderFactory:
             ("hyperliquid", "MELONUSDT"),
         }
 
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_budget_preserves_candidate_rank_order(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_ws_bbo_per_venue_budget = 1
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidates = [
+            TestPrimaryTrackingAdmission._make_candidate(
+                "MELONUSDT",
+                "bybit",
+                "hyperliquid",
+                "melonusdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+            TestPrimaryTrackingAdmission._make_candidate(
+                "BANANAUSDT",
+                "bybit",
+                "hyperliquid",
+                "bananausdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+        ]
+
+        async def fake_connect_ws_streams():
+            return len(rt.ws_bbo_data_plane._clients)
+
+        monkeypatch.setattr(
+            rt.ws_bbo_data_plane,
+            "connect_ws_streams",
+            fake_connect_ws_streams,
+        )
+        try:
+            await rt._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
+        finally:
+            rt.journal.close()
+
+        assert set(rt.ws_bbo_data_plane._clients) == {
+            ("bybit", "MELONUSDT"),
+            ("hyperliquid", "MELONUSDT"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_tick_prewarms_before_snapshot_quote_filter(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from lightfee.config.schema import (
+            AppConfig,
+            PersistenceConfig,
+            RuntimeConfig,
+            StrategyConfig,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.lifecycle import transition_to_running
+        from lightfee.sidecar.snapshot import CandidateInput, SidecarSnapshot
+
+        now_ms = 1778985600000
+        candidate = CandidateInput(
+            long_venue="bybit",
+            short_venue="hyperliquid",
+            symbol="BANANAUSDT",
+            funding_diff_bps=15.0,
+            funding_edge_bps=15.0,
+            expected_edge_bps=15.0,
+            worst_case_edge_bps=10.0,
+            ranking_edge_bps=15.0,
+            entry_notional_quote=500.0,
+            pair_id="bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        snapshot = SidecarSnapshot(
+            published_at_ms=now_ms,
+            market_observed_at_ms=now_ms,
+            candidates=[candidate],
+            quotes={},
+        )
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_snapshot_max_age_ms=600_000,
+                max_market_age_ms=1_000,
+                live_scan_recovery_success_count=1,
+            ),
+            strategy=StrategyConfig(
+                local_l2_enabled=False,
+                entry_readiness_provider="ws_bbo_quote_lease",
+                max_concurrent_positions=1,
+                min_scan_minutes_before_funding=0,
+                max_scan_minutes_before_funding=10,
+                entry_window_secs=60,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+        rt = LiveRuntime(config)
+        rt.entry_executor = object()
+        transition_to_running(rt.state)
+        seen_symbols: list[str] = []
+
+        async def capture_prewarm(candidates, prewarm_now_ms):
+            seen_symbols.extend(str(getattr(c, "symbol", "")) for c in candidates)
+
+        async def passthrough_catalog(candidates):
+            return list(candidates)
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+        monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _: snapshot)
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_supported_by_venue_catalog",
+            passthrough_catalog,
+        )
+        monkeypatch.setattr(rt, "_ensure_entry_bbo_active_for_candidates", capture_prewarm)
+
+        rt.journal.open()
+        try:
+            await rt.tick()
+        finally:
+            rt.journal.close()
+
+        assert seen_symbols == ["BANANAUSDT"]
+
 
 # ===========================================================================
 # Dual-ready book state reason taxonomy

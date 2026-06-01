@@ -90,7 +90,7 @@ class VenueBboCache:
 
 
 def binance_bbo_stream_url(symbol: str) -> str:
-    return f"wss://fstream.binance.com/ws/{symbol.lower()}@bookTicker"
+    return f"wss://fstream.binance.com/public/ws/{symbol.lower()}@bookTicker"
 
 
 def aster_bbo_stream_url(symbol: str) -> str:
@@ -165,9 +165,11 @@ class BboWsClient(ABC):
     _ws: Any = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
     _connected: bool = field(default=False, init=False)
+    _subscribed: bool = field(default=False, init=False)
     _message_count: int = field(default=0, init=False)
     _last_quote: TopBookQuote | None = field(default=None, init=False)
     _last_error: str = field(default="", init=False)
+    _last_control_message: str = field(default="", init=False)
 
     @property
     def wire_symbol(self) -> str:
@@ -188,8 +190,10 @@ class BboWsClient(ABC):
             "wire_symbol": str(self.wire_symbol),
             "tracked": True,
             "connected": bool(self.is_connected),
+            "subscribed": bool(self._subscribed),
             "message_count": int(self._message_count),
             "last_error": str(self._last_error or ""),
+            "last_control_message": str(self._last_control_message or ""),
         }
 
     async def start(self) -> None:
@@ -268,27 +272,52 @@ class BboWsClient(ABC):
             return
         if not isinstance(payload, dict):
             return
-        if self._is_control_message(payload):
-            return
         if isinstance(payload.get("data"), dict) and "stream" in payload:
             payload = payload["data"]
         received_at_ms = int(time.time() * 1000)
+        if self._handle_control_message(payload):
+            return
         quote = self.parse_bbo_message(payload, received_at_ms=received_at_ms)
         if quote is None:
             return
         if self.cache.update_quote(quote):
             self._message_count += 1
 
-    @staticmethod
-    def _is_control_message(payload: dict[str, Any]) -> bool:
+    def _handle_control_message(self, payload: dict[str, Any]) -> bool:
         event = str(payload.get("event", "")).lower()
         op = str(payload.get("op", "")).lower()
         channel = str(payload.get("channel", "")).lower()
-        if event in {"subscribe", "unsubscribe", "ping", "pong"}:
+
+        code = str(payload.get("code") or payload.get("retCode") or "")
+        msg = str(
+            payload.get("msg")
+            or payload.get("ret_msg")
+            or payload.get("retMsg")
+            or ""
+        )
+        success = payload.get("success")
+        if event == "error" or success is False or (code and code not in {"0", "200"}):
+            self._last_error = (
+                f"ws_control_error code={code or 'unknown'} msg={msg or 'unknown'}"
+            )
+            self._last_control_message = self._last_error
+            return True
+
+        if event in {"subscribe", "unsubscribe"} or op in {"subscribe", "unsubscribe"}:
+            if event == "subscribe" or op == "subscribe":
+                self._subscribed = True
+            elif event == "unsubscribe" or op == "unsubscribe":
+                self._subscribed = False
+            self._last_control_message = event or op
             return True
         if op in {"subscribe", "unsubscribe", "ping", "pong"}:
             return True
         if channel in {"subscriptionresponse", "subscription_response", "pong", "heartbeat"}:
+            if channel in {"subscriptionresponse", "subscription_response"}:
+                self._subscribed = True
+            self._last_control_message = channel
+            return True
+        if event in {"ping", "pong"}:
             return True
         return False
 

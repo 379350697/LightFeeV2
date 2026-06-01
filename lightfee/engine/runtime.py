@@ -2517,7 +2517,8 @@ class LiveRuntime:
         if self.config.runtime.mode == "paper":
             return
 
-        needed: dict[str, set[str]] = {}
+        needed: dict[str, list[str]] = {}
+        seen_by_venue: dict[str, set[str]] = {}
         tracked_keys: set[tuple[str, str]] = set()
         for candidate in list(candidates or []):
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
@@ -2530,7 +2531,10 @@ class LiveRuntime:
                 venue = str(raw_venue or "").strip().lower()
                 if not venue:
                     continue
-                needed.setdefault(venue, set()).add(symbol)
+                seen = seen_by_venue.setdefault(venue, set())
+                if symbol not in seen:
+                    needed.setdefault(venue, []).append(symbol)
+                    seen.add(symbol)
                 tracked_keys.add((venue, symbol))
 
         if not needed:
@@ -2552,7 +2556,7 @@ class LiveRuntime:
         registered_total = 0
         registered_venues: set[str] = set()
         for venue_str, symbols in needed.items():
-            symbols_list = sorted(symbols)[:per_venue_budget]
+            symbols_list = list(symbols)[:per_venue_budget]
             if not symbols_list:
                 continue
             adapter = None
@@ -3172,8 +3176,11 @@ class LiveRuntime:
                 self._apply_shadow_promotion_if_eligible(
                     tracked, now_ms,
                 )
-            if self._entry_readiness_provider_uses_ws_bbo() and tradeable:
-                await self._ensure_entry_bbo_active_for_candidates(tradeable, now_ms)
+            if self._entry_readiness_provider_uses_ws_bbo() and l2_tracking_tradeable:
+                await self._ensure_entry_bbo_active_for_candidates(
+                    l2_tracking_tradeable,
+                    now_ms,
+                )
 
             if tradeable:
                 self.journal.append(
