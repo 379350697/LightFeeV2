@@ -2840,6 +2840,57 @@ class TestEntryReadinessProviderFactory:
             "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_stale_quote",
         }
 
+    def test_ws_bbo_quote_lease_missing_quote_logs_stream_error_evidence(self, tmp_path):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("bybit", ["BANANAUSDT"])
+        client = rt.ws_bbo_data_plane._clients[("bybit", "BANANAUSDT")]
+        client._last_error = "ConnectionError: test-stream-down"
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        evidence = payload["readiness_evidence"]
+        assert evidence["provider"] == "ws_bbo_quote_lease"
+        assert evidence["long_stream_state"]["last_error"] == "ConnectionError: test-stream-down"
+
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_activation_does_not_create_local_l2_books(
         self,
@@ -2882,6 +2933,61 @@ class TestEntryReadinessProviderFactory:
         assert set(rt.ws_bbo_data_plane._clients) == {
             ("bybit", "BANANAUSDT"),
             ("hyperliquid", "BANANAUSDT"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_uses_independent_per_venue_budget(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.local_l2_hot_exec_per_venue_budget = 1
+        config.strategy.entry_ws_bbo_per_venue_budget = 2
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidates = [
+            TestPrimaryTrackingAdmission._make_candidate(
+                "BANANAUSDT",
+                "bybit",
+                "hyperliquid",
+                "bananausdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+            TestPrimaryTrackingAdmission._make_candidate(
+                "MELONUSDT",
+                "bybit",
+                "hyperliquid",
+                "melonusdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+        ]
+
+        async def fake_connect_ws_streams():
+            return len(rt.ws_bbo_data_plane._clients)
+
+        monkeypatch.setattr(
+            rt.ws_bbo_data_plane,
+            "connect_ws_streams",
+            fake_connect_ws_streams,
+        )
+        try:
+            await rt._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
+        finally:
+            rt.journal.close()
+
+        assert set(rt.ws_bbo_data_plane._clients) == {
+            ("bybit", "BANANAUSDT"),
+            ("bybit", "MELONUSDT"),
+            ("hyperliquid", "BANANAUSDT"),
+            ("hyperliquid", "MELONUSDT"),
         }
 
 

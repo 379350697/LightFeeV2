@@ -181,6 +181,17 @@ class BboWsClient(ABC):
     def message_count(self) -> int:
         return self._message_count
 
+    def state_snapshot(self) -> dict[str, Any]:
+        return {
+            "venue": str(self.venue),
+            "symbol": str(self.symbol).upper(),
+            "wire_symbol": str(self.wire_symbol),
+            "tracked": True,
+            "connected": bool(self.is_connected),
+            "message_count": int(self._message_count),
+            "last_error": str(self._last_error or ""),
+        }
+
     async def start(self) -> None:
         if self._task is not None:
             return
@@ -664,6 +675,26 @@ class VenueBboDataPlane:
 
     def get_quote(self, venue: str, symbol: str) -> TopBookQuote | None:
         return self._cache.get_quote(venue, symbol)
+
+    def stream_state(self, venue: str, symbol: str) -> dict[str, Any]:
+        key = self._key(venue, symbol)
+        client = self._clients.get(key)
+        if client is None:
+            return {
+                "venue": key[0],
+                "symbol": key[1],
+                "tracked": False,
+                "connected": False,
+                "message_count": 0,
+                "last_error": "",
+            }
+        return client.state_snapshot()
+
+    def stream_states(self) -> list[dict[str, Any]]:
+        return [
+            client.state_snapshot()
+            for _, client in sorted(self._clients.items())
+        ]
 
     def fresh_quote(
         self,

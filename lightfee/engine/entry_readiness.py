@@ -104,8 +104,10 @@ class QuoteLease:
     symbol: str
     long_venue: str
     short_venue: str
+    long_bid: float
     long_ask: float
     short_bid: float
+    short_ask: float
     long_observed_at_ms: int
     short_observed_at_ms: int
     created_at_ms: int
@@ -307,8 +309,10 @@ class QuoteLeaseEntryReadinessProvider(RestTopBookEntryReadinessProvider):
             symbol=symbol,
             long_venue=str(getattr(candidate, "long_venue", "")),
             short_venue=str(getattr(candidate, "short_venue", "")),
+            long_bid=float(getattr(long_quote, "bid", 0.0) or 0.0),
             long_ask=float(getattr(long_quote, "ask", 0.0) or 0.0),
             short_bid=float(getattr(short_quote, "bid", 0.0) or 0.0),
+            short_ask=float(getattr(short_quote, "ask", 0.0) or 0.0),
             long_observed_at_ms=int(getattr(long_quote, "observed_at_ms", 0) or 0),
             short_observed_at_ms=int(getattr(short_quote, "observed_at_ms", 0) or 0),
             created_at_ms=now_ms,
@@ -480,6 +484,8 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                     "missing_long_quote": long_quote is None,
                     "missing_short_quote": short_quote is None,
                     "source": "ws_bbo_cache",
+                    "long_stream_state": self._stream_state(long_venue, symbol),
+                    "short_stream_state": self._stream_state(short_venue, symbol),
                 },
             )
 
@@ -497,6 +503,16 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                 evidence=evidence,
             )
         return symbol, pair_id, long_quote, short_quote
+
+    def _stream_state(self, venue: str, symbol: str) -> dict[str, Any]:
+        data_plane = getattr(self._runtime, "ws_bbo_data_plane", None)
+        if data_plane is None or not hasattr(data_plane, "stream_state"):
+            return {
+                "venue": str(venue),
+                "symbol": str(symbol).upper(),
+                "tracked": False,
+            }
+        return data_plane.stream_state(venue, symbol)
 
 
 def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:

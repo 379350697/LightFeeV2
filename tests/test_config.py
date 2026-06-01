@@ -162,6 +162,13 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
+    def test_ws_bbo_per_venue_budget_must_be_positive(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_ws_bbo_per_venue_budget = 0
+        issues = validate_config(config)
+        assert any("entry_ws_bbo_per_venue_budget" in i for i in issues)
+
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])
         issues = validate_config(config)

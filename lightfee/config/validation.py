@@ -149,6 +149,14 @@ def validate_config(config: AppConfig) -> list[str]:
         and quote_lease_ttl_ms <= 0
     ):
         issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
+    try:
+        ws_bbo_per_venue_budget = int(
+            getattr(config.strategy, "entry_ws_bbo_per_venue_budget", 0) or 0
+        )
+    except (TypeError, ValueError):
+        ws_bbo_per_venue_budget = 0
+    if provider == "ws_bbo_quote_lease" and ws_bbo_per_venue_budget <= 0:
+        issues.append("strategy.entry_ws_bbo_per_venue_budget must be > 0")
 
     # V1 local-L2 resource budget validation
     if config.strategy.local_l2_global_max_books <= 0:

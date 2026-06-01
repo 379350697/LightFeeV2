@@ -525,6 +525,27 @@ class LiveRuntime:
     def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
         return self._entry_readiness_provider_name() == "ws_bbo_quote_lease"
 
+    def _entry_readiness_provider_uses_quote_lease(self) -> bool:
+        return self._entry_readiness_provider_name() in {
+            "quote_lease",
+            "ws_top_book",
+            "ws_bbo_quote_lease",
+        }
+
+    def _entry_quote_lease_max_age_ms(self) -> int:
+        budgets = []
+        for value in (
+            getattr(self.config.runtime, "max_market_age_ms", 0),
+            getattr(self.config.strategy, "entry_quote_lease_ttl_ms", 0),
+        ):
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                parsed = 0
+            if parsed > 0:
+                budgets.append(parsed)
+        return min(budgets) if budgets else 0
+
     def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
         """Return the minimum notional value for a venue/symbol pair.
 
@@ -2521,7 +2542,11 @@ class LiveRuntime:
             return
 
         per_venue_budget = max(
-            getattr(self.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
+            getattr(
+                self.config.strategy,
+                "entry_ws_bbo_per_venue_budget",
+                getattr(self.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
+            ),
             1,
         )
         registered_total = 0
@@ -8410,7 +8435,9 @@ class LiveRuntime:
             "source": "local_l2",
         }
         if self._entry_readiness_provider_uses_ws_bbo():
+            stale_after_ms = self._entry_quote_lease_max_age_ms()
             payload["source"] = "ws_bbo_quote_lease"
+            payload["stale_after_ms"] = stale_after_ms
             quote = self.ws_bbo_cache.get_quote(venue_str, symbol)
             if quote is None:
                 payload["freshness"] = "missing"
@@ -10265,6 +10292,7 @@ class LiveRuntime:
                 continue
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._candidate_pair_id(candidate)
+            readiness_evidence: dict = {}
             first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
             blocker = (
                 self._entry_finalization_window_blocker(first_funding_ts, now_ms)
@@ -10277,6 +10305,7 @@ class LiveRuntime:
                     now_ms,
                     market_quotes=market_quotes,
                 )
+                readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
                 blocker = None if readiness.allowed else (
                     readiness.reason or "entry_readiness_provider_denied"
                 )
@@ -10293,14 +10322,17 @@ class LiveRuntime:
                     "entry_waiting_for_finalization_window_too_early",
                     "entry_finalization_window_expired",
                 }:
+                    diagnostic_payload = {
+                        "symbol": symbol,
+                        "pair_id": pair_id,
+                        "reason": blocker_str,
+                        "ts_ms": now_ms,
+                    }
+                    if readiness_evidence:
+                        diagnostic_payload["readiness_evidence"] = readiness_evidence
                     self._append_runtime_diagnostic_event(
                         "runtime.entry_blocked_local_l2_selection",
-                        {
-                            "symbol": symbol,
-                            "pair_id": pair_id,
-                            "reason": blocker_str,
-                            "ts_ms": now_ms,
-                        },
+                        diagnostic_payload,
                         now_ms=now_ms,
                         key_parts=(symbol, pair_id, blocker_str),
                         interval_ms=self._ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS,
@@ -10508,6 +10540,93 @@ class LiveRuntime:
             return 0.0, step
         return aligned, step
 
+    def _entry_quote_lease_execution_check(
+        self,
+        candidate,
+        now_ms: int,
+    ) -> tuple[str, object | None, dict]:
+        provider_name = self._entry_readiness_provider_name()
+        evidence = {
+            "provider": provider_name,
+            "pair_id": self._candidate_pair_id(candidate),
+            "symbol": str(getattr(candidate, "symbol", "")),
+            "long_venue": str(getattr(candidate, "long_venue", "")),
+            "short_venue": str(getattr(candidate, "short_venue", "")),
+            "max_age_ms": self._entry_quote_lease_max_age_ms(),
+        }
+        if (
+            self.config.runtime.mode != "live"
+            or not self._entry_readiness_provider_uses_quote_lease()
+        ):
+            return "", None, evidence
+
+        get_lease = getattr(self.entry_readiness_provider, "get_lease", None)
+        if not callable(get_lease):
+            return "missing_quote_lease_provider", None, evidence
+        lease = get_lease(evidence["pair_id"])
+        if lease is None:
+            return "missing_quote_lease", None, evidence
+
+        evidence.update(
+            {
+                "lease_provider": str(getattr(lease, "provider", "")),
+                "created_at_ms": int(getattr(lease, "created_at_ms", 0) or 0),
+                "expires_at_ms": int(getattr(lease, "expires_at_ms", 0) or 0),
+                "long_observed_at_ms": int(
+                    getattr(lease, "long_observed_at_ms", 0) or 0
+                ),
+                "short_observed_at_ms": int(
+                    getattr(lease, "short_observed_at_ms", 0) or 0
+                ),
+                "long_bid": float(getattr(lease, "long_bid", 0.0) or 0.0),
+                "long_ask": float(getattr(lease, "long_ask", 0.0) or 0.0),
+                "short_bid": float(getattr(lease, "short_bid", 0.0) or 0.0),
+                "short_ask": float(getattr(lease, "short_ask", 0.0) or 0.0),
+            }
+        )
+        if evidence["lease_provider"] != provider_name:
+            return "quote_lease_provider_mismatch", lease, evidence
+        if str(getattr(lease, "symbol", "")) != evidence["symbol"]:
+            return "quote_lease_symbol_mismatch", lease, evidence
+        if str(getattr(lease, "long_venue", "")) != evidence["long_venue"]:
+            return "quote_lease_long_venue_mismatch", lease, evidence
+        if str(getattr(lease, "short_venue", "")) != evidence["short_venue"]:
+            return "quote_lease_short_venue_mismatch", lease, evidence
+
+        expires_at_ms = evidence["expires_at_ms"]
+        if expires_at_ms <= 0 or now_ms >= expires_at_ms:
+            return "expired_quote_lease", lease, evidence
+
+        max_age_ms = int(evidence["max_age_ms"] or 0)
+        for leg in ("long", "short"):
+            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            evidence[f"{leg}_age_ms"] = age_ms
+            if (
+                observed_at_ms <= 0
+                or max_age_ms <= 0
+                or age_ms is None
+                or age_ms > max_age_ms
+            ):
+                return "stale_quote_lease", lease, evidence
+
+        if (
+            evidence["long_bid"] <= 0.0
+            or evidence["long_ask"] <= evidence["long_bid"]
+            or evidence["short_bid"] <= 0.0
+            or evidence["short_ask"] <= evidence["short_bid"]
+        ):
+            return "invalid_quote_lease", lease, evidence
+        return "", lease, evidence
+
+    @staticmethod
+    def _quote_lease_reference_price(lease) -> float:
+        long_ask = float(getattr(lease, "long_ask", 0.0) or 0.0)
+        short_bid = float(getattr(lease, "short_bid", 0.0) or 0.0)
+        if long_ask > 0.0 and short_bid > 0.0:
+            return (long_ask + short_bid) / 2.0
+        return max(long_ask, short_bid, 0.0)
+
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
@@ -10582,6 +10701,44 @@ class LiveRuntime:
                     },
                 )
                 return False
+
+        quote_lease = None
+        quote_lease_evidence: dict = {}
+        quote_lease_reason, quote_lease, quote_lease_evidence = (
+            self._entry_quote_lease_execution_check(candidate, now_ms)
+        )
+        if quote_lease_reason:
+            payload = {
+                **quote_lease_evidence,
+                "reason": quote_lease_reason,
+                "ts_ms": now_ms,
+            }
+            self.journal.append("runtime.entry_blocked_quote_lease", payload)
+            self.journal.append(
+                "review.candidate_rejected",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": candidate.long_venue,
+                    "short_venue": candidate.short_venue,
+                    "rejected_stage": "quote_lease_execution_gate",
+                    "rejected_reason": quote_lease_reason,
+                    "ranking_edge_bps": candidate.ranking_edge_bps,
+                    "expected_edge_bps": candidate.expected_edge_bps,
+                    "funding_edge_bps": candidate.funding_edge_bps,
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+        long_order_price_hint = price_hint
+        short_order_price_hint = price_hint
+        if quote_lease is not None:
+            price_hint = self._quote_lease_reference_price(quote_lease)
+            long_order_price_hint = float(
+                getattr(quote_lease, "long_ask", 0.0) or 0.0
+            )
+            short_order_price_hint = float(
+                getattr(quote_lease, "short_bid", 0.0) or 0.0
+            )
 
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
@@ -10797,6 +10954,29 @@ class LiveRuntime:
         # are resolved from the adapter or spec when available.
         strategy = self.config.strategy
         min_notional = strategy.min_entry_leg_notional_quote
+        # V1: maker leg from strategy config (funding arb: long side is typically maker)
+        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        if quote_lease is not None:
+            if maker_leg == Side.BUY:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_bid", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_bid", 0.0) or 0.0
+                )
+            else:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_ask", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_ask", 0.0) or 0.0
+                )
+        maker_planner_price = (
+            long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
+        )
+        hedge_planner_price = (
+            short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
+        )
 
         # V1: min_hedgeable_chunk aligns to venue step and notional floor
         min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
@@ -10808,10 +10988,10 @@ class LiveRuntime:
             slice_ratio=strategy.maker_initial_slice_ratio,
             min_hedgeable_chunk=min_hedgeable_chunk,
             maker_min_notional_quote=min_notional,
-            maker_price_hint=price_hint if price_hint > 0 else None,
+            maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
             max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
             hedge_min_notional_quote=min_notional,
-            hedge_price_hint=price_hint if price_hint > 0 else None,
+            hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
         )
 
         if route == ExecutionRoute.REJECTED:
@@ -10836,8 +11016,13 @@ class LiveRuntime:
             entry_type = EntryType.STANDARD_DUAL_TAKER
             effective_quantity = plan.full_target_quantity
 
-        # V1: maker leg from strategy config (funding arb: long side is typically maker)
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
+            long_order_price_hint = float(
+                getattr(quote_lease, "long_ask", 0.0) or 0.0
+            )
+            short_order_price_hint = float(
+                getattr(quote_lease, "short_bid", 0.0) or 0.0
+            )
 
         entry_id = f"entry-{now_ms}-{candidate.symbol}"
 
@@ -10890,11 +11075,14 @@ class LiveRuntime:
 
         maker_bbo_evidence: dict = {}
         if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
+            maker_order_price_hint = (
+                long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
+            )
             bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
                 venue=maker_venue,
                 symbol=candidate.symbol,
                 side=maker_leg,
-                price=price_hint,
+                price=maker_order_price_hint,
                 now_ms=now_ms,
             )
             if not bbo_ok:
@@ -10980,8 +11168,8 @@ class LiveRuntime:
             short_venue=short_venue,
             long_quantity=effective_quantity,
             short_quantity=effective_quantity,
-            long_price_hint=price_hint,
-            short_price_hint=price_hint,
+            long_price_hint=long_order_price_hint,
+            short_price_hint=short_order_price_hint,
             maker_leg=maker_leg,
             entry_type=entry_type,
             created_at_ms=now_ms,

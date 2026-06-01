@@ -425,6 +425,55 @@ class TestPlannerDispatchIntegration:
         runtime = LiveRuntime(config, venue_adapters=adapters)
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        candidate = self._candidate()
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
+        assert readiness.allowed
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5000,
+            price_hint=50000.0,
+        )
+
+        assert dispatched is True
+        assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
+        assert binance.last_request is not None
+        assert binance.last_request.post_only is True
+        assert len(runtime.state.pending_entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_dispatch_requires_selected_quote_lease(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         for venue, bid, ask in (
             ("binance", 50000.0, 50010.0),
             ("okx", 49990.0, 50000.0),
@@ -447,11 +496,102 @@ class TestPlannerDispatchIntegration:
             price_hint=50000.0,
         )
 
+        assert dispatched is False
+        assert binance.last_request is None
+        payload = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_quote_lease"
+        ][-1]
+        assert payload["reason"] == "missing_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_dispatch_uses_selected_quote_lease_prices(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        candidate = self._candidate()
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
+        assert readiness.allowed
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5000,
+            price_hint=12345.0,
+        )
+
         assert dispatched is True
-        assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
         assert binance.last_request is not None
         assert binance.last_request.post_only is True
-        assert len(runtime.state.pending_entries) == 1
+        assert binance.last_request.price == 50000.0
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_post_only_guard_uses_quote_lease_age_budget(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.runtime.max_market_age_ms = 3000
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+
+        ok, reason, payload = runtime._post_only_maker_bbo_guard(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            price=50000.0,
+            now_ms=7001,
+        )
+
+        assert ok is False
+        assert reason == "stale_bbo"
+        assert payload["stale_after_ms"] == 1500
 
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_blocks_stale_post_only_quote(
