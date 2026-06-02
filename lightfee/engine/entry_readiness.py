@@ -474,6 +474,24 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         cache = getattr(self._runtime, "ws_bbo_cache", None)
         long_quote = cache.get_quote(long_venue, symbol) if cache is not None else None
         short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
+        long_stream_state = self._stream_state(long_venue, symbol)
+        short_stream_state = self._stream_state(short_venue, symbol)
+        long_quote = self._quote_with_rest_refresh(
+            long_venue,
+            symbol,
+            long_quote,
+            "ask",
+            now_ms,
+            long_stream_state,
+        )
+        short_quote = self._quote_with_rest_refresh(
+            short_venue,
+            symbol,
+            short_quote,
+            "bid",
+            now_ms,
+            short_stream_state,
+        )
         if long_quote is None or short_quote is None:
             return EntryReadinessDecision.block(
                 self._reason("missing_quote"),
@@ -484,8 +502,8 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                     "missing_long_quote": long_quote is None,
                     "missing_short_quote": short_quote is None,
                     "source": "ws_bbo_cache",
-                    "long_stream_state": self._stream_state(long_venue, symbol),
-                    "short_stream_state": self._stream_state(short_venue, symbol),
+                    "long_stream_state": long_stream_state,
+                    "short_stream_state": short_stream_state,
                 },
             )
 
@@ -503,6 +521,65 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                 evidence=evidence,
             )
         return symbol, pair_id, long_quote, short_quote
+
+    def _quote_with_rest_refresh(
+        self,
+        venue: str,
+        symbol: str,
+        quote: Any,
+        executable_side: str,
+        now_ms: int,
+        stream_state: dict[str, Any],
+    ) -> Any:
+        if not bool(stream_state.get("tracked")):
+            return quote
+        if not self._quote_needs_rest_refresh(quote, executable_side, now_ms):
+            return quote
+
+        refresher = self._rest_top_book_refresher()
+        refresh_quote = getattr(refresher, "refresh_quote", None)
+        if not callable(refresh_quote):
+            return quote
+        refreshed = refresh_quote(
+            str(venue or "").strip().lower(),
+            str(symbol or "").strip().upper(),
+            now_ms=now_ms,
+        )
+        if refreshed is None:
+            return quote
+        if self._quote_error(refreshed, executable_side, now_ms):
+            return quote
+
+        cache = getattr(self._runtime, "ws_bbo_cache", None)
+        if cache is not None and hasattr(cache, "update_quote"):
+            if cache.update_quote(refreshed):
+                return cache.get_quote(venue, symbol) or refreshed
+            return quote
+        return refreshed
+
+    def _quote_needs_rest_refresh(
+        self,
+        quote: Any,
+        executable_side: str,
+        now_ms: int,
+    ) -> bool:
+        if quote is None:
+            return True
+        quote_error = self._quote_error(quote, executable_side, now_ms)
+        if quote_error is None:
+            return False
+        reason, _ = quote_error
+        return reason == self._reason("stale_quote")
+
+    def _rest_top_book_refresher(self) -> Any:
+        refresher = getattr(self._runtime, "ws_bbo_rest_refresher", None)
+        if refresher is not None:
+            return refresher
+        from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+        refresher = RestTopBookQuoteRefresher(timeout_ms=750)
+        setattr(self._runtime, "ws_bbo_rest_refresher", refresher)
+        return refresher
 
     def _stream_state(self, venue: str, symbol: str) -> dict[str, Any]:
         data_plane = getattr(self._runtime, "ws_bbo_data_plane", None)

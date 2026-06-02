@@ -219,6 +219,144 @@ def test_hyperliquid_bbo_parser_uses_bbo_channel():
     assert quote.ask == 113397.0
 
 
+def test_rest_top_book_refresher_fetches_aster_bookticker_official_path():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "GUNUSDT",
+                "bidPrice": "0.00735",
+                "bidQty": "100",
+                "askPrice": "0.00742",
+                "askQty": "120",
+                "time": 1778985599950,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("aster", "GUNUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "aster"
+    assert quote.symbol == "GUNUSDT"
+    assert quote.bid == 0.00735
+    assert quote.ask == 0.00742
+    assert quote.observed_at_ms == 1778985599950
+    assert quote.source == "aster_rest_top_book"
+    assert requests
+    assert str(requests[0].url) == (
+        "https://fapi.asterdex.com/fapi/v1/ticker/bookTicker?symbol=GUNUSDT"
+    )
+
+
+def test_rest_top_book_refresher_fetches_bybit_linear_ticker():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "retCode": 0,
+                "time": 1778985599900,
+                "result": {
+                    "list": [{
+                        "symbol": "ARIAUSDT",
+                        "bid1Price": "0.0391",
+                        "bid1Size": "500",
+                        "ask1Price": "0.0393",
+                        "ask1Size": "600",
+                    }],
+                },
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("bybit", "ARIAUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "bybit"
+    assert quote.bid == 0.0391
+    assert quote.ask == 0.0393
+    assert quote.observed_at_ms == 1778985599900
+    assert str(requests[0].url) == (
+        "https://api.bybit.com/v5/market/tickers?category=linear&symbol=ARIAUSDT"
+    )
+
+
+def test_rest_top_book_refresher_fetches_okx_ticker_with_venue_symbol():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "code": "0",
+                "data": [{
+                    "instId": "ARIA-USDT-SWAP",
+                    "bidPx": "0.0390",
+                    "bidSz": "700",
+                    "askPx": "0.0392",
+                    "askSz": "800",
+                    "ts": "1778985599980",
+                }],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("okx", "ARIAUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "okx"
+    assert quote.symbol == "ARIAUSDT"
+    assert quote.bid == 0.0390
+    assert quote.ask == 0.0392
+    assert quote.observed_at_ms == 1778985599980
+    assert str(requests[0].url) == (
+        "https://www.okx.com/api/v5/market/ticker?instId=ARIA-USDT-SWAP"
+    )
+
+
+def test_rest_top_book_refresher_rejects_one_sided_quote():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "COSUSDT",
+                "bidPrice": "0",
+                "askPrice": "0.001153",
+                "time": 1778985599950,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    assert refresher.refresh_quote("aster", "COSUSDT", now_ms=1778985600000) is None
+
+
 @pytest.mark.asyncio
 async def test_bbo_ws_client_records_subscription_error_control_message():
     from lightfee.marketdata.ws_bbo import OkxBboWsClient, VenueBboCache

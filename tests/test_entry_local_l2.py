@@ -2840,6 +2840,256 @@ class TestEntryReadinessProviderFactory:
             "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_stale_quote",
         }
 
+    def test_ws_bbo_quote_lease_refreshes_stale_tracked_quote_from_rest_top_book(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        config.runtime.max_market_age_ms = 3000
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "GUNUSDT",
+            "aster",
+            "binance",
+            "gunusdt:aster->binance",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["GUNUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("binance", ["GUNUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="aster",
+                symbol="GUNUSDT",
+                bid=0.00730,
+                ask=0.00740,
+                observed_at_ms=now_ms - 40_000,
+                received_at_ms=now_ms - 40_000,
+                source="aster_book_ticker",
+            )
+        )
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="GUNUSDT",
+                bid=0.00750,
+                ask=0.00760,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source="binance_book_ticker",
+            )
+        )
+
+        class FakeRestRefresher:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                self.calls.append((venue, symbol, now_ms))
+                if venue == "aster" and symbol == "GUNUSDT":
+                    return TopBookQuote(
+                        venue="aster",
+                        symbol="GUNUSDT",
+                        bid=0.00735,
+                        ask=0.00742,
+                        observed_at_ms=now_ms - 50,
+                        received_at_ms=now_ms - 40,
+                        source="aster_rest_top_book",
+                    )
+                return None
+
+        refresher = FakeRestRefresher()
+        rt.ws_bbo_rest_refresher = refresher
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == [candidate]
+        assert selection == Counter()
+        assert blockers == {}
+        assert refresher.calls == [("aster", "GUNUSDT", now_ms)]
+        lease = rt.entry_readiness_provider.get_lease("gunusdt:aster->binance")
+        assert lease is not None
+        assert lease.long_ask == 0.00742
+        assert lease.long_observed_at_ms == now_ms - 50
+
+    def test_ws_bbo_quote_lease_keeps_fail_closed_when_rest_top_book_invalid(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.runtime.max_market_age_ms = 3000
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "COSUSDT",
+            "aster",
+            "binance",
+            "cosusdt:aster->binance",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["COSUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("binance", ["COSUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="aster",
+                symbol="COSUSDT",
+                bid=0.00110,
+                ask=0.00120,
+                observed_at_ms=now_ms - 40_000,
+                received_at_ms=now_ms - 40_000,
+                source="aster_book_ticker",
+            )
+        )
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="COSUSDT",
+                bid=0.00130,
+                ask=0.00140,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source="binance_book_ticker",
+            )
+        )
+
+        class FakeRestRefresher:
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                return TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=0.0,
+                    ask=0.00115,
+                    observed_at_ms=now_ms,
+                    received_at_ms=now_ms,
+                    source="aster_rest_top_book",
+                )
+
+        rt.ws_bbo_rest_refresher = FakeRestRefresher()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_ws_bbo_quote_lease_stale_quote": 1})
+        assert blockers == {
+            "cosusdt:aster->binance": "entry_ws_bbo_quote_lease_stale_quote",
+        }
+
+    def test_ws_bbo_quote_lease_refreshes_tracked_missing_quote_from_rest_top_book(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        config.runtime.max_market_age_ms = 3000
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "ARIAUSDT",
+            "aster",
+            "binance",
+            "ariausdt:aster->binance",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["ARIAUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("binance", ["ARIAUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="ARIAUSDT",
+                bid=0.0394,
+                ask=0.0396,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source="binance_book_ticker",
+            )
+        )
+
+        class FakeRestRefresher:
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                if venue == "aster" and symbol == "ARIAUSDT":
+                    return TopBookQuote(
+                        venue="aster",
+                        symbol="ARIAUSDT",
+                        bid=0.0391,
+                        ask=0.0393,
+                        observed_at_ms=now_ms - 25,
+                        received_at_ms=now_ms - 20,
+                        source="aster_rest_top_book",
+                    )
+                return None
+
+        rt.ws_bbo_rest_refresher = FakeRestRefresher()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == [candidate]
+        assert selection == Counter()
+        assert blockers == {}
+        lease = rt.entry_readiness_provider.get_lease("ariausdt:aster->binance")
+        assert lease is not None
+        assert lease.long_bid == 0.0391
+
     def test_ws_bbo_quote_lease_missing_quote_logs_stream_error_evidence(self, tmp_path):
         from collections import Counter
         import json

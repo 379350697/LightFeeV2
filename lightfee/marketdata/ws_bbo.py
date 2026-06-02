@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
+import httpx
 import websockets
 
 
@@ -115,6 +116,181 @@ def gate_bbo_stream_url() -> str:
 
 def hyperliquid_bbo_stream_url() -> str:
     return "wss://api.hyperliquid.xyz/ws"
+
+
+class RestTopBookQuoteRefresher:
+    """Short-timeout public REST top-book refresh for tracked WS BBO gaps."""
+
+    SUPPORTED_VENUES = {"binance", "aster", "bybit", "okx"}
+    MIN_ATTEMPT_INTERVAL_MS = 1_000
+
+    def __init__(
+        self,
+        *,
+        client: httpx.Client | None = None,
+        timeout_ms: int = 750,
+    ) -> None:
+        self._client = client
+        self._owns_client = client is None
+        self._timeout_s = max(min(int(timeout_ms or 750), 1_000), 100) / 1000.0
+        self._last_attempt_ms: dict[tuple[str, str], int] = {}
+
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def refresh_quote(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> TopBookQuote | None:
+        venue_key = str(venue or "").strip().lower()
+        symbol_key = str(symbol or "").strip().upper()
+        if venue_key not in self.SUPPORTED_VENUES or not symbol_key:
+            return None
+
+        key = (venue_key, symbol_key)
+        last_attempt_ms = int(self._last_attempt_ms.get(key, 0) or 0)
+        if (
+            last_attempt_ms > 0
+            and now_ms - last_attempt_ms < self.MIN_ATTEMPT_INTERVAL_MS
+        ):
+            return None
+        self._last_attempt_ms[key] = now_ms
+
+        try:
+            return self._refresh_quote_uncached(venue_key, symbol_key, now_ms)
+        except Exception:
+            return None
+
+    def _refresh_quote_uncached(
+        self,
+        venue: str,
+        symbol: str,
+        now_ms: int,
+    ) -> TopBookQuote | None:
+        from lightfee.core.domain import Venue
+        from lightfee.venues.specs import get_spec
+
+        venue_enum = Venue.from_str(venue)
+        spec = get_spec(venue_enum)
+        venue_symbol = spec.symbol_to_venue(symbol) if spec.symbol_to_venue else symbol
+
+        if venue in {"binance", "aster"}:
+            raw = self._get_json(
+                spec.public_base_url + spec.market_snapshot_path,
+                params={"symbol": venue_symbol},
+            )
+            row = self._select_row(raw, venue_symbol)
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(row.get("bidPrice"), row.get("b")),
+                ask=_float_value(row.get("askPrice"), row.get("a")),
+                bid_size=_float_value(row.get("bidQty"), row.get("B")),
+                ask_size=_float_value(row.get("askQty"), row.get("A")),
+                observed_at_ms=_int_ms(
+                    row.get("time"),
+                    row.get("E"),
+                    row.get("T"),
+                    now_ms,
+                ),
+                received_at_ms=now_ms,
+            )
+
+        if venue == "bybit":
+            raw = self._get_json(
+                spec.public_base_url + spec.market_snapshot_path,
+                params={"category": "linear", "symbol": venue_symbol},
+            )
+            result = raw.get("result") if isinstance(raw, dict) else {}
+            rows = result.get("list") if isinstance(result, dict) else []
+            row = self._select_row(rows, venue_symbol)
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(row.get("bid1Price"), row.get("bidPrice")),
+                ask=_float_value(row.get("ask1Price"), row.get("askPrice")),
+                bid_size=_float_value(row.get("bid1Size"), row.get("bidSize")),
+                ask_size=_float_value(row.get("ask1Size"), row.get("askSize")),
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("time"), now_ms),
+                received_at_ms=now_ms,
+            )
+
+        if venue == "okx":
+            raw = self._get_json(
+                spec.public_base_url + "/api/v5/market/ticker",
+                params={"instId": venue_symbol},
+            )
+            row = self._select_row(
+                raw.get("data") if isinstance(raw, dict) else [],
+                venue_symbol,
+            )
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(row.get("bidPx")),
+                ask=_float_value(row.get("askPx")),
+                bid_size=_float_value(row.get("bidSz")),
+                ask_size=_float_value(row.get("askSz")),
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("ts"), now_ms),
+                received_at_ms=now_ms,
+            )
+
+        return None
+
+    def _get_json(self, url: str, *, params: dict[str, Any]) -> Any:
+        if self._client is None:
+            self._client = httpx.Client(timeout=httpx.Timeout(self._timeout_s))
+        response = self._client.get(url, params=params, timeout=self._timeout_s)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _select_row(raw: Any, venue_symbol: str) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, list):
+            return {}
+        if len(raw) == 1 and isinstance(raw[0], dict):
+            return raw[0]
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or row.get("instId") or "")
+            if symbol == venue_symbol:
+                return row
+        return {}
+
+    @staticmethod
+    def _make_rest_quote(
+        *,
+        venue: str,
+        symbol: str,
+        bid: float,
+        ask: float,
+        bid_size: float,
+        ask_size: float,
+        observed_at_ms: int,
+        received_at_ms: int,
+    ) -> TopBookQuote | None:
+        quote = TopBookQuote(
+            venue=venue,
+            symbol=symbol,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            observed_at_ms=observed_at_ms or received_at_ms,
+            received_at_ms=received_at_ms,
+            source=f"{venue}_rest_top_book",
+        )
+        if quote.bid <= 0.0 or quote.ask <= 0.0 or quote.bid >= quote.ask:
+            return None
+        return quote
 
 
 def _float_value(*values: Any) -> float:
