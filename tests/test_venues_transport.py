@@ -2908,6 +2908,82 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert result["response_classification"] == "ack_accepted"
 
     @pytest.mark.asyncio
+    async def test_okx_filled_response_converts_fill_contracts_to_base_quantity(
+        self,
+        monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    ct_val=100.0,
+                    rule_source="test_okx_instrument",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        transport._pos_mode_cache = "net"
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            assert path == transport._spec.order_path
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "ordId": "okx-fill-1",
+                        "clOrdId": "okx-fill-cid",
+                        "sCode": "0",
+                        "fillSz": "3",
+                        "avgPx": "0.0525",
+                        "state": "filled",
+                    }
+                ],
+            }
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=300.0,
+            client_order_id="okx-fill-cid",
+            price_hint=0.0525,
+            observed_at_ms=123456,
+        )
+
+        fill = await transport.place_order(req)
+
+        assert fill.quantity == pytest.approx(300.0)
+        attempt = next(
+            e["payload"]
+            for e in transport.order_diagnostics
+            if e["kind"] == "order.submit_attempt"
+        )
+        assert attempt["ct_val"] == pytest.approx(100.0)
+        assert attempt["contract_qty"] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
     async def test_okx_fetch_position_uses_instrument_ct_val_for_base_quantity(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
@@ -6238,6 +6314,39 @@ class TestVenueSpecificOrderReconciliationEvidence:
             "/api/v5/trade/orders-history",
         ]
         assert query_payload["response_classification"] == "open_order_not_found;closed_order_not_found"
+
+    def test_okx_order_status_scales_acc_fill_contracts_to_base_quantity(self):
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import okx_spec
+
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        raw = {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "HOME-USDT-SWAP",
+                    "ordId": "okx-status-1",
+                    "clOrdId": "okx-status-cid",
+                    "side": "buy",
+                    "accFillSz": "3",
+                    "avgPx": "0.0525",
+                    "state": "filled",
+                }
+            ],
+        }
+
+        result = transport._parse_order_status_okx(
+            raw,
+            "HOME-USDT-SWAP",
+            1780411997394,
+            contract_size=100.0,
+        )
+
+        assert result is not None
+        assert result.quantity == pytest.approx(300.0)
+        assert result.metadata["quantity_units"] == "contracts_to_base"
+        assert result.metadata["contract_qty"] == pytest.approx(3.0)
+        assert result.metadata["ct_val"] == pytest.approx(100.0)
 
 
 # ===========================================================================

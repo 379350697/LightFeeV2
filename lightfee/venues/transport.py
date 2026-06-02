@@ -3666,7 +3666,21 @@ class VenueTransport(MarketDataClient):
                 _require_aster_success(raw, "aster order failed")
 
             try:
-                fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
+                okx_contract_size = None
+                if spec.venue_id == Venue.OKX and preflight is not None:
+                    candidate_ct_val = float(preflight.get("ct_val") or 0.0)
+                    if candidate_ct_val > 0.0:
+                        okx_contract_size = candidate_ct_val
+                if spec.venue_id == Venue.OKX:
+                    fill = self._parse_order_fill(
+                        raw,
+                        request,
+                        venue_sym,
+                        now_ms,
+                        contract_size_override=okx_contract_size,
+                    )
+                else:
+                    fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
             except OrderSubmitError as exc:
                 order_id, client_order_id = self._extract_order_identifiers(raw)
                 if (
@@ -3809,6 +3823,8 @@ class VenueTransport(MarketDataClient):
         request: OrderRequest,
         venue_sym: str,
         now_ms: int,
+        *,
+        contract_size_override: float | None = None,
     ) -> OrderFill:
         spec = self._spec
 
@@ -3959,6 +3975,11 @@ class VenueTransport(MarketDataClient):
                 SubmitFailureClass.UNCERTAIN,
                 "order response contains no order id and no fill data",
             )
+        if spec.venue_id == Venue.OKX:
+            exec_qty = self._okx_contracts_to_base_quantity(
+                exec_qty,
+                contract_size_override,
+            )
 
         return OrderFill(
             venue=spec.venue_id,
@@ -3970,6 +3991,15 @@ class VenueTransport(MarketDataClient):
             client_order_id=request.client_order_id,
             filled_at_ms=now_ms,
         )
+
+    @staticmethod
+    def _okx_contracts_to_base_quantity(
+        contract_quantity: float,
+        contract_size: float | None,
+    ) -> float:
+        ct_val = float(contract_size or 0.0)
+        quantity = abs(float(contract_quantity or 0.0))
+        return quantity * ct_val if ct_val > 0.0 else quantity
 
     @staticmethod
     def _extract_order_identifiers(raw: dict[str, Any]) -> tuple[str, str]:
@@ -4201,7 +4231,15 @@ class VenueTransport(MarketDataClient):
         open_raw = await self._request(
             "GET", "/api/v5/trade/order", params=params, private=True,
         )
-        open_result = self._parse_order_status_okx(open_raw, venue_sym, now_ms)
+        contract_size = None
+        if self._okx_order_status_has_fill_quantity(open_raw):
+            contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
+        open_result = self._parse_order_status_okx(
+            open_raw,
+            venue_sym,
+            now_ms,
+            contract_size=contract_size,
+        )
         if open_result is not None:
             self._record_order_reconcile_query(
                 symbol=venue_sym,
@@ -4219,7 +4257,14 @@ class VenueTransport(MarketDataClient):
         history_raw = await self._request(
             "GET", "/api/v5/trade/orders-history", params=history_params, private=True,
         )
-        history_result = self._parse_order_status_okx(history_raw, venue_sym, now_ms)
+        if contract_size is None and self._okx_order_status_has_fill_quantity(history_raw):
+            contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
+        history_result = self._parse_order_status_okx(
+            history_raw,
+            venue_sym,
+            now_ms,
+            contract_size=contract_size,
+        )
         if history_result is not None:
             metadata = dict(history_result.metadata or {})
             metadata["queried_endpoints"] = list(endpoints)
@@ -4246,11 +4291,28 @@ class VenueTransport(MarketDataClient):
         )
         return None
 
+    @staticmethod
+    def _okx_order_status_has_fill_quantity(raw: dict[str, Any]) -> bool:
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            return False
+        data = raw.get("data", [])
+        if isinstance(data, list):
+            row = data[0] if data else {}
+        elif isinstance(data, dict):
+            row = data
+        else:
+            row = {}
+        if not isinstance(row, dict) or not row:
+            return False
+        return _safe_float(row.get("accFillSz", row.get("fillSz", "0"))) > 0.0
+
     def _parse_order_status_okx(
         self,
         raw: dict[str, Any],
         venue_sym: str,
         now_ms: int,
+        *,
+        contract_size: float | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         if not isinstance(raw, dict):
             return None
@@ -4265,9 +4327,10 @@ class VenueTransport(MarketDataClient):
             row = {}
         if not isinstance(row, dict) or not row:
             return None
-        qty = _safe_float(row.get("accFillSz", row.get("fillSz", "0")))
-        if qty <= 0.0:
+        contract_qty = _safe_float(row.get("accFillSz", row.get("fillSz", "0")))
+        if contract_qty <= 0.0:
             return None
+        qty = self._okx_contracts_to_base_quantity(contract_qty, contract_size)
         side_raw = str(row.get("side", "")).lower()
         if side_raw == "buy":
             side = Side.BUY
@@ -4293,6 +4356,9 @@ class VenueTransport(MarketDataClient):
                 "raw_exchange_status": str(row.get("state", "")),
                 "queried_endpoints": ["/api/v5/trade/order"],
                 "response_classification": "filled",
+                "quantity_units": "contracts_to_base",
+                "contract_qty": contract_qty,
+                "ct_val": float(contract_size or 0.0),
             },
         )
 
