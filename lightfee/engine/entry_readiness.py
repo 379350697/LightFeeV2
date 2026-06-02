@@ -522,6 +522,31 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             )
         return symbol, pair_id, long_quote, short_quote
 
+    def _quote_error(
+        self,
+        quote: Any,
+        executable_side: str,
+        now_ms: int,
+    ) -> tuple[str, dict[str, Any]] | None:
+        base_error = super()._quote_error(quote, executable_side, now_ms)
+        if base_error is not None:
+            return base_error
+
+        max_age_ms = self._quote_lease_age_budget_ms()
+        observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+        if (
+            observed_at_ms <= 0
+            or max_age_ms <= 0
+            or age_ms is None
+            or age_ms > max_age_ms
+        ):
+            evidence = self._quote_base_evidence(quote, now_ms)
+            evidence["max_age_ms"] = max_age_ms
+            evidence["age_budget_source"] = "entry_quote_lease_ttl_ms"
+            return self._reason("stale_quote"), evidence
+        return None
+
     def _quote_with_rest_refresh(
         self,
         venue: str,
@@ -570,6 +595,11 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             return False
         reason, _ = quote_error
         return reason == self._reason("stale_quote")
+
+    def _quote_lease_age_budget_ms(self) -> int:
+        return int(
+            getattr(self._runtime.config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
+        )
 
     def _rest_top_book_refresher(self) -> Any:
         refresher = getattr(self._runtime, "ws_bbo_rest_refresher", None)

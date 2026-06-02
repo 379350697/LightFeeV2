@@ -2933,6 +2933,99 @@ class TestEntryReadinessProviderFactory:
         assert lease.long_ask == 0.00742
         assert lease.long_observed_at_ms == now_ms - 50
 
+    def test_ws_bbo_quote_lease_refreshes_quote_older_than_lease_ttl(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        config.runtime.max_market_age_ms = 30_000
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "GUAUSDT",
+            "aster",
+            "binance",
+            "guausdt:aster->binance",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["GUAUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("binance", ["GUAUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="aster",
+                symbol="GUAUSDT",
+                bid=0.0810,
+                ask=0.0820,
+                observed_at_ms=now_ms - 2_000,
+                received_at_ms=now_ms - 2_000,
+                source="aster_book_ticker",
+            )
+        )
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="GUAUSDT",
+                bid=0.0830,
+                ask=0.0840,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source="binance_book_ticker",
+            )
+        )
+
+        class FakeRestRefresher:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                self.calls.append((venue, symbol, now_ms))
+                if venue == "aster" and symbol == "GUAUSDT":
+                    return TopBookQuote(
+                        venue="aster",
+                        symbol="GUAUSDT",
+                        bid=0.0815,
+                        ask=0.0825,
+                        observed_at_ms=now_ms - 50,
+                        received_at_ms=now_ms - 40,
+                        source="aster_rest_top_book",
+                    )
+                return None
+
+        refresher = FakeRestRefresher()
+        rt.ws_bbo_rest_refresher = refresher
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == [candidate]
+        assert selection == Counter()
+        assert blockers == {}
+        assert refresher.calls == [("aster", "GUAUSDT", now_ms)]
+        lease = rt.entry_readiness_provider.get_lease("guausdt:aster->binance")
+        assert lease is not None
+        assert lease.long_ask == 0.0825
+        assert lease.long_observed_at_ms == now_ms - 50
+
     def test_ws_bbo_quote_lease_keeps_fail_closed_when_rest_top_book_invalid(
         self,
         tmp_path,

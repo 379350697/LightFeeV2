@@ -10985,6 +10985,52 @@ class LiveRuntime:
             return "invalid_quote_lease", lease, evidence
         return "", lease, evidence
 
+    def _refresh_entry_quote_lease_for_execution(
+        self,
+        candidate,
+        now_ms: int,
+        quote_lease_reason: str,
+        quote_lease: object | None,
+        quote_lease_evidence: dict,
+    ) -> tuple[str, object | None, dict]:
+        if quote_lease_reason not in {"expired_quote_lease", "stale_quote_lease"}:
+            return quote_lease_reason, quote_lease, quote_lease_evidence
+        if self._entry_readiness_provider_name() != "ws_bbo_quote_lease":
+            return quote_lease_reason, quote_lease, quote_lease_evidence
+
+        decide = getattr(self.entry_readiness_provider, "decide", None)
+        if not callable(decide):
+            return quote_lease_reason, quote_lease, quote_lease_evidence
+
+        refresh_evidence = dict(quote_lease_evidence)
+        refresh_evidence["execution_refresh_attempted"] = True
+        refresh_evidence["execution_refresh_reason"] = quote_lease_reason
+        try:
+            decision = decide(candidate, now_ms)
+        except Exception as exc:
+            refresh_evidence["execution_refresh_error"] = (
+                f"{type(exc).__name__}: {str(exc)[:300]}"
+            )
+            return quote_lease_reason, quote_lease, refresh_evidence
+
+        if not getattr(decision, "allowed", False):
+            refresh_evidence["execution_refresh_block_reason"] = str(
+                getattr(decision, "reason", "")
+            )
+            refresh_evidence["execution_refresh_evidence"] = dict(
+                getattr(decision, "evidence", {}) or {}
+            )
+            return quote_lease_reason, quote_lease, refresh_evidence
+
+        new_reason, new_lease, new_evidence = self._entry_quote_lease_execution_check(
+            candidate,
+            now_ms,
+        )
+        new_evidence = dict(new_evidence)
+        new_evidence["execution_refresh_attempted"] = True
+        new_evidence["execution_refresh_reason"] = quote_lease_reason
+        return new_reason, new_lease, new_evidence
+
     @staticmethod
     def _quote_lease_reference_price(lease) -> float:
         long_ask = float(getattr(lease, "long_ask", 0.0) or 0.0)
@@ -11073,6 +11119,16 @@ class LiveRuntime:
         quote_lease_reason, quote_lease, quote_lease_evidence = (
             self._entry_quote_lease_execution_check(candidate, now_ms)
         )
+        if quote_lease_reason:
+            quote_lease_reason, quote_lease, quote_lease_evidence = (
+                self._refresh_entry_quote_lease_for_execution(
+                    candidate,
+                    now_ms,
+                    quote_lease_reason,
+                    quote_lease,
+                    quote_lease_evidence,
+                )
+            )
         if quote_lease_reason:
             payload = {
                 **quote_lease_evidence,
@@ -11893,8 +11949,74 @@ class LiveRuntime:
                         state=self.state,
                     )
 
+    def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
+        """Resolve a close price hint from the active WS BBO quote provider."""
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return 0.0
+
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            return 0.0
+
+        try:
+            cache = getattr(self, "ws_bbo_cache", None)
+            if cache is None or not hasattr(cache, "get_quote"):
+                return 0.0
+            quote = cache.get_quote(venue_value, symbol)
+            if quote is None:
+                return 0.0
+
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            if (
+                observed_at_ms <= 0
+                or age_ms is None
+                or age_ms > budget_ms
+                or bid <= 0.0
+                or ask <= bid
+            ):
+                self.journal.append(
+                    "runtime.close_price_evidence_stale",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "age_ms": age_ms,
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+
+            mid = (bid + ask) / 2.0
+            self.journal.append(
+                "runtime.close_price_evidence_fallback",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "observed_at_ms": observed_at_ms,
+                    "age_ms": age_ms,
+                    "budget_ms": budget_ms,
+                    "decision": "use_price_hint",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return mid
+        except Exception:
+            return 0.0
+
     def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
-        """Get mid price from local L2 book or sidecar for the given venue+symbol."""
+        """Get mid price from local L2 book or active close-price fallback for venue+symbol."""
         if now_ms is None:
             now_ms = wall_clock_now_ms()
         venue_value = venue.value if hasattr(venue, 'value') else str(venue)
@@ -11917,13 +12039,13 @@ class LiveRuntime:
                             "ts_ms": now_ms,
                         },
                     )
-                    return 0.0
+                    return self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
                 mid = book.mid_price()
                 if mid and mid > 0:
                     return mid
         except Exception:
             pass
-        return 0.0
+        return self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
 
     def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
         """Get best bid/ask from the local L2 book for passive tick inference."""

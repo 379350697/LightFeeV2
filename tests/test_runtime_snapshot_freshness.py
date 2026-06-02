@@ -1296,3 +1296,114 @@ def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch)
     assert stale[-1]["budget_ms"] == 5000
     assert stale[-1]["decision"] == "reject_price_hint"
     assert stale[-1]["fallback_source"] == "none"
+
+
+def test_close_price_hint_uses_fresh_ws_bbo_when_local_l2_missing(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1500,
+            max_liquidity_snapshot_age_ms=300000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.ws_bbo_cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=1000,
+            received_at_ms=1001,
+            source="binance_book_ticker",
+        )
+    )
+
+    runtime.journal.open()
+    try:
+        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=2000) == 100.5
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    fallback = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.close_price_evidence_fallback"
+    ]
+    assert fallback[-1]["venue"] == "binance"
+    assert fallback[-1]["symbol"] == "BTCUSDT"
+    assert fallback[-1]["domain"] == "ws_bbo_cache"
+    assert fallback[-1]["age_ms"] == 1000
+    assert fallback[-1]["budget_ms"] == 1500
+    assert fallback[-1]["decision"] == "use_price_hint"
+
+
+def test_close_price_hint_rejects_stale_ws_bbo_fallback(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1500,
+            max_liquidity_snapshot_age_ms=300000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.ws_bbo_cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=1000,
+            received_at_ms=1001,
+            source="binance_book_ticker",
+        )
+    )
+
+    runtime.journal.open()
+    try:
+        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=3000) == 0.0
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    stale = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.close_price_evidence_stale"
+    ]
+    assert stale[-1]["venue"] == "binance"
+    assert stale[-1]["symbol"] == "BTCUSDT"
+    assert stale[-1]["domain"] == "ws_bbo_cache"
+    assert stale[-1]["age_ms"] == 2000
+    assert stale[-1]["budget_ms"] == 1500
+    assert stale[-1]["decision"] == "reject_price_hint"
+    assert stale[-1]["fallback_source"] == "none"
