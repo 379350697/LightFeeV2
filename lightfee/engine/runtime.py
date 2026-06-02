@@ -70,6 +70,8 @@ logger = logging.getLogger("lightfee.engine.runtime")
 class LiveRuntime:
     """Live trading runtime with multi-lane ticks and control-plane exports."""
 
+    _MAX_STATIC_RECOVERY_PROBE_SYMBOLS = 1
+
     def __init__(self, config: AppConfig, venue_adapters: Optional[dict[Venue, VenueAdapter]] = None) -> None:
         self.config = config
         self.state = EngineState()
@@ -1712,6 +1714,21 @@ class LiveRuntime:
                 for symbol in getattr(self.config, "symbols", [])
                 if str(symbol)
             ]
+            max_static = self._MAX_STATIC_RECOVERY_PROBE_SYMBOLS
+            if len(static_symbols) > max_static:
+                if getattr(self.journal, "_file", None) is not None:
+                    self.journal.append(
+                        "recovery.live_position_static_config_probe_skipped",
+                        {
+                            "venue": venue.value,
+                            "static_symbol_count": len(static_symbols),
+                            "max_static_symbol_count": max_static,
+                            "requested_symbol_count": len(requested_symbols),
+                            "reason": "static_universe_too_large",
+                            "decision": "skip_per_symbol_fallback",
+                        },
+                    )
+                return []
             return await self._position_probe_symbols_for_venue(
                 venue,
                 adapter,

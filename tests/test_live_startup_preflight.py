@@ -714,6 +714,60 @@ class TestRuntimePreflight:
             assert symbols == []
 
     @pytest.mark.asyncio
+    async def test_clean_live_position_probe_empty_symbols_does_not_probe_static_config(self):
+        """Clean startup must not scan configured symbols when no recovery symbol exists."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["BTCUSDT", "ETHUSDT"]
+
+            class NoBulkBinanceAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT", "ETHUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BINANCE,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            binance = NoBulkBinanceAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+
+            runtime.journal.open()
+            try:
+                snapshots = await runtime._fetch_startup_live_position_snapshots([])
+            finally:
+                runtime.journal.close()
+
+            assert snapshots == []
+            assert binance.fetch_position_symbols == []
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            skipped = [
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_static_config_probe_skipped"
+            ]
+            assert skipped[-1]["venue"] == "binance"
+            assert skipped[-1]["static_symbol_count"] == 2
+            assert skipped[-1]["max_static_symbol_count"] == 1
+            assert skipped[-1]["decision"] == "skip_per_symbol_fallback"
+
+    @pytest.mark.asyncio
     async def test_live_position_probe_skips_when_local_recovery_work_exists(self):
         """Pending recovery work owns its live legs; flat live discovery must not race it."""
         with tempfile.TemporaryDirectory() as td:
