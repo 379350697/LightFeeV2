@@ -1954,6 +1954,124 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         )
 
     @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_registers_ws_for_hot_ws_authoritative_books(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from lightfee.core.domain import Venue
+        from lightfee.marketdata.l2 import PriceLevel
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("HOT book must not be re-bootstrapped")
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_ws_enabled = True
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+
+        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        for venue in ("binance", "bybit"):
+            book = rt.local_l2_runtime.ensure_book(venue, candidate.symbol)
+            book.transition_to_bootstrapping(now_ms=9000)
+            book.apply_snapshot(
+                [PriceLevel(price=50000.0, quantity=1.0)],
+                [PriceLevel(price=50100.0, quantity=1.0)],
+                sequence=10,
+                now_ms=9500,
+            )
+            book.transition_to_hot()
+
+        calls = []
+        real_start_ws_streams = rt.l2_data_plane.start_ws_streams
+
+        def start_ws_streams(venue, symbols, adapter=None):
+            calls.append(("start", venue, tuple(symbols), adapter is not None))
+            return real_start_ws_streams(venue, symbols, adapter=adapter)
+
+        async def connect_ws_streams():
+            calls.append(("connect",))
+            return 1
+
+        def start_background_bootstrap(**kwargs):
+            calls.append(("bootstrap", kwargs["venue"], tuple(kwargs["symbols"])))
+
+        monkeypatch.setattr(rt.l2_data_plane, "start_ws_streams", start_ws_streams)
+        monkeypatch.setattr(rt.l2_data_plane, "connect_ws_streams", connect_ws_streams)
+        monkeypatch.setattr(
+            rt.l2_data_plane, "start_background_bootstrap", start_background_bootstrap,
+        )
+
+        try:
+            await rt._ensure_l2_active_for_candidates([candidate], now_ms=10000)
+        finally:
+            rt.journal.close()
+
+        assert ("start", "bybit", ("BTCUSDT",), True) in calls
+        assert ("start", "binance", ("BTCUSDT",), True) not in calls
+        assert ("connect",) in calls
+        assert not [call for call in calls if call[0] == "bootstrap"]
+        assert rt.l2_data_plane.ws_stream_state("bybit", "BTCUSDT")["registered"] is True
+
+    @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_connects_existing_disconnected_ws_streams(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from lightfee.core.domain import Venue
+        from lightfee.marketdata.l2 import PriceLevel
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("background bootstrap is stubbed in this test")
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_ws_enabled = True
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+
+        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        binance_book = rt.local_l2_runtime.ensure_book("binance", candidate.symbol)
+        binance_book.transition_to_bootstrapping(now_ms=9000)
+        binance_book.apply_snapshot(
+            [PriceLevel(price=50000.0, quantity=1.0)],
+            [PriceLevel(price=50100.0, quantity=1.0)],
+            sequence=10,
+            now_ms=9500,
+        )
+        binance_book.transition_to_hot()
+        rt.l2_data_plane.start_ws_streams("bybit", [candidate.symbol], adapter=Adapter())
+
+        calls = []
+        real_start_ws_streams = rt.l2_data_plane.start_ws_streams
+
+        def start_ws_streams(venue, symbols, adapter=None):
+            calls.append(("start", venue, tuple(symbols), adapter is not None))
+            return real_start_ws_streams(venue, symbols, adapter=adapter)
+
+        async def connect_ws_streams():
+            calls.append(("connect",))
+            return 1
+
+        monkeypatch.setattr(rt.l2_data_plane, "start_ws_streams", start_ws_streams)
+        monkeypatch.setattr(rt.l2_data_plane, "connect_ws_streams", connect_ws_streams)
+        monkeypatch.setattr(
+            rt.l2_data_plane, "start_background_bootstrap", lambda **kwargs: None,
+        )
+
+        try:
+            await rt._ensure_l2_active_for_candidates([candidate], now_ms=10000)
+        finally:
+            rt.journal.close()
+
+        assert ("start", "bybit", ("BTCUSDT",), True) in calls
+        assert ("connect",) in calls
+
+    @pytest.mark.asyncio
     async def test_dynamic_l2_activation_preserves_shadow_warm_assignment(
         self, runtime_with_l2, monkeypatch,
     ):

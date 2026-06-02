@@ -578,6 +578,30 @@ class LocalL2DataPlane:
         client = self._ws_clients.get(key)
         return bool(client is not None and getattr(client, "is_connected", False))
 
+    def ws_stream_state(self, venue: str, symbol: str) -> dict[str, object]:
+        """Return WS lifecycle evidence for a local-L2 venue/symbol stream."""
+        key = LocalL2BookKey(venue=str(venue), symbol=str(symbol))
+        client = self._ws_clients.get(key)
+        state = self._freshness_states.get(key)
+        return {
+            "venue": key.venue,
+            "symbol": key.symbol,
+            "registered": client is not None,
+            "connected": bool(client is not None and getattr(client, "is_connected", False)),
+            "freshness_state_present": state is not None,
+            "last_subscription_confirmed_ms": (
+                int(state.last_subscription_confirmed_ms) if state is not None else 0
+            ),
+            "last_ws_delta_ms": int(state.last_ws_delta_ms) if state is not None else 0,
+            "last_ws_keepalive_ms": (
+                int(state.last_ws_keepalive_ms) if state is not None else 0
+            ),
+            "last_book_confirmation_ms": (
+                int(state.last_book_confirmation_ms) if state is not None else 0
+            ),
+            "last_rest_refresh_ms": int(state.last_rest_refresh_ms) if state is not None else 0,
+        }
+
     def _effective_hot_freshness_ms(
         self,
         key: LocalL2BookKey,

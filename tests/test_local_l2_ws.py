@@ -845,6 +845,22 @@ class TestDataPlaneWsStreams:
         started = dp.start_ws_streams("binance", ["BTCUSDT"])
         assert started == 0  # Already started
 
+    def test_ws_stream_state_exposes_registration_connection_and_freshness(self):
+        dp, rt, _ = _make_data_plane()
+
+        assert dp.ws_stream_state("bybit", "BTCUSDT")["registered"] is False
+
+        dp.start_ws_streams("bybit", ["BTCUSDT"])
+        dp.note_ws_subscription_confirmed("bybit", "BTCUSDT", now_ms=1000)
+        dp.note_ws_delta("bybit", "BTCUSDT", now_ms=1100)
+
+        state = dp.ws_stream_state("bybit", "BTCUSDT")
+        assert state["registered"] is True
+        assert state["connected"] is False
+        assert state["freshness_state_present"] is True
+        assert state["last_subscription_confirmed_ms"] == 1000
+        assert state["last_ws_delta_ms"] == 1100
+
     def test_start_ws_streams_ignores_unregistered_venues(self):
         dp, rt, _ = _make_data_plane()
 

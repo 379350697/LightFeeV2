@@ -2489,7 +2489,79 @@ class LiveRuntime:
         # Collect (venue, symbol) pairs from candidates that need L2
         # CandidateInput has long_venue/short_venue as str fields (not leg objects)
         needed: dict[str, set[str]] = {}  # venue -> {symbols}
+        registered_total = 0
+        registered_venues: set[str] = set()
+        connect_ws_streams_needed = False
         stale_after_ms = self._entry_local_l2_stale_after_ms()
+        from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
+
+        def hot_book_needs_ws_lifecycle_attention(venue: str, symbol: str) -> bool:
+            if not getattr(self.config.strategy, 'local_l2_ws_enabled', False):
+                return False
+            policy = policy_for_venue(venue)
+            if policy.bridge_mode not in (
+                BridgeMode.WS_SNAPSHOT_AUTHORITATIVE,
+                BridgeMode.STREAM_ONLY,
+            ):
+                return False
+            stream_state_fn = getattr(self.l2_data_plane, "ws_stream_state", None)
+            if not callable(stream_state_fn):
+                return False
+            stream_state = stream_state_fn(venue, symbol)
+            return (
+                not bool(stream_state.get("registered"))
+                or not bool(stream_state.get("connected"))
+            )
+
+        def venue_adapter_for_local_l2(venue: str):
+            try:
+                ven = Venue.from_str(venue)
+                return self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+            except (ValueError, KeyError):
+                return None
+
+        def ensure_hot_ws_lifecycle(venue: str, symbol: str) -> None:
+            nonlocal registered_total, connect_ws_streams_needed
+            adapter = venue_adapter_for_local_l2(venue)
+            if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
+                return
+            before_state = self.l2_data_plane.ws_stream_state(venue, symbol)
+            registered = self.l2_data_plane.start_ws_streams(
+                venue, [symbol], adapter=adapter,
+            )
+            after_state = self.l2_data_plane.ws_stream_state(venue, symbol)
+            if registered > 0:
+                registered_total += registered
+            if (
+                registered > 0
+                or (
+                    bool(before_state.get("registered"))
+                    and not bool(before_state.get("connected"))
+                )
+                or (
+                    bool(after_state.get("registered"))
+                    and not bool(after_state.get("connected"))
+                )
+            ):
+                connect_ws_streams_needed = True
+                registered_venues.add(venue)
+
+        async def connect_registered_ws_streams() -> None:
+            nonlocal connect_ws_streams_needed
+            if not connect_ws_streams_needed:
+                return
+            connected = await self.l2_data_plane.connect_ws_streams()
+            self.journal.append(
+                "runtime.local_l2_dynamic_ws_started",
+                {
+                    "registered_stream_count": registered_total,
+                    "connected_stream_count": connected,
+                    "venues": sorted(registered_venues),
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
+            connect_ws_streams_needed = False
+
         for c in candidates:
             sym = getattr(c, 'symbol', '')
             for ven_str in (getattr(c, 'long_venue', ''), getattr(c, 'short_venue', '')):
@@ -2509,6 +2581,8 @@ class LiveRuntime:
                         stale = book.is_stale(stale_after_ms, now_ms)
                         crossed = book.has_crossed_book()
                         if not stale and not crossed:
+                            if hot_book_needs_ws_lifecycle_attention(ven_str, str(sym)):
+                                ensure_hot_ws_lifecycle(ven_str, str(sym))
                             continue
                         book.transition_to_rebuilding(now_ms)
                         book.fault_reason = (
@@ -2539,6 +2613,7 @@ class LiveRuntime:
             remember_key(getattr(position, "short_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
 
         if not needed:
+            await connect_registered_ws_streams()
             self.l2_data_plane.prune_untracked_books(
                 tracked_keys,
                 now_ms,
@@ -2551,8 +2626,6 @@ class LiveRuntime:
         )
         from lightfee.marketdata.local_l2_venues import get_venue_rules
 
-        registered_total = 0
-        registered_venues: set[str] = set()
         for ven_str, symbols in needed.items():
             # Limit per venue budget (V1: take(per_venue_budget))
             symbols_list = sorted(symbols)[:per_venue_budget]
@@ -2593,12 +2666,35 @@ class LiveRuntime:
                     book.transition_to_bootstrapping(now_ms)
 
             if getattr(self.config.strategy, 'local_l2_ws_enabled', False):
+                stream_state_fn = getattr(self.l2_data_plane, "ws_stream_state", None)
+                before_states = (
+                    {
+                        sym: stream_state_fn(ven_str, sym)
+                        for sym in symbols_list
+                    }
+                    if callable(stream_state_fn)
+                    else {}
+                )
                 registered = self.l2_data_plane.start_ws_streams(
                     ven_str, symbols_list, adapter=adapter,
                 )
+                after_states = (
+                    {
+                        sym: stream_state_fn(ven_str, sym)
+                        for sym in symbols_list
+                    }
+                    if callable(stream_state_fn)
+                    else {}
+                )
                 if registered > 0:
                     registered_total += registered
+                disconnected_registered = any(
+                    bool(state.get("registered")) and not bool(state.get("connected"))
+                    for state in [*before_states.values(), *after_states.values()]
+                )
+                if registered > 0 or disconnected_registered:
                     registered_venues.add(ven_str)
+                    connect_ws_streams_needed = True
 
             # Start background bootstrap worker
             bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
@@ -2613,17 +2709,7 @@ class LiveRuntime:
                 retry_backoff_ms=bs_retry,
             )
 
-        if registered_total > 0:
-            connected = await self.l2_data_plane.connect_ws_streams()
-            self.journal.append(
-                "runtime.local_l2_dynamic_ws_started",
-                {
-                    "registered_stream_count": registered_total,
-                    "connected_stream_count": connected,
-                    "venues": sorted(registered_venues),
-                    "ts_ms": wall_clock_now_ms(),
-                },
-            )
+        await connect_registered_ws_streams()
 
         self.l2_data_plane.prune_untracked_books(
             tracked_keys,
