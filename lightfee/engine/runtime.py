@@ -2836,6 +2836,50 @@ class LiveRuntime:
         snap = getattr(self.state, "local_l2_books_snapshot", None)
         if not snap:
             return
+        active_owner_pairs: set[tuple[str, str]] = set()
+
+        def remember_owner_pair(venue, symbol) -> None:
+            ven_str = venue.value if hasattr(venue, "value") else str(venue or "")
+            sym = str(symbol or "")
+            if ven_str and sym:
+                active_owner_pairs.add((ven_str, sym))
+
+        for book in getattr(self.state, "retained_local_l2_books", []) or []:
+            remember_owner_pair(book.get("venue", ""), book.get("symbol", ""))
+
+        open_positions = getattr(self.state, "open_positions", {}) or {}
+        open_position_values = (
+            open_positions.values() if hasattr(open_positions, "values") else open_positions
+        )
+        for position in open_position_values:
+            sym = getattr(position, "symbol", "")
+            remember_owner_pair(getattr(position, "long_venue", ""), sym)
+            remember_owner_pair(getattr(position, "short_venue", ""), sym)
+            remember_owner_pair(getattr(position, "venue", ""), sym)
+
+        pending_entries = getattr(self.state, "pending_entries", {}) or {}
+        pending_entry_values = (
+            pending_entries.values() if hasattr(pending_entries, "values") else pending_entries
+        )
+        for pending in pending_entry_values:
+            sym = getattr(pending, "symbol", "")
+            remember_owner_pair(getattr(pending, "long_venue", ""), sym)
+            remember_owner_pair(getattr(pending, "short_venue", ""), sym)
+
+        pending_passive_closes = getattr(self.state, "pending_passive_closes", {}) or {}
+        pending_close_values = (
+            pending_passive_closes.values()
+            if hasattr(pending_passive_closes, "values")
+            else pending_passive_closes
+        )
+        for pending_close in pending_close_values:
+            position = getattr(pending_close, "position_snapshot", None)
+            if position is None:
+                continue
+            sym = getattr(position, "symbol", "")
+            remember_owner_pair(getattr(position, "long_venue", ""), sym)
+            remember_owner_pair(getattr(position, "short_venue", ""), sym)
+
         allowed_pairs: set[tuple[str, str]] = set()
         if self.config.runtime.mode != "paper":
             from lightfee.core.domain import Venue as VenueEnum
@@ -2882,6 +2926,15 @@ class LiveRuntime:
                 continue
             if (venue, symbol) not in allowed_pairs:
                 continue
+            pool_str = str(entry.get("pool", "dropped"))
+            if (
+                pool_str in {
+                    L2PoolAssignment.HOT_EXEC.value,
+                    L2PoolAssignment.WARM.value,
+                }
+                and (venue, symbol) not in active_owner_pairs
+            ):
+                continue
             book = self.local_l2_runtime.ensure_book(venue, symbol)
             book.last_update_id = entry.get("last_update_id", 0)
             book.sequence = entry.get("sequence", 0)
@@ -2897,7 +2950,6 @@ class LiveRuntime:
                 book.asks = [PriceLevel(price=l["price"], quantity=l["quantity"]) for l in entry["asks"]]
             # Restore the persisted pool — only RETAINED books should be
             # re-bootstrapped at startup (V1: retained_local_l2_books).
-            pool_str = entry.get("pool", "dropped")
             try:
                 book.pool = L2PoolAssignment(pool_str)
             except ValueError:

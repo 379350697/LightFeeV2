@@ -1417,6 +1417,48 @@ class TestRuntimePreflight:
             assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
 
     @pytest.mark.asyncio
+    async def test_local_l2_snapshot_restore_skips_unowned_transient_hot_exec_books(self):
+        """Entry HOT books without retained/live owners must not survive restart."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.local_l2_enabled = True
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BYBIT)
+                    self.loaded = False
+
+                def supported_symbols(self) -> list[str]:
+                    return ["HUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            bybit = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.state.local_l2_books_snapshot = [
+                {
+                    "venue": "bybit",
+                    "symbol": "HUSDT",
+                    "status": "hot",
+                    "pool": "hot_exec",
+                    "sequence": 2978207,
+                    "last_update_id": 2978207,
+                    "bids": [{"price": 1.0, "quantity": 1.0}],
+                    "asks": [{"price": 1.1, "quantity": 1.0}],
+                },
+            ]
+
+            runtime.journal.open()
+            try:
+                await runtime._restore_local_l2_state()
+            finally:
+                runtime.journal.close()
+
+            assert bybit.loaded is True
+            assert runtime.local_l2_runtime.get_book("bybit", "HUSDT") is None
+
+    @pytest.mark.asyncio
     async def test_housekeeping_recovers_balanced_live_positions_after_start(self):
         """A running clean state must not stay false-clean after live positions appear."""
         with tempfile.TemporaryDirectory() as td:
