@@ -22,6 +22,9 @@ Terminal reduce-only, already-flat, under-min, or price-unavailable close branch
 - V1 terminal-maker and under-min branches do not spin forever; they either prove flat, compensate, or fail-closed.
 - Unsupported or failed open-order truth is not flat evidence.
 - Exchange min-notional / reduce-only terminal rejects must be interpreted with live position truth, not used blindly as success.
+- Missing close price evidence must explain whether Local-L2 was stale, WS BBO
+  fallback was stale, or WS BBO fallback had no cache/quote/budget. A bare
+  `price_hint=0.0` is not enough to choose a semantic fix.
 
 ## Attempts Ledger
 
@@ -32,6 +35,7 @@ Terminal reduce-only, already-flat, under-min, or price-unavailable close branch
 | 2026-05-29 | Terminal-maker price-unavailable compensation | effective | JCTUSDT terminal maker branch no longer loops; cloud probe flat/no-open-orders. |
 | 2026-05-30 | Post-`bbcd7b9` RAVE/NOM/ORCA flatness watch plus post-fix POWER/HOME closes | deployed/probe verified | Current probes are flat. POWER/HOME opened and auto-closed after `0fd9a74`; POWER had duplicate/reduce-only already-flat noise after live-matched close, then terminal-flat recovery cleared. |
 | 2026-05-31 | Live-truth precheck before first passive maker submit | fixed, deployed, cloud verified | ID/HOME reproduced Bybit `110017` because the chosen short maker leg was already live-flat before first maker submit. V2 now probes both legs first and routes maker-flat truth to existing one-sided flatten or both-flat recovery. Cloud `70a1a8c` targeted HOME/ID probes are flat/no-open-orders. |
+| 2026-06-03 | WS BBO close fallback missing-quote evidence | local green, deploy pending | Post-`e087513` had two passive close missing-price events after current state recovered flat. Runtime now emits `runtime.close_price_evidence_missing` for active WS BBO fallback missing cache/quote/budget branches without changing fail-closed behavior. |
 
 ## Recurrences
 
@@ -42,6 +46,7 @@ Terminal reduce-only, already-flat, under-min, or price-unavailable close branch
 | 2026-05-29 | `JCTUSDT` | `9cdb9df` | closed by cloud probe | [daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression](../daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression) |
 | 2026-05-30 | `RAVEUSDT`, `NOMUSDT`, `ORCAUSDT`, `HOMEUSDT`, `POWERUSDT` | `0fd9a74` | final targeted probes flat/no-open-orders; no pending passive close remains | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | `IDUSDT`, `HOMEUSDT` Binance/Bybit | `70a1a8c` | deployed; post-restart window has no opens or maker-submit errors; targeted probes flat/no-open-orders | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
+| 2026-06-03 | `STEEMUSDT`, `TRIAUSDT` | working tree | local green, deploy pending | [daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up](../daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up) |
 
 ## Regression Harness
 
@@ -57,5 +62,8 @@ Terminal reduce-only, already-flat, under-min, or price-unavailable close branch
 2. Run `diagnose_live.py --symbol <symbol> --venues <long,short>` for high-confidence live truth.
 3. Check whether open-order truth is supported and successful on both venues.
 4. Search for terminal flat, under-min, price-unavailable, and fallback events.
-5. If live truth is flat, bug is stale local terminality. If live truth is nonzero, bug is compensation/repair path.
-6. Closure requires harness replay plus credentialed flat/no-open-orders probe.
+5. When `price_hint=0.0`, search adjacent `runtime.close_price_evidence_fallback`,
+   `runtime.close_price_evidence_stale`, and
+   `runtime.close_price_evidence_missing` before changing close semantics.
+6. If live truth is flat, bug is stale local terminality. If live truth is nonzero, bug is compensation/repair path.
+7. Closure requires harness replay plus credentialed flat/no-open-orders probe.

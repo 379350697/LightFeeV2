@@ -4115,10 +4115,14 @@ class VenueTransport(MarketDataClient):
             return None
 
         params: dict[str, Any] = {"symbol": venue_sym}
-        if order_id:
-            params["orderId"] = order_id
+        order_id_text = str(order_id or "").strip()
+        client_order_id_text = str(client_order_id or "").strip()
+        if order_id_text and order_id_text.isdigit():
+            params["orderId"] = order_id_text
+        elif client_order_id_text:
+            params["origClientOrderId"] = client_order_id_text
         else:
-            params["origClientOrderId"] = client_order_id
+            params["origClientOrderId"] = order_id_text
         raw = await self._request("GET", "/fapi/v1/order", params=params, private=True)
 
         code = raw.get("code") if isinstance(raw, dict) else None

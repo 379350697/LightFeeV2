@@ -1407,3 +1407,45 @@ def test_close_price_hint_rejects_stale_ws_bbo_fallback(tmp_path):
     assert stale[-1]["budget_ms"] == 1500
     assert stale[-1]["decision"] == "reject_price_hint"
     assert stale[-1]["fallback_source"] == "none"
+
+
+def test_close_price_hint_records_missing_ws_bbo_fallback_quote(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1500,
+            max_liquidity_snapshot_age_ms=300000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+
+    runtime.journal.open()
+    try:
+        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "STEEMUSDT", now_ms=2000) == 0.0
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    missing = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.close_price_evidence_missing"
+    ]
+    assert missing[-1]["venue"] == "binance"
+    assert missing[-1]["symbol"] == "STEEMUSDT"
+    assert missing[-1]["domain"] == "ws_bbo_cache"
+    assert missing[-1]["reason"] == "missing_quote"
+    assert missing[-1]["budget_ms"] == 1500
+    assert missing[-1]["decision"] == "reject_price_hint"

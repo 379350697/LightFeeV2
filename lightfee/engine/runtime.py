@@ -12160,14 +12160,56 @@ class LiveRuntime:
 
         budget_ms = self._entry_quote_lease_max_age_ms()
         if budget_ms <= 0:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_lease_budget_unavailable",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
             return 0.0
 
         try:
             cache = getattr(self, "ws_bbo_cache", None)
             if cache is None or not hasattr(cache, "get_quote"):
+                self.journal.append(
+                    "runtime.close_price_evidence_missing",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "reason": "cache_unavailable",
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
                 return 0.0
             quote = cache.get_quote(venue_value, symbol)
             if quote is None:
+                self.journal.append(
+                    "runtime.close_price_evidence_missing",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "reason": "missing_quote",
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
                 return 0.0
 
             observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
@@ -12216,7 +12258,22 @@ class LiveRuntime:
                 },
             )
             return mid
-        except Exception:
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "fallback_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
             return 0.0
 
     def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:

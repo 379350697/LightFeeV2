@@ -6273,6 +6273,57 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert query_payload["client_order_id"] == "bn-timeout-cid"
 
     @pytest.mark.anyio
+    async def test_binance_recovery_placeholder_order_id_uses_orig_client_order_id(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        seen_queries: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            query = dict(request.url.params)
+            seen_queries.append(query)
+            if query.get("origClientOrderId") == "bn-recovery-cid" and "orderId" not in query:
+                return httpx.Response(200, json={
+                    "symbol": "CLOUSDT",
+                    "orderId": 123456,
+                    "clientOrderId": "bn-recovery-cid",
+                    "status": "FILLED",
+                    "executedQty": "178",
+                    "avgPrice": "0.00041",
+                    "side": "SELL",
+                    "updateTime": 1770000000000,
+                })
+            return httpx.Response(200, json={
+                "code": -1102,
+                "msg": "Mandatory parameter 'orderId' was not sent, was empty/null, or malformed.",
+            })
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "CLOUSDT",
+            order_id="entry-1780415543977-CLOUSDT-recovery-short",
+            client_order_id="bn-recovery-cid",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.order_id == "123456"
+        assert result.client_order_id == "bn-recovery-cid"
+        assert seen_queries[-1]["origClientOrderId"] == "bn-recovery-cid"
+        assert "orderId" not in seen_queries[-1]
+        query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
+        assert query_payload["order_id"] == "123456"
+        assert query_payload["client_order_id"] == "bn-recovery-cid"
+
+    @pytest.mark.anyio
     async def test_okx_order_not_found_queries_open_and_history(self):
         from lightfee.venues.okx import OkxAdapter
 
