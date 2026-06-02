@@ -17,6 +17,26 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest startup recovery lifecycle follow-up, 2026-06-03: cloud deployed
+`cb1abbed4516ff016b78be6cc1e0f588d40853c7`; remote focused tests passed
+(`60 passed`), services restarted active with `NRestarts=0`, and the prior
+CL036 Binance startup probe fanout no longer reproduced (`live_tick_stale` /
+Binance `429` gone, Local-L2 rebuild and sequence-gap counts `0`). Production
+health still stayed red for a separate V2/V1 lifecycle-release drift:
+`lifecycle=risk_only` with stale
+`recovery_blocked_reason=startup_recovery_pending_work_without_open_positions`
+after runtime recovery had submitted the missing Bybit hedge and then detected
+a balanced live `HIVEUSDT` position (`Binance long 394`, `Bybit short 394`,
+no open orders). The local CL037 fix is narrow: when
+`LiveRuntime._maybe_recover_clean_live_positions()` creates a new balanced open
+position from the runtime live-position probe and no pending entry/close work
+remains, it reuses `_finalize_startup_recovery()` to apply the V1 rule that
+recovered open positions are managed running state. It does not change order
+submit, Local-L2, WS BBO, close, residual repair, mismatch flattening, or
+generic recovery-block clearing behavior. RED/GREEN reproduced the stale block
+(`risk_only` before fix), then focused and adjacent local gates passed
+(`1`, `48`, `11`, `4`, and `15` tests). Deploy is pending.
+
 Latest OKX contract-fill unit follow-up, 2026-06-02: cloud remained on
 `a0b8b84` while the WS BBO classification fix `a8ee0ec` was pushed but not
 deployed. Current remote health later recovered green (`ok=true`,

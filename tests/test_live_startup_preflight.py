@@ -1557,6 +1557,69 @@ class TestRuntimePreflight:
             assert pos.matched_quantity == pytest.approx(0.03)
 
     @pytest.mark.asyncio
+    async def test_runtime_live_recovery_clears_stale_pending_without_open_block(self):
+        """Balanced live recovery must release the startup pending-without-open block."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            bybit = FakeVenueAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            )
+
+            await runtime.start()
+            assert len(runtime.state.open_positions) == 0
+
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = (
+                "startup_recovery_pending_work_without_open_positions"
+            )
+            runtime.state.recovery_blocked_at_ms = 1234
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.03,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000005000,
+                )
+            ]
+            bybit.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65015.0,
+                    observed_at_ms=1700000005000,
+                )
+            ]
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+            await runtime.stop()
+
+            assert len(runtime.state.open_positions) == 1
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            assert any(r["kind"] == "recovery.live_detected" for r in records)
+            assert any(
+                r["kind"] == "runtime.running"
+                and r["payload"].get("reason")
+                == "startup_recovery_completed_with_positions"
+                for r in records
+            )
+
+    @pytest.mark.asyncio
     async def test_startup_flattens_unpaired_live_exchange_position(self):
         """Unpaired live exposure should be reduce-only flattened, not shown as clean."""
         with tempfile.TemporaryDirectory() as td:

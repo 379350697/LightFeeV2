@@ -1207,11 +1207,22 @@ class LiveRuntime:
             return
 
         self._last_private_position_probe_ms = now_ms
+        open_positions_before = len(self.state.open_positions)
         await self._recover_startup_live_positions(
             self._startup_position_probe_symbols({}),
             now_ms,
             source="runtime_live_position_probe",
         )
+        if (
+            self.state.recovery_blocked_reason
+            == "startup_recovery_pending_work_without_open_positions"
+            and len(self.state.open_positions) > open_positions_before
+            and not self.state.pending_entries
+            and not self.state.pending_closes
+            and not self.state.pending_passive_closes
+            and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+        ):
+            self._finalize_startup_recovery()
 
     async def _position_probe_symbols_for_venue(
         self, venue: Venue, adapter: VenueAdapter, symbols: list[str],
