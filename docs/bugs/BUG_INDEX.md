@@ -17,7 +17,7 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest startup recovery lifecycle follow-up, 2026-06-03: cloud deployed
+Latest startup recovery lifecycle follow-up, 2026-06-03: cloud first deployed
 `cb1abbed4516ff016b78be6cc1e0f588d40853c7`; remote focused tests passed
 (`60 passed`), services restarted active with `NRestarts=0`, and the prior
 CL036 Binance startup probe fanout no longer reproduced (`live_tick_stale` /
@@ -35,7 +35,19 @@ recovered open positions are managed running state. It does not change order
 submit, Local-L2, WS BBO, close, residual repair, mismatch flattening, or
 generic recovery-block clearing behavior. RED/GREEN reproduced the stale block
 (`risk_only` before fix), then focused and adjacent local gates passed
-(`1`, `48`, `11`, `4`, and `15` tests). Deploy is pending.
+(`1`, `48`, `11`, `4`, and `15` tests); full pytest passed
+(`3369 passed`, `9 skipped`, `1 warning`), compileall/diff-check passed, and
+GitNexus detect-changes was LOW with zero affected processes. Cloud deployed
+`5625361a99d8f5efd0a589446d809353674c7b5e`, remote focused regression passed
+(`80 passed`), compileall and manifest checks passed, and services restarted
+active. Settled production verification is green (`ok=true`,
+`critical_count=0`, `risk_mode=running`, `lifecycle=running`, local
+open/pending/close/residual `0/0/0/0`). Credentialed HIVE-only exchange truth
+is flat/no-open-orders on Binance and Bybit with high confidence. The close
+window did emit WS-BBO/close-price missing evidence and reduce-only retry
+noise, but terminal events reached `exit.closed`, `recovery.flat`, and
+`runtime.position_drift_corrected`; treat that as a separate close-path watch,
+not old WS BBO subscription or Local-L2 recurrence.
 
 Latest OKX contract-fill unit follow-up, 2026-06-02: cloud remained on
 `a0b8b84` while the WS BBO classification fix `a8ee0ec` was pushed but not
