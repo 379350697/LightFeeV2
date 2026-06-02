@@ -3226,6 +3226,163 @@ class TestEntryReadinessProviderFactory:
             "cosusdt:aster->binance": "entry_ws_bbo_quote_lease_stale_quote",
         }
 
+    def test_ws_bbo_quote_lease_stale_quote_records_rest_refresh_failure_evidence(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "GUNUSDT",
+            "aster",
+            "binance",
+            "gunusdt:aster->binance",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["GUNUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("binance", ["GUNUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="aster",
+                symbol="GUNUSDT",
+                bid=0.00730,
+                ask=0.00740,
+                observed_at_ms=now_ms - 20_000,
+                received_at_ms=now_ms - 20_000,
+                source="aster_book_ticker",
+            )
+        )
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="GUNUSDT",
+                bid=0.00750,
+                ask=0.00760,
+                observed_at_ms=now_ms - 50,
+                received_at_ms=now_ms - 40,
+                source="binance_book_ticker",
+            )
+        )
+
+        class NoQuoteRestRefresher:
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                return None
+
+        rt.ws_bbo_rest_refresher = NoQuoteRestRefresher()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_ws_bbo_quote_lease_stale_quote": 1})
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        evidence = payload["readiness_evidence"]
+        assert evidence["rest_refresh"]["long"]["attempted"] is True
+        assert evidence["rest_refresh"]["long"]["outcome"] == "no_quote"
+
+    def test_ws_bbo_quote_lease_missing_tracked_quote_records_rest_refresh_failure_evidence(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1200
+        rt = LiveRuntime(config)
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "SIGNUSDT",
+            "okx",
+            "aster",
+            "signusdt:okx->aster",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        rt.ws_bbo_data_plane.start_ws_streams("okx", ["SIGNUSDT"])
+        rt.ws_bbo_data_plane.start_ws_streams("aster", ["SIGNUSDT"])
+        rt.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="SIGNUSDT",
+                bid=0.01110,
+                ask=0.01120,
+                observed_at_ms=now_ms - 50,
+                received_at_ms=now_ms - 40,
+                source="okx_ticker",
+            )
+        )
+
+        class NoQuoteRestRefresher:
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                return None
+
+        rt.ws_bbo_rest_refresher = NoQuoteRestRefresher()
+        selection: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({"entry_ws_bbo_quote_lease_missing_quote": 1})
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        evidence = payload["readiness_evidence"]
+        assert evidence["rest_refresh"]["short"]["attempted"] is True
+        assert evidence["rest_refresh"]["short"]["outcome"] == "no_quote"
+
     def test_ws_bbo_quote_lease_refreshes_tracked_missing_quote_from_rest_top_book(
         self,
         tmp_path,
@@ -3574,6 +3731,88 @@ class TestEntryReadinessProviderFactory:
             ("bybit", "MELONUSDT"),
             ("hyperliquid", "MELONUSDT"),
         }
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_marks_budget_excluded_candidates_separately(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_ws_bbo_per_venue_budget = 1
+        rt = LiveRuntime(config)
+        rt.journal.open()
+        candidates = [
+            TestPrimaryTrackingAdmission._make_candidate(
+                "MELONUSDT",
+                "bybit",
+                "hyperliquid",
+                "melonusdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+            TestPrimaryTrackingAdmission._make_candidate(
+                "BANANAUSDT",
+                "bybit",
+                "hyperliquid",
+                "bananausdt:bybit->hyperliquid",
+                first_funding_timestamp_ms=now_ms + 300_000,
+            ),
+        ]
+
+        async def fake_connect_ws_streams():
+            return len(rt.ws_bbo_data_plane._clients)
+
+        monkeypatch.setattr(
+            rt.ws_bbo_data_plane,
+            "connect_ws_streams",
+            fake_connect_ws_streams,
+        )
+        try:
+            await rt._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
+            selection: Counter = Counter()
+            blockers: dict[str, str] = {}
+            selected = rt._select_entry_candidates(
+                [candidates[1]],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter({
+            "entry_ws_bbo_quote_lease_budget_exhausted": 1,
+        })
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": (
+                "entry_ws_bbo_quote_lease_budget_exhausted"
+            ),
+        }
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        evidence = payload["readiness_evidence"]
+        assert evidence["coverage_reason"] == "subscription_budget_exhausted"
+        assert evidence["per_venue_budget"] == 1
+        assert evidence["long_subscription_budget"]["excluded"] is True
+        assert evidence["short_subscription_budget"]["excluded"] is True
 
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_tick_prewarms_before_snapshot_quote_filter(

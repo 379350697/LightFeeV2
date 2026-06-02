@@ -142,6 +142,9 @@ class LiveRuntime:
             cache=self.ws_bbo_cache,
             journal=self.journal,
         )
+        self._entry_bbo_subscription_budgeted_keys: set[tuple[str, str]] = set()
+        self._entry_bbo_subscription_budget_excluded_keys: set[tuple[str, str]] = set()
+        self._entry_bbo_subscription_per_venue_budget: int = 0
 
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
@@ -580,14 +583,56 @@ class LiveRuntime:
         if not missing_long_subscription and not missing_short_subscription:
             return None, {}
 
-        return "entry_ws_bbo_quote_lease_waiting_for_subscription", {
+        budgeted_keys = getattr(self, "_entry_bbo_subscription_budgeted_keys", set())
+        budget_excluded_keys = getattr(
+            self,
+            "_entry_bbo_subscription_budget_excluded_keys",
+            set(),
+        )
+        per_venue_budget = int(
+            getattr(self, "_entry_bbo_subscription_per_venue_budget", 0) or 0
+        )
+
+        def budget_state(venue: str) -> dict[str, Any]:
+            key = (venue, symbol)
+            return {
+                "venue": venue,
+                "symbol": symbol,
+                "budgeted": key in budgeted_keys,
+                "excluded": key in budget_excluded_keys,
+                "per_venue_budget": per_venue_budget,
+            }
+
+        long_budget = budget_state(long_venue)
+        short_budget = budget_state(short_venue)
+        budget_exhausted = (
+            missing_long_subscription and bool(long_budget["excluded"])
+        ) or (
+            missing_short_subscription and bool(short_budget["excluded"])
+        )
+        reason = (
+            "entry_ws_bbo_quote_lease_budget_exhausted"
+            if budget_exhausted
+            else "entry_ws_bbo_quote_lease_waiting_for_subscription"
+        )
+        coverage_reason = (
+            "subscription_budget_exhausted"
+            if budget_exhausted
+            else "subscription_missing"
+        )
+
+        return reason, {
             "provider": "ws_bbo_quote_lease",
             "source": "ws_bbo_subscription",
+            "coverage_reason": coverage_reason,
             "symbol": symbol,
             "missing_long_subscription": missing_long_subscription,
             "missing_short_subscription": missing_short_subscription,
             "long_stream_state": long_state,
             "short_stream_state": short_state,
+            "per_venue_budget": per_venue_budget,
+            "long_subscription_budget": long_budget,
+            "short_subscription_budget": short_budget,
         }
 
     def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
@@ -2728,8 +2773,14 @@ class LiveRuntime:
         snapshots, replay deltas, or update entry L2 sessions.
         """
         if not self._entry_readiness_provider_uses_ws_bbo():
+            self._entry_bbo_subscription_budgeted_keys = set()
+            self._entry_bbo_subscription_budget_excluded_keys = set()
+            self._entry_bbo_subscription_per_venue_budget = 0
             return
         if self.config.runtime.mode == "paper":
+            self._entry_bbo_subscription_budgeted_keys = set()
+            self._entry_bbo_subscription_budget_excluded_keys = set()
+            self._entry_bbo_subscription_per_venue_budget = 0
             return
 
         needed: dict[str, list[str]] = {}
@@ -2753,6 +2804,9 @@ class LiveRuntime:
                 tracked_keys.add((venue, symbol))
 
         if not needed:
+            self._entry_bbo_subscription_budgeted_keys = set()
+            self._entry_bbo_subscription_budget_excluded_keys = set()
+            self._entry_bbo_subscription_per_venue_budget = 0
             self.ws_bbo_data_plane.prune_untracked_quotes(
                 tracked_keys,
                 now_ms,
@@ -2768,6 +2822,18 @@ class LiveRuntime:
             ),
             1,
         )
+        budgeted_keys: set[tuple[str, str]] = set()
+        budget_excluded_keys: set[tuple[str, str]] = set()
+        for venue_str, symbols in needed.items():
+            venue_symbols = list(symbols)
+            for symbol in venue_symbols[:per_venue_budget]:
+                budgeted_keys.add((venue_str, symbol))
+            for symbol in venue_symbols[per_venue_budget:]:
+                budget_excluded_keys.add((venue_str, symbol))
+        self._entry_bbo_subscription_budgeted_keys = budgeted_keys
+        self._entry_bbo_subscription_budget_excluded_keys = budget_excluded_keys
+        self._entry_bbo_subscription_per_venue_budget = per_venue_budget
+
         registered_total = 0
         registered_venues: set[str] = set()
         for venue_str, symbols in needed.items():

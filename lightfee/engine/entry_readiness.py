@@ -476,7 +476,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
         long_stream_state = self._stream_state(long_venue, symbol)
         short_stream_state = self._stream_state(short_venue, symbol)
-        long_quote = self._quote_with_rest_refresh(
+        long_quote, long_rest_refresh = self._quote_with_rest_refresh(
             long_venue,
             symbol,
             long_quote,
@@ -484,7 +484,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             now_ms,
             long_stream_state,
         )
-        short_quote = self._quote_with_rest_refresh(
+        short_quote, short_rest_refresh = self._quote_with_rest_refresh(
             short_venue,
             symbol,
             short_quote,
@@ -492,28 +492,37 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             now_ms,
             short_stream_state,
         )
+        rest_refresh_evidence = {}
+        if long_rest_refresh is not None:
+            rest_refresh_evidence["long"] = long_rest_refresh
+        if short_rest_refresh is not None:
+            rest_refresh_evidence["short"] = short_rest_refresh
         if long_quote is None or short_quote is None:
+            evidence = {
+                "provider": self.provider_name,
+                "missing_long_quote": long_quote is None,
+                "missing_short_quote": short_quote is None,
+                "source": "ws_bbo_cache",
+                "long_stream_state": long_stream_state,
+                "short_stream_state": short_stream_state,
+            }
+            if rest_refresh_evidence:
+                evidence["rest_refresh"] = rest_refresh_evidence
             return EntryReadinessDecision.block(
                 self._reason("missing_quote"),
                 symbol=symbol,
                 pair_id=pair_id,
-                evidence={
-                    "provider": self.provider_name,
-                    "missing_long_quote": long_quote is None,
-                    "missing_short_quote": short_quote is None,
-                    "source": "ws_bbo_cache",
-                    "long_stream_state": long_stream_state,
-                    "short_stream_state": short_stream_state,
-                },
+                evidence=evidence,
             )
 
-        quote_error = (
-            self._quote_error(long_quote, "ask", now_ms)
-            or self._quote_error(short_quote, "bid", now_ms)
-        )
+        long_quote_error = self._quote_error(long_quote, "ask", now_ms)
+        short_quote_error = self._quote_error(short_quote, "bid", now_ms)
+        quote_error = long_quote_error or short_quote_error
         if quote_error:
             reason, evidence = quote_error
             evidence.update({"provider": self.provider_name, "source": "ws_bbo_cache"})
+            if rest_refresh_evidence:
+                evidence["rest_refresh"] = rest_refresh_evidence
             return EntryReadinessDecision.block(
                 reason,
                 symbol=symbol,
@@ -555,32 +564,65 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         executable_side: str,
         now_ms: int,
         stream_state: dict[str, Any],
-    ) -> Any:
+    ) -> tuple[Any, dict[str, Any] | None]:
+        venue_key = str(venue or "").strip().lower()
+        symbol_key = str(symbol or "").strip().upper()
         if not bool(stream_state.get("tracked")):
-            return quote
+            return quote, None
         if not self._quote_needs_rest_refresh(quote, executable_side, now_ms):
-            return quote
+            return quote, None
+
+        evidence: dict[str, Any] = {
+            "attempted": True,
+            "source": "rest_top_book_refresh",
+            "venue": venue_key,
+            "symbol": symbol_key,
+            "quote_present_before_refresh": quote is not None,
+        }
 
         refresher = self._rest_top_book_refresher()
         refresh_quote = getattr(refresher, "refresh_quote", None)
         if not callable(refresh_quote):
-            return quote
-        refreshed = refresh_quote(
-            str(venue or "").strip().lower(),
-            str(symbol or "").strip().upper(),
-            now_ms=now_ms,
-        )
+            evidence["outcome"] = "no_refresher"
+            return quote, evidence
+        try:
+            refreshed = refresh_quote(
+                venue_key,
+                symbol_key,
+                now_ms=now_ms,
+            )
+        except Exception as exc:  # pragma: no cover - defensive telemetry
+            evidence["outcome"] = "error"
+            evidence["error"] = f"{type(exc).__name__}: {exc}"[:240]
+            return quote, evidence
         if refreshed is None:
-            return quote
-        if self._quote_error(refreshed, executable_side, now_ms):
-            return quote
+            evidence["outcome"] = "no_quote"
+            return quote, evidence
+        refreshed_error = self._quote_error(refreshed, executable_side, now_ms)
+        if refreshed_error:
+            reason, error_evidence = refreshed_error
+            evidence["outcome"] = "invalid_quote"
+            evidence["reason"] = reason
+            evidence["quote_evidence"] = error_evidence
+            return quote, evidence
 
         cache = getattr(self._runtime, "ws_bbo_cache", None)
         if cache is not None and hasattr(cache, "update_quote"):
             if cache.update_quote(refreshed):
-                return cache.get_quote(venue, symbol) or refreshed
-            return quote
-        return refreshed
+                evidence["outcome"] = "cache_updated"
+                evidence["observed_at_ms"] = int(
+                    getattr(refreshed, "observed_at_ms", 0) or 0
+                )
+                return cache.get_quote(venue, symbol) or refreshed, evidence
+            evidence["outcome"] = "cache_rejected"
+            evidence["quote_evidence"] = self._quote_base_evidence(
+                refreshed,
+                now_ms,
+            )
+            return quote, evidence
+        evidence["outcome"] = "refreshed"
+        evidence["observed_at_ms"] = int(getattr(refreshed, "observed_at_ms", 0) or 0)
+        return refreshed, evidence
 
     def _quote_needs_rest_refresh(
         self,
