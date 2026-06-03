@@ -79,6 +79,37 @@ class HyperliquidAdapter(VenueAdapter):
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         return await self._transport.fetch_position(symbol)
 
+    async def fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """Fetch Hyperliquid open orders for the configured account."""
+        cred = self._credential
+        if cred is None or not cred.account_address:
+            return []
+
+        raw = await self._transport._request(
+            "POST",
+            "/info",
+            body={"type": "openOrders", "user": cred.account_address},
+            private=False,
+        )
+        rows: Any = raw
+        if isinstance(raw, dict):
+            rows = raw.get("openOrders", raw.get("orders", raw.get("data", [])))
+        if not isinstance(rows, list):
+            return []
+
+        venue_symbol = self._transport._venue_symbol(symbol).upper()
+        canonical_symbol = symbol.upper()
+        matched: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            coin = str(row.get("coin", "") or "").upper()
+            if not coin:
+                continue
+            if coin == venue_symbol or f"{coin}USDT" == canonical_symbol:
+                matched.append(dict(row))
+        return matched
+
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 

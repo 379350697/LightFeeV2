@@ -8361,6 +8361,44 @@ class TestCancelAbsentOrderDetection:
         assert ack.state == PassiveOrderState.CANCELED
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_adapter_fetch_open_orders_uses_info_open_orders(self):
+        """Hyperliquid open-order truth comes from the official /info openOrders API."""
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.transport import LiveCredential
+
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key="0x" + "11" * 32,
+                account_address="0x" + "33" * 20,
+            ),
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = kwargs.get("body")
+            seen["private"] = kwargs.get("private")
+            return [
+                {"coin": "MERL", "oid": 455070590535, "sz": "864"},
+                {"coin": "BTC", "oid": 1, "sz": "0.1"},
+            ]
+
+        adapter._transport._request = fake_request
+
+        rows = await adapter.fetch_open_orders("MERLUSDT")
+
+        assert rows == [{"coin": "MERL", "oid": 455070590535, "sz": "864"}]
+        account_address = adapter._credential.account_address
+        assert seen == {
+            "method": "POST",
+            "path": "/info",
+            "body": {"type": "openOrders", "user": account_address},
+            "private": False,
+        }
+
+    @pytest.mark.asyncio
     async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):
         """Bybit V5 order lookup is GET /v5/order/realtime, not GET /v5/order/create."""
         from lightfee.venues.transport import VenueTransport

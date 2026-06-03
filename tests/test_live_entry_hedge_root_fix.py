@@ -1095,6 +1095,17 @@ class TestPendingReconcileTerminalPolicy:
     """CL-002-C: stale hedge_inflight must be safely cleared after negative
     evidence; hedge residuals below min_notional must enter terminal state."""
 
+    def test_hyperliquid_open_order_match_accepts_oid_and_coin(self, tmp_path):
+        """Hyperliquid openOrders rows use oid/cloid and coin, not USDT symbols."""
+        runtime = _make_open_runtime(tmp_path)
+
+        assert runtime._pending_entry_open_order_matches(
+            {"oid": 455070590535, "coin": "MERL"},
+            symbol="MERLUSDT",
+            order_id="455070590535",
+            client_order_id="",
+        )
+
     def test_stale_hedge_inflight_cleared_after_negative_evidence(self):
         """When order missing + fills zero + position zero, inflight is cleared."""
         pending = PendingEntry(

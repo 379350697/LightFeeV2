@@ -5386,6 +5386,7 @@ class LiveRuntime:
             row.get("orderId")
             or row.get("ordId")
             or row.get("id")
+            or row.get("oid")
             or row.get("order_id")
             or ""
         )
@@ -5394,6 +5395,7 @@ class LiveRuntime:
             or row.get("clOrdId")
             or row.get("orderLinkId")
             or row.get("clientOid")
+            or row.get("cloid")
             or row.get("client_order_id")
             or ""
         )
@@ -5405,10 +5407,15 @@ class LiveRuntime:
         row_symbol = str(row.get("symbol") or row.get("instId") or row.get("coin") or "")
         if not row_symbol:
             return True
+        target_symbol = symbol.replace("-", "").replace("_", "").replace("SWAP", "")
         compact_row_symbol = (
             row_symbol.replace("-", "").replace("_", "").replace("SWAP", "")
         )
-        return row_symbol == symbol or compact_row_symbol == symbol
+        return (
+            row_symbol == symbol
+            or compact_row_symbol == target_symbol
+            or f"{compact_row_symbol}USDT" == target_symbol
+        )
 
     async def _pending_entry_maker_open_order_matches(
         self,
