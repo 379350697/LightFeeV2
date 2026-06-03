@@ -6277,13 +6277,33 @@ class VenueTransport(MarketDataClient):
                 if order_id:
                     params["order_id"] = order_id
             elif spec.venue_id == Venue.HYPERLIQUID:
-                body = {
+                try:
+                    oid = int(order_id)
+                except (TypeError, ValueError):
+                    raise TransportError(
+                        TransportErrorCategory.ORDER_STATE_UNCERTAIN,
+                        "hyperliquid cancel requires numeric exchange order id",
+                    )
+                if self._credential is None or not self._credential.wallet_private_key:
+                    raise TransportError(
+                        TransportErrorCategory.AUTH_FAILURE,
+                        "hyperliquid cancel requires wallet_private_key",
+                    )
+                from lightfee.venues.hyperliquid_signing import (
+                    build_hyperliquid_exchange_payload,
+                )
+
+                meta = self._hl_cached_asset_meta(venue_sym)
+                action = {
                     "type": "cancel",
-                    "cancel": {
-                        "coin": venue_sym,
-                        "oid": int(order_id) if order_id else 0,
-                    },
+                    "cancels": [{"a": int(meta["asset_index"]), "o": oid}],
                 }
+                body = build_hyperliquid_exchange_payload(
+                    action=action,
+                    private_key_hex=self._credential.wallet_private_key,
+                    vault_address=None,
+                    is_mainnet=True,
+                )
                 raw = await self._request("POST", spec.order_path, body=body, private=True)
                 # V1: check HL cancel response (hyperliquid.rs cancel path)
                 # Response: {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [...]}}}
@@ -6293,12 +6313,19 @@ class VenueTransport(MarketDataClient):
                     data = response_data.get("data", {})
                     if isinstance(data, dict):
                         statuses = data.get("statuses", [])
-                        if isinstance(statuses, list) and statuses:
-                            cancel_status = str(statuses[0]).lower()
-                            if cancel_status == "success":
-                                status = "ok"
+                        if isinstance(statuses, list):
+                            for item in statuses:
+                                if isinstance(item, dict) and item.get("error"):
+                                    status = "error"
+                                    break
+                                if "error" in str(item).lower():
+                                    status = "error"
+                                    break
                 if status != "ok":
-                    raise TransportError(f"Hyperliquid cancel rejected: {raw}")
+                    raise TransportError(
+                        TransportErrorCategory.REQUEST_REJECTED,
+                        f"Hyperliquid cancel rejected: {raw}",
+                    )
                 return PassiveOrderAck(
                     venue=spec.venue_id,
                     symbol=venue_sym,
