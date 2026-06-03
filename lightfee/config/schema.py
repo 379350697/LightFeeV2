@@ -15,6 +15,14 @@ ENTRY_READINESS_PROVIDERS = (
     "ws_top_book",
     "ws_bbo_quote_lease",
 )
+V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE = 1_000_000.0
+V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
+    "bitget": 2_000_000.0,
+    "bybit": 2_000_000.0,
+    "binance": 5_000_000.0,
+    "okx": 5_000_000.0,
+}
+V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE = 1_000_000.0
 
 
 def _is_valid_generate_time(s: str) -> bool:
@@ -23,6 +31,10 @@ def _is_valid_generate_time(s: str) -> bool:
     parts = s.split(":")
     h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
     return 0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59
+
+
+def _v1_entry_volume_floor_quote_by_venue() -> dict[str, float]:
+    return dict(V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE)
 
 
 @dataclass
@@ -224,6 +236,12 @@ class StrategyConfig:
     entry_readiness_provider: str = "local_l2"
     entry_quote_lease_ttl_ms: int = 1500
     entry_ws_bbo_per_venue_budget: int = 10
+    entry_volume_floor_default_quote: float = V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
+    entry_volume_floor_quote_by_venue: dict[str, float] = field(
+        default_factory=_v1_entry_volume_floor_quote_by_venue
+    )
+    entry_open_interest_floor_default_quote: float = V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE
+    entry_open_interest_floor_quote_by_venue: dict[str, float] = field(default_factory=dict)
     local_l2_enabled: bool = True
     local_l2_ws_enabled: bool = True  # WS L2 delta streaming
     bybit_local_l2_depth: int = 50
@@ -242,6 +260,28 @@ class StrategyConfig:
     local_l2_hot_exec_global_budget: int = 16
     local_l2_hot_exec_per_venue_budget: int = 4
     entry_min_size_round_up_whitelist: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def _venue_key(venue) -> str:
+        if hasattr(venue, "value"):
+            venue = venue.value
+        return str(venue or "").lower()
+
+    def entry_volume_floor_quote(self, venue) -> float:
+        return float(
+            self.entry_volume_floor_quote_by_venue.get(
+                self._venue_key(venue),
+                self.entry_volume_floor_default_quote,
+            )
+        )
+
+    def entry_open_interest_floor_quote(self, venue) -> float:
+        return float(
+            self.entry_open_interest_floor_quote_by_venue.get(
+                self._venue_key(venue),
+                self.entry_open_interest_floor_default_quote,
+            )
+        )
 
 
     def local_l2_resource_budget(self) -> dict:

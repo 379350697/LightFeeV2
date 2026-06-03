@@ -99,6 +99,30 @@ def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
         ask=ask,
         bid_size=100.0,
         ask_size=100.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest=2_000_000.0,
+    )
+
+
+def _quote_with_liquidity(
+    venue: str,
+    symbol: str,
+    *,
+    volume_24h_quote: float,
+    open_interest: float,
+    observed_at_ms: int = 69000,
+) -> QuoteSnapshot:
+    return QuoteSnapshot(
+        venue=venue,
+        symbol=symbol,
+        bid=100.0,
+        ask=101.0,
+        observed_at_ms=observed_at_ms,
+        source="sidecar_quote",
+        bid_size=100.0,
+        ask_size=100.0,
+        volume_24h_quote=volume_24h_quote,
+        open_interest=open_interest,
     )
 
 
@@ -685,6 +709,210 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
     assert "runtime.perp_liquidity_stale_advisory" in [
         record["kind"] for record in records
     ]
+
+
+def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=6_000_000.0,
+                open_interest=900_000.0,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == []
+    records_by_venue = {
+        record["venue"]: record
+        for record in runtime.state.entry_liquidity_qualification_records
+    }
+    assert records_by_venue["okx"] == {
+        "venue": "okx",
+        "symbol": "BTCUSDT",
+        "consecutive_failures": 1,
+        "last_failure_at_ms": 70000,
+        "suppress_until_ms": None,
+        "last_class": "temporary_below_floor",
+        "last_observed_open_interest_quote": 900000,
+        "last_observed_open_interest_at_ms": 69000,
+        "last_structural_probe_at_ms": None,
+    }
+    assert records_by_venue["bybit"] == {
+        "venue": "bybit",
+        "symbol": "BTCUSDT",
+        "consecutive_failures": 0,
+        "last_failure_at_ms": None,
+        "suppress_until_ms": None,
+        "last_class": "eligible",
+        "last_observed_open_interest_quote": 2000000,
+        "last_observed_open_interest_at_ms": 69000,
+        "last_structural_probe_at_ms": None,
+    }
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert "execution.entry_liquidity_blocked" in [record["kind"] for record in records]
+    decision = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "perp_open_interest_below_floor"
+    )
+    assert decision["decision"] == "skip_entry"
+    assert decision["observed_open_interest_quote"] == 900000.0
+    assert decision["min_open_interest_quote"] == 1000000.0
+    assert decision["eligibility_class"] == "temporary_below_floor"
+
+
+def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.entry_liquidity_qualification_records = [
+        {
+            "venue": "okx",
+            "symbol": "BTCUSDT",
+            "consecutive_failures": 3,
+            "last_failure_at_ms": 10000,
+            "suppress_until_ms": 1_810_000,
+            "last_class": "structural_ineligibility",
+            "last_observed_open_interest_quote": 900000,
+            "last_observed_open_interest_at_ms": 10000,
+            "last_structural_probe_at_ms": 69500,
+        }
+    ]
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=6_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+        assert filtered == []
+
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=130000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == [candidate]
+    records = runtime.state.entry_liquidity_qualification_records
+    okx_record = next(record for record in records if record["venue"] == "okx")
+    assert okx_record["last_class"] == "eligible"
+    assert okx_record["consecutive_failures"] == 0
+    assert okx_record["suppress_until_ms"] is None
+    journal_records = _read_journal_records(tmp_path / "events.jsonl")
+    structural = next(
+        record["payload"]
+        for record in journal_records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "perp_open_interest_structural"
+    )
+    assert structural["eligibility_class"] == "structural_ineligibility"
+    assert structural["last_structural_probe_at_ms"] == 69500
 
 
 @pytest.mark.asyncio

@@ -9548,6 +9548,256 @@ class LiveRuntime:
                 return True
         return False
 
+    def _entry_liquidity_qualification_state(self):
+        from lightfee.engine.entry_liquidity_qualification import (
+            EntryLiquidityQualificationState,
+        )
+
+        return EntryLiquidityQualificationState.from_records(
+            getattr(self.state, "entry_liquidity_qualification_records", []) or []
+        )
+
+    def _entry_liquidity_volume_floor_quote(self, venue: str) -> float:
+        from lightfee.config.schema import V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
+
+        getter = getattr(self.config.strategy, "entry_volume_floor_quote", None)
+        if callable(getter):
+            return float(getter(venue))
+        return float(V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE)
+
+    def _entry_liquidity_open_interest_floor_quote(self, venue: str) -> float:
+        from lightfee.config.schema import V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE
+
+        getter = getattr(self.config.strategy, "entry_open_interest_floor_quote", None)
+        if callable(getter):
+            return float(getter(venue))
+        return float(V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE)
+
+    def _entry_liquidity_decision_payload(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        quote,
+        snapshot,
+        now_ms: int,
+        fallback_source: str,
+        reason: str,
+        decision: str,
+        event_kind: str,
+        eligibility_class: str,
+        observed_volume_24h_quote: float,
+        min_volume_24h_quote: float,
+        observed_open_interest_quote: float,
+        min_open_interest_quote: float,
+        state_record: dict | None = None,
+    ) -> dict:
+        observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        payload = {
+            "venue": venue,
+            "symbol": symbol,
+            "domain": "liquidity",
+            "source_domain": "perp_liquidity",
+            "source": "sidecar_perp_liquidity",
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+            "budget_ms": self._snapshot_domain_budget_ms("liquidity"),
+            "decision": decision,
+            "fallback_source": fallback_source,
+            "reason": reason,
+            "event_kind": event_kind,
+            "blocking": decision == "skip_entry",
+            "observed_volume_24h_quote": observed_volume_24h_quote,
+            "min_volume_24h_quote": min_volume_24h_quote,
+            "observed_open_interest_quote": observed_open_interest_quote,
+            "min_open_interest_quote": min_open_interest_quote,
+            "eligibility_class": eligibility_class,
+        }
+        if state_record:
+            payload.update({
+                "consecutive_failures": int(
+                    state_record.get("consecutive_failures", 0) or 0
+                ),
+                "suppress_until_ms": state_record.get("suppress_until_ms"),
+                "last_failure_at_ms": state_record.get("last_failure_at_ms"),
+                "last_structural_probe_at_ms": state_record.get(
+                    "last_structural_probe_at_ms"
+                ),
+            })
+        return payload
+
+    def _entry_liquidity_qualification_decisions(
+        self,
+        candidate,
+        *,
+        snapshot,
+        quote_lookup: dict,
+        now_ms: int,
+        fallback_source: str,
+        record_result: bool = False,
+    ) -> list[dict]:
+        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+            return []
+        if not bool(getattr(self.config.strategy, "execution_liquidity_enabled", True)):
+            return []
+
+        from lightfee.engine.entry_liquidity_qualification import (
+            ENTRY_LIQUIDITY_STRUCTURAL_PROBE_INTERVAL_MS,
+            EntryLiquidityEligibilityClass,
+        )
+
+        state = self._entry_liquidity_qualification_state()
+        decisions: list[dict] = []
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        if not symbol:
+            return decisions
+
+        for venue_attr in ("long_venue", "short_venue"):
+            venue = str(getattr(candidate, venue_attr, "") or "").lower()
+            if not venue:
+                continue
+            quote = quote_lookup.get((venue, symbol))
+            if quote is None:
+                continue
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            if bid <= 0.0 or ask <= 0.0:
+                continue
+
+            observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
+            volume_24h_quote = float(getattr(quote, "volume_24h_quote", 0.0) or 0.0)
+            open_interest_quote = float(getattr(quote, "open_interest", 0.0) or 0.0)
+            volume_floor = self._entry_liquidity_volume_floor_quote(venue)
+            open_interest_floor = self._entry_liquidity_open_interest_floor_quote(venue)
+            current_class = state.current_class(venue, symbol, now_ms=now_ms)
+
+            if record_result:
+                state.note_open_interest_observation(
+                    venue,
+                    symbol,
+                    open_interest_quote,
+                    observed_at_ms=observed_at_ms,
+                )
+
+            if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY:
+                if not record_result or not state.should_probe_structural(
+                    venue,
+                    symbol,
+                    now_ms=now_ms,
+                    probe_interval_ms=ENTRY_LIQUIDITY_STRUCTURAL_PROBE_INTERVAL_MS,
+                ):
+                    state_record = next(
+                        (
+                            record for record in state.to_records()
+                            if record["venue"] == venue and record["symbol"] == symbol
+                        ),
+                        None,
+                    )
+                    decisions.append(
+                        self._entry_liquidity_decision_payload(
+                            venue=venue,
+                            symbol=symbol,
+                            quote=quote,
+                            snapshot=snapshot,
+                            now_ms=now_ms,
+                            fallback_source=fallback_source,
+                            reason="perp_open_interest_structural",
+                            decision="skip_entry",
+                            event_kind="execution.entry_liquidity_blocked",
+                            eligibility_class=(
+                                EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY.value
+                            ),
+                            observed_volume_24h_quote=volume_24h_quote,
+                            min_volume_24h_quote=volume_floor,
+                            observed_open_interest_quote=open_interest_quote,
+                            min_open_interest_quote=open_interest_floor,
+                            state_record=state_record,
+                        )
+                    )
+                    continue
+
+            if volume_floor > 0.0 and volume_24h_quote < volume_floor:
+                decisions.append(
+                    self._entry_liquidity_decision_payload(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        fallback_source=fallback_source,
+                        reason="perp_volume_below_floor_advisory",
+                        decision="continue",
+                        event_kind="execution.entry_liquidity_advisory",
+                        eligibility_class=(
+                            EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR.value
+                        ),
+                        observed_volume_24h_quote=volume_24h_quote,
+                        min_volume_24h_quote=volume_floor,
+                        observed_open_interest_quote=open_interest_quote,
+                        min_open_interest_quote=open_interest_floor,
+                    )
+                )
+
+            if open_interest_floor > 0.0 and open_interest_quote < open_interest_floor:
+                if record_result:
+                    result_class = state.record_result(
+                        venue,
+                        symbol,
+                        EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR,
+                        now_ms=now_ms,
+                    )
+                else:
+                    result_class = (
+                        EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
+                        if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
+                        else EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR
+                    )
+                state_record = next(
+                    (
+                        record for record in state.to_records()
+                        if record["venue"] == venue and record["symbol"] == symbol
+                    ),
+                    None,
+                )
+                reason = (
+                    "perp_open_interest_structural"
+                    if result_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
+                    else "perp_open_interest_below_floor"
+                )
+                decisions.append(
+                    self._entry_liquidity_decision_payload(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        fallback_source=fallback_source,
+                        reason=reason,
+                        decision="skip_entry",
+                        event_kind="execution.entry_liquidity_blocked",
+                        eligibility_class=result_class.value,
+                        observed_volume_24h_quote=volume_24h_quote,
+                        min_volume_24h_quote=volume_floor,
+                        observed_open_interest_quote=open_interest_quote,
+                        min_open_interest_quote=open_interest_floor,
+                        state_record=state_record,
+                    )
+                )
+                continue
+
+            if record_result:
+                state.record_result(
+                    venue,
+                    symbol,
+                    EntryLiquidityEligibilityClass.ELIGIBLE,
+                    now_ms=now_ms,
+                )
+
+        if record_result:
+            self.state.entry_liquidity_qualification_records = state.to_records()
+        return decisions
+
     @staticmethod
     def _liquidity_degraded_reason_blocks_symbol(reason: str, symbol: str) -> bool:
         reason_upper = str(reason or "").upper()
@@ -9843,6 +10093,7 @@ class LiveRuntime:
         *,
         snapshot,
         now_ms: int,
+        record_liquidity_qualification: bool = False,
     ) -> list[dict]:
         if snapshot is None:
             return []
@@ -9964,6 +10215,17 @@ class LiveRuntime:
                     )
                 )
 
+        decisions.extend(
+            self._entry_liquidity_qualification_decisions(
+                candidate,
+                snapshot=snapshot,
+                quote_lookup=quote_lookup,
+                now_ms=now_ms,
+                fallback_source=fallback_source,
+                record_result=record_liquidity_qualification,
+            )
+        )
+
         return decisions
 
     @staticmethod
@@ -10015,6 +10277,15 @@ class LiveRuntime:
             "quote_index_price",
             "quote_funding_timestamp_ms",
             "invalid_quote_fields",
+            "observed_volume_24h_quote",
+            "min_volume_24h_quote",
+            "observed_open_interest_quote",
+            "min_open_interest_quote",
+            "eligibility_class",
+            "consecutive_failures",
+            "suppress_until_ms",
+            "last_failure_at_ms",
+            "last_structural_probe_at_ms",
         )
         return {key: decision[key] for key in keys if key in decision}
 
@@ -10324,6 +10595,7 @@ class LiveRuntime:
                 candidate,
                 snapshot=snapshot,
                 now_ms=now_ms,
+                record_liquidity_qualification=True,
             )
             if not decisions:
                 filtered.append(candidate)
@@ -11580,6 +11852,50 @@ class LiveRuntime:
             return (long_ask + short_bid) / 2.0
         return max(long_ask, short_bid, 0.0)
 
+    def _entry_final_gate_skew_blocker(
+        self,
+        candidate,
+        *,
+        long_venue,
+        short_venue,
+        now_ms: int,
+    ) -> dict | None:
+        if (
+            self.config.runtime.mode != "live"
+            or not self.config.strategy.local_l2_enabled
+            or not self._entry_readiness_provider_uses_local_l2()
+        ):
+            return None
+        long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
+        short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
+        if long_book is None or short_book is None:
+            return None
+        long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
+        short_observed_at_ms = int(getattr(short_book, "observed_at_ms", 0) or 0)
+        if long_observed_at_ms <= 0 or short_observed_at_ms <= 0:
+            return None
+        max_skew_ms = max(
+            int(getattr(self.config.strategy, "entry_final_gate_max_skew_ms", 0) or 0),
+            0,
+        )
+        skew_ms = abs(long_observed_at_ms - short_observed_at_ms)
+        if skew_ms <= max_skew_ms:
+            return None
+        return {
+            "pair_id": self._candidate_pair_id(candidate),
+            "symbol": candidate.symbol,
+            "long_venue": long_venue.value,
+            "short_venue": short_venue.value,
+            "reason": "execution_skew",
+            "skew_ms": skew_ms,
+            "max_skew_ms": max_skew_ms,
+            "left_venue": long_venue.value,
+            "left_observed_at_ms": long_observed_at_ms,
+            "right_venue": short_venue.value,
+            "right_observed_at_ms": short_observed_at_ms,
+            "ts_ms": now_ms,
+        }
+
     async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
@@ -11907,6 +12223,30 @@ class LiveRuntime:
                         "long_venue": long_venue.value,
                         "short_venue": short_venue.value,
                         "reasons": not_ready_reasons,
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+
+            skew_blocker = self._entry_final_gate_skew_blocker(
+                candidate,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                now_ms=now_ms,
+            )
+            if skew_blocker is not None:
+                self.journal.append("runtime.entry_blocked_final_gate", skew_blocker)
+                self.journal.append(
+                    "review.candidate_rejected",
+                    {
+                        "symbol": candidate.symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "rejected_stage": "entry_final_gate",
+                        "rejected_reason": skew_blocker["reason"],
+                        "ranking_edge_bps": candidate.ranking_edge_bps,
+                        "expected_edge_bps": candidate.expected_edge_bps,
+                        "funding_edge_bps": candidate.funding_edge_bps,
                         "ts_ms": now_ms,
                     },
                 )

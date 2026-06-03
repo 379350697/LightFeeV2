@@ -67,6 +67,8 @@ def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
         source="sidecar_quote",
         bid_size=100.0,
         ask_size=100.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest=2_000_000.0,
     )
 
 

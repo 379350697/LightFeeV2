@@ -54,6 +54,72 @@ class TestConfigLoading:
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
 
+    def test_loads_v1_entry_perp_liquidity_thresholds(self, tmp_path):
+        path = tmp_path / "paper.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+
+[strategy]
+entry_volume_floor_default_quote = 900000.0
+entry_open_interest_floor_quote = 1200000.0
+
+[strategy.entry_volume_floor_quote_by_venue]
+binance = 4500000.0
+okx = 4200000.0
+
+[strategy.entry_open_interest_floor_quote_by_venue]
+okx = 5000000.0
+gate = 1000000.0
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.strategy.entry_volume_floor_quote("gate") == 900_000.0
+        assert config.strategy.entry_volume_floor_quote("binance") == 4_500_000.0
+        assert config.strategy.entry_volume_floor_quote("okx") == 4_200_000.0
+        assert config.strategy.entry_open_interest_floor_quote("gate") == 1_000_000.0
+        assert config.strategy.entry_open_interest_floor_quote("okx") == 5_000_000.0
+        assert config.strategy.entry_open_interest_floor_quote("binance") == 1_200_000.0
+
+    def test_loads_legacy_v1_entry_perp_liquidity_threshold_fields(self, tmp_path):
+        path = tmp_path / "paper.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+
+[strategy]
+entry_min_perp_volume_24h_quote_gate = 1000000.0
+entry_min_perp_volume_24h_quote_aster = 1000000.0
+entry_min_perp_volume_24h_quote_hyperliquid = 1000000.0
+entry_min_perp_volume_24h_quote_bitget = 2000000.0
+entry_min_perp_volume_24h_quote_bybit = 2000000.0
+entry_min_perp_volume_24h_quote_binance = 5000000.0
+entry_min_perp_volume_24h_quote_okx = 5000000.0
+entry_min_perp_open_interest_quote = 1100000.0
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.strategy.entry_volume_floor_quote("gate") == 1_000_000.0
+        assert config.strategy.entry_volume_floor_quote("aster") == 1_000_000.0
+        assert config.strategy.entry_volume_floor_quote("hyperliquid") == 1_000_000.0
+        assert config.strategy.entry_volume_floor_quote("bitget") == 2_000_000.0
+        assert config.strategy.entry_volume_floor_quote("bybit") == 2_000_000.0
+        assert config.strategy.entry_volume_floor_quote("binance") == 5_000_000.0
+        assert config.strategy.entry_volume_floor_quote("okx") == 5_000_000.0
+        assert config.strategy.entry_open_interest_floor_quote("okx") == 1_100_000.0
+
 
 class TestConfigValidation:
     def test_strategy_defaults_keep_entry_window_valid(self):

@@ -83,8 +83,53 @@ def _load_runtime(raw: dict[str, Any]) -> RuntimeConfig:
 
 def _load_strategy(raw: dict[str, Any]) -> StrategyConfig:
     cfg = default_strategy()
+    raw = _normalize_entry_perp_liquidity_thresholds(raw)
     _merge_defaults(cfg, raw)
     return cfg
+
+
+def _normalize_entry_perp_liquidity_thresholds(raw: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(raw)
+
+    if (
+        "entry_open_interest_floor_quote" in normalized
+        and "entry_open_interest_floor_default_quote" not in normalized
+    ):
+        normalized["entry_open_interest_floor_default_quote"] = normalized[
+            "entry_open_interest_floor_quote"
+        ]
+    normalized.pop("entry_open_interest_floor_quote", None)
+    if (
+        "entry_min_perp_open_interest_quote" in normalized
+        and "entry_open_interest_floor_default_quote" not in normalized
+    ):
+        normalized["entry_open_interest_floor_default_quote"] = normalized[
+            "entry_min_perp_open_interest_quote"
+        ]
+    normalized.pop("entry_min_perp_open_interest_quote", None)
+
+    raw_volume_by_venue = normalized.get("entry_volume_floor_quote_by_venue", {})
+    volume_by_venue = (
+        dict(raw_volume_by_venue)
+        if isinstance(raw_volume_by_venue, dict)
+        else {}
+    )
+    for venue in (
+        "gate",
+        "aster",
+        "hyperliquid",
+        "bitget",
+        "bybit",
+        "binance",
+        "okx",
+    ):
+        legacy_key = f"entry_min_perp_volume_24h_quote_{venue}"
+        if legacy_key in normalized:
+            volume_by_venue[venue] = normalized[legacy_key]
+    if volume_by_venue:
+        normalized["entry_volume_floor_quote_by_venue"] = volume_by_venue
+
+    return normalized
 
 
 def _load_persistence(raw: dict[str, Any]) -> PersistenceConfig:

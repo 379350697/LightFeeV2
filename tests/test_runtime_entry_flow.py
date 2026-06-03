@@ -408,6 +408,48 @@ class TestPlannerDispatchIntegration:
         assert len(runtime.state.pending_entries) == 1
 
     @pytest.mark.asyncio
+    async def test_final_gate_blocks_fresh_bbo_with_excessive_leg_skew(
+        self, config, tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.entry_final_gate_max_skew_ms = 100
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        self._install_hot_book(
+            runtime, "binance", "BTCUSDT",
+            bid=50000.0, ask=50010.0, observed_at_ms=5000,
+        )
+        self._install_hot_book(
+            runtime, "okx", "BTCUSDT",
+            bid=49990.0, ask=50000.0, observed_at_ms=4800,
+        )
+
+        dispatched = await runtime._dispatch_entry(
+            self._candidate(),
+            5000,
+            price_hint=50000.0,
+        )
+
+        assert dispatched is False
+        assert binance.last_request is None
+        payload = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_final_gate"
+        ][-1]
+        assert payload["reason"] == "execution_skew"
+        assert payload["skew_ms"] == 200
+        assert payload["max_skew_ms"] == 100
+        assert payload["left_venue"] == "binance"
+        assert payload["right_venue"] == "okx"
+
+    @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_does_not_require_local_l2_books(
         self,
         config,

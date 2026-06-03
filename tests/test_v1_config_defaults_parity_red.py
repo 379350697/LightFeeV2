@@ -84,3 +84,17 @@ class TestV1ConfigDefaultsParity:
         assert cfg.local_l2_bootstrap_jitter_ms == 250
         assert cfg.local_l2_bootstrap_retry_backoff_ms == 5000
         assert cfg.local_l2_startup_background_enabled is True
+
+    def test_entry_perp_liquidity_threshold_defaults(self):
+        """V1 entry perp-liquidity hard-gate defaults."""
+        cfg = StrategyConfig()
+        assert cfg.entry_volume_floor_default_quote == 1_000_000.0
+        assert cfg.entry_volume_floor_quote("gate") == 1_000_000.0
+        assert cfg.entry_volume_floor_quote("aster") == 1_000_000.0
+        assert cfg.entry_volume_floor_quote("hyperliquid") == 1_000_000.0
+        assert cfg.entry_volume_floor_quote("bitget") == 2_000_000.0
+        assert cfg.entry_volume_floor_quote("bybit") == 2_000_000.0
+        assert cfg.entry_volume_floor_quote("binance") == 5_000_000.0
+        assert cfg.entry_volume_floor_quote("okx") == 5_000_000.0
+        assert cfg.entry_open_interest_floor_default_quote == 1_000_000.0
+        assert cfg.entry_open_interest_floor_quote("okx") == 1_000_000.0
