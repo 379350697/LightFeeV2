@@ -296,6 +296,80 @@ async def test_stale_accepted_order_with_momentary_flat_position_stays_uncertain
 
 
 @pytest.mark.asyncio
+async def test_uncertain_maker_order_live_position_does_not_apply_maker_progress(
+    config, tmp_journal,
+):
+    result = PositionReconciliationResult(
+        position_id="entry-me-v1-terminality",
+        symbol="MEUSDT",
+        long_status="uncertain",
+        short_status="not_found",
+        long_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="MEUSDT",
+            side=Side.BUY,
+            quantity=608.0,
+            entry_price=0.07895,
+            observed_at_ms=3000,
+        ),
+        short_position=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="MEUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ),
+        is_flat=False,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.OKX: _NoFillReconciliationAdapter(),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(result)
+
+    async def _do_not_drive_missing_hedge(*args, **kwargs):
+        return False
+
+    runtime._drive_missing_hedge_live = _do_not_drive_missing_hedge
+    pending = _pending_entry(
+        pending_id="entry-me-v1-terminality",
+        symbol="MEUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        target_quantity=608.0,
+        maker_leg="long",
+        maker_order_id="668be726-46b4-4c68-a1ae-4257c10c6661",
+        maker_client_order_id="e0da5db734dba297d0b8904aaa39a65fd7a0",
+        hedge_order_id="",
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=4000)
+
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.maker_leg_filled == 0.0
+    assert pending.maker_fill_price == 0.0
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.maker_progress_applied" not in kinds
+    deferred = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.live_position_progress_deferred"
+    ]
+    assert deferred[-1]["entry_id"] == "entry-me-v1-terminality"
+    assert deferred[-1]["leg"] == "maker"
+    assert deferred[-1]["status"] == "uncertain"
+    assert deferred[-1]["reason"] == "order_terminality_not_confirmed"
+
+
+@pytest.mark.asyncio
 async def test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1(
     config, tmp_journal,
 ):

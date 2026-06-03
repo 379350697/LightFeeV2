@@ -4928,24 +4928,64 @@ class LiveRuntime:
                         pending.hedge_order_id = result.short_fill.order_id
                         hedge_filled_updated = True
 
-            # Also update from position snapshots if fill data wasn't available
+            def _defer_live_position_progress(
+                *,
+                position_leg: str,
+                status: str,
+                position: PositionSnapshot,
+            ) -> None:
+                pos_qty = abs(float(getattr(position, "quantity", 0.0) or 0.0))
+                pos_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+                if (
+                    pos_qty <= pending.maker_leg_filled
+                    and (pos_price <= 0 or pending.maker_fill_price > 0)
+                    and pending.maker_order_id
+                ):
+                    return
+                self.journal.append(
+                    "pending_entry.live_position_progress_deferred",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "leg": "maker",
+                        "position_leg": position_leg,
+                        "venue": position.venue.value,
+                        "status": status,
+                        "position_quantity": pos_qty,
+                        "position_entry_price": pos_price,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "maker_fill_price": pending.maker_fill_price,
+                        "reason": "order_terminality_not_confirmed",
+                    },
+                )
+
+            # Also update from position snapshots if fill data wasn't available.
+            # Passive-maker progress still requires terminal order/fill evidence;
+            # live position truth alone is used as evidence, not maker terminality.
             if result.long_position is not None and abs(result.long_position.quantity) > 0:
                 pos_qty = abs(result.long_position.quantity)
                 pos_price = float(getattr(result.long_position, "entry_price", 0.0) or 0.0)
-                if pending.maker_leg == "long" and pos_qty > pending.maker_leg_filled:
-                    pending.maker_leg_filled = pos_qty
-                    maker_filled_updated = True
-                elif pending.maker_leg == "short" and pos_qty > pending.hedge_leg_filled:
+                if pending.maker_leg == "long":
+                    if result.long_status == "filled":
+                        if pos_qty > pending.maker_leg_filled:
+                            pending.maker_leg_filled = pos_qty
+                            maker_filled_updated = True
+                        if pos_price > 0 and pending.maker_fill_price <= 0:
+                            pending.maker_fill_price = pos_price
+                            maker_filled_updated = True
+                        if not pending.maker_order_id:
+                            pending.maker_order_id = f"{entry_id}-recovery-long"
+                            maker_filled_updated = True
+                    else:
+                        _defer_live_position_progress(
+                            position_leg="long",
+                            status=result.long_status,
+                            position=result.long_position,
+                        )
+                elif pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
                     hedge_filled_updated = True
-                if pending.maker_leg == "long":
-                    if pos_price > 0 and pending.maker_fill_price <= 0:
-                        pending.maker_fill_price = pos_price
-                        maker_filled_updated = True
-                    if not pending.maker_order_id:
-                        pending.maker_order_id = f"{entry_id}-recovery-long"
-                        maker_filled_updated = True
-                else:
+                if pending.maker_leg != "long":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
                         pending.hedge_fill_price = pos_price
                         hedge_filled_updated = True
@@ -4956,20 +4996,27 @@ class LiveRuntime:
             if result.short_position is not None and abs(result.short_position.quantity) > 0:
                 pos_qty = abs(result.short_position.quantity)
                 pos_price = float(getattr(result.short_position, "entry_price", 0.0) or 0.0)
-                if pending.maker_leg == "short" and pos_qty > pending.maker_leg_filled:
-                    pending.maker_leg_filled = pos_qty
-                    maker_filled_updated = True
-                elif pending.maker_leg == "long" and pos_qty > pending.hedge_leg_filled:
+                if pending.maker_leg == "short":
+                    if result.short_status == "filled":
+                        if pos_qty > pending.maker_leg_filled:
+                            pending.maker_leg_filled = pos_qty
+                            maker_filled_updated = True
+                        if pos_price > 0 and pending.maker_fill_price <= 0:
+                            pending.maker_fill_price = pos_price
+                            maker_filled_updated = True
+                        if not pending.maker_order_id:
+                            pending.maker_order_id = f"{entry_id}-recovery-short"
+                            maker_filled_updated = True
+                    else:
+                        _defer_live_position_progress(
+                            position_leg="short",
+                            status=result.short_status,
+                            position=result.short_position,
+                        )
+                elif pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
                     hedge_filled_updated = True
-                if pending.maker_leg == "short":
-                    if pos_price > 0 and pending.maker_fill_price <= 0:
-                        pending.maker_fill_price = pos_price
-                        maker_filled_updated = True
-                    if not pending.maker_order_id:
-                        pending.maker_order_id = f"{entry_id}-recovery-short"
-                        maker_filled_updated = True
-                else:
+                if pending.maker_leg != "short":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
                         pending.hedge_fill_price = pos_price
                         hedge_filled_updated = True

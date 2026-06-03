@@ -4225,11 +4225,15 @@ class VenueTransport(MarketDataClient):
             )
             return None
 
+        order_id_text = str(order_id or "").strip()
+        client_order_id_text = str(client_order_id or "").strip()
         params: dict[str, Any] = {"instId": venue_sym}
-        if order_id:
-            params["ordId"] = order_id
-        else:
-            params["clOrdId"] = client_order_id
+        if order_id_text and order_id_text.isdigit():
+            params["ordId"] = order_id_text
+        elif client_order_id_text:
+            params["clOrdId"] = client_order_id_text
+        elif order_id_text:
+            params["clOrdId"] = order_id_text
 
         endpoints: list[str] = ["/api/v5/trade/order"]
         open_raw = await self._request(

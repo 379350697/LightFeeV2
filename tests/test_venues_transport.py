@@ -6366,6 +6366,61 @@ class TestVenueSpecificOrderReconciliationEvidence:
         ]
         assert query_payload["response_classification"] == "open_order_not_found;closed_order_not_found"
 
+    @pytest.mark.anyio
+    async def test_okx_recovery_placeholder_order_id_uses_client_order_id_query(self):
+        from lightfee.venues.okx import OkxAdapter
+
+        seen_queries: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            if request.url.path == "/api/v5/trade/order":
+                query = dict(request.url.params)
+                seen_queries.append(query)
+                if query.get("clOrdId") == "okx-recovery-cid" and "ordId" not in query:
+                    return httpx.Response(200, json={
+                        "code": "0",
+                        "data": [
+                            {
+                                "instId": "ME-USDT-SWAP",
+                                "ordId": "okx-real-order-1",
+                                "clOrdId": "okx-recovery-cid",
+                                "side": "sell",
+                                "accFillSz": "304",
+                                "avgPx": "0.07895",
+                                "state": "filled",
+                            }
+                        ],
+                    })
+                return httpx.Response(400, json={
+                    "code": "51000",
+                    "msg": "Parameter ordId error",
+                    "data": [],
+                })
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+        adapter._transport._okx_contract_size_for_venue_symbol = AsyncMock(return_value=1.0)
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "MEUSDT",
+            order_id="entry-1780487640389-MEUSDT-recovery-short",
+            client_order_id="okx-recovery-cid",
+        )
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.order_id == "okx-real-order-1"
+        assert result.client_order_id == "okx-recovery-cid"
+        assert seen_queries[-1]["clOrdId"] == "okx-recovery-cid"
+        assert "ordId" not in seen_queries[-1]
+
     def test_okx_order_status_scales_acc_fill_contracts_to_base_quantity(self):
         from lightfee.venues.transport import VenueTransport
         from lightfee.venues.specs import okx_spec
