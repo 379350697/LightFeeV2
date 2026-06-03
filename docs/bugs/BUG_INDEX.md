@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest pending-entry maker-order follow-up, 2026-06-03: after cloud deploy
+`338caec`, production health was green but an all-venue exchange-truth probe
+found a separate pending-entry lifecycle issue: local state was flat while 9
+non-reduce-only PostOnly/GTX maker entry orders remained open on Binance/Bybit.
+OKX current positions and open orders were empty, so this was not the OKX
+copy/follow account path. The 9 exact order id/client id targets were canceled
+through `VenueTransport.cancel_passive_order()`, and follow-up all-venue truth
+showed nonzero positions `0` and open orders `0`; `verify_production_services.py`
+stayed green. V1 comparison showed the structural guard: V1 always carries
+`PendingEntryHedge.passive_order`, cancels through that passive-order lifecycle,
+persists `cancel_requested_at_ms`, and polls passive progress by order id/client
+id. The local CL039 fix fully mirrors that boundary: recovery cancel/progress,
+abort-open-order truth, maintenance, reconciliation/finalize maker id lookup,
+snapshot `passive_order`/`next_progress_poll_ms` roundtrip, and durable cancel
+state now all use the passive-order identity. Code is local and not yet
+deployed; closure requires commit/deploy, remote focused tests, service restart,
+all-venue truth staying `0/0`, and deploy-window proof that no new
+local-flat/exchange-open maker orphan appears.
+
 Latest startup recovery lifecycle follow-up, 2026-06-03: cloud first deployed
 `cb1abbed4516ff016b78be6cc1e0f588d40853c7`; remote focused tests passed
 (`60 passed`), services restarted active with `NRestarts=0`, and the prior

@@ -11,7 +11,14 @@ from typing import Any, Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, TimeInForce, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    PassiveOrderState,
+    PositionSnapshot,
+    Side,
+    TimeInForce,
+    Venue,
+)
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.bybit_duplicate_reconcile import (
     BYBIT_DUPLICATE_RECONCILE_ENDPOINTS,
@@ -4384,8 +4391,8 @@ class LiveRuntime:
                 continue
             maker_venue = pending.maker_venue()
 
-            # Guard: must have a valid order ID to query/cancel
-            if not po.order_id:
+            # Guard: must have a valid exchange order id or client id to query/cancel.
+            if not (po.order_id or po.client_order_id):
                 continue
 
             # Respect poll interval — V1 next_progress_poll_ms gate
@@ -4866,14 +4873,17 @@ class LiveRuntime:
                     if pending.hedge_inflight
                     else ""
                 )
+                maker_order_id, maker_client_order_id = (
+                    self._pending_entry_maker_order_identifiers(pending)
+                )
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
                     long_venue=pending.long_venue,
                     short_venue=pending.short_venue,
-                    long_order_id=pending.maker_order_id,
+                    long_order_id=maker_order_id,
                     short_order_id=pending.hedge_order_id,
-                    long_client_order_id=pending.maker_client_order_id,
+                    long_client_order_id=maker_client_order_id,
                     short_client_order_id=hedge_lookup_cid,
                 )
                 self._flush_reconciler_order_diagnostics()
@@ -5278,10 +5288,208 @@ class LiveRuntime:
 
     @staticmethod
     def _pending_entry_has_maker_order_reference(pending) -> bool:
-        return bool(
-            getattr(pending, "maker_order_id", "")
-            or getattr(pending, "maker_client_order_id", "")
+        order_id, client_order_id = LiveRuntime._pending_entry_maker_order_identifiers(
+            pending
         )
+        return bool(order_id or client_order_id)
+
+    @staticmethod
+    def _pending_entry_maker_order_identifiers(pending) -> tuple[str, str]:
+        passive_order = getattr(pending, "passive_order", None)
+        order_id = str(getattr(pending, "maker_order_id", "") or "")
+        client_order_id = str(getattr(pending, "maker_client_order_id", "") or "")
+        if passive_order is not None:
+            order_id = order_id or str(getattr(passive_order, "order_id", "") or "")
+            client_order_id = client_order_id or str(
+                getattr(passive_order, "client_order_id", "") or ""
+            )
+        return order_id, client_order_id
+
+    @staticmethod
+    def _pending_entry_maker_cancel_requested(pending) -> bool:
+        passive_order = getattr(pending, "passive_order", None)
+        return bool(
+            getattr(pending, "_cancel_requested", False)
+            or (
+                passive_order is not None
+                and passive_order.cancel_requested()
+            )
+        )
+
+    def _mark_pending_entry_maker_cancel_requested(self, pending, now_ms: int) -> None:
+        passive_order = getattr(pending, "passive_order", None)
+        if passive_order is not None and not passive_order.cancel_requested():
+            passive_order.cancel_requested_at_ms = now_ms
+        pending._cancel_requested = True
+        pending.next_progress_poll_ms = (
+            now_ms + self.config.strategy.maker_venue_budget_window_ms
+        )
+
+    @staticmethod
+    def _pending_entry_open_order_matches(
+        row: Any,
+        *,
+        symbol: str,
+        order_id: str,
+        client_order_id: str,
+    ) -> bool:
+        if not isinstance(row, dict):
+            return False
+        row_order_id = str(
+            row.get("orderId")
+            or row.get("ordId")
+            or row.get("id")
+            or row.get("order_id")
+            or ""
+        )
+        row_client_order_id = str(
+            row.get("clientOrderId")
+            or row.get("clOrdId")
+            or row.get("orderLinkId")
+            or row.get("clientOid")
+            or row.get("client_order_id")
+            or ""
+        )
+        id_matches = bool(order_id and row_order_id == order_id) or bool(
+            client_order_id and row_client_order_id == client_order_id
+        )
+        if not id_matches:
+            return False
+        row_symbol = str(row.get("symbol") or row.get("instId") or row.get("coin") or "")
+        if not row_symbol:
+            return True
+        compact_row_symbol = (
+            row_symbol.replace("-", "").replace("_", "").replace("SWAP", "")
+        )
+        return row_symbol == symbol or compact_row_symbol == symbol
+
+    async def _pending_entry_maker_open_order_matches(
+        self,
+        pending,
+        adapter,
+        maker_venue: Venue,
+    ) -> tuple[list[Any] | None, str]:
+        order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
+        try:
+            open_orders = await self._fetch_residual_repair_open_orders(
+                adapter,
+                maker_venue,
+                pending.symbol,
+            )
+        except Exception as exc:
+            return None, str(exc)
+        matches = [
+            row
+            for row in open_orders
+            if self._pending_entry_open_order_matches(
+                row,
+                symbol=pending.symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+        ]
+        return matches, "open_order_truth"
+
+    async def _ensure_pending_entry_maker_not_open_before_abort(
+        self,
+        pending,
+        entry_id: str,
+        reason: str,
+    ) -> bool:
+        if not self._pending_entry_has_maker_order_reference(pending):
+            return True
+        if pending.maker_completed():
+            return True
+
+        maker_venue = pending.maker_venue()
+        adapter = self.get_venue_adapter(maker_venue)
+        order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
+        evidence = {
+            "entry_id": entry_id,
+            "symbol": pending.symbol,
+            "maker_venue": maker_venue.value,
+            "maker_order_id": order_id,
+            "maker_client_order_id": client_order_id,
+            "reason": reason,
+        }
+
+        if adapter is None:
+            self.journal.append(
+                "entry.abort_maker_order_truth_unavailable",
+                {**evidence, "error": "maker_adapter_unavailable"},
+            )
+            return False
+
+        if not self._pending_entry_maker_cancel_requested(pending):
+            try:
+                await adapter.cancel_passive_order(
+                    symbol=pending.symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id or None,
+                )
+                self._mark_pending_entry_maker_cancel_requested(
+                    pending,
+                    wall_clock_now_ms(),
+                )
+                self.journal.append(
+                    "entry.abort_maker_cancel_requested",
+                    evidence,
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "entry.abort_maker_cancel_failed",
+                    {**evidence, "error": str(exc)},
+                )
+                return False
+
+        matches, open_order_error = await self._pending_entry_maker_open_order_matches(
+            pending,
+            adapter,
+            maker_venue,
+        )
+        if matches is not None:
+            if matches:
+                self.journal.append(
+                    "entry.abort_retained_maker_open_order",
+                    {
+                        **evidence,
+                        "open_order_count": len(matches),
+                        "open_order_truth": "present",
+                    },
+                )
+                return False
+            return True
+
+        try:
+            progress = await adapter.query_passive_order_progress(
+                symbol=pending.symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or None,
+                side=pending.maker_side(),
+            )
+        except Exception as exc:
+            self.journal.append(
+                "entry.abort_maker_order_truth_unavailable",
+                {**evidence, "error": str(exc), "open_order_error": open_order_error},
+            )
+            return False
+
+        state = getattr(progress, "state", None) if progress is not None else None
+        cumulative_quantity = float(
+            getattr(progress, "cumulative_quantity", 0.0) or 0.0
+        ) if progress is not None else 0.0
+        if state is not None and hasattr(state, "is_terminal") and state.is_terminal():
+            return True
+        self.journal.append(
+            "entry.abort_maker_order_truth_unavailable",
+            {
+                **evidence,
+                "open_order_error": open_order_error,
+                "progress_state": getattr(state, "value", str(state or "")),
+                "cumulative_quantity": cumulative_quantity,
+            },
+        )
+        return False
 
     def _pending_entry_flat_clear_has_terminal_maker_evidence(self, pending, result) -> bool:
         if not self._pending_entry_has_maker_order_reference(pending):
@@ -5305,10 +5513,13 @@ class LiveRuntime:
             maker_side = getattr(pending, 'maker_side', None)
             if callable(maker_side):
                 maker_side = maker_side()
+            order_id, client_order_id = self._pending_entry_maker_order_identifiers(
+                pending
+            )
             progress = await adapter.query_passive_order_progress(
                 symbol=pending.symbol,
-                order_id=getattr(pending, "maker_order_id", "") or "",
-                client_order_id=getattr(pending, "maker_client_order_id", "") or None,
+                order_id=order_id,
+                client_order_id=client_order_id or None,
                 side=maker_side if isinstance(maker_side, Side) else None,
             )
         except Exception as e:
@@ -5603,7 +5814,7 @@ class LiveRuntime:
 
         if not pending.maker_completed():
             cancel_issued = False
-            if getattr(pending, "maker_order_id", ""):
+            if self._pending_entry_has_maker_order_reference(pending):
                 cancel_issued = await self._recover_cancel_maker_order(
                     pending, entry_id, final_reason
                 )
@@ -5742,6 +5953,15 @@ class LiveRuntime:
         maker_venue = pending.maker_venue()
         hedge_venue = pending.hedge_venue()
         symbol = pending.symbol
+
+        if not await self._ensure_pending_entry_maker_not_open_before_abort(
+            pending,
+            entry_id,
+            reason,
+        ):
+            enter_fail_closed(self.state)
+            self.state.last_error = reason
+            return False
 
         # Tier 1: cleanup/flatten residual exposure on both legs
         maker_cleaned = await self._cleanup_failed_leg_exposure(
@@ -6071,14 +6291,17 @@ class LiveRuntime:
                     if pending.hedge_inflight
                     else ""
                 )
+                maker_order_id, maker_client_order_id = (
+                    self._pending_entry_maker_order_identifiers(pending)
+                )
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
                     long_venue=pending.long_venue,
                     short_venue=pending.short_venue,
-                    long_order_id=pending.maker_order_id,
+                    long_order_id=maker_order_id,
                     short_order_id=pending.hedge_order_id,
-                    long_client_order_id=pending.maker_client_order_id,
+                    long_client_order_id=maker_client_order_id,
                     short_client_order_id=hedge_lookup_cid,
                 )
                 self._flush_reconciler_order_diagnostics()
@@ -6238,7 +6461,10 @@ class LiveRuntime:
             # Two main paths: maker not completed (cancel first) vs maker completed
 
             # --- 4a: Maker not completed → cancel maker order first (V1 cancel-before-abort) ---
-            if not pending.maker_completed() and pending.maker_order_id:
+            if (
+                not pending.maker_completed()
+                and self._pending_entry_has_maker_order_reference(pending)
+            ):
                 cancel_issued = await self._recover_cancel_maker_order(
                     pending, entry_id, final_reason
                 )
@@ -6373,15 +6599,89 @@ class LiveRuntime:
         hedge_order_id independently, rather than using a fallback chain
         that shadows the hedge order when a maker order exists.
         """
-        # Query maker venue with maker order
-        if pending.maker_order_id:
+        # Query maker venue with maker passive order identity.
+        order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
+        if order_id or client_order_id:
             maker_ven = pending.maker_venue()
             maker_adapter = self.get_venue_adapter(maker_ven)
-            if maker_adapter is not None and hasattr(maker_adapter, "get_order_status"):
+            if maker_adapter is not None and hasattr(
+                maker_adapter,
+                "query_passive_order_progress",
+            ):
+                try:
+                    progress = await maker_adapter.query_passive_order_progress(
+                        symbol=pending.symbol,
+                        order_id=order_id,
+                        client_order_id=client_order_id or None,
+                        side=pending.maker_side(),
+                    )
+                    if progress is not None:
+                        state = getattr(
+                            progress,
+                            "state",
+                            PassiveOrderState.UNKNOWN,
+                        ) or PassiveOrderState.UNKNOWN
+                        if not isinstance(state, PassiveOrderState):
+                            try:
+                                state = PassiveOrderState(str(state))
+                            except ValueError:
+                                state = PassiveOrderState.UNKNOWN
+                        passive_order = getattr(pending, "passive_order", None)
+                        if passive_order is not None:
+                            passive_order.last_progress_state = state
+                        filled_qty = float(
+                            getattr(progress, "cumulative_quantity", 0.0) or 0.0
+                        )
+                        if filled_qty > 0:
+                            pending.maker_leg_filled = max(
+                                pending.maker_leg_filled,
+                                filled_qty,
+                            )
+                            avg_price = float(
+                                getattr(progress, "average_price", 0.0) or 0.0
+                            )
+                            if avg_price > 0:
+                                pending.maker_fill_price = avg_price
+                        if state == PassiveOrderState.FILLED:
+                            pending.uncertain_outcome = False
+                            pending.outcome = "filled"
+                            self.journal.append(
+                                "recovery.maker_order_status_resolved",
+                                {
+                                    "entry_id": entry_id,
+                                    "venue": str(maker_ven),
+                                    "status": state.value,
+                                },
+                            )
+                            return
+                        if state in {
+                            PassiveOrderState.CANCELED,
+                            PassiveOrderState.REJECTED,
+                            PassiveOrderState.EXPIRED,
+                        }:
+                            pending.uncertain_outcome = False
+                            pending.outcome = state.value
+                            self.journal.append(
+                                "recovery.maker_order_canceled",
+                                {
+                                    "entry_id": entry_id,
+                                    "venue": str(maker_ven),
+                                    "status": state.value,
+                                },
+                            )
+                            return
+                except Exception:
+                    pass
+
+            if (
+                order_id
+                and maker_adapter is not None
+                and hasattr(maker_adapter, "get_order_status")
+            ):
                 try:
                     status = await maker_adapter.get_order_status(
                         symbol=pending.symbol,
-                        order_id=pending.maker_order_id,
+                        order_id=order_id,
                     )
                     if status and getattr(status, "status", "") == "filled":
                         pending.uncertain_outcome = False
@@ -6708,10 +7008,11 @@ class LiveRuntime:
         if adapter is None:
             return False
 
-        if not pending.maker_order_id:
+        order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
+        if not (order_id or client_order_id):
             return False
 
-        if getattr(pending, "_cancel_requested", False):
+        if self._pending_entry_maker_cancel_requested(pending):
             return False
 
         # V1: check maker venue request budget before issuing cancel
@@ -6731,10 +7032,10 @@ class LiveRuntime:
         try:
             await adapter.cancel_passive_order(
                 symbol=pending.symbol,
-                order_id=pending.maker_order_id,
-                client_order_id=pending.maker_client_order_id or None,
+                order_id=order_id,
+                client_order_id=client_order_id or None,
             )
-            pending._cancel_requested = True
+            self._mark_pending_entry_maker_cancel_requested(pending, now_ms)
             pending.reconcile_next_attempt_ms = (
                 now_ms + self._RECONCILE_RETRY_BASE_MS
             )
@@ -6744,7 +7045,8 @@ class LiveRuntime:
                     "entry_id": entry_id,
                     "symbol": pending.symbol,
                     "maker_venue": str(maker_venue),
-                    "maker_order_id": pending.maker_order_id,
+                    "maker_order_id": order_id,
+                    "maker_client_order_id": client_order_id,
                     "reason": reason,
                 },
             )
@@ -7178,8 +7480,13 @@ class LiveRuntime:
             adapter = self.get_venue_adapter(venue)
             if adapter is None:
                 return
-            order_id = getattr(pending, f"{label}_order_id", "") or ""
-            client_order_id = getattr(pending, f"{label}_client_order_id", "") or ""
+            if label == "maker":
+                order_id, client_order_id = (
+                    self._pending_entry_maker_order_identifiers(pending)
+                )
+            else:
+                order_id = getattr(pending, f"{label}_order_id", "") or ""
+                client_order_id = getattr(pending, f"{label}_client_order_id", "") or ""
             if not order_id and not client_order_id:
                 return
             try:
@@ -7246,8 +7553,7 @@ class LiveRuntime:
 
         if (
             float(getattr(pending, "maker_leg_filled", 0.0) or 0.0) > 0.0
-            or getattr(pending, "maker_order_id", "")
-            or getattr(pending, "maker_client_order_id", "")
+            or self._pending_entry_has_maker_order_reference(pending)
         ):
             await _reconcile_leg("maker", pending.maker_venue())
         if (
@@ -7343,6 +7649,9 @@ class LiveRuntime:
             pending.short_venue,
             pending.symbol,
         )
+        maker_order_id_for_fill, maker_client_order_id_for_fill = (
+            self._pending_entry_maker_order_identifiers(pending)
+        )
 
         # V1: build_residual_task is computed before branching, but only after
         # order/fill reconciliation has made pending quantities authoritative.
@@ -7352,7 +7661,7 @@ class LiveRuntime:
             side=maker_side,
             quantity=pending.maker_leg_filled,
             price=pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price,
-            order_id=pending.maker_order_id,
+            order_id=maker_order_id_for_fill,
             filled_at_ms=now_ms,
         )
         hedge_fill = OrderFill(
@@ -7400,9 +7709,9 @@ class LiveRuntime:
             "raw_long_fill_quantity": raw_long_fill_quantity,
             "raw_short_fill_quantity": raw_short_fill_quantity,
             "matched_quantity": balanced_quantity,
-            "maker_order_id": pending.maker_order_id,
+            "maker_order_id": maker_order_id_for_fill,
             "hedge_order_id": pending.hedge_order_id,
-            "maker_client_order_id": pending.maker_client_order_id,
+            "maker_client_order_id": maker_client_order_id_for_fill,
             "hedge_client_order_id": pending.hedge_client_order_id,
             "quantity_source": "finalized_pending_entry_reconciled_fills",
             "long_venue_metadata": long_venue_metadata,
@@ -7498,7 +7807,7 @@ class LiveRuntime:
             side=maker_side,
             quantity=open_maker_fill_quantity,
             price=pending.maker_fill_price,
-            order_id=pending.maker_order_id,
+            order_id=maker_order_id_for_fill,
             filled_at_ms=now_ms,
         )
         hedge_fill = OrderFill(

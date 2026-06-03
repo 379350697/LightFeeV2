@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from lightfee.core.domain import OrderFill, PassiveOrderState, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -155,6 +155,51 @@ class PendingPassiveOrder:
     timeout_at_ms: int = 0
     cancel_requested_at_ms: int = 0  # 0 means no cancel requested
     last_progress_state: PassiveOrderState = PassiveOrderState.UNKNOWN
+
+    def to_dict(self) -> dict[str, Any]:
+        state = self.last_progress_state
+        state_value = (
+            state.value if isinstance(state, PassiveOrderState) else str(state or "")
+        )
+        return {
+            "order_id": self.order_id,
+            "client_order_id": self.client_order_id,
+            "limit_price": self.limit_price,
+            "target_quantity": self.target_quantity,
+            "accepted_at_ms": self.accepted_at_ms,
+            "timeout_at_ms": self.timeout_at_ms,
+            "cancel_requested_at_ms": self.cancel_requested_at_ms,
+            "last_progress_state": state_value or PassiveOrderState.UNKNOWN.value,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PendingPassiveOrder | None":
+        if not isinstance(data, dict):
+            return None
+        state_raw = data.get("last_progress_state", PassiveOrderState.UNKNOWN.value)
+        if isinstance(state_raw, PassiveOrderState):
+            state = state_raw
+        else:
+            try:
+                state = PassiveOrderState(str(state_raw or ""))
+            except ValueError:
+                state = PassiveOrderState.UNKNOWN
+        limit_price_raw = data.get("limit_price")
+        limit_price = (
+            None
+            if limit_price_raw is None
+            else float(limit_price_raw)
+        )
+        return cls(
+            order_id=str(data.get("order_id", "") or ""),
+            client_order_id=str(data.get("client_order_id", "") or ""),
+            limit_price=limit_price,
+            target_quantity=float(data.get("target_quantity", 0.0) or 0.0),
+            accepted_at_ms=int(data.get("accepted_at_ms", 0) or 0),
+            timeout_at_ms=int(data.get("timeout_at_ms", 0) or 0),
+            cancel_requested_at_ms=int(data.get("cancel_requested_at_ms", 0) or 0),
+            last_progress_state=state,
+        )
 
     def maker_completed(self) -> bool:
         """V1: PendingEntryHedge.maker_completed() — terminal progress state."""
@@ -741,6 +786,8 @@ class EngineState:
                     "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": p.expected_edge_bps_entry,
                     "exit_after_first_stage": p.exit_after_first_stage,
+                    "passive_order": p.passive_order.to_dict() if p.passive_order else None,
+                    "next_progress_poll_ms": p.next_progress_poll_ms,
                 }
                 for pid, p in self.pending_entries.items()
             },

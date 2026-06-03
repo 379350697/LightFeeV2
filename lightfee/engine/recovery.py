@@ -27,6 +27,7 @@ from lightfee.engine.state import (
     PendingEntry,
     PendingPassiveClose,
     PendingPassiveLegFill,
+    PendingPassiveOrder,
     RecoveryWorkSnapshot,
 )
 from lightfee.core.domain import Side, Venue
@@ -509,6 +510,12 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     repost_count=int(pdata.get("repost_count", 0)),
                     zero_fill_since_ms=int(pdata.get("zero_fill_since_ms", 0)),
                     maker_leg=str(pdata.get("maker_leg", "long")),
+                    passive_order=PendingPassiveOrder.from_dict(
+                        pdata.get("passive_order")
+                    ),
+                    next_progress_poll_ms=int(
+                        pdata.get("next_progress_poll_ms", 0) or 0
+                    ),
                 )
 
     # Restore pending closes
@@ -945,6 +952,8 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "exit_after_first_stage": p.exit_after_first_stage,
             "repost_count": p.repost_count,
             "zero_fill_since_ms": p.zero_fill_since_ms,
+            "passive_order": p.passive_order.to_dict() if p.passive_order else None,
+            "next_progress_poll_ms": p.next_progress_poll_ms,
         }
         for pid, p in state.pending_entries.items()
     }

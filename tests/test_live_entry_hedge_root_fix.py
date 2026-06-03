@@ -24,7 +24,7 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.reconciliation import PositionReconciliationResult
-from lightfee.engine.state import PendingEntry
+from lightfee.engine.state import PendingEntry, PendingPassiveOrder
 from lightfee.venues.hyperliquid import HyperliquidAdapter
 from lightfee.venues.symbol_rules import SymbolRule
 
@@ -930,6 +930,128 @@ class TestPendingEntryPersistenceRoundtrip:
         assert pe["maker_client_order_id"] == "crv-maker-cid"
         assert pe["hedge_client_order_id"] == "crv-hedge-cid"
         assert pe["outcome"] == "hedge_uncertain"
+
+    def test_passive_order_survives_engine_state_to_dict(self):
+        """V1 pending-entry passive order lifecycle must be snapshotted."""
+        from lightfee.engine.state import EngineState, PendingEntry
+
+        state = EngineState()
+        state.pending_entries["passive-snap"] = PendingEntry(
+            pending_id="passive-snap",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.ASTER,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            passive_order=PendingPassiveOrder(
+                order_id="",
+                client_order_id="maker-client-only",
+                limit_price=0.0012,
+                target_quantity=3920.0,
+                accepted_at_ms=1100,
+                timeout_at_ms=7100,
+                cancel_requested_at_ms=0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        state.pending_entries["passive-snap"].next_progress_poll_ms = 2500
+
+        pe = state.to_dict()["pending_entries"]["passive-snap"]
+
+        assert pe["passive_order"] == {
+            "order_id": "",
+            "client_order_id": "maker-client-only",
+            "limit_price": 0.0012,
+            "target_quantity": 3920.0,
+            "accepted_at_ms": 1100,
+            "timeout_at_ms": 7100,
+            "cancel_requested_at_ms": 0,
+            "last_progress_state": "open",
+        }
+        assert pe["next_progress_poll_ms"] == 2500
+
+    def test_passive_order_restored_from_snapshot(self):
+        """Restart recovery must preserve V1 PendingPassiveOrder identity."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        snap = {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "pending_entries": {
+                "passive-restore": {
+                    "pending_id": "passive-restore",
+                    "symbol": "USTCUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "aster",
+                    "target_quantity": 3920.0,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "created_at_ms": 1000,
+                    "maker_leg": "long",
+                    "next_progress_poll_ms": 2500,
+                    "passive_order": {
+                        "order_id": "",
+                        "client_order_id": "maker-client-only",
+                        "limit_price": 0.0012,
+                        "target_quantity": 3920.0,
+                        "accepted_at_ms": 1100,
+                        "timeout_at_ms": 7100,
+                        "cancel_requested_at_ms": 0,
+                        "last_progress_state": "open",
+                    },
+                },
+            },
+        }
+
+        restored = _restore_state_from_snapshot_dict(snap).pending_entries[
+            "passive-restore"
+        ]
+
+        assert restored.passive_order is not None
+        assert restored.passive_order.order_id == ""
+        assert restored.passive_order.client_order_id == "maker-client-only"
+        assert restored.passive_order.limit_price == 0.0012
+        assert restored.passive_order.target_quantity == 3920.0
+        assert restored.passive_order.accepted_at_ms == 1100
+        assert restored.passive_order.timeout_at_ms == 7100
+        assert restored.passive_order.last_progress_state == PassiveOrderState.OPEN
+        assert restored.next_progress_poll_ms == 2500
+
+    def test_passive_order_survives_persistent_state_view(self):
+        """Persistent recovery snapshots must include passive order lifecycle."""
+        from lightfee.engine.state import EngineState, PendingEntry
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        state = EngineState()
+        state.pending_entries["passive-view"] = PendingEntry(
+            pending_id="passive-view",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.ASTER,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            passive_order=PendingPassiveOrder(
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+                target_quantity=3920.0,
+                last_progress_state=PassiveOrderState.PARTIALLY_FILLED,
+            ),
+        )
+        state.pending_entries["passive-view"].next_progress_poll_ms = 2500
+
+        pe = build_persistent_state_view(state)["pending_entries"]["passive-view"]
+
+        assert pe["passive_order"]["order_id"] == "maker-oid"
+        assert pe["passive_order"]["client_order_id"] == "maker-cid"
+        assert pe["passive_order"]["target_quantity"] == 3920.0
+        assert pe["passive_order"]["last_progress_state"] == "partially_filled"
+        assert pe["next_progress_poll_ms"] == 2500
 
     def test_hedge_fill_price_zero_not_lost_after_roundtrip(self):
         """Zero hedge_fill_price is valid (not yet filled) and must roundtrip as 0.0."""
@@ -2280,6 +2402,61 @@ class TestRealPathAbortCleanupDeadline:
         assert "entry.aborted" in kinds
         assert "reconciliation.entry_flat_unresolved_maker_retained" not in kinds
 
+    @pytest.mark.asyncio
+    async def test_hard_ceiling_client_only_passive_order_uses_v1_cancel_lifecycle(
+        self, tmp_path
+    ):
+        """V1 terminalization cancels from PendingPassiveOrder, not maker_order_id."""
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        hedge = _FakeVenueAdapter(Venue.ASTER)
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.ASTER] = hedge
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-hard-ceiling-client-only",
+            symbol="USTCUSDT",
+            long_status="uncertain",
+            short_status="uncertain",
+            is_flat=True,
+        )
+
+        pending = PendingEntry(
+            pending_id="entry-hard-ceiling-client-only",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.ASTER,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="",
+            maker_client_order_id="",
+            zero_fill_since_ms=1000,
+            reconcile_attempt=1,
+            passive_order=PendingPassiveOrder(
+                order_id="",
+                client_order_id="maker-client-only",
+                target_quantity=3920.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(now_ms=200_000)
+
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert maker._cancel_passive_order_calls == [
+            ("USTCUSDT", "", "maker-client-only")
+        ]
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "recovery.maker_cancel_requested" in kinds
+        assert "entry.abort_maker_cancel_requested" not in kinds
+        assert "entry.aborted" in kinds
+
     # ── Bug 1: _abort_pending_entry_fail_closed enter_fail_closed no NameError ──
 
     @pytest.mark.asyncio
@@ -3129,6 +3306,161 @@ class TestRealPathAbortCleanupDeadline:
         assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
         # Pending entry MUST be retained (cleanup failed)
         assert "entry-bug3b" in runtime.state.pending_entries
+
+    @pytest.mark.asyncio
+    async def test_recover_cancel_maker_order_uses_client_id_without_exchange_order_id(self, tmp_path):
+        """Accepted maker orders can be addressable only by client id locally.
+
+        Hard-ceiling terminalization must still issue a cancel before any abort;
+        otherwise a flat local pending can be removed while the exchange maker
+        order remains resting.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = maker
+
+        pending = PendingEntry(
+            pending_id="entry-client-only-cancel",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_order_id="",
+            maker_client_order_id="",
+            passive_order=PendingPassiveOrder(
+                order_id="",
+                client_order_id="maker-client-only",
+                target_quantity=3920.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+
+        cancel_issued = await runtime._recover_cancel_maker_order(
+            pending,
+            pending.pending_id,
+            "hard ceiling client-id-only cancel",
+        )
+
+        assert cancel_issued is True
+        assert maker._cancel_passive_order_calls == [
+            ("USTCUSDT", "", "maker-client-only")
+        ]
+        assert pending.passive_order is not None
+        assert pending.passive_order.cancel_requested_at_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_recover_poll_order_status_uses_passive_order_client_id(self, tmp_path):
+        """Startup recovery must poll V1 passive-order progress by client id."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="USTCUSDT",
+            side=Side.BUY,
+            order_id="",
+            client_order_id="maker-client-only",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+
+        pending = PendingEntry(
+            pending_id="entry-client-only-progress",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="",
+            maker_client_order_id="",
+            passive_order=PendingPassiveOrder(
+                order_id="",
+                client_order_id="maker-client-only",
+                target_quantity=3920.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+
+        await runtime._recover_poll_order_status(pending.pending_id, pending)
+
+        assert maker._query_passive_progress_calls == [
+            ("USTCUSDT", "", "maker-client-only")
+        ]
+        assert pending.uncertain_outcome is False
+        assert pending.outcome == "canceled"
+        assert pending.passive_order is not None
+        assert pending.passive_order.last_progress_state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_abort_pending_entry_retains_when_maker_open_order_still_resting(self, tmp_path):
+        """Do not remove a pending entry while its maker order is still open."""
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = None
+        hedge.position = None
+        maker.open_orders = [
+            {
+                "symbol": "USTCUSDT",
+                "orderId": "",
+                "orderLinkId": "maker-client-only",
+                "orderStatus": "New",
+                "reduceOnly": False,
+            }
+        ]
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-open-maker-retain",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_order_id="",
+            maker_client_order_id="maker-client-only",
+            passive_order=PendingPassiveOrder(
+                order_id="",
+                client_order_id="maker-client-only",
+                target_quantity=3920.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        removed = await runtime._abort_pending_entry(
+            pending,
+            pending.pending_id,
+            "hard ceiling flat but maker open",
+        )
+
+        assert removed is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert maker._cancel_passive_order_calls == [
+            ("USTCUSDT", "", "maker-client-only")
+        ]
+        assert pending.passive_order is not None
+        assert pending.passive_order.cancel_requested_at_ms > 0
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "entry.abort_retained_maker_open_order" in kinds
 
     # ── Bug 3/5: _reconcile_pending_state deadline breach + cleanup failure ──
 
