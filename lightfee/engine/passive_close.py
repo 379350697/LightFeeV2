@@ -2561,6 +2561,36 @@ class PassiveCloseExecutor:
     ) -> None:
         """Clear local passive/open state after live exchange truth is flat."""
 
+        def add_id(values: list[str], value: Any) -> None:
+            text = str(value or "")
+            if text and text not in values:
+                values.append(text)
+
+        client_order_ids: list[str] = []
+        order_ids: list[str] = []
+        phase_state = getattr(pending, "phase_state", None)
+        add_id(client_order_ids, getattr(phase_state, "maker_client_order_id", ""))
+        add_id(order_ids, getattr(phase_state, "maker_order_id", ""))
+        for fill_state in (
+            getattr(pending, "maker_fill", None),
+            getattr(pending, "hedge_fill", None),
+        ):
+            add_id(client_order_ids, getattr(fill_state, "client_order_id", ""))
+            add_id(order_ids, getattr(fill_state, "order_id", ""))
+        for leg in [
+            *getattr(pending, "short_legs", []),
+            *getattr(pending, "long_legs", []),
+        ]:
+            add_id(client_order_ids, getattr(leg, "client_order_id", ""))
+            fill = getattr(leg, "fill", None)
+            add_id(client_order_ids, getattr(fill, "client_order_id", ""))
+            add_id(order_ids, getattr(fill, "order_id", ""))
+        if extra:
+            for value in extra.get("force_close_client_order_ids", []):
+                add_id(client_order_ids, value)
+            for value in extra.get("force_close_order_ids", []):
+                add_id(order_ids, value)
+
         payload = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
@@ -2572,11 +2602,27 @@ class PassiveCloseExecutor:
             "actual_short_size": actual_short_size,
             "new_quantity": 0.0,
             "source": source,
+            "client_order_ids": client_order_ids,
+            "order_ids": order_ids,
         }
         if extra:
             payload.update(extra)
         self._journal.append("runtime.position_drift_detected", payload)
         self._journal.append("exit.passive_close_fallback_terminal_flat", payload)
+        self._journal.append(
+            "runtime.position_lifecycle_terminal",
+            {
+                **payload,
+                "terminal_state": "flat",
+                "terminal_reason": source,
+                "problem": bool(payload.get("problem", False)),
+                "problem_reason": str(
+                    payload.get("problem_reason")
+                    or payload.get("force_close_reason")
+                    or ""
+                ),
+            },
+        )
 
         state.pending_passive_closes.pop(pending.position_id, None)
         state.open_positions.pop(pending.position_id, None)
@@ -3008,6 +3054,80 @@ class PassiveCloseExecutor:
                     "error": str(exc),
                 },
             )
+            if self._close_executor is not None:
+                from lightfee.core.errors import SubmitFailureClass
+
+                short_legs, long_legs = self._pending_runtime_close_legs(pending)
+                force_payload = {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "live_quantity": live_qty,
+                    "normalized_quantity": normalized_qty,
+                    "side": close_side.value,
+                    "failed_stage": stage,
+                    "failed_error": str(exc),
+                    "problem": True,
+                    "reason": "normal_one_sided_flatten_failed_force_close",
+                }
+                try:
+                    await self._close_executor.compensate_failed_full_close(
+                        position,
+                        pending.reason,
+                        stage,
+                        venue,
+                        OrderSubmitError(
+                            SubmitFailureClass.UNCERTAIN,
+                            str(exc) or "one-sided flatten failed",
+                        ),
+                        short_legs,
+                        long_legs,
+                        state,
+                    )
+                except Exception as force_exc:
+                    self._journal.append(
+                        "exit.passive_close_live_one_sided_force_close_problem",
+                        {
+                            **force_payload,
+                            "result": "failed",
+                            "force_close_error": str(force_exc),
+                        },
+                    )
+                else:
+                    force_close_client_order_ids: list[str] = []
+                    force_close_order_ids: list[str] = []
+                    for leg in [*short_legs, *long_legs]:
+                        if leg.client_order_id:
+                            force_close_client_order_ids.append(leg.client_order_id)
+                        fill = getattr(leg, "fill", None)
+                        order_id = getattr(fill, "order_id", "")
+                        if order_id:
+                            force_close_order_ids.append(str(order_id))
+                    self._journal.append(
+                        "exit.passive_close_live_one_sided_force_close_problem",
+                        {
+                            **force_payload,
+                            "result": "submitted",
+                            "force_close_client_order_ids": force_close_client_order_ids,
+                            "force_close_order_ids": force_close_order_ids,
+                        },
+                    )
+                    if await self._clear_if_live_flat(
+                        state,
+                        pending,
+                        position,
+                        source="passive_close_live_one_sided_force_close_problem",
+                        extra={
+                            "flattened_venue": venue.value,
+                            "flattened_quantity": normalized_qty,
+                            "problem": True,
+                            "force_close_reason": force_payload["reason"],
+                            "force_close_client_order_ids": force_close_client_order_ids,
+                            "force_close_order_ids": force_close_order_ids,
+                        },
+                    ):
+                        return True
             if await self._clear_if_live_flat(
                 state,
                 pending,

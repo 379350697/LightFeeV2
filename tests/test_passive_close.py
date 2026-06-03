@@ -1907,6 +1907,122 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_flatten" in kinds
         assert "exit.passive_close_fallback_unhedged_failed" not in kinds
 
+    def test_live_one_sided_error_force_closes_and_marks_problem(self):
+        """If normal one-sided flatten fails, force-close live exposure and mark it."""
+        journal = _open_journal()
+
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class ForceCloseAdapter(VenueAdapter):
+            def __init__(self, venue, snapshots, *, first_order_raises=False):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self._first_order_raises = first_order_raises
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                if self._first_order_raises:
+                    self._first_order_raises = False
+                    raise RuntimeError("simulated one-sided IOC failure")
+                self._snapshots = [(0.0, Side.SELL)]
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0211,
+                    order_id=f"{self._venue.value}-force-close",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=2000,
+                )
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    qty, side = self._snapshots.pop(0)
+                else:
+                    qty, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    entry_price=1.0211 if qty else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        okx = ForceCloseAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
+        bybit = ForceCloseAdapter(
+            Venue.BYBIT,
+            [(20.0, Side.SELL), (20.0, Side.SELL), (0.0, Side.SELL)],
+            first_order_raises=True,
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        executor = PassiveCloseExecutor(adapters, journal)
+        executor.set_close_executor(CloseExecutor(adapters, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-force-one-sided",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is True
+        assert len(bybit.place_order_calls) == 2
+        assert bybit.place_order_calls[-1].reduce_only is True
+        assert bybit.place_order_calls[-1].time_in_force == TimeInForce.IOC
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+
+        records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.passive_close_live_one_sided_error" in kinds
+        assert "exit.passive_close_live_one_sided_force_close_problem" in kinds
+        assert "exit.compensated" in kinds
+        assert "exit.passive_close_fallback_terminal_flat" in kinds
+        terminals = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "runtime.position_lifecycle_terminal"
+        ]
+        assert terminals
+        assert terminals[-1]["position_id"] == position.position_id
+        assert terminals[-1]["problem"] is True
+        assert terminals[-1]["terminal_reason"] == "passive_close_live_one_sided_force_close_problem"
+        assert terminals[-1]["problem_reason"] == "normal_one_sided_flatten_failed_force_close"
+        assert terminals[-1]["client_order_ids"]
+
     def test_beatusdt_live_imbalanced_under_min_excess_compensates_flat(self):
         """Both live legs nonzero but imbalanced must not retry stale local dust."""
         journal = _open_journal()

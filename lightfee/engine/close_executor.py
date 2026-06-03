@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
+from lightfee.core.domain import OrderFill, OrderRequest, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.exchange_errors import (
     RequestContext,
@@ -1633,6 +1633,7 @@ class CloseExecutor:
         req = OrderRequest(
             venue=venue, symbol=symbol, side=side,
             quantity=quantity, reduce_only=True, post_only=False,
+            time_in_force=TimeInForce.IOC,
             client_order_id=client_order_id,
         )
 
