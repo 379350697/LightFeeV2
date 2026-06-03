@@ -8040,6 +8040,29 @@ class TestCancelAbsentOrderDetection:
             '{"retCode":170001,"retMsg":"order not found"}', 400, Venue.BYBIT
         )
 
+    def test_hyperliquid_absent_order_status_is_terminal(self):
+        from lightfee.venues.transport import _cancel_response_indicates_absent_order
+
+        assert _cancel_response_indicates_absent_order(
+            {
+                "status": "ok",
+                "response": {
+                    "type": "cancel",
+                    "data": {
+                        "statuses": [
+                            {
+                                "error": (
+                                    "Order was never placed, already canceled, "
+                                    "or filled. asset=126"
+                                )
+                            }
+                        ]
+                    },
+                },
+            },
+            Venue.HYPERLIQUID,
+        )
+
     def test_gate_order_not_found(self):
         from lightfee.venues.transport import _cancel_error_indicates_absent_order
         assert _cancel_error_indicates_absent_order(
@@ -8271,6 +8294,71 @@ class TestCancelAbsentOrderDetection:
                 "nonce": 12345,
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_cancel_passive_order_treats_absent_order_as_canceled(self, monkeypatch):
+        """Hyperliquid absent cancel status is terminal for recovery, matching V1."""
+        from lightfee.core.domain import PassiveOrderState
+        from lightfee.venues import hyperliquid_signing
+        from lightfee.venues.specs import hyperliquid_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        transport = VenueTransport(
+            hyperliquid_spec(),
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key="0x" + "11" * 32,
+                account_address="0x" + "22" * 20,
+            ),
+        )
+        monkeypatch.setattr(
+            transport,
+            "_hl_resolve_asset_meta",
+            AsyncMock(
+                return_value={"asset_index": 126, "sz_decimals": 0, "price_decimals": 6}
+            ),
+        )
+
+        def fake_exchange_payload(action, private_key_hex, vault_address=None, is_mainnet=True):
+            return {
+                "action": action,
+                "signature": {"r": "0x1", "s": "0x2", "v": 27},
+                "nonce": 12345,
+            }
+
+        monkeypatch.setattr(
+            hyperliquid_signing,
+            "build_hyperliquid_exchange_payload",
+            fake_exchange_payload,
+        )
+
+        async def fake_request(method, path, **kwargs):
+            return {
+                "status": "ok",
+                "response": {
+                    "type": "cancel",
+                    "data": {
+                        "statuses": [
+                            {
+                                "error": (
+                                    "Order was never placed, already canceled, "
+                                    "or filled. asset=126"
+                                )
+                            }
+                        ]
+                    },
+                },
+            }
+
+        transport._request = fake_request
+
+        ack = await transport.cancel_passive_order(
+            "MERLUSDT",
+            "455070590535",
+            client_order_id="4e29a7a3a58546f4ffc40711d8d8f3601dba",
+        )
+
+        assert ack.state == PassiveOrderState.CANCELED
 
     @pytest.mark.asyncio
     async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):

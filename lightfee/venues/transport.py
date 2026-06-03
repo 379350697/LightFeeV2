@@ -1177,6 +1177,15 @@ def _cancel_response_indicates_absent_order(raw: dict[str, Any], venue_id: "Venu
             ret_code = result.get("retCode", result.get("ret_code", 0))
             if str(ret_code) == "110001":
                 return True
+    if venue_id == Venue.HYPERLIQUID:
+        response = raw.get("response", raw)
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        statuses = data.get("statuses", []) if isinstance(data, dict) else []
+        if isinstance(statuses, list):
+            for item in statuses:
+                msg = str(item.get("error", item) if isinstance(item, dict) else item).lower()
+                if "order was never placed, already canceled, or filled" in msg:
+                    return True
     return False
 
 
@@ -6305,11 +6314,14 @@ class VenueTransport(MarketDataClient):
                     is_mainnet=True,
                 )
                 raw = await self._request("POST", spec.order_path, body=body, private=True)
+                cancel_already_terminal = _cancel_response_indicates_absent_order(
+                    raw, spec.venue_id
+                )
                 # V1: check HL cancel response (hyperliquid.rs cancel path)
                 # Response: {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [...]}}}
                 status = str(raw.get("status", "")).lower()
                 response_data = raw.get("response", raw)
-                if isinstance(response_data, dict):
+                if not cancel_already_terminal and isinstance(response_data, dict):
                     data = response_data.get("data", {})
                     if isinstance(data, dict):
                         statuses = data.get("statuses", [])
