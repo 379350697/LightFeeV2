@@ -488,8 +488,34 @@ class TestProjectionWriter:
         assert len(store.query_entry_exit_facts(conn)) == 1
         assert len(store.query_risk_counter_facts(conn)) == 1
 
-    def test_skips_journal_only_kinds(self):
-        """Recovery and lifecycle records must stay in journal, never projected."""
+    def test_v1_ledger_backfill_counts_new_ledger_rows_as_appended(self):
+        """Upgrade replay writes the new ledger row even when old fact row exists."""
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(
+                1,
+                "entry.opened",
+                ts_ms=1000,
+                position_id="pos-backfill",
+                symbol="LABUSDT",
+                entry_fee_quote=1.0,
+            ),
+        ]
+        writer = ProjectionWriter(store)
+
+        legacy = writer._project_entry_exit(conn, 1, 1000, "entry.opened", records[0]["payload"])
+        assert legacy is True
+        result = writer.project_records(conn, records)
+
+        assert result == {"appended": 1, "skipped": 0, "failed": 0}
+        assert len(store.query_entry_exit_facts(conn)) == 1
+        events = store.query_trade_ledger_events(conn)
+        assert len(events) == 1
+        assert events[0]["event_kind"] == "entry.opened"
+        assert events[0]["entity_id"] == "pos-backfill"
+
+    def test_journal_only_kinds_only_enter_v1_lifecycle_ledger_when_supported(self):
+        """Recovery stays journal-first, but V1 live recovery gets a ledger view."""
         _td, store, conn = self._open_store()
         records = [
             _make_record(1, "recovery.live_detected", position_id="p1"),
@@ -501,11 +527,22 @@ class TestProjectionWriter:
         ]
         writer = ProjectionWriter(store)
         result = writer.project_records(conn, records)
-        assert result["appended"] == 0
+        assert result["appended"] == 1
         assert result["skipped"] == 0
         assert result["failed"] == 0
 
-        assert not store.has_projection_data(conn)
+        assert store.has_projection_data(conn)
+        assert not store.query_entry_exit_facts(conn)
+        assert not store.query_diagnostic_facts(conn)
+        events = store.query_trade_ledger_events(conn)
+        assert len(events) == 1
+        assert events[0]["event_kind"] == "recovery.live_detected"
+        assert events[0]["entity_id"] == "p1"
+
+        duplicate = writer.project_records(conn, records)
+        assert duplicate["appended"] == 0
+        assert duplicate["skipped"] == 1
+        assert duplicate["failed"] == 0
 
     def test_cursor_tracks_projection_progress(self):
         _td, store, conn = self._open_store()
@@ -535,6 +572,203 @@ class TestProjectionWriter:
         assert metrics.projection_skips == 0
         assert metrics.projection_failures == 0
         assert metrics.last_projection_seq == 2
+
+    def test_v1_ledger_bridge_records_full_position_order_fill_chain(self):
+        """V1 ledger bridge: position, order, fill, and event rows join by ids."""
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(
+                1,
+                "entry.opened",
+                ts_ms=1000,
+                position_id="pos-ledger-1",
+                review_id="rvw-ledger-1",
+                symbol="LABUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                quantity=12.0,
+                entry_notional_quote=120.0,
+                entered_at_ms=900,
+            ),
+            _make_record(
+                2,
+                "order.submitted",
+                ts_ms=1100,
+                position_id="pos-ledger-1",
+                review_id="rvw-ledger-1",
+                venue="binance",
+                symbol="LABUSDT",
+                side="buy",
+                stage="entry_maker",
+                client_order_id="entry-maker-cid",
+                order_id="entry-maker-oid",
+                requested_quantity=12.0,
+            ),
+            _make_record(
+                3,
+                "order.filled",
+                ts_ms=1200,
+                position_id="pos-ledger-1",
+                review_id="rvw-ledger-1",
+                venue="binance",
+                symbol="LABUSDT",
+                side="buy",
+                stage="entry_maker",
+                client_order_id="entry-maker-cid",
+                order_id="entry-maker-oid",
+                trade_id="trade-1",
+                executed_quantity=12.0,
+                average_price=10.0,
+                fee_quote=0.1,
+                filled_at_ms=1190,
+            ),
+            _make_record(
+                4,
+                "exit.closed",
+                ts_ms=2000,
+                position_id="pos-ledger-1",
+                review_id="rvw-ledger-1",
+                symbol="LABUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                reason="funding_capture",
+                net_quote=1.23,
+                realized_price_pnl_quote=1.56,
+                total_entry_fee_quote=0.1,
+                total_exit_fee_quote=0.2,
+                long_exit_order_id="long-exit-oid",
+                short_exit_order_id="short-exit-oid",
+                closed_at_ms=2000,
+                entry_notional_quote=120.0,
+            ),
+        ]
+
+        result = ProjectionWriter(store).project_records(conn, records)
+
+        assert result["failed"] == 0
+        positions = conn.execute("SELECT * FROM position_ledger").fetchall()
+        assert len(positions) == 1
+        assert positions[0]["position_id"] == "pos-ledger-1"
+        assert positions[0]["state"] == "closed"
+        assert positions[0]["truth_level"] == "venue_fill_confirmed"
+        assert positions[0]["closed_at_ms"] == 2000
+
+        orders = conn.execute("SELECT * FROM order_ledger").fetchall()
+        assert len(orders) == 1
+        assert orders[0]["position_id"] == "pos-ledger-1"
+        assert orders[0]["client_order_id"] == "entry-maker-cid"
+        assert orders[0]["exchange_order_id"] == "entry-maker-oid"
+        assert orders[0]["status"] == "filled"
+        assert orders[0]["truth_level"] == "venue_fill_confirmed"
+
+        fills = conn.execute("SELECT * FROM fill_ledger").fetchall()
+        assert len(fills) == 1
+        assert fills[0]["position_id"] == "pos-ledger-1"
+        assert fills[0]["exchange_trade_id"] == "trade-1"
+
+        events = conn.execute(
+            "SELECT event_kind, entity_type, entity_id, truth_level "
+            "FROM trade_ledger_events ORDER BY seq"
+        ).fetchall()
+        assert [row["event_kind"] for row in events] == [
+            "entry.opened",
+            "order.submitted",
+            "order.filled",
+            "exit.closed",
+        ]
+        assert {row["entity_id"] for row in events} >= {
+            "pos-ledger-1",
+            "binance:entry-maker-cid",
+        }
+
+    def test_v1_ledger_bridge_records_compensation_recovery_and_terminal_problem(self):
+        """Compensation/recovery/terminal events must not remain attribution blind spots."""
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(
+                1,
+                "recovery.live_detected",
+                ts_ms=1000,
+                position_id="live-recovered:LABUSDT:binance->bybit",
+                symbol="LABUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                quantity=12.0,
+                source="runtime_live_position_probe",
+            ),
+            _make_record(
+                2,
+                "exit.compensated",
+                ts_ms=1100,
+                position_id="live-recovered:LABUSDT:binance->bybit",
+                symbol="LABUSDT",
+                reason="passive_close_live_one_sided_force_close_problem",
+                failed_stage="exit_short",
+                failed_venue="bybit",
+                compensated_venues=["bybit"],
+            ),
+            _make_record(
+                3,
+                "execution.compensation_failed",
+                ts_ms=1200,
+                position_id="live-recovered:LABUSDT:binance->bybit",
+                symbol="LABUSDT",
+                phase="close",
+                compensation_venue="bybit",
+                hard_stop_error="simulated failure",
+            ),
+            _make_record(
+                4,
+                "runtime.position_lifecycle_terminal",
+                ts_ms=1300,
+                position_id="live-recovered:LABUSDT:binance->bybit",
+                symbol="LABUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                terminal_state="flat",
+                terminal_reason="passive_close_live_one_sided_force_close_problem",
+                problem=True,
+                problem_reason="normal_one_sided_flatten_failed_force_close",
+                client_order_ids=["force-close-cid"],
+                order_ids=["force-close-oid"],
+            ),
+            _make_record(
+                5,
+                "recovery.flat",
+                ts_ms=1400,
+                position_id="live-recovered:LABUSDT:binance->bybit",
+                symbol="LABUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                reason="exchange_flat_local_open",
+            ),
+        ]
+
+        result = ProjectionWriter(store).project_records(conn, records)
+
+        assert result["failed"] == 0
+        events = conn.execute(
+            "SELECT event_kind, entity_type, entity_id, truth_level "
+            "FROM trade_ledger_events ORDER BY seq"
+        ).fetchall()
+        assert [row["event_kind"] for row in events] == [
+            "recovery.live_detected",
+            "exit.compensated",
+            "execution.compensation_failed",
+            "runtime.position_lifecycle_terminal",
+            "recovery.flat",
+        ]
+        assert all(row["entity_id"] == "live-recovered:LABUSDT:binance->bybit" for row in events)
+        assert all(row["truth_level"] == "runtime_estimated" for row in events)
+
+        positions = conn.execute("SELECT * FROM position_ledger").fetchall()
+        assert len(positions) == 1
+        assert positions[0]["position_id"] == "live-recovered:LABUSDT:binance->bybit"
+        assert positions[0]["state"] == "closed"
+        assert positions[0]["closed_at_ms"] == 1400
+        assert positions[0]["terminal_reason"] == "passive_close_live_one_sided_force_close_problem"
+        assert positions[0]["problem"] == 1
+        assert positions[0]["problem_reason"] == "normal_one_sided_flatten_failed_force_close"
 
 
 class TestStoreBackedAnalysis:
@@ -650,6 +884,10 @@ class TestProjectionClassification:
         assert is_projected_kind("order.filled")
         assert is_projected_kind("entry.opened")
         assert is_projected_kind("exit.closed")
+        assert is_projected_kind("entry.compensated")
+        assert is_projected_kind("exit.compensated")
+        assert is_projected_kind("execution.compensation_failed")
+        assert is_projected_kind("runtime.position_lifecycle_terminal")
         assert is_projected_kind("risk.warning_triggered")
         assert is_projected_kind("runtime.local_l2_sequence_gap")
         assert is_projected_kind("scan.no_entry_diagnostics")

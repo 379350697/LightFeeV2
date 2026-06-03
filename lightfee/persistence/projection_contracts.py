@@ -126,6 +126,13 @@ PROJECTED_EXECUTION_KINDS: frozenset[str] = frozenset({
     "execution.passive_phase_switched",
 })
 
+PROJECTED_LEDGER_BRIDGE_KINDS: frozenset[str] = frozenset({
+    "entry.compensated",
+    "execution.compensation_failed",
+    "exit.compensated",
+    "runtime.position_lifecycle_terminal",
+})
+
 # ---------------------------------------------------------------------------
 # All projected kinds (union of all projection groups)
 # ---------------------------------------------------------------------------
@@ -137,10 +144,12 @@ ALL_PROJECTED_KINDS: frozenset[str] = (
     | PROJECTED_RISK_KINDS
     | PROJECTED_L2_HEALTH_KINDS
     | PROJECTED_EXECUTION_KINDS
+    | PROJECTED_LEDGER_BRIDGE_KINDS
 )
 
 # ---------------------------------------------------------------------------
-# Journal-only kinds — these stay in the journal, never projected
+# Journal-first kinds — these stay in the journal for replay authority. Some
+# recovery kinds may also receive rebuildable ledger rows for attribution.
 # ---------------------------------------------------------------------------
 
 JOURNAL_ONLY_RECOVERY_KINDS: frozenset[str] = frozenset({
@@ -217,6 +226,7 @@ FACT_TABLE_MAP: dict[str, str] = {
     **{k: "risk_counter_facts" for k in PROJECTED_RISK_KINDS},
     **{k: "local_l2_health_facts" for k in PROJECTED_L2_HEALTH_KINDS},
     **{k: "diagnostic_facts" for k in PROJECTED_EXECUTION_KINDS},
+    **{k: "trade_ledger_events" for k in PROJECTED_LEDGER_BRIDGE_KINDS},
 }
 
 # All fact table names that the projection layer writes into
@@ -228,6 +238,11 @@ PROJECTION_TABLES: tuple[str, ...] = (
     "risk_counter_facts",
     "local_l2_health_facts",
     "diagnostic_facts",
+    "trade_ledger_events",
+    "position_ledger",
+    "position_pnl_facts",
+    "order_ledger",
+    "fill_ledger",
 )
 
 # ---------------------------------------------------------------------------
@@ -241,7 +256,7 @@ def is_projected_kind(kind: str) -> bool:
 
 
 def is_journal_only_kind(kind: str) -> bool:
-    """Return True if this journal kind must stay in the journal only."""
+    """Return True if this journal kind must stay journal-first."""
     return kind in ALL_JOURNAL_ONLY_KINDS
 
 

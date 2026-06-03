@@ -17,6 +17,32 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest lifecycle attribution follow-up, 2026-06-03: CL038 and CL039 closed the
+runtime safety surface, but open-to-close attribution still had a V2/V1 drift:
+V2 projected only simple order/entry/exit facts, while compensation, recovery,
+and terminal-problem events such as `exit.compensated`,
+`entry.compensated`, `execution.compensation_failed`, and
+`runtime.position_lifecycle_terminal` were not part of a structured lifecycle
+ledger. V1's answer is `runtime_state/ledger_bridge.rs`: a rebuildable
+journal-derived bridge into `trade_ledger_events`, `position_ledger`,
+`order_ledger`, `fill_ledger`, and `position_pnl_facts` with `truth_level`
+labels. The local CL040 fix replicates that boundary in V2's persistence layer:
+`ProjectionWriter` now writes V1-compatible lifecycle ledger rows for
+entry/open, recovered live positions, order submit/fill/failure, exit close,
+recovery flat, compensation success/failure, and terminal problem events.
+Recovery remains journal-first for replay, but no longer lacks a queryable
+attribution row. `execution.compensation_failed` is also mapped to
+`trade_ledger_events` rather than `diagnostic_facts`, matching the implemented
+ledger bridge. Focused RED/GREEN proved the old missing-table blind spot and
+the new full position/order/fill/exit plus recovery/compensation/terminal
+chains; adjacent persistence/offline and close/replay suites passed. This
+fix then passed the full local gate (`3381 passed`, `9 skipped`, `1 warning`),
+compileall, diff-check, and GitNexus detect-changes LOW with zero affected
+processes. It does not change live order submit, close executor, recovery
+policy, Local-L2, WS BBO, sizing, or residual repair. Historical unallocated
+Binance/Bybit/Aster rows still require exchange order-history replay; future
+rows after CL040 have the V1-style join surface.
+
 Latest pending-entry maker-order follow-up, 2026-06-03: after cloud deploy
 `338caec`, production health was green but an all-venue exchange-truth probe
 found a separate pending-entry lifecycle issue: local state was flat while 9

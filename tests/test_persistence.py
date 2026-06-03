@@ -16,6 +16,7 @@ from lightfee.persistence.projection_contracts import (
     ALL_PROJECTED_KINDS,
     PROJECTED_ENTRY_EXIT_KINDS,
     PROJECTED_EXECUTION_KINDS,
+    PROJECTED_LEDGER_BRIDGE_KINDS,
     PROJECTED_L2_HEALTH_KINDS,
     PROJECTED_ORDER_KINDS,
     PROJECTED_RISK_KINDS,
@@ -198,6 +199,11 @@ class TestSqliteStore:
             assert "local_l2_health_facts" in table_names
             assert "diagnostic_facts" in table_names
             assert "projection_cursor" in table_names
+            assert "trade_ledger_events" in table_names
+            assert "position_ledger" in table_names
+            assert "position_pnl_facts" in table_names
+            assert "order_ledger" in table_names
+            assert "fill_ledger" in table_names
             conn.close()
 
     def test_insert_daily_snapshot(self):
@@ -935,6 +941,12 @@ class TestProjectionContractsFactTableMapping:
     def test_execution_kinds_map_to_diagnostic_facts(self):
         for kind in PROJECTED_EXECUTION_KINDS:
             assert fact_table_for_kind(kind) == "diagnostic_facts"
+
+    def test_lifecycle_ledger_bridge_kinds_map_to_trade_ledger_events(self):
+        assert "execution.compensation_failed" in PROJECTED_LEDGER_BRIDGE_KINDS
+        assert "execution.compensation_failed" not in PROJECTED_EXECUTION_KINDS
+        for kind in PROJECTED_LEDGER_BRIDGE_KINDS:
+            assert fact_table_for_kind(kind) == "trade_ledger_events"
 
     def test_journal_only_kinds_return_none_table(self):
         for kind in list(ALL_JOURNAL_ONLY_KINDS)[:5]:
