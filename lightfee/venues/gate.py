@@ -46,6 +46,61 @@ class GateAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return loaded Gate USDT futures symbols in canonical LightFee format."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        spec = gate_spec()
+        symbols: set[str] = set()
+        for symbol in metadata:
+            symbol_text = str(symbol)
+            if not symbol_text:
+                continue
+            symbols.add(spec.symbol_from_venue(symbol_text) if spec.symbol_from_venue else symbol_text)
+        return sorted(symbols)
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate Gate futures contract catalog for recovery probe filtering."""
+        if self._transport._symbol_metadata:
+            return
+        raw = await self._transport._request(
+            "GET",
+            "/api/v4/futures/usdt/contracts",
+            private=False,
+        )
+        rows = raw.get("data", raw) if isinstance(raw, dict) else raw
+        items = rows if isinstance(rows, list) else [rows]
+        spec = gate_spec()
+        metadata: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            venue_symbol = str(
+                item.get("name")
+                or item.get("contract")
+                or item.get("symbol")
+                or ""
+            ).upper()
+            if not venue_symbol:
+                continue
+            canonical = (
+                spec.symbol_from_venue(venue_symbol)
+                if spec.symbol_from_venue
+                else venue_symbol
+            )
+            if not canonical.endswith("USDT"):
+                continue
+            status = str(
+                item.get("status")
+                or item.get("trade_status")
+                or "trading"
+            ).lower()
+            if status not in ("trading", "tradable", "open"):
+                continue
+            if bool(item.get("in_delisting", False)):
+                continue
+            metadata[venue_symbol] = dict(item)
+        self._transport.set_symbol_metadata(metadata)
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 

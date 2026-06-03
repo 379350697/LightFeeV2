@@ -5746,6 +5746,54 @@ class TestBinanceAdapterSymbolCatalog:
         assert adapter.supported_symbols() == ["BTCUSDT"]
 
 
+class TestBybitAdapterSymbolCatalog:
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_paginates_linear_perpetuals(self):
+        """Bybit linear catalog exceeds the default page and must be fully loaded."""
+        from lightfee.venues.bybit import BybitAdapter
+
+        adapter = BybitAdapter(mode="paper")
+        cursors: list[str] = []
+
+        async def mock_request(method, path, **kwargs):
+            assert method == "GET"
+            assert path == "/v5/market/instruments-info"
+            params = kwargs.get("params", {})
+            assert params["category"] == "linear"
+            assert params["limit"] == 1000
+            cursor = str(params.get("cursor", ""))
+            cursors.append(cursor)
+            if not cursor:
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {"symbol": "BTCUSDT", "status": "Trading", "contractType": "LinearPerpetual"},
+                            {"symbol": "ETHUSDT", "status": "Settling", "contractType": "LinearPerpetual"},
+                            {"symbol": "BTCUSDT_260626", "status": "Trading", "contractType": "LinearFutures"},
+                            {"symbol": "BTCUSDC", "status": "Trading", "contractType": "LinearPerpetual"},
+                        ],
+                        "nextPageCursor": "page-2",
+                    },
+                }
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "SOLUSDT", "status": "Trading", "contractType": "LinearPerpetual"},
+                    ],
+                    "nextPageCursor": "",
+                },
+            }
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert cursors == ["", "page-2"]
+        assert adapter.supported_symbols() == ["BTCUSDT", "SOLUSDT"]
+
+
 # ---------------------------------------------------------------------------
 # Aster/Hyperliquid symbol catalog guards
 # ---------------------------------------------------------------------------
@@ -5774,6 +5822,32 @@ class TestAsterAdapterSymbolCatalog:
         await adapter.ensure_supported_symbols_loaded()
 
         assert adapter.supported_symbols() == ["BTCUSDT"]
+
+
+class TestGateAdapterSymbolCatalog:
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_keeps_trading_usdt_contracts_only(self):
+        """Gate recovery catalog must use active futures contracts, not an empty list."""
+        from lightfee.venues.gate import GateAdapter
+
+        adapter = GateAdapter(mode="paper")
+
+        async def mock_request(method, path, **kwargs):
+            assert method == "GET"
+            assert path == "/api/v4/futures/usdt/contracts"
+            assert kwargs.get("private") is False
+            return [
+                {"name": "BTC_USDT", "status": "trading", "in_delisting": False},
+                {"name": "ETH_USDT", "status": "delisting", "in_delisting": True},
+                {"name": "SOL_USDT", "trade_status": "tradable", "in_delisting": False},
+                {"name": "FOO_USD", "status": "trading", "in_delisting": False},
+            ]
+
+        adapter._transport._request = mock_request
+
+        await adapter.ensure_supported_symbols_loaded()
+
+        assert adapter.supported_symbols() == ["BTCUSDT", "SOLUSDT"]
 
 
 class TestHyperliquidAdapterSymbolCatalog:

@@ -300,6 +300,59 @@ class TestProductionSidecarParserRegressions:
         assert ticker.funding_rate_bps == 1.0
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_asset_contexts_match_universe_by_index(self):
+        """Official metaAndAssetCtxs returns asset contexts parallel to universe."""
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                assert body == {"type": "metaAndAssetCtxs"}
+                return [
+                    {"universe": [{"name": "BTC"}, {"name": "MERL"}]},
+                    [
+                        {
+                            "markPx": "65000", "funding": "0.0001",
+                            "dayNtlVlm": "1000", "openInterest": "20",
+                            "impactPxs": ["64000", "66000"],
+                        },
+                        {
+                            "markPx": "0.42", "funding": "0.0002",
+                            "dayNtlVlm": "2000", "openInterest": "500",
+                            "impactPxs": ["0.41", "0.43"],
+                        },
+                    ],
+                ]
+
+        result = await FakeHyperliquidClient(hyperliquid_spec())._fetch_hyperliquid_style(
+            ["BTCUSDT", "MERLUSDT"]
+        )
+
+        assert result["hyperliquid:BTCUSDT"].bid == 64000.0
+        assert result["hyperliquid:BTCUSDT"].ask == 66000.0
+        assert result["hyperliquid:MERLUSDT"].bid == 0.41
+        assert result["hyperliquid:MERLUSDT"].ask == 0.43
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_missing_asset_context_is_not_zero_quote(self):
+        """A listed universe item without usable context must not become bid=ask=0."""
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                assert body == {"type": "metaAndAssetCtxs"}
+                return [
+                    {"universe": [{"name": "BTC"}, {"name": "MERL"}]},
+                    [{
+                        "markPx": "65000", "funding": "0.0001",
+                        "dayNtlVlm": "1000", "openInterest": "20",
+                        "impactPxs": ["64000", "66000"],
+                    }],
+                ]
+
+        result = await FakeHyperliquidClient(hyperliquid_spec())._fetch_hyperliquid_style(
+            ["BTCUSDT", "MERLUSDT"]
+        )
+
+        assert "hyperliquid:BTCUSDT" in result
+        assert "hyperliquid:MERLUSDT" not in result
+
+    @pytest.mark.asyncio
     async def test_binance_large_universe_skips_per_symbol_open_interest(self):
         symbols = [f"S{i}USDT" for i in range(64)]
 

@@ -727,9 +727,14 @@ class MarketDataClient:
                 universe = raw[0] if isinstance(raw[0], list) else []
             asset_ctxs = raw[1] if isinstance(raw[1], list) else []
 
-        # Index asset contexts by coin name
+        # Official metaAndAssetCtxs returns asset contexts parallel to universe.
+        # Keep name lookup for wrappers that add "coin", but trust index parity.
         ctx_by_name: dict[str, dict] = {}
-        for ctx in asset_ctxs:
+        ctx_by_index: dict[int, dict] = {}
+        for idx, ctx in enumerate(asset_ctxs):
+            if not isinstance(ctx, dict):
+                continue
+            ctx_by_index[idx] = ctx
             name = str(ctx.get("coin", "") or "")
             if name:
                 ctx_by_name[name] = ctx
@@ -738,13 +743,17 @@ class MarketDataClient:
         funding_ts = _next_hour_boundary(observed_at_ms)
 
         result: dict[str, FundingTicker] = {}
-        for item in universe:
+        for idx, item in enumerate(universe):
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("isDelisted", False)):
+                continue
             name = str(item.get("name", ""))
             canon = name + "USDT"
             if canon.upper() not in canonical_set and canon not in canonical_set:
                 continue
 
-            ctx = ctx_by_name.get(name, {})
+            ctx = ctx_by_name.get(name) or ctx_by_index.get(idx, {})
             mark = _safe_float(ctx.get("markPx", item.get("markPx", 0)))
 
             # V1 parity: mid price fallback from midPx → markPx
@@ -761,6 +770,9 @@ class MarketDataClient:
             else:
                 best_bid = mid_price
                 best_ask = mid_price
+
+            if best_bid <= 0 or best_ask <= 0:
+                continue
 
             # V1 parity: bid/ask sizes from impact notional
             impact_notional = 6_000.0 if name not in ("BTC", "ETH") else 20_000.0

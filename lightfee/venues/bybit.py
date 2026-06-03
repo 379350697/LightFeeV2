@@ -43,6 +43,48 @@ class BybitAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    def supported_symbols(self) -> list[str]:
+        """Return loaded Bybit linear USDT perpetual symbols, if available."""
+        metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
+        return sorted(str(symbol) for symbol in metadata.keys())
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        """Populate Bybit's paginated linear contract catalog for recovery probes."""
+        if self._transport._symbol_metadata:
+            return
+        metadata: dict[str, dict[str, Any]] = {}
+        cursor = ""
+        while True:
+            params: dict[str, Any] = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._transport._request(
+                "GET",
+                "/v5/market/instruments-info",
+                params=params,
+                private=False,
+            )
+            result = raw.get("result", {}) if isinstance(raw, dict) else {}
+            rows = result.get("list", []) if isinstance(result, dict) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol", "")).upper()
+                if not symbol.endswith("USDT"):
+                    continue
+                status = str(row.get("status", "Trading")).upper()
+                if status != "TRADING":
+                    continue
+                contract_type = str(row.get("contractType", "LinearPerpetual")).upper()
+                if "PERPETUAL" not in contract_type:
+                    continue
+                metadata[symbol] = dict(row)
+            next_cursor = str(result.get("nextPageCursor", "") or "")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        self._transport.set_symbol_metadata(metadata)
+
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
