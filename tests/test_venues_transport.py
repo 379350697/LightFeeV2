@@ -8207,6 +8207,72 @@ class TestCancelAbsentOrderDetection:
         }
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_cancel_passive_order_loads_asset_meta_after_restart(self, monkeypatch):
+        """Recovery cancel must not depend on a warm Hyperliquid asset-index cache."""
+        from lightfee.core.domain import PassiveOrderState
+        from lightfee.venues import hyperliquid_signing
+        from lightfee.venues.specs import hyperliquid_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        transport = VenueTransport(
+            hyperliquid_spec(),
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key="0x" + "11" * 32,
+                account_address="0x" + "22" * 20,
+            ),
+        )
+
+        def fake_exchange_payload(action, private_key_hex, vault_address=None, is_mainnet=True):
+            assert private_key_hex == "0x" + "11" * 32
+            return {
+                "action": action,
+                "signature": {"r": "0x1", "s": "0x2", "v": 27},
+                "nonce": 12345,
+            }
+
+        monkeypatch.setattr(
+            hyperliquid_signing,
+            "build_hyperliquid_exchange_payload",
+            fake_exchange_payload,
+        )
+        seen: list[tuple[str, str, Any]] = []
+
+        async def fake_request(method, path, **kwargs):
+            seen.append((method, path, kwargs.get("body")))
+            if path == "/info":
+                universe = [{"name": f"DUMMY{i}", "szDecimals": 0} for i in range(17)]
+                universe.append({"name": "MERL", "szDecimals": 0})
+                return {"universe": universe}
+            return {
+                "status": "ok",
+                "response": {"type": "cancel", "data": {"statuses": ["success"]}},
+            }
+
+        transport._request = fake_request
+
+        ack = await transport.cancel_passive_order(
+            "MERLUSDT",
+            "455070590535",
+            client_order_id="4e29a7a3a58546f4ffc40711d8d8f3601dba",
+        )
+
+        assert ack.state == PassiveOrderState.CANCELED
+        assert seen[0] == ("POST", "/info", {"type": "meta"})
+        assert seen[1] == (
+            "POST",
+            "/exchange",
+            {
+                "action": {
+                    "type": "cancel",
+                    "cancels": [{"a": 17, "o": 455070590535}],
+                },
+                "signature": {"r": "0x1", "s": "0x2", "v": 27},
+                "nonce": 12345,
+            },
+        )
+
+    @pytest.mark.asyncio
     async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):
         """Bybit V5 order lookup is GET /v5/order/realtime, not GET /v5/order/create."""
         from lightfee.venues.transport import VenueTransport

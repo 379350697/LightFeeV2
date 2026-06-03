@@ -6293,7 +6293,7 @@ class VenueTransport(MarketDataClient):
                     build_hyperliquid_exchange_payload,
                 )
 
-                meta = self._hl_cached_asset_meta(venue_sym)
+                meta = await self._hl_resolve_asset_meta(venue_sym)
                 action = {
                     "type": "cancel",
                     "cancels": [{"a": int(meta["asset_index"]), "o": oid}],
