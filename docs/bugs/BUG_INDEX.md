@@ -31,10 +31,19 @@ persists `cancel_requested_at_ms`, and polls passive progress by order id/client
 id. The local CL039 fix fully mirrors that boundary: recovery cancel/progress,
 abort-open-order truth, maintenance, reconciliation/finalize maker id lookup,
 snapshot `passive_order`/`next_progress_poll_ms` roundtrip, and durable cancel
-state now all use the passive-order identity. Code is local and not yet
-deployed; closure requires commit/deploy, remote focused tests, service restart,
-all-venue truth staying `0/0`, and deploy-window proof that no new
-local-flat/exchange-open maker orphan appears.
+state now all use the passive-order identity. It was committed as `4b6a6ee`
+and deployed to `/opt/lightfee-v2`: remote focused maker/passive lifecycle tests
+passed (`117 passed`), compileall and deploy-manifest checks passed, sidecar
+and live restarted active with `NRestarts=0`, `.deploy_version=4b6a6ee`, and
+`diagnose_live.py --since-deploy --json` was healthy with local
+open/pending/close `0/0/0` and Local-L2 missing/stale/sequence-gap counts
+`0/0/0`. A credentialed all-venue truth probe over Binance, Aster, Bybit, OKX,
+Bitget, Gate, and Hyperliquid returned `nonzero_position_count=0` and
+`open_order_count=0`, and warning-level journal logs since restart were empty.
+CL039 is closed; keep `entry.abort_retained_maker_open_order`,
+`entry.abort_maker_order_truth_unavailable`, and
+`recovery.maker_cancel_requested` as watch keys for future maker terminality
+samples.
 
 Latest startup recovery lifecycle follow-up, 2026-06-03: cloud first deployed
 `cb1abbed4516ff016b78be6cc1e0f588d40853c7`; remote focused tests passed
