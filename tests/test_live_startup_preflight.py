@@ -1227,6 +1227,68 @@ class TestRuntimePreflight:
             assert payload["error"]
 
     @pytest.mark.asyncio
+    async def test_live_position_bulk_timeout_records_probe_budget_and_batch_evidence(self):
+        """Bulk timeout evidence must identify endpoint, budget, timing, and batch scope."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.live_recovery_rest_probe_timeout_ms = 10
+
+            class SlowBulkAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.OKX)
+                    self._transport = SimpleNamespace(
+                        _spec=SimpleNamespace(position_path="/api/v5/account/positions"),
+                        _venue_symbol=lambda symbol: symbol,
+                    )
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT", "ETHUSDT"]
+
+                async def fetch_all_positions(self):
+                    await asyncio.sleep(1)
+                    return []
+
+            okx = SlowBulkAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "ETHUSDT"]
+                )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                r["payload"] for r in records
+                if r["kind"] == "recovery.live_position_bulk_probe_error"
+            )
+            assert payload["venue"] == "okx"
+            assert payload["endpoint"] == "/api/v5/account/positions"
+            assert payload["classification"] == "timeout"
+            assert payload["timeout_budget_ms"] == 10
+            assert payload["timeout_budget_source"] == (
+                "runtime.live_recovery_rest_probe_timeout_ms"
+            )
+            assert payload["timeout_trigger"] == "per_venue_wait_for"
+            assert payload["global_timeout_triggered"] is False
+            assert payload["global_timeout_budget_ms"] == 0
+            assert payload["concurrency_limit"] == 8
+            assert payload["probe_batch_index"] == 1
+            assert payload["probe_batch_count"] == 1
+            assert payload["probe_batch_symbol_count"] == 2
+            assert payload["requested_symbols"] == ["BTCUSDT", "ETHUSDT"]
+            assert payload["probe_started_at_ms"] > 0
+            assert payload["probe_finished_at_ms"] >= payload["probe_started_at_ms"]
+            assert payload["probe_elapsed_ms"] >= 0
+            assert payload["global_probe_started_at_ms"] <= payload["probe_started_at_ms"]
+            assert payload["global_probe_elapsed_ms"] >= payload["probe_elapsed_ms"]
+
+    @pytest.mark.asyncio
     async def test_live_position_bulk_metadata_missing_keeps_inst_id_context(self):
         """Bulk OKX metadata failures must not lose the failing instId context."""
         from lightfee.venues.specs import okx_spec

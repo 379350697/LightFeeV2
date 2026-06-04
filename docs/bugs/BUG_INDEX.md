@@ -17,6 +17,18 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest recovery bulk-probe timeout evidence follow-up, 2026-06-04:
+`recovery.live_position_bulk_probe_error` timeout is not root-fixed because the
+available evidence is insufficient to distinguish exchange/network transport
+noise from a local budget/concurrency defect. The runtime now records endpoint,
+timeout budget/source, per-venue vs global timeout trigger, global-budget
+applied/triggered state, concurrency limit, batch index/count, requested symbol
+scope, and probe queued/start/finish/elapsed timings. This is intentionally an
+observability-only change: future occurrences only become code work if the new
+fields prove exchange truth became unavailable or pending/residual cleanup
+could not close; otherwise update evidence/docs without changing runtime
+behavior.
+
 Latest pending-entry live-truth contract closure, 2026-06-04: CL-048, CL-049,
 and CL-050 are now one contract family governed by
 [`pending-entry-live-truth-contract`](contracts/pending-entry-live-truth-contract.md),

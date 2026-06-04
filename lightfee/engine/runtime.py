@@ -1717,10 +1717,14 @@ class LiveRuntime:
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
     ) -> list[tuple[str, PositionSnapshot]]:
-        timeout_s = (
-            max(self.config.runtime.live_recovery_rest_probe_timeout_ms, 1) / 1000.0
+        timeout_budget_ms = max(
+            int(self.config.runtime.live_recovery_rest_probe_timeout_ms),
+            1,
         )
-        semaphore = asyncio.Semaphore(8)
+        timeout_s = timeout_budget_ms / 1000.0
+        concurrency_limit = 8
+        semaphore = asyncio.Semaphore(concurrency_limit)
+        global_probe_started_at_ms = wall_clock_now_ms()
         requested_symbols = list(
             dict.fromkeys(str(symbol) for symbol in symbols if str(symbol))
         )
@@ -1789,15 +1793,21 @@ class LiveRuntime:
             venue: Venue,
             adapter: VenueAdapter,
             venue_symbols: list[str],
+            *,
+            probe_batch_index: int,
+            probe_batch_count: int,
         ):
             venue_probe_symbols = set(venue_symbols)
+            probe_queued_at_ms = wall_clock_now_ms()
             async with semaphore:
+                probe_started_at_ms = wall_clock_now_ms()
                 try:
                     positions = await asyncio.wait_for(
                         adapter.fetch_all_positions(),
                         timeout=timeout_s,
                     )
                 except Exception as e:
+                    probe_finished_at_ms = wall_clock_now_ms()
                     payload = self._position_probe_exception_payload(
                         venue,
                         adapter,
@@ -1812,6 +1822,40 @@ class LiveRuntime:
                     payload["symbols"] = sorted(venue_probe_symbols)
                     payload["requested_symbols"] = sorted(venue_probe_symbols)
                     payload["symbol_count"] = len(venue_probe_symbols)
+                    payload.update(
+                        {
+                            "probe_scope": "bulk_positions",
+                            "probe_queued_at_ms": probe_queued_at_ms,
+                            "probe_started_at_ms": probe_started_at_ms,
+                            "probe_finished_at_ms": probe_finished_at_ms,
+                            "probe_elapsed_ms": max(
+                                probe_finished_at_ms - probe_started_at_ms,
+                                0,
+                            ),
+                            "global_probe_started_at_ms": global_probe_started_at_ms,
+                            "global_probe_elapsed_ms": max(
+                                probe_finished_at_ms - global_probe_started_at_ms,
+                                0,
+                            ),
+                            "timeout_budget_ms": timeout_budget_ms,
+                            "timeout_budget_s": timeout_s,
+                            "timeout_budget_source": (
+                                "runtime.live_recovery_rest_probe_timeout_ms"
+                            ),
+                            "timeout_trigger": (
+                                "per_venue_wait_for"
+                                if payload.get("classification") == "timeout"
+                                else ""
+                            ),
+                            "global_timeout_budget_ms": 0,
+                            "global_timeout_triggered": False,
+                            "global_budget_applied": False,
+                            "concurrency_limit": concurrency_limit,
+                            "probe_batch_index": probe_batch_index,
+                            "probe_batch_count": probe_batch_count,
+                            "probe_batch_symbol_count": len(venue_probe_symbols),
+                        }
+                    )
                     if payload.get("classification") in (
                         "instrument_missing",
                         "metadata_missing",
@@ -1882,8 +1926,13 @@ class LiveRuntime:
                     venue,
                     adapter,
                     probe_symbols_by_venue.get(venue, []),
+                    probe_batch_index=idx,
+                    probe_batch_count=len(self._venue_adapters),
                 )
-                for venue, adapter in self._venue_adapters.items()
+                for idx, (venue, adapter) in enumerate(
+                    self._venue_adapters.items(),
+                    start=1,
+                )
             ]
         )
         snapshots: list[tuple[str, PositionSnapshot]] = []
