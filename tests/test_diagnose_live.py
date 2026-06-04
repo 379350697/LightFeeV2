@@ -857,6 +857,37 @@ def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
     assert set(result["fetch_status"]) == set(result["available_venues"])
 
 
+def test_exchange_truth_sync_wrapper_does_not_emit_deprecation_warning(monkeypatch):
+    import warnings
+    from scripts import diagnose_live as dl
+
+    async def fake_exchange_truth_async(runtime_dir, symbols, venues):
+        return {
+            "available": True,
+            "available_venues": venues or [],
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "fetch_status": {},
+            "errors": [],
+            "missing_evidence": [],
+        }
+
+    monkeypatch.setattr(dl, "_build_exchange_truth_async", fake_exchange_truth_async)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        result = dl._build_exchange_truth("/unused", [], venues=["binance"])
+
+    assert result["available"] is True
+    assert not [
+        warning for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ]
+
+
 def test_exchange_truth_uses_okx_venue_symbol_for_open_orders():
     import asyncio
     from scripts import diagnose_live as dl

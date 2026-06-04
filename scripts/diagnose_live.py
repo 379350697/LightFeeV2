@@ -1015,20 +1015,36 @@ def _build_exchange_truth(
 ) -> dict[str, Any]:
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    _build_exchange_truth_async(runtime_dir, symbols, venues),
-                )
-                return future.result(timeout=30)
-        return loop.run_until_complete(
-            _build_exchange_truth_async(runtime_dir, symbols, venues),
-        )
+        asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_build_exchange_truth_async(runtime_dir, symbols, venues))
+        try:
+            return asyncio.run(_build_exchange_truth_async(runtime_dir, symbols, venues))
+        except Exception as exc:
+            return {
+                "available": False,
+                "confidence": "low",
+                "positions": {},
+                "open_orders": {},
+                "errors": [str(exc)[:500]],
+                "missing_evidence": ["exchange_truth_fetch_failed"],
+            }
+    except Exception as exc:
+        return {
+            "available": False,
+            "confidence": "low",
+            "positions": {},
+            "open_orders": {},
+            "errors": [str(exc)[:500]],
+            "missing_evidence": ["exchange_truth_fetch_failed"],
+        }
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(
+                asyncio.run,
+                _build_exchange_truth_async(runtime_dir, symbols, venues),
+            )
+            return future.result(timeout=30)
     except Exception as exc:
         return {
             "available": False,
