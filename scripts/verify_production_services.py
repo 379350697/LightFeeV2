@@ -26,6 +26,8 @@ from lightfee.ops.production_health import (
     summarize_reports,
 )
 
+EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
+
 
 def _read_json(path: str) -> dict:
     with open(path) as f:
@@ -83,6 +85,58 @@ def _load_environment_files(paths: list[Path]) -> list[str]:
     return loaded
 
 
+def _exchange_truth_probe_timeout_s() -> float:
+    raw = os.environ.get("LIGHTFEE_VERIFY_EXCHANGE_TRUTH_TIMEOUT_S")
+    if raw is None:
+        return EXCHANGE_TRUTH_PROBE_TIMEOUT_S
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return EXCHANGE_TRUTH_PROBE_TIMEOUT_S
+
+
+def _call_exchange_truth_builder_with_timeout(
+    exchange_truth_builder,
+    runtime_dir: str,
+) -> dict:
+    timeout_s = _exchange_truth_probe_timeout_s()
+    if timeout_s <= 0:
+        return exchange_truth_builder(runtime_dir, [], None)
+
+    try:
+        import signal
+    except Exception:
+        return exchange_truth_builder(runtime_dir, [], None)
+
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        return exchange_truth_builder(runtime_dir, [], None)
+
+    def _timeout(_signum, _frame):
+        raise TimeoutError(
+            "exchange truth probe timed out after {:.3g}s".format(timeout_s)
+        )
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = (0.0, 0.0)
+    try:
+        signal.signal(signal.SIGALRM, _timeout)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout_s)
+    except (AttributeError, ValueError):
+        return exchange_truth_builder(runtime_dir, [], None)
+
+    try:
+        return exchange_truth_builder(runtime_dir, [], None)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                previous_timer[0],
+                previous_timer[1],
+            )
+
+
 def _attach_exchange_truth_if_missing(
     state: dict,
     *,
@@ -103,7 +157,10 @@ def _attach_exchange_truth_if_missing(
     runtime_dir = str(Path(current_state_path).resolve().parent)
     enriched = dict(state)
     try:
-        exchange_truth = exchange_truth_builder(runtime_dir, [], None)
+        exchange_truth = _call_exchange_truth_builder_with_timeout(
+            exchange_truth_builder,
+            runtime_dir,
+        )
     except Exception as exc:
         exchange_truth = {
             "available": False,

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from lightfee.ops.production_health import (
@@ -533,6 +534,51 @@ def test_verify_production_services_attaches_exchange_truth_from_systemd_env_fil
     assert seen["symbols"] == []
     assert seen["venues"] is None
     assert seen["api_key"] == "key-from-file"
+
+
+def test_verify_production_services_exchange_truth_probe_times_out(
+    tmp_path, monkeypatch,
+):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+    }
+
+    def stuck_exchange_truth(_runtime_dir_arg, _symbols, _venues=None):
+        time.sleep(0.2)
+        return {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        }
+
+    monkeypatch.setattr(vps, "EXCHANGE_TRUTH_PROBE_TIMEOUT_S", 0.01, raising=False)
+    started_at = time.monotonic()
+
+    enriched = vps._attach_exchange_truth_if_missing(
+        state,
+        current_state_path=current_state,
+        unit_texts={},
+        exchange_truth_builder=stuck_exchange_truth,
+    )
+
+    elapsed_s = time.monotonic() - started_at
+    assert elapsed_s < 0.15
+    assert enriched["exchange_truth"]["available"] is False
+    assert "exchange_truth_fetch_failed" in enriched["exchange_truth"]["missing_evidence"]
+    assert "timed out" in enriched["exchange_truth"]["errors"][0].lower()
 
 
 def test_verify_production_services_cli_json_failure(tmp_path):
