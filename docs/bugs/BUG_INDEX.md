@@ -32,9 +32,17 @@ verification passed: runtime/admission `51 passed`, pending-entry parity
 `35 passed`, and record-layer pending protection `1 passed`, `27 deselected`.
 Adjacent gates passed (`355 passed`; `49 passed`), compileall and diff-check
 passed, and full pytest passed with `3447 passed`, `9 skipped`, `1 warning`.
+Cloud fast-forwarded to `3af002d`, wrote `.deploy_version=3af002d`, passed the
+manifest gate and remote compileall, and restarted sidecar/live active/running
+with `NRestarts=0`. Production acceptance is not closed: service-env
+`diagnose_live.py --json --since-deploy` returned `status=unhealthy`,
+`risk=high`, and blocker `exchange_truth_open_orders_present` because Bybit has
+one non-reduce-only `TRXUSDT` open maker order
+`a84df707-efb3-4e40-bab1-641a4eb0f3d4` for `72.0` at `0.33044` while local
+open/pending state is flat. No manual order/cancel/runtime-state mutation was
+performed.
 This follow-up is documented in
 [`daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity`](daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity).
-No cloud deployment is included in this session by request.
 
 Latest recovery bulk-probe timeout evidence follow-up, 2026-06-04:
 `recovery.live_position_bulk_probe_error` timeout is not root-fixed because the
