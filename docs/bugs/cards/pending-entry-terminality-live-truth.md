@@ -12,6 +12,10 @@ orders, planned hedge CID misuse, and balanced live-position hydration.
 - Balanced live-position evidence has quantity but missing local order/price details.
 - `pending_entry.finalize_deferred_unresolved_maker_zero_fill`
 - `pending_entry.finalize_fill_reconciliation_ignored_stale_zero`
+- `reconciliation.rejected_pending_retained_with_fill` repeats while exchange
+  truth has a nonzero position and local state has no managed open position.
+- `startup_recovery_pending_work_without_open_positions` blocks recovery even
+  though credentialed exchange truth proves a pending entry has live exposure.
 
 ## Current Effective Rule
 
@@ -25,6 +29,12 @@ Zero-fill reconciliation is terminal evidence only when the maker/order status
 is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
 entry unresolved, and a later stale zero reconciliation must not erase a
 previously confirmed positive fill.
+
+A rejected/retained pending entry with positive fill evidence must not remain
+as a local false-flat loop. Startup/runtime recovery must either hydrate and
+finalize the live quantity into managed state, create deterministic residual or
+reduce-only cleanup work, or stay fail-closed/risk-only with explicit exchange
+truth evidence and no new-entry risk.
 
 ## V1 / Exchange Semantics
 
@@ -71,6 +81,7 @@ previously confirmed positive fill.
 | 2026-06-03 | Binance recovery placeholder reconciliation | deployed, short-window clean | Binance USD-M `orderId` is exchange numeric id; V2 recovery placeholders now query with `origClientOrderId` when a client id is available. |
 | 2026-06-03 | Runtime live recovery stale startup block release | deployed/cloud verified | After a missing hedge is recovered and live truth proves a balanced managed open position, V2 must reuse V1 startup finalization instead of leaving `risk_only` latched. |
 | 2026-06-04 | Bybit nonterminal zero-fill and stale zero reconciliation | local full gate green, cloud deploy pending | Maker zero-fill with nonterminal evidence no longer finalizes as passive unfilled, and later zero reconciliation no longer erases known positive hedge fill. Full pytest reached `3432 passed`, `9 skipped`, `1 warning`. |
+| 2026-06-04 | SEIUSDT post-deploy retained pending/live-truth mismatch | open | Cloud deploy reached `9e93c90` and services restarted, but Bybit live truth showed `SEIUSDT` long `455.0` while local state had no managed open position and retained one pending entry. This is a distinct startup pending-entry recovery gap, not closed by the passive-close fixes. |
 
 ## Recurrences
 
@@ -82,6 +93,7 @@ previously confirmed positive fill.
 | 2026-06-03 | `CLOUSDT`, `TRIAUSDT`, `PEOPLEUSDT` Binance | `a272b6b` / `cb1abbe` | deployed, short-window clean; green health blocked by separate CL037 | [daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up](../daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up) |
 | 2026-06-03 | `HIVEUSDT` Binance/Bybit | `5625361` | cloud verified: lifecycle running, local flat, credentialed exchange truth flat/no-open-orders; close-path retry noise remains a separate watch | [daily/2026-06-03.md#cluster-cl-037-runtime-live-recovery-stale-startup-block](../daily/2026-06-03.md#cluster-cl-037-runtime-live-recovery-stale-startup-block) |
 | 2026-06-04 | `MEUUSDT`, `LDOUSDT` Bybit-related entry/fill samples | main push in this session | full pytest `3432 passed`, `9 skipped`, `1 warning`; cloud deploy pending | [daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop](../daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) |
+| 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid | `9e93c90` deployed; fix open | post-deploy acceptance failed: services active but lifecycle `risk_only`, Bybit live long `455.0`, local `open_positions=[]`, retained pending entry repeatedly logged `reconciliation.rejected_pending_retained_with_fill` | [daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch](../daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch) |
 
 ## Regression Harness
 
@@ -110,3 +122,7 @@ previously confirmed positive fill.
 10. If a leg already has positive fill progress, reject later stale zero
    reconciliation unless exchange truth proves a terminal correction.
 11. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
+12. For retained rejected pending entries with positive fill evidence, verify
+   startup recovery can use credentialed live truth to hydrate/finalize,
+   residualize, or issue deterministic reduce-only cleanup instead of looping
+   in local false-flat/risk-only.
