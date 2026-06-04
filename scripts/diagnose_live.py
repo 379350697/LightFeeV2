@@ -40,6 +40,16 @@ DEFAULT_DEPLOY_FILE = ".deploy_version"
 DEFAULT_UNIT_DIR = "/etc/systemd/system"
 DEFAULT_MAX_EVENTS = 50_000
 SERVICE_NAMES = ["lightfee-live.service", "lightfee-sidecar.service"]
+DEFAULT_EXCHANGE_TRUTH_VENUES = [
+    "binance",
+    "bybit",
+    "aster",
+    "okx",
+    "bitget",
+    "gate",
+    "hyperliquid",
+]
+UNFILTERED_PROBE_KEY = "*"
 
 ORDER_ERROR_KINDS = frozenset({
     "order.rejected",
@@ -448,7 +458,9 @@ def _load_venue_credential(venue: str) -> Optional[Any]:
     prefix = "LIGHTFEE_{}_".format(venue.upper())
     api_key = os.environ.get(prefix + "API_KEY", "")
     api_secret = os.environ.get(prefix + "API_SECRET", "")
-    if not api_key or not api_secret:
+    wallet_private_key = os.environ.get(prefix + "WALLET_PRIVATE_KEY", "")
+    account_address = os.environ.get(prefix + "ACCOUNT_ADDRESS", "")
+    if not ((api_key and api_secret) or wallet_private_key or account_address):
         return None
     try:
         from lightfee.venues.transport import LiveCredential
@@ -456,6 +468,8 @@ def _load_venue_credential(venue: str) -> Optional[Any]:
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=os.environ.get(prefix + "API_PASSPHRASE", ""),
+            wallet_private_key=wallet_private_key,
+            account_address=account_address,
         )
     except Exception:
         return None
@@ -475,6 +489,15 @@ def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
         elif venue.lower() == "okx":
             from lightfee.venues.okx import OkxAdapter
             return OkxAdapter(mode="live", credential=credential)
+        elif venue.lower() == "bitget":
+            from lightfee.venues.bitget import BitgetAdapter
+            return BitgetAdapter(mode="live", credential=credential)
+        elif venue.lower() == "gate":
+            from lightfee.venues.gate import GateAdapter
+            return GateAdapter(mode="live", credential=credential)
+        elif venue.lower() == "hyperliquid":
+            from lightfee.venues.hyperliquid import HyperliquidAdapter
+            return HyperliquidAdapter(mode="live", credential=credential)
     except Exception:
         pass
     return None
@@ -521,6 +544,47 @@ async def _fetch_venue_positions(
     succeeded: set[str] = set()
     failed: set[str] = set()
     evidence: dict[str, Any] = {}
+    if not symbols:
+        fetch_all = getattr(adapter, "fetch_all_positions", None)
+        if not callable(fetch_all):
+            transport = getattr(adapter, "_transport", None)
+            fetch_all = getattr(transport, "fetch_all_positions", None)
+        if not callable(fetch_all):
+            failed.add(UNFILTERED_PROBE_KEY)
+            evidence[UNFILTERED_PROBE_KEY] = {
+                "classification": "position_probe_unfiltered_failed",
+                "error": "fetch_all_positions_unavailable",
+            }
+            return positions, succeeded, failed, evidence
+        try:
+            all_positions = await fetch_all()
+            items = all_positions if isinstance(all_positions, (list, tuple)) else []
+            for pos in items:
+                qty = float(getattr(pos, "quantity", 0) or 0)
+                if abs(qty) <= 1e-9:
+                    continue
+                sym = str(getattr(pos, "symbol", "") or "")
+                if not sym:
+                    sym = UNFILTERED_PROBE_KEY
+                positions[sym] = {
+                    "symbol": sym,
+                    "quantity": qty,
+                    "entry_price": float(getattr(pos, "entry_price", 0) or 0),
+                    "side": str(getattr(pos, "side", "")),
+                }
+            succeeded.add(UNFILTERED_PROBE_KEY)
+            evidence[UNFILTERED_PROBE_KEY] = {
+                "classification": "position_probe_unfiltered_succeeded",
+                "position_count": len(positions),
+            }
+        except Exception as exc:
+            failed.add(UNFILTERED_PROBE_KEY)
+            evidence[UNFILTERED_PROBE_KEY] = {
+                "classification": "position_probe_unfiltered_failed",
+                "error": str(exc)[:200],
+            }
+        return positions, succeeded, failed, evidence
+
     for sym in symbols:
         try:
             pos = await adapter.fetch_position(sym)
@@ -556,6 +620,128 @@ async def _fetch_venue_positions(
     return positions, succeeded, failed, evidence
 
 
+def _extract_order_rows(raw: Any) -> list[Any]:
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, dict):
+        return []
+    result = raw.get("result")
+    if isinstance(result, dict) and isinstance(result.get("list"), list):
+        return result["list"]
+    data = raw.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("entrustedList", "orderList", "list", "orders"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return rows
+    for key in ("list", "orders", "openOrders"):
+        rows = raw.get(key)
+        if isinstance(rows, list):
+            return rows
+    return []
+
+
+def _float_order_field(order: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        if key in order and order.get(key) not in (None, ""):
+            try:
+                return float(order.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _bool_order_field(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").lower() in {"true", "1", "yes"}
+
+
+def _summarize_open_order(order: dict[str, Any], fallback_symbol: str = "") -> dict[str, Any]:
+    symbol = str(
+        order.get("symbol")
+        or order.get("instId")
+        or order.get("contract")
+        or order.get("coin")
+        or fallback_symbol
+        or ""
+    )
+    return {
+        "order_id": str(
+            order.get("orderId")
+            or order.get("order_id")
+            or order.get("ordId")
+            or order.get("id")
+            or order.get("orderLinkId")
+            or order.get("clientOid")
+            or order.get("clOrdId")
+            or ""
+        ),
+        "symbol": symbol,
+        "side": str(order.get("side", "")),
+        "quantity": _float_order_field(order, "origQty", "qty", "size", "sz", "left", "amount"),
+        "price": _float_order_field(order, "price", "px"),
+        "reduce_only": _bool_order_field(order.get("reduceOnly", order.get("reduce_only"))),
+    }
+
+
+async def _fetch_unfiltered_open_orders(
+    adapter: Any,
+    transport: Any,
+    venue: str,
+) -> list[dict[str, Any]]:
+    venue_lower = venue.lower()
+    if "binance" in venue_lower:
+        raw = await transport._request("GET", "/fapi/v1/openOrders", params={}, private=True)
+    elif "aster" in venue_lower:
+        raw = await transport._request("GET", "/fapi/v1/openOrders", params={}, private=True)
+    elif "bybit" in venue_lower:
+        raw = await transport._request(
+            "GET", "/v5/order/realtime",
+            params={"category": "linear", "settleCoin": "USDT"},
+            private=True,
+        )
+    elif "okx" in venue_lower:
+        raw = await transport._request(
+            "GET", "/api/v5/trade/orders-pending",
+            params={"instType": "SWAP"},
+            private=True,
+        )
+    elif "bitget" in venue_lower:
+        raw = await transport._request(
+            "GET", "/api/v2/mix/order/orders-pending",
+            params={"productType": "USDT-FUTURES"},
+            private=True,
+        )
+    elif "gate" in venue_lower:
+        raw = await transport._request(
+            "GET", "/api/v4/futures/usdt/orders",
+            params={"status": "open"},
+            private=True,
+        )
+    elif "hyperliquid" in venue_lower:
+        credential = getattr(transport, "_credential", None)
+        account = str(getattr(credential, "account_address", "") or "")
+        raw = await transport._request(
+            "POST", "/info",
+            body={"type": "openOrders", "user": account},
+            private=False,
+        )
+    else:
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            rows = await fetch_open_orders(UNFILTERED_PROBE_KEY)
+            return [dict(row) for row in rows if isinstance(row, dict)]
+        return []
+    return [
+        _summarize_open_order(row)
+        for row in _extract_order_rows(raw)[:50]
+        if isinstance(row, dict)
+    ]
+
+
 async def _fetch_venue_open_orders(
     adapter: Any, symbols: list[str],
 ) -> tuple[dict[str, Any], set[str], set[str], dict[str, Any]]:
@@ -577,6 +763,24 @@ async def _fetch_venue_open_orders(
         return orders, succeeded, failed, evidence
 
     venue = str(getattr(adapter, "venue", ""))
+    if not symbols:
+        try:
+            order_items = await _fetch_unfiltered_open_orders(adapter, transport, venue)
+            orders[UNFILTERED_PROBE_KEY] = order_items
+            succeeded.add(UNFILTERED_PROBE_KEY)
+            evidence[UNFILTERED_PROBE_KEY] = {
+                "classification": "open_order_probe_unfiltered_succeeded",
+                "order_count": len(order_items),
+            }
+        except Exception as exc:
+            orders[UNFILTERED_PROBE_KEY] = {"error": str(exc)[:200]}
+            failed.add(UNFILTERED_PROBE_KEY)
+            evidence[UNFILTERED_PROBE_KEY] = {
+                "classification": "open_order_probe_unfiltered_failed",
+                "error": str(exc)[:200],
+            }
+        return orders, succeeded, failed, evidence
+
     for sym in symbols:
         venue_symbol = _probe_venue_symbol(adapter, sym)
         try:
@@ -611,19 +815,13 @@ async def _fetch_venue_open_orders(
                 }
                 continue
 
-            order_list = raw if isinstance(raw, list) else raw.get("result", {}).get("list", raw.get("data", []))
+            order_list = _extract_order_rows(raw)
             if isinstance(order_list, list) and order_list:
-                orders[sym] = []
-                for o in order_list[:50]:
-                    if isinstance(o, dict):
-                        orders[sym].append({
-                            "order_id": str(o.get("orderId", o.get("orderLinkId", ""))),
-                            "symbol": sym,
-                            "side": str(o.get("side", "")),
-                            "quantity": float(o.get("origQty", o.get("qty", 0)) or 0),
-                            "price": float(o.get("price", 0) or 0),
-                            "reduce_only": bool(o.get("reduceOnly", False)),
-                        })
+                orders[sym] = [
+                    _summarize_open_order(o, fallback_symbol=sym)
+                    for o in order_list[:50]
+                    if isinstance(o, dict)
+                ]
             else:
                 orders[sym] = []
             succeeded.add(sym)
@@ -666,7 +864,7 @@ async def _build_exchange_truth_async(
 
     target_symbols = symbols if symbols else []
 
-    target_venues = venues or ["binance", "bybit"]
+    target_venues = venues or DEFAULT_EXCHANGE_TRUTH_VENUES
     for venue in target_venues:
         credential = _load_venue_credential(venue)
         if credential is None:

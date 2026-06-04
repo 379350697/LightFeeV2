@@ -680,6 +680,168 @@ def test_exchange_truth_uses_private_binance_open_orders_request():
     ]
 
 
+def test_exchange_truth_empty_symbols_uses_all_positions_probe():
+    import asyncio
+    from scripts import diagnose_live as dl
+    from lightfee.core.domain import PositionSnapshot, Side, Venue
+
+    class FakeAdapter:
+        venue = "bybit"
+
+        async def fetch_all_positions(self):
+            return [
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.25,
+                    entry_price=61000.0,
+                    observed_at_ms=1700000000000,
+                )
+            ]
+
+    positions, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_positions(FakeAdapter(), [])
+    )
+
+    assert succeeded == {"*"}
+    assert failed == set()
+    assert positions == {
+        "BTCUSDT": {
+            "symbol": "BTCUSDT",
+            "quantity": 0.25,
+            "entry_price": 61000.0,
+            "side": "Side.BUY",
+        }
+    }
+    assert evidence["*"]["classification"] == "position_probe_unfiltered_succeeded"
+    assert evidence["*"]["position_count"] == 1
+
+
+def test_exchange_truth_empty_symbols_uses_unfiltered_open_orders_probe():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        async def _request(self, method, path, **kwargs):
+            self.calls.append((method, path, kwargs))
+            return [
+                {
+                    "orderId": "ord-1",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "origQty": "0.25",
+                    "price": "61000",
+                }
+            ]
+
+    class FakeAdapter:
+        venue = "binance"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+    adapter = FakeAdapter()
+
+    orders, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, [])
+    )
+
+    assert succeeded == {"*"}
+    assert failed == set()
+    assert orders == {
+        "*": [
+            {
+                "order_id": "ord-1",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "quantity": 0.25,
+                "price": 61000.0,
+                "reduce_only": False,
+            }
+        ]
+    }
+    assert evidence["*"]["classification"] == "open_order_probe_unfiltered_succeeded"
+    assert evidence["*"]["order_count"] == 1
+    assert adapter._transport.calls == [
+        ("GET", "/fapi/v1/openOrders", {"params": {}, "private": True})
+    ]
+
+
+def test_exchange_truth_creates_readonly_adapters_for_all_live_perp_venues():
+    from scripts import diagnose_live as dl
+    from lightfee.venues.transport import LiveCredential
+
+    credential = LiveCredential(
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="passphrase",
+        wallet_private_key="0x" + "1" * 64,
+        account_address="0x" + "2" * 40,
+    )
+
+    for venue in (
+        "binance",
+        "bybit",
+        "aster",
+        "okx",
+        "bitget",
+        "gate",
+        "hyperliquid",
+    ):
+        adapter = dl._create_readonly_adapter(venue, credential)
+        assert adapter is not None, venue
+
+
+def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        async def _request(self, method, path, **kwargs):
+            return []
+
+    class FakeAdapter:
+        def __init__(self, venue):
+            self.venue = venue
+            self._transport = FakeTransport()
+
+        async def fetch_all_positions(self):
+            return []
+
+        async def shutdown(self):
+            pass
+
+    monkeypatch.setattr(dl, "_load_venue_credential", lambda venue: object())
+    monkeypatch.setattr(
+        dl,
+        "_create_readonly_adapter",
+        lambda venue, credential: FakeAdapter(venue),
+    )
+
+    result = asyncio.run(dl._build_exchange_truth_async(
+        runtime_dir="/unused",
+        symbols=[],
+        venues=None,
+    ))
+
+    assert result["available"] is True
+    assert result["confidence"] == "high"
+    assert result["available_venues"] == [
+        "binance",
+        "bybit",
+        "aster",
+        "okx",
+        "bitget",
+        "gate",
+        "hyperliquid",
+    ]
+    assert set(result["fetch_status"]) == set(result["available_venues"])
+
+
 def test_exchange_truth_uses_okx_venue_symbol_for_open_orders():
     import asyncio
     from scripts import diagnose_live as dl
