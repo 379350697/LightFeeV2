@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Optional
 
 from lightfee.config.schema import StrategyConfig
-from lightfee.core.domain import Venue
+from lightfee.core.domain import Side, Venue
 from lightfee.engine.state import OpenPosition
 
 
@@ -138,6 +138,10 @@ class RiskExecutionPlan:
     long_slippage_bps: Optional[float] = None
     short_slippage_bps: Optional[float] = None
     capacity_constrained: bool = False
+    # --- Single-side protection target (V1 select_single_side_protection_target) ---
+    protection_venue: Optional[Venue] = None
+    protection_side: Optional[Side] = None
+    protection_stage: Optional[str] = None
 
 
 @dataclass
@@ -437,9 +441,15 @@ def build_risk_execution_plan(
     if risk_view.death_condition and strategy.death_line_enabled:
         reason = risk_view.degraded_reason or "death_line_health_breach"
         if strategy.death_single_side_protection_enabled:
+            venue, side, stage = _select_single_side_protection_target(
+                position, risk_view,
+            )
             return RiskExecutionPlan(
                 kind=RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION,
                 reason=reason,
+                protection_venue=venue,
+                protection_side=side,
+                protection_stage=stage,
             )
         else:
             return RiskExecutionPlan(
@@ -475,9 +485,15 @@ def build_risk_execution_plan(
         )
         if blocked_reason is not None:
             if strategy.death_single_side_protection_enabled:
+                venue, side, stage = _select_single_side_protection_target(
+                    position, risk_view,
+                )
                 return RiskExecutionPlan(
                     kind=RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION,
                     reason=blocked_reason,
+                    protection_venue=venue,
+                    protection_side=side,
+                    protection_stage=stage,
                 )
             else:
                 return RiskExecutionPlan(
@@ -493,6 +509,34 @@ def build_risk_execution_plan(
         )
 
     return None
+
+
+def _select_single_side_protection_target(
+    position: OpenPosition, risk_view: PositionRiskView,
+) -> tuple[Optional[Venue], Optional[Side], Optional[str]]:
+    """V1 select_single_side_protection_target without market-freshness input.
+
+    The V2 supervisor risk lane does not carry a MarketView, so this keeps the
+    V1 venue/side ordering based on degraded venue and health ratio. Runtime
+    market freshness still belongs in the execution/price-hint layer.
+    """
+    if risk_view.degraded_venue == position.long_venue:
+        return position.short_venue, Side.BUY, "risk_protection_short"
+    if risk_view.degraded_venue == position.short_venue:
+        return position.long_venue, Side.SELL, "risk_protection_long"
+
+    long_health = risk_view.long_health_ratio
+    short_health = risk_view.short_health_ratio
+    if long_health is not None and short_health is not None:
+        if long_health <= short_health:
+            return position.long_venue, Side.SELL, "risk_protection_long"
+        return position.short_venue, Side.BUY, "risk_protection_short"
+    if long_health is not None:
+        return position.long_venue, Side.SELL, "risk_protection_long"
+    if short_health is not None:
+        return position.short_venue, Side.BUY, "risk_protection_short"
+
+    return None, None, None
 
 
 def _check_delever_liquidity_blocked(

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from lightfee.config.schema import AppConfig, RuntimeConfig, StrategyConfig
+from lightfee.core.domain import OrderFill
 from lightfee.core.domain import Side, Venue
 from lightfee.engine.risk_actions import (
     AccountRiskSnapshot,
@@ -294,6 +295,7 @@ class _FakeCloseExecutor:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.single_side_calls: list[dict] = []
 
     async def execute_close(self, position, reason, now_ms, **kwargs) -> None:
         self.calls.append({
@@ -302,6 +304,33 @@ class _FakeCloseExecutor:
             "now_ms": now_ms,
             "kwargs": kwargs,
         })
+
+    async def execute_single_side_protection(
+        self, position, venue, side, reason, now_ms, **kwargs
+    ):
+        self.single_side_calls.append({
+            "position_id": position.position_id,
+            "venue": venue,
+            "side": side,
+            "reason": reason,
+            "now_ms": now_ms,
+            "kwargs": kwargs,
+        })
+        return {
+            "outcome": "filled",
+            "fill": OrderFill(
+                venue=venue,
+                symbol=position.symbol,
+                side=side,
+                quantity=position.matched_quantity,
+                price=50000.0,
+                order_id="single-side-fill",
+                client_order_id="single-side-cid",
+                filled_at_ms=now_ms,
+            ),
+            "client_order_id": "single-side-cid",
+            "stage": kwargs.get("stage", ""),
+        }
 
 
 class TestExecuteRiskPlan:
@@ -396,15 +425,23 @@ class TestExecuteRiskPlan:
         config = _make_config()
         state = EngineState()
         journal = _make_journal()
-        supervisor = Supervisor(config, state, journal)
+        fake_close = _FakeCloseExecutor()
+        supervisor = Supervisor(config, state, journal, close_executor=fake_close)
 
         pos = _make_position()
         plan = RiskExecutionPlan(
             kind=RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION,
             reason="test_death",
+            protection_venue=pos.short_venue,
+            protection_side=Side.BUY,
+            protection_stage="risk_protection_short",
         )
         await supervisor._execute_single_side_protection(pos, plan, 5000)
 
+        assert fake_close.calls == []
+        assert len(fake_close.single_side_calls) == 1
+        assert fake_close.single_side_calls[0]["venue"] == pos.short_venue
+        assert fake_close.single_side_calls[0]["side"] == Side.BUY
         assert pos.single_side_protection_triggered
         assert pos.last_risk_reason == "test_death"
         assert state.lifecycle == EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk

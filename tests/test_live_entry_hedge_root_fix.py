@@ -5428,6 +5428,63 @@ class TestResidualRepairExecutionV1Parity:
         assert runtime.state.pending_residual_repairs == []
 
     @pytest.mark.asyncio
+    async def test_bybit_duplicate_residual_repair_reconciles_full_live_flat(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-bybit-duplicate-repair",
+            "pair_id": "btcusdt:binance->bybit",
+            "symbol": "BTCUSDT",
+            "origin": "entry_open",
+            "repair_venue": "bybit",
+            "repair_side": "buy",
+            "repair_quantity": 0.01,
+            "created_at_ms": now_ms,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+        })
+
+        class DuplicateThenFlatAdapter(_FakeVenueAdapter):
+            async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
+                self._fetch_position_calls.append(symbol)
+                if len(self._fetch_position_calls) == 1:
+                    return PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol=symbol,
+                        side=Side.SELL,
+                        quantity=0.01,
+                        entry_price=50000.0,
+                        observed_at_ms=now_ms,
+                    )
+                return None
+
+        bybit = DuplicateThenFlatAdapter(Venue.BYBIT)
+        bybit.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+        )
+        bybit.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            average_price=50000.0,
+            order_id="bybit-old-repair",
+            client_order_id="old-repair-cid",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+        await runtime._recover_residual_repairs(now_ms + 1)
+
+        assert runtime.state.pending_residual_repairs == []
+        assert bybit._fetch_order_fill_reconciliation_calls
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "order.reconcile_result" in kinds
+        assert "recovery.residual_repair_duplicate_client_order_reconcile_result" in kinds
+
+    @pytest.mark.asyncio
     async def test_pending_residual_repairs_are_driven_by_normal_housekeeping_tick(self, tmp_path, monkeypatch):
         runtime = _make_open_runtime(tmp_path)
         now_ms = 1779422875621

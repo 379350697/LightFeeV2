@@ -1087,6 +1087,54 @@ class TestPlannerDispatchIntegration:
         assert "runtime.normal_close_routing_passive" in kinds
 
     @pytest.mark.asyncio
+    async def test_normal_exit_routes_force_close_due_as_settlement_force_close(
+        self, config, tmp_journal,
+    ):
+        config.strategy.post_funding_hold_secs = 0
+        config.strategy.settlement_remainder_close_delay_secs = 60
+        config.strategy.settlement_force_close_delay_secs = 120
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        class CapturingPassiveClose:
+            def __init__(self):
+                self.reasons = []
+
+            async def start_pending_passive_close(self, state, position, reason, **kwargs):
+                self.reasons.append(reason)
+                return object()
+
+            async def drive_pending_passive_close(
+                self, state, position_id, wait_until_terminal=False,
+            ):
+                return None
+
+        passive = CapturingPassiveClose()
+        runtime.passive_close_executor = passive
+        funding_ms = 1780167600000
+        position = OpenPosition(
+            position_id="entry-force-close",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=50000.0,
+            short_entry_price=50000.0,
+            opened_at_ms=funding_ms - 30_000,
+            matched_quantity=0.01,
+            funding_timestamp_ms=funding_ms,
+            opportunity_type="aligned",
+            funding_captured=True,
+            current_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+
+        await runtime._maybe_process_normal_exits(funding_ms + 120_000)
+
+        assert passive.reasons == ["settlement_force_close"]
+
+    @pytest.mark.asyncio
     async def test_normal_exit_backfills_recovered_first_stage_exit_semantics(
         self, config, tmp_journal,
     ):

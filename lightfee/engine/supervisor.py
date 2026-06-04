@@ -545,41 +545,113 @@ class Supervisor:
                 "remaining_quantity": position.matched_quantity,
             },
         )
-        self.journal.append(
-            "risk.single_side_protection_triggered",
-            {
-                "position_id": position.position_id,
-                "symbol": position.symbol,
-                "reason": plan.reason,
-                "protection_venue": plan.long_liquidity_source or "",
-                "protection_side": "buy" if plan.short_liquidity_source else "sell",
-                "requested_quantity": plan.requested_quantity,
-                "adjusted_quantity": plan.adjusted_quantity,
-                "remaining_quantity": position.matched_quantity,
-            },
-        )
+        protection_venue = plan.protection_venue
+        protection_side = plan.protection_side
+        protection_stage = plan.protection_stage or ""
 
-        # V1: Submit protective close order on the healthier leg
+        if protection_venue is None or protection_side is None:
+            position.last_risk_reason = plan.reason
+            self.state.lifecycle = EngineLifecycle.RISK_ONLY
+            self.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            self.journal.append(
+                "risk.single_side_protection_unavailable",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": plan.reason,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                },
+            )
+            self.journal.append(
+                "risk.fail_closed_entered",
+                {
+                    "reason": f"single_side_protection_unavailable:{position.position_id}",
+                    "position_id": position.position_id,
+                },
+            )
+            return
+
+        # V1: submit exactly one protective reduce-only leg before fail-closed.
+        result = None
+        error = None
         if self.close_executor and position.matched_quantity > 0:
-            total_quantity = min(position.matched_quantity, plan.adjusted_quantity if plan.adjusted_quantity > 0 else position.matched_quantity)
+            total_quantity = min(
+                position.matched_quantity,
+                plan.adjusted_quantity if plan.adjusted_quantity > 0 else position.matched_quantity,
+            )
+            price_hint = (
+                long_price_hint
+                if protection_venue == position.long_venue
+                else short_price_hint
+            )
             self.journal.append(
                 "risk.death_protection_close_initiated",
                 {
                     "position_id": position.position_id,
                     "quantity": total_quantity,
+                    "protection_venue": protection_venue.value,
+                    "protection_side": protection_side.value,
+                    "stage": protection_stage,
                 },
             )
-            await self.close_executor.execute_close(
-                position, f"death_protection:{plan.reason}", now_ms,
-                long_price_hint=long_price_hint,
-                short_price_hint=short_price_hint,
-                total_quantity=total_quantity,
-                state=self.state,
-            )
+            try:
+                result = await self.close_executor.execute_single_side_protection(
+                    position,
+                    protection_venue,
+                    protection_side,
+                    plan.reason,
+                    now_ms,
+                    quantity=total_quantity,
+                    price_hint=price_hint,
+                    stage=protection_stage,
+                )
+            except Exception as exc:
+                error = exc
+        elif position.matched_quantity > 0:
+            error = RuntimeError("single_side_protection_close_executor_missing")
 
         position.last_risk_action_at_ms = now_ms
         position.last_risk_reason = plan.reason
         position.single_side_protection_triggered = True
+
+        if error is None:
+            fill = result.get("fill") if isinstance(result, dict) else None
+            self.journal.append(
+                "risk.single_side_protection_triggered",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": plan.reason,
+                    "protection_venue": protection_venue.value,
+                    "protection_side": protection_side.value,
+                    "requested_quantity": plan.requested_quantity,
+                    "adjusted_quantity": plan.adjusted_quantity,
+                    "remaining_quantity": position.matched_quantity,
+                    "order_id": getattr(fill, "order_id", ""),
+                    "client_order_id": (
+                        result.get("client_order_id", "")
+                        if isinstance(result, dict)
+                        else ""
+                    ),
+                    "executed_quantity": float(getattr(fill, "quantity", 0.0) or 0.0),
+                    "average_price": float(getattr(fill, "price", 0.0) or 0.0),
+                    "fee_quote": float(getattr(fill, "fee_quote", 0.0) or 0.0),
+                    "filled_at_ms": int(getattr(fill, "filled_at_ms", now_ms) or now_ms),
+                },
+            )
+        else:
+            self.journal.append(
+                "risk.single_side_protection_failed",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": plan.reason,
+                    "protection_venue": protection_venue.value,
+                    "protection_side": protection_side.value,
+                    "error": str(error),
+                },
+            )
 
         # Enter fail-closed after protection
         self.state.lifecycle = EngineLifecycle.RISK_ONLY  # V1: FailClosed = RISK_ONLY + FAIL_CLOSED risk
@@ -697,4 +769,3 @@ class Supervisor:
                 "risk.warning_line_triggered",
                 {"min_health_ratio": health.min_health_ratio, "ts_ms": now_ms},
             )
-

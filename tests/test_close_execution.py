@@ -588,6 +588,52 @@ class TestCloseChunkExecutor:
         assert short_adapter.place_order_call_count == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason,price_field,fee_field",
+        [
+            (
+                "risk_delever",
+                "risk_delever_realized_price_pnl_quote",
+                "risk_delever_realized_exit_fee_quote",
+            ),
+            (
+                "death_protection:bybit_private_stale",
+                "protection_realized_price_pnl_quote",
+                "protection_realized_exit_fee_quote",
+            ),
+        ],
+    )
+    async def test_risk_and_protection_close_writeback_use_v1_pnl_buckets(
+        self, reason, price_field, fee_field,
+    ):
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE, default_fill_price=50100.0)
+        short_adapter = FakeVenueAdapter(Venue.OKX, default_fill_price=49900.0)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"close_chunk_max_notional_quote": 10000.0},
+        )
+
+        pos = _make_position(long_quantity=0.01, short_quantity=0.01, matched_quantity=0.01)
+        state = EngineState()
+        state.open_positions[pos.position_id] = pos
+
+        await executor.execute_close(
+            pos, reason, 2000,
+            long_price_hint=50000.0, short_price_hint=50000.0,
+            total_quantity=0.01, state=state,
+        )
+
+        assert getattr(pos, price_field) == pytest.approx(pos.realized_price_pnl_quote)
+        assert getattr(pos, fee_field) == pytest.approx(pos.realized_exit_fee_quote)
+
+    @pytest.mark.asyncio
     async def test_large_position_is_chunked(self):
         """Large position exceeds notional cap → multiple chunks."""
         from lightfee.engine.close_executor import CloseExecutor
@@ -1160,6 +1206,84 @@ class TestCompensateFailedFullClose:
         # Legs should be added
         assert len(short_legs) == 1
         assert len(long_legs) == 1
+
+    @pytest.mark.asyncio
+    async def test_compensate_bybit_duplicate_reconciles_full_live_flat(self):
+        """Bybit 110072 during compensation records reconciled fill evidence."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        class DuplicateThenFlatCompensationAdapter(FakeCompensationAdapter):
+            def __init__(self):
+                super().__init__(
+                    Venue.BYBIT, position_qty=0.01, side=Side.SELL,
+                    place_succeeds=False,
+                )
+                self.order_fill_reconciliation = OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.01,
+                    average_price=50000.0,
+                    order_id="bybit-old-comp",
+                    client_order_id="old-comp-cid",
+                    filled_at_ms=1000,
+                )
+                self.reconciliation_calls = []
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+            async def fetch_position(self, symbol: str):
+                self.fetch_position_calls.append(symbol)
+                if len(self.fetch_position_calls) == 1:
+                    return self.position
+                return None
+
+            async def fetch_order_fill_reconciliation(
+                self, symbol, order_id, client_order_id=None
+            ):
+                self.reconciliation_calls.append((symbol, order_id, client_order_id))
+                return self.order_fill_reconciliation
+
+        short_adapter = DuplicateThenFlatCompensationAdapter()
+        long_adapter = FakeCompensationAdapter(Venue.BINANCE, position_qty=0.0)
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.BYBIT: short_adapter},
+            journal=journal,
+        )
+
+        pos = _make_position(
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            matched_quantity=0.01,
+        )
+        state = EngineState()
+        short_legs: list = []
+        long_legs: list = []
+
+        await executor.compensate_failed_full_close(
+            pos, "hard_stop", "exit_short_chunk_0",
+            pos.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs, long_legs, state,
+        )
+
+        assert len(short_legs) == 1
+        assert short_legs[0].fill.order_id == "bybit-old-comp"
+        assert short_adapter.reconciliation_calls
+        kinds = [event["kind"] for event in journal.read_all()]
+        assert "order.reconcile_result" in kinds
+        assert "exit.compensation_duplicate_client_order_reconcile_result" in kinds
 
     @pytest.mark.asyncio
     async def test_compensate_flatten_fails_hard_stop_succeeds(self):

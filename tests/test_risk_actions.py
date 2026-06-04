@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from lightfee.config.schema import StrategyConfig
-from lightfee.core.domain import Venue
+from lightfee.core.domain import Side, Venue
 from lightfee.engine.risk_actions import (
     AccountRiskSnapshot,
     PositionRiskView,
@@ -376,11 +376,31 @@ class TestBuildRiskExecutionPlan:
         risk_view = PositionRiskView(
             death_condition=True,
             degraded_reason="test_death",
+            degraded_venue=pos.long_venue,
         )
         plan = build_risk_execution_plan(pos, risk_view, strategy, 5000)
         assert plan is not None
         assert plan.kind == RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION
         assert plan.reason == "test_death"
+        assert plan.protection_venue == pos.short_venue
+        assert plan.protection_side == Side.BUY
+        assert plan.protection_stage == "risk_protection_short"
+
+    def test_death_line_selects_weaker_healthy_leg_when_no_degraded_venue(self):
+        strategy = _strategy()
+        pos = _make_position()
+        risk_view = PositionRiskView(
+            death_condition=True,
+            long_health_ratio=1.05,
+            short_health_ratio=1.4,
+            min_health_ratio=1.05,
+        )
+        plan = build_risk_execution_plan(pos, risk_view, strategy, 5000)
+        assert plan is not None
+        assert plan.kind == RiskExecutionPlanKind.SINGLE_SIDE_PROTECTION
+        assert plan.protection_venue == pos.long_venue
+        assert plan.protection_side == Side.SELL
+        assert plan.protection_stage == "risk_protection_long"
 
     def test_death_line_without_single_side_protection_returns_fail_closed(self):
         strategy = _strategy(death_single_side_protection_enabled=False)

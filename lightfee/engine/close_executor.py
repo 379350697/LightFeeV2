@@ -989,6 +989,21 @@ class CloseExecutor:
         position.short_quantity = max(position.short_quantity - short_closed, 0.0)
         position.realized_price_pnl_quote += close.realized_price_pnl_quote
         position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+        if reason.startswith("risk_delever"):
+            position.risk_delever_realized_price_pnl_quote += close.realized_price_pnl_quote
+            position.risk_delever_realized_exit_fee_quote += (
+                close.long_fee_quote + close.short_fee_quote
+            )
+        elif (
+            "single_side_protection" in reason
+            or "death_protection" in reason
+            or reason.startswith("protection_")
+            or reason.startswith("risk_protection")
+        ):
+            position.protection_realized_price_pnl_quote += close.realized_price_pnl_quote
+            position.protection_realized_exit_fee_quote += (
+                close.long_fee_quote + close.short_fee_quote
+            )
         position.current_net_quote += close.net_quote
 
         # If any leg is uncertain, register a PendingClose for reconciliation
@@ -1076,6 +1091,74 @@ class CloseExecutor:
                         "ts_ms": now_ms,
                     },
                 )
+
+    async def execute_single_side_protection(
+        self,
+        position: OpenPosition,
+        venue: Venue,
+        side: Side,
+        reason: str,
+        now_ms: int,
+        *,
+        quantity: float | None = None,
+        price_hint: float = 0.0,
+        stage: str = "",
+    ) -> dict[str, Any]:
+        """Submit V1 death-line single-side reduce-only protection.
+
+        Unlike execute_close(), this touches only the selected venue/side. The
+        supervisor enters fail-closed immediately after this protective action.
+        """
+        if quantity is None:
+            quantity = position.matched_quantity
+        if quantity <= 0:
+            return {
+                "outcome": "filled",
+                "fill": OrderFill(
+                    venue=venue,
+                    symbol=position.symbol,
+                    side=side,
+                    quantity=0.0,
+                    price=0.0,
+                    filled_at_ms=now_ms,
+                ),
+                "client_order_id": "",
+            }
+
+        if not stage:
+            if venue == position.long_venue and side == Side.SELL:
+                stage = "risk_protection_long"
+            elif venue == position.short_venue and side == Side.BUY:
+                stage = "risk_protection_short"
+            else:
+                stage = "risk_protection"
+
+        client_order_id = compact_client_order_id(position.position_id, stage)
+        request = OrderRequest(
+            venue=venue,
+            symbol=position.symbol,
+            side=side,
+            quantity=quantity,
+            price=price_hint or None,
+            reduce_only=True,
+            post_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+        result = await self._submit_close_leg_with_retry(
+            request,
+            position.position_id,
+            stage,
+            now_ms,
+        )
+        if result.get("outcome") != "filled":
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                str(result.get("reason") or result.get("outcome") or "single_side_protection_failed"),
+            )
+        result["client_order_id"] = client_order_id
+        result["stage"] = stage
+        return result
 
     async def _submit_close_leg(
         self,
@@ -1639,7 +1722,71 @@ class CloseExecutor:
 
         try:
             fill = await adapter.place_order(req)
-        except Exception:
+        except Exception as exc:
+            if venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(str(exc)):
+                duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                    adapter=adapter,
+                    symbol=symbol,
+                    client_order_id=client_order_id,
+                    target_qty=quantity,
+                )
+                self.journal.append(
+                    "order.reconcile_result",
+                    build_order_reconcile_result_payload(
+                        result=duplicate_reconcile,
+                        symbol=symbol,
+                        client_order_id=client_order_id,
+                        reason="duplicate_client_id",
+                    ),
+                )
+                self.journal.append(
+                    "exit.compensation_duplicate_client_order_reconcile_result",
+                    {
+                        "position_id": position_id,
+                        "stage": stage,
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "client_order_id": client_order_id,
+                        "classification": duplicate_reconcile.classification,
+                        "decision": duplicate_reconcile.decision,
+                        "target_qty": duplicate_reconcile.target_qty,
+                        "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                        "live_qty": duplicate_reconcile.live_qty,
+                        "remaining_qty": duplicate_reconcile.remaining_qty,
+                        "retry_qty": duplicate_reconcile.retry_qty,
+                        "order_id": duplicate_reconcile.order_id,
+                        "original_error": str(exc),
+                    },
+                )
+                if duplicate_reconcile.clear_state and duplicate_reconcile.reconciled_qty > 1e-9:
+                    fill = OrderFill(
+                        venue=venue,
+                        symbol=symbol,
+                        side=side,
+                        quantity=duplicate_reconcile.reconciled_qty,
+                        price=duplicate_reconcile.average_price or 0.0,
+                        order_id=duplicate_reconcile.order_id,
+                        client_order_id=duplicate_reconcile.client_order_id,
+                        filled_at_ms=submit_ms,
+                    )
+                    return (fill, client_order_id, submit_ms)
+                if duplicate_reconcile.should_retry_with_new_client_id:
+                    retry_client_order_id = compact_client_order_id(
+                        position_id, f"{stage}:duplicate_retry:{symbol}",
+                    )
+                    retry_req = replace(
+                        req,
+                        quantity=duplicate_reconcile.retry_qty,
+                        client_order_id=retry_client_order_id,
+                    )
+                    try:
+                        retry_fill = await adapter.place_order(retry_req)
+                    except Exception:
+                        pass
+                    else:
+                        if retry_fill.quantity >= duplicate_reconcile.retry_qty - 1e-9:
+                            return (retry_fill, retry_client_order_id, submit_ms)
+
             # Order may have created exposure — check if position is now flat
             try:
                 verify_pos = await adapter.fetch_position(symbol)

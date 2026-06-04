@@ -8431,30 +8431,133 @@ class LiveRuntime:
                 time_in_force=TimeInForce.IOC,
                 client_order_id=compact_client_order_id(position_id, "residual_repair"),
             )
+            fill = None
             try:
                 fill = await adapter.place_order(req)
                 self._flush_adapter_order_diagnostics(adapter)
             except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
-                self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
-                self.journal.append(
-                    "recovery.residual_repair_failed",
-                    {
+                if (
+                    repair_venue == Venue.BYBIT
+                    and _is_bybit_duplicate_order_link_id(str(e))
+                ):
+                    duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                        adapter=adapter,
+                        symbol=symbol,
+                        client_order_id=req.client_order_id or "",
+                        target_qty=repair_quantity,
+                        live_pos_before=live_position,
+                    )
+                    self.journal.append(
+                        "order.reconcile_result",
+                        build_order_reconcile_result_payload(
+                            result=duplicate_reconcile,
+                            symbol=symbol,
+                            client_order_id=req.client_order_id or "",
+                            reason="duplicate_client_id",
+                        ),
+                    )
+                    duplicate_payload = {
                         "position_id": position_id,
                         "pair_id": pair_id,
                         "symbol": symbol,
+                        "origin": task.get("origin", ""),
                         "repair_venue": repair_venue.value,
                         "repair_side": repair_side.value,
-                        "repair_quantity": repair_quantity,
-                        "live_excess_quantity": live_excess_quantity,
-                        "baseline_quantity": baseline,
-                        "live_size": live_size,
-                        "open_order_count": open_order_count,
-                        "open_order_counts_by_venue": open_order_counts_by_venue,
-                        "error": str(e),
-                    },
-                )
-                continue
+                        "client_order_id": req.client_order_id,
+                        "reconcile_endpoints": list(BYBIT_DUPLICATE_RECONCILE_ENDPOINTS),
+                        "classification": duplicate_reconcile.classification,
+                        "decision": duplicate_reconcile.decision,
+                        "target_qty": duplicate_reconcile.target_qty,
+                        "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                        "live_qty": duplicate_reconcile.live_qty,
+                        "remaining_qty": duplicate_reconcile.remaining_qty,
+                        "retry_qty": duplicate_reconcile.retry_qty,
+                        "order_id": duplicate_reconcile.order_id,
+                        "original_error": str(e),
+                    }
+                    if duplicate_reconcile.reconcile_error:
+                        duplicate_payload["reconcile_error"] = (
+                            duplicate_reconcile.reconcile_error
+                        )
+                    if duplicate_reconcile.live_fetch_error:
+                        duplicate_payload["live_fetch_error"] = (
+                            duplicate_reconcile.live_fetch_error
+                        )
+                    self.journal.append(
+                        "recovery.residual_repair_duplicate_client_order_reconcile_result",
+                        duplicate_payload,
+                    )
+                    if duplicate_reconcile.clear_state:
+                        self.state.pending_residual_repairs.remove(task)
+                        self._release_residual_repair_pair_gate(pair_id, symbol)
+                        repaired += 1
+                        self.journal.append(
+                            "execution.residual_repair_completed",
+                            {
+                                "position_id": position_id,
+                                "pair_id": pair_id,
+                                "symbol": symbol,
+                                "origin": task.get("origin", ""),
+                                "repair_venue": repair_venue.value,
+                                "repair_side": repair_side.value,
+                                "result": "duplicate_client_order_reconciled",
+                                "client_order_id": req.client_order_id,
+                                "order_id": duplicate_reconcile.order_id,
+                                "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                                "live_qty": duplicate_reconcile.live_qty,
+                            },
+                        )
+                        continue
+                    if duplicate_reconcile.should_retry_with_new_client_id:
+                        retry_quantity = duplicate_reconcile.retry_qty
+                        if duplicate_reconcile.live_qty > 1e-9:
+                            retry_quantity = min(retry_quantity, duplicate_reconcile.live_qty)
+                        duplicate_attempt = self._residual_repair_attempt_count(task) + 1
+                        retry_req = OrderRequest(
+                            venue=repair_venue,
+                            symbol=symbol,
+                            side=repair_side,
+                            quantity=retry_quantity,
+                            price=None,
+                            post_only=False,
+                            reduce_only=True,
+                            time_in_force=TimeInForce.IOC,
+                            client_order_id=compact_client_order_id(
+                                position_id,
+                                f"residual_repair_duplicate_{duplicate_attempt}",
+                            ),
+                        )
+                        try:
+                            fill = await adapter.place_order(retry_req)
+                            self._flush_adapter_order_diagnostics(adapter)
+                            repair_quantity = retry_quantity
+                        except Exception as retry_error:
+                            self._flush_adapter_order_diagnostics(adapter)
+                            e = retry_error
+
+                if fill is not None:
+                    pass
+                else:
+                    self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                    self.journal.append(
+                        "recovery.residual_repair_failed",
+                        {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "repair_venue": repair_venue.value,
+                            "repair_side": repair_side.value,
+                            "repair_quantity": repair_quantity,
+                            "live_excess_quantity": live_excess_quantity,
+                            "baseline_quantity": baseline,
+                            "live_size": live_size,
+                            "open_order_count": open_order_count,
+                            "open_order_counts_by_venue": open_order_counts_by_venue,
+                            "error": str(e),
+                        },
+                    )
+                    continue
 
             remaining_quantity = max(live_excess_quantity - float(fill.quantity or 0.0), 0.0)
             self.state.pending_residual_repairs.remove(task)
@@ -12766,10 +12869,12 @@ class LiveRuntime:
         This method CONSUMES the predicate that was previously only unit-tested.
         """
         from lightfee.engine.exit_decision import (
+            force_close_due,
             normal_close_reason_uses_passive_maker_taker,
             standard_close_reason,
             update_position_funding_capture_state,
         )
+        from lightfee.engine.exit import ExitReason
 
         if not self.state.open_positions:
             return
@@ -12835,7 +12940,11 @@ class LiveRuntime:
                     },
                 )
 
-            reason = standard_close_reason(position, self.config.strategy, now_ms)
+            reason = (
+                ExitReason.SETTLEMENT_FORCE_CLOSE
+                if force_close_due(position, self.config.strategy, now_ms)
+                else standard_close_reason(position, self.config.strategy, now_ms)
+            )
             if reason is None:
                 continue
 
