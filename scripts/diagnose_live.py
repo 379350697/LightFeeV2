@@ -1568,14 +1568,43 @@ def _payload_dict(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_snapshot_fallback_blocking(payload: dict[str, Any]) -> bool:
+    if _snapshot_fallback_blocking_scope(payload):
+        return True
     if payload.get("blocked") is True or payload.get("block_reason"):
         return True
+    return False
+
+
+def _snapshot_fallback_blocking_scope(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
     for item in payload.get("candidate_freshness_scope", []) or []:
         if isinstance(item, dict) and (
             item.get("blocked") is True or item.get("block_reason")
         ):
+            blockers.append(item)
+    return blockers
+
+
+def _snapshot_fallback_has_scoped_blocking_evidence(payload: dict[str, Any]) -> bool:
+    for item in _snapshot_fallback_blocking_scope(payload):
+        if not (item.get("candidate_symbol") or item.get("candidate_pair_id")):
+            continue
+        if (
+            item.get("domain")
+            or item.get("venue")
+            or item.get("source_age_ms") is not None
+            or item.get("fallback_duration_ms") is not None
+        ):
             return True
     return False
+
+
+def _snapshot_fallback_exception_conclusion(payload: dict[str, Any]) -> str:
+    if payload.get("v1_parity_evidence"):
+        return "v1_parity"
+    if _snapshot_fallback_has_scoped_blocking_evidence(payload):
+        return "v1_parity"
+    return "insufficient_evidence"
 
 
 def _has_official_sequence_rebuild_evidence(payload: dict[str, Any]) -> bool:
@@ -1728,10 +1757,9 @@ def _build_production_acceptance_gate(
 
         if kind == "runtime.snapshot_fallback_last_good" and _is_snapshot_fallback_blocking(payload):
             snapshot_fallback_blocking_count += 1
-            if payload.get("v1_parity_evidence"):
-                exception_conclusions["snapshot_fallback_blocking"] = "v1_parity"
-            else:
-                exception_conclusions["snapshot_fallback_blocking"] = "insufficient_evidence"
+            exception_conclusions["snapshot_fallback_blocking"] = (
+                _snapshot_fallback_exception_conclusion(payload)
+            )
 
         if kind == "entry.opened":
             entry_opened_count += 1

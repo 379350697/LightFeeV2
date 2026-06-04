@@ -25,7 +25,15 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.engine.state import (
+    ActiveMakerLeg,
+    OpenPosition,
+    PassiveExecutionPhase,
+    PassivePhaseState,
+    PendingEntry,
+    PendingPassiveClose,
+    PersistedCloseExecutionLeg,
+)
 from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
@@ -1946,6 +1954,85 @@ class TestRuntimePreflight:
             kinds = [event["kind"] for event in runtime.journal.read_all()]
             assert "runtime.position_drift_correction_verified" in kinds
             assert "runtime.position_drift_correction_failed" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_active_position_drift_skips_passive_close_live_action_settling(self):
+        """Passive close owns a position while its live close action is settling."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+            await runtime.start()
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            position = OpenPosition(
+                position_id="pos-passive-settling",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.05,
+                short_quantity=0.05,
+                long_entry_price=65000.0,
+                short_entry_price=65010.0,
+                opened_at_ms=1700000000000,
+                matched_quantity=0.05,
+            )
+            runtime.state.open_positions[position.position_id] = position
+            runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+                position_id=position.position_id,
+                reason="funding_capture",
+                position_snapshot=position,
+                target_quantity=0.05,
+                chunk_quantities=[0.05],
+                phase_state=PassivePhaseState(
+                    phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                    active_maker_leg=ActiveMakerLeg.SHORT,
+                ),
+                long_legs=[
+                    PersistedCloseExecutionLeg(
+                        fill=make_fake_fill(
+                            Venue.BINANCE,
+                            "BTCUSDT",
+                            Side.SELL,
+                            quantity=0.02,
+                            price=65000.0,
+                        ),
+                        client_order_id="lfex-live-flatten",
+                        submit_started_at_ms=1700000010000,
+                    )
+                ],
+                next_retry_at_ms=wall_clock_now_ms() + 5_000,
+            )
+
+            await runtime.tick_active_positions()
+            await runtime.stop()
+
+            assert binance.place_order_call_count == 0
+            assert okx.place_order_call_count == 0
+            assert position.position_id in runtime.state.pending_passive_closes
+            assert runtime.state.open_positions[position.position_id].matched_quantity == pytest.approx(0.05)
 
     @pytest.mark.asyncio
     async def test_active_position_drift_removes_position_when_exchange_flat(self):

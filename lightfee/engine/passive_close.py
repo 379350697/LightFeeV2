@@ -124,6 +124,12 @@ class PassiveManagerDecisionKind(Enum):
     COOLDOWN = "cooldown"
 
 
+class PassiveCloseLiveTruthResolution(Enum):
+    CONTINUE_MAKER = "continue_maker"
+    CLEARED = "cleared"
+    STOP_RETRY = "stop_retry"
+
+
 @dataclass
 class PassiveManagerDecision:
     kind: PassiveManagerDecisionKind
@@ -707,13 +713,16 @@ class PassiveCloseExecutor:
             maker_client_id = pending.phase_state.maker_client_order_id
 
             if not maker_order_id:
-                if await self._resolve_flat_maker_leg_from_live_truth(
+                live_truth_resolution = await self._resolve_flat_maker_leg_from_live_truth(
                     state,
                     pending,
                     position,
                     maker_leg_label=maker_leg_label,
-                ):
+                )
+                if live_truth_resolution == PassiveCloseLiveTruthResolution.CLEARED:
                     return True
+                if live_truth_resolution == PassiveCloseLiveTruthResolution.STOP_RETRY:
+                    return False
 
                 # Submit initial maker order
                 success = await self._submit_maker_order(state, pending, position,
@@ -3005,7 +3014,7 @@ class PassiveCloseExecutor:
         position: OpenPosition,
         *,
         maker_leg_label: str,
-    ) -> bool:
+    ) -> PassiveCloseLiveTruthResolution:
         """Avoid submitting a reduce-only maker order to a leg live truth says is flat."""
         live_long, live_long_error = await self._fetch_live_position_snapshot(
             position.long_venue,
@@ -3029,14 +3038,14 @@ class PassiveCloseExecutor:
                     "decision": "continue_pending_passive_close",
                 },
             )
-            return False
+            return PassiveCloseLiveTruthResolution.CONTINUE_MAKER
 
         live_long_qty = self._live_position_quantity(live_long)
         live_short_qty = self._live_position_quantity(live_short)
         maker_qty = live_long_qty if maker_leg_label == "long" else live_short_qty
         other_qty = live_short_qty if maker_leg_label == "long" else live_long_qty
         if maker_qty > 1e-9:
-            return False
+            return PassiveCloseLiveTruthResolution.CONTINUE_MAKER
 
         other_venue = position.short_venue if maker_leg_label == "long" else position.long_venue
         other_snapshot = live_short if maker_leg_label == "long" else live_long
@@ -3057,22 +3066,28 @@ class PassiveCloseExecutor:
         )
 
         if other_qty <= 1e-9:
-            return await self._clear_if_live_flat(
+            if await self._clear_if_live_flat(
                 state,
                 pending,
                 position,
                 source="passive_close_maker_leg_live_flat_precheck",
                 extra={"maker_leg": maker_leg_label},
-            )
+            ):
+                return PassiveCloseLiveTruthResolution.CLEARED
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return PassiveCloseLiveTruthResolution.STOP_RETRY
 
-        return await self._flatten_live_one_sided_position(
+        if await self._flatten_live_one_sided_position(
             state,
             pending,
             position,
             venue=other_venue,
             live_snapshot=other_snapshot,
             leg_label=other_leg_label,
-        )
+        ):
+            return PassiveCloseLiveTruthResolution.CLEARED
+        pending.next_retry_at_ms = max(pending.next_retry_at_ms, self._now_ms() + 5_000)
+        return PassiveCloseLiveTruthResolution.STOP_RETRY
 
     def _pending_runtime_close_legs(
         self,

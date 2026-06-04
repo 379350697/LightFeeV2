@@ -2020,6 +2020,18 @@ class LiveRuntime:
                 # detect exchange-flat and break stuck passive close states.
                 if getattr(ppc.phase_state, "maker_order_id", ""):
                     continue
+                # V1 ownership: once passive close has submitted live close work,
+                # let that pending close settle before drift correction can submit
+                # another reduce-only leg for the same position.
+                passive_close_action_settling = (
+                    (
+                        bool(getattr(ppc, "short_legs", None))
+                        or bool(getattr(ppc, "long_legs", None))
+                    )
+                    and int(getattr(ppc, "next_retry_at_ms", 0) or 0) > now_ms
+                )
+                if passive_close_action_settling:
+                    continue
             if any(
                 pending.position_id == position.position_id
                 for pending in self.state.pending_closes.values()

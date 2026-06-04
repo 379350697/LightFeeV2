@@ -4528,6 +4528,107 @@ class TestNonTerminalPartialFillHedgeGapClosure:
 class TestPassiveCloseMakerLegLiveTruthPrecheck:
     """Live-truth precheck before first maker submit."""
 
+    def test_one_sided_flatten_settling_does_not_submit_maker_same_cycle(self):
+        """A live flatten action consumes this drive even if flat truth has not settled."""
+        journal = _open_journal()
+
+        class SettlingLiveTruthAdapter(VenueAdapter):
+            def __init__(self, venue, side, quantities):
+                self._venue = venue
+                self._side = side
+                self._quantities = list(quantities)
+                self.place_order_calls = []
+                self.submit_passive_order = AsyncMock(
+                    side_effect=OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit retCode=110017 retMsg=current position is zero, cannot fix reduce-only order qty",
+                    )
+                )
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def fetch_position(self, symbol):
+                quantity = self._quantities.pop(0) if self._quantities else 0.0
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=quantity,
+                    entry_price=1.0 if quantity else 0.0,
+                    observed_at_ms=1780560000000,
+                )
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 1.0,
+                    order_id=f"{self._venue.value}-flatten",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=1780560000001,
+                )
+
+        long_adapter = SettlingLiveTruthAdapter(Venue.OKX, Side.SELL, [23.3, 23.3])
+        short_adapter = SettlingLiveTruthAdapter(Venue.BYBIT, Side.BUY, [0.0, 0.0])
+        executor = PassiveCloseExecutor(
+            {Venue.OKX: long_adapter, Venue.BYBIT: short_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.999, 1.001))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-axs-maker-flat-settling",
+            symbol="AXSUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=23.3,
+            short_quantity=23.3,
+            matched_quantity=23.3,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="first_stage_capture",
+            position_snapshot=position,
+            target_quantity=23.3,
+            chunk_quantities=[23.3],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+            next_retry_at_ms=0,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        short_adapter.submit_passive_order.assert_not_called()
+        assert len(long_adapter.place_order_calls) == 1
+        assert position.position_id in state.pending_passive_closes
+        assert state.pending_passive_closes[position.position_id].next_retry_at_ms > 0
+
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        assert "exit.passive_close_maker_submit_error" not in kinds
+
     def test_flat_maker_leg_flattens_other_live_leg_without_submit(self):
         """If the chosen maker leg is already flat, do not submit a doomed maker order."""
         journal = _open_journal()

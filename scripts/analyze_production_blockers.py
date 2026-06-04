@@ -67,14 +67,43 @@ def _inc_symbol_pair(
 
 
 def _snapshot_fallback_blocked(payload: dict[str, Any]) -> bool:
+    if _snapshot_fallback_blocking_scope(payload):
+        return True
     if payload.get("blocked") is True or payload.get("block_reason"):
         return True
+    return False
+
+
+def _snapshot_fallback_blocking_scope(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
     for item in payload.get("candidate_freshness_scope", []) or []:
         if isinstance(item, dict) and (
             item.get("blocked") is True or item.get("block_reason")
         ):
+            blockers.append(item)
+    return blockers
+
+
+def _snapshot_fallback_has_scoped_blocking_evidence(payload: dict[str, Any]) -> bool:
+    for item in _snapshot_fallback_blocking_scope(payload):
+        if not (item.get("candidate_symbol") or item.get("candidate_pair_id")):
+            continue
+        if (
+            item.get("domain")
+            or item.get("venue")
+            or item.get("source_age_ms") is not None
+            or item.get("fallback_duration_ms") is not None
+        ):
             return True
     return False
+
+
+def _snapshot_fallback_conclusion(payload: dict[str, Any]) -> str:
+    if payload.get("v1_parity_evidence"):
+        return "v1_parity"
+    if _snapshot_fallback_has_scoped_blocking_evidence(payload):
+        return "v1_parity"
+    return "insufficient_evidence"
 
 
 def _has_official_sequence_evidence(payload: dict[str, Any]) -> bool:
@@ -333,9 +362,7 @@ def analyze_event_file(
                     incident_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
             elif kind == "runtime.snapshot_fallback_last_good" and _snapshot_fallback_blocked(payload):
                 incident_counts["snapshot_fallback_blocking"] += 1
-                incident_conclusions["snapshot_fallback_blocking"] = (
-                    "v1_parity" if payload.get("v1_parity_evidence") else "insufficient_evidence"
-                )
+                incident_conclusions["snapshot_fallback_blocking"] = _snapshot_fallback_conclusion(payload)
             elif kind == "entry.opened":
                 incident_counts["entry_opened"] += 1
                 incident_conclusions["entry_opened"] = "insufficient_evidence"

@@ -2006,6 +2006,98 @@ class TestBybitGetSigningWithQueryString:
             f"Bybit query_string must be invariant to param order: {qs1!r} != {qs2!r}"
         )
 
+    def test_bybit_server_time_parse_uses_millisecond_precision_before_seconds(self):
+        spec = bybit_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+
+        assert transport._parse_server_time({
+            "retCode": 0,
+            "time": "1770000000123",
+            "result": {
+                "timeSecond": "1770000000",
+                "timeNano": "1770000000456789000",
+            },
+        }) == 1770000000123
+        assert transport._parse_server_time({
+            "retCode": 0,
+            "result": {
+                "timeSecond": "1770000000",
+                "timeNano": "1770000000456789000",
+            },
+        }) == 1770000000456
+
+    def test_bybit_10002_timestamp_window_error_is_retryable(self):
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+
+        body = (
+            '{"retCode":10002,'
+            '"retMsg":"invalid request, please check your server timestamp or recv_window param"}'
+        )
+        assert transport._is_time_offset_retryable(200, body)
+
+    def test_bybit_success_envelope_with_timestamp_text_is_not_retryable(self):
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+
+        body = '{"retCode":0,"retMsg":"OK","result":{"timestamp":"1770000000000"}}'
+        assert not transport._is_time_offset_retryable(200, body)
+
+    @pytest.mark.asyncio
+    async def test_bybit_10002_clears_server_time_offset_and_retries_private_request(self, monkeypatch):
+        spec = bybit_spec()
+        cred = LiveCredential(api_key="bybit-k", api_secret="bybit-s")
+        transport = VenueTransport(spec=spec, mode="live", credential=cred)
+        time_calls = 0
+        private_timestamps: list[str] = []
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        monkeypatch.setattr("lightfee.venues.transport.asyncio.sleep", no_sleep)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal time_calls
+            if request.url.path == "/v5/market/time":
+                time_calls += 1
+                server_ms = 1770000000000 + time_calls * 1000
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "time": str(server_ms),
+                    "result": {
+                        "timeSecond": str(server_ms // 1000),
+                        "timeNano": str(server_ms * 1_000_000),
+                    },
+                })
+            if request.url.path == "/v5/position/list":
+                private_timestamps.append(request.headers["X-BAPI-TIMESTAMP"])
+                if len(private_timestamps) == 1:
+                    return httpx.Response(200, json={
+                        "retCode": 10002,
+                        "retMsg": "invalid request, please check your server timestamp or recv_window param",
+                    })
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "result": {"list": []},
+                })
+            return httpx.Response(404, json={"error": "unexpected path"})
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        raw = await transport._request(
+            "GET",
+            "/v5/position/list",
+            params={"category": "linear", "symbol": "BTCUSDT"},
+            private=True,
+        )
+
+        assert raw["retCode"] == 0
+        assert time_calls == 2
+        assert len(private_timestamps) == 2
+        assert private_timestamps[0] != private_timestamps[1]
+
 
 # ---------------------------------------------------------------------------
 # Private GET base_url selection (Fix 3)
@@ -4975,6 +5067,8 @@ class TestFetchAllPositions:
     @pytest.mark.asyncio
     async def test_binance_fetch_all_positions_parses_multiple_nonzero_symbols(self):
         async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/fapi/v1/time":
+                return httpx.Response(200, json={"serverTime": 1770000000000})
             assert request.url.path == "/fapi/v2/positionRisk"
             assert "symbol" not in dict(request.url.params)
             return httpx.Response(

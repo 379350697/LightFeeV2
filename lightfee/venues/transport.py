@@ -1946,14 +1946,17 @@ class VenueTransport(MarketDataClient):
 
         # Bybit: {"retCode":0,"result":{"timeSecond":"1234567890","timeNano":"..."}}
         if vid == Venue.BYBIT:
+            top_level_time = raw.get("time")
+            if top_level_time:
+                return int(top_level_time)
             result = raw.get("result", {})
             if isinstance(result, dict):
-                time_second = result.get("timeSecond")
-                if time_second:
-                    return int(time_second) * 1000
                 time_nano = result.get("timeNano")
                 if time_nano:
                     return int(time_nano) // 1_000_000
+                time_second = result.get("timeSecond")
+                if time_second:
+                    return int(time_second) * 1000
             return 0
 
         return 0
@@ -2312,15 +2315,21 @@ class VenueTransport(MarketDataClient):
                             scopes, retry_after_ms=retry_after_ms or 0,
                         )
 
-                # Binance/Aster time error retry (Task 10)
-                if _retry_ts_error and private and self._is_time_offset_retryable(
-                    resp.status_code, resp.text
-                ):
-                    self._clear_server_time_offset()
-                    await asyncio.sleep(0.1)  # V1: short delay before retry
-                    return await self._request(
-                        method, path, params=params, body=body,
-                        private=private, _retry_ts_error=False,
+                if private and self._is_time_offset_retryable(resp.status_code, resp.text):
+                    if _retry_ts_error:
+                        self._clear_server_time_offset()
+                        await asyncio.sleep(0.1)  # V1: short delay before retry
+                        return await self._request(
+                            method, path, params=params, body=body,
+                            private=private, _retry_ts_error=False,
+                        )
+                    raise TransportError(
+                        TransportErrorCategory.TRANSPORT_FAILURE,
+                        self._time_offset_retry_exhausted_message(
+                            method, path, resp.status_code, resp.text, headers
+                        ),
+                        status_code=resp.status_code, body=resp.text,
+                        headers=dict(resp.headers),
                     )
 
                 cat = classify_transport_error(resp.status_code, resp.text)
@@ -2331,13 +2340,33 @@ class VenueTransport(MarketDataClient):
                         headers=dict(resp.headers),
                     )
 
+            if not resp.text:
+                # V1: record success for all scopes
+                if self._rate_limiter is not None:
+                    self._rate_limiter.record_success_for_scopes(scopes)
+                return {}
+            raw = resp.json()
+            if private and self._is_time_offset_retryable(resp.status_code, resp.text):
+                if _retry_ts_error:
+                    self._clear_server_time_offset()
+                    await asyncio.sleep(0.1)
+                    return await self._request(
+                        method, path, params=params, body=body,
+                        private=private, _retry_ts_error=False,
+                    )
+                raise TransportError(
+                    TransportErrorCategory.TRANSPORT_FAILURE,
+                    self._time_offset_retry_exhausted_message(
+                        method, path, resp.status_code, resp.text, headers
+                    ),
+                    status_code=resp.status_code, body=resp.text,
+                    headers=dict(resp.headers),
+                )
+
             # V1: record success for all scopes
             if self._rate_limiter is not None:
                 self._rate_limiter.record_success_for_scopes(scopes)
-
-            if not resp.text:
-                return {}
-            return resp.json()
+            return raw
         except httpx.TimeoutException:
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
@@ -2450,27 +2479,79 @@ class VenueTransport(MarketDataClient):
                 f"unexpected error: {method} {path}: {e}",
             )
 
+    def _time_offset_retry_exhausted_message(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        body: str,
+        request_headers: dict[str, str],
+    ) -> str:
+        spec = self._spec
+        fields = [
+            f"{spec.venue_id.value}: timestamp/recv_window error after server-time refresh",
+            f"method={method.upper()}",
+            f"path={path}",
+            f"status={status_code}",
+            f"server_time_path={spec.server_time_path or ''}",
+        ]
+        if spec.timestamp_header:
+            fields.append(
+                f"auth_timestamp_ms={request_headers.get(spec.timestamp_header, '')}"
+            )
+        if spec.recv_window_header:
+            fields.append(
+                f"recv_window_ms={request_headers.get(spec.recv_window_header, spec.recv_window_ms or '')}"
+            )
+        fields.append(f"body={body[:200]}")
+        return " ".join(fields)
+
     def _is_time_offset_retryable(self, status_code: int, body: str) -> bool:
-        """V1: should_retry_binance_order_error — retry once on time/signature/order-mode/5xx errors.
+        """V1/doc aligned retry for server timestamp and recv_window errors.
 
         V1 predicate matches (case-insensitive, on error message):
           code=-1021, recvwindow, timestamp, position-side mismatch, 500-504
+
+        Bybit V1 prevents most clock drift with server time and a 1500ms auth
+        backoff. Bybit official V5 code 10002 is the remaining timestamp /
+        recv_window window failure, so V2 clears the cached offset and retries
+        once with a fresh server-time sample.
         """
         spec = self._spec
-        if spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
-            return False
         msg = f"status={status_code} {body}".lower()
-        return (
-            "code=-1021" in msg
-            or "recvwindow" in msg
-            or "timestamp" in msg
-            or ("position side" in msg and "setting" in msg)
-            or "positionside" in msg
-            or "status=500" in msg
-            or "status=502" in msg
-            or "status=503" in msg
-            or "status=504" in msg
-        )
+        if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+            if status_code < 400:
+                return False
+            return (
+                "code=-1021" in msg
+                or "recvwindow" in msg
+                or "timestamp" in msg
+                or ("position side" in msg and "setting" in msg)
+                or "positionside" in msg
+                or "status=500" in msg
+                or "status=502" in msg
+                or "status=503" in msg
+                or "status=504" in msg
+            )
+        if spec.venue_id == Venue.BYBIT:
+            ret_code = ""
+            try:
+                raw = json.loads(body) if body else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = {}
+            if isinstance(raw, dict):
+                ret_code = str(raw.get("retCode", raw.get("ret_code", "")) or "")
+            if status_code < 400:
+                return ret_code == "10002"
+            return (
+                ret_code == "10002"
+                or "retcode\":10002" in msg
+                or "ret_code\":10002" in msg
+                or "recv_window" in msg
+                or "recvwindow" in msg
+                or "timestamp" in msg
+            )
+        return False
 
     def _rest_rate_limit_scopes(
         self, method: str, path: str, base_url: str, *, private: bool = False,

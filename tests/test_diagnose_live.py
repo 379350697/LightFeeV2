@@ -231,6 +231,110 @@ def test_run_diagnose_acceptance_gate_blocks_insufficient_exception_evidence(mon
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_classifies_scoped_snapshot_fallback_as_v1_parity(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "BULLAUSDT",
+                            "candidate_pair_id": "bulla:bybit->aster",
+                            "domain": "market_observed",
+                            "venue": "global",
+                            "source_age_ms": 60000,
+                            "fallback_duration_ms": 55000,
+                            "blocked": True,
+                            "block_reason": "market_observed_stale",
+                        }
+                    ],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["bybit", "aster"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 1
+        assert gate["exception_conclusions"]["snapshot_fallback_blocking"] == "v1_parity"
+        assert gate["insufficient_evidence_exceptions"] == []
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_acceptance_gate_blocks_global_snapshot_fallback_without_scope_evidence(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "blocked": True,
+                    "block_reason": "global_snapshot_stale",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["bybit", "aster"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 1
+        assert gate["exception_conclusions"]["snapshot_fallback_blocking"] == "insufficient_evidence"
+        assert gate["insufficient_evidence_exceptions"] == ["snapshot_fallback_blocking"]
+        assert gate["blocking_reasons"] == ["diagnostic_exception_insufficient_evidence"]
+        assert gate["gate_passed"] is False
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -489,6 +593,46 @@ def test_production_blocker_window_reports_closed_evidence_conclusions(tmp_path)
     }
     assert result["windows"]["last_2h"]["incident_conclusions"] == {
         "local_l2_official_rebuild": "official_doc",
+        "snapshot_fallback_blocking": "v1_parity",
+    }
+
+
+def test_production_blocker_window_classifies_scoped_snapshot_fallback_as_v1_parity(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "window_scoped_fallback.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779811000000,
+            "kind": "runtime.snapshot_fallback_last_good",
+            "payload": {
+                "symbol": "MONUSDT",
+                "candidate_freshness_scope": [
+                    {
+                        "candidate_symbol": "MONUSDT",
+                        "candidate_pair_id": "mon:bybit->aster",
+                        "domain": "market_observed",
+                        "venue": "global",
+                        "source_age_ms": 60000,
+                        "fallback_duration_ms": 55000,
+                        "blocked": True,
+                        "block_reason": "market_observed_stale",
+                    }
+                ],
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h", "run_window"],
+    )
+
+    assert result["windows"]["last_2h"]["incident_counts"] == {
+        "snapshot_fallback_blocking": 1,
+    }
+    assert result["windows"]["last_2h"]["incident_conclusions"] == {
         "snapshot_fallback_blocking": "v1_parity",
     }
 
