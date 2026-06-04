@@ -1846,8 +1846,21 @@ def _build_evidence_completeness(
         missing.append("state_consistency_breach")
 
     if not completions:
-        overall = "missing"
-        confidence = "low"
+        truth_confidence = str(exchange_truth.get("confidence", "low"))
+        if (
+            exchange_truth.get("available", False)
+            and truth_confidence == "high"
+            and not state_consistency.get("state_mismatch")
+            and not missing
+        ):
+            overall = "complete"
+            confidence = "high"
+        elif exchange_truth.get("available", False) and not missing:
+            overall = "partial"
+            confidence = "medium"
+        else:
+            overall = "missing"
+            confidence = "low"
     elif "transport_only" in completions or any(
         c in completions for c in ("missing_exchange_body",)
     ):

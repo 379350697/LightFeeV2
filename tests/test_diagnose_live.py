@@ -888,6 +888,28 @@ def test_exchange_truth_sync_wrapper_does_not_emit_deprecation_warning(monkeypat
     ]
 
 
+def test_evidence_quality_complete_when_truth_high_and_no_order_errors():
+    from scripts import diagnose_live as dl
+
+    result = dl._build_evidence_completeness(
+        order_errors=[],
+        state_consistency={
+            "state_mismatch": False,
+            "local_open_exchange_flat": False,
+            "confidence": "high",
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "missing_evidence": [],
+        },
+    )
+
+    assert result["overall"] == "complete"
+    assert result["confidence"] == "high"
+    assert result["missing_evidence"] == []
+
+
 def test_exchange_truth_uses_okx_venue_symbol_for_open_orders():
     import asyncio
     from scripts import diagnose_live as dl
