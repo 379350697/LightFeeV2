@@ -796,6 +796,21 @@ def test_exchange_truth_creates_readonly_adapters_for_all_live_perp_venues():
         assert adapter is not None, venue
 
 
+def test_exchange_truth_loads_hyperliquid_private_key_alias(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    private_key = "0x" + "1" * 64
+    account = "0x" + "2" * 40
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_PRIVATE_KEY", private_key)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS", account)
+
+    credential = dl._load_venue_credential("hyperliquid")
+
+    assert credential is not None
+    assert credential.wallet_private_key == private_key
+    assert credential.account_address == account
+
+
 def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
     import asyncio
     from scripts import diagnose_live as dl

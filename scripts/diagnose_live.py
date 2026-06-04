@@ -458,7 +458,10 @@ def _load_venue_credential(venue: str) -> Optional[Any]:
     prefix = "LIGHTFEE_{}_".format(venue.upper())
     api_key = os.environ.get(prefix + "API_KEY", "")
     api_secret = os.environ.get(prefix + "API_SECRET", "")
-    wallet_private_key = os.environ.get(prefix + "WALLET_PRIVATE_KEY", "")
+    wallet_private_key = (
+        os.environ.get(prefix + "WALLET_PRIVATE_KEY", "")
+        or os.environ.get(prefix + "PRIVATE_KEY", "")
+    )
     account_address = os.environ.get(prefix + "ACCOUNT_ADDRESS", "")
     if not ((api_key and api_secret) or wallet_private_key or account_address):
         return None
