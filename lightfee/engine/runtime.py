@@ -4852,6 +4852,13 @@ class LiveRuntime:
                     )
                     resolved_entry_ids.append(entry_id)
                     continue
+                if await self._maybe_finalize_rejected_pending_with_fill(
+                    pending,
+                    entry_id,
+                    now_ms,
+                    source="reconciliation",
+                ):
+                    continue
                 self.journal.append(
                     "reconciliation.rejected_pending_retained_with_fill",
                     {
@@ -6391,6 +6398,17 @@ class LiveRuntime:
 
         resolved_ids: list[str] = []
         for entry_id, pending in list(self.state.pending_entries.items()):
+            if getattr(pending, "outcome", "") == "rejected" and pending.has_any_fill():
+                if await self._maybe_finalize_rejected_pending_with_fill(
+                    pending,
+                    entry_id,
+                    now_ms,
+                    source="startup_force_reconcile",
+                ):
+                    continue
+                self._apply_reconcile_backoff(pending, now_ms)
+                continue
+
             if not pending.uncertain_outcome:
                 resolved_ids.append(entry_id)
                 continue
@@ -6458,6 +6476,81 @@ class LiveRuntime:
             {"resolved_entries": len(resolved_ids), "ts_ms": now_ms},
         )
 
+    async def _maybe_finalize_rejected_pending_with_fill(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+        *,
+        source: str,
+    ) -> bool:
+        """Close V1 recovery for retained rejected entries with positive fills.
+
+        A deterministic maker reject with zero fill can clear. Once either leg
+        has positive fill evidence, local false-flat is no longer a terminal
+        state: finalize the matched quantity and queue residual cleanup, or
+        retain with explicit deferred evidence if fill details are incomplete.
+        """
+        if getattr(pending, "outcome", "") != "rejected" or not pending.has_any_fill():
+            return False
+
+        before_maker = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
+        before_hedge = float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0)
+        before_pending_residuals = len(
+            getattr(self.state, "pending_residual_repairs", []) or []
+        )
+        hydrated = await self._recover_hydrate_from_live_positions(pending)
+
+        await self._finalize_pending_entry(pending, entry_id, now_ms)
+
+        opened_position = self.state.open_positions.get(entry_id)
+        finalized = entry_id not in self.state.pending_entries
+        if opened_position is not None:
+            self.state.pending_entries.pop(entry_id, None)
+            finalized = True
+
+        if finalized:
+            self.journal.append(
+                "recovery.rejected_pending_positive_fill_finalized",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "source": source,
+                    "hydrated_from_live_truth": hydrated,
+                    "before_maker_leg_filled": before_maker,
+                    "before_hedge_leg_filled": before_hedge,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                    "balanced_quantity": min(
+                        float(pending.maker_leg_filled or 0.0),
+                        float(pending.hedge_leg_filled or 0.0),
+                    ),
+                    "opened_position": opened_position is not None,
+                    "pending_residual_repairs_added": max(
+                        0,
+                        len(getattr(self.state, "pending_residual_repairs", []) or [])
+                        - before_pending_residuals,
+                    ),
+                },
+            )
+            return True
+
+        self.journal.append(
+            "recovery.rejected_pending_positive_fill_deferred",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "source": source,
+                "hydrated_from_live_truth": hydrated,
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "maker_fill_price": pending.maker_fill_price,
+                "hedge_fill_price": pending.hedge_fill_price,
+                "reason": "positive_fill_evidence_incomplete_for_finalization",
+            },
+        )
+        return False
+
     def _flush_reconciler_order_diagnostics(self) -> None:
         if self.reconciler is None:
             return
@@ -6504,6 +6597,14 @@ class LiveRuntime:
         force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
 
         for entry_id, pending in list(self.state.pending_entries.items()):
+            if await self._maybe_finalize_rejected_pending_with_fill(
+                pending,
+                entry_id,
+                now_ms,
+                source="startup_recovery",
+            ):
+                continue
+
             # V1: startup_recovery_ready gate — skip entries that don't need recovery yet
             if not pending.startup_recovery_ready():
                 continue

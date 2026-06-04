@@ -874,6 +874,142 @@ async def test_startup_blocked_pending_entry_retries_live_truth_recovery(
 
 
 @pytest.mark.asyncio
+async def test_startup_rejected_positive_fill_finalizes_open_and_residual(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="SEIUSDT",
+                side=Side.BUY,
+                quantity=455.0,
+                entry_price=0.05263,
+                observed_at_ms=1780570570000,
+            )),
+            Venue.HYPERLIQUID: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.HYPERLIQUID,
+                symbol="SEIUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=1780570570000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.state.recovery_blocked_reason = (
+        "startup_recovery_pending_work_without_open_positions"
+    )
+    runtime.state.recovery_blocked_at_ms = 1780570589000
+    pending = _pending_entry(
+        pending_id="entry-1780570508073-SEIUSDT",
+        symbol="SEIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=455.0,
+        maker_leg="long",
+        maker_leg_filled=455.0,
+        hedge_leg_filled=68.0,
+        maker_price=0.05263,
+        maker_fill_price=0.05263,
+        hedge_fill_price=0.05271,
+        maker_order_id="bybit-maker-filled",
+        maker_client_order_id="maker-cid",
+        hedge_order_id="hyperliquid-partial-fill",
+        hedge_client_order_id="hedge-cid",
+        outcome="rejected",
+        uncertain_outcome=False,
+        created_at_ms=1780570508073,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._recover_pending_entry_hedges(now_ms=1780570590000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(68.0)
+    assert opened.long_quantity == pytest.approx(68.0)
+    assert opened.short_quantity == pytest.approx(68.0)
+    [residual] = runtime.state.pending_residual_repairs
+    assert residual["symbol"] == "SEIUSDT"
+    assert residual["repair_venue"] == "bybit"
+    assert residual["repair_side"] == "sell"
+    assert residual["repair_quantity"] == pytest.approx(387.0)
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    assert runtime.state.recovery_blocked_reason is None
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "reconciliation.rejected_pending_retained_with_fill" not in kinds
+    finalized = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.pending_entry_finalized"
+    ][-1]
+    assert finalized["raw_maker_leg_filled"] == pytest.approx(455.0)
+    assert finalized["raw_hedge_leg_filled"] == pytest.approx(68.0)
+    assert finalized["balanced_quantity"] == pytest.approx(68.0)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejected_positive_fill_does_not_retained_loop(
+    config, tmp_journal,
+):
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.HYPERLIQUID: _NoFillReconciliationAdapter(),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(PositionReconciliationResult(
+        position_id="entry-1780570508073-SEIUSDT",
+        symbol="SEIUSDT",
+        long_status="filled",
+        short_status="uncertain",
+        is_flat=False,
+    ))
+    pending = _pending_entry(
+        pending_id="entry-1780570508073-SEIUSDT",
+        symbol="SEIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=455.0,
+        maker_leg="long",
+        maker_leg_filled=455.0,
+        hedge_leg_filled=68.0,
+        maker_price=0.05263,
+        maker_fill_price=0.05263,
+        hedge_fill_price=0.05271,
+        maker_order_id="bybit-maker-filled",
+        maker_client_order_id="maker-cid",
+        hedge_order_id="hyperliquid-partial-fill",
+        hedge_client_order_id="hedge-cid",
+        outcome="rejected",
+        uncertain_outcome=True,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=1780570595000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert runtime.state.open_positions[pending.pending_id].matched_quantity == pytest.approx(
+        68.0
+    )
+    [residual] = runtime.state.pending_residual_repairs
+    assert residual["repair_venue"] == "bybit"
+    assert residual["repair_quantity"] == pytest.approx(387.0)
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "reconciliation.rejected_pending_retained_with_fill" not in kinds
+    assert "recovery.rejected_pending_positive_fill_finalized" in kinds
+
+
+@pytest.mark.asyncio
 async def test_finalize_zero_fill_does_not_query_planned_hedge_client_order_id(
     config, tmp_journal,
 ):
