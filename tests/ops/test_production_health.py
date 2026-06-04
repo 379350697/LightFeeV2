@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from lightfee.ops.production_health import (
     summarize_reports,
 )
 from scripts.diagnose_live import _build_state_consistency
+from scripts import verify_production_services as vps
 
 
 def test_sidecar_unit_rejects_missing_config():
@@ -473,6 +475,64 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
     ][0]
     assert "exchange_truth_missing" in current_report["fingerprints"]
     assert current_report["details"]["exchange_truth_required"] is True
+
+
+def test_verify_production_services_attaches_exchange_truth_from_systemd_env_file(
+    tmp_path, monkeypatch,
+):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    env_file = tmp_path / "lightfee.env"
+    env_file.write_text(
+        "LIGHTFEE_BYBIT_API_KEY=key-from-file\n"
+        "LIGHTFEE_BYBIT_API_SECRET=secret-from-file\n"
+    )
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+    }
+    seen: dict[str, object] = {}
+
+    def fake_exchange_truth(runtime_dir_arg, symbols, venues=None):
+        seen["runtime_dir"] = runtime_dir_arg
+        seen["symbols"] = list(symbols)
+        seen["venues"] = venues
+        seen["api_key"] = os.environ.get("LIGHTFEE_BYBIT_API_KEY")
+        return {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        }
+
+    monkeypatch.delenv("LIGHTFEE_BYBIT_API_KEY", raising=False)
+    enriched = vps._attach_exchange_truth_if_missing(
+        state,
+        current_state_path=current_state,
+        unit_texts={
+            "lightfee-live.service": (
+                "[Service]\n"
+                f"EnvironmentFile={env_file}\n"
+            ),
+        },
+        exchange_truth_builder=fake_exchange_truth,
+    )
+
+    assert enriched["exchange_truth"]["available"] is True
+    assert enriched["exchange_truth_source"] == "verify_production_services_probe"
+    assert seen["runtime_dir"] == str(runtime_dir)
+    assert seen["symbols"] == []
+    assert seen["venues"] is None
+    assert seen["api_key"] == "key-from-file"
 
 
 def test_verify_production_services_cli_json_failure(tmp_path):
