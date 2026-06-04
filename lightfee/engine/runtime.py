@@ -337,6 +337,8 @@ class LiveRuntime:
         keys = [f"{venue.value}:{symbol}"]
         if venue == Venue.ASTER and reason == "max_notional_admission_blocked":
             keys.append(f"{venue.value}:*")
+        if venue == Venue.HYPERLIQUID and reason == "insufficient_margin_admission_blocked":
+            keys.append(f"{venue.value}:*")
         return keys
 
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
@@ -4580,8 +4582,8 @@ class LiveRuntime:
                     if removed:
                         resolved.append(entry_id)
                 elif pending.missing_hedge_quantity() <= 1e-9:
-                    await self._finalize_pending_entry(pending, entry_id, now_ms)
-                    resolved.append(entry_id)
+                    if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                        resolved.append(entry_id)
                 elif await self._maybe_finalize_pending_entry_terminal_hedge_dust(
                     pending,
                     entry_id,
@@ -4591,16 +4593,16 @@ class LiveRuntime:
                     resolved.append(entry_id)
                 elif cancel_elapsed > 30_000:
                     # Stale cancel with partial fill — force finalize what we have
-                    await self._finalize_pending_entry(pending, entry_id, now_ms)
-                    resolved.append(entry_id)
+                    if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                        resolved.append(entry_id)
                 else:
                     # Drive hedge for partial fill
                     hedge_driven = await self._drive_missing_hedge_live(
                         pending, entry_id, now_ms
                     )
                     if hedge_driven and pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
-                        await self._finalize_pending_entry(pending, entry_id, now_ms)
-                        resolved.append(entry_id)
+                        if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                            resolved.append(entry_id)
                     else:
                         pending.next_progress_poll_ms = now_ms + poll_ms
             else:
@@ -4632,7 +4634,8 @@ class LiveRuntime:
                     "state": po.last_progress_state.value,
                 },
             )
-            await self._finalize_pending_entry(pending, entry_id, now_ms)
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
             return True
 
         metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
@@ -5128,17 +5131,21 @@ class LiveRuntime:
 
             # --- V1: check if both legs are now filled → finalize ---
             if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
-                await self._finalize_pending_entry(pending, entry_id, now_ms)
-                resolved_entry_ids.append(entry_id)
+                if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                    resolved_entry_ids.append(entry_id)
+                else:
+                    self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
             if result.long_status == "filled" and result.short_status == "filled":
-                await self._finalize_pending_entry(pending, entry_id, now_ms)
-                resolved_entry_ids.append(entry_id)
-                self.journal.append(
-                    "reconciliation.entry_resolved",
-                    {"entry_id": entry_id, "long_status": result.long_status, "short_status": result.short_status},
-                )
+                if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                    resolved_entry_ids.append(entry_id)
+                    self.journal.append(
+                        "reconciliation.entry_resolved",
+                        {"entry_id": entry_id, "long_status": result.long_status, "short_status": result.short_status},
+                    )
+                else:
+                    self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
             # V1: force_terminalize_pending_entry_if_budget_exhausted()
@@ -5234,8 +5241,10 @@ class LiveRuntime:
                 hedge_driven = await self._drive_missing_hedge_live(pending, entry_id, now_ms)
                 if hedge_driven:
                     if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
-                        await self._finalize_pending_entry(pending, entry_id, now_ms)
-                        resolved_entry_ids.append(entry_id)
+                        if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                            resolved_entry_ids.append(entry_id)
+                        else:
+                            self._apply_reconcile_backoff(pending, now_ms)
                         continue
                 # Keep entry for next reconciliation cycle
                 self._apply_reconcile_backoff(pending, now_ms)
@@ -5849,8 +5858,7 @@ class LiveRuntime:
                 "source": source,
             },
         )
-        await self._finalize_pending_entry(pending, entry_id, now_ms)
-        return True
+        return await self._finalize_pending_entry(pending, entry_id, now_ms)
 
     # ------------------------------------------------------------------
     # V1 parity: hedge deadline, terminalization budget, abort/cleanup
@@ -5996,16 +6004,18 @@ class LiveRuntime:
 
             if hard_ceiling_reached:
                 if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
-                    await self._finalize_pending_entry(pending, entry_id, now_ms)
-                    self.state.pending_entries.pop(entry_id, None)
-                    self.journal.append(
-                        "recovery.pending_entry_finalized",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "reason": final_reason,
-                        },
-                    )
+                    if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                        self.state.pending_entries.pop(entry_id, None)
+                        self.journal.append(
+                            "recovery.pending_entry_finalized",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "reason": final_reason,
+                            },
+                        )
+                    else:
+                        self._apply_reconcile_backoff(pending, now_ms)
                     return True
 
                 await self._abort_pending_entry(pending, entry_id, final_reason)
@@ -6084,16 +6094,8 @@ class LiveRuntime:
                 )
                 self._apply_reconcile_backoff(pending, now_ms)
                 return True
-            self.journal.append(
-                "pending_entry.force_terminalized",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "reason": final_reason,
-                    "lifetime_ms": budget["lifetime_ms"],
-                },
-            )
-            self.state.pending_entries.pop(entry_id, None)
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
             return True
 
         return False
@@ -6506,8 +6508,10 @@ class LiveRuntime:
                     pending.maker_fill_price = _recon_fill_price(result.long_fill)
                 if result.short_fill and _recon_fill_price(result.short_fill) > 0:
                     pending.hedge_fill_price = _recon_fill_price(result.short_fill)
-                await self._finalize_pending_entry(pending, entry_id, now_ms)
-                resolved_ids.append(entry_id)
+                if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                    resolved_ids.append(entry_id)
+                else:
+                    self._apply_reconcile_backoff(pending, now_ms)
             elif result.is_flat:
                 if not self._pending_entry_flat_clear_has_terminal_maker_evidence(
                     pending, result
@@ -6559,10 +6563,9 @@ class LiveRuntime:
         )
         hydrated = await self._recover_hydrate_from_live_positions(pending)
 
-        await self._finalize_pending_entry(pending, entry_id, now_ms)
+        finalized = await self._finalize_pending_entry(pending, entry_id, now_ms)
 
         opened_position = self.state.open_positions.get(entry_id)
-        finalized = entry_id not in self.state.pending_entries
         if opened_position is not None:
             self.state.pending_entries.pop(entry_id, None)
             finalized = True
@@ -6746,13 +6749,16 @@ class LiveRuntime:
                     if hard_ceiling_reached:
                         if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
                             # Balanced fill → finalize even on hard ceiling
-                            await self._finalize_pending_entry(pending, entry_id, now_ms)
-                            self.state.pending_entries.pop(entry_id, None)
-                            self.journal.append(
-                                "recovery.pending_entry_finalized",
-                                {"entry_id": entry_id, "symbol": pending.symbol,
-                                 "reason": "cancel_completed_entry_balanced"},
-                            )
+                            if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                                self.state.pending_entries.pop(entry_id, None)
+                                self.journal.append(
+                                    "recovery.pending_entry_finalized",
+                                    {"entry_id": entry_id, "symbol": pending.symbol,
+                                     "reason": "cancel_completed_entry_balanced"},
+                                )
+                            else:
+                                pending.reconcile_attempt += 1
+                                self._apply_reconcile_backoff(pending, now_ms)
                         else:
                             # Has fills with missing hedge or no fills → abort (with cleanup)
                             await self._abort_pending_entry(pending, entry_id, final_reason)
@@ -6805,16 +6811,19 @@ class LiveRuntime:
                 if hedge_driven:
                     # V1: if hedge completes the entry → finalize immediately
                     if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
-                        await self._finalize_pending_entry(pending, entry_id, now_ms)
-                        self.state.pending_entries.pop(entry_id, None)
-                        self.journal.append(
-                            "recovery.pending_entry_finalized",
-                            {
-                                "entry_id": entry_id,
-                                "symbol": pending.symbol,
-                                "reason": "recovery_hedge_completed_entry",
-                            },
-                        )
+                        if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                            self.state.pending_entries.pop(entry_id, None)
+                            self.journal.append(
+                                "recovery.pending_entry_finalized",
+                                {
+                                    "entry_id": entry_id,
+                                    "symbol": pending.symbol,
+                                    "reason": "recovery_hedge_completed_entry",
+                                },
+                            )
+                        else:
+                            pending.reconcile_attempt += 1
+                            self._apply_reconcile_backoff(pending, now_ms)
                         continue
 
                     # Hedge submitted but entry not yet complete — keep for reconciliation
@@ -6838,16 +6847,19 @@ class LiveRuntime:
 
             # --- 4d: Fully filled → finalize ---
             if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
-                await self._finalize_pending_entry(pending, entry_id, now_ms)
-                self.state.pending_entries.pop(entry_id, None)
-                self.journal.append(
-                    "recovery.pending_entry_finalized",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "reason": final_reason,
-                    },
-                )
+                if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                    self.state.pending_entries.pop(entry_id, None)
+                    self.journal.append(
+                        "recovery.pending_entry_finalized",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": final_reason,
+                        },
+                    )
+                else:
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
             # --- 4e: Fallback — still pending and hard ceiling reached → abort (with cleanup) ---
@@ -8039,8 +8051,12 @@ class LiveRuntime:
         )
         return True
 
-    async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
+    async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
+
+        Returns True only after terminal open/residual/passive-unfilled evidence.
+        Returns False when live truth or fill details defer finalization and the
+        caller must retain pending work.
 
         V1 parity gate (entry_sync.rs:5338-5454):
         1. Compute residual_task BEFORE the balanced_quantity branch (line 5338).
@@ -8069,7 +8085,7 @@ class LiveRuntime:
             entry_id,
             now_ms,
         ):
-            return
+            return False
 
         raw_maker_leg_filled = float(pending.maker_leg_filled or 0.0)
         raw_hedge_leg_filled = float(pending.hedge_leg_filled or 0.0)
@@ -8163,13 +8179,13 @@ class LiveRuntime:
                     entry_id,
                     now_ms,
                 ):
-                    return
+                    return False
                 if await self._pending_entry_zero_fill_has_live_maker_position(
                     pending,
                     entry_id,
                     now_ms,
                 ):
-                    return
+                    return False
                 # V1: !has_any_fill → zero-fill, safe to remove as passive_unfilled
                 self.journal.append(
                     "entry.passive_unfilled",
@@ -8198,7 +8214,7 @@ class LiveRuntime:
                     },
                 )
                 self.state.pending_entries.pop(entry_id, None)
-                return
+                return True
 
             # V1: balanced_quantity == 0 but has_any_fill → one-sided exposure.
             # No open position, no entry.opened. Persist residual task if asymmetric.
@@ -8240,7 +8256,7 @@ class LiveRuntime:
                 },
             )
             self.state.pending_entries.pop(entry_id, None)
-            return
+            return True
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
         open_maker_fill_quantity = min(
@@ -8384,6 +8400,7 @@ class LiveRuntime:
                 "incremental_entry_open_partially_matched",
                 residual_evidence,
             )
+        return True
 
     def _queue_pending_residual_repair(
         self,
@@ -10102,7 +10119,7 @@ class LiveRuntime:
         long_v = getattr(candidate, 'long_venue', '')
         short_v = getattr(candidate, 'short_venue', '')
         if has_pending_entry_for_symbol(self.state, sym, long_v, short_v):
-            return False, "pending_entry_duplicate"
+            return False, "pending_entry_protection"
         return True, ""
 
     def _gate_entry_sizing(self, candidate) -> tuple[bool, str]:

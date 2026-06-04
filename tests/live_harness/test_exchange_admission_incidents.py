@@ -368,6 +368,13 @@ async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_witho
         assert cooldown["official_doc_url"] == (
             "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
         )
+        venue_cooldown = runtime.state.venue_entry_cooldowns["hyperliquid:*"]
+        assert venue_cooldown["reason"] == "insufficient_margin_admission_blocked"
+        assert venue_cooldown["block_scope"] == "venue"
+        assert runtime._candidate_admission_block(
+            _candidate("WLDUSDT", "bybit", "hyperliquid"),
+            1778787002000,
+        )["reason"] == "insufficient_margin_admission_blocked"
         records = runtime.journal.read_all()
         assert [
             record for record in records

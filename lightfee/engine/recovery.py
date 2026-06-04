@@ -1445,16 +1445,24 @@ def has_pending_entry_for_symbol(
     long_venue: str,
     short_venue: str,
 ) -> bool:
-    """Check if there's already a pending entry for the same symbol and venues.
+    """Check if a pending entry protects this pair or overlapping symbol route.
 
-    V1: prevents opening duplicate positions on the same pair while
-    a pending entry already exists.
+    V1: `pending_entry_gate_reason_excluding_position` blocks the same pair, and
+    also blocks the same symbol when either venue overlaps. That prevents a
+    live-truth-deferred pending entry from being bypassed by routing the same
+    symbol through a slightly different pair.
     """
+    def _venue_key(venue) -> str:
+        return venue.value if hasattr(venue, "value") else str(venue)
+
+    requested_venues = {_venue_key(long_venue), _venue_key(short_venue)}
     for pe in state.pending_entries.values():
         if pe.symbol != symbol:
             continue
-        pe_long = pe.long_venue.value if hasattr(pe.long_venue, 'value') else str(pe.long_venue)
-        pe_short = pe.short_venue.value if hasattr(pe.short_venue, 'value') else str(pe.short_venue)
-        if pe_long == long_venue and pe_short == short_venue:
+        pe_long = _venue_key(pe.long_venue)
+        pe_short = _venue_key(pe.short_venue)
+        if pe_long == _venue_key(long_venue) and pe_short == _venue_key(short_venue):
+            return True
+        if requested_venues.intersection({pe_long, pe_short}):
             return True
     return False

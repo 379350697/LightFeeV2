@@ -66,6 +66,10 @@ The minimum semantic surface from V1 is:
 - recovery/lifecycle: recovery work snapshots drive risk mode. Local flat is
   not enough, and ambiguous or untrusted live exposure must fail closed instead
   of being guessed into healthy state.
+- pending-entry protection: V1 blocks a new entry on the same pair, and also
+  blocks the same symbol when either venue overlaps with an unresolved pending
+  entry. A live-truth-deferred pending entry must not be bypassed by swapping
+  only one venue.
 
 ## Unified Invariants
 
@@ -129,12 +133,14 @@ The minimum semantic surface from V1 is:
 | PE-08 | balanced positive fills missing local price/order but trusted live position has price | hydrate missing details then create managed open position | require manual recovery only |
 | PE-09 | imbalanced positive fills on both legs | open matched quantity, queue residual for excess | treat excess as missing hedge demand |
 | PE-10 | one-sided positive fill | queue unmatched residual cleanup or fail-closed | local flat / healthy |
-| PE-11 | deterministic hedge admission reject after maker exposure | abort through cleanup path; retain fail-closed if cleanup unproven | retry same hedge indefinitely |
+| PE-11 | deterministic hedge admission reject after maker exposure, including account/venue-scoped margin rejects | abort through cleanup path; retain fail-closed if cleanup unproven; arm symbol/venue admission cooldown when the reject proves account/venue capacity is exhausted | retry same hedge indefinitely or keep submitting new entries through the same exhausted venue |
 | PE-12 | terminalization budget reached while hedge is inflight | retain/reconcile until hedge terminality or deadline fail-closed | force-finalize or pop pending |
 | PE-13 | zero-fill terminal maker state with configured taker fallback/repost/cooldown | try V1 fallback/repost path or record zero-fill cooldown before accepting terminal no-entry | clear and immediately churn the same pair |
 | PE-14 | stale pending backlog, zero fills, no inflight/cancel, resting order fetch returns none | supervision may clear as terminal no-fill | clear when any fill/inflight/cancel/progress exists |
 | PE-15 | live balanced exposure exists while local fill/order details are incomplete | hydrate from live truth and then finalize/open/residualize | require manual recovery or discard live truth |
 | PE-16 | live exposure is ambiguous, untrusted, or cannot be mapped to the pending contract | retain/fail-closed with explicit evidence and no new-entry risk | guess healthy/open/flat |
+| PE-17 | unresolved pending entry exists for the same symbol and the new candidate shares either venue | block the new entry with `pending_entry_protection` until the pending entry terminalizes or cleanup proves flat | open a second overlapping pending entry by changing only one venue |
+| PE-18 | `_finalize_pending_entry()` defers because fill details, open-order truth, or live-position truth are incomplete | caller retains pending work, applies backoff, and does not add the entry to resolved/pop paths | treat a deferred finalizer call as terminal completion |
 | RC-01 | residual task, live excess tradeable, open orders empty | submit one reduce-only IOC and complete/backoff from fill truth | use stale local repair quantity blindly |
 | RC-02 | residual task, live excess zero, open orders empty | complete as already flat and release pair gate | keep pair gate forever |
 | RC-03 | residual task, live excess zero, open orders present | pause/backoff with open-order evidence | clear task as already flat |
@@ -160,12 +166,14 @@ The minimum semantic surface from V1 is:
 | PE-07, PE-08 | `tests/test_pending_entry_v1_semantic_drift.py::test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1` | covered |
 | PE-09 | `tests/test_pending_entry_v1_semantic_drift.py::test_startup_recovery_imbalanced_live_truth_finalizes_balanced_position` | covered |
 | PE-10 | `tests/test_live_entry_hedge_root_fix.py::TestUnmatchedResidualV1Parity` | covered locally |
-| PE-11 | `tests/live_harness/test_exchange_admission_incidents.py`, `tests/test_live_startup_preflight.py` | covered for known deterministic families |
-| PE-12 | `tests/test_v1_parity_pending_entry_recovery_red.py`; `_pending_entry_terminalization_budget()` runtime path | covered for budget table; caller-side finalize/pop audit remains open |
-| PE-13 | `tests/engine/test_v1_real_config_gap_semantics.py`; `tests/test_v1_config_defaults_parity_red.py`; runtime zero-fill cooldown hooks | partially covered; terminal taker fallback/repost parity needs matrix RED tests before code changes if it recurs |
+| PE-11 | `tests/live_harness/test_exchange_admission_incidents.py::test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_without_retry`, `tests/test_live_startup_preflight.py` | covered for known deterministic families; Hyperliquid insufficient margin now arms both symbol and venue cooldowns |
+| PE-12 | `tests/test_v1_parity_pending_entry_recovery_red.py`; `_pending_entry_terminalization_budget()` runtime path | covered for budget table and inflight/force-terminal decision shape |
+| PE-13 | `tests/engine/test_v1_real_config_gap_semantics.py`; `tests/test_v1_config_defaults_parity_red.py`; `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_force_terminal_zero_fill_uses_finalizer_not_blind_pop` | covered for zero-fill terminal completion through the V1 finalizer; add incident REDs before changing fallback/repost routing if a configured fallback recurrence appears |
 | PE-14 | V1 source audited; V2 has stale-entry abandon/terminal evidence checks but no dedicated supervision-backlog matrix test found | uncovered matrix row; add RED before any supervision clear change |
 | PE-15 | `tests/test_pending_entry_v1_semantic_drift.py::test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1` | covered with PE-07/PE-08 |
 | PE-16 | `tests/live_harness/test_residual_repair_incident_replay.py::test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed`; pending-entry ambiguous-live coverage still needs targeted RED if production evidence appears | partially covered |
+| PE-17 | `tests/test_runtime_entry_flow.py::TestPendingEntryTracking::test_pending_entry_dedup_blocks_same_symbol_venue_overlap_like_v1`; `tests/test_v1_record_layer_parity.py -k has_pending_entry_for_symbol` | covered for V1 same-symbol venue-overlap pending protection |
+| PE-18 | `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_reconcile_retains_pending_when_finalize_defers_missing_fill_details`; runtime caller audit grep for `_finalize_pending_entry()` | covered for normal reconciliation incomplete-fill defer and caller-side pop/resolve guards |
 | RC-01, RC-02, RC-05 | `tests/test_live_entry_hedge_root_fix.py::TestResidualRepairExecutionV1Parity` | covered |
 | RC-03 | `tests/live_harness/test_residual_repair_incident_replay.py::test_hmstr_open_orders_present_pause_records_truth_evidence` | covered |
 | RC-04 | `tests/live_harness/test_residual_repair_incident_replay.py::test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed` | covered |
@@ -202,16 +210,20 @@ The minimum semantic surface from V1 is:
    `pending_entry.live_position_progress_deferred`, zero finalization,
    duplicate cleanup retries, and final exchange truth mismatch.
 
-5. `PE-12` / caller-side deferred finalize:
+5. `PE-18` / caller-side deferred finalize:
    create one runtime-path RED per finalize-and-pop caller where
    `_finalize_pending_entry()` can defer because fill details or live truth are
    incomplete. Expected: pending remains and no caller-level pop occurs.
+   RED/GREEN added for the normal reconciliation path in
+   `tests/test_runtime_entry_flow.py`; runtime call sites now consume the
+   finalizer boolean instead of assuming completion.
 
 6. `PE-13` / terminal fallback and cooldown:
-   if a production recurrence reaches zero-fill terminal maker state with
-   fallback/repost/cooldown evidence, add RED tests covering frozen-candidate
-   fallback materialization, fallback deferred retention, and cooldown before
-   changing runtime code.
+   force-terminal zero-fill must route through the finalizer rather than direct
+   pending removal. RED/GREEN added in `tests/test_runtime_entry_flow.py`. If a
+   future production recurrence reaches configured fallback/repost evidence, add
+   RED tests covering frozen-candidate fallback materialization, fallback
+   deferred retention, and cooldown before changing runtime code.
 
 7. `PE-14` / supervision terminal backlog clear:
    add RED tests before any supervision clear change proving that stale zero-fill
@@ -223,6 +235,11 @@ The minimum semantic surface from V1 is:
    residual, or deterministic cleanup semantics, add RED tests requiring
    fail-closed retention rather than guessed open/flat state.
 
+9. `PE-17` / same-symbol venue-overlap pending protection:
+   RED/GREEN added in `tests/test_runtime_entry_flow.py` and record-layer parity
+   coverage. Future overlapping-pending recurrences should update evidence/docs
+   if this row still passes.
+
 ## Bug Mapping
 
 | Bug / family | Contract rows | Coverage judgement | Next action |
@@ -232,7 +249,8 @@ The minimum semantic surface from V1 is:
 | CL-050 BIOUSDT local false-flat with live position | PE-03, RC-07, RC-08, DG-01 | covered and cloud-verified at `68a979b`; production verifier and service-env diagnose were high-confidence flat/no-open-orders across all seven venues | keep as regression; if it recurs, map evidence first and only add code after an uncovered RED row |
 | Bybit duplicate `110072` stale-fill/live-nonzero family | RC-06, RC-07, RC-08 | covered locally | keep repeated-loop/fail-closed regression |
 | Residual repair live truth card | RC-01 through RC-05 | mostly covered | add any BIOUSDT residual variant if evidence proves residual path |
-| Hyperliquid insufficient margin admission | PE-11 | covered for symbol-level containment | evaluate account/venue cooldown only if recurrence evidence supports it |
+| Hyperliquid insufficient margin admission | PE-11 | covered for symbol and venue-level containment | keep admission regression; if it recurs with same evidence, update docs/evidence only |
+| Post-contract WLD/XLM/MON/MOVE Hyperliquid margin rejects and XLM overlapping pending churn | PE-11, PE-17, PE-18 | covered locally by full-loop parity follow-up | deploy when requested; future recurrences map to these rows before code |
 | Diagnose false green | DG-01 through DG-03 | diagnose and production service verifier covered locally | keep production acceptance tied to exchange truth |
 
 ## Implementation Direction After RED Tests
@@ -255,6 +273,14 @@ The minimum semantic surface from V1 is:
    when credentialed exchange truth is red. DG-01 is now guarded locally by
    requiring exchange-truth evidence in `verify_production_services.py`.
 
+5. Treat the boolean result of `_finalize_pending_entry()` as part of the
+   contract. `False` means retained pending work; callers must back off or keep
+   recovery reachable, not resolve/pop.
+
+6. Apply V1 pending-entry protection before dispatch. Same symbol plus either
+   venue overlap is enough to block a new candidate while the old pending entry
+   is unresolved.
+
 Before editing any production function, run GitNexus freshness and impact for
 the target symbols named in the RED tests.
 
@@ -265,24 +291,14 @@ Source audit on 2026-06-04 found the expected core contract checks inside
 maker open-order truth, zero-fill checks maker live-position truth, balanced
 fills create managed open positions, and one-sided fills queue residual cleanup.
 
-The remaining structural risk is caller-side bypass: several runtime branches
-still call `_finalize_pending_entry()` and then remove the entry from
-`state.pending_entries` or a resolved-id list without checking whether the
-finalize call actually completed. These paths are candidates for PE-03/PE-08
-regression tests before any code edit:
+Follow-up audit on 2026-06-05 closed the caller-side bypass risk. Runtime
+callers now consume the boolean result of `_finalize_pending_entry()`: true paths
+may resolve/pop, false paths retain pending work and back off. The RED/GREEN
+normal-reconciliation test covers incomplete fill-detail deferral, and a code
+grep confirms no bare `await self._finalize_pending_entry(...)` call remains.
 
-- passive maintenance resolved list after finalize:
-  `lightfee/engine/runtime.py:4534`, `:4545`, `:4553`, final pop at `:4562`.
-- normal reconciliation resolved list after finalize:
-  `lightfee/engine/runtime.py:5082`, `:5087`, `:5188`, final pop at `:5198`.
-- force-reconcile resolved list after finalize:
-  `lightfee/engine/runtime.py:6460`, final pop at `:6481`.
-- startup recovery finalize-and-pop paths:
-  `lightfee/engine/runtime.py:6700`, `:6759`, `:6792`.
-- terminalization hard-ceiling finalize-and-pop path:
-  `lightfee/engine/runtime.py:5950`.
-
-No production evidence after deploy currently proves one of these branches is
-active: cloud truth is flat/no-open-orders. Therefore this audit records the
-contract-bypass candidates for RED-test-first follow-up rather than changing
-runtime code blindly.
+The same follow-up added V1 same-symbol venue-overlap pending protection and
+Hyperliquid insufficient-margin venue cooldown coverage. Remaining open matrix
+rows are evidence-driven, not active production bugs: `PE-14` needs supervision
+backlog RED tests before any stale-backlog clear change, and pending-entry
+`PE-16` needs targeted RED only if future live truth is ambiguous or untrusted.

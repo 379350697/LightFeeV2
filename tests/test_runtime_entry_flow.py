@@ -8,20 +8,29 @@ Rust references:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
-from lightfee.core.domain import OrderFill, OrderRequest, PositionSnapshot, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderRequest,
+    PassiveOrderState,
+    PositionSnapshot,
+    Side,
+    Venue,
+)
 from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
 from lightfee.engine.execution_planner import ExecutionRoute
-from lightfee.engine.reconciliation import OrderReconciler
+from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
     EngineState,
     OpenPosition,
+    PendingPassiveOrder,
     PassiveExecutionPhase,
     PassivePhaseState,
     PendingEntry,
@@ -278,6 +287,37 @@ class TestPendingEntryTracking:
             uncertain_outcome=True,
         )
         assert pe.uncertain_outcome is True
+
+    def test_pending_entry_dedup_blocks_same_symbol_venue_overlap_like_v1(
+        self, config, tmp_journal
+    ):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="entry-xlm-live-deferred",
+            symbol="XLMUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=116.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1780591991005,
+            maker_client_order_id="maker-xlm-live-deferred",
+            hedge_client_order_id="hedge-xlm-live-deferred",
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        candidate = SimpleNamespace(
+            symbol="XLMUSDT",
+            long_venue="bybit",
+            short_venue="okx",
+        )
+
+        allowed, reason = runtime._gate_pending_entry_dedup(candidate)
+
+        assert allowed is False
+        assert reason == "pending_entry_protection"
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1387,118 @@ class TestPlannerDispatchIntegration:
         kinds = [r["kind"] for r in records]
         assert "pending_entry.maker_progress_applied" not in kinds
         assert "pending_entry.missing_hedge_detected" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_reconcile_retains_pending_when_finalize_defers_missing_fill_details(
+        self, config, tmp_journal
+    ):
+        """V1: deferred finalization is still pending recovery work, not resolved."""
+
+        class PricelessFilledReconciler:
+            async def reconcile_position(self, **kwargs):
+                return PositionReconciliationResult(
+                    position_id=kwargs["position_id"],
+                    symbol=kwargs["symbol"],
+                    long_status="filled",
+                    short_status="filled",
+                    long_fill=OrderFill(
+                        venue=Venue.BYBIT,
+                        symbol=kwargs["symbol"],
+                        side=Side.BUY,
+                        quantity=116.0,
+                        price=0.0,
+                        order_id="maker-xlm-filled",
+                        filled_at_ms=1780591992000,
+                    ),
+                    short_fill=OrderFill(
+                        venue=Venue.HYPERLIQUID,
+                        symbol=kwargs["symbol"],
+                        side=Side.SELL,
+                        quantity=116.0,
+                        price=0.0,
+                        order_id="hedge-xlm-filled",
+                        filled_at_ms=1780591992000,
+                    ),
+                )
+
+            def drain_order_diagnostics(self):
+                return []
+
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        hyperliquid = FakeVenueAdapter(Venue.HYPERLIQUID)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BYBIT: bybit, Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal = tmp_journal
+        runtime.reconciler = PricelessFilledReconciler()
+        pending = PendingEntry(
+            pending_id="entry-xlm-priceless",
+            symbol="XLMUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=116.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1780591991000,
+            maker_order_id="maker-xlm-filled",
+            hedge_order_id="hedge-xlm-filled",
+            maker_client_order_id="maker-xlm-cid",
+            hedge_client_order_id="hedge-xlm-cid",
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(1780591993000)
+
+        assert pending.pending_id in runtime.state.pending_entries
+        assert runtime.state.open_positions == {}
+        records = tmp_journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "pending_entry.finalize_deferred_incomplete_fill" in kinds
+        assert "pending_entry.pending_entry_finalized" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_force_terminal_zero_fill_uses_finalizer_not_blind_pop(
+        self, config, tmp_journal
+    ):
+        """V1: force-terminal zero fill still emits terminal no-fill evidence."""
+        config.strategy.pending_entry_force_terminal_after_ms = 1_000
+        config.strategy.pending_entry_hard_ceiling_ms = 120_000
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="entry-zero-force-terminal",
+            symbol="WLDUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=38.7,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000,
+            maker_client_order_id="",
+            hedge_client_order_id="",
+            uncertain_outcome=True,
+            passive_order=PendingPassiveOrder(
+                last_progress_state=PassiveOrderState.CANCELED,
+                target_quantity=38.7,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
+            pending,
+            pending.pending_id,
+            3_000,
+        )
+
+        assert handled is True
+        assert pending.pending_id not in runtime.state.pending_entries
+        records = tmp_journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "entry.passive_unfilled" in kinds
+        assert "pending_entry.pending_entry_finalized" in kinds
+        assert "pending_entry.force_terminalized" not in kinds
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_rejects_below_min_notional(self, config, tmp_journal):

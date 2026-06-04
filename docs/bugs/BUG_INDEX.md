@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest pending-entry V1 full-loop parity follow-up, 2026-06-05: post-contract
+review after the latest deployment did not create a new independent CL bug. The
+observed pending churn maps to the unified
+[`pending-entry-live-truth-contract`](contracts/pending-entry-live-truth-contract.md):
+Hyperliquid insufficient-margin retries are `PE-11`, same-symbol venue-overlap
+pending protection is `PE-17`, deferred-finalizer caller retention is `PE-18`,
+and force-terminal zero-fill finalizer routing is `PE-13`. V2 now blocks
+Hyperliquid account/venue margin recurrences with a venue cooldown before maker
+submit, matches V1 `pending_entry_protection` for same-symbol candidates sharing
+either venue, makes `_finalize_pending_entry()` return terminality status, and
+requires callers to retain/backoff when finalization defers. Focused local
+verification passed: runtime/admission `51 passed`, pending-entry parity
+`35 passed`, and record-layer pending protection `1 passed`, `27 deselected`.
+Adjacent gates passed (`355 passed`; `49 passed`), compileall and diff-check
+passed, and full pytest passed with `3447 passed`, `9 skipped`, `1 warning`.
+This follow-up is documented in
+[`daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity`](daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity).
+No cloud deployment is included in this session by request.
+
 Latest recovery bulk-probe timeout evidence follow-up, 2026-06-04:
 `recovery.live_position_bulk_probe_error` timeout is not root-fixed because the
 available evidence is insufficient to distinguish exchange/network transport

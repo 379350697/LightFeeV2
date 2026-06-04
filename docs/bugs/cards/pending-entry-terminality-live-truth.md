@@ -22,6 +22,13 @@ evidence must map to the matrix before runtime code changes.
   truth has a nonzero position and local state has no managed open position.
 - `startup_recovery_pending_work_without_open_positions` blocks recovery even
   though credentialed exchange truth proves a pending entry has live exposure.
+- Hyperliquid `Insufficient margin to place order.` repeats after maker
+  exposure, or new candidates continue to route through Hyperliquid while an
+  account/venue margin block is active.
+- A same-symbol candidate changes one venue and bypasses an unresolved pending
+  entry that already shares the other venue.
+- `_finalize_pending_entry()` emits deferred evidence, but the caller still
+  resolves or removes the pending entry.
 
 ## Current Effective Rule
 
@@ -41,6 +48,15 @@ as a local false-flat loop. Startup/runtime recovery must either hydrate and
 finalize the live quantity into managed state, create deterministic residual or
 reduce-only cleanup work, or stay fail-closed/risk-only with explicit exchange
 truth evidence and no new-entry risk.
+
+The finalizer return value is terminality evidence. If
+`_finalize_pending_entry()` defers because fill details, open-order truth, or
+live-position truth are incomplete, callers must retain pending work and back
+off. A deferred finalizer call is not a resolved entry.
+
+While a pending entry is unresolved, V1 protects the same pair and the same
+symbol with either venue overlapping. A new route cannot bypass live-truth
+recovery by swapping only one venue.
 
 ## V1 / Exchange Semantics
 
@@ -78,6 +94,13 @@ truth evidence and no new-entry risk.
   supervision backlog clear, and ambiguous-live fail-closed semantics are now
   explicit matrix rows (`PE-12` through `PE-16`). They must not be treated as
   optional just because CL-048 / CL-049 / CL-050 did not exercise all of them.
+- V1 `pending_entry_gate_reason_excluding_position` blocks same-pair pending
+  entries and same-symbol candidates with any venue overlap. The block reason is
+  `pending_entry_protection`.
+- Hyperliquid insufficient margin is deterministic admission evidence. Once it
+  proves account/venue capacity is exhausted, V2 must block new entries through
+  that venue before maker submit, not discover the same condition after another
+  maker exposure.
 
 ## Attempts Ledger
 
@@ -94,6 +117,7 @@ truth evidence and no new-entry risk.
 | 2026-06-04 | SEIUSDT post-deploy retained pending/live-truth mismatch | deployed/cloud verified | Rejected pending entries with positive fill evidence now route through V1 `_finalize_pending_entry()` from startup force reconcile, startup recovery, and normal reconciliation. The SEIUSDT fixture finalizes maker `455.0` / hedge `68.0` into matched open `68.0` plus Bybit residual repair `387.0`; incomplete evidence is retained with explicit deferred events instead of local false-flat looping. Full pytest reached `3434 passed`, `9 skipped`, `1 warning`; cloud final health is running/flat with no open orders. |
 | 2026-06-04 | SEIUSDT open maker order truth before zero-fill finalize | deployed/cloud verified | `_finalize_pending_entry()` now queries live maker open-order truth before removing a zero-fill pending entry. If a matching maker order is still open, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_open_order`; diagnose also treats acceptance-gate open-order blockers as unhealthy. Cloud final truth is high-confidence flat/no-open-orders on all venues. |
 | 2026-06-04 | BIOUSDT live-position truth before zero-fill finalize | deployed/cloud verified | `_finalize_pending_entry()` now checks maker live-position truth before removing a zero-fill pending entry. If maker live position is nonzero, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_live_position`; residual duplicate cleanup and production service gating are also covered. Cloud `68a979b` final verifier/diagnose proved all seven venues flat/no-open-orders. |
+| 2026-06-05 | Full-loop V1 parity follow-up after post-deploy pending churn | effective locally; not deployed in this session | Hyperliquid insufficient-margin now creates both symbol and venue admission cooldowns; same-symbol venue-overlap pending entries block with `pending_entry_protection`; `_finalize_pending_entry()` returns terminality status and runtime callers retain/backoff on deferred finalization instead of resolving/popping; force-terminal zero-fill routes through the finalizer so positive/live evidence cannot be discarded. |
 
 ## Recurrences
 
@@ -108,6 +132,7 @@ truth evidence and no new-entry risk.
 | 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid | `8be067e`; deployed via `30aba89` | local RED/GREEN fixed retained rejected positive-fill recovery; cloud emitted `recovery.rejected_pending_positive_fill_finalized`, completed residual repair and drift correction, then settled to `lifecycle=running`, local open/pending/residual `0/0/0`, all-venue exchange truth flat/no open orders | [daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch](../daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch) |
 | 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid open maker order | `1e082d9` | local RED/GREEN prevents zero-fill finalization when Bybit live open-order truth still has the maker order; cloud final diagnose is healthy/high-confidence flat/no-open-orders on all venues, and no manual order/state mutation was used | [daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality](../daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) |
 | 2026-06-04 | `BIOUSDT` Bybit live maker position | `68a979b` | deployed/cloud verified: local RED/GREEN prevents zero-fill finalization when Bybit maker live-position truth is nonzero; RC-08 duplicate cleanup convergence and DG-01 production service gate are covered; final verifier/diagnose proved all seven venues flat/no-open-orders. CL-048/049/050 now map to the contract matrix instead of separate active bug tracks. | [daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality](../daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality) |
+| 2026-06-05 | `WLDUSDT`, `XLMUSDT`, `MONUSDT`, `MOVEUSDT` Hyperliquid margin rejects; `XLMUSDT` overlapping pending route | local follow-up | Mapped to `PE-11`, `PE-17`, and `PE-18`; local RED/GREEN covers venue-level margin cooldown, same-symbol venue-overlap pending protection, deferred-finalizer retention, and force-terminal zero-fill finalizer routing. No cloud deployment in this session. | [daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity](../daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity) |
 
 ## Regression Harness
 
@@ -140,3 +165,11 @@ truth evidence and no new-entry risk.
    startup recovery can use credentialed live truth to hydrate/finalize,
    residualize, or issue deterministic reduce-only cleanup instead of looping
    in local false-flat/risk-only.
+13. If Hyperliquid insufficient margin appears, confirm whether the block is
+   account/venue scoped. If yes, future candidates through Hyperliquid must be
+   blocked before maker submit.
+14. If a pending entry remains unresolved, block same-symbol candidates that
+   share either venue until finalization, residual cleanup, or fail-closed
+   evidence releases the risk.
+15. If finalization emits a deferred event, check that the caller retained the
+   pending entry and did not append it to a resolved list or pop it afterward.
