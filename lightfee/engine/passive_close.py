@@ -49,6 +49,7 @@ from lightfee.engine.close_executor import (
     close_leg_exchange_min_notional_violation,
     compute_close_chunks,
 )
+from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
@@ -150,6 +151,7 @@ class PassiveCloseConfig:
     max_slippage_bps: Optional[float] = None
     default_tick_size: float = 0.01
     close_chunk_max_notional_quote: float = 0.0
+    maker_hedge_deadline_ms: int = 800
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,7 @@ class PassiveCloseExecutor:
             max_slippage_bps=overrides.get("max_slippage_bps"),
             default_tick_size=overrides.get("default_tick_size", 0.01),
             close_chunk_max_notional_quote=overrides.get("close_chunk_max_notional_quote", 0.0),
+            maker_hedge_deadline_ms=overrides.get("maker_hedge_deadline_ms", 800),
         )
         # Inject L2 mid resolver for live repricing (set by runtime after construction)
         self._l2_mid_resolver: Optional[callable] = None
@@ -265,6 +268,268 @@ class PassiveCloseExecutor:
     ) -> bool:
         """V1: ops token bucket check for passive close maintenance."""
         return ops_token_available(pending, profile, now_ms)
+
+    def _exit_deadline_extension_ms(
+        self,
+        *,
+        base_hard_deadline_ms: int,
+        notional_quote: float,
+        quote_fresh: bool,
+        has_execution_progress: bool,
+        reconciled: bool,
+    ) -> int:
+        """V1 adaptive_hedge_deadline_extension_ms for passive exit hedges."""
+        if not quote_fresh:
+            return 0
+        if reconciled and not has_execution_progress:
+            return 0
+
+        notional = max(float(notional_quote or 0.0), 0.0)
+        if notional <= 50.0:
+            base_extension_ms = 800
+        elif notional <= 150.0:
+            base_extension_ms = 400
+        elif notional <= 300.0:
+            base_extension_ms = 200
+        else:
+            base_extension_ms = 0
+
+        if base_extension_ms <= 0:
+            return 0
+
+        progress_bonus_ms = 250 if has_execution_progress else 0
+        reconciled_bonus_ms = 100 if reconciled and has_execution_progress else 0
+        exit_cap_ms = max(int(base_hard_deadline_ms or 0) // 5, 0)
+        return min(base_extension_ms + progress_bonus_ms + reconciled_bonus_ms, exit_cap_ms)
+
+    @staticmethod
+    def _deadline_clock_domains_match(started_at_ms: int, now_ms: int) -> bool:
+        """Avoid mixing test-local millisecond clocks with wall-clock epoch ms."""
+        epoch_floor_ms = 1_000_000_000_000
+        return not started_at_ms < epoch_floor_ms <= now_ms
+
+    def _passive_close_hedge_deadline_decision(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        now_ms: int,
+        *,
+        reconciled: bool = False,
+    ) -> dict[str, Any]:
+        """V1 exit_hedge_deadline_decision for pending passive-close hedge gaps."""
+        unhedged_gap = max(pending.maker_fill.quantity - pending.hedge_fill.quantity, 0.0)
+        if unhedged_gap <= 1e-9:
+            return {"hard_breached": False, "unhedged_gap": 0.0}
+
+        started_at_ms = (
+            pending.maker_fill.last_fill_time_ms
+            or pending.phase_state.cycle_started_at_ms
+            or pending.multi_phase_started_at_ms
+        )
+        if started_at_ms <= 0 or now_ms <= 0:
+            return {"hard_breached": False, "unhedged_gap": unhedged_gap}
+        if not self._deadline_clock_domains_match(started_at_ms, now_ms):
+            return {"hard_breached": False, "unhedged_gap": unhedged_gap}
+
+        if pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG:
+            hedge_venue = position.short_venue
+            hedge_side = Side.BUY
+            hedge_leg = "short"
+        else:
+            hedge_venue = position.long_venue
+            hedge_side = Side.SELL
+            hedge_leg = "long"
+
+        price_hint = self._resolve_local_l2_mid(hedge_venue, position.symbol)
+        if price_hint <= 0.0:
+            price_hint = pending.maker_fill.average_price
+        base_hard_ms = max(int(self._config.maker_hedge_deadline_ms or 0), 1)
+        extension_ms = self._exit_deadline_extension_ms(
+            base_hard_deadline_ms=base_hard_ms,
+            notional_quote=unhedged_gap * max(price_hint, 0.0),
+            quote_fresh=price_hint > 0.0,
+            has_execution_progress=pending.hedge_fill.quantity > 1e-9,
+            reconciled=reconciled,
+        )
+        hard_deadline_ms = max(base_hard_ms + extension_ms, 1)
+        elapsed_ms = max(now_ms - started_at_ms, 0)
+        return {
+            "hard_breached": elapsed_ms > hard_deadline_ms,
+            "hard_deadline_ms": hard_deadline_ms,
+            "soft_deadline_ms": min(base_hard_ms // 2 + extension_ms // 2, hard_deadline_ms),
+            "hedge_elapsed_ms": elapsed_ms,
+            "hedge_venue": hedge_venue,
+            "hedge_side": hedge_side,
+            "hedge_leg": hedge_leg,
+            "unhedged_gap": unhedged_gap,
+            "price_hint": price_hint,
+            "reconciled": reconciled,
+        }
+
+    def _passive_close_fallback_deadline_decision(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Deadline for DUAL_TAKER fallback execution itself."""
+        started_at_ms = (
+            pending.phase_state.phase_started_at_ms
+            or pending.multi_phase_started_at_ms
+            or pending.phase_state.cycle_started_at_ms
+        )
+        if started_at_ms <= 0 or now_ms <= 0:
+            return {"hard_breached": False}
+        if not self._deadline_clock_domains_match(started_at_ms, now_ms):
+            return {"hard_breached": False}
+
+        remaining_quantity = max(
+            pending.current_chunk_quantity() - min(
+                pending.maker_fill.quantity,
+                pending.hedge_fill.quantity,
+            ),
+            0.0,
+        )
+        price_hint = max(
+            self._resolve_local_l2_mid(position.long_venue, position.symbol),
+            self._resolve_local_l2_mid(position.short_venue, position.symbol),
+            0.0,
+        )
+        base_hard_ms = max(int(self._config.maker_hedge_deadline_ms or 0), 1)
+        extension_ms = self._exit_deadline_extension_ms(
+            base_hard_deadline_ms=base_hard_ms,
+            notional_quote=remaining_quantity * price_hint,
+            quote_fresh=price_hint > 0.0,
+            has_execution_progress=False,
+            reconciled=False,
+        )
+        hard_deadline_ms = max(base_hard_ms + extension_ms, 1)
+        elapsed_ms = max(now_ms - started_at_ms, 0)
+        return {
+            "hard_breached": elapsed_ms > hard_deadline_ms,
+            "hard_deadline_ms": hard_deadline_ms,
+            "soft_deadline_ms": min(base_hard_ms // 2 + extension_ms // 2, hard_deadline_ms),
+            "elapsed_ms": elapsed_ms,
+            "remaining_quantity": remaining_quantity,
+            "price_hint": price_hint,
+        }
+
+    async def _enter_passive_close_hedge_fail_closed(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        decision: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        enter_fail_closed(state)
+        state.last_error = f"passive close hedge deadline breached for {pending.position_id}"
+        pending.next_retry_at_ms = 0
+        payload = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "execution_kind": "exit",
+            "hedge_venue": decision.get("hedge_venue").value
+            if isinstance(decision.get("hedge_venue"), Venue) else str(decision.get("hedge_venue", "")),
+            "hedge_side": decision.get("hedge_side").value
+            if isinstance(decision.get("hedge_side"), Side) else str(decision.get("hedge_side", "")),
+            "hedge_elapsed_ms": decision.get("hedge_elapsed_ms", 0),
+            "deadline_ms": decision.get("hard_deadline_ms", 0),
+            "soft_deadline_ms": decision.get("soft_deadline_ms", 0),
+            "has_execution_progress": pending.hedge_fill.quantity > 1e-9,
+            "hedge_notional_quote": decision.get("unhedged_gap", 0.0)
+            * max(decision.get("price_hint", 0.0), 0.0),
+            "reconciled": bool(decision.get("reconciled", False)),
+            "source": source,
+        }
+        self._journal.append("execution.hedge_deadline_breached", payload)
+        self._journal.append(
+            "exit.passive_close_hedge_deadline_fail_closed",
+            {
+                **payload,
+                "maker_quantity": pending.maker_fill.quantity,
+                "hedge_quantity": pending.hedge_fill.quantity,
+                "unhedged_gap": decision.get("unhedged_gap", 0.0),
+            },
+        )
+
+        compensate = getattr(self._close_executor, "compensate_failed_full_close", None)
+        if callable(compensate):
+            short_legs, long_legs = self._pending_runtime_close_legs(pending)
+            try:
+                await compensate(
+                    position=position,
+                    close_reason="passive_close_hedge_deadline_breached",
+                    failed_stage=(
+                        pending.short_stage or "exit_short"
+                        if decision.get("hedge_leg") == "short"
+                        else pending.long_stage or "exit_long"
+                    ),
+                    failed_venue=decision.get("hedge_venue"),
+                    error=RuntimeError("passive close hedge deadline breached"),
+                    short_legs=short_legs,
+                    long_legs=long_legs,
+                    state=state,
+                )
+            except Exception as exc:
+                self._journal.append(
+                    "exit.passive_close_hedge_deadline_compensation_failed",
+                    {
+                        "position_id": pending.position_id,
+                        "symbol": position.symbol,
+                        "error": str(exc),
+                        "source": source,
+                    },
+                )
+                return False
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_hedge_deadline_compensated_flat",
+                extra={"source": source},
+            ):
+                return True
+            return False
+
+        self._journal.append(
+            "exit.passive_close_hedge_deadline_compensation_unavailable",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "source": source,
+            },
+        )
+        return False
+
+    def _enter_passive_close_execution_fail_closed(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        decision: dict[str, Any],
+        *,
+        source: str,
+        error: str,
+    ) -> None:
+        enter_fail_closed(state)
+        state.last_error = f"passive close fallback deadline breached for {pending.position_id}: {error}"
+        pending.next_retry_at_ms = 0
+        self._journal.append(
+            "execution.close_deadline_breached",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "execution_kind": "exit",
+                "elapsed_ms": decision.get("elapsed_ms", 0),
+                "deadline_ms": decision.get("hard_deadline_ms", 0),
+                "soft_deadline_ms": decision.get("soft_deadline_ms", 0),
+                "remaining_quantity": decision.get("remaining_quantity", 0.0),
+                "source": source,
+                "error": error,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Start
@@ -554,6 +819,17 @@ class PassiveCloseExecutor:
                             return False
                         # Hedge not caught up — record unhedged residual, retry
                         unhedged = pending.maker_fill.quantity - pending.hedge_fill.quantity
+                        deadline = self._passive_close_hedge_deadline_decision(
+                            pending, position, now_ms,
+                        )
+                        if deadline.get("hard_breached"):
+                            return await self._enter_passive_close_hedge_fail_closed(
+                                state,
+                                pending,
+                                position,
+                                deadline,
+                                source="terminal_maker_filled_unhedged_retry",
+                            )
                         self._journal.append(
                             "exit.passive_close_unhedged_residual",
                             {
@@ -597,6 +873,17 @@ class PassiveCloseExecutor:
 
             unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
             if unhedged_gap > 1e-9:
+                deadline = self._passive_close_hedge_deadline_decision(
+                    pending, position, now_ms,
+                )
+                if deadline.get("hard_breached"):
+                    return await self._enter_passive_close_hedge_fail_closed(
+                        state,
+                        pending,
+                        position,
+                        deadline,
+                        source="drive_unhedged_gap",
+                    )
                 # --- V1 small-fill buffer: avoid submitting hedge below min-notional ---
                 # Compute hedge price hint for notional check
                 if maker_leg == ActiveMakerLeg.LONG:
@@ -3533,15 +3820,28 @@ class PassiveCloseExecutor:
                     live_long_qty=live_long_qty,
                     live_short_qty=live_short_qty,
                 )
-        elif await self._clear_if_live_flat(
-            state,
-            pending,
-            position,
-            source="pending_passive_close_flat_probe",
-        ):
-            return True
+            elif await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="pending_passive_close_flat_probe",
+            ):
+                return True
 
         if self._close_executor is None:
+            deadline = self._passive_close_fallback_deadline_decision(
+                pending, position, self._now_ms(),
+            )
+            if deadline.get("hard_breached"):
+                self._enter_passive_close_execution_fail_closed(
+                    state,
+                    pending,
+                    position,
+                    deadline,
+                    source="fallback_no_close_executor",
+                    error="no close_executor injected",
+                )
+                return False
             self._journal.append(
                 "exit.passive_close_fallback_unavailable",
                 {
@@ -3570,6 +3870,19 @@ class PassiveCloseExecutor:
         from lightfee.engine.close_executor import CloseExecutor
 
         if not isinstance(self._close_executor, CloseExecutor):
+            deadline = self._passive_close_fallback_deadline_decision(
+                pending, position, self._now_ms(),
+            )
+            if deadline.get("hard_breached"):
+                self._enter_passive_close_execution_fail_closed(
+                    state,
+                    pending,
+                    position,
+                    deadline,
+                    source="fallback_invalid_close_executor",
+                    error="close_executor is not CloseExecutor",
+                )
+                return False
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
 
@@ -3602,9 +3915,19 @@ class PassiveCloseExecutor:
                         },
                     ):
                         return True
+                deadline = self._passive_close_hedge_deadline_decision(
+                    pending, position, self._now_ms(),
+                )
+                if deadline.get("hard_breached"):
+                    return await self._enter_passive_close_hedge_fail_closed(
+                        state,
+                        pending,
+                        position,
+                        deadline,
+                        source="fallback_unhedged_failed",
+                    )
                 pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
-            # Recompute paired residual after hedge catch-up
             paired_residual = max(pending.current_chunk_quantity() - pending.maker_fill.quantity, 0.0)
 
         # Step 2: Close paired residual via aggressive close
@@ -3620,8 +3943,20 @@ class PassiveCloseExecutor:
                 short_stage=pending.short_stage or "exit_short",
                 long_stage=pending.long_stage or "exit_long",
             )
-            # Check if aggressive close actually executed
             if close_result is None:
+                deadline = self._passive_close_fallback_deadline_decision(
+                    pending, position, self._now_ms(),
+                )
+                if deadline.get("hard_breached"):
+                    self._enter_passive_close_execution_fail_closed(
+                        state,
+                        pending,
+                        position,
+                        deadline,
+                        source="fallback_aggressive_null_result",
+                        error="close_executor returned None",
+                    )
+                    return False
                 self._journal.append(
                     "exit.passive_close_fallback_aggressive_null_result",
                     {"position_id": pending.position_id},
@@ -3637,16 +3972,28 @@ class PassiveCloseExecutor:
                 pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
 
-            long_closed = close_result.long_close_qty if hasattr(close_result, 'long_close_qty') else 0.0
-            short_closed = close_result.short_close_qty if hasattr(close_result, 'short_close_qty') else 0.0
+            long_closed = close_result.long_close_qty if hasattr(close_result, "long_close_qty") else 0.0
+            short_closed = close_result.short_close_qty if hasattr(close_result, "short_close_qty") else 0.0
 
             if long_closed < 1e-12 and short_closed < 1e-12:
-                # Zero fill — check if a PendingClose was registered for tracking
                 has_pending_close = any(
                     pc.position_id == pending.position_id
                     for pc in state.pending_closes.values()
                 )
                 if not has_pending_close:
+                    deadline = self._passive_close_fallback_deadline_decision(
+                        pending, position, self._now_ms(),
+                    )
+                    if deadline.get("hard_breached"):
+                        self._enter_passive_close_execution_fail_closed(
+                            state,
+                            pending,
+                            position,
+                            deadline,
+                            source="fallback_zero_fill_no_pending",
+                            error="aggressive close returned zero fill with no pending close",
+                        )
+                        return False
                     self._journal.append(
                         "exit.passive_close_fallback_zero_fill_no_pending",
                         {

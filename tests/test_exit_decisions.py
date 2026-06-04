@@ -22,6 +22,7 @@ from lightfee.engine.exit_decision import (
     is_delever_close_reason,
     is_protection_close_reason,
     normal_close_reason_uses_passive_maker_taker,
+    passive_close_fallback_due,
     position_delta_monitor,
     remaining_close_delay_active,
     stale_market_safe_close_reason,
@@ -456,6 +457,35 @@ class TestForceCloseDue:
         )
         cfg = _config(settlement_force_close_delay_secs=1200)
         assert force_close_due(pos, cfg, 2200001) is False
+
+
+class TestPassiveCloseFallbackDue:
+    def test_staggered_after_first_stage_past_force_deadline(self):
+        pos = _make_position(
+            opportunity_type="staggered",
+            matched_quantity=0.01,
+            funding_timestamp_ms=1000000,
+            second_funding_timestamp_ms=2000000,
+            second_stage_enabled_at_entry=True,
+            exit_after_first_stage=True,
+        )
+        cfg = _config(settlement_force_close_delay_secs=1200)
+
+        assert passive_close_fallback_due(pos, cfg, 2200001) is True
+
+    def test_staggered_waiting_second_stage_uses_second_funding_deadline(self):
+        pos = _make_position(
+            opportunity_type="staggered",
+            matched_quantity=0.01,
+            funding_timestamp_ms=1000000,
+            second_funding_timestamp_ms=2000000,
+            second_stage_enabled_at_entry=True,
+            exit_after_first_stage=False,
+        )
+        cfg = _config(settlement_force_close_delay_secs=1200)
+
+        assert passive_close_fallback_due(pos, cfg, 2200001) is False
+        assert passive_close_fallback_due(pos, cfg, 3200001) is True
 
 
 # ---------------------------------------------------------------------------

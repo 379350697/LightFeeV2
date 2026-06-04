@@ -1,140 +1,86 @@
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# Agent Instructions - LightFeeV2
 
-This project is indexed by GitNexus as **LightFeeV2** (20613 symbols, 43745 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+These instructions apply to `/Users/wl/projects/LightFeeV2`.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+This project is used by both Codex and Claude Code. Keep `AGENTS.md` and
+`CLAUDE.md` synchronized; `AGENTS.md` is the source of truth when the two files
+disagree.
 
-## Always Do
+## V1 Reference
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+`LightFee V1` means the original legacy LightFee production behavior, especially
+the Rust V1 live-trading semantics. When the sibling V1 repo is available, it is
+expected at `/Users/wl/projects/LightFee`.
 
-## Never Do
+For LightFeeV2, V1 is authoritative only for compatibility-sensitive trading
+semantics such as recovery, passive close, residual repair, and live-position
+truth. If V2 behavior disagrees with V1 in those areas, treat V1 as the expected
+semantic contract before changing the V2 implementation.
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+## Production Safety
 
-## Resources
+- Treat production diagnostics and trading-state changes as high risk.
+- Start read-only unless the user explicitly asks for a fix, deploy, or mutation.
+- Do not submit orders, cancel orders, edit runtime state, or deploy while
+  gathering evidence.
+- For bugs involving live exchange state, exchange truth outranks local recovered
+  state.
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/LightFeeV2/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/LightFeeV2/clusters` | All functional areas |
-| `gitnexus://repo/LightFeeV2/processes` | All execution flows |
-| `gitnexus://repo/LightFeeV2/process/{name}` | Step-by-step execution trace |
+## GitNexus
 
-## CLI
+The actual GitNexus repo name for this project is `LightFeeV2`.
 
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+Prefer GitNexus MCP tools when available. If MCP tools are unavailable, use the
+GitNexus CLI equivalents. Prefer the `rtk` prefix for compact output; if `rtk`
+is not installed in the current shell, run the same command without `rtk`.
 
-<!-- gitnexus:end -->
+Before relying on GitNexus for the current code:
 
-<!-- lightfee-v1-contract:start -->
-# LightFee V1 Recovery / Close Semantic Contract
+1. Get the current commit:
 
-When a production bug is a V2/V1 semantic drift, V1 is authoritative. Do not
-replace these rules with wider thresholds, manual state edits, or approximate
-V2-only shortcuts.
+   ```bash
+   rtk git rev-parse HEAD
+   ```
 
-## Passive Close / Recovery
+2. Call GitNexus `list_repos` and check repo `LightFeeV2`:
+   - `lastCommit` must match the current `HEAD`.
+   - `staleness.commitsBehind` must be `0`.
 
-- Exchange truth outranks local recovered state. Local matched quantities are
-  evidence, not authority, once live position probes disagree.
-- Before retrying a pending passive close from recovered or fallback state,
-  probe both live legs and trusted open-order truth when available.
-- If both live legs are flat and there are no trusted open orders, clear the
-  pending passive close, local open position, and related last-error/recovery
-  latch. Persist only after both pending and open state are removed.
-- If live truth is one-sided, close the actual live nonzero exposure with
-  reduce-only taker semantics. Do not derive the close target from stale local
-  matched deltas.
-- Terminal under-minimum or normalized-zero hedge branches must not schedule an
-  identical retry loop. V1 buffers small fills while the maker is still live;
-  once the maker is terminal or attempts are exhausted, it emits the terminal
-  min-notional path and compensates/flattens from live exchange truth.
-- Missing price evidence is not allowed to become an infinite retry loop. Use a
-  V1-compatible live-truth compensation path when there is confirmed live
-  one-sided exposure; if compensation cannot prove flat, remain fail-closed with
-  structured evidence.
+   CLI fallback:
 
-## Residual Repair
+   ```bash
+   rtk npx gitnexus list
+   rtk npx gitnexus status
+   ```
 
-- Residual repair is normal runtime housekeeping, not a startup-only cleanup.
-- Fetch live position for the repair venue. V2 may also fetch counter venue and
-  open-order truth, but that safety check must not block a tradeable repair on
-  the repair venue.
-- Compute live excess relative to the V1 baseline. If live excess is zero and
-  trusted open-order truth is clear, complete the repair and release the pair
-  gate.
-- If live excess is tradeable, submit one reduce-only IOC repair for the live
-  excess even when the task was previously paused or attempts were exhausted.
-- A paused or attempt-exhausted repair may be resumed only when live position
-  truth and open-order truth are trusted, and repeated submit failures must still
-  respect `next_attempt_ms` backoff.
-- When no local open position remains but the repair venue has trusted nonzero
-  live exposure, rebuild the close side from the signed live position before
-  submitting reduce-only IOC. This is a V2 root-fix extension over V1's
-  conservative paused-task behavior, not a reason to keep stale local repair
-  side authoritative.
-- If live excess is below official venue quantity/notional rules, terminalize
-  the residual as dust and release the pair gate with the official metadata
-  source in the evidence.
-- If live truth or open-order truth is unavailable, keep fail-closed and emit a
-  non-empty structured reason. Do not clear or mark green from missing truth.
+3. If `staleness.commitsBehind > 0`, `lastCommit` differs from `HEAD`, symbols
+   are missing, call relationships look wrong, or node versions do not match the
+   current code, rebuild the index from the repo root:
 
-## Required Closure Evidence
+   ```bash
+   rtk npx gitnexus analyze --index-only --name LightFeeV2 --drop-embeddings .
+   ```
 
-- Every production P0 must have a sanitized production fixture or fake-adapter
-  harness that fails before the fix and passes after it.
-- Branches that depend on real exchange state must have a read-only probe path.
-  Probes may fetch positions, open orders, instrument metadata, account/risk
-  metadata, and public market data; they must not submit, cancel, or mutate.
-- A fix is not complete until the focused harness and the relevant probe/default
-  probe guard both pass, and production current state no longer shows the stale
-  open/pending/residual condition or has an explicitly documented dust terminal.
+4. Re-run GitNexus `list_repos` or the CLI fallback and confirm the index is
+   fresh before running `impact`, `query`, `context`, or `detect_changes`.
 
-<!-- lightfee-v1-contract:end -->
+Embedding rules:
 
-<!-- rtk-skills:start -->
-# RTK Skills — Auto-Invoke Rules
+- Default rebuilds must use `--index-only --drop-embeddings`.
+- Do not use `--embeddings` by default.
+- Do not use `--embeddings=0` as a way to disable embeddings. It enables
+  embeddings and removes the generation cap.
+- Use `--embeddings` only when the user explicitly asks for semantic search or
+  better natural-language query accuracy.
 
-All RTK skills are installed at `~/.config/opencode/skills/`. When any scenario below matches, you **MUST** invoke the corresponding skill via the `skill` tool **before** taking any action. Do not wait to be asked.
+Code-change rules:
 
-## Must-Invoke Mapping
+- Before modifying any function, class, or method, run upstream impact analysis
+  for the target symbol.
+- Report direct callers, affected processes, and risk level to the user.
+- If impact returns `HIGH` or `CRITICAL`, warn the user before editing.
+- Before committing, confirm the GitNexus index is fresh and run
+  `detect_changes`; verify the affected scope matches the intended change.
 
-| Scenario | Skill | Trigger Keywords |
-|----------|-------|-----------------|
-| Writing or modifying Rust code (new filter, feature, bugfix) | `tdd-rust` | implement, add feature, new filter, fix bug, write code |
-| Writing or modifying any code (any language) — TDD cycle | `rtk-tdd` | test, refactor, implement, bug fix |
-| Reviewing or simplifying existing Rust code | `code-simplifier` | simplify, review code, clean up, refactor rust |
-| Designing a new module, struct, or refactoring architecture | `design-patterns` | design, architecture, new module, refactor, pattern |
-| Triage open issues (categorize, detect duplicates, risk) | `issue-triage` | triage issues, audit issues, issue list, bug triage |
-| Triage open PRs (review, assess, comment) | `pr-triage` | triage PR, review PR, PR list, audit PR |
-| Full triage — both issues and PRs | `rtk-triage` | full triage, triage all, project health |
-| Deep review of a specific PR | `pr-review` | review PR, code review, PR # |
-| Security audit or vulnerability check | `security-guardian` | security, vulnerability, injection, CVE, exploit |
-| Performance optimization (startup, memory, token savings) | `performance` | slow, performance, optimize, benchmark, memory |
-| Build, commit, push, version bump, release | `ship` | release, ship, deploy, bump version, publish |
-| Repo status summary (PRs, issues, releases) | `repo-recap` | recap, summary, status, what happened |
-
-## Rules
-
-1. **Invoke BEFORE action.** When a user request matches a scenario, call `skill({name: "skill-name"})` first, then follow the skill's instructions.
-2. **Multiple matches.** If more than one skill applies (e.g., writing Rust code matches both `tdd-rust` and `design-patterns`), invoke the most specific one first, then the others.
-3. **Never skip.** Even if you think you know how to proceed, invoke the skill. The skill may contain project-specific rules you would otherwise miss.
-4. **RTK project context.** These skills are written for the RTK Rust CLI project. When working on RTK code, always respect their Rust-specific conventions, testing patterns, and filter module structure.
-
-<!-- rtk-skills:end -->
+Docs-only edits that do not modify functions, classes, or methods do not require
+symbol impact analysis.

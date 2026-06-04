@@ -440,6 +440,48 @@ class TestFallbackToAggressive:
         assert result is False
         assert pending.next_retry_at_ms > 0
 
+    def test_fallback_unavailable_past_v1_deadline_enters_fail_closed(self):
+        """V1 parity: fallback execution unavailable cannot keep retrying after deadline."""
+        from lightfee.risk.modes import GlobalRiskMode
+
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        state = EngineState()
+        position = _make_position(
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                phase_started_at_ms=1_000,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        executor._now_ms = lambda: 1_801
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is False
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert pending.next_retry_at_ms == 0
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.close_deadline_breached" in kinds
+        assert "exit.passive_close_fallback_unavailable" not in kinds
+
     def test_fallback_zero_residual_returns_true(self):
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
@@ -2980,6 +3022,65 @@ class TestFallbackResidualReal:
         zero_fill_events = [e for e in events if e.get("kind") == "exit.passive_close_fallback_zero_fill_no_pending"]
         assert len(zero_fill_events) == 1
 
+    def test_fallback_zero_fill_no_pending_past_deadline_enters_fail_closed(self):
+        """V1 parity: repeated zero close result after fallback deadline is fail-closed."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.risk.modes import GlobalRiskMode
+
+        journal = _open_journal()
+        mock_close_exec = MagicMock(spec=CloseExecutor)
+
+        async def fake_zero_fill(position, reason, now_ms, long_price_hint,
+                                 short_price_hint, total_quantity, state,
+                                 short_stage="", long_stage=""):
+            return CloseExecution(
+                position_id=position.position_id, reason=reason,
+                long_close_price=0.0, short_close_price=0.0,
+                long_close_qty=0.0, short_close_qty=0.0,
+                long_fee_quote=0.0, short_fee_quote=0.0,
+                realized_price_pnl_quote=0.0, funding_pnl_quote=0.0, net_quote=0.0,
+            )
+
+        mock_close_exec.execute_close = AsyncMock(side_effect=fake_zero_fill)
+
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        executor.set_close_executor(mock_close_exec)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                phase_started_at_ms=1_000,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.4, average_price=50000.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.4, average_price=50000.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        executor._now_ms = lambda: 1_801
+
+        result = asyncio.run(
+            executor._fallback_to_aggressive_close(state, pending, position)
+        )
+
+        assert result is False
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert pending.next_retry_at_ms == 0
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.close_deadline_breached" in kinds
+        assert "exit.passive_close_fallback_zero_fill_no_pending" not in kinds
+
 
 class TestMaintainFailClosed:
     """Test 4: maintain/reprice fail-closed on missing L2/tick data."""
@@ -4171,6 +4272,76 @@ class TestNonTerminalPartialFillHedgeGapClosure:
     maker_fill_delta == 0. Tests the unhedged_gap-based hedge logic end-to-end
     through drive_pending_passive_close.
     """
+
+    def test_unhedged_gap_past_v1_hedge_deadline_enters_fail_closed(self):
+        """V1: passive close hedge hard breach enters fail-closed and compensates."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.risk.modes import GlobalRiskMode
+
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        hedge_adapter = _mock_adapter_with_tick(Venue.OKX)
+        hedge_adapter.place_order = AsyncMock(
+            side_effect=AssertionError("hard-breached hedge gap must not submit another hedge")
+        )
+
+        close_executor = MagicMock(spec=CloseExecutor)
+        close_executor.compensate_failed_full_close = AsyncMock()
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        executor.set_close_executor(close_executor)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor._now_ms = lambda: 1_801
+
+        state = EngineState()
+        position = _make_position(
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=50000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=0.4,
+                average_price=50000.0,
+                last_fill_time_ms=1_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(quantity=0.1, average_price=50000.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is False
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert pending.next_retry_at_ms == 0
+        hedge_adapter.place_order.assert_not_called()
+        close_executor.compensate_failed_full_close.assert_awaited_once()
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.hedge_deadline_breached" in kinds
+        assert "exit.passive_close_hedge_incomplete" not in kinds
 
     def test_partial_fill_hedge_gap_repeated_until_closed(self):
         """First drive: maker=0.004, hedge gets 0.002 → gap 0.002 remains.

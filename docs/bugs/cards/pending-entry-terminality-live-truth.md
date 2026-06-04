@@ -10,6 +10,8 @@ orders, planned hedge CID misuse, and balanced live-position hydration.
 - planned hedge client order id queried before submit.
 - `pending_entry` cleared from momentary flat position snapshots.
 - Balanced live-position evidence has quantity but missing local order/price details.
+- `pending_entry.finalize_deferred_unresolved_maker_zero_fill`
+- `pending_entry.finalize_fill_reconciliation_ignored_stale_zero`
 
 ## Current Effective Rule
 
@@ -18,6 +20,11 @@ not by stale accepted maker state, planned hedge IDs, stale recovery blocks, or
 momentary flat probes. Live exchange truth dominates local false-flat state.
 Balanced live-position evidence can hydrate pending fills with quantity and
 price and finalize by V1 quantity+price semantics.
+
+Zero-fill reconciliation is terminal evidence only when the maker/order status
+is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
+entry unresolved, and a later stale zero reconciliation must not erase a
+previously confirmed positive fill.
 
 ## V1 / Exchange Semantics
 
@@ -63,6 +70,7 @@ price and finalize by V1 quantity+price semantics.
 | 2026-06-01 | ARIA under-min hedge dust, imbalanced live hydration, stale recovery-block retry, drift false-negative verification, and planned hedge CID finalize query | deployed/cloud verified | Balanced `619` pending entry no longer stays pending when only untradeable hedge dust remains; imbalanced live truth finalizes the balanced quantity instead of treating excess as missing hedge; stale fail-closed recovery blocks no longer make pending-entry recovery unreachable; post-cleanup live truth can verify drift correction when synchronous fill evidence is incomplete; finalize no longer queries a planned-only hedge CID. |
 | 2026-06-03 | Binance recovery placeholder reconciliation | deployed, short-window clean | Binance USD-M `orderId` is exchange numeric id; V2 recovery placeholders now query with `origClientOrderId` when a client id is available. |
 | 2026-06-03 | Runtime live recovery stale startup block release | deployed/cloud verified | After a missing hedge is recovered and live truth proves a balanced managed open position, V2 must reuse V1 startup finalization instead of leaving `risk_only` latched. |
+| 2026-06-04 | Bybit nonterminal zero-fill and stale zero reconciliation | local green, cloud deploy pending | Maker zero-fill with nonterminal evidence no longer finalizes as passive unfilled, and later zero reconciliation no longer erases known positive hedge fill. |
 
 ## Recurrences
 
@@ -73,6 +81,7 @@ price and finalize by V1 quantity+price semantics.
 | 2026-06-01 | `ARIAUSDT` Bybit/Binance | `f1727c1`; cloud verified | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching; final deploy reached running/flat/no-open-orders | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
 | 2026-06-03 | `CLOUSDT`, `TRIAUSDT`, `PEOPLEUSDT` Binance | `a272b6b` / `cb1abbe` | deployed, short-window clean; green health blocked by separate CL037 | [daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up](../daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up) |
 | 2026-06-03 | `HIVEUSDT` Binance/Bybit | `5625361` | cloud verified: lifecycle running, local flat, credentialed exchange truth flat/no-open-orders; close-path retry noise remains a separate watch | [daily/2026-06-03.md#cluster-cl-037-runtime-live-recovery-stale-startup-block](../daily/2026-06-03.md#cluster-cl-037-runtime-live-recovery-stale-startup-block) |
+| 2026-06-04 | `MEUUSDT`, `LDOUSDT` Bybit-related entry/fill samples | working tree | local full gate green; cloud deploy pending | [daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop](../daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) |
 
 ## Regression Harness
 
@@ -95,4 +104,9 @@ price and finalize by V1 quantity+price semantics.
 8. If a runtime live probe recovers balanced exchange positions while an old
    `startup_recovery_pending_work_without_open_positions` block is latched,
    confirm the lifecycle re-finalizes to `running` when no pending work remains.
-9. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
+9. If maker reconciliation reports quantity `0`, confirm the order status is
+   terminal no-fill before finalizing as unfilled; otherwise keep pending
+   unresolved.
+10. If a leg already has positive fill progress, reject later stale zero
+   reconciliation unless exchange truth proves a terminal correction.
+11. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.

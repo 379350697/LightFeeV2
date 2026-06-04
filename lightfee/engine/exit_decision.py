@@ -247,6 +247,42 @@ def force_close_due(
     return now_ms >= position.funding_timestamp_ms + force_ms
 
 
+def passive_close_fallback_due(
+    position: OpenPosition,
+    config: StrategyConfig,
+    now_ms: int,
+) -> bool:
+    """V1 close-deadline guard for passive closes already in flight.
+
+    Normal close routing starts passive maker/taker at the funding capture
+    point.  If that passive close is still pending past the settlement force
+    window, it must be escalated rather than waiting on retry backoff.
+    """
+    if position.matched_quantity <= 0:
+        return False
+
+    base_ms = 0
+    if position.settlement_half_closed_at_ms > 0:
+        base_ms = position.settlement_half_closed_at_ms
+    elif (
+        position.opportunity_type == "staggered"
+        and position.second_stage_enabled_at_entry
+        and not position.exit_after_first_stage
+    ):
+        base_ms = max(position.second_funding_timestamp_ms, position.funding_timestamp_ms)
+    else:
+        base_ms = position.funding_timestamp_ms
+
+    if base_ms <= 0:
+        return False
+
+    force_ms = max(
+        int(config.settlement_force_close_delay_secs or 0) * 1000,
+        int(config.post_funding_hold_secs or 0) * 1000,
+    )
+    return now_ms >= base_ms + force_ms
+
+
 # ---------------------------------------------------------------------------
 # Funding capture state update
 # ---------------------------------------------------------------------------

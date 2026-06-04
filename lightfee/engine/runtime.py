@@ -966,6 +966,9 @@ class LiveRuntime:
             self.passive_close_executor = PassiveCloseExecutor(
                 adapters=self._venue_adapters,
                 journal=self.journal,
+                config_overrides={
+                    "maker_hedge_deadline_ms": self.config.strategy.maker_hedge_deadline_ms,
+                },
             )
             # Inject the L2 mid resolver so repricing has live book data
             self.passive_close_executor.set_l2_mid_resolver(self._resolve_local_l2_mid)
@@ -5334,6 +5337,47 @@ class LiveRuntime:
         }
 
     @staticmethod
+    def _fill_reconciliation_terminal_no_fill(reconciliation: Any) -> bool:
+        qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+        if qty > 0.0:
+            return False
+        metadata = getattr(reconciliation, "metadata", None) or {}
+        status = ""
+        if isinstance(metadata, dict):
+            for key in (
+                "status",
+                "raw_exchange_status",
+                "order_status",
+                "state",
+                "response_classification",
+            ):
+                status = str(metadata.get(key) or "")
+                if status:
+                    break
+        return LiveRuntime._order_status_is_terminal_no_fill(status)
+
+    @staticmethod
+    def _pending_entry_has_terminal_maker_zero_fill_evidence(
+        pending,
+        maker_reconciliation: Any | None,
+    ) -> bool:
+        if (
+            maker_reconciliation is not None
+            and LiveRuntime._fill_reconciliation_terminal_no_fill(maker_reconciliation)
+        ):
+            return True
+
+        passive_order = getattr(pending, "passive_order", None)
+        state = getattr(passive_order, "last_progress_state", None)
+        if state is None:
+            return False
+        if hasattr(state, "is_terminal") and state.is_terminal():
+            return True
+        return LiveRuntime._order_status_is_terminal_no_fill(
+            getattr(state, "value", str(state or ""))
+        )
+
+    @staticmethod
     def _pending_entry_has_maker_order_reference(pending) -> bool:
         order_id, client_order_id = LiveRuntime._pending_entry_maker_order_identifiers(
             pending
@@ -7529,6 +7573,8 @@ class LiveRuntime:
         now_ms: int,
     ) -> bool:
         """Gate entry.opened on confirmed price and order id for both legs."""
+        reconciliation_by_leg: dict[str, Any] = {}
+        reconciliation_attempted: set[str] = set()
 
         async def _reconcile_leg(label: str, venue: Venue) -> None:
             adapter = self.get_venue_adapter(venue)
@@ -7543,6 +7589,7 @@ class LiveRuntime:
                 client_order_id = getattr(pending, f"{label}_client_order_id", "") or ""
             if not order_id and not client_order_id:
                 return
+            reconciliation_attempted.add(label)
             try:
                 reconciliation = await adapter.fetch_order_fill_reconciliation(
                     pending.symbol,
@@ -7565,6 +7612,7 @@ class LiveRuntime:
                 return
             if reconciliation is None:
                 return
+            reconciliation_by_leg[label] = reconciliation
             qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
             avg_price = float(
                 getattr(reconciliation, "average_price", 0.0)
@@ -7575,8 +7623,24 @@ class LiveRuntime:
             before_qty = float(getattr(pending, f"{label}_leg_filled", 0.0) or 0.0)
             before_price = float(getattr(pending, f"{label}_fill_price", 0.0) or 0.0)
             before_order_id = getattr(pending, f"{label}_order_id", "") or ""
-            if math.isfinite(qty) and qty >= 0:
+            if math.isfinite(qty) and (qty > 0.0 or before_qty <= 0.0):
                 setattr(pending, f"{label}_leg_filled", qty)
+            elif math.isfinite(qty) and qty <= 0.0 and before_qty > 0.0:
+                self.journal.append(
+                    "pending_entry.finalize_fill_reconciliation_ignored_stale_zero",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "leg": label,
+                        "venue": venue.value,
+                        "before_quantity": before_qty,
+                        "reconciliation_quantity": qty,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "reconciliation_order_id": reconciled_order_id,
+                        "metadata": getattr(reconciliation, "metadata", None),
+                    },
+                )
             if avg_price > 0:
                 setattr(pending, f"{label}_fill_price", avg_price)
             if reconciled_order_id:
@@ -7623,6 +7687,40 @@ class LiveRuntime:
             float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0),
         )
         if balanced_quantity <= 0.0:
+            maker_reconciliation = reconciliation_by_leg.get("maker")
+            if (
+                self._pending_entry_has_maker_order_reference(pending)
+                and "maker" in reconciliation_attempted
+                and not self._pending_entry_has_terminal_maker_zero_fill_evidence(
+                    pending,
+                    maker_reconciliation,
+                )
+            ):
+                pending.uncertain_outcome = True
+                pending.reconcile_next_attempt_ms = max(
+                    int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                    now_ms + 1_000,
+                )
+                metadata = (
+                    getattr(maker_reconciliation, "metadata", None)
+                    if maker_reconciliation is not None
+                    else None
+                )
+                self.journal.append(
+                    "pending_entry.finalize_deferred_unresolved_maker_zero_fill",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "maker_order_id": pending.maker_order_id,
+                        "maker_client_order_id": pending.maker_client_order_id,
+                        "reconciliation_found": maker_reconciliation is not None,
+                        "reconciliation_metadata": metadata,
+                        "reason": "maker_zero_fill_without_terminal_no_fill_evidence",
+                    },
+                )
+                return False
             return True
 
         missing: list[str] = []
@@ -12832,6 +12930,53 @@ class LiveRuntime:
     # Passive close lane (V1: process_pending_passive_closes)
     # ------------------------------------------------------------------
 
+    def _arm_overdue_passive_close_fallbacks(self, now_ms: int) -> None:
+        """Escalate pending passive closes that are past the V1 force deadline."""
+        if not self.state.pending_passive_closes:
+            return
+
+        from lightfee.engine.exit_decision import passive_close_fallback_due
+        from lightfee.engine.state import PassiveExecutionPhase
+
+        for position_id, pending in list(self.state.pending_passive_closes.items()):
+            position = self.state.open_positions.get(position_id) or getattr(
+                pending, "position_snapshot", None
+            )
+            if position is None:
+                continue
+            if not passive_close_fallback_due(position, self.config.strategy, now_ms):
+                continue
+
+            phase_state = getattr(pending, "phase_state", None)
+            previous_phase = getattr(getattr(phase_state, "phase", None), "value", "")
+            previous_retry_at_ms = int(getattr(pending, "next_retry_at_ms", 0) or 0)
+
+            if phase_state is not None:
+                phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                phase_state.phase_started_at_ms = now_ms
+                phase_state.cycle_started_at_ms = now_ms
+            pending.next_retry_at_ms = 0
+
+            if (
+                previous_phase != PassiveExecutionPhase.DUAL_TAKER.value
+                or previous_retry_at_ms > now_ms
+            ):
+                self.journal.append(
+                    "runtime.passive_close_deadline_fallback_armed",
+                    {
+                        "position_id": position_id,
+                        "symbol": position.symbol,
+                        "reason": getattr(pending, "reason", ""),
+                        "opportunity_type": position.opportunity_type,
+                        "funding_timestamp_ms": position.funding_timestamp_ms,
+                        "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                        "exit_after_first_stage": position.exit_after_first_stage,
+                        "previous_phase": previous_phase,
+                        "previous_next_retry_at_ms": previous_retry_at_ms,
+                        "ts_ms": now_ms,
+                    },
+                )
+
     async def _maybe_tick_passive_close(self, now_ms: int) -> None:
         """Drive pending passive closes each tick.
 
@@ -12842,6 +12987,8 @@ class LiveRuntime:
             return
         if not self.state.pending_passive_closes:
             return
+
+        self._arm_overdue_passive_close_fallbacks(now_ms)
 
         try:
             await self.passive_close_executor.process_pending_passive_closes(

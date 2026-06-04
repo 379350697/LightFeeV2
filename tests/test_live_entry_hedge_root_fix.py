@@ -4729,6 +4729,59 @@ class TestZeroFillFinalizeV1ParityGate:
         runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_zero_fill_finalize_retains_nonterminal_maker_reconciliation(self, tmp_path):
+        """V1: zero fill is removable only with terminal maker no-fill evidence.
+
+        A live/open maker order can report cumulative fill 0 while still resting.
+        Finalizing that as passive_unfilled loses the pending entry and leaves
+        later maker fills to live-recovery cleanup, matching the MEUSDT pattern.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        runtime.journal.open()
+
+        maker_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        maker_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="MEUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            average_price=0.0,
+            order_id="bybit-maker-oid",
+            client_order_id="bybit-maker-cid",
+            metadata={"status": "new"},
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker_adapter
+
+        now_ms = 1780488000000
+        pending = PendingEntry(
+            pending_id="entry-meusdt-maker-open-zero",
+            symbol="MEUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.OKX,
+            target_quantity=608.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=0.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=0.0,
+            hedge_fill_price=0.0,
+            maker_order_id="bybit-maker-oid",
+            maker_client_order_id="bybit-maker-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        assert pending.pending_id in runtime.state.pending_entries
+        kinds = [e.get("kind") for e in runtime.journal.read_all()]
+        assert "pending_entry.finalize_deferred_unresolved_maker_zero_fill" in kinds
+        assert "entry.passive_unfilled" not in kinds
+        assert "pending_entry.pending_entry_finalized" not in kinds
+        runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_asymmetric_zero_fill_one_leg_zero_does_not_create_position(self, tmp_path):
         """If maker filled 10 but hedge filled 0, balanced_quantity=0, still
         no open position.  V1: min(10, 0) = 0 > 0.0 is False.
@@ -4983,6 +5036,72 @@ class TestZeroFillFinalizeV1ParityGate:
         assert events[0]["payload"]["hedge_order_id"] == "hedge-real-oid"
         assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
             ("HYPEUSDT", "hedge-stale-oid", "hedge-cid")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stale_zero_reconciliation_does_not_erase_known_hedge_fill(self, tmp_path):
+        """V1 parity: a later zero reconciliation must not erase confirmed fill.
+
+        Production Bybit/Hyperliquid incident:
+        maker=78.8 and hedge=78.0 were confirmed, but a later Hyperliquid
+        terminal-zero reconciliation overwrote hedge_leg_filled to 0.0. That
+        wrongly finalized as unmatched residual and sold the Bybit maker leg.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.HYPERLIQUID,
+            symbol="LDOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            average_price=0.0,
+            order_id="hl-hedge-order",
+            client_order_id="hl-hedge-cid",
+            filled_at_ms=2000,
+            metadata={"status": "canceled"},
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge_adapter
+
+        now_ms = 1780505840000
+        pending = PendingEntry(
+            pending_id="entry-bybit-hl-stale-zero",
+            symbol="LDOUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=78.8,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 5000,
+            maker_leg="long",
+            maker_leg_filled=78.8,
+            hedge_leg_filled=78.0,
+            maker_fill_price=0.304,
+            hedge_fill_price=0.30462,
+            maker_order_id="bybit-maker-order",
+            hedge_order_id="hl-hedge-order",
+            maker_client_order_id="bybit-maker-cid",
+            hedge_client_order_id="hl-hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        assert pending.hedge_leg_filled == pytest.approx(78.0)
+        assert pending.pending_id in runtime.state.open_positions
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.matched_quantity == pytest.approx(78.0)
+        residual_tasks = runtime.state.pending_residual_repairs
+        assert len(residual_tasks) == 1
+        assert residual_tasks[0]["repair_venue"] == "bybit"
+        assert residual_tasks[0]["repair_side"] == "sell"
+        assert residual_tasks[0]["repair_quantity"] == pytest.approx(0.8)
+        finalized = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.pending_entry_finalized"
+        ][-1]["payload"]
+        assert finalized["finalized_as"] == "open_position"
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("LDOUSDT", "hl-hedge-order", "hl-hedge-cid")
         ]
 
     @pytest.mark.asyncio

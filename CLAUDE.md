@@ -1,191 +1,86 @@
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# Agent Instructions - LightFeeV2
 
-This project is indexed by GitNexus as **LightFeeV2** (20613 symbols, 43745 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+These instructions apply to `/Users/wl/projects/LightFeeV2`.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+This project is used by both Codex and Claude Code. Keep `AGENTS.md` and
+`CLAUDE.md` synchronized; `AGENTS.md` is the source of truth when the two files
+disagree.
 
-## Always Do
+## V1 Reference
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+`LightFee V1` means the original legacy LightFee production behavior, especially
+the Rust V1 live-trading semantics. When the sibling V1 repo is available, it is
+expected at `/Users/wl/projects/LightFee`.
 
-## Never Do
+For LightFeeV2, V1 is authoritative only for compatibility-sensitive trading
+semantics such as recovery, passive close, residual repair, and live-position
+truth. If V2 behavior disagrees with V1 in those areas, treat V1 as the expected
+semantic contract before changing the V2 implementation.
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+## Production Safety
 
-## Resources
+- Treat production diagnostics and trading-state changes as high risk.
+- Start read-only unless the user explicitly asks for a fix, deploy, or mutation.
+- Do not submit orders, cancel orders, edit runtime state, or deploy while
+  gathering evidence.
+- For bugs involving live exchange state, exchange truth outranks local recovered
+  state.
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/LightFeeV2/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/LightFeeV2/clusters` | All functional areas |
-| `gitnexus://repo/LightFeeV2/processes` | All execution flows |
-| `gitnexus://repo/LightFeeV2/process/{name}` | Step-by-step execution trace |
+## GitNexus
 
-## CLI
+The actual GitNexus repo name for this project is `LightFeeV2`.
 
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+Prefer GitNexus MCP tools when available. If MCP tools are unavailable, use the
+GitNexus CLI equivalents. Prefer the `rtk` prefix for compact output; if `rtk`
+is not installed in the current shell, run the same command without `rtk`.
 
-<!-- gitnexus:end -->
-{
-  "permissions": {
-    "bash": [
-      { "pattern": "scp .* root@38.60.253.248:.*", "mode": "allow" },
-      { "pattern": "ssh .* root@38.60.253.248 .*", "mode": "allow" },
-      { "pattern": "git push origin main", "mode": "allow" }
-    ]
-  }
-}
+Before relying on GitNexus for the current code:
 
-<!-- rtk-instructions v2 -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
+1. Get the current commit:
 
-## Golden Rule
+   ```bash
+   rtk git rev-parse HEAD
+   ```
 
-**Always prefix commands with `rtk`**. If RTK has a dedicated filter, it uses it. If not, it passes through unchanged. This means RTK is always safe to use.
+2. Call GitNexus `list_repos` and check repo `LightFeeV2`:
+   - `lastCommit` must match the current `HEAD`.
+   - `staleness.commitsBehind` must be `0`.
 
-**Important**: Even in command chains with `&&`, use `rtk`:
-```bash
-# ❌ Wrong
-git add . && git commit -m "msg" && git push
+   CLI fallback:
 
-# ✅ Correct
-rtk git add . && rtk git commit -m "msg" && rtk git push
-```
+   ```bash
+   rtk npx gitnexus list
+   rtk npx gitnexus status
+   ```
 
-## RTK Commands by Workflow
+3. If `staleness.commitsBehind > 0`, `lastCommit` differs from `HEAD`, symbols
+   are missing, call relationships look wrong, or node versions do not match the
+   current code, rebuild the index from the repo root:
 
-### Build & Compile (80-90% savings)
-```bash
-rtk cargo build         # Cargo build output
-rtk cargo check         # Cargo check output
-rtk cargo clippy        # Clippy warnings grouped by file (80%)
-rtk tsc                 # TypeScript errors grouped by file/code (83%)
-rtk lint                # ESLint/Biome violations grouped (84%)
-rtk prettier --check    # Files needing format only (70%)
-rtk next build          # Next.js build with route metrics (87%)
-```
+   ```bash
+   rtk npx gitnexus analyze --index-only --name LightFeeV2 --drop-embeddings .
+   ```
 
-### Test (60-99% savings)
-```bash
-rtk cargo test          # Cargo test failures only (90%)
-rtk go test             # Go test failures only (90%)
-rtk jest                # Jest failures only (99.5%)
-rtk vitest              # Vitest failures only (99.5%)
-rtk playwright test     # Playwright failures only (94%)
-rtk pytest              # Python test failures only (90%)
-rtk rake test           # Ruby test failures only (90%)
-rtk rspec               # RSpec test failures only (60%)
-rtk test <cmd>          # Generic test wrapper - failures only
-```
+4. Re-run GitNexus `list_repos` or the CLI fallback and confirm the index is
+   fresh before running `impact`, `query`, `context`, or `detect_changes`.
 
-### Git (59-80% savings)
-```bash
-rtk git status          # Compact status
-rtk git log             # Compact log (works with all git flags)
-rtk git diff            # Compact diff (80%)
-rtk git show            # Compact show (80%)
-rtk git add             # Ultra-compact confirmations (59%)
-rtk git commit          # Ultra-compact confirmations (59%)
-rtk git push            # Ultra-compact confirmations
-rtk git pull            # Ultra-compact confirmations
-rtk git branch          # Compact branch list
-rtk git fetch           # Compact fetch
-rtk git stash           # Compact stash
-rtk git worktree        # Compact worktree
-```
+Embedding rules:
 
-Note: Git passthrough works for ALL subcommands, even those not explicitly listed.
+- Default rebuilds must use `--index-only --drop-embeddings`.
+- Do not use `--embeddings` by default.
+- Do not use `--embeddings=0` as a way to disable embeddings. It enables
+  embeddings and removes the generation cap.
+- Use `--embeddings` only when the user explicitly asks for semantic search or
+  better natural-language query accuracy.
 
-### GitHub (26-87% savings)
-```bash
-rtk gh pr view <num>    # Compact PR view (87%)
-rtk gh pr checks        # Compact PR checks (79%)
-rtk gh run list         # Compact workflow runs (82%)
-rtk gh issue list       # Compact issue list (80%)
-rtk gh api              # Compact API responses (26%)
-```
+Code-change rules:
 
-### JavaScript/TypeScript Tooling (70-90% savings)
-```bash
-rtk pnpm list           # Compact dependency tree (70%)
-rtk pnpm outdated       # Compact outdated packages (80%)
-rtk pnpm install        # Compact install output (90%)
-rtk npm run <script>    # Compact npm script output
-rtk npx <cmd>           # Compact npx command output
-rtk prisma              # Prisma without ASCII art (88%)
-```
+- Before modifying any function, class, or method, run upstream impact analysis
+  for the target symbol.
+- Report direct callers, affected processes, and risk level to the user.
+- If impact returns `HIGH` or `CRITICAL`, warn the user before editing.
+- Before committing, confirm the GitNexus index is fresh and run
+  `detect_changes`; verify the affected scope matches the intended change.
 
-### Files & Search (60-75% savings)
-```bash
-rtk ls <path>           # Tree format, compact (65%)
-rtk read <file>         # Code reading with filtering (60%)
-rtk grep <pattern>      # Search grouped by file (75%). Format flags (-c, -l, -L, -o, -Z) run raw.
-rtk find <pattern>      # Find grouped by directory (70%)
-```
-
-### Analysis & Debug (70-90% savings)
-```bash
-rtk err <cmd>           # Filter errors only from any command
-rtk log <file>          # Deduplicated logs with counts
-rtk json <file>         # JSON structure without values
-rtk deps                # Dependency overview
-rtk env                 # Environment variables compact
-rtk summary <cmd>       # Smart summary of command output
-rtk diff                # Ultra-compact diffs
-```
-
-### Infrastructure (85% savings)
-```bash
-rtk docker ps           # Compact container list
-rtk docker images       # Compact image list
-rtk docker logs <c>     # Deduplicated logs
-rtk kubectl get         # Compact resource list
-rtk kubectl logs        # Deduplicated pod logs
-```
-
-### Network (65-70% savings)
-```bash
-rtk curl <url>          # Compact HTTP responses (70%)
-rtk wget <url>          # Compact download output (65%)
-```
-
-### Meta Commands
-```bash
-rtk gain                # View token savings statistics
-rtk gain --history      # View command history with savings
-rtk discover            # Analyze Claude Code sessions for missed RTK usage
-rtk proxy <cmd>         # Run command without filtering (for debugging)
-rtk init                # Add RTK instructions to CLAUDE.md
-rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
-```
-
-## Token Savings Overview
-
-| Category | Commands | Typical Savings |
-|----------|----------|-----------------|
-| Tests | vitest, playwright, cargo test | 90-99% |
-| Build | next, tsc, lint, prettier | 70-87% |
-| Git | status, log, diff, add, commit | 59-80% |
-| GitHub | gh pr, gh run, gh issue | 26-87% |
-| Package Managers | pnpm, npm, npx | 70-90% |
-| Files | ls, read, grep, find | 60-75% |
-| Infrastructure | docker, kubectl | 85% |
-| Network | curl, wget | 65-70% |
-
-Overall average: **60-90% token reduction** on common development operations.
-<!-- /rtk-instructions -->
+Docs-only edits that do not modify functions, classes, or methods do not require
+symbol impact analysis.

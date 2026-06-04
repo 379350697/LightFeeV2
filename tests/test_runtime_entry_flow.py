@@ -19,7 +19,14 @@ from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.reconciliation import OrderReconciler
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
+from lightfee.engine.state import (
+    EngineState,
+    OpenPosition,
+    PassiveExecutionPhase,
+    PassivePhaseState,
+    PendingEntry,
+    PendingPassiveClose,
+)
 from lightfee.persistence.journal import Journal
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -1133,6 +1140,64 @@ class TestPlannerDispatchIntegration:
         await runtime._maybe_process_normal_exits(funding_ms + 120_000)
 
         assert passive.reasons == ["settlement_force_close"]
+
+    @pytest.mark.asyncio
+    async def test_pending_passive_close_overdue_arms_dual_taker_despite_future_retry(
+        self, config, tmp_journal,
+    ):
+        config.strategy.settlement_force_close_delay_secs = 120
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        class CapturingPassiveClose:
+            def __init__(self):
+                self.seen_phase = None
+                self.seen_retry = None
+
+            async def process_pending_passive_closes(self, state, now_ms):
+                pending = state.pending_passive_closes["entry-overdue-passive"]
+                self.seen_phase = pending.phase_state.phase
+                self.seen_retry = pending.next_retry_at_ms
+                return set(state.pending_passive_closes.keys())
+
+        passive = CapturingPassiveClose()
+        runtime.passive_close_executor = passive
+        funding_ms = 1780167600000
+        position = OpenPosition(
+            position_id="entry-overdue-passive",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=50000.0,
+            short_entry_price=50000.0,
+            opened_at_ms=funding_ms - 30_000,
+            matched_quantity=0.01,
+            funding_timestamp_ms=funding_ms,
+            opportunity_type="aligned",
+            funding_captured=True,
+            current_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+        runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+            ),
+            next_retry_at_ms=funding_ms + 8 * 60 * 60 * 1000,
+        )
+
+        await runtime._maybe_tick_passive_close(funding_ms + 120_001)
+
+        assert passive.seen_phase == PassiveExecutionPhase.DUAL_TAKER
+        assert passive.seen_retry == 0
+        kinds = [r["kind"] for r in runtime.journal.read_all()]
+        assert "runtime.passive_close_deadline_fallback_armed" in kinds
 
     @pytest.mark.asyncio
     async def test_normal_exit_backfills_recovered_first_stage_exit_semantics(

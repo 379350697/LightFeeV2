@@ -17,6 +17,30 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Bybit entry/passive-close deadline follow-up, 2026-06-04: phone
+screenshots showed Bybit-related abnormal close samples including `MEUUSDT`
+opened around `2026-06-03 20:12`, seconds-long closes, and one position with
+more than eight hours of exposure. The root was not a single Bybit-only leg:
+entry and close are dual-leg workflows, so Bybit maker/fill evidence must be
+matched against the opposite venue before V2 can finalize or close. CL046
+copies V1 semantics in two places. Pending-entry finalize now defers
+zero-balanced finalization unless maker/order evidence is terminal no-fill, and
+later stale zero reconciliation no longer erases a previously confirmed
+positive fill. Passive close now has the V1 settlement-force fallback guard:
+overdue pending passive closes are armed into DUAL_TAKER, retry delay is
+cleared, and hedge/fallback hard breaches enter fail-closed with compensation
+and live-flat probing instead of continuing retry backoff. Local verification is
+green: passive close suite `110 passed`, focused adjacent set `16 passed`,
+historical JCT compensation regression `1 passed`, and full pytest
+`3423 passed`, `9 skipped`, `1 warning`; compile, diff-check, and GitNexus
+detect-changes also ran. Cloud deploy/credentialed flat-no-open-orders
+verification is pending in this session. Watch
+`pending_entry.finalize_deferred_unresolved_maker_zero_fill`,
+`pending_entry.finalize_fill_reconciliation_ignored_stale_zero`,
+`runtime.passive_close_deadline_fallback_armed`,
+`execution.hedge_deadline_breached`, and
+`execution.close_deadline_breached`.
+
 Latest pending-entry maker terminality follow-up, 2026-06-03: post-`bd12acd`
 production is currently green and flat/no-open-orders across all configured
 venues, but the deploy window showed a CL039 recurrence variant. Two `MEUSDT`
