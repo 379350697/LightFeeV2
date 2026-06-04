@@ -213,6 +213,9 @@ class LiveRuntime:
     _BINANCE_USDM_ERROR_DOC_URL = (
         "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
     )
+    _HYPERLIQUID_ERROR_DOC_URL = (
+        "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+    )
     _ASTER_API_DOC_URL = "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation"
     _ASTER_OPENABLE_NOTIONAL_DOC_URL = (
         "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
@@ -263,6 +266,12 @@ class LiveRuntime:
             return LiveRuntime._entry_admission_evidence(
                 "insufficient_margin_admission_blocked"
             )
+        if venue == Venue.HYPERLIQUID and "insufficient margin" in text:
+            return {
+                "reason": "insufficient_margin_admission_blocked",
+                "official_doc_url": LiveRuntime._HYPERLIQUID_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
         if venue == Venue.BINANCE and (
             "-2027" in text
             or "max_leverage_ratio" in text
@@ -7866,6 +7875,66 @@ class LiveRuntime:
         )
         return False
 
+    async def _pending_entry_zero_fill_has_live_maker_open_order(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+    ) -> bool:
+        if not self._pending_entry_has_maker_order_reference(pending):
+            return False
+        if pending.maker_completed():
+            return False
+
+        maker_venue = pending.maker_venue()
+        adapter = self.get_venue_adapter(maker_venue)
+        order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
+        if adapter is None:
+            return False
+
+        matches, open_order_error = await self._pending_entry_maker_open_order_matches(
+            pending,
+            adapter,
+            maker_venue,
+        )
+        if matches is None:
+            self.journal.append(
+                "pending_entry.finalize_maker_open_order_truth_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": maker_venue.value,
+                    "maker_order_id": order_id,
+                    "maker_client_order_id": client_order_id,
+                    "error": open_order_error,
+                    "reason": "zero_fill_finalize_open_order_truth_unavailable",
+                },
+            )
+            return False
+        if not matches:
+            return False
+
+        pending.uncertain_outcome = True
+        pending.reconcile_next_attempt_ms = max(
+            int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+            now_ms + 1_000,
+        )
+        self.journal.append(
+            "pending_entry.finalize_deferred_maker_open_order",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "maker_venue": maker_venue.value,
+                "maker_order_id": order_id,
+                "maker_client_order_id": client_order_id,
+                "open_order_count": len(matches),
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "reason": "maker_open_order_truth_present",
+            },
+        )
+        return True
+
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
 
@@ -7985,6 +8054,12 @@ class LiveRuntime:
 
         if balanced_quantity <= 0.0:
             if not pending.has_any_fill():
+                if await self._pending_entry_zero_fill_has_live_maker_open_order(
+                    pending,
+                    entry_id,
+                    now_ms,
+                ):
+                    return
                 # V1: !has_any_fill → zero-fill, safe to remove as passive_unfilled
                 self.journal.append(
                     "entry.passive_unfilled",

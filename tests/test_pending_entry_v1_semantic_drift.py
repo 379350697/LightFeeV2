@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
-from lightfee.core.domain import PositionSnapshot, Side, Venue
+from lightfee.core.domain import OrderFillReconciliation, PositionSnapshot, Side, Venue
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
@@ -95,6 +95,37 @@ class _LivePositionAdapter(_NoFillReconciliationAdapter):
 class _LivePositionOpenOrdersAdapter(_LivePositionAdapter):
     async def fetch_open_orders(self, symbol):
         return []
+
+
+class _TerminalNoFillOpenMakerAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, *, order_id: str, client_order_id: str):
+        self.order_id = order_id
+        self.client_order_id = client_order_id
+        self.open_order_calls: list[str] = []
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            average_price=0.0,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            metadata={"status": "canceled"},
+        )
+
+    async def fetch_open_orders(self, symbol):
+        self.open_order_calls.append(symbol)
+        return [
+            {
+                "orderId": self.order_id,
+                "orderLinkId": self.client_order_id,
+                "symbol": symbol,
+                "side": "Buy",
+                "reduceOnly": False,
+            }
+        ]
 
 
 class _NormalizingAdapter(_NoFillReconciliationAdapter):
@@ -248,6 +279,53 @@ async def test_pending_entry_does_not_query_planned_hedge_cid_before_submit(
     await runtime._reconcile_pending_state(now_ms=2000)
 
     assert reconciler.calls[-1]["short_client_order_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists(
+    config, tmp_journal,
+):
+    adapter = _TerminalNoFillOpenMakerAdapter(
+        order_id="d792a623-d9e4-4c20-905f-f76a8f2efaeb",
+        client_order_id="e86085435b3216fade136612525d1917e503",
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780573948279-SEIUSDT",
+        symbol="SEIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=451.6244366455595,
+        maker_order_id="d792a623-d9e4-4c20-905f-f76a8f2efaeb",
+        maker_client_order_id="e86085435b3216fade136612525d1917e503",
+        maker_leg="long",
+        maker_price=0.05315,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780573970000,
+    )
+
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.uncertain_outcome is True
+    assert pending.reconcile_next_attempt_ms >= 1780573971000
+    assert adapter.open_order_calls == ["SEIUSDT"]
+    assert pending.maker_leg_filled == 0.0
+    assert pending.hedge_leg_filled == 0.0
+
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.finalize_deferred_maker_open_order" in kinds
+    assert "entry.passive_unfilled" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
 
 
 @pytest.mark.asyncio

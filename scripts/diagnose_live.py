@@ -1938,8 +1938,22 @@ def _build_conclusion(
     order_errors: list[dict[str, Any]],
     l2_evidence: dict[str, Any],
     exchange_truth: dict[str, Any],
+    production_acceptance_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if health["ok"] and not state_consistency["state_mismatch"] and not order_errors:
+    gate_failed = (
+        production_acceptance_gate is not None
+        and production_acceptance_gate.get("gate_passed") is False
+    )
+    gate_blockers = (
+        list(production_acceptance_gate.get("blocking_reasons", []) or [])
+        if production_acceptance_gate is not None
+        else []
+    )
+
+    if gate_failed:
+        status = "unhealthy"
+        risk = "high"
+    elif health["ok"] and not state_consistency["state_mismatch"] and not order_errors:
         status = "healthy"
         risk = "low"
     elif health["critical_count"] > 0:
@@ -1977,6 +1991,12 @@ def _build_conclusion(
         ))
     if evidence_completeness["overall"] != "complete":
         summary_parts.append("evidence: {}".format(evidence_completeness["overall"]))
+    if gate_failed:
+        summary_parts.append(
+            "production acceptance gate failed: {}".format(
+                ", ".join(gate_blockers[:5]) if gate_blockers else "unknown"
+            )
+        )
 
     summary = "; ".join(summary_parts) if summary_parts else "no issues detected"
 
@@ -2017,6 +2037,12 @@ def _build_conclusion(
         next_actions.append("investigate L2 stale/rebuild ({} rebuilds, {} gaps)".format(
             l2_evidence["stale_rebuild_count"], l2_evidence["sequence_gap_count"],
         ))
+    if gate_failed:
+        next_actions.append(
+            "resolve production acceptance gate blockers: {}".format(
+                ", ".join(gate_blockers[:5]) if gate_blockers else "unknown"
+            )
+        )
     if not next_actions:
         next_actions.append("no immediate action required")
 
@@ -2114,7 +2140,7 @@ def run_diagnose(
     )
     conclusion = _build_conclusion(
         health, state_consistency, evidence_completeness, order_errors,
-        l2_evidence, exchange_truth,
+        l2_evidence, exchange_truth, production_acceptance_gate,
     )
 
     event_counts: dict[str, int] = {}

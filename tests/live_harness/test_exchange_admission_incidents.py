@@ -83,6 +83,14 @@ class RejectingExecutor:
             False,
         ),
         (
+            "hyperliquid",
+            "SEIUSDT",
+            "Insufficient margin to place order. asset=40",
+            "insufficient_margin_admission_blocked",
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses",
+            False,
+        ),
+        (
             "binance",
             "GTXUSDT",
             (
@@ -319,6 +327,58 @@ async def test_pending_hedge_binance_leverage_reject_aborts_without_retry():
             record for record in records
             if record["kind"] == "entry.aborted"
         ][-1]["payload"]["reason"] == "hedge_admission_blocked:leverage_admission_blocked"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_without_retry():
+    with tempfile.TemporaryDirectory() as td:
+        hyperliquid = RejectingHedgeAdapter(
+            "Insufficient margin to place order. asset=40"
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={
+                Venue.BYBIT: FlatAdapter(),
+                Venue.HYPERLIQUID: hyperliquid,
+            },
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-sei",
+            symbol="SEIUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert hyperliquid.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == (
+            "hedge_admission_blocked:insufficient_margin_admission_blocked"
+        )
+        cooldown = runtime.state.venue_entry_cooldowns["hyperliquid:SEIUSDT"]
+        assert cooldown["reason"] == "insufficient_margin_admission_blocked"
+        assert cooldown["official_doc_url"] == (
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+        )
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]["reason"] == "insufficient_margin_admission_blocked"
+        assert [
+            record for record in records
+            if record["kind"] == "entry.aborted"
+        ][-1]["payload"]["reason"] == (
+            "hedge_admission_blocked:insufficient_margin_admission_blocked"
+        )
         runtime.journal.close()
 
 

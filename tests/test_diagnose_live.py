@@ -543,6 +543,85 @@ def test_run_diagnose_gate_fails_when_exchange_truth_unavailable(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_conclusion_is_unhealthy_when_acceptance_gate_has_open_order(
+    monkeypatch,
+):
+    """A failed production gate must dominate a locally-flat health snapshot."""
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        def open_order_exchange_truth(runtime_dir, symbols, venues=None):
+            return {
+                "available": True,
+                "available_venues": ["bybit"],
+                "confidence": "high",
+                "positions": {"bybit": {}},
+                "open_orders": {
+                    "bybit": {
+                        "*": [
+                            {
+                                "order_id": "d792a623-d9e4-4c20-905f-f76a8f2efaeb",
+                                "symbol": "SEIUSDT",
+                                "side": "Buy",
+                                "quantity": 451.0,
+                                "reduce_only": False,
+                            }
+                        ]
+                    }
+                },
+                "has_nonzero_position": False,
+                "has_open_order": True,
+                "fetch_status": {
+                    "bybit": {
+                        "status": "ok",
+                        "positions_succeeded": [],
+                        "positions_failed": [],
+                        "orders_succeeded": ["*"],
+                        "orders_failed": [],
+                    }
+                },
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", open_order_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="",
+            venues=["bybit"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert gate["blocking_reasons"] == ["exchange_truth_open_orders_present"]
+        assert result["conclusion"]["status"] == "unhealthy"
+        assert result["conclusion"]["risk"] == "high"
+        assert "production acceptance gate failed" in result["conclusion"]["summary"]
+        assert any(
+            "exchange_truth_open_orders_present" in action
+            for action in result["conclusion"]["next_actions"]
+        )
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_production_blocker_window_reports_closed_evidence_conclusions(tmp_path):
     from scripts.analyze_production_blockers import analyze_event_file
 
