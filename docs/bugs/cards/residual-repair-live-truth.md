@@ -5,6 +5,9 @@ live-position truth, open-order truth, and dust terminality.
 
 Unified contract and coverage matrix:
 [pending-entry-live-truth-contract](../contracts/pending-entry-live-truth-contract.md).
+Residual repair rows are part of the same V1 coverage floor as pending-entry
+terminality. CL-048 / CL-049 / CL-050 are mapped through that contract, not
+tracked as separate active root-fix branches.
 
 ## Stable Fingerprints
 
@@ -46,7 +49,7 @@ release the gate with rule-source evidence.
 | 2026-05-25/26 | Exhausted residual already-flat cleanup and open-order truth | effective | LYN/OPG style tasks clear only after trusted live flat plus open-order empty truth. |
 | 2026-05-29 | Paused/exhausted live-nonzero resume, side rebuild, dust terminality | effective | PARTI/JCT production closure showed tradeable live residuals resume and complete; untrusted truth stays fail-closed. |
 | 2026-05-30 | HMSTR open-order-present pause evidence | fixed, deployed, probe verified | RED/GREEN harness now requires paused-event payload to include aggregate and per-venue open-order truth evidence; `0fd9a74` deployed and affected-symbol probes are flat/no-open-orders. |
-| 2026-06-04 | BIOUSDT Bybit duplicate cleanup convergence | local green | Repeated Bybit `110072` residual cleanup with stale-full/live-nonzero evidence now persists bounded CID attempt evidence, stops at `residual_repair_duplicate_live_nonzero_blocked`, enters fail-closed/risk-only, and retains the residual pair gate. Cloud deploy/diagnose still pending. |
+| 2026-06-04 | BIOUSDT Bybit duplicate cleanup convergence | deployed/cloud verified | Repeated Bybit `110072` residual cleanup with stale-full/live-nonzero evidence now persists bounded CID attempt evidence, stops at `residual_repair_duplicate_live_nonzero_blocked`, enters fail-closed/risk-only, and retains the residual pair gate. Cloud `68a979b` final verifier/diagnose proved all seven venues flat/no-open-orders. |
 
 ## Recurrences
 
@@ -57,7 +60,7 @@ release the gate with rule-source evidence.
 | 2026-05-29 | `PARTIUSDT` OKX/Binance | `9cdb9df` | closed by cloud probe | [daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression](../daily/2026-05-29.md#cluster-cl-015-jctusdt-partiusdt-v1-terminality-regression) |
 | 2026-05-30 | `HMSTRUSDT` Bybit/OKX, `RAVEUSDT` Bybit/OKX, post-fix `HOMEUSDT`/`POWERUSDT` residual completions | `0fd9a74` | fixed, deployed, final probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | `HOMEUSDT` Binance residual repair before passive close | existing residual-repair live-truth path | completed; final local state and read-only exchange truth flat/no-open-orders | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
-| 2026-06-04 | `BIOUSDT` Bybit live mismatch cleanup | working tree | PE-03 local fix keeps live maker position truth from becoming false-flat zero-fill; RC-08 local RED/GREEN makes repeated duplicate/live-nonzero cleanup fail-closed with explicit blocker evidence and non-reused CIDs | [daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality](../daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality) |
+| 2026-06-04 | `BIOUSDT` Bybit live mismatch cleanup | `68a979b` | deployed/cloud verified: `PE-03` keeps live maker position truth from becoming false-flat zero-fill; `RC-08` makes repeated duplicate/live-nonzero cleanup fail-closed with explicit blocker evidence and non-reused CIDs; production verifier/diagnose ended flat/no-open-orders across all seven venues. | [daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality](../daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality) |
 
 ## Regression Harness
 

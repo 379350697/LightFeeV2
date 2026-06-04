@@ -17,55 +17,49 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest BIOUSDT local follow-up, 2026-06-04: after CL-049 cloud verification,
-credentialed read-only diagnose later found local runtime flat/running while
-Bybit held a live `BIOUSDT` long position (`2429.0`, entry `0.02963`) and no
-venues had open orders. This is a deeper recurrence of the pending-entry
-terminality/live-truth family: V2 had an open-order guard before zero-fill
-finalization, but no live-position guard. CL050 adds
-`pending_entry.finalize_deferred_maker_live_position` and retains/backoffs the
-pending entry when maker live-position truth is nonzero instead of emitting
-`entry.passive_unfilled` / `unfilled_zero_balanced`. The same local change set
-also covers repeated Bybit duplicate cleanup (`RC-08`) by fail-closing with
-`residual_repair_duplicate_live_nonzero_blocked` after bounded non-reused CID
-attempts, and covers service-gate alignment (`DG-01`) by making
-`verify_production_services.py` require exchange-truth evidence instead of
-green-lighting local-flat snapshots without it. Local RED/GREEN passed for all
-three rows; production closure still requires deploy plus credentialed all-venue
-flat/no-open-orders verification.
+Latest pending-entry live-truth contract closure, 2026-06-04: CL-048, CL-049,
+and CL-050 are now one contract family governed by
+[`pending-entry-live-truth-contract`](contracts/pending-entry-live-truth-contract.md),
+not three independent root-fix tracks. Each recurrence maps into the matrix:
+CL-048 covers retained rejected positive fill recovery (`PE-05`, `PE-06`,
+`PE-07`, `PE-09`, `RC-01`), CL-049 covers live open-order terminality and
+diagnose gate alignment (`PE-02`, `PE-11`, `DG-02`), and CL-050 covers live
+maker position zero-fill terminality plus duplicate cleanup convergence
+(`PE-03`, `RC-07`, `RC-08`, `DG-01`). The contract closure is deployed through
+`68a979b`; production `verify_production_services.py --json` returned `ok=true`
+with zero local open/pending/close/residual work, and service-env
+`diagnose_live.py --json --since-deploy` returned healthy/high-confidence
+flat/no-open-orders truth across all seven venues. Future production issues in
+this family must be mapped to the matrix first. If the row is already covered
+and cloud truth is flat, update evidence/docs only; if not, add a RED test for
+the uncovered row before changing runtime code. The same contract now records
+V1 as the coverage floor, including terminalization budget, terminal
+taker-fallback/repost/cooldown, supervision backlog clear, live balanced
+hydration, ambiguous-live fail-closed behavior, and recovery-work lifecycle
+semantics. Rows `PE-12` through `PE-16` are the current V1 completeness audit
+surface; any future production evidence must map there before runtime edits.
 
-Latest post-CL048 local follow-up, 2026-06-04: after the CL-048 deployment was
-healthy, read-only diagnose later found a new SEIUSDT shape: local state was
-flat/running with no pending entry while Bybit still had non-reduce-only maker
-order `d792a623-d9e4-4c20-905f-f76a8f2efaeb` open for `451.0` `SEIUSDT` at
-`0.05315`. Event evidence showed `entry-1780573948279-SEIUSDT` was accepted on
-Bybit, stayed uncertain/no Hyperliquid position, then was finalized as
-`entry.passive_unfilled` / `unfilled_zero_balanced`. CL049 root-fixes this
-recurrence locally by querying live maker open-order truth before zero-fill
-pending finalization, retaining/backing off the pending entry when a matching
-open maker order exists, classifying Hyperliquid `Insufficient margin to place
-order.` as deterministic admission block evidence, and making
-`diagnose_live.py` conclusions consume `production_acceptance_gate` so open
-orders cannot be reported as healthy. Local RED/GREEN passed for the three new
-fixtures, file suites reached `16 passed`, `14 passed`, and `42 passed`, the
-adjacent startup/entry/runtime/passive suite reached `350 passed`, and full
-pytest reached `3438 passed`, `9 skipped`, `1 warning`. Cloud fast-forwarded to
-`1e082d9`, manifest and focused tests passed, services are active/running with
-`NRestarts=0`, final production health is `ok=true`, and service-env diagnose is
+Historical CL-049 contract recurrence, 2026-06-04: after the CL-048 deployment
+was healthy, read-only diagnose found local state flat/running while Bybit still
+had non-reduce-only maker order
+`d792a623-d9e4-4c20-905f-f76a8f2efaeb` open for `451.0` `SEIUSDT` at
+`0.05315`. This maps to matrix rows `PE-02`, `PE-11`, and `DG-02`. The deployed
+fix queries live maker open-order truth before zero-fill pending finalization,
+retains/backoffs pending when a matching maker order exists, classifies
+Hyperliquid insufficient margin as deterministic admission evidence, and keeps
+diagnose from reporting healthy when production acceptance has blockers. Cloud
+fast-forwarded to `1e082d9`, manifest and focused tests passed, services were
+active/running with `NRestarts=0`, and final service-env diagnose was
 healthy/high-confidence flat/no-open-orders across all seven venues.
 
-Latest deployment verification failure, 2026-06-04: cloud fast-forwarded to
-`9e93c90`, wrote `.deploy_version=9e93c90`, passed manifest verification,
-compileall, and the focused passive-close/startup-preflight/transport/diagnose
-suite (`612 passed`), then restarted sidecar/live active with `NRestarts=0`.
-Production acceptance failed anyway because credentialed exchange truth found a
-Bybit `SEIUSDT` long position (`455.0`) while local runtime had
-`open_positions=[]`, `pending_entry_count=1`, and `lifecycle=risk_only`.
-`diagnose_live.py --since-deploy` classified the window as
-`exchange_truth_mismatch` with blockers `local_pending_entries_or_closes_present`
-and `exchange_truth_nonzero_position`. This is CL048, a retained
-pending-entry/live-truth recovery gap, not a snapshot-fallback classifier issue
-and not the Bybit `10002` time-window issue.
+Historical CL-048 contract recurrence, 2026-06-04: cloud fast-forwarded to
+`9e93c90` and restarted sidecar/live active with `NRestarts=0`, but production
+acceptance failed because credentialed exchange truth found a Bybit `SEIUSDT`
+long position (`455.0`) while local runtime had `open_positions=[]`,
+`pending_entry_count=1`, and `lifecycle=risk_only`. This maps to matrix rows
+`PE-05`, `PE-06`, `PE-07`, `PE-09`, and `RC-01`: retained rejected positive
+fill recovery must finalize matched state plus residual cleanup instead of
+looping in local false-flat/risk-only.
 
 Latest diagnostic/Bybit time-window follow-up, 2026-06-04: two post-deploy
 concerns were split away from the order/close main-loop fight. First,
@@ -84,8 +78,9 @@ path, and body evidence if the refreshed retry still fails. Local verification:
 diagnose suite `41 passed`, transport suite `392 passed`, full pytest
 `3432 passed`, `9 skipped`, `1 warning`, compileall/diff-check clean, and
 GitNexus detect-changes critical as expected because private REST transport is
-a shared entry point. Cloud code deployment completed, but overall production
-acceptance is blocked by CL048.
+a shared entry point. Cloud code deployment completed, and the later
+pending-entry live-truth contract closure at `68a979b` closed the production
+acceptance blocker.
 
 Latest Bybit entry/passive-close deadline follow-up, 2026-06-04: phone
 screenshots showed Bybit-related abnormal close samples including `MEUUSDT`
@@ -106,8 +101,9 @@ passive-close live action is settling. Local verification is green: passive
 close suite `111 passed`, startup preflight `67 passed`, runtime entry /
 passive-close / live incident focused gates passed, and full pytest
 `3432 passed`, `9 skipped`, `1 warning`; compile, diff-check, and GitNexus
-detect-changes also ran. Cloud deploy/credentialed flat-no-open-orders
-verification is pending in this session. Watch
+detect-changes also ran. Cloud deployment and credentialed flat/no-open-orders
+acceptance for the pending-entry contract family were later closed at
+`68a979b`. Watch
 `pending_entry.finalize_deferred_unresolved_maker_zero_fill`,
 `pending_entry.finalize_fill_reconciliation_ignored_stale_zero`,
 `runtime.passive_close_deadline_fallback_armed`,
@@ -675,8 +671,8 @@ Latest Task-7 closure evidence, 2026-05-27: local full gate is green on code clo
 |---|---|---:|---|---|---|---|---|---|---|---|
 | [CL-049-post-cl048-seiusdt-open-maker-order-terminality](daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) | fixed, deployed, cloud verified | critical | `live-runtime`, `pending-entry`, `entry-reconciliation`, `exchange-truth`, `diagnose-live`, `bybit`, `hyperliquid`, `v1-parity`, `production-risk` | `post-cl048.bybit-seiusdt-open-maker-order-local-flat + zero-fill-finalize-cleared-pending + diagnose-gate-failed-conclusion-healthy + hyperliquid-insufficient-margin-no-admission-block` | 2026-06-04 | post-CL048 production diagnose found Bybit `SEIUSDT` maker order open while local pending/open state was empty; events showed zero-fill finalize removed the owner | `1e082d9` | 2026-06-04 local: RED/GREEN covered maker open-order truth blocking zero-fill finalize, Hyperliquid insufficient-margin admission block, and diagnose gate false-green; focused tests `1 passed`, `9 passed`, `1 passed`; file suites `16 passed`, `14 passed`, `42 passed`; adjacent startup/entry/runtime/passive suite `350 passed`; full pytest `3438 passed`, `9 skipped`, `1 warning`; compileall/diff-check/manifest passed; GitNexus detect-changes `medium`. Cloud: fast-forwarded to `1e082d9`, `.deploy_version=1e082d9`, manifest PASS, focused tests `11 passed`, sidecar/live active with `NRestarts=0`, final `verify_production_services.py --json` `ok=true`, and service-env diagnose `healthy`/`risk=low` with all-venue flat/no-open-orders truth. | `V1 pending-entry terminality live open-order truth plus deterministic Hyperliquid admission evidence` | V2 now checks maker live open-order truth before zero-fill `passive_unfilled`, retains/backoffs pending entries with matching open maker orders, classifies Hyperliquid insufficient-margin as a deterministic admission block for initial and pending hedge paths, and prevents diagnose from reporting healthy when the production acceptance gate has blockers. The pre-existing SEIUSDT orphan open order was absent from final read-only truth; no manual order or runtime-state mutation was used. |
 | [CL-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch](daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch) | fixed, deployed, cloud verified | critical | `live-runtime`, `pending-entry`, `startup-recovery`, `entry-reconciliation`, `exchange-truth`, `bybit`, `hyperliquid`, `v1-parity`, `production-risk` | `post-deploy.bybit-seiusdt-live-position-local-flat + reconciliation.rejected_pending_retained_with_fill + startup_recovery_pending_work_without_open_positions` | 2026-06-04 | post-`9e93c90` deploy verification found Bybit `SEIUSDT` live long while local state had no open position and retained one pending entry | `8be067e` | 2026-06-04 local: GitNexus index refreshed to `772614d`; private method impact unresolved by symbol, scoped by query/direct callers and treated HIGH; RED/GREEN SEIUSDT startup and reconciliation fixtures passed; pending-entry file `15 passed`; adjacent startup/entry/runtime/passive suite `350 passed`; V1 recovery `18 passed`; live harness `3 passed`; full pytest `3434 passed`, `9 skipped`, `1 warning`; compileall and diff-check passed. Cloud: fast-forwarded to `30aba89`, manifest PASS, remote focused `365 passed`, services active with `NRestarts=0`, final `verify_production_services.py --json` `ok=true`, and service-env diagnose `healthy`/`risk=low` with all-venue flat/no-open-orders truth. | `Retained rejected pending positive-fill recovery finalizes matched state plus residual repair` | V2 now routes rejected pending entries with positive fill evidence through the existing V1 `_finalize_pending_entry()` path from startup force reconcile, startup recovery, and normal reconciliation. The deployed SEIUSDT recovery emitted `recovery.rejected_pending_positive_fill_finalized`, opened matched state, queued/completed residual repair, verified drift flat, and returned local state to running with open/pending/residual `0/0/0`. |
-| [CL-047-diagnose-snapshot-fallback-and-bybit-time-window-evidence](daily/2026-06-04.md#cluster-cl-047-diagnose-snapshot-fallback-and-bybit-time-window-evidence) | code deployed; overall acceptance blocked by CL-048 | high | `production-diagnostics`, `acceptance-gate`, `venue-transport`, `venue-bybit`, `server-time`, `exchange-docs`, `v1-parity` | `diagnose.snapshot_fallback_scoped_blocking_misclassified_insufficient + bybit.10002.timestamp_recv_window_retry_missing + bybit.server_time_seconds_precision_loss` | 2026-06-04 | post-deploy review separated snapshot fallback insufficient-evidence and Bybit 10002 from passive-close mutual fighting | `9e93c90` | 2026-06-04 local: GitNexus impact LOW for diagnose snapshot helper, CRITICAL for private REST transport helpers; RED/GREEN covered scoped vs global snapshot fallback, Bybit millisecond server-time parse, Bybit 10002 retry, and success envelope no false retry; diagnose suite `41 passed`; transport suite `392 passed`; full pytest `3432 passed, 9 skipped, 1 warning`; remote manifest PASS and focused suite `612 passed`; services restarted active/running; post-deploy acceptance blocked by separate CL-048 | `Candidate-scoped snapshot fallback classification plus Bybit official time-window retry/evidence` | Candidate-scoped snapshot fallback with candidate/domain/venue/age evidence now classifies as `v1_parity`, while global fallback without scope still blocks as insufficient evidence. Bybit server time now uses millisecond precision, 200-envelope `retCode=10002` clears cached offset and re-signs once, and repeated failure emits server-time/header/body evidence instead of leaving an unrooted timestamp-window guess. |
-| [CL-046-bybit-entry-passive-close-v1-deadline-loop](daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) | code deployed; overall acceptance blocked by CL-048 | critical | `live-runtime`, `pending-entry`, `entry-reconciliation`, `exit-decision`, `passive-close`, `close-executor`, `bybit`, `v1-parity`, `production-risk` | `bybit.non-settlement-entry + pending-entry-nonterminal-zero-fill-finalized + stale-zero-reconciliation-erases-fill + passive-close-overdue-backoff-loop + passive-close-fallback-zero-fill-no-fail-closed` | 2026-06-04 | phone screenshots showed Bybit entries/closes outside expected settlement behavior, seconds-long closes, and >8h exposure; V1 comparison required dual-leg terminality, hard passive-close deadline, and no close-loop mutual fighting | `9e93c90` | 2026-06-04 local: GitNexus impact HIGH/CRITICAL for passive close and transport-adjacent flows; RED/GREEN covered pending-entry zero terminality, stale zero fill preservation, overdue passive fallback, no-executor/zero-fill hard breach, hedge hard breach, one-sided live flatten settling, and drift-correction ownership. Passive close `111 passed`; startup preflight `67 passed`; runtime/passive/incident focused gates passed; full pytest `3432 passed, 9 skipped, 1 warning`; remote manifest PASS and focused suite `612 passed`; services restarted active/running; post-deploy acceptance blocked by separate CL-048 | `V1 pending-entry terminality plus passive-close deadline/fail-closed ownership` | V2 no longer finalizes maker zero-fill without terminal order/fill evidence, no longer lets stale zero reconciliation erase known positive fills, arms overdue passive closes into DUAL_TAKER, converts hard breaches into fail-closed with compensation/live-flat probing, and prevents passive close from submitting maker work in the same tick after live truth has already driven one-sided flatten. Runtime drift correction now stands down while passive-close live action is settling. |
+| [CL-047-diagnose-snapshot-fallback-and-bybit-time-window-evidence](daily/2026-06-04.md#cluster-cl-047-diagnose-snapshot-fallback-and-bybit-time-window-evidence) | code deployed; later contract acceptance closed | high | `production-diagnostics`, `acceptance-gate`, `venue-transport`, `venue-bybit`, `server-time`, `exchange-docs`, `v1-parity` | `diagnose.snapshot_fallback_scoped_blocking_misclassified_insufficient + bybit.10002.timestamp_recv_window_retry_missing + bybit.server_time_seconds_precision_loss` | 2026-06-04 | post-deploy review separated snapshot fallback insufficient-evidence and Bybit 10002 from passive-close mutual fighting | `9e93c90` | 2026-06-04 local: GitNexus impact LOW for diagnose snapshot helper, CRITICAL for private REST transport helpers; RED/GREEN covered scoped vs global snapshot fallback, Bybit millisecond server-time parse, Bybit 10002 retry, and success envelope no false retry; diagnose suite `41 passed`; transport suite `392 passed`; full pytest `3432 passed, 9 skipped, 1 warning`; remote manifest PASS and focused suite `612 passed`; services restarted active/running; the later pending-entry live-truth contract closure at `68a979b` closed the production acceptance blocker | `Candidate-scoped snapshot fallback classification plus Bybit official time-window retry/evidence` | Candidate-scoped snapshot fallback with candidate/domain/venue/age evidence now classifies as `v1_parity`, while global fallback without scope still blocks as insufficient evidence. Bybit server time now uses millisecond precision, 200-envelope `retCode=10002` clears cached offset and re-signs once, and repeated failure emits server-time/header/body evidence instead of leaving an unrooted timestamp-window guess. |
+| [CL-046-bybit-entry-passive-close-v1-deadline-loop](daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) | code deployed; later contract acceptance closed | critical | `live-runtime`, `pending-entry`, `entry-reconciliation`, `exit-decision`, `passive-close`, `close-executor`, `bybit`, `v1-parity`, `production-risk` | `bybit.non-settlement-entry + pending-entry-nonterminal-zero-fill-finalized + stale-zero-reconciliation-erases-fill + passive-close-overdue-backoff-loop + passive-close-fallback-zero-fill-no-fail-closed` | 2026-06-04 | phone screenshots showed Bybit entries/closes outside expected settlement behavior, seconds-long closes, and >8h exposure; V1 comparison required dual-leg terminality, hard passive-close deadline, and no close-loop mutual fighting | `9e93c90` | 2026-06-04 local: GitNexus impact HIGH/CRITICAL for passive close and transport-adjacent flows; RED/GREEN covered pending-entry zero terminality, stale zero fill preservation, overdue passive fallback, no-executor/zero-fill hard breach, hedge hard breach, one-sided live flatten settling, and drift-correction ownership. Passive close `111 passed`; startup preflight `67 passed`; runtime/passive/incident focused gates passed; full pytest `3432 passed, 9 skipped, 1 warning`; remote manifest PASS and focused suite `612 passed`; services restarted active/running; the later pending-entry live-truth contract closure at `68a979b` closed the production acceptance blocker | `V1 pending-entry terminality plus passive-close deadline/fail-closed ownership` | V2 no longer finalizes maker zero-fill without terminal order/fill evidence, no longer lets stale zero reconciliation erase known positive fills, arms overdue passive closes into DUAL_TAKER, converts hard breaches into fail-closed with compensation/live-flat probing, and prevents passive close from submitting maker work in the same tick after live truth has already driven one-sided flatten. Runtime drift correction now stands down while passive-close live action is settling. |
 | [CL-044-close-risk-force-v1-parity-gaps](daily/2026-06-04.md#cluster-cl-044-close-risk-force-v1-parity-gaps) | fixed, deployed, cloud verified; full risk-delever L2 sizing follow-up open | critical | `live-runtime`, `risk-supervisor`, `close-executor`, `residual-repair`, `bybit-duplicate-reconcile`, `v1-parity` | `v2.force-close-helper-unwired + death-line-single-side-protection-dual-close + residual-repair-bybit-110072-loop + compensation-duplicate-no-reconcile + risk-protection-pnl-bucket-missing` | 2026-06-04 | V1/V2 source audit after production Bybit residual-repair duplicate loop and force-close question | `6466eb0` | 2026-06-04 local/cloud: GitNexus impact HIGH for `build_risk_execution_plan`, LOW for close/risk helpers; RED/GREEN focused passed; adjacent suite reached `189 passed`; remote compile/manifest/focused tests passed; services active with `NRestarts=0`; post-deploy all-account truth high-confidence flat/no-open-orders across seven venues | `V1 close/risk/force-close semantic parity on active runtime paths` | Runtime now routes due aligned positions as `settlement_force_close`; death-line protection carries a V1 venue/side/stage target and submits exactly one reduce-only IOC leg; residual repair and close compensation reconcile Bybit `110072` before rescheduling/failing; risk/protection close PnL buckets are written. Full V1 risk-delever L2 sizing remains explicitly open because it needs a separate HIGH-impact change. |
 | [CL-045-diagnose-empty-symbol-exchange-truth-gap](daily/2026-06-04.md#cluster-cl-045-diagnose-empty-symbol-exchange-truth-gap) | fixed, deployed, cloud verified | high | `production-diagnostics`, `exchange-truth`, `read-only-probes`, `deployment-acceptance`, `exchange-docs` | `diagnose-live.empty-local-symbols-skips-exchange-truth + exchange-truth-unavailable-after-healthy-deploy` | 2026-06-04 | post-`37d7b6f` deploy health was green, but `diagnose_live --since-deploy` could not prove exchange truth because local symbols were empty and no private probe was issued | `6138003` | 2026-06-04 local/cloud: impact LOW/MEDIUM limited to diagnose report flow; RED/GREEN `3 passed`; full diagnose suite `38 passed`; adjacent deploy gate `189 passed`; remote compile/manifest/focused tests passed; post-deploy diagnose reports seven venue `status=ok`, zero positions/orders, `gate_passed=true`, and evidence complete | `Read-only all-account exchange-truth probes when local state has no symbols` | `diagnose_live` now uses all-position and venue-documented all-open-order read-only probes when symbols are empty, creates readonly adapters for all seven live perp venues, defaults truth venues to all seven, loads Hyperliquid wallet/account envs including the production `LIGHTFEE_HYPERLIQUID_PRIVATE_KEY` alias, avoids the cloud `asyncio.get_event_loop()` DeprecationWarning, and marks high-confidence no-error healthy windows as complete evidence. No trading-state mutation or order submission path changed. |
 | [CL-043-pending-entry-maker-progress-open-order-truth](daily/2026-06-03.md#cluster-cl-043-pending-entry-maker-progress-open-order-truth) | fixed, deployed, short-window cloud verified; historical Bybit chronology evidence pending | critical | `live-runtime`, `pending-entry-reconciliation`, `venue-transport`, `venue-bybit`, `venue-okx`, `production-observability`, `v1-parity`, `exchange-docs` | `post-bd12acd.pending-entry.live-position-progress-with-uncertain-maker-order + bybit-open-maker-orders-after-local-flat + okx-synthetic-recovery-ordid-51000` | 2026-06-03 | post-`bd12acd` deploy-window read-only audit found two `MEUSDT` Bybit non-reduce-only PostOnly maker orders open after local pending state was absent, plus OKX `51000 Parameter ordId error` for a synthetic recovery order id; final all-venue truth later returned flat/no-open-orders | `9d580d5` | 2026-06-03 local/cloud: production read-only pre-fix state was green/flat but deploy window had `pending_entry.maker_progress_applied` after Bybit `execution_not_found` / `live_position_delta.quantity=608`, two transient Bybit open maker orders, later cleanup/recovery flattening, and OKX `51000` for synthetic `entry-...-recovery-short`. GitNexus index refreshed to `bd12acd`; method-level impact returned UNKNOWN/not found, so blast radius was bounded by query/direct callers. RED/GREEN proved OKX synthetic ids no longer go to `ordId` and uncertain maker live positions no longer apply maker progress; focused `2 passed`; pending-entry `13 passed`; live-harness incident `3 passed`; runtime/abort cleanup `65 passed`; venue evidence `5 passed`; reconciliation/V1 client-id `45 passed`; full transport `382 passed`; live-entry root-fix `134 passed`; full pytest `3392 passed, 9 skipped, 1 warning`; compileall/diff-check passed; detect-changes HIGH with `8 files`, `24 symbols`, `6` OKX transport affected flows and pre-existing `AGENTS.md`/`CLAUDE.md` noise. Cloud fast-forwarded `bd12acd..9d580d5`, wrote `.deploy_version=9d580d5`, manifest `370` files / 14 critical checks passed, remote compileall passed, focused remote suite `86 passed`, services restarted active/running with `NRestarts=0`, post-deploy health green with local open/pending/close/residual `0/0/0/0`, warning logs empty, diagnose Local-L2 missing/stale/sequence-gap `0/0/0`, entry/open-position `0/0`, and credentialed all-account truth showed all 7 venues nonzero positions `0` and open orders `0`. | `V1 passive-maker terminality semantics plus exchange-documented OKX order query ids` | V2 now refuses to apply live-position quantity/price/order-id progress to the passive maker leg unless that leg is reconciled as `filled`; it emits `pending_entry.live_position_progress_deferred` when live position truth exists but maker order terminality is unproven. OKX order status now sends numeric exchange ids as `ordId` and synthetic/client ids as `clOrdId`. Hedge live-position hydration remains unchanged for the PRL-style V1 recovery path. No Bybit orphan maker or OKX synthetic `ordId` recurrence appeared in the short post-deploy window. Remaining evidence is historical: credentialed Bybit order/execution-history around the two pre-fix MEUSDT order ids/client ids. |
