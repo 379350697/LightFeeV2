@@ -95,6 +95,13 @@ it is the compact reusable memory for future root-cause work:
 docs/bugs/cards/<family-fingerprint>.md
 ```
 
+Use contracts for cross-family invariants and test matrices that must gate
+future fixes:
+
+```text
+docs/bugs/contracts/<contract-name>.md
+```
+
 Use one daily ledger file for normal work:
 
 ```text

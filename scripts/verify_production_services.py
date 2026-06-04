@@ -66,7 +66,12 @@ def main() -> None:
             details={"path": args.snapshot},
         ))
     if Path(args.current_state).exists():
-        reports.append(analyze_current_state(_read_json(args.current_state), now_ms=now_ms, max_tick_age_ms=args.max_tick_age_ms))
+        reports.append(analyze_current_state(
+            _read_json(args.current_state),
+            now_ms=now_ms,
+            max_tick_age_ms=args.max_tick_age_ms,
+            require_exchange_truth=True,
+        ))
     else:
         reports.append(HealthReport(
             name="current_state",

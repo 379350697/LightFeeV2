@@ -3,6 +3,9 @@
 Purpose: keep the reusable memory for pending-entry false flat, stale accepted
 orders, planned hedge CID misuse, and balanced live-position hydration.
 
+Unified contract and coverage matrix:
+[pending-entry-live-truth-contract](../contracts/pending-entry-live-truth-contract.md).
+
 ## Stable Fingerprints
 
 - Local state shows no open/pending work while exchange truth has nonzero positions.
@@ -83,6 +86,7 @@ truth evidence and no new-entry risk.
 | 2026-06-04 | Bybit nonterminal zero-fill and stale zero reconciliation | local full gate green, cloud deploy pending | Maker zero-fill with nonterminal evidence no longer finalizes as passive unfilled, and later zero reconciliation no longer erases known positive hedge fill. Full pytest reached `3432 passed`, `9 skipped`, `1 warning`. |
 | 2026-06-04 | SEIUSDT post-deploy retained pending/live-truth mismatch | deployed/cloud verified | Rejected pending entries with positive fill evidence now route through V1 `_finalize_pending_entry()` from startup force reconcile, startup recovery, and normal reconciliation. The SEIUSDT fixture finalizes maker `455.0` / hedge `68.0` into matched open `68.0` plus Bybit residual repair `387.0`; incomplete evidence is retained with explicit deferred events instead of local false-flat looping. Full pytest reached `3434 passed`, `9 skipped`, `1 warning`; cloud final health is running/flat with no open orders. |
 | 2026-06-04 | SEIUSDT open maker order truth before zero-fill finalize | deployed/cloud verified | `_finalize_pending_entry()` now queries live maker open-order truth before removing a zero-fill pending entry. If a matching maker order is still open, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_open_order`; diagnose also treats acceptance-gate open-order blockers as unhealthy. Cloud final truth is high-confidence flat/no-open-orders on all venues. |
+| 2026-06-04 | BIOUSDT live-position truth before zero-fill finalize | local green | `_finalize_pending_entry()` now checks maker live-position truth before removing a zero-fill pending entry. If maker live position is nonzero, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_live_position`; residual duplicate cleanup and production service gating are also covered locally, with cloud deploy/diagnose still pending. |
 
 ## Recurrences
 
@@ -96,6 +100,7 @@ truth evidence and no new-entry risk.
 | 2026-06-04 | `MEUUSDT`, `LDOUSDT` Bybit-related entry/fill samples | main push in this session | full pytest `3432 passed`, `9 skipped`, `1 warning`; cloud deploy pending | [daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop](../daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) |
 | 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid | `8be067e`; deployed via `30aba89` | local RED/GREEN fixed retained rejected positive-fill recovery; cloud emitted `recovery.rejected_pending_positive_fill_finalized`, completed residual repair and drift correction, then settled to `lifecycle=running`, local open/pending/residual `0/0/0`, all-venue exchange truth flat/no open orders | [daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch](../daily/2026-06-04.md#cluster-cl-048-post-deploy-seiusdt-pending-entry-live-truth-mismatch) |
 | 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid open maker order | `1e082d9` | local RED/GREEN prevents zero-fill finalization when Bybit live open-order truth still has the maker order; cloud final diagnose is healthy/high-confidence flat/no-open-orders on all venues, and no manual order/state mutation was used | [daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality](../daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) |
+| 2026-06-04 | `BIOUSDT` Bybit live maker position | working tree | local RED/GREEN prevents zero-fill finalization when Bybit maker live-position truth is nonzero; RC-08 duplicate cleanup convergence and DG-01 production service gate are covered locally, but production closure still requires deploy plus credentialed all-venue flat/no-open-orders verification | [daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality](../daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality) |
 
 ## Regression Harness
 

@@ -7935,6 +7935,61 @@ class LiveRuntime:
         )
         return True
 
+    async def _pending_entry_zero_fill_has_live_maker_position(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+    ) -> bool:
+        maker_venue = pending.maker_venue()
+        adapter = self.get_venue_adapter(maker_venue)
+        if adapter is None:
+            return False
+
+        try:
+            position = await adapter.fetch_position(pending.symbol)
+        except Exception as exc:
+            self.journal.append(
+                "pending_entry.finalize_maker_live_position_truth_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": maker_venue.value,
+                    "error": str(exc) or exc.__class__.__name__,
+                    "reason": "zero_fill_finalize_live_position_truth_unavailable",
+                },
+            )
+            return False
+
+        live_qty = abs(float(getattr(position, "quantity", 0.0) or 0.0)) if position else 0.0
+        if live_qty <= 1e-9:
+            return False
+
+        pending.uncertain_outcome = True
+        pending.reconcile_next_attempt_ms = max(
+            int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+            now_ms + 1_000,
+        )
+        self.journal.append(
+            "pending_entry.finalize_deferred_maker_live_position",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "maker_venue": maker_venue.value,
+                "live_position_quantity": live_qty,
+                "live_position_side": getattr(
+                    getattr(position, "side", None), "value", str(getattr(position, "side", ""))
+                ),
+                "live_position_entry_price": float(
+                    getattr(position, "entry_price", 0.0) or 0.0
+                ),
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "reason": "maker_live_position_truth_present",
+            },
+        )
+        return True
+
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> None:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
 
@@ -8055,6 +8110,12 @@ class LiveRuntime:
         if balanced_quantity <= 0.0:
             if not pending.has_any_fill():
                 if await self._pending_entry_zero_fill_has_live_maker_open_order(
+                    pending,
+                    entry_id,
+                    now_ms,
+                ):
+                    return
+                if await self._pending_entry_zero_fill_has_live_maker_position(
                     pending,
                     entry_id,
                     now_ms,
@@ -8392,7 +8453,6 @@ class LiveRuntime:
 
         from lightfee.core.domain import OrderRequest
         from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
-        from lightfee.venues.cid import compact_client_order_id
 
         repaired = 0
         for task in list(self.state.pending_residual_repairs):
@@ -8706,6 +8766,21 @@ class LiveRuntime:
                     },
                 )
 
+            next_client_order_id = str(task.pop("next_client_order_id", "") or "")
+            current_duplicate_attempt = int(
+                task.pop(
+                    "next_duplicate_attempt",
+                    self._residual_repair_attempt_count(task),
+                )
+                or 0
+            )
+            cleanup_client_order_id = (
+                next_client_order_id
+                or self._residual_repair_client_order_id(
+                    position_id,
+                    current_duplicate_attempt,
+                )
+            )
             req = OrderRequest(
                 venue=repair_venue,
                 symbol=symbol,
@@ -8715,9 +8790,11 @@ class LiveRuntime:
                 post_only=False,
                 reduce_only=True,
                 time_in_force=TimeInForce.IOC,
-                client_order_id=compact_client_order_id(position_id, "residual_repair"),
+                client_order_id=cleanup_client_order_id,
             )
             fill = None
+            duplicate_live_nonzero_error = ""
+            duplicate_live_nonzero_evidence: dict[str, Any] | None = None
             try:
                 fill = await adapter.place_order(req)
                 self._flush_adapter_order_diagnostics(adapter)
@@ -8799,7 +8876,22 @@ class LiveRuntime:
                         retry_quantity = duplicate_reconcile.retry_qty
                         if duplicate_reconcile.live_qty > 1e-9:
                             retry_quantity = min(retry_quantity, duplicate_reconcile.live_qty)
-                        duplicate_attempt = self._residual_repair_attempt_count(task) + 1
+                        duplicate_attempt = max(
+                            self._residual_repair_attempt_count(task) + 1,
+                            current_duplicate_attempt + 1,
+                        )
+                        retry_client_order_id = self._residual_repair_client_order_id(
+                            position_id,
+                            duplicate_attempt,
+                        )
+                        if retry_client_order_id == req.client_order_id:
+                            duplicate_attempt += 1
+                            retry_client_order_id = (
+                                self._residual_repair_client_order_id(
+                                    position_id,
+                                    duplicate_attempt,
+                                )
+                            )
                         retry_req = OrderRequest(
                             venue=repair_venue,
                             symbol=symbol,
@@ -8809,10 +8901,7 @@ class LiveRuntime:
                             post_only=False,
                             reduce_only=True,
                             time_in_force=TimeInForce.IOC,
-                            client_order_id=compact_client_order_id(
-                                position_id,
-                                f"residual_repair_duplicate_{duplicate_attempt}",
-                            ),
+                            client_order_id=retry_client_order_id,
                         )
                         try:
                             fill = await adapter.place_order(retry_req)
@@ -8820,12 +8909,80 @@ class LiveRuntime:
                             repair_quantity = retry_quantity
                         except Exception as retry_error:
                             self._flush_adapter_order_diagnostics(adapter)
-                            e = retry_error
+                            if (
+                                repair_venue == Venue.BYBIT
+                                and _is_bybit_duplicate_order_link_id(str(retry_error))
+                                and duplicate_reconcile.live_qty > 1e-9
+                            ):
+                                next_retry_count = (
+                                    self._residual_repair_attempt_count(task) + 1
+                                )
+                                duplicate_live_nonzero_error = (
+                                    "residual_repair_duplicate_live_nonzero_blocked"
+                                    if next_retry_count >= 3
+                                    else "residual_repair_duplicate_live_nonzero_retry_failed"
+                                )
+                                task["next_client_order_id"] = (
+                                    self._residual_repair_client_order_id(
+                                        position_id,
+                                        duplicate_attempt + 1,
+                                    )
+                                )
+                                task["next_duplicate_attempt"] = duplicate_attempt + 1
+                                duplicate_live_nonzero_evidence = {
+                                    "position_id": position_id,
+                                    "pair_id": pair_id,
+                                    "symbol": symbol,
+                                    "origin": task.get("origin", ""),
+                                    "repair_venue": repair_venue.value,
+                                    "repair_side": repair_side.value,
+                                    "client_order_id": req.client_order_id,
+                                    "retry_client_order_id": retry_req.client_order_id,
+                                    "next_client_order_id": task["next_client_order_id"],
+                                    "classification": duplicate_reconcile.classification,
+                                    "decision": duplicate_reconcile.decision,
+                                    "target_qty": duplicate_reconcile.target_qty,
+                                    "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                                    "live_qty": duplicate_reconcile.live_qty,
+                                    "remaining_qty": duplicate_reconcile.remaining_qty,
+                                    "retry_qty": duplicate_reconcile.retry_qty,
+                                    "order_id": duplicate_reconcile.order_id,
+                                    "original_error": str(e),
+                                    "retry_error": str(retry_error),
+                                }
+                                e = RuntimeError(duplicate_live_nonzero_error)
+                            else:
+                                e = retry_error
 
                 if fill is not None:
                     pass
                 else:
                     self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                    if duplicate_live_nonzero_evidence is not None:
+                        task["last_duplicate_cleanup"] = dict(
+                            duplicate_live_nonzero_evidence
+                        )
+                        if (
+                            duplicate_live_nonzero_error
+                            == "residual_repair_duplicate_live_nonzero_blocked"
+                        ):
+                            enter_fail_closed(self.state)
+                            self.state.recovery_blocked_reason = (
+                                duplicate_live_nonzero_error
+                            )
+                            self.state.recovery_blocked_at_ms = now_ms
+                            self.state.last_error = duplicate_live_nonzero_error
+                            task["last_error"] = duplicate_live_nonzero_error
+                            blocker_payload = dict(duplicate_live_nonzero_evidence)
+                            blocker_payload.update({
+                                "retry_count": self._residual_repair_attempt_count(task),
+                                "blocked_new_entry": True,
+                                "ts_ms": now_ms,
+                            })
+                            self.journal.append(
+                                "recovery.residual_repair_duplicate_live_nonzero_blocked",
+                                blocker_payload,
+                            )
                     self.journal.append(
                         "recovery.residual_repair_failed",
                         {
@@ -8891,6 +9048,20 @@ class LiveRuntime:
                 "recovery.residual_repairs_complete",
                 {"repaired": repaired, "ts_ms": now_ms},
             )
+
+    @staticmethod
+    def _residual_repair_client_order_id(
+        position_id: str,
+        duplicate_attempt: int,
+    ) -> str:
+        from lightfee.venues.cid import compact_client_order_id
+
+        suffix = (
+            "residual_repair"
+            if duplicate_attempt <= 0
+            else f"residual_repair_duplicate_{duplicate_attempt}"
+        )
+        return compact_client_order_id(position_id, suffix)
 
     def _pending_residual_repair_fields(self, task: dict) -> tuple[Venue, Side, float] | None:
         venue_raw = task.get("repair_venue") or task.get("exposure_venue")

@@ -248,6 +248,7 @@ def analyze_current_state(
     *,
     now_ms: int,
     max_tick_age_ms: int,
+    require_exchange_truth: bool = False,
 ) -> HealthReport:
     fingerprints: list[str] = []
     last_tick_ms = int(state.get("last_tick_ms") or 0)
@@ -267,6 +268,22 @@ def analyze_current_state(
         fingerprints.append("last_scan_missing")
     exchange_truth = state.get("exchange_truth")
     exchange_truth_mismatches: list[dict[str, Any]] = []
+    exchange_truth_available = (
+        isinstance(exchange_truth, dict)
+        and bool(exchange_truth.get("available"))
+    )
+    exchange_truth_confidence = (
+        str(exchange_truth.get("confidence", ""))
+        if isinstance(exchange_truth, dict)
+        else ""
+    )
+    if require_exchange_truth:
+        if not isinstance(exchange_truth, dict):
+            fingerprints.append("exchange_truth_missing")
+        elif not exchange_truth_available:
+            fingerprints.append("exchange_truth_unavailable")
+        elif exchange_truth_confidence != "high":
+            fingerprints.append("exchange_truth_confidence_not_high")
     if isinstance(exchange_truth, dict) and exchange_truth.get("available") and exchange_truth.get("confidence") == "high":
         leg_mismatches = _exchange_truth_position_mismatches(state, exchange_truth)
         if leg_mismatches:
@@ -314,6 +331,9 @@ def analyze_current_state(
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
             "pending_residual_repair_count": int(state.get("pending_residual_repair_count") or 0),
+            "exchange_truth_required": require_exchange_truth,
+            "exchange_truth_available": exchange_truth_available,
+            "exchange_truth_confidence": exchange_truth_confidence,
             "exchange_truth_mismatches": exchange_truth_mismatches,
         },
     )

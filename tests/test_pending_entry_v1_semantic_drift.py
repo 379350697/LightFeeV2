@@ -128,6 +128,29 @@ class _TerminalNoFillOpenMakerAdapter(_NoFillReconciliationAdapter):
         ]
 
 
+class _TerminalNoFillLivePositionAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, position: PositionSnapshot):
+        self.position = position
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return OrderFillReconciliation(
+            venue=self.position.venue,
+            symbol=symbol,
+            side=self.position.side,
+            quantity=0.0,
+            average_price=0.0,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            metadata={"status": "canceled"},
+        )
+
+    async def fetch_open_orders(self, symbol):
+        return []
+
+    async def fetch_position(self, symbol):
+        return self.position
+
+
 class _NormalizingAdapter(_NoFillReconciliationAdapter):
     def __init__(self, *, normalized_quantity: float):
         self.normalized_quantity = normalized_quantity
@@ -445,6 +468,61 @@ async def test_uncertain_maker_order_live_position_does_not_apply_maker_progress
     assert deferred[-1]["leg"] == "maker"
     assert deferred[-1]["status"] == "uncertain"
     assert deferred[-1]["reason"] == "order_terminality_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_finalize_retains_when_live_position_truth_is_nonzero(
+    config, tmp_journal,
+):
+    bybit_position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="BIOUSDT",
+        side=Side.BUY,
+        quantity=2429.0,
+        entry_price=0.02963,
+        observed_at_ms=1780580073206,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _TerminalNoFillLivePositionAdapter(bybit_position),
+            Venue.HYPERLIQUID: _NoFillReconciliationAdapter(),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780577580703-BIOUSDT",
+        symbol="BIOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=810.0,
+        maker_leg="long",
+        maker_order_id="45e9f91a-bybit-maker",
+        maker_client_order_id="70aadf0478bf44bb92de6633497714b8",
+        hedge_order_id="",
+        hedge_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._finalize_pending_entry(pending, pending.pending_id, 1780580073206)
+
+    assert pending.pending_id in runtime.state.pending_entries
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "entry.passive_unfilled" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
+    deferred = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.finalize_deferred_maker_live_position"
+    ]
+    assert deferred[-1]["entry_id"] == pending.pending_id
+    assert deferred[-1]["live_position_quantity"] == pytest.approx(2429.0)
+    assert deferred[-1]["reason"] == "maker_live_position_truth_present"
 
 
 @pytest.mark.asyncio

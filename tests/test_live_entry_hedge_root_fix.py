@@ -5604,6 +5604,100 @@ class TestResidualRepairExecutionV1Parity:
         assert "recovery.residual_repair_duplicate_client_order_reconcile_result" in kinds
 
     @pytest.mark.asyncio
+    async def test_bybit_duplicate_residual_repair_live_nonzero_blocks_after_bounded_retries(
+        self, tmp_path,
+    ):
+        from lightfee.risk.modes import EngineLifecycle
+
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        pair_id = "biousdt:bybit->hyperliquid"
+        position_id = "live-recovery:probe:BIOUSDT:bybit"
+        runtime.state.pending_residual_repairs.append({
+            "position_id": position_id,
+            "pair_id": pair_id,
+            "symbol": "BIOUSDT",
+            "origin": "live_recovery_mismatch",
+            "repair_venue": "bybit",
+            "repair_side": "sell",
+            "repair_quantity": 2429.0,
+            "created_at_ms": now_ms,
+            "deadline_ms": now_ms + 300_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+
+        class AlwaysDuplicateLiveNonzeroAdapter(_FakeVenueAdapter):
+            async def fetch_position(self, symbol):
+                self._fetch_position_calls.append(symbol)
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=2429.0,
+                    entry_price=0.02963,
+                    observed_at_ms=now_ms + len(self._fetch_position_calls),
+                )
+
+            async def fetch_order_fill_reconciliation(
+                self, symbol, order_id, client_order_id=None,
+            ):
+                self._fetch_order_fill_reconciliation_calls.append(
+                    (symbol, order_id, client_order_id)
+                )
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=2429.0,
+                    average_price=0.02963,
+                    order_id="stale-filled-cleanup",
+                    client_order_id=client_order_id,
+                    filled_at_ms=now_ms - 5_000,
+                )
+
+            async def place_order(self, request):
+                self._place_order_calls.append(request)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                )
+
+        bybit = AlwaysDuplicateLiveNonzeroAdapter(Venue.BYBIT)
+        runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+        for offset_ms in (0, 60_000, 120_000):
+            await runtime._recover_residual_repairs(now_ms + offset_ms)
+
+        assert len(runtime.state.pending_residual_repairs) == 1
+        task = runtime.state.pending_residual_repairs[0]
+        assert task["local_entry_paused"] is True
+        assert task["last_error"] == "residual_repair_duplicate_live_nonzero_blocked"
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.risk_mode.value == "fail_closed"
+        assert runtime._has_pending_residual_pair(pair_id) is True
+
+        client_order_ids = [
+            request.client_order_id for request in bybit._place_order_calls
+        ]
+        assert len(client_order_ids) >= 3
+        assert len(client_order_ids) == len(set(client_order_ids))
+
+        events = runtime.journal.read_all()
+        blocked = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "recovery.residual_repair_duplicate_live_nonzero_blocked"
+        ]
+        assert blocked
+        assert blocked[-1]["position_id"] == position_id
+        assert blocked[-1]["symbol"] == "BIOUSDT"
+        assert blocked[-1]["live_qty"] == pytest.approx(2429.0)
+        assert blocked[-1]["retry_count"] == 3
+        assert blocked[-1]["blocked_new_entry"] is True
+
+    @pytest.mark.asyncio
     async def test_pending_residual_repairs_are_driven_by_normal_housekeeping_tick(self, tmp_path, monkeypatch):
         runtime = _make_open_runtime(tmp_path)
         now_ms = 1779422875621

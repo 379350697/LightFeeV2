@@ -17,6 +17,23 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest BIOUSDT local follow-up, 2026-06-04: after CL-049 cloud verification,
+credentialed read-only diagnose later found local runtime flat/running while
+Bybit held a live `BIOUSDT` long position (`2429.0`, entry `0.02963`) and no
+venues had open orders. This is a deeper recurrence of the pending-entry
+terminality/live-truth family: V2 had an open-order guard before zero-fill
+finalization, but no live-position guard. CL050 adds
+`pending_entry.finalize_deferred_maker_live_position` and retains/backoffs the
+pending entry when maker live-position truth is nonzero instead of emitting
+`entry.passive_unfilled` / `unfilled_zero_balanced`. The same local change set
+also covers repeated Bybit duplicate cleanup (`RC-08`) by fail-closing with
+`residual_repair_duplicate_live_nonzero_blocked` after bounded non-reused CID
+attempts, and covers service-gate alignment (`DG-01`) by making
+`verify_production_services.py` require exchange-truth evidence instead of
+green-lighting local-flat snapshots without it. Local RED/GREEN passed for all
+three rows; production closure still requires deploy plus credentialed all-venue
+flat/no-open-orders verification.
+
 Latest post-CL048 local follow-up, 2026-06-04: after the CL-048 deployment was
 healthy, read-only diagnose later found a new SEIUSDT shape: local state was
 flat/running with no pending entry while Bybit still had non-reduce-only maker
