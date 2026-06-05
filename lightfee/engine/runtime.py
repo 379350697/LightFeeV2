@@ -57,6 +57,8 @@ from lightfee.engine.recovery import (
     clear_stale_recovery_block_if_recovery_clean,
     build_persistent_state_view,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
@@ -184,6 +186,7 @@ class LiveRuntime:
 
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
+        self.recovery_ledger: RecoveryLedger | None = None
 
         # V1 entry gate cooldown state
         self._venue_cooldown_until_ms: dict[str, int] = {}
@@ -1002,6 +1005,50 @@ class LiveRuntime:
             },
             flush=True,
         )
+
+    def _refresh_recovery_ledger_from_exchange_truth(
+        self,
+        exchange_truth: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> RecoveryLedger:
+        owner_index = RecoveryOwnerIndex.from_state(self.state)
+        ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local=self.state,
+            exchange_truth=exchange_truth,
+            owner_index=owner_index,
+        )
+        self.recovery_ledger = ledger
+
+        if ledger.has_blocking_work():
+            self.state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+            self.state.recovery_blocked_at_ms = now_ms
+            set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+            self.journal.append(
+                "recovery.ledger_blocked",
+                {
+                    "reason": self.state.recovery_blocked_reason,
+                    "work_items": [
+                        self._recovery_ledger_work_item_payload(item)
+                        for item in ledger.work_items
+                        if item.blocking
+                    ],
+                    "ts_ms": now_ms,
+                },
+            )
+        return ledger
+
+    @staticmethod
+    def _recovery_ledger_work_item_payload(item) -> dict[str, Any]:
+        return {
+            "kind": item.kind,
+            "symbol": item.symbol,
+            "venues": sorted(item.venues),
+            "blocking": item.blocking,
+            "decision": item.decision.outcome,
+            "owner_type": item.owner.owner_type if item.owner is not None else "",
+            "owner_confidence": item.owner.confidence if item.owner is not None else "",
+        }
 
     def _startup_position_probe_symbols(self, symbol_info: object) -> list[str]:
         """Symbols to probe for live startup position recovery.
@@ -4610,7 +4657,9 @@ class LiveRuntime:
                 pending.next_progress_poll_ms = now_ms + poll_ms
 
         for eid in resolved:
-            self.state.pending_entries.pop(eid, None)
+            self._remove_pending_entry_after_terminal_decision(
+                eid, reason="passive_entry_maintenance_resolved"
+            )
 
     async def _handle_pending_passive_zero_fill_completion(
         self,
@@ -5253,7 +5302,9 @@ class LiveRuntime:
                 self._apply_reconcile_backoff(pending, now_ms)
 
         for eid in resolved_entry_ids:
-            self.state.pending_entries.pop(eid, None)
+            self._remove_pending_entry_after_terminal_decision(
+                eid, reason="pending_entry_reconcile_resolved"
+            )
 
         # --- Process pending closes ---
         resolved_ids: list[str] = []
@@ -6005,7 +6056,9 @@ class LiveRuntime:
             if hard_ceiling_reached:
                 if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
                     if await self._finalize_pending_entry(pending, entry_id, now_ms):
-                        self.state.pending_entries.pop(entry_id, None)
+                        self._remove_pending_entry_after_terminal_decision(
+                            entry_id, reason="terminal_budget_balanced_finalize"
+                        )
                         self.journal.append(
                             "recovery.pending_entry_finalized",
                             {
@@ -6042,7 +6095,9 @@ class LiveRuntime:
                         return True
                 abandoned = await self._try_abandon_stale_entry(pending, entry_id)
                 if abandoned:
-                    self.state.pending_entries.pop(entry_id, None)
+                    self._remove_pending_entry_after_terminal_decision(
+                        entry_id, reason="terminal_budget_abandoned_flat"
+                    )
                     return True
 
             # P6: if there are actual fills (not repair-state), give
@@ -6177,7 +6232,9 @@ class LiveRuntime:
                 return False
 
         # Success: remove pending entry
-        self.state.pending_entries.pop(entry_id, None)
+        self._remove_pending_entry_after_terminal_decision(
+            entry_id, reason="abort_pending_entry_cleanup_succeeded"
+        )
         self.state.last_error = reason
         self.journal.append(
             "entry.aborted",
@@ -6531,7 +6588,9 @@ class LiveRuntime:
                 resolved_ids.append(entry_id)
 
         for eid in resolved_ids:
-            self.state.pending_entries.pop(eid, None)
+            self._remove_pending_entry_after_terminal_decision(
+                eid, reason="force_reconcile_pending_entry_resolved"
+            )
 
         self.journal.append(
             "recovery.force_reconcile_complete",
@@ -6567,7 +6626,9 @@ class LiveRuntime:
 
         opened_position = self.state.open_positions.get(entry_id)
         if opened_position is not None:
-            self.state.pending_entries.pop(entry_id, None)
+            self._remove_pending_entry_after_terminal_decision(
+                entry_id, reason="rejected_pending_without_fill"
+            )
             finalized = True
 
         if finalized:
@@ -6706,7 +6767,9 @@ class LiveRuntime:
                 now_ms,
                 source="startup_recovery",
             ):
-                self.state.pending_entries.pop(entry_id, None)
+                self._remove_pending_entry_after_terminal_decision(
+                    entry_id, reason="terminal_hedge_dust_after_live_truth"
+                )
                 self.journal.append(
                     "recovery.pending_entry_finalized",
                     {
@@ -6750,7 +6813,9 @@ class LiveRuntime:
                         if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
                             # Balanced fill → finalize even on hard ceiling
                             if await self._finalize_pending_entry(pending, entry_id, now_ms):
-                                self.state.pending_entries.pop(entry_id, None)
+                                self._remove_pending_entry_after_terminal_decision(
+                                    entry_id, reason="cancel_completed_entry_balanced"
+                                )
                                 self.journal.append(
                                     "recovery.pending_entry_finalized",
                                     {"entry_id": entry_id, "symbol": pending.symbol,
@@ -6787,7 +6852,9 @@ class LiveRuntime:
                 # Must attempt cleanup/flatten before removing pending.
                 abandoned = await self._try_abandon_stale_entry(pending, entry_id)
                 if abandoned:
-                    self.state.pending_entries.pop(entry_id, None)
+                    self._remove_pending_entry_after_terminal_decision(
+                        entry_id, reason="startup_zero_fill_abandoned_flat"
+                    )
                     continue  # Both venues flat → safe to clear
                 removed = await self._abort_pending_entry(pending, entry_id, final_reason)
                 if removed:
@@ -6812,7 +6879,9 @@ class LiveRuntime:
                     # V1: if hedge completes the entry → finalize immediately
                     if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
                         if await self._finalize_pending_entry(pending, entry_id, now_ms):
-                            self.state.pending_entries.pop(entry_id, None)
+                            self._remove_pending_entry_after_terminal_decision(
+                                entry_id, reason="recovery_hedge_completed_entry"
+                            )
                             self.journal.append(
                                 "recovery.pending_entry_finalized",
                                 {
@@ -6848,7 +6917,9 @@ class LiveRuntime:
             # --- 4d: Fully filled → finalize ---
             if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():
                 if await self._finalize_pending_entry(pending, entry_id, now_ms):
-                    self.state.pending_entries.pop(entry_id, None)
+                    self._remove_pending_entry_after_terminal_decision(
+                        entry_id, reason="startup_fully_filled_finalized"
+                    )
                     self.journal.append(
                         "recovery.pending_entry_finalized",
                         {
@@ -8213,7 +8284,9 @@ class LiveRuntime:
                         "finalized_as": "unfilled_zero_balanced",
                     },
                 )
-                self.state.pending_entries.pop(entry_id, None)
+                self._remove_pending_entry_after_terminal_decision(
+                    entry_id, reason="zero_fill_unfilled_removal"
+                )
                 return True
 
             # V1: balanced_quantity == 0 but has_any_fill → one-sided exposure.
@@ -8255,7 +8328,9 @@ class LiveRuntime:
                     "finalized_as": "unmatched_residual",
                 },
             )
-            self.state.pending_entries.pop(entry_id, None)
+            self._remove_pending_entry_after_terminal_decision(
+                entry_id, reason="unmatched_residual_terminalized"
+            )
             return True
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
@@ -10121,6 +10196,28 @@ class LiveRuntime:
         if has_pending_entry_for_symbol(self.state, sym, long_v, short_v):
             return False, "pending_entry_protection"
         return True, ""
+
+    def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
+        ledger = self.recovery_ledger
+        if ledger is None:
+            return True, ""
+        if not ledger.allows_new_entry(candidate):
+            return False, "recovery_ledger_blocked"
+        return True, ""
+
+    def _remove_pending_entry_after_terminal_decision(
+        self,
+        entry_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Single runtime authority for pending-entry removal.
+
+        Callers must reach this only after a terminalizer, abort, cleanup, or
+        reconciliation decision has proven that retaining the pending entry is
+        no longer the V1-safe action.
+        """
+        self.state.pending_entries.pop(entry_id, None)
 
     def _gate_entry_sizing(self, candidate) -> tuple[bool, str]:
         """Block entry if notional quote is zero or negative."""
@@ -12622,6 +12719,7 @@ class LiveRuntime:
             ("reduce_only", self._gate_reduce_only, ()),
             ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
             ("passive_close_in_flight", self._gate_passive_close_pending, ()),
+            ("recovery_ledger", self._gate_recovery_ledger, ()),
             ("pending_entry_duplicate", self._gate_pending_entry_dedup, ()),
             ("entry_sizing", self._gate_entry_sizing, ()),
             ("venue_cooldown", self._gate_venue_cooldown, (now_ms,)),

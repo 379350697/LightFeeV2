@@ -1,0 +1,39 @@
+{
+  "incident_id": "seiusdt-bybit-positive-fill-local-false-flat",
+  "symbol": "SEIUSDT",
+  "local": {
+    "open_positions": [],
+    "pending_entries": [],
+    "pending_residual_repairs": [],
+    "fill_evidence": [
+      {
+        "venue": "bybit",
+        "symbol": "SEIUSDT",
+        "leg": "maker",
+        "side": "buy",
+        "filled_quantity": 455.0,
+        "average_price": 0.1887,
+        "order_id": "sanitized-maker-order-seiusdt",
+        "client_order_id": "sanitized-maker-client-seiusdt",
+        "classification": "positive_fill"
+      },
+      {
+        "venue": "hyperliquid",
+        "symbol": "SEIUSDT",
+        "leg": "hedge",
+        "side": "sell",
+        "filled_quantity": 0.0,
+        "average_price": 0.0,
+        "order_id": "sanitized-hedge-order-seiusdt",
+        "client_order_id": "sanitized-hedge-client-seiusdt",
+        "classification": "uncertain_or_partial_fill"
+      }
+    ]
+  },
+  "exchange_truth": {
+    "truth_available": true,
+    "positions": [],
+    "open_orders": []
+  },
+  "expected_work_kind": "owned_pending_entry"
+}

@@ -25,6 +25,7 @@ from lightfee.ops.production_health import (
     analyze_systemd_unit,
     summarize_reports,
 )
+from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 
@@ -157,19 +158,23 @@ def _attach_exchange_truth_if_missing(
     runtime_dir = str(Path(current_state_path).resolve().parent)
     enriched = dict(state)
     try:
-        exchange_truth = _call_exchange_truth_builder_with_timeout(
-            exchange_truth_builder,
-            runtime_dir,
+        exchange_truth = normalize_exchange_truth_payload(
+            _call_exchange_truth_builder_with_timeout(
+                exchange_truth_builder,
+                runtime_dir,
+            )
         )
     except Exception as exc:
-        exchange_truth = {
-            "available": False,
-            "confidence": "low",
-            "positions": {},
-            "open_orders": {},
-            "errors": [str(exc)[:500]],
-            "missing_evidence": ["exchange_truth_fetch_failed"],
-        }
+        exchange_truth = normalize_exchange_truth_payload(
+            {
+                "available": False,
+                "confidence": "low",
+                "positions": {},
+                "open_orders": {},
+                "errors": [str(exc)[:500]],
+                "missing_evidence": ["exchange_truth_fetch_failed"],
+            }
+        )
     enriched["exchange_truth"] = exchange_truth
     enriched["exchange_truth_source"] = "verify_production_services_probe"
     enriched["exchange_truth_env_files_loaded"] = loaded_env_files

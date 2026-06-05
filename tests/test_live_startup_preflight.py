@@ -1724,6 +1724,45 @@ class TestRuntimePreflight:
             assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
             assert runtime.state.recovery_blocked_reason is None
 
+    def test_startup_recovery_ledger_blocks_local_flat_with_live_open_order(self):
+        """Local flat is not accepted while exchange truth has a live maker order."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "side": "buy",
+                            "quantity": 72.0,
+                            "price": 0.33044,
+                            "reduce_only": False,
+                            "order_id": "a84df707-efb3-4e40-bab1-641a4eb0f3d4",
+                        }
+                    ],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert ledger.has_blocking_work()
+            assert ledger.work_items[0].kind == "orphan_maker_order"
+            assert runtime.state.recovery_blocked_reason == (
+                "exchange_truth_recovery_ledger_blocked"
+            )
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            events = [
+                event for event in runtime.journal.read_all()
+                if event["kind"] == "recovery.ledger_blocked"
+            ]
+            assert events[-1]["payload"]["work_items"][0]["kind"] == "orphan_maker_order"
+            runtime.journal.close()
+
     @pytest.mark.asyncio
     async def test_startup_clears_stale_blocked_reason_when_snapshot_is_clean(self):
         with tempfile.TemporaryDirectory() as td:

@@ -29,6 +29,12 @@ evidence must map to the matrix before runtime code changes.
   entry that already shares the other venue.
 - `_finalize_pending_entry()` emits deferred evidence, but the caller still
   resolves or removes the pending entry.
+- `exchange_truth_recovery_ledger_blocked`
+- `orphan_maker_order`
+- `unpaired_live_position`
+- `ambiguous_exchange_truth`
+- local state is flat while exchange truth has a non-reduce-only open maker
+  order.
 
 ## Current Effective Rule
 
@@ -57,6 +63,14 @@ off. A deferred finalizer call is not a resolved entry.
 While a pending entry is unresolved, V1 protects the same pair and the same
 symbol with either venue overlapping. A new route cannot bypass live-truth
 recovery by swapping only one venue.
+
+The V1-style recovery ledger is now the shared intake for this family. Local
+empty `open_positions`, `pending_entries`, and `pending_residual_repairs` are
+not enough to prove flat. Runtime must classify exchange positions, exchange
+open orders, pending work, residual repair, passive close work, owner evidence,
+and ambiguous probe evidence before normal entry risk is allowed. A live
+non-reduce order without a proven owner becomes blocking `orphan_maker_order`;
+a live position without a proven owner becomes blocking `unpaired_live_position`.
 
 ## V1 / Exchange Semantics
 
@@ -118,6 +132,7 @@ recovery by swapping only one venue.
 | 2026-06-04 | SEIUSDT open maker order truth before zero-fill finalize | deployed/cloud verified | `_finalize_pending_entry()` now queries live maker open-order truth before removing a zero-fill pending entry. If a matching maker order is still open, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_open_order`; diagnose also treats acceptance-gate open-order blockers as unhealthy. Cloud final truth is high-confidence flat/no-open-orders on all venues. |
 | 2026-06-04 | BIOUSDT live-position truth before zero-fill finalize | deployed/cloud verified | `_finalize_pending_entry()` now checks maker live-position truth before removing a zero-fill pending entry. If maker live position is nonzero, pending is retained with `uncertain_outcome`, reconcile backoff, and `pending_entry.finalize_deferred_maker_live_position`; residual duplicate cleanup and production service gating are also covered. Cloud `68a979b` final verifier/diagnose proved all seven venues flat/no-open-orders. |
 | 2026-06-05 | Full-loop V1 parity follow-up after post-deploy pending churn | deployed; production acceptance blocked by live open order | Hyperliquid insufficient-margin now creates both symbol and venue admission cooldowns; same-symbol venue-overlap pending entries block with `pending_entry_protection`; `_finalize_pending_entry()` returns terminality status and runtime callers retain/backoff on deferred finalization instead of resolving/popping; force-terminal zero-fill routes through the finalizer so positive/live evidence cannot be discarded. Cloud deployed `3af002d` and services stayed active, but diagnose still found one Bybit `TRXUSDT` non-reduce-only open maker order from pre-deploy state, so acceptance remains blocked by `DG-02`. |
+| 2026-06-05 | Exchange-truth recovery ledger V1 parity | locally implemented, not deployed in this pass | Added sanitized `TRXUSDT` and `SEIUSDT` incident fixtures, pure `RecoveryLedger`, shared exchange-truth normalizer, recovery owner index, pending-entry terminalizer, runtime recovery-ledger refresh/entry gate, shared pending-entry post-terminal removal helper, and production-health local-flat/live-open-order critical classification. Focused tests passed: core ledger/owner/truth/terminalizer `27 passed`, startup/runtime/passive-close `359 passed`, diagnose/health `66 passed`, pending-entry parity `35 passed`; full pytest `3479 passed`, `9 skipped`, `1 warning`; compileall and diff-check passed; GitNexus staged detect-changes reported medium risk, 23 files, 47 symbols, and 3 affected verifier flows. |
 
 ## Recurrences
 
@@ -133,11 +148,17 @@ recovery by swapping only one venue.
 | 2026-06-04 | `SEIUSDT` Bybit/Hyperliquid open maker order | `1e082d9` | local RED/GREEN prevents zero-fill finalization when Bybit live open-order truth still has the maker order; cloud final diagnose is healthy/high-confidence flat/no-open-orders on all venues, and no manual order/state mutation was used | [daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality](../daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) |
 | 2026-06-04 | `BIOUSDT` Bybit live maker position | `68a979b` | deployed/cloud verified: local RED/GREEN prevents zero-fill finalization when Bybit maker live-position truth is nonzero; RC-08 duplicate cleanup convergence and DG-01 production service gate are covered; final verifier/diagnose proved all seven venues flat/no-open-orders. CL-048/049/050 now map to the contract matrix instead of separate active bug tracks. | [daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality](../daily/2026-06-04.md#cluster-cl-050-biousdt-live-position-zero-fill-terminality) |
 | 2026-06-05 | `WLDUSDT`, `XLMUSDT`, `MONUSDT`, `MOVEUSDT` Hyperliquid margin rejects; `XLMUSDT` overlapping pending route; post-deploy `TRXUSDT` Bybit open maker order | deployed `3af002d`; acceptance blocked | Mapped to `PE-11`, `PE-17`, `PE-18`, plus `PE-02`/`DG-02` for the remaining Bybit open order. Local RED/GREEN covers venue-level margin cooldown, same-symbol venue-overlap pending protection, deferred-finalizer retention, and force-terminal zero-fill finalizer routing. Cloud deploy passed manifest/services, but diagnose found Bybit open order `a84df707-efb3-4e40-bab1-641a4eb0f3d4` for `72.0` `TRXUSDT`; no manual order/state mutation was performed. | [daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity](../daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity) |
+| 2026-06-05 | `TRXUSDT` Bybit live open maker order local-flat; `SEIUSDT` Bybit positive-fill local false-flat | local implementation pending deploy | Mapped to the unified exchange-truth recovery ledger. `TRXUSDT` local-flat/live-open-order becomes blocking `orphan_maker_order`; `SEIUSDT` positive-fill evidence prevents proven-flat and routes into blocking recovery work. Runtime entry gating now asks the ledger before dispatch, and production health flags live non-reduce open orders as critical exchange-truth mismatches. | [daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity](../daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity) |
 
 ## Regression Harness
 
 - `tests/test_pending_entry_v1_semantic_drift.py`
 - `tests/test_live_entry_hedge_root_fix.py`
+- `tests/engine/test_recovery_ledger.py`
+- `tests/engine/test_recovery_owner_index.py`
+- `tests/engine/test_exchange_truth_runtime.py`
+- `tests/engine/test_pending_entry_terminalizer.py`
+- `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py`
 - `tests/live_harness`
 - `scripts/diagnose_live.py --venues ...`
 
@@ -173,3 +194,7 @@ recovery by swapping only one venue.
    evidence releases the risk.
 15. If finalization emits a deferred event, check that the caller retained the
    pending entry and did not append it to a resolved list or pop it afterward.
+16. If local state is flat, build or inspect the recovery ledger before calling
+   the state safe. A live position, non-reduce open order, unavailable exchange
+   truth, or positive fill evidence must map to ledger work before any
+   production-health conclusion or entry-risk decision.

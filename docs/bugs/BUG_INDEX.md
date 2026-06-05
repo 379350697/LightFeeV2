@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest exchange-truth recovery ledger V1 parity follow-up, 2026-06-05: the
+post-contract `TRXUSDT` and `SEIUSDT` evidence is now handled as one V1-style
+runtime recovery-ledger boundary, not another CL-specific patch. V2 now has a
+pure `RecoveryLedger`, shared exchange-truth normalizer, recovery owner index,
+pending-entry terminalizer, runtime recovery-ledger refresh helper, runtime
+entry gate, shared post-terminal pending-entry removal helper, and production
+health classification for local-flat/live-open-order mismatches. Sanitized
+fixtures prove the current `TRXUSDT` Bybit non-reduce live open maker order
+maps to blocking `orphan_maker_order`, and positive-fill local false-flat
+evidence maps to blocking recovery work rather than proven-flat. Focused tests
+passed: core ledger/owner/truth/terminalizer `27 passed`,
+startup/runtime/passive-close `359 passed`, diagnose/health `66 passed`, and
+pending-entry parity `35 passed`. Full pytest passed with `3479 passed`,
+`9 skipped`, `1 warning`; compileall and `git diff --check` passed. GitNexus
+staged detect-changes reported medium risk across 23 files, 47 symbols, and 3
+affected verifier flows. This pass did not submit orders, cancel orders, edit runtime
+state, or deploy to cloud. It is documented in
+[`daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity`](daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity).
+
 Latest pending-entry V1 full-loop parity follow-up, 2026-06-05: post-contract
 review after the latest deployment did not create a new independent CL bug. The
 observed pending churn maps to the unified

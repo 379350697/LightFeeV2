@@ -132,6 +132,49 @@ def test_current_state_clean_local_exchange_nonzero_is_critical():
     assert report.details["exchange_truth_mismatches"][0]["symbol"] == "BIOUSDT"
 
 
+def test_current_state_clean_local_exchange_open_order_is_critical():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {"bybit": {}},
+            "open_orders": {
+                "bybit": {
+                    "*": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "side": "buy",
+                            "quantity": 72.0,
+                            "reduce_only": False,
+                            "order_id": "live-maker",
+                        }
+                    ]
+                }
+            },
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "exchange_truth_mismatch" in report.fingerprints
+    assert "live_open_order" in report.fingerprints
+    mismatch = report.details["exchange_truth_mismatches"][0]
+    assert mismatch["check"] == "unexpected_live_open_order"
+    assert mismatch["symbol"] == "TRXUSDT"
+
+
 def test_current_state_local_open_exchange_leg_quantity_mismatch_is_critical():
     state = {
         "lifecycle": "running",

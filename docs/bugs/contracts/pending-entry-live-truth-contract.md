@@ -43,6 +43,9 @@ Code audit rule: callers of `_finalize_pending_entry()` must treat deferred
 finalization as retained pending work. A direct `pending_entries.pop()` after a
 finalize call is a potential contract bypass unless the caller has proved that
 the finalize path actually emitted terminal open/residual/unfilled evidence.
+Runtime pending-entry removal must route through the pending-entry terminality
+authority or the shared post-terminal removal helper; a direct pop outside that
+boundary is a contract bypass.
 
 ## V1 Coverage Floor
 
@@ -77,44 +80,49 @@ The minimum semantic surface from V1 is:
    Local `open_positions=[]` or `pending_entries=[]` is not healthy if a
    credentialed venue probe reports a nonzero position or live open order.
 
-2. Zero-fill is terminal only with terminal no-fill evidence.
+2. Local flat must be ledger-proven flat.
+   A state is flat only when the recovery ledger has classified live positions,
+   live open orders, pending entries, residual repairs, passive closes, and
+   ambiguous truth. Local empty collections are inputs, not the conclusion.
+
+3. Zero-fill is terminal only with terminal no-fill evidence.
    A local zero fill, stale accepted order, missing fill record, or uncertain
    reconciliation is not enough. A live maker open order or live position
    progress keeps the pending entry unresolved.
 
-3. Positive fill evidence is never discarded.
+4. Positive fill evidence is never discarded.
    Any maker or hedge fill quantity greater than zero must become one of:
    managed matched open state, residual / reduce-only cleanup work, or an
    explicit fail-closed state with evidence and no new-entry risk.
 
-4. Live position progress is safety evidence before it is terminality evidence.
+5. Live position progress is safety evidence before it is terminality evidence.
    If order terminality is uncertain but live position truth is nonzero, V2
    must not finalize as `unfilled_zero_balanced`. It must retain, hydrate, or
    cleanup/fail-closed.
 
-5. Balanced quantity opens only the matched portion.
+6. Balanced quantity opens only the matched portion.
    `min(maker_fill, hedge_fill) > 0` creates a managed open position for that
    matched quantity. Any excess is residual repair or deterministic cleanup.
 
-6. One-sided fill is not local flat.
+7. One-sided fill is not local flat.
    `maker_fill > 0, hedge_fill == 0` or the inverse creates unmatched residual
    cleanup/fail-closed work. It does not create a matched open position, but it
    also must not clear local state as healthy.
 
-7. Residual repair is driven from live truth.
+8. Residual repair is driven from live truth.
    Repair quantity, side, and terminal dust decisions use trusted live position
    and open-order truth, not stale local deltas.
 
-8. Duplicate client id evidence is idempotency evidence, not completion.
+9. Duplicate client id evidence is idempotency evidence, not completion.
    Bybit `110072` must be reconciled by order id/client id/execution history
    and rechecked against live position. An old filled order is completion only
    when live truth is flat or at target.
 
-9. Risk-only can be correct, but it is not green.
+10. Risk-only can be correct, but it is not green.
    `risk_only` with unresolved exchange truth mismatch is a safe operating
    posture, not production acceptance.
 
-10. Production health gates must agree with exchange truth.
+11. Production health gates must agree with exchange truth.
     `verify_production_services.py` and `diagnose_live.py` must not create a
     false-green split for local-flat/exchange-nonzero or local-flat/open-order
     states.
@@ -157,6 +165,8 @@ The minimum semantic surface from V1 is:
 
 | Matrix IDs | Current coverage | Status |
 |---|---|---|
+| PE-02, PE-05, PE-10, RC-01 through RC-04, DG-01 through DG-03 | `tests/engine/test_recovery_ledger.py`; `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py` | covered for pure recovery-ledger classification of local-flat/live-open-order, local-flat/live-position, positive-fill false-flat, residual repair, ambiguous truth, and proven-flat states |
+| PE-01 through PE-03, PE-07 through PE-10, PE-16, PE-18 | `tests/engine/test_pending_entry_terminalizer.py` | covered for pure terminal decision outcomes; runtime finalizer remains the integration authority |
 | PE-01 | `tests/test_live_entry_hedge_root_fix.py::TestZeroFillFinalizeV1ParityGate` | covered |
 | PE-02 | `tests/test_pending_entry_v1_semantic_drift.py::test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists` | covered for open-order truth |
 | PE-03 | `tests/test_pending_entry_v1_semantic_drift.py::test_uncertain_maker_order_live_position_does_not_apply_maker_progress`; `test_zero_fill_finalize_retains_when_live_position_truth_is_nonzero` | covered and cloud-verified in CL-050; zero-fill finalize now defers when maker live position is nonzero |
@@ -240,6 +250,13 @@ The minimum semantic surface from V1 is:
    coverage. Future overlapping-pending recurrences should update evidence/docs
    if this row still passes.
 
+10. Exchange-truth recovery ledger fixtures:
+    RED/GREEN added in
+    `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py`.
+    The `TRXUSDT` fixture proves local-flat plus a Bybit non-reduce open maker
+    order becomes blocking `orphan_maker_order`; the `SEIUSDT` fixture proves
+    positive maker-fill evidence prevents local false-flat/proven-flat.
+
 ## Bug Mapping
 
 | Bug / family | Contract rows | Coverage judgement | Next action |
@@ -247,6 +264,7 @@ The minimum semantic surface from V1 is:
 | CL-048 SEIUSDT retained rejected positive fill | PE-05, PE-06, PE-07, PE-09, RC-01 | covered for that shape; historical cluster now maps into this contract | keep as regression |
 | CL-049 SEIUSDT open maker order terminality | PE-02, PE-11, DG-02 | covered for open-order shape; historical cluster now maps into this contract | keep as regression |
 | CL-050 BIOUSDT local false-flat with live position | PE-03, RC-07, RC-08, DG-01 | covered and cloud-verified at `68a979b`; production verifier and service-env diagnose were high-confidence flat/no-open-orders across all seven venues | keep as regression; if it recurs, map evidence first and only add code after an uncovered RED row |
+| 2026-06-05 V1 recovery ledger architecture | PE-02, PE-05, PE-10, PE-16, RC-01 through RC-04, DG-01 through DG-03 | locally covered by pure ledger, shared exchange-truth normalizer, owner index, terminalizer, startup ledger blocker, entry ledger gate, and production-health open-order mismatch tests | keep as the common runtime boundary for future CL-048-family recurrences; do not add CL-specific branches |
 | Bybit duplicate `110072` stale-fill/live-nonzero family | RC-06, RC-07, RC-08 | covered locally | keep repeated-loop/fail-closed regression |
 | Residual repair live truth card | RC-01 through RC-05 | mostly covered | add any BIOUSDT residual variant if evidence proves residual path |
 | Hyperliquid insufficient margin admission | PE-11 | covered for symbol and venue-level containment | keep admission regression; if it recurs with same evidence, update docs/evidence only |
@@ -302,3 +320,22 @@ Hyperliquid insufficient-margin venue cooldown coverage. Remaining open matrix
 rows are evidence-driven, not active production bugs: `PE-14` needs supervision
 backlog RED tests before any stale-backlog clear change, and pending-entry
 `PE-16` needs targeted RED only if future live truth is ambiguous or untrusted.
+
+Implementation follow-up on 2026-06-05 added the first unified V1-style
+recovery ledger boundary:
+
+- `lightfee/engine/recovery_ledger.py` classifies live exchange artifacts,
+  local pending/open/residual/passive-close work, ambiguous truth, and
+  proven-flat states into recovery work items.
+- `lightfee/engine/exchange_truth.py` normalizes the exchange-truth payload
+  used by runtime-adjacent health gates, production verifier, and
+  `diagnose_live.py`.
+- `lightfee/engine/recovery_owner_index.py` maps live orders/positions to
+  proven or probable owners and leaves insufficient evidence as orphan work.
+- `lightfee/engine/pending_entry_terminalizer.py` records the pure terminality
+  decision surface so pending-entry removal stays behind one authority.
+- `LiveRuntime` now has a recovery-ledger refresh helper and an entry gate that
+  blocks new risk on orphan maker orders, unpaired live positions, ambiguous
+  truth, and same-symbol/venue overlap with unresolved work.
+- Production health now treats local-flat plus live non-reduce open orders as a
+  critical exchange-truth mismatch, not green service health.

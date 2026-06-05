@@ -163,6 +163,32 @@ def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any
     return live
 
 
+def _live_open_order_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any]]:
+    live: list[dict[str, Any]] = []
+    for venue, orders_by_symbol in (exchange_truth.get("open_orders") or {}).items():
+        if not isinstance(orders_by_symbol, dict):
+            continue
+        for symbol, rows in orders_by_symbol.items():
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                qty = _safe_abs_quantity(row.get("quantity") or row.get("qty"))
+                if qty <= 1e-9:
+                    continue
+                live.append({
+                    "venue": str(row.get("venue") or venue).lower(),
+                    "symbol": str(row.get("symbol") or symbol).upper(),
+                    "side": str(row.get("side") or "").lower(),
+                    "quantity": qty,
+                    "price": row.get("price"),
+                    "reduce_only": bool(row.get("reduce_only", False)),
+                    "order_id": row.get("order_id"),
+                })
+    return live
+
+
 def _local_expected_legs(state: dict[str, Any]) -> list[dict[str, Any]]:
     legs: list[dict[str, Any]] = []
     for pos in state.get("open_positions", []) or state.get("positions", []) or []:
@@ -316,6 +342,16 @@ def analyze_current_state(
                             "quantity": qty,
                             "entry_price": pos.get("entry_price"),
                         })
+        if clean and exchange_truth.get("has_open_order"):
+            if "exchange_truth_mismatch" not in fingerprints:
+                fingerprints.append("exchange_truth_mismatch")
+            if "live_open_order" not in fingerprints:
+                fingerprints.append("live_open_order")
+            for order in _live_open_order_details(exchange_truth):
+                exchange_truth_mismatches.append({
+                    "check": "unexpected_live_open_order",
+                    **order,
+                })
 
     severity = "critical" if any(fp != "last_scan_missing" for fp in fingerprints) else "warning"
     return HealthReport(

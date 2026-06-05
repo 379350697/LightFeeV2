@@ -1,0 +1,26 @@
+{
+  "incident_id": "trxusdt-bybit-open-order-local-flat",
+  "symbol": "TRXUSDT",
+  "local": {
+    "open_positions": [],
+    "pending_entries": [],
+    "pending_residual_repairs": []
+  },
+  "exchange_truth": {
+    "truth_available": true,
+    "positions": [],
+    "open_orders": [
+      {
+        "venue": "bybit",
+        "symbol": "TRXUSDT",
+        "side": "buy",
+        "quantity": 72.0,
+        "price": 0.33044,
+        "reduce_only": false,
+        "order_id": "a84df707-efb3-4e40-bab1-641a4eb0f3d4",
+        "client_order_id": ""
+      }
+    ]
+  },
+  "expected_work_kind": "orphan_maker_order"
+}

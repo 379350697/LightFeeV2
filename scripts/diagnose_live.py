@@ -26,6 +26,7 @@ from typing import Any, Optional
 from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
+from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 
 # Schema version — bump when output shape changes
 SCHEMA_VERSION = 2
@@ -993,7 +994,7 @@ async def _build_exchange_truth_async(
     else:
         confidence = "high"
 
-    return {
+    return normalize_exchange_truth_payload({
         "available": any_available,
         "available_venues": available_venues,
         "confidence": confidence,
@@ -1006,7 +1007,7 @@ async def _build_exchange_truth_async(
         "fetch_status": fetch_status,
         "errors": errors,
         "missing_evidence": missing,
-    }
+    })
 
 
 def _build_exchange_truth(
@@ -1020,23 +1021,23 @@ def _build_exchange_truth(
         try:
             return asyncio.run(_build_exchange_truth_async(runtime_dir, symbols, venues))
         except Exception as exc:
-            return {
+            return normalize_exchange_truth_payload({
                 "available": False,
                 "confidence": "low",
                 "positions": {},
                 "open_orders": {},
                 "errors": [str(exc)[:500]],
                 "missing_evidence": ["exchange_truth_fetch_failed"],
-            }
+            })
     except Exception as exc:
-        return {
+        return normalize_exchange_truth_payload({
             "available": False,
             "confidence": "low",
             "positions": {},
             "open_orders": {},
             "errors": [str(exc)[:500]],
             "missing_evidence": ["exchange_truth_fetch_failed"],
-        }
+        })
     try:
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -1046,14 +1047,14 @@ def _build_exchange_truth(
             )
             return future.result(timeout=30)
     except Exception as exc:
-        return {
+        return normalize_exchange_truth_payload({
             "available": False,
             "confidence": "low",
             "positions": {},
             "open_orders": {},
             "errors": [str(exc)[:500]],
             "missing_evidence": ["exchange_truth_fetch_failed"],
-        }
+        })
 
 
 # ---------------------------------------------------------------------------

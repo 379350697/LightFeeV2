@@ -26,6 +26,7 @@ from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
+from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
     EngineState,
@@ -318,6 +319,79 @@ class TestPendingEntryTracking:
 
         assert allowed is False
         assert reason == "pending_entry_protection"
+
+    def test_recovery_ledger_orphan_maker_order_blocks_every_new_entry(
+        self, config, tmp_journal
+    ):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local={"open_positions": [], "pending_entries": []},
+            exchange_truth={
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [
+                    {
+                        "venue": "bybit",
+                        "symbol": "TRXUSDT",
+                        "side": "buy",
+                        "quantity": 72.0,
+                        "reduce_only": False,
+                    }
+                ],
+            },
+        )
+
+        allowed, reason = runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
+        )
+
+        assert allowed is False
+        assert reason == "recovery_ledger_blocked"
+
+    def test_recovery_ledger_blocks_same_symbol_or_venue_overlap(
+        self, config, tmp_journal
+    ):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local={
+                "pending_entries": [
+                    {
+                        "pending_id": "entry-sei",
+                        "symbol": "SEIUSDT",
+                        "long_venue": "bybit",
+                        "short_venue": "hyperliquid",
+                    }
+                ]
+            },
+            exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+        )
+
+        assert runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="SEIUSDT", long_venue="binance", short_venue="okx")
+        ) == (False, "recovery_ledger_blocked")
+        assert runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="bybit", short_venue="okx")
+        ) == (False, "recovery_ledger_blocked")
+        assert runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
+        ) == (True, "")
+
+    def test_clean_recovery_ledger_allows_candidate_path(self, config, tmp_journal):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local={"open_positions": [], "pending_entries": []},
+            exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+        )
+
+        allowed, reason = runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
+        )
+
+        assert allowed is True
+        assert reason == ""
 
 
 # ---------------------------------------------------------------------------
