@@ -36,8 +36,7 @@ def _pending_entry(first_ms=1_300_000, maker_filled=0.0, hedge_filled=0.0):
 
 def test_pending_without_positive_exposure_becomes_nonviable_when_first_funding_too_close():
     cfg = StrategyConfig()
-    cfg.min_scan_minutes_before_funding = 0
-    cfg.entry_min_first_funding_remaining_secs = 60
+    cfg.min_scan_minutes_before_funding = 1
 
     decision = V1TradingLifecycle.pending_entry_viability(
         _pending_entry(first_ms=1_059_000),
@@ -57,8 +56,7 @@ def test_pending_without_positive_exposure_becomes_nonviable_when_first_funding_
 
 def test_pending_positive_exposure_is_not_discarded_when_first_funding_too_close():
     cfg = StrategyConfig()
-    cfg.min_scan_minutes_before_funding = 0
-    cfg.entry_min_first_funding_remaining_secs = 60
+    cfg.min_scan_minutes_before_funding = 1
 
     decision = V1TradingLifecycle.pending_entry_viability(
         _pending_entry(first_ms=1_059_000, maker_filled=10.0),
@@ -78,8 +76,7 @@ def test_pending_positive_exposure_is_not_discarded_when_first_funding_too_close
 
 def test_pending_positive_exposure_outside_horizon_allows_without_recovery_reason():
     cfg = StrategyConfig()
-    cfg.min_scan_minutes_before_funding = 0
-    cfg.entry_min_first_funding_remaining_secs = 60
+    cfg.min_scan_minutes_before_funding = 1
 
     decision = V1TradingLifecycle.pending_entry_viability(
         _pending_entry(first_ms=1_300_000, hedge_filled=10.0),
@@ -235,7 +232,7 @@ def test_ledger_evidence_omits_malformed_work_items_but_keeps_source_and_truth()
 
 def test_entry_admissibility_blocks_first_funding_too_close():
     cfg = StrategyConfig()
-    cfg.min_scan_minutes_before_funding = 0
+    cfg.min_scan_minutes_before_funding = 1
     candidate = _candidate(first_ms=1_059_000)
 
     decision = V1TradingLifecycle.entry_admissibility(

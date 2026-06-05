@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import math
+import sys
 from collections import Counter
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from lightfee.config.schema import AppConfig
@@ -64,7 +66,26 @@ from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
     PendingEntryTerminalizer,
 )
-from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
+from lightfee.engine.pending_entry_lifecycle import (
+    advance_pending_entry_zero_fill_phase,
+    apply_pending_entry_passive_progress,
+    candidate_for_terminal_taker_fallback,
+    decide_terminal_taker_fallback,
+    ensure_pending_entry_phase_state,
+    note_pending_entry_passive_cycle_accepted,
+    note_pending_entry_remainder_repost_accepted,
+    note_passive_operation,
+    pending_entry_phase_zero_fill_budget,
+    prepare_pending_entry_passive_cycle,
+    prepare_pending_entry_remainder_repost,
+    record_pending_entry_zero_fill_cycle,
+    terminal_recheck_is_tradeable,
+)
+from lightfee.engine.state import (
+    EngineState,
+    HedgeInflight,
+    OpenPosition,
+)
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -81,10 +102,25 @@ from lightfee.venues.transport import (
 logger = logging.getLogger("lightfee.engine.runtime")
 
 
+class _PendingEntryPassiveSubmitFinalized(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class LiveRuntime:
     """Live trading runtime with multi-lane ticks and control-plane exports."""
 
     _MAX_STATIC_RECOVERY_PROBE_SYMBOLS = 1
+    _PASSIVE_POST_ONLY_LADDER_FRACTIONS = (0.0, 0.5, 0.75, 1.0)
+    _PASSIVE_POST_ONLY_CLOSEST_PRICE_EXTRA_RETRIES = 2
+    _PASSIVE_POST_ONLY_TIGHT_SPREAD_LADDER_FRACTIONS = (0.0, 1.0)
+    _PASSIVE_POST_ONLY_BALANCED_SPREAD_LADDER_FRACTIONS = (0.0, 0.5, 1.0)
+    _PASSIVE_POST_ONLY_WIDE_SPREAD_LADDER_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
+    _PASSIVE_POST_ONLY_TIGHT_SPREAD_BPS = 5.0
+    _PASSIVE_POST_ONLY_WIDE_SPREAD_BPS = 20.0
+    _PASSIVE_POST_ONLY_RETRY_BACKOFF_MS = (500, 1000, 2000, 4000, 6000, 8000, 10000)
+    _MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR = 2.0
 
     def __init__(self, config: AppConfig, venue_adapters: Optional[dict[Venue, VenueAdapter]] = None) -> None:
         self.config = config
@@ -206,6 +242,7 @@ class LiveRuntime:
         # Per-venue sliding window of operation timestamps for cancel/submit
         # rate limiting. V1: try_consume_maker_venue_request_budget
         self._maker_venue_op_history: dict[str, list[int]] = {}
+        self._maker_venue_request_budget_frozen_until_ms: dict[str, int] = {}
 
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
@@ -4651,6 +4688,31 @@ class LiveRuntime:
             funding_edge_bps_entry=pending.funding_edge_bps_entry,
             total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
             expected_edge_bps_entry=pending.expected_edge_bps_entry,
+            worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            entry_maker_leg=pending.entry_maker_leg,
+            exit_maker_leg=pending.exit_maker_leg,
+            entry_cross_bps_entry=pending.entry_cross_bps_entry,
+            fee_bps_entry=pending.fee_bps_entry,
+            entry_slippage_bps_entry=pending.entry_slippage_bps_entry,
+            transfer_bias_bps_entry=pending.transfer_bias_bps_entry,
+            transfer_state_at_entry=pending.transfer_state_at_entry,
+            entry_liquidity_source_at_entry=pending.entry_liquidity_source_at_entry,
+            long_volume_24h_quote_at_entry=pending.long_volume_24h_quote_at_entry,
+            short_volume_24h_quote_at_entry=pending.short_volume_24h_quote_at_entry,
+            long_open_interest_quote_at_entry=pending.long_open_interest_quote_at_entry,
+            short_open_interest_quote_at_entry=pending.short_open_interest_quote_at_entry,
+            long_entry_vwap=pending.long_entry_vwap,
+            short_entry_vwap=pending.short_entry_vwap,
+            entry_capacity_constrained=pending.entry_capacity_constrained,
+            entry_target_quantity=pending.entry_target_quantity,
+            long_max_executable_quantity=pending.long_max_executable_quantity,
+            short_max_executable_quantity=pending.short_max_executable_quantity,
+            entry_max_executable_quantity=pending.entry_max_executable_quantity,
+            entry_depth_shortfall_quantity=pending.entry_depth_shortfall_quantity,
+            entry_max_executable_notional_quote=pending.entry_max_executable_notional_quote,
+            entry_depth_capped_at_entry=pending.entry_depth_capped_at_entry,
+            advisories=list(pending.advisories),
+            blocked_reasons=list(pending.blocked_reasons),
             exit_after_first_stage=pending.exit_after_first_stage,
         )
         await self.entry_executor.execute(ctx)
@@ -4803,6 +4865,298 @@ class LiveRuntime:
     # Passive entry maintenance (V1 maintain_pending_entry_passive_order — Fix 1)
     # ------------------------------------------------------------------
 
+    def _pending_entry_terminal_fallback_candidate(self, pending):
+        return candidate_for_terminal_taker_fallback(pending)
+
+    @staticmethod
+    def _candidate_to_runtime_namespace(candidate: Any, pending: Any) -> Any:
+        if candidate is None:
+            long_venue = getattr(pending, "long_venue", "")
+            short_venue = getattr(pending, "short_venue", "")
+            return SimpleNamespace(
+                symbol=getattr(pending, "symbol", ""),
+                long_venue=long_venue.value if hasattr(long_venue, "value") else str(long_venue),
+                short_venue=(
+                    short_venue.value if hasattr(short_venue, "value") else str(short_venue)
+                ),
+                blocked=True,
+                blocked_reasons=["legacy_no_frozen_candidate_out_of_scope"],
+                ranking_edge_bps=0.0,
+                expected_edge_bps=0.0,
+                funding_edge_bps=0.0,
+                entry_notional_quote=0.0,
+            )
+        if isinstance(candidate, SimpleNamespace):
+            data = dict(vars(candidate))
+        elif isinstance(candidate, dict):
+            data = dict(candidate)
+        else:
+            return candidate
+
+        long_venue = getattr(pending, "long_venue", "")
+        short_venue = getattr(pending, "short_venue", "")
+        data.setdefault("symbol", getattr(pending, "symbol", ""))
+        data.setdefault(
+            "long_venue",
+            long_venue.value if hasattr(long_venue, "value") else str(long_venue),
+        )
+        data.setdefault(
+            "short_venue",
+            short_venue.value if hasattr(short_venue, "value") else str(short_venue),
+        )
+        data.setdefault("blocked", False)
+        data.setdefault("blocked_reasons", [])
+        data.setdefault("ranking_edge_bps", 0.0)
+        data.setdefault("expected_edge_bps", 0.0)
+        data.setdefault("funding_edge_bps", 0.0)
+        data.setdefault("entry_notional_quote", 0.0)
+        return SimpleNamespace(**data)
+
+    def _apply_terminal_taker_runtime_entry_guards(
+        self,
+        candidate: Any,
+        pending: Any,
+        now_ms: int,
+    ) -> Any:
+        """V1: apply_runtime_entry_guards_excluding_pending for terminal fallback."""
+
+        checked = self._candidate_to_runtime_namespace(candidate, pending)
+        blocked_reasons = list(getattr(checked, "blocked_reasons", []) or [])
+
+        if not self._candidate_is_tradeable_for_selection(checked):
+            blocked_reasons.append("candidate_not_tradeable_for_selection")
+
+        gates = [
+            ("reduce_only", self._gate_reduce_only, ()),
+            ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
+            ("passive_close_in_flight", self._gate_passive_close_pending, ()),
+            ("recovery_ledger", self._gate_recovery_ledger, ()),
+            ("entry_sizing", self._gate_entry_sizing, ()),
+            ("venue_cooldown", self._gate_venue_cooldown, (now_ms,)),
+            ("zero_fill_cooldown", self._gate_zero_fill_cooldown, (now_ms,)),
+        ]
+        for gate_name, gate_fn, gate_args in gates:
+            allowed, reason = gate_fn(checked, *gate_args)
+            if allowed:
+                continue
+            blocked_reasons.append(reason or gate_name)
+
+        checked.blocked_reasons = blocked_reasons
+        checked.blocked = bool(blocked_reasons)
+        return checked
+
+    @staticmethod
+    def _candidate_float_hint(candidate: Any, *names: str) -> float:
+        for name in names:
+            try:
+                value = float(getattr(candidate, name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0.0:
+                return value
+        return 0.0
+
+    def _force_standard_candidate_context_values(self, candidate: Any, pending: Any) -> tuple[float, float, float]:
+        long_price_hint = self._candidate_float_hint(
+            candidate,
+            "long_price_hint",
+            "long_order_price_hint",
+            "long_entry_vwap",
+        )
+        short_price_hint = self._candidate_float_hint(
+            candidate,
+            "short_price_hint",
+            "short_order_price_hint",
+            "short_entry_vwap",
+        )
+        fallback_price = (
+            getattr(getattr(pending, "passive_order", None), "limit_price", None)
+            or getattr(pending, "maker_price", 0.0)
+            or 0.0
+        )
+        if long_price_hint <= 0.0:
+            long_price_hint = float(fallback_price or 0.0)
+        if short_price_hint <= 0.0:
+            short_price_hint = float(fallback_price or 0.0)
+
+        reference_price = long_price_hint if long_price_hint > 0.0 else short_price_hint
+        entry_notional_quote = float(
+            getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+        )
+        target_quantity = (
+            (entry_notional_quote / reference_price)
+            if entry_notional_quote > 0.0 and reference_price > 0.0
+            else (
+                float(getattr(pending, "target_quantity", 0.0) or 0.0)
+                or float(getattr(pending, "long_quantity", 0.0) or 0.0)
+                or float(getattr(pending, "short_quantity", 0.0) or 0.0)
+            )
+        )
+        return target_quantity, long_price_hint, short_price_hint
+
+    async def _execute_pending_entry_terminal_taker_fallback(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+        terminal_reason: str,
+    ) -> bool:
+        """V1: try_terminal_taker_fallback for pending entry zero-fill terminal."""
+        source_candidate = self._pending_entry_terminal_fallback_candidate(pending)
+        candidate = self._apply_terminal_taker_runtime_entry_guards(
+            source_candidate,
+            pending,
+            now_ms,
+        )
+        recheck = terminal_recheck_is_tradeable(candidate)
+        if recheck.kind == "blocked":
+            self.journal.append(
+                "execution.entry_fallback_to_taker_skipped",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": recheck.reason,
+                    "terminal_reason": terminal_reason,
+                    "maker_venue": pending.maker_venue().value,
+                    "maker_leg": getattr(pending, "maker_leg", "long"),
+                    "blocked_reasons": recheck.evidence.get("blocked_reasons", []),
+                },
+            )
+            return False
+
+        action = decide_terminal_taker_fallback(candidate, terminal_reason)
+        if action.kind == "skip_fallback":
+            payload = {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "reason": action.reason,
+                "terminal_reason": terminal_reason,
+                "maker_venue": pending.maker_venue().value,
+                "maker_leg": getattr(pending, "maker_leg", "long"),
+            }
+            if action.evidence.get("blocked_reasons"):
+                payload["blocked_reasons"] = action.evidence["blocked_reasons"]
+            self.journal.append("execution.entry_fallback_to_taker_skipped", payload)
+            return False
+
+        if self.entry_executor is None:
+            return False
+
+        from lightfee.engine.entry import EntryContext, EntryType
+
+        maker_leg = Side.SELL if getattr(pending, "maker_leg", "long") == "short" else Side.BUY
+        target_quantity, long_price_hint, short_price_hint = (
+            self._force_standard_candidate_context_values(candidate, pending)
+        )
+        if target_quantity <= 1e-9 or long_price_hint <= 0.0 or short_price_hint <= 0.0:
+            self.journal.append(
+                "execution.entry_fallback_to_taker_skipped",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": "missing_force_standard_quantity_or_price",
+                    "terminal_reason": terminal_reason,
+                    "target_quantity": target_quantity,
+                    "long_price_hint": long_price_hint,
+                    "short_price_hint": short_price_hint,
+                },
+            )
+            return False
+
+        self.journal.append(
+            "execution.entry_fallback_to_taker",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "reason": action.reason,
+                "terminal_reason": terminal_reason,
+                "maker_venue": pending.maker_venue().value,
+                "maker_leg": getattr(pending, "maker_leg", "long"),
+                "repost_attempt_count": pending.repost_attempt_count,
+            },
+        )
+
+        ctx = EntryContext(
+            entry_id=entry_id,
+            symbol=pending.symbol,
+            long_venue=pending.long_venue,
+            short_venue=pending.short_venue,
+            long_quantity=target_quantity,
+            short_quantity=target_quantity,
+            long_price_hint=long_price_hint,
+            short_price_hint=short_price_hint,
+            maker_leg=maker_leg,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            created_at_ms=now_ms,
+            opportunity_type=pending.opportunity_type,
+            funding_timestamp_ms=pending.funding_timestamp_ms,
+            first_funding_timestamp_ms=pending.first_funding_timestamp_ms,
+            long_funding_timestamp_ms=pending.long_funding_timestamp_ms,
+            short_funding_timestamp_ms=pending.short_funding_timestamp_ms,
+            second_funding_timestamp_ms=pending.second_funding_timestamp_ms,
+            first_funding_leg=pending.first_funding_leg,
+            funding_edge_bps_entry=float(
+                getattr(candidate, "funding_edge_bps", pending.funding_edge_bps_entry) or 0.0
+            ),
+            total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
+            expected_edge_bps_entry=float(
+                getattr(candidate, "expected_edge_bps", pending.expected_edge_bps_entry) or 0.0
+            ),
+            worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            entry_maker_leg=pending.entry_maker_leg,
+            exit_maker_leg=pending.exit_maker_leg,
+            entry_cross_bps_entry=pending.entry_cross_bps_entry,
+            fee_bps_entry=pending.fee_bps_entry,
+            entry_slippage_bps_entry=pending.entry_slippage_bps_entry,
+            transfer_bias_bps_entry=pending.transfer_bias_bps_entry,
+            transfer_state_at_entry=pending.transfer_state_at_entry,
+            entry_liquidity_source_at_entry=pending.entry_liquidity_source_at_entry,
+            long_volume_24h_quote_at_entry=pending.long_volume_24h_quote_at_entry,
+            short_volume_24h_quote_at_entry=pending.short_volume_24h_quote_at_entry,
+            long_open_interest_quote_at_entry=pending.long_open_interest_quote_at_entry,
+            short_open_interest_quote_at_entry=pending.short_open_interest_quote_at_entry,
+            long_entry_vwap=pending.long_entry_vwap,
+            short_entry_vwap=pending.short_entry_vwap,
+            entry_capacity_constrained=pending.entry_capacity_constrained,
+            entry_target_quantity=pending.entry_target_quantity,
+            long_max_executable_quantity=pending.long_max_executable_quantity,
+            short_max_executable_quantity=pending.short_max_executable_quantity,
+            entry_max_executable_quantity=pending.entry_max_executable_quantity,
+            entry_depth_shortfall_quantity=pending.entry_depth_shortfall_quantity,
+            entry_max_executable_notional_quote=pending.entry_max_executable_notional_quote,
+            entry_depth_capped_at_entry=pending.entry_depth_capped_at_entry,
+            advisories=list(pending.advisories),
+            blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
+            exit_after_first_stage=pending.exit_after_first_stage,
+        )
+        result = await self.entry_executor.execute(ctx)
+        if getattr(result, "open_position", None) is not None:
+            self.state.open_positions[result.open_position.position_id] = result.open_position
+            self.journal.append(
+                "runtime.position_opened",
+                {"position_id": result.open_position.position_id},
+            )
+            self._remove_pending_entry_after_terminal_decision(
+                entry_id,
+                reason="pending_entry_terminal_fallback_to_taker",
+            )
+            return True
+
+        pending.next_progress_poll_ms = now_ms + (
+            getattr(self.config.strategy, "maker_entry_reconcile_backoff_ms", 1000)
+            or 1000
+        )
+        self.journal.append(
+            "execution.entry_fallback_to_taker_deferred",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "terminal_reason": terminal_reason,
+                "reason": "force_standard_open_not_materialized",
+            },
+        )
+        return True
+
     async def _maintain_pending_entry_passive_orders(self, now_ms: int) -> None:
         """V1: maintain_pending_entry_passive_order() at tick level.
 
@@ -4868,12 +5222,9 @@ class LiveRuntime:
 
             # --- Step 2: Apply progress to pending entry ---
             if progress is not None:
-                po.last_progress_state = progress.state
-                if progress.cumulative_quantity > pending.maker_leg_filled:
-                    prev_filled = pending.maker_leg_filled
-                    pending.maker_leg_filled = progress.cumulative_quantity
-                    if progress.average_price > 0:
-                        pending.maker_fill_price = progress.average_price
+                prev_filled = pending.maker_leg_filled
+                progress_changed = apply_pending_entry_passive_progress(pending, progress)
+                if progress_changed and progress.cumulative_quantity > prev_filled:
                     self.journal.append(
                         "passive_maintenance.maker_progress",
                         {
@@ -4952,6 +5303,14 @@ class LiveRuntime:
                     if removed:
                         resolved.append(entry_id)
                 elif pending.missing_hedge_quantity() <= 1e-9:
+                    if await self._try_repost_pending_entry_remainder(
+                        pending,
+                        entry_id,
+                        po,
+                        adapter,
+                        now_ms,
+                    ):
+                        continue
                     if await self._finalize_pending_entry(pending, entry_id, now_ms):
                         resolved.append(entry_id)
                 elif await self._maybe_finalize_pending_entry_terminal_hedge_dust(
@@ -4984,6 +5343,684 @@ class LiveRuntime:
                 eid, reason="passive_entry_maintenance_resolved"
             )
 
+    async def _submit_pending_entry_passive_order_with_retries(
+        self,
+        *,
+        pending,
+        entry_id: str,
+        adapter,
+        quantity: float,
+        price: float | None,
+        stage_prefix: str,
+        start_attempt_index: int = 0,
+    ):
+        """V1: passive post-only attempt loop for pending-entry submit/repost."""
+
+        from lightfee.core.domain import OrderRequest
+        from lightfee.venues.cid import compact_client_order_id
+
+        attempt_limit = self._pending_entry_passive_post_only_attempt_limit()
+        attempt_index = max(0, int(start_attempt_index or 0))
+        last_error: Exception | None = None
+        while attempt_index < attempt_limit:
+            client_order_id = compact_client_order_id(
+                entry_id,
+                f"{stage_prefix}_attempt_{attempt_index}",
+            )
+            price_hint = self._pending_entry_post_only_price_hint_at_attempt(
+                pending,
+                attempt_index,
+                fallback_price=price,
+            )
+            if price_hint is None:
+                raise _PendingEntryPassiveSubmitFinalized("missing_passive_price_hint")
+            request = OrderRequest(
+                venue=pending.maker_venue(),
+                symbol=pending.symbol,
+                side=pending.maker_side(),
+                quantity=quantity,
+                price=price_hint if price_hint and price_hint > 0 else None,
+                client_order_id=client_order_id,
+                post_only=True,
+                reduce_only=False,
+                price_hint=price_hint if price_hint and price_hint > 0 else None,
+            )
+            try:
+                ack = await adapter.submit_passive_order(request)
+                return ack, request, attempt_index + 1
+            except Exception as exc:
+                last_error = exc
+                if (
+                    attempt_index + 1 >= attempt_limit
+                    or not self._entry_reject_is_post_only_would_take(str(exc))
+                ):
+                    raise
+                wait_ms = self._pending_entry_passive_retry_wait_ms(
+                    str(exc),
+                    attempt_index,
+                )
+                self._freeze_pending_entry_passive_maker_venue_from_error(
+                    pending.maker_venue(),
+                    str(exc),
+                    wait_ms,
+                )
+                if wait_ms > 0:
+                    await self._pending_entry_post_only_retry_sleep(wait_ms)
+                attempt_index += 1
+                await self._refresh_pending_entry_passive_market_snapshot(
+                    pending,
+                    adapter,
+                )
+                self.journal.append(
+                    "execution.passive_entry_requote_retry",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": pending.maker_venue().value,
+                        "maker_leg": getattr(pending, "maker_leg", "long"),
+                        "attempt": attempt_index,
+                        "error": str(exc),
+                        "wait_ms": wait_ms,
+                        "price_hint": request.price,
+                    },
+                )
+        raise _PendingEntryPassiveSubmitFinalized("max_passive_attempts_reached")
+
+    @classmethod
+    def _pending_entry_passive_post_only_attempt_limit(cls) -> int:
+        """V1: passive_post_only_attempt_limit()."""
+
+        return (
+            len(cls._PASSIVE_POST_ONLY_WIDE_SPREAD_LADDER_FRACTIONS)
+            + cls._PASSIVE_POST_ONLY_CLOSEST_PRICE_EXTRA_RETRIES
+        )
+
+    def _pending_entry_post_only_price_hint_at_attempt(
+        self,
+        pending,
+        attempt_index: int,
+        *,
+        fallback_price: float | None,
+    ) -> float | None:
+        """V1 boundary: post_only_entry_price_hint_at_attempt for pending entry IO."""
+
+        quote = self._pending_entry_passive_best_quote(pending)
+        if quote is None:
+            return None
+        best_bid, best_ask = quote
+        side = pending.maker_side()
+        adaptive_ladder_enabled, queue_jump_enabled = (
+            self._pending_entry_passive_ladder_profile(pending.maker_venue())
+        )
+        attempt = self._pending_entry_passive_queue_jump_attempt_index(
+            attempt_index,
+            queue_jump_enabled=queue_jump_enabled,
+        )
+        price = self._pending_entry_post_only_price_from_book_at_attempt(
+            best_bid,
+            best_ask,
+            side,
+            attempt,
+            adaptive_ladder_enabled=adaptive_ladder_enabled,
+        )
+        price = self._pending_entry_apply_inventory_bias(
+            pending,
+            best_bid,
+            best_ask,
+            side,
+            price,
+        )
+        price = self._pending_entry_apply_edge_headroom(
+            pending,
+            best_bid,
+            best_ask,
+            side,
+            price,
+            attempt,
+        )
+        tick_size = self._pending_entry_infer_price_tick_size([best_bid, best_ask])
+        if tick_size > 0.0:
+            from lightfee.venues.common import align_passive_price_to_tick
+
+            price = align_passive_price_to_tick(price, tick_size, side)
+        if math.isfinite(price) and price > 0.0:
+            return price
+        return fallback_price if fallback_price and fallback_price > 0 else None
+
+    def _pending_entry_passive_best_quote(self, pending) -> tuple[float, float] | None:
+        quote = self._resolve_local_l2_quote(pending.maker_venue(), pending.symbol)
+        if quote is not None:
+            return quote
+        if self._entry_readiness_provider_uses_ws_bbo():
+            venue_value = pending.maker_venue().value
+            quote_obj = self.ws_bbo_cache.get_quote(venue_value, pending.symbol)
+            if quote_obj is not None:
+                bid = float(getattr(quote_obj, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote_obj, "ask", 0.0) or 0.0)
+                if bid > 0.0 and ask >= bid:
+                    return bid, ask
+        return None
+
+    def _pending_entry_passive_ladder_profile(self, venue: Venue) -> tuple[bool, bool]:
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        for venue_config in getattr(self.config, "venues", []) or []:
+            if str(getattr(venue_config, "venue", "")).lower() != venue_value:
+                continue
+            passive_maker = getattr(getattr(venue_config, "live", None), "passive_maker", None)
+            if passive_maker is not None:
+                return (
+                    bool(getattr(passive_maker, "adaptive_ladder_enabled", True)),
+                    bool(getattr(passive_maker, "queue_jump_enabled", True)),
+                )
+        strategy = self.config.strategy
+        return (
+            bool(getattr(strategy, "passive_adaptive_ladder_enabled", True)),
+            bool(getattr(strategy, "passive_queue_jump_enabled", True)),
+        )
+
+    @staticmethod
+    def _pending_entry_passive_queue_jump_attempt_index(
+        attempt: int,
+        *,
+        queue_jump_enabled: bool,
+    ) -> int | None:
+        """V1: passive_queue_jump_attempt_index; None is Rust usize::MAX."""
+
+        if not queue_jump_enabled:
+            return max(0, int(attempt or 0))
+        if int(attempt or 0) == 0:
+            return None
+        return min(max(0, int(attempt or 0)), 2)
+
+    @classmethod
+    def _pending_entry_post_only_price_from_book_at_attempt(
+        cls,
+        best_bid: float,
+        best_ask: float,
+        side: Side,
+        attempt: int | None,
+        *,
+        adaptive_ladder_enabled: bool,
+    ) -> float:
+        fallback = best_bid if side == Side.BUY else best_ask
+        if (
+            not math.isfinite(best_bid)
+            or not math.isfinite(best_ask)
+            or best_bid <= 0.0
+            or best_ask <= 0.0
+        ):
+            return fallback
+        if best_ask <= best_bid:
+            return fallback
+
+        closest = cls._pending_entry_post_only_closest_price(best_bid, best_ask, side)
+        if attempt is None:
+            return closest
+        ladder = cls._pending_entry_passive_ladder_fractions_for_spread_bps(
+            cls._pending_entry_passive_spread_bps(best_bid, best_ask),
+            adaptive_ladder_enabled=adaptive_ladder_enabled,
+        )
+        stage_index = min(max(0, int(attempt or 0)), len(ladder) - 1)
+        fraction = ladder[stage_index]
+        if side == Side.BUY:
+            return best_bid + (closest - best_bid) * fraction
+        return best_ask - (best_ask - closest) * fraction
+
+    @staticmethod
+    def _pending_entry_post_only_closest_price(
+        best_bid: float,
+        best_ask: float,
+        side: Side,
+    ) -> float:
+        if side == Side.BUY:
+            return max(math.nextafter(best_ask, -math.inf), best_bid)
+        return min(math.nextafter(best_bid, math.inf), best_ask)
+
+    @classmethod
+    def _pending_entry_passive_ladder_fractions_for_spread_bps(
+        cls,
+        spread_bps: float,
+        *,
+        adaptive_ladder_enabled: bool,
+    ) -> tuple[float, ...]:
+        if not adaptive_ladder_enabled:
+            return cls._PASSIVE_POST_ONLY_LADDER_FRACTIONS
+        if (
+            not math.isfinite(spread_bps)
+            or spread_bps <= cls._PASSIVE_POST_ONLY_TIGHT_SPREAD_BPS
+        ):
+            return cls._PASSIVE_POST_ONLY_TIGHT_SPREAD_LADDER_FRACTIONS
+        if spread_bps <= cls._PASSIVE_POST_ONLY_WIDE_SPREAD_BPS:
+            return cls._PASSIVE_POST_ONLY_BALANCED_SPREAD_LADDER_FRACTIONS
+        return cls._PASSIVE_POST_ONLY_WIDE_SPREAD_LADDER_FRACTIONS
+
+    @staticmethod
+    def _pending_entry_passive_spread_bps(best_bid: float, best_ask: float) -> float:
+        if (
+            not math.isfinite(best_bid)
+            or not math.isfinite(best_ask)
+            or best_bid <= 0.0
+            or best_ask <= best_bid
+        ):
+            return 0.0
+        mid = max((best_bid + best_ask) * 0.5, sys.float_info.epsilon)
+        return ((best_ask - best_bid) / mid) * 10_000.0
+
+    @staticmethod
+    def _pending_entry_infer_price_tick_size(values: list[float]) -> float:
+        tick_size = 0.0
+        for value in values:
+            if not (math.isfinite(value) and value > 0.0):
+                continue
+            text = str(value)
+            if "e" in text.lower():
+                text = format(value, ".15f").rstrip("0").rstrip(".")
+            if "." not in text:
+                continue
+            fractional = text.split(".", 1)[1].rstrip("0")
+            if not fractional:
+                continue
+            inferred = 10.0 ** (-len(fractional))
+            tick_size = inferred if tick_size <= 0.0 else min(tick_size, inferred)
+        return tick_size
+
+    def _pending_entry_apply_inventory_bias(
+        self,
+        pending,
+        best_bid: float,
+        best_ask: float,
+        side: Side,
+        base_price: float,
+    ) -> float:
+        if not (math.isfinite(base_price) and base_price > 0.0 and best_ask > best_bid):
+            return base_price
+        passive_maker = self._pending_entry_passive_maker_config(pending.maker_venue())
+        inventory_bias_enabled = bool(
+            getattr(passive_maker, "maker_inventory_bias_enabled", None)
+            if passive_maker is not None and hasattr(passive_maker, "maker_inventory_bias_enabled")
+            else getattr(self.config.strategy, "maker_inventory_bias_enabled", True)
+        )
+        if not inventory_bias_enabled:
+            return base_price
+        threshold = self._pending_entry_maker_inventory_bias_threshold_quote()
+        signed_inventory = self._pending_entry_signed_inventory_notional_quote(
+            pending.maker_venue(),
+            pending.symbol,
+            (best_bid + best_ask) * 0.5,
+        )
+        if (
+            not math.isfinite(signed_inventory)
+            or abs(signed_inventory) <= sys.float_info.epsilon
+            or not math.isfinite(threshold)
+            or threshold <= 0.0
+        ):
+            return base_price
+
+        pressure = min(max(abs(signed_inventory) / threshold, 0.0), 1.0)
+        if pressure <= sys.float_info.epsilon:
+            return base_price
+        bps_per_unit = float(getattr(self.config.strategy, "maker_inventory_bias_bps_per_unit", 25.0) or 0.0)
+        max_bps = float(getattr(self.config.strategy, "maker_inventory_bias_max_bps", 25.0) or 0.0)
+        shift_bps = min(max(bps_per_unit * pressure, 0.0), max_bps)
+        if shift_bps <= sys.float_info.epsilon:
+            return base_price
+
+        shift = max((best_bid + best_ask) * 0.5, sys.float_info.epsilon) * (shift_bps / 10_000.0)
+        closest = self._pending_entry_post_only_closest_price(best_bid, best_ask, side)
+        biased_price = base_price - shift if signed_inventory > 0.0 else base_price + shift
+        if side == Side.BUY:
+            return max(min(biased_price, closest), best_bid)
+        return min(max(biased_price, closest), best_ask)
+
+    def _pending_entry_apply_edge_headroom(
+        self,
+        pending,
+        best_bid: float,
+        best_ask: float,
+        side: Side,
+        base_price: float,
+        attempt: int | None,
+    ) -> float:
+        if attempt == 0:
+            return base_price
+        edge_headroom_bps = self._pending_entry_edge_headroom_bps(pending)
+        if edge_headroom_bps is None:
+            return base_price
+        full_headroom = self._pending_entry_full_aggression_headroom_bps()
+        if (
+            not math.isfinite(edge_headroom_bps)
+            or not math.isfinite(full_headroom)
+            or full_headroom <= 0.0
+            or best_ask <= best_bid
+        ):
+            return base_price
+
+        pressure = min(max(edge_headroom_bps / full_headroom, -1.0), 1.0)
+        if abs(pressure) <= sys.float_info.epsilon:
+            return base_price
+        closest = self._pending_entry_post_only_closest_price(best_bid, best_ask, side)
+        if side == Side.BUY and pressure > 0.0:
+            adjusted = base_price + max(closest - base_price, 0.0) * pressure
+        elif side == Side.BUY:
+            adjusted = base_price - max(base_price - best_bid, 0.0) * -pressure
+        elif pressure > 0.0:
+            adjusted = base_price - max(base_price - closest, 0.0) * pressure
+        else:
+            adjusted = base_price + max(best_ask - base_price, 0.0) * -pressure
+        if side == Side.BUY:
+            return max(min(adjusted, closest), best_bid)
+        return min(max(adjusted, closest), best_ask)
+
+    def _pending_entry_passive_maker_config(self, venue: Venue) -> Any | None:
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        for venue_config in getattr(self.config, "venues", []) or []:
+            if str(getattr(venue_config, "venue", "")).lower() != venue_value:
+                continue
+            return getattr(getattr(venue_config, "live", None), "passive_maker", None)
+        return None
+
+    def _pending_entry_maker_inventory_bias_threshold_quote(self) -> float:
+        strategy = self.config.strategy
+        return max(
+            float(getattr(strategy, "live_entry_notional_cap_quote", 0.0) or 0.0),
+            float(getattr(strategy, "entry_notional_cap_quote", 0.0) or 0.0),
+            float(getattr(strategy, "min_entry_leg_notional_quote", 0.0) or 0.0),
+            1.0,
+        )
+
+    def _pending_entry_signed_inventory_notional_quote(
+        self,
+        venue: Venue,
+        symbol: str,
+        price_hint: float,
+    ) -> float:
+        if not (math.isfinite(price_hint) and price_hint > 0.0):
+            return 0.0
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        signed_quantity = 0.0
+        for position in getattr(self.state, "open_positions", {}).values():
+            if getattr(position, "symbol", "") != symbol:
+                continue
+            if hasattr(position, "long_venue") or hasattr(position, "short_venue"):
+                long_venue = getattr(position, "long_venue", "")
+                short_venue = getattr(position, "short_venue", "")
+                long_value = long_venue.value if hasattr(long_venue, "value") else str(long_venue)
+                short_value = short_venue.value if hasattr(short_venue, "value") else str(short_venue)
+                quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+                if long_value == venue_value:
+                    signed_quantity += quantity
+                if short_value == venue_value:
+                    signed_quantity -= quantity
+                continue
+            pos_venue = getattr(position, "venue", "")
+            pos_value = pos_venue.value if hasattr(pos_venue, "value") else str(pos_venue)
+            if pos_value != venue_value:
+                continue
+            quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+            side = getattr(position, "side", None)
+            signed_quantity += quantity if side == Side.BUY else -quantity
+        return signed_quantity * price_hint
+
+    def _pending_entry_edge_headroom_bps(self, pending) -> float | None:
+        source = getattr(pending, "frozen_candidate", None)
+        if not isinstance(source, dict):
+            source = {
+                "entry_notional_quote": getattr(pending, "entry_notional_quote", 0.0),
+                "expected_edge_bps": getattr(pending, "expected_edge_bps_entry", 0.0),
+                "worst_case_edge_bps": getattr(pending, "worst_case_edge_bps_entry", 0.0),
+            }
+        try:
+            entry_notional = float(source.get("entry_notional_quote", 0.0) or 0.0)
+            expected_edge = float(source.get("expected_edge_bps", 0.0) or 0.0)
+            worst_case_edge = float(source.get("worst_case_edge_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (
+            math.isfinite(entry_notional)
+            and math.isfinite(expected_edge)
+            and math.isfinite(worst_case_edge)
+        ):
+            return None
+        strategy = self.config.strategy
+        min_expected = float(getattr(strategy, "min_expected_edge_bps", 0.0) or 0.0)
+        min_worst = float(getattr(strategy, "min_worst_case_edge_bps", 0.0) or 0.0)
+        return min(expected_edge - min_expected, worst_case_edge - min_worst)
+
+    def _pending_entry_full_aggression_headroom_bps(self) -> float:
+        return max(
+            float(getattr(self.config.strategy, "execution_buffer_bps", 0.0) or 0.0) * 4.0,
+            self._MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR,
+        )
+
+    def _pending_entry_passive_retry_wait_ms(self, error: str, attempt_index: int) -> int:
+        schedule = self._PASSIVE_POST_ONLY_RETRY_BACKOFF_MS
+        idx = min(max(0, int(attempt_index or 0)), len(schedule) - 1)
+        minimum = schedule[idx]
+        retry_after = self._pending_entry_retry_after_ms(error)
+        if self._pending_entry_error_is_rate_limited(error):
+            return max(minimum, retry_after)
+        return minimum
+
+    @staticmethod
+    def _pending_entry_retry_after_ms(error: str) -> int:
+        marker = "retry_after_ms="
+        text = str(error or "").lower()
+        start = text.find(marker)
+        if start < 0:
+            return 0
+        digits = []
+        for ch in text[start + len(marker):]:
+            if not ch.isdigit():
+                break
+            digits.append(ch)
+        return int("".join(digits) or "0")
+
+    @staticmethod
+    def _pending_entry_error_is_rate_limited(error: str) -> bool:
+        text = str(error or "").lower()
+        return (
+            "status=429" in text
+            or "too many requests" in text
+            or "rate limited" in text
+            or "retry_after" in text
+        )
+
+    def _freeze_pending_entry_passive_maker_venue_from_error(
+        self,
+        venue: Venue,
+        error: str,
+        wait_ms: int,
+    ) -> None:
+        if wait_ms <= 0 or not self._pending_entry_error_is_rate_limited(error):
+            return
+        venue_key = venue.value if hasattr(venue, "value") else str(venue)
+        until_ms = wall_clock_now_ms() + wait_ms
+        self._maker_venue_request_budget_frozen_until_ms[venue_key] = max(
+            int(self._maker_venue_request_budget_frozen_until_ms.get(venue_key, 0) or 0),
+            until_ms,
+        )
+
+    async def _pending_entry_post_only_retry_sleep(self, wait_ms: int) -> None:
+        await asyncio.sleep(wait_ms / 1000.0)
+
+    async def _refresh_pending_entry_passive_market_snapshot(self, pending, adapter) -> None:
+        refresh = getattr(adapter, "refresh_market_snapshot", None)
+        if refresh is None:
+            return
+        try:
+            await refresh(pending.symbol)
+        except Exception as exc:
+            self.journal.append(
+                "execution.passive_entry_market_refresh_failed",
+                {
+                    "entry_id": getattr(pending, "pending_id", ""),
+                    "symbol": pending.symbol,
+                    "maker_venue": pending.maker_venue().value,
+                    "error": str(exc),
+                },
+            )
+
+    async def _try_repost_pending_entry_remainder(
+        self,
+        pending,
+        entry_id: str,
+        po,
+        adapter,
+        now_ms: int,
+    ) -> bool:
+        """V1: `try_repost_pending_entry_remainder` runtime IO wrapper."""
+
+        if not getattr(po, "maker_completed", lambda: False)():
+            return False
+        if not pending.has_any_fill():
+            return False
+        if pending.missing_hedge_quantity() > 1e-9:
+            return False
+
+        remaining_quantity = max(
+            0.0,
+            float(getattr(pending, "target_quantity", 0.0) or 0.0)
+            - float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
+        )
+        if remaining_quantity <= 1e-9:
+            return False
+
+        try:
+            normalized_quantity = float(
+                await adapter.normalize_quantity(pending.symbol, remaining_quantity)
+            )
+        except Exception as exc:
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            self.journal.append(
+                "execution.passive_entry_repost_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": pending.maker_venue().value,
+                    "remaining_quantity": remaining_quantity,
+                    "error": str(exc),
+                },
+            )
+            return True
+
+        action = prepare_pending_entry_remainder_repost(
+            pending,
+            self.config.strategy,
+            normalized_quantity=normalized_quantity,
+        )
+        if action.kind == "finalized":
+            remaining = float(action.evidence.get("remaining_quantity", remaining_quantity) or 0.0)
+            if remaining > 1e-9:
+                self.journal.append(
+                    "execution.passive_entry_repost_exhausted",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": action.reason,
+                        **action.evidence,
+                    },
+                )
+            return False
+
+        if not self._try_consume_maker_venue_budget(pending.maker_venue(), now_ms):
+            pending.next_progress_poll_ms = (
+                now_ms + self.config.strategy.maker_venue_budget_window_ms
+            )
+            self.journal.append(
+                "passive_maintenance.repost_budget_delayed",
+                {"entry_id": entry_id, "venue": str(pending.maker_venue())},
+            )
+            return True
+
+        from lightfee.core.domain import PassiveOrderState
+
+        price = (
+            getattr(po, "limit_price", None)
+            if getattr(po, "limit_price", None) is not None
+            else getattr(pending, "maker_price", 0.0)
+        )
+        try:
+            ack, request, passive_attempt_count = (
+                await self._submit_pending_entry_passive_order_with_retries(
+                    pending=pending,
+                    entry_id=entry_id,
+                    adapter=adapter,
+                    quantity=normalized_quantity,
+                    price=price if price and price > 0 else None,
+                    stage_prefix=(
+                        f"{getattr(pending, 'maker_leg', 'long')}_repost_"
+                        f"{pending.repost_attempt_count + 1}"
+                    ),
+                    start_attempt_index=int(getattr(pending, "passive_attempt_count", 0) or 0),
+                )
+            )
+        except _PendingEntryPassiveSubmitFinalized as finalized:
+            remaining = float(action.evidence.get("remaining_quantity", remaining_quantity) or 0.0)
+            if remaining > 1e-9:
+                self.journal.append(
+                    "execution.passive_entry_repost_exhausted",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": finalized.reason,
+                        **action.evidence,
+                    },
+                )
+            return False
+        except Exception as exc:
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            self.journal.append(
+                "execution.passive_entry_repost_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": pending.maker_venue().value,
+                    "remaining_quantity": remaining_quantity,
+                    "error": str(exc),
+                },
+            )
+            return True
+
+        accepted_at_ms = int(getattr(ack, "accepted_at_ms", 0) or now_ms)
+        order_id = getattr(ack, "order_id", "") or po.order_id
+        ack_client_order_id = (
+            getattr(ack, "client_order_id", "")
+            or request.client_order_id
+            or ""
+        )
+        ack_price = getattr(ack, "price", 0.0) or request.price or price or 0.0
+        ack_quantity = getattr(ack, "quantity", 0.0) or normalized_quantity
+        ack_state = getattr(ack, "state", None) or PassiveOrderState.OPEN
+
+        pending.maker_order_id = order_id
+        pending.maker_client_order_id = ack_client_order_id
+        pending.maker_price = float(ack_price or 0.0)
+        note_pending_entry_remainder_repost_accepted(
+            pending,
+            order_id=order_id,
+            client_order_id=ack_client_order_id,
+            accepted_at_ms=accepted_at_ms,
+            limit_price=float(ack_price) if ack_price and ack_price > 0 else None,
+            target_quantity=float(ack_quantity),
+            passive_attempt_count=passive_attempt_count,
+            rest_timeout_ms=getattr(self.config.strategy, "maker_entry_rest_timeout_ms", 6000) or 6000,
+        )
+        if pending.passive_order is not None:
+            pending.passive_order.last_progress_state = ack_state
+        self.journal.append(
+            "execution.passive_entry_reposted",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "maker_venue": pending.maker_venue().value,
+                "attempt": pending.repost_attempt_count,
+                "remaining_quantity": remaining_quantity,
+                "repost_quantity": normalized_quantity,
+                "price_hint": request.price,
+            },
+        )
+        return True
+
     async def _handle_pending_passive_zero_fill_completion(
         self,
         pending,
@@ -4995,20 +6032,6 @@ class LiveRuntime:
         """V1 zero-fill passive cycle: record delay, then repost before terminal abort."""
         strategy = self.config.strategy
         max_reposts = getattr(strategy, "maker_entry_max_reposts", 0) or 0
-        if max_reposts > 0 and pending.repost_count >= max_reposts:
-            self.journal.append(
-                "passive_maintenance.zero_fill_repost_exhausted",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "repost_count": pending.repost_count,
-                    "max_reposts": max_reposts,
-                    "state": po.last_progress_state.value,
-                },
-            )
-            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
-                self._apply_reconcile_backoff(pending, now_ms)
-            return True
 
         if not pending.has_any_fill():
             from lightfee.engine.v1_lifecycle import V1TradingLifecycle
@@ -5038,17 +6061,12 @@ class LiveRuntime:
         retry_pending = bool(metadata.get("passive_zero_fill_retry_pending"))
 
         if not retry_pending:
-            cycles = int(metadata.get("passive_zero_fill_cycles", 0)) + 1
-            delays = getattr(strategy, "maker_cycle_retry_delays_ms", []) or []
-            if delays:
-                delay_idx = min(max(cycles - 1, 0), len(delays) - 1)
-                retry_delay_ms = int(delays[delay_idx])
-            else:
-                retry_delay_ms = 0
+            retry_delay_ms = record_pending_entry_zero_fill_cycle(pending, strategy, now_ms)
+            phase_state = ensure_pending_entry_phase_state(pending, now_ms)
+            cycles = int(phase_state.zero_fill_cycles_in_phase or 0)
             metadata["passive_zero_fill_cycles"] = cycles
             metadata["passive_zero_fill_retry_pending"] = True
-            metadata["passive_zero_fill_retry_at_ms"] = now_ms + retry_delay_ms
-            pending.next_progress_poll_ms = now_ms + retry_delay_ms
+            metadata["passive_zero_fill_retry_at_ms"] = pending.next_progress_poll_ms
             self.journal.append(
                 "passive_maintenance.zero_fill_cycle",
                 {
@@ -5069,6 +6087,82 @@ class LiveRuntime:
             pending.next_progress_poll_ms = retry_at_ms
             return True
 
+        phase_state = ensure_pending_entry_phase_state(pending, now_ms)
+        previous_phase = phase_state.phase
+        zero_fill_candidate = self._apply_terminal_taker_runtime_entry_guards(
+            self._pending_entry_terminal_fallback_candidate(pending),
+            pending,
+            now_ms,
+        )
+        action = advance_pending_entry_zero_fill_phase(
+            pending,
+            strategy,
+            now_ms,
+            candidate=zero_fill_candidate,
+        )
+        phase_budget = pending_entry_phase_zero_fill_budget(self.config.strategy)
+        if action.reason == "candidate_not_tradeable_after_zero_fill_reprice":
+            self.journal.append(
+                "execution.direction_drift_blocked",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": action.reason,
+                    "blocked_reasons": action.evidence.get("blocked_reasons", []),
+                    "phase": previous_phase,
+                    "phase_zero_fill_budget": phase_budget,
+                },
+            )
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
+            return True
+        if action.reason == "phase_switched_to_low_slippage_maker":
+            phase_state = ensure_pending_entry_phase_state(pending, now_ms)
+            metadata["passive_zero_fill_cycles"] = 0
+            self.journal.append(
+                "execution.passive_phase_switched",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "from_phase": previous_phase,
+                    "to_phase": phase_state.phase,
+                    "maker_leg": pending.maker_leg,
+                    "maker_venue": str(pending.maker_venue()),
+                    "phase_zero_fill_budget": phase_budget,
+                },
+            )
+        elif action.kind == "trigger_dual_taker":
+            self.journal.append(
+                "execution.dual_taker_armed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": action.reason,
+                    "phase_zero_fill_budget": phase_budget,
+                },
+            )
+            if await self._execute_pending_entry_terminal_taker_fallback(
+                pending,
+                entry_id,
+                now_ms,
+                action.reason,
+            ):
+                return True
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
+            return True
+        elif action.reason == "dual_taker_phase_already_armed":
+            if await self._execute_pending_entry_terminal_taker_fallback(
+                pending,
+                entry_id,
+                now_ms,
+                action.reason,
+            ):
+                return True
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
+            return True
+
         maker_venue = pending.maker_venue()
         if not self._try_consume_maker_venue_budget(maker_venue, now_ms):
             pending.next_progress_poll_ms = (
@@ -5080,26 +6174,65 @@ class LiveRuntime:
             )
             return True
 
-        from lightfee.core.domain import OrderRequest, PassiveOrderState
-        from lightfee.venues.cid import compact_client_order_id
+        from lightfee.core.domain import PassiveOrderState
 
         quantity = po.target_quantity or pending.target_quantity
         price = po.limit_price if po.limit_price is not None else pending.maker_price
-        client_order_id = compact_client_order_id(
-            entry_id, f"maker_repost_{pending.repost_count + 1}"
+        cycle_action = prepare_pending_entry_passive_cycle(
+            pending,
+            normalized_quantity=quantity,
         )
-        request = OrderRequest(
-            venue=maker_venue,
-            symbol=pending.symbol,
-            side=pending.maker_side(),
-            quantity=quantity,
-            price=price if price and price > 0 else None,
-            client_order_id=client_order_id,
-            post_only=True,
-            reduce_only=False,
-        )
+        if cycle_action.kind == "finalized":
+            self.journal.append(
+                "passive_maintenance.zero_fill_repost_exhausted",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": cycle_action.reason,
+                    **cycle_action.evidence,
+                },
+            )
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
+            return True
+        submit_adapter = self._venue_adapters.get(maker_venue)
+        if submit_adapter is None:
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            self.journal.append(
+                "passive_maintenance.repost_error",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": str(maker_venue),
+                    "error": "maker venue adapter unavailable",
+                },
+            )
+            return True
         try:
-            ack = await adapter.submit_passive_order(request)
+            ack, request, passive_attempt_count = (
+                await self._submit_pending_entry_passive_order_with_retries(
+                    pending=pending,
+                    entry_id=entry_id,
+                    adapter=submit_adapter,
+                    quantity=quantity,
+                    price=price if price and price > 0 else None,
+                    stage_prefix=f"maker_repost_{pending.repost_count + 1}",
+                    start_attempt_index=0,
+                )
+            )
+        except _PendingEntryPassiveSubmitFinalized as finalized:
+            self.journal.append(
+                "passive_maintenance.zero_fill_repost_exhausted",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": finalized.reason,
+                    **cycle_action.evidence,
+                },
+            )
+            if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                self._apply_reconcile_backoff(pending, now_ms)
+            return True
         except Exception as exc:
             pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
             self.journal.append(
@@ -5116,28 +6249,29 @@ class LiveRuntime:
         accepted_at_ms = getattr(ack, "accepted_at_ms", 0) or now_ms
         order_id = getattr(ack, "order_id", "") or po.order_id
         client_order_id = getattr(ack, "client_order_id", "") or request.client_order_id or ""
-        ack_price = getattr(ack, "price", 0.0) or price or 0.0
+        ack_price = getattr(ack, "price", 0.0) or request.price or price or 0.0
         ack_quantity = getattr(ack, "quantity", 0.0) or quantity
         ack_state = getattr(ack, "state", None) or PassiveOrderState.UNKNOWN
 
         pending.repost_count += 1
+        phase_state = ensure_pending_entry_phase_state(pending, now_ms)
         pending.maker_order_id = order_id
         pending.maker_client_order_id = client_order_id
         pending.maker_price = float(ack_price or 0.0)
-        po.order_id = order_id
-        po.client_order_id = client_order_id
-        po.limit_price = float(ack_price) if ack_price and ack_price > 0 else po.limit_price
-        po.target_quantity = float(ack_quantity)
-        po.accepted_at_ms = accepted_at_ms
-        po.timeout_at_ms = accepted_at_ms + (
-            getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000
+        note_pending_entry_passive_cycle_accepted(
+            pending,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            accepted_at_ms=accepted_at_ms,
+            limit_price=float(ack_price) if ack_price and ack_price > 0 else po.limit_price,
+            target_quantity=float(ack_quantity),
+            passive_attempt_count=passive_attempt_count,
+            rest_timeout_ms=getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000,
         )
-        po.cancel_requested_at_ms = 0
-        po.last_progress_state = ack_state
+        po = pending.passive_order
+        if po is not None:
+            po.last_progress_state = ack_state
         metadata["passive_zero_fill_retry_pending"] = False
-        pending.next_progress_poll_ms = accepted_at_ms + (
-            getattr(strategy, "maker_entry_progress_poll_ms", 500) or 500
-        )
         self.journal.append(
             "passive_maintenance.passive_entry_reposted",
             {
@@ -5147,8 +6281,8 @@ class LiveRuntime:
                 "order_id": order_id,
                 "client_order_id": client_order_id,
                 "repost_count": pending.repost_count,
-                "quantity": po.target_quantity,
-                "price": po.limit_price,
+                "quantity": pending.passive_order.target_quantity if pending.passive_order else 0.0,
+                "price": pending.passive_order.limit_price if pending.passive_order else None,
             },
         )
         return True
@@ -5259,6 +6393,7 @@ class LiveRuntime:
             pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
             return False
 
+        note_passive_operation(pending)
         po.cancel_requested_at_ms = now_ms
         pending.next_progress_poll_ms = now_ms + self.config.strategy.maker_venue_budget_window_ms
         self.journal.append(
@@ -7718,6 +8853,11 @@ class LiveRuntime:
         cost = strategy.maker_venue_submit_cost  # cancel uses submit cost
 
         venue_key = str(venue) if hasattr(venue, "value") else str(venue)
+        frozen_until_ms = int(
+            self._maker_venue_request_budget_frozen_until_ms.get(venue_key, 0) or 0
+        )
+        if frozen_until_ms > 0 and now_ms < frozen_until_ms:
+            return False
         history = self._maker_venue_op_history.setdefault(venue_key, [])
 
         # Prune expired timestamps
@@ -7867,7 +9007,11 @@ class LiveRuntime:
                 return False
 
             # V1: use maker fill price as hedge price hint (live fill preferred)
-            hedge_price = pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price
+            hedge_price = (
+                pending.unmatched_maker_weighted_average_price()
+                or pending.maker_fill_price
+                or pending.maker_price
+            )
 
             from lightfee.venues.cid import generate_exchange_cid
             recovery_cid = generate_exchange_cid(pending.pending_id, "h", hedge_venue)
@@ -7887,6 +9031,7 @@ class LiveRuntime:
             fill = await adapter.place_order(req)
             if fill.quantity > 0:
                 pending.hedge_leg_filled += fill.quantity
+                pending.consume_hedge_quantity_fifo(fill.quantity)
                 pending.hedge_order_id = fill.order_id
                 pending.hedge_fill_price = fill.price
                 if pending.missing_hedge_quantity() <= 1e-9:
@@ -7949,7 +9094,11 @@ class LiveRuntime:
                 )
                 return False
 
-            hedge_price = pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price
+            hedge_price = (
+                pending.unmatched_maker_weighted_average_price()
+                or pending.maker_fill_price
+                or pending.maker_price
+            )
 
             # Terminal policy: compute notional and check against venue min_notional
             hedge_notional = abs(normalized * hedge_price)
@@ -8018,6 +9167,7 @@ class LiveRuntime:
 
             if fill.quantity > 0:
                 pending.hedge_leg_filled += fill.quantity
+                pending.consume_hedge_quantity_fifo(fill.quantity)
                 pending.hedge_order_id = fill.order_id
                 pending.hedge_fill_price = fill.price
                 pending.hedge_inflight = None
@@ -8826,6 +9976,31 @@ class LiveRuntime:
             funding_edge_bps_entry=pending.funding_edge_bps_entry,
             total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
             expected_edge_bps_entry=pending.expected_edge_bps_entry,
+            worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            entry_maker_leg=pending.entry_maker_leg,
+            exit_maker_leg=pending.exit_maker_leg,
+            entry_cross_bps_entry=pending.entry_cross_bps_entry,
+            fee_bps_entry=pending.fee_bps_entry,
+            entry_slippage_bps_entry=pending.entry_slippage_bps_entry,
+            transfer_bias_bps_entry=pending.transfer_bias_bps_entry,
+            transfer_state_at_entry=pending.transfer_state_at_entry,
+            entry_liquidity_source_at_entry=pending.entry_liquidity_source_at_entry,
+            long_volume_24h_quote_at_entry=pending.long_volume_24h_quote_at_entry,
+            short_volume_24h_quote_at_entry=pending.short_volume_24h_quote_at_entry,
+            long_open_interest_quote_at_entry=pending.long_open_interest_quote_at_entry,
+            short_open_interest_quote_at_entry=pending.short_open_interest_quote_at_entry,
+            long_entry_vwap=pending.long_entry_vwap,
+            short_entry_vwap=pending.short_entry_vwap,
+            entry_capacity_constrained=pending.entry_capacity_constrained,
+            entry_target_quantity=pending.entry_target_quantity,
+            long_max_executable_quantity=pending.long_max_executable_quantity,
+            short_max_executable_quantity=pending.short_max_executable_quantity,
+            entry_max_executable_quantity=pending.entry_max_executable_quantity,
+            entry_depth_shortfall_quantity=pending.entry_depth_shortfall_quantity,
+            entry_max_executable_notional_quote=pending.entry_max_executable_notional_quote,
+            entry_depth_capped_at_entry=pending.entry_depth_capped_at_entry,
+            advisories=list(pending.advisories),
+            blocked_reasons=list(pending.blocked_reasons),
             exit_after_first_stage=pending.exit_after_first_stage,
         )
 
@@ -13725,6 +14900,15 @@ class LiveRuntime:
                 return 0
             return parsed if parsed > 0 else 0
 
+        def _float_attr(name: str, default: float = 0.0) -> float:
+            try:
+                return float(getattr(candidate, name, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        def _str_attr(name: str, default: str = "") -> str:
+            return str(getattr(candidate, name, default) or default)
+
         opportunity_type = normalize_opportunity_type(
             str(getattr(candidate, "opportunity_type", "aligned") or "aligned")
         )
@@ -13762,7 +14946,17 @@ class LiveRuntime:
             getattr(candidate, "total_funding_edge_bps", 0.0) or funding_edge_bps_entry
         )
         expected_edge_bps_entry = float(getattr(candidate, "expected_edge_bps", 0.0) or 0.0)
+        worst_case_edge_bps_entry = _float_attr("worst_case_edge_bps")
         first_funding_leg = str(getattr(candidate, "first_funding_leg", "") or "")
+        entry_maker_leg = _str_attr(
+            "entry_maker_leg",
+            "long" if maker_leg == Side.BUY else "short",
+        )
+        entry_liquidity_source_at_entry = (
+            getattr(candidate, "entry_liquidity_source_at_entry", None)
+            or _str_attr("sizing_liquidity_source")
+            or None
+        )
         exit_after_first_stage = (
             opportunity_type == "staggered"
             and str(getattr(self.config.strategy, "staggered_exit_mode", "") or "").lower()
@@ -13791,6 +14985,37 @@ class LiveRuntime:
             funding_edge_bps_entry=funding_edge_bps_entry,
             total_funding_edge_bps_entry=total_funding_edge_bps_entry,
             expected_edge_bps_entry=expected_edge_bps_entry,
+            worst_case_edge_bps_entry=worst_case_edge_bps_entry,
+            entry_maker_leg=entry_maker_leg,
+            exit_maker_leg=_str_attr("exit_maker_leg"),
+            entry_cross_bps_entry=_float_attr("entry_cross_bps"),
+            fee_bps_entry=_float_attr("fee_bps"),
+            entry_slippage_bps_entry=_float_attr("entry_slippage_bps"),
+            transfer_bias_bps_entry=_float_attr("transfer_bias_bps"),
+            transfer_state_at_entry=getattr(candidate, "transfer_state_at_entry", None),
+            entry_liquidity_source_at_entry=entry_liquidity_source_at_entry,
+            long_volume_24h_quote_at_entry=_float_attr("long_volume_24h_quote"),
+            short_volume_24h_quote_at_entry=_float_attr("short_volume_24h_quote"),
+            long_open_interest_quote_at_entry=_float_attr("long_open_interest_quote_at_entry"),
+            short_open_interest_quote_at_entry=_float_attr("short_open_interest_quote_at_entry"),
+            long_entry_vwap=getattr(candidate, "long_entry_vwap", None),
+            short_entry_vwap=getattr(candidate, "short_entry_vwap", None),
+            entry_capacity_constrained=bool(
+                getattr(candidate, "entry_capacity_constrained", False)
+            ),
+            entry_target_quantity=_float_attr("entry_target_quantity"),
+            long_max_executable_quantity=_float_attr("long_max_executable_quantity"),
+            short_max_executable_quantity=_float_attr("short_max_executable_quantity"),
+            entry_max_executable_quantity=_float_attr("entry_max_executable_quantity"),
+            entry_depth_shortfall_quantity=_float_attr("entry_depth_shortfall_quantity"),
+            entry_max_executable_notional_quote=_float_attr(
+                "entry_max_executable_notional_quote"
+            ),
+            entry_depth_capped_at_entry=bool(
+                getattr(candidate, "entry_depth_capped_at_entry", False)
+            ),
+            advisories=list(getattr(candidate, "advisories", []) or []),
+            blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
             exit_after_first_stage=exit_after_first_stage,
         )
 
@@ -13900,6 +15125,19 @@ class LiveRuntime:
                     )
                     return True
                 # Track pending entry for reconciliation
+                if getattr(result.pending_entry, "created_cycle", 0) == 0:
+                    result.pending_entry.created_cycle = int(
+                        getattr(self.state, "tick_count", 0) or 0
+                    )
+                if getattr(result.pending_entry, "frozen_candidate", None) is None:
+                    from dataclasses import asdict, is_dataclass
+
+                    if is_dataclass(candidate):
+                        result.pending_entry.frozen_candidate = asdict(candidate)
+                    else:
+                        result.pending_entry.frozen_candidate = dict(
+                            getattr(candidate, "__dict__", {}) or {}
+                        )
                 self.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
                 self._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
                 self._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id

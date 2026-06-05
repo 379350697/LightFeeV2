@@ -544,6 +544,27 @@ class TestUpdateFundingCaptureState:
         # peak should update to current_net_quote (15.0) since captured_funding > 0
         assert pos.peak_net_quote == max(0.0, pos.current_net_quote)
 
+    def test_stage1_capture_books_funding_delta_like_v1(self):
+        pos = _make_position(
+            funding_timestamp_ms=1000000,
+            funding_captured=False,
+            captured_funding_quote=0.0,
+            funding_edge_bps_entry=10.0,
+            long_quantity=2.0,
+            short_quantity=2.0,
+            long_entry_price=100.0,
+            short_entry_price=110.0,
+            current_net_quote=-1.0,
+            peak_net_quote=-1.0,
+        )
+
+        update_position_funding_capture_state(pos, 1000000, post_funding_hold_ms=0)
+
+        assert pos.funding_captured is True
+        assert pos.captured_funding_quote == pytest.approx(0.21)
+        assert pos.current_net_quote == pytest.approx(-0.79)
+        assert pos.peak_net_quote == pytest.approx(-0.79)
+
     def test_stage1_not_captured_before_hold(self):
         pos = _make_position(
             funding_timestamp_ms=1000000,
@@ -626,6 +647,31 @@ class TestUpdateFundingCaptureState:
         update_position_funding_capture_state(pos, 2030000, post_funding_hold_ms=30000)
         assert pos.second_stage_funding_captured is True
         assert pos.peak_net_quote == max(15.0, 25.0)
+
+    def test_stage2_capture_books_incremental_funding_delta_like_v1(self):
+        pos = _make_position(
+            funding_timestamp_ms=1000000,
+            funding_captured=True,
+            captured_funding_quote=0.21,
+            second_stage_enabled_at_entry=True,
+            second_stage_funding_captured=False,
+            second_funding_timestamp_ms=2000000,
+            funding_edge_bps_entry=10.0,
+            total_funding_edge_bps_entry=30.0,
+            long_quantity=2.0,
+            short_quantity=2.0,
+            long_entry_price=100.0,
+            short_entry_price=110.0,
+            current_net_quote=-0.79,
+            peak_net_quote=-0.79,
+        )
+
+        update_position_funding_capture_state(pos, 2000000, post_funding_hold_ms=0)
+
+        assert pos.second_stage_funding_captured is True
+        assert pos.second_stage_funding_quote == pytest.approx(0.42)
+        assert pos.current_net_quote == pytest.approx(-0.37)
+        assert pos.peak_net_quote == pytest.approx(-0.37)
 
     def test_stage2_not_captured_stage1_not_done(self):
         pos = _make_position(

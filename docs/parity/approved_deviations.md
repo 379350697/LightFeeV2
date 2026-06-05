@@ -49,9 +49,25 @@
 
 ---
 
+## DEV-003: Pending Entry Python Runtime Boundaries
+
+| Field | Value |
+|-------|-------|
+| **id** | DEV-003 |
+| **area** | pending-entry-lifecycle |
+| **v1_behavior** | V1 implements pending-entry passive opening in Rust methods that combine lifecycle decisions, `MarketView` candidate rechecks, passive order manager state, and exchange IO in `src/execution_core/entry_sync.rs`. |
+| **v2_behavior** | V2 ports source-named lifecycle state transitions into `lightfee/engine/pending_entry_lifecycle.py`, while `LiveRuntime` remains the Python adapter boundary for progress query, cancel, post-only submit/retry, quantity normalization, and ForceStandard execution. Frozen candidates are stored as Python dictionaries rather than Rust `CandidateOpportunity` values; terminal fallback uses candidate-derived sizing and price hints when present. Pending entries without a frozen candidate skip terminal fallback instead of synthesizing a tradeable candidate. The full `hedge_pending_entry_delta` deadline and terminal driver remains explicitly out of scope for this cleanup. |
+| **reason** | Python adapters, journal shape, snapshot/candidate objects, async order APIs, and candidate rediscovery do not match the Rust `MarketView`/adapter boundary closely enough for a literal source copy. Keeping the unavoidable IO boundary in runtime avoids inventing a V1-looking redesign while still moving lifecycle semantics out of runtime. Skipping no-frozen fallback is safer than fabricating a candidate without V1 rediscovery guards. |
+| **risk** | MEDIUM. Pending-entry passive opening remains a live-trading hot path, and runtime IO wrappers can still drift if future changes bypass the source-named lifecycle helpers. |
+| **operator_impact** | No new order/cancel behavior is enabled by this deviation. Operators should expect journal evidence to preserve V1 reasons while Python-specific adapter evidence may use V2 field names. |
+| **test_coverage** | `tests/engine/test_v1_pending_entry_lifecycle_parity.py`; `tests/live_harness/test_passive_maker_zero_fill_incident.py`; `tests/test_runtime_entry_flow.py`; `tests/test_live_entry_hedge_root_fix.py` |
+
+---
+
 ## Summary
 
 | ID | Area | Risk | Status |
 |----|------|------|--------|
 | DEV-001 | opportunity-input | LOW | Approved |
 | DEV-002 | venue-capabilities | LOW (fixed) | Resolved |
+| DEV-003 | pending-entry-lifecycle | MEDIUM | Approved |

@@ -22,6 +22,19 @@ from lightfee.engine.state import OpenPosition
 _POSITION_DELTA_WARNING_FRACTION: float = 0.5
 
 
+def _paired_entry_notional_quote(position: OpenPosition) -> float:
+    """V1 paired_entry_notional_quote(quantity, long_avg, short_avg)."""
+    stored = float(getattr(position, "entry_notional_quote", 0.0) or 0.0)
+    if stored > 0.0:
+        return stored
+    quantity = float(position.matched_quantity or 0.0)
+    long_price = float(position.long_entry_price or 0.0)
+    short_price = float(position.short_entry_price or 0.0)
+    if quantity <= 0.0 or long_price <= 0.0 or short_price <= 0.0:
+        return 0.0
+    return quantity * (long_price + short_price) * 0.5
+
+
 # ---------------------------------------------------------------------------
 # Core close reason decision
 # ---------------------------------------------------------------------------
@@ -307,6 +320,11 @@ def update_position_funding_capture_state(
     Updates funding_captured, captured_funding_quote, second_stage_funding_captured,
     second_stage_funding_quote, and peak_net_quote on capture events.
     """
+    previous_total_funding_quote = (
+        position.captured_funding_quote + position.second_stage_funding_quote
+    )
+    entry_notional_quote = _paired_entry_notional_quote(position)
+
     # Stage 1: primary funding
     funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
     if funding_ms <= 0:
@@ -314,9 +332,9 @@ def update_position_funding_capture_state(
     hold_deadline = funding_ms + post_funding_hold_ms
     if not position.funding_captured and now_ms >= hold_deadline:
         position.funding_captured = True
-        # captured_funding_quote is set by entry; keep existing if already computed
-        if position.captured_funding_quote > 0:
-            position.peak_net_quote = max(position.peak_net_quote, position.current_net_quote)
+        position.captured_funding_quote = (
+            entry_notional_quote * position.funding_edge_bps_entry / 10_000.0
+        )
 
     if (
         position.funding_captured
@@ -331,9 +349,27 @@ def update_position_funding_capture_state(
             second_hold = second_funding_ms + post_funding_hold_ms
             if now_ms >= second_hold:
                 position.second_stage_funding_captured = True
+                position.second_stage_funding_quote = (
+                    entry_notional_quote
+                    * (
+                        position.total_funding_edge_bps_entry
+                        - position.funding_edge_bps_entry
+                    )
+                    / 10_000.0
+                )
                 position.peak_net_quote = max(
                     position.peak_net_quote, position.current_net_quote
                 )
+
+    funding_delta_quote = (
+        position.captured_funding_quote
+        + position.second_stage_funding_quote
+        - previous_total_funding_quote
+    )
+    if abs(funding_delta_quote) > 0.0:
+        position.current_net_quote += funding_delta_quote
+        if position.current_net_quote > position.peak_net_quote:
+            position.peak_net_quote = position.current_net_quote
 
 
 # ---------------------------------------------------------------------------

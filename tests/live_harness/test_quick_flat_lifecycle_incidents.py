@@ -21,8 +21,7 @@ def test_quick_flat_entry_chain_would_have_been_blocked_by_lifecycle_horizon():
     selected = next(event for event in events if event["kind"] == "execution.entry_selected")
     payload = selected["payload"]
     cfg = StrategyConfig()
-    cfg.min_scan_minutes_before_funding = 0
-    cfg.entry_min_first_funding_remaining_secs = 60
+    cfg.min_scan_minutes_before_funding = 1
     candidate = SimpleNamespace(
         symbol=payload["symbol"],
         first_funding_timestamp_ms=payload["first_funding_timestamp_ms"],

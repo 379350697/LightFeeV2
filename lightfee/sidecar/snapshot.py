@@ -107,7 +107,11 @@ class CandidateInput:
     expected_edge_bps: float
     worst_case_edge_bps: float
     ranking_edge_bps: float
+    total_funding_edge_bps: float = 0.0
     transfer_bias_bps: float = 0.0
+    entry_cross_bps: float = 0.0
+    fee_bps: float = 0.0
+    entry_slippage_bps: float = 0.0
     opportunity_type: str = "aligned"
     blocked: bool = False
     blocked_reasons: list[str] = field(default_factory=list)
@@ -123,6 +127,25 @@ class CandidateInput:
     second_funding_timestamp_ms: int = 0
     # V1: FundingLeg — which side's funding settles first
     first_funding_leg: str = ""  # "long" or "short"
+    entry_maker_leg: str = ""
+    exit_maker_leg: str = ""
+    transfer_state_at_entry: Optional[str] = None
+    entry_liquidity_source_at_entry: Optional[str] = None
+    long_volume_24h_quote: float = 0.0
+    short_volume_24h_quote: float = 0.0
+    long_open_interest_quote_at_entry: float = 0.0
+    short_open_interest_quote_at_entry: float = 0.0
+    long_entry_vwap: Optional[float] = None
+    short_entry_vwap: Optional[float] = None
+    entry_capacity_constrained: bool = False
+    entry_target_quantity: float = 0.0
+    long_max_executable_quantity: float = 0.0
+    short_max_executable_quantity: float = 0.0
+    entry_max_executable_quantity: float = 0.0
+    entry_depth_shortfall_quantity: float = 0.0
+    entry_max_executable_notional_quote: float = 0.0
+    entry_depth_capped_at_entry: bool = False
+    advisories: list[str] = field(default_factory=list)
     # V2: direction consistency and interval alignment (V1 fix)
     direction_consistent: bool = False
     interval_aligned: bool = False

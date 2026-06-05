@@ -15,7 +15,7 @@
 | 5 | venue-capabilities | 2 |
 | 6 | market-data | 1 |
 | 7 | local-l2 | 1 |
-| 8 | entry | 2 |
+| 8 | entry | 3 |
 | 9 | close | 1 |
 | 10 | passive-close | 1 |
 | 11 | risk | 1 |
@@ -312,6 +312,22 @@
 - **focused test path:** `tests/engine/test_entry_semantic_parity.py::test_entry_execution_idempotency`
 - **deviation id:** —
 
+### ENTRY-003: Pending Entry Passive Opening Lifecycle
+
+- **area:** entry
+- **V1 source anchors:**
+  - `src/execution_core/entry_sync.rs` — pending-entry passive opening lifecycle, terminal fallback, remainder repost
+  - `crates/lightfee-engine/src/lib.rs` — pending-entry state fields
+- **V2 source anchors:**
+  - `lightfee/engine/pending_entry_lifecycle.py` — source-named lifecycle state transitions
+  - `lightfee/engine/runtime.py` — Python adapter IO boundary
+  - `lightfee/engine/state.py` — pending-entry passive lifecycle state
+- **observable behavior:** Pending-entry passive opening preserves zero-fill cycle recording, high-to-low maker phase switch, low-phase dual-taker fallback, frozen-candidate terminal recheck, candidate-derived ForceStandard materialization/defer behavior, post-only submit retry, maker fill checkpoint progress, maker remainder FIFO tracking, and terminal partial remainder repost before finalization.
+- **required state fields:** `PendingEntry.phase_state`, `.passive_order`, `.maker_remainder_slices`, `.frozen_candidate`, `.repost_attempt_count`, `.passive_attempt_count`
+- **required journal/event kinds:** `passive_maintenance.zero_fill_cycle`, `execution.passive_phase_switched`, `execution.dual_taker_armed`, `execution.entry_fallback_to_taker`, `execution.entry_fallback_to_taker_deferred`, `execution.passive_entry_reposted`
+- **focused test path:** `tests/engine/test_v1_pending_entry_lifecycle_parity.py`
+- **deviation id:** DEV-003
+
 ---
 
 ## 9. close
@@ -542,3 +558,4 @@
 |-------------|------|---------|
 | DEV-001 | opportunity-input | Chillybot-era inputs intentionally removed |
 | DEV-002 | venue-capabilities | Bitget/Gate risk_health capability drift |
+| DEV-003 | pending-entry-lifecycle | Python runtime IO boundaries for pending-entry passive opening |

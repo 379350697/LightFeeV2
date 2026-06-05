@@ -970,6 +970,10 @@ class TestPendingEntryPersistenceRoundtrip:
             "timeout_at_ms": 7100,
             "cancel_requested_at_ms": 0,
             "last_progress_state": "open",
+            "fill_checkpoint_quantity": 0.0,
+            "fill_checkpoint_notional_quote": 0.0,
+            "fill_checkpoint_fee_quote": 0.0,
+            "fill_checkpoint_last_fill_at_ms": None,
         }
         assert pe["next_progress_poll_ms"] == 2500
 
@@ -3683,8 +3687,7 @@ class TestRealPathAbortCleanupDeadline:
 
         runtime = _make_open_runtime(
             tmp_path,
-            min_scan_minutes_before_funding=0,
-            entry_min_first_funding_remaining_secs=60,
+            min_scan_minutes_before_funding=1,
             maker_entry_max_reposts=2,
             maker_cycle_retry_delays_ms=[0],
         )

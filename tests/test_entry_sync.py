@@ -494,6 +494,31 @@ class TestPassiveMakerLifecycle:
             maker_leg=Side.BUY,
             entry_type=EntryType.PASSIVE_INCREMENTAL,
             created_at_ms=1000,
+            worst_case_edge_bps_entry=4.0,
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            entry_cross_bps_entry=1.25,
+            fee_bps_entry=2.1,
+            entry_slippage_bps_entry=0.75,
+            transfer_bias_bps_entry=-0.5,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote_at_entry=12_000_000.0,
+            short_volume_24h_quote_at_entry=15_000_000.0,
+            long_open_interest_quote_at_entry=8_000_000.0,
+            short_open_interest_quote_at_entry=9_000_000.0,
+            long_entry_vwap=50000.5,
+            short_entry_vwap=50010.5,
+            entry_capacity_constrained=True,
+            entry_target_quantity=0.002,
+            long_max_executable_quantity=0.0018,
+            short_max_executable_quantity=0.0016,
+            entry_max_executable_quantity=0.0016,
+            entry_depth_shortfall_quantity=0.0004,
+            entry_max_executable_notional_quote=80.0,
+            entry_depth_capped_at_entry=True,
+            advisories=["thin_book"],
+            blocked_reasons=["capacity_cap"],
         )
         # Force post_only on the maker leg
         result = await executor.execute(ctx)
@@ -503,6 +528,41 @@ class TestPassiveMakerLifecycle:
         assert hedge.place_order_call_count == 0
         assert result.pending_entry is not None
         assert result.pending_entry.maker_order_id == "maker-order-1"
+        assert result.pending_entry.phase_state is not None
+        assert result.pending_entry.phase_state.execution_kind == "entry"
+        assert result.pending_entry.phase_state.preferred_maker_leg == "long"
+        assert result.pending_entry.phase_state.active_maker_leg == "long"
+        assert result.pending_entry.phase_state.phase == "high_slippage_maker"
+        assert result.pending_entry.phase_state.phase_started_at_ms == 1000
+        assert result.pending_entry.phase_state.cycle_started_at_ms == 1000
+        assert result.pending_entry.phase_state.cycle_attempt == 1
+        assert result.pending_entry.passive_attempt_count == 1
+        assert result.pending_entry.repost_attempt_count == 0
+        assert result.pending_entry.worst_case_edge_bps_entry == pytest.approx(4.0)
+        assert result.pending_entry.entry_maker_leg == "long"
+        assert result.pending_entry.exit_maker_leg == "short"
+        assert result.pending_entry.entry_cross_bps_entry == pytest.approx(1.25)
+        assert result.pending_entry.fee_bps_entry == pytest.approx(2.1)
+        assert result.pending_entry.entry_slippage_bps_entry == pytest.approx(0.75)
+        assert result.pending_entry.transfer_bias_bps_entry == pytest.approx(-0.5)
+        assert result.pending_entry.transfer_state_at_entry == "ok"
+        assert result.pending_entry.entry_liquidity_source_at_entry == "local_l2"
+        assert result.pending_entry.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+        assert result.pending_entry.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+        assert result.pending_entry.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+        assert result.pending_entry.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+        assert result.pending_entry.long_entry_vwap == pytest.approx(50000.5)
+        assert result.pending_entry.short_entry_vwap == pytest.approx(50010.5)
+        assert result.pending_entry.entry_capacity_constrained is True
+        assert result.pending_entry.entry_target_quantity == pytest.approx(0.002)
+        assert result.pending_entry.long_max_executable_quantity == pytest.approx(0.0018)
+        assert result.pending_entry.short_max_executable_quantity == pytest.approx(0.0016)
+        assert result.pending_entry.entry_max_executable_quantity == pytest.approx(0.0016)
+        assert result.pending_entry.entry_depth_shortfall_quantity == pytest.approx(0.0004)
+        assert result.pending_entry.entry_max_executable_notional_quote == pytest.approx(80.0)
+        assert result.pending_entry.entry_depth_capped_at_entry is True
+        assert result.pending_entry.advisories == ["thin_book"]
+        assert result.pending_entry.blocked_reasons == ["capacity_cap"]
         assert result.state == EntryState.MAKER_RESTING
         assert result.route == ExecutionRoute.PASSIVE_INCREMENTAL
         journal.close()

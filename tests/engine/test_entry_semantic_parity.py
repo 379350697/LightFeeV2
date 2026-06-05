@@ -30,7 +30,7 @@ from lightfee.engine.execution_planner import (
     plan_incremental_entry_execution,
     quantities_match,
 )
-from lightfee.engine.state import OpenPosition
+from lightfee.engine.state import OpenPosition, PendingEntry, PendingEntryRemainderSlice
 
 
 # ============================================================================
@@ -228,6 +228,51 @@ class TestEntryPlanningSemantics:
 # ============================================================================
 
 
+class TestPendingEntryRemainderSemantics:
+    """V1 PendingEntryHedge maker remainder FIFO semantics."""
+
+    def test_maker_remainder_slices_drive_missing_quantity_and_fifo_consumption(self):
+        pending = PendingEntry(
+            pending_id="entry-remainder",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=3.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg_filled=3.0,
+            hedge_leg_filled=0.0,
+            maker_fill_price=20.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.0,
+                    notional_quote=10.0,
+                    fill_at_ms=1001,
+                ),
+                PendingEntryRemainderSlice(
+                    quantity=2.0,
+                    notional_quote=40.0,
+                    fill_at_ms=1002,
+                ),
+            ],
+        )
+
+        assert pending.missing_hedge_quantity() == pytest.approx(3.0)
+        assert pending.unmatched_maker_weighted_average_price() == pytest.approx(
+            50.0 / 3.0
+        )
+
+        assert pending.consume_hedge_quantity_fifo(1.5) == pytest.approx(1.5)
+
+        assert pending.missing_hedge_quantity() == pytest.approx(1.5)
+        assert len(pending.maker_remainder_slices) == 1
+        remainder = pending.maker_remainder_slices[0]
+        assert remainder.quantity == pytest.approx(1.5)
+        assert remainder.notional_quote == pytest.approx(30.0)
+        assert remainder.fill_at_ms == 1002
+
+
 class TestEntryExecutionIdempotency:
     """V1 entry execution: maker/hedge ordering, client-order idempotency,
     uncertain outcomes, reject classification, residual tasks, pending entry."""
@@ -346,6 +391,54 @@ class TestEntryExecutionIdempotency:
         assert pos.symbol == "BTC-USDT"
         assert pos.matched_quantity == min(maker_fill.quantity, hedge_fill.quantity)
 
+    def test_build_open_position_initializes_entry_fee_net_like_v1(self):
+        """V1 PendingEntryHedge::build_open_position starts net at matched entry fees."""
+        ctx = EntryContext(
+            entry_id="pos-fee",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_price_hint=50000.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTC-USDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=50000.0,
+            order_id="m1",
+            fee_quote=2.0,
+            filled_at_ms=1000,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTC-USDT",
+            side=Side.SELL,
+            quantity=0.5,
+            price=49990.0,
+            order_id="h1",
+            fee_quote=1.0,
+            filled_at_ms=1001,
+        )
+
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1001)
+
+        assert pos.matched_quantity == pytest.approx(0.5)
+        assert pos.initial_quantity == pytest.approx(0.5)
+        assert pos.entered_at_ms == 1001
+        assert pos.entry_notional_quote == pytest.approx(24997.5)
+        assert pos.long_entry_fee_quote == pytest.approx(1.0)
+        assert pos.short_entry_fee_quote == pytest.approx(1.0)
+        assert pos.total_entry_fee_quote == pytest.approx(2.0)
+        assert pos.current_net_quote == pytest.approx(-2.0)
+        assert pos.peak_net_quote == pytest.approx(-2.0)
+        assert pos.entry_quality_completed_at_ms == 0
+
     def test_build_open_position_preserves_funding_semantics(self):
         """Entry-selected funding timestamps must survive into close decisions."""
         from lightfee.config.schema import StrategyConfig
@@ -398,6 +491,8 @@ class TestEntryExecutionIdempotency:
 
         assert pos.opportunity_type == "staggered"
         assert pos.funding_timestamp_ms == first_funding_ms
+        assert pos.long_funding_timestamp_ms == first_funding_ms
+        assert pos.short_funding_timestamp_ms == second_funding_ms
         assert pos.second_funding_timestamp_ms == second_funding_ms
         assert pos.second_stage_enabled_at_entry is True
         assert pos.funding_edge_bps_entry == pytest.approx(7.45)
@@ -408,6 +503,98 @@ class TestEntryExecutionIdempotency:
             StrategyConfig(settlement_remainder_close_delay_secs=300),
             1780163920476,
         ) is None
+
+    def test_build_open_position_copies_v1_entry_metadata(self):
+        """V1 PendingEntryHedge::build_open_position copies metadata into OpenPosition."""
+        ctx = EntryContext(
+            entry_id="entry-v1-metadata",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=0.1,
+            short_quantity=0.1,
+            long_price_hint=50000.0,
+            short_price_hint=50010.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+            opportunity_type="staggered",
+            first_funding_leg="long",
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            funding_edge_bps_entry=8.0,
+            total_funding_edge_bps_entry=11.0,
+            expected_edge_bps_entry=6.5,
+            worst_case_edge_bps_entry=4.0,
+            entry_cross_bps_entry=1.25,
+            fee_bps_entry=2.1,
+            entry_slippage_bps_entry=0.75,
+            transfer_bias_bps_entry=-0.5,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote_at_entry=12_000_000.0,
+            short_volume_24h_quote_at_entry=15_000_000.0,
+            long_open_interest_quote_at_entry=8_000_000.0,
+            short_open_interest_quote_at_entry=9_000_000.0,
+            long_entry_vwap=50000.5,
+            short_entry_vwap=50010.5,
+            entry_capacity_constrained=True,
+            entry_target_quantity=0.2,
+            long_max_executable_quantity=0.18,
+            short_max_executable_quantity=0.16,
+            entry_max_executable_quantity=0.16,
+            entry_depth_shortfall_quantity=0.04,
+            entry_max_executable_notional_quote=8000.0,
+            entry_depth_capped_at_entry=True,
+            advisories=["thin_book"],
+            blocked_reasons=["capacity_cap"],
+        )
+        maker_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTC-USDT",
+            side=Side.BUY,
+            quantity=0.1,
+            price=50000.0,
+            order_id="maker",
+            filled_at_ms=1000,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTC-USDT",
+            side=Side.SELL,
+            quantity=0.1,
+            price=50010.0,
+            order_id="hedge",
+            filled_at_ms=1001,
+        )
+
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1001)
+
+        assert pos.first_funding_leg == "long"
+        assert pos.entry_maker_leg == "long"
+        assert pos.exit_maker_leg == "short"
+        assert pos.worst_case_edge_bps_entry == pytest.approx(4.0)
+        assert pos.entry_cross_bps_entry == pytest.approx(1.25)
+        assert pos.fee_bps_entry == pytest.approx(2.1)
+        assert pos.entry_slippage_bps_entry == pytest.approx(0.75)
+        assert pos.transfer_bias_bps_entry == pytest.approx(-0.5)
+        assert pos.transfer_state_at_entry == "ok"
+        assert pos.entry_liquidity_source_at_entry == "local_l2"
+        assert pos.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+        assert pos.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+        assert pos.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+        assert pos.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+        assert pos.long_entry_vwap == pytest.approx(50000.5)
+        assert pos.short_entry_vwap == pytest.approx(50010.5)
+        assert pos.entry_capacity_constrained is True
+        assert pos.entry_target_quantity == pytest.approx(0.2)
+        assert pos.long_max_executable_quantity == pytest.approx(0.18)
+        assert pos.short_max_executable_quantity == pytest.approx(0.16)
+        assert pos.entry_max_executable_quantity == pytest.approx(0.16)
+        assert pos.entry_depth_shortfall_quantity == pytest.approx(0.04)
+        assert pos.entry_max_executable_notional_quote == pytest.approx(8000.0)
+        assert pos.entry_depth_capped_at_entry is True
+        assert pos.advisories == ["thin_book"]
+        assert pos.blocked_reasons == ["capacity_cap"]
 
 
 class TestEntryContextFields:

@@ -48,11 +48,7 @@ class FundingLifecycle:
         min_scan_ms = (
             int(getattr(strategy, "min_scan_minutes_before_funding", 0) or 0) * 60_000
         )
-        floor_ms = (
-            int(getattr(strategy, "entry_min_first_funding_remaining_secs", 60) or 0)
-            * 1_000
-        )
-        return max(min_scan_ms, floor_ms, 0)
+        return max(min_scan_ms, 0)
 
     @classmethod
     def entry_horizon(

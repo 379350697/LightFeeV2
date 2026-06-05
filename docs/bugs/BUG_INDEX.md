@@ -17,6 +17,30 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest pending-entry passive opening source-port closure, 2026-06-05: the
+post-quick-flat pending-entry work has been re-centered on V1 source functions
+rather than incident patches. The required matrix now classifies current hunks
+and has no `missing`, `pending-audit`, or `replace-current` rows. Source-named
+helpers in `lightfee/engine/pending_entry_lifecycle.py` own phase-state
+construction, passive progress, zero-fill cycle recording, high-to-low and
+low-to-dual transitions, terminal fallback decisions, passive-cycle acceptance,
+and remainder-repost decisions. `LiveRuntime` keeps Python adapter IO only.
+The post-review drift fixes also make terminal fallback derive ForceStandard
+sizing/price hints from the rechecked frozen candidate, persist and apply V1
+passive-order `fill_checkpoint` for repost progress, and run passive submit /
+repost through the V1 post-only loop: retryable rejects now wait, freeze maker
+venue request budget on rate-limit evidence, refresh the passive market
+snapshot, reprice with best-quote/tick/edge/inventory semantics, and exhaust
+instead of submitting a stale maker price when price evidence is missing.
+Accepted boundary adaptations are recorded as
+[`DEV-003`](../parity/approved_deviations.md#dev-003-pending-entry-python-runtime-boundaries).
+Local verification for this closure passed focused pending-entry parity,
+incident regressions, the broad plan regression suite, `compileall`,
+full pytest (`3575 passed`, `9 skipped`, `1 warning`), `git diff --check`,
+and GitNexus `detect-changes` at medium risk. This is local source-port
+acceptance only: no orders, cancels, production state mutation, deploy, or
+production acceptance is claimed.
+
 Latest V1 trading lifecycle core local follow-up, 2026-06-05: entry,
 pending-entry, recovery, close-facing funding facts, and quick-flat
 observability now route through a shared lifecycle semantic surface instead of

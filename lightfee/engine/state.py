@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -21,6 +23,8 @@ class OpenPosition:
     long_entry_price: float
     short_entry_price: float
     opened_at_ms: int
+    # --- V1 entry_notional_quote: paired entry notional for funding capture ---
+    entry_notional_quote: float = 0.0
     # --- Review & origin (V1 review_id, opportunity_origin_tags, opportunity_hint_source) ---
     review_id: str | None = None
     opportunity_origin_tags: list[str] = field(default_factory=list)
@@ -28,6 +32,7 @@ class OpenPosition:
     # --- Entry fees (matched Rust V1 total_entry_fee_quote per leg) ---
     long_entry_fee_quote: float = 0.0
     short_entry_fee_quote: float = 0.0
+    total_entry_fee_quote: float = 0.0
     # --- PnL attribution (matches Rust V1 realized_* fields) ---
     realized_price_pnl_quote: float = 0.0
     realized_exit_fee_quote: float = 0.0
@@ -43,6 +48,10 @@ class OpenPosition:
     funding_edge_bps_entry: float = 0.0
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
+    worst_case_edge_bps_entry: float = 0.0
+    entry_cross_bps_entry: float = 0.0
+    fee_bps_entry: float = 0.0
+    entry_slippage_bps_entry: float = 0.0
     # --- Edge & net tracking (Rust V1 peak_net_quote, current_net_quote) ---
     peak_net_quote: float = 0.0
     current_net_quote: float = 0.0
@@ -56,31 +65,52 @@ class OpenPosition:
     single_side_protection_triggered: bool = False
     # --- Matched quantity = min(long_qty, short_qty) (Rust V1 matched_quantity) ---
     matched_quantity: float = 0.0
+    initial_quantity: float = 0.0
     # --- Funding timing for exit capture stages ---
     funding_timestamp_ms: int = 0
+    long_funding_timestamp_ms: int = 0
+    short_funding_timestamp_ms: int = 0
     exit_after_first_stage: bool = False
     # --- Funding stage tracking (Rust V1 second_stage_*, opportunity_type) ---
     opportunity_type: str = "aligned"
+    first_funding_leg: str = ""
     second_stage_enabled_at_entry: bool = False
     second_funding_timestamp_ms: int = 0
     second_stage_funding_captured: bool = False
     second_stage_funding_quote: float = 0.0
+    # --- Entry/exit maker leg selection (V1 entry_maker_leg, exit_maker_leg) ---
+    entry_maker_leg: str = ""
+    exit_maker_leg: str = ""
     # --- Transfer & liquidity (V1 transfer_state_at_entry, entry_liquidity_source_at_entry) ---
+    transfer_bias_bps_entry: float = 0.0
     transfer_state_at_entry: str | None = None
     entry_liquidity_source_at_entry: str | None = None
+    long_volume_24h_quote_at_entry: float = 0.0
+    short_volume_24h_quote_at_entry: float = 0.0
+    long_open_interest_quote_at_entry: float = 0.0
+    short_open_interest_quote_at_entry: float = 0.0
     # --- VWAP (V1 long_entry_vwap, short_entry_vwap) ---
     long_entry_vwap: float | None = None
     short_entry_vwap: float | None = None
-    # --- Capacity constraints (V1 entry_capacity_constrained) ---
+    # --- Capacity constraints (V1 entry_capacity_constrained and depth caps) ---
     entry_capacity_constrained: bool = False
+    entry_target_quantity: float = 0.0
+    long_max_executable_quantity: float = 0.0
+    short_max_executable_quantity: float = 0.0
+    entry_max_executable_quantity: float = 0.0
+    entry_depth_shortfall_quantity: float = 0.0
+    entry_max_executable_notional_quote: float = 0.0
+    entry_depth_capped_at_entry: bool = False
     # --- Advisories & blocked reasons (V1 advisories, blocked_reasons) ---
     advisories: list[str] = field(default_factory=list)
     blocked_reasons: list[str] = field(default_factory=list)
     # --- Quality markouts (V1 entry_quality_markout_5s/30s_emitted) ---
+    entry_quality_completed_at_ms: int = 0
     entry_quality_markout_5s_emitted: bool = False
     entry_quality_markout_30s_emitted: bool = False
     # --- Exit reason (V1 exit_reason) ---
     exit_reason: str | None = None
+    entered_at_ms: int = 0
     # --- Fills (orders that created this position, for reconciliation) ---
     long_fill: OrderFill | None = None
     short_fill: OrderFill | None = None
@@ -88,6 +118,12 @@ class OpenPosition:
     def __post_init__(self) -> None:
         if self.matched_quantity == 0.0:
             self.matched_quantity = min(self.long_quantity, self.short_quantity)
+        if self.initial_quantity == 0.0:
+            self.initial_quantity = self.matched_quantity
+        if self.entered_at_ms == 0:
+            self.entered_at_ms = self.opened_at_ms
+        if self.total_entry_fee_quote == 0.0:
+            self.total_entry_fee_quote = self.long_entry_fee_quote + self.short_entry_fee_quote
 
 
 @dataclass
@@ -155,6 +191,10 @@ class PendingPassiveOrder:
     timeout_at_ms: int = 0
     cancel_requested_at_ms: int = 0  # 0 means no cancel requested
     last_progress_state: PassiveOrderState = PassiveOrderState.UNKNOWN
+    fill_checkpoint_quantity: float = 0.0
+    fill_checkpoint_notional_quote: float = 0.0
+    fill_checkpoint_fee_quote: float = 0.0
+    fill_checkpoint_last_fill_at_ms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         state = self.last_progress_state
@@ -170,6 +210,10 @@ class PendingPassiveOrder:
             "timeout_at_ms": self.timeout_at_ms,
             "cancel_requested_at_ms": self.cancel_requested_at_ms,
             "last_progress_state": state_value or PassiveOrderState.UNKNOWN.value,
+            "fill_checkpoint_quantity": self.fill_checkpoint_quantity,
+            "fill_checkpoint_notional_quote": self.fill_checkpoint_notional_quote,
+            "fill_checkpoint_fee_quote": self.fill_checkpoint_fee_quote,
+            "fill_checkpoint_last_fill_at_ms": self.fill_checkpoint_last_fill_at_ms,
         }
 
     @classmethod
@@ -199,6 +243,14 @@ class PendingPassiveOrder:
             timeout_at_ms=int(data.get("timeout_at_ms", 0) or 0),
             cancel_requested_at_ms=int(data.get("cancel_requested_at_ms", 0) or 0),
             last_progress_state=state,
+            fill_checkpoint_quantity=float(data.get("fill_checkpoint_quantity", 0.0) or 0.0),
+            fill_checkpoint_notional_quote=float(
+                data.get("fill_checkpoint_notional_quote", 0.0) or 0.0
+            ),
+            fill_checkpoint_fee_quote=float(data.get("fill_checkpoint_fee_quote", 0.0) or 0.0),
+            fill_checkpoint_last_fill_at_ms=_optional_int(
+                data.get("fill_checkpoint_last_fill_at_ms")
+            ),
         )
 
     def maker_completed(self) -> bool:
@@ -212,6 +264,106 @@ class PendingPassiveOrder:
     def timed_out(self, now_ms: int) -> bool:
         """V1: PendingEntryHedge.timed_out() — rest timeout exceeded."""
         return self.timeout_at_ms > 0 and now_ms >= self.timeout_at_ms
+
+
+@dataclass
+class PendingEntryPassivePhaseState:
+    """V1 pending-entry PassivePhaseState.
+
+    This is deliberately separate from passive-close PassivePhaseState: V1
+    pending entry tracks execution_kind, hedge deadlines, and cycle delay fields
+    that passive close does not own.
+    """
+
+    execution_kind: str = "entry"
+    preferred_maker_leg: str = "long"
+    active_maker_leg: str = "long"
+    phase: str = "high_slippage_maker"
+    zero_fill_cycles_in_phase: int = 0
+    cycle_attempt: int = 0
+    next_cycle_delay_ms: int | None = None
+    small_fill_min_notional_attempts: int = 0
+    hedge_deadline_at_ms: int | None = None
+    hedge_timeout_grace_deadline_at_ms: int | None = None
+    phase_started_at_ms: int = 0
+    cycle_started_at_ms: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_kind": self.execution_kind,
+            "preferred_maker_leg": self.preferred_maker_leg,
+            "active_maker_leg": self.active_maker_leg,
+            "phase": self.phase,
+            "zero_fill_cycles_in_phase": self.zero_fill_cycles_in_phase,
+            "cycle_attempt": self.cycle_attempt,
+            "next_cycle_delay_ms": self.next_cycle_delay_ms,
+            "small_fill_min_notional_attempts": self.small_fill_min_notional_attempts,
+            "hedge_deadline_at_ms": self.hedge_deadline_at_ms,
+            "hedge_timeout_grace_deadline_at_ms": self.hedge_timeout_grace_deadline_at_ms,
+            "phase_started_at_ms": self.phase_started_at_ms,
+            "cycle_started_at_ms": self.cycle_started_at_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PendingEntryPassivePhaseState | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            execution_kind=str(data.get("execution_kind", "entry") or "entry"),
+            preferred_maker_leg=str(data.get("preferred_maker_leg", "long") or "long"),
+            active_maker_leg=str(data.get("active_maker_leg", "long") or "long"),
+            phase=str(data.get("phase", "high_slippage_maker") or "high_slippage_maker"),
+            zero_fill_cycles_in_phase=int(data.get("zero_fill_cycles_in_phase", 0) or 0),
+            cycle_attempt=int(data.get("cycle_attempt", 0) or 0),
+            next_cycle_delay_ms=_optional_int(data.get("next_cycle_delay_ms")),
+            small_fill_min_notional_attempts=int(
+                data.get("small_fill_min_notional_attempts", 0) or 0
+            ),
+            hedge_deadline_at_ms=_optional_int(data.get("hedge_deadline_at_ms")),
+            hedge_timeout_grace_deadline_at_ms=_optional_int(
+                data.get("hedge_timeout_grace_deadline_at_ms")
+            ),
+            phase_started_at_ms=int(data.get("phase_started_at_ms", 0) or 0),
+            cycle_started_at_ms=int(data.get("cycle_started_at_ms", 0) or 0),
+        )
+
+
+@dataclass
+class PendingEntryRemainderSlice:
+    """V1 PendingEntryRemainderSlice: maker fill remainder metadata."""
+
+    quantity: float = 0.0
+    notional_quote: float = 0.0
+    fill_at_ms: int | None = None
+
+    def average_price(self) -> float:
+        return self.notional_quote / self.quantity if self.quantity > 0.0 else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "quantity": self.quantity,
+            "notional_quote": self.notional_quote,
+            "fill_at_ms": self.fill_at_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PendingEntryRemainderSlice":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            quantity=float(data.get("quantity", 0.0) or 0.0),
+            notional_quote=float(data.get("notional_quote", 0.0) or 0.0),
+            fill_at_ms=_optional_int(data.get("fill_at_ms")),
+        )
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -265,7 +417,42 @@ class PendingEntry:
     funding_edge_bps_entry: float = 0.0
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
+    worst_case_edge_bps_entry: float = 0.0
+    entry_maker_leg: str = ""
+    exit_maker_leg: str = ""
+    entry_cross_bps_entry: float = 0.0
+    fee_bps_entry: float = 0.0
+    entry_slippage_bps_entry: float = 0.0
+    transfer_bias_bps_entry: float = 0.0
+    transfer_state_at_entry: str | None = None
+    entry_liquidity_source_at_entry: str | None = None
+    long_volume_24h_quote_at_entry: float = 0.0
+    short_volume_24h_quote_at_entry: float = 0.0
+    long_open_interest_quote_at_entry: float = 0.0
+    short_open_interest_quote_at_entry: float = 0.0
+    long_entry_vwap: float | None = None
+    short_entry_vwap: float | None = None
+    entry_capacity_constrained: bool = False
+    entry_target_quantity: float = 0.0
+    long_max_executable_quantity: float = 0.0
+    short_max_executable_quantity: float = 0.0
+    entry_max_executable_quantity: float = 0.0
+    entry_depth_shortfall_quantity: float = 0.0
+    entry_max_executable_notional_quote: float = 0.0
+    entry_depth_capped_at_entry: bool = False
+    advisories: list[str] = field(default_factory=list)
+    blocked_reasons: list[str] = field(default_factory=list)
     exit_after_first_stage: bool = False
+    # --- V1 pending passive-entry lifecycle state ---
+    phase_state: PendingEntryPassivePhaseState | None = None
+    passive_manager_runtime: Any = field(default_factory=lambda: PassiveOrderManagerRuntime())
+    created_cycle: int = 0
+    repost_attempt_count: int = 0
+    passive_attempt_count: int = 0
+    passive_ops_total: int = 0
+    maker_remainder_slices: list[PendingEntryRemainderSlice] = field(default_factory=list)
+    lifetime_exhausted_logged_final_reason: str | None = None
+    frozen_candidate: dict | None = None
     # --- V1 maker entry repost tracking ---
     repost_count: int = 0
     # --- V1 zero-fill terminal cooldown ---
@@ -303,6 +490,8 @@ class PendingEntry:
 
     def __post_init__(self) -> None:
         """Migrate legacy string hedge_inflight to HedgeInflight | None."""
+        if self.repost_count == 0 and self.repost_attempt_count:
+            self.repost_count = self.repost_attempt_count
         if isinstance(self.hedge_inflight, str):
             if self.hedge_inflight:
                 self.hedge_inflight = HedgeInflight(
@@ -315,6 +504,17 @@ class PendingEntry:
                 )
             else:
                 self.hedge_inflight = None
+        if isinstance(self.phase_state, dict):
+            self.phase_state = PendingEntryPassivePhaseState.from_dict(self.phase_state)
+        if isinstance(self.passive_manager_runtime, dict):
+            self.passive_manager_runtime = PassiveOrderManagerRuntime.from_dict(
+                self.passive_manager_runtime
+            )
+        self.maker_remainder_slices = [
+            item if isinstance(item, PendingEntryRemainderSlice)
+            else PendingEntryRemainderSlice.from_dict(item)
+            for item in (self.maker_remainder_slices or [])
+        ]
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -322,11 +522,41 @@ class PendingEntry:
         """Quantity still needed on the hedge leg.
 
         V1: PendingEntryHedge.missing_hedge_quantity() — the gap between
-        what the maker leg has filled and what the hedge leg has filled,
-        capped by the balanced (matched) quantity.
+        unmatched maker fill slices and hedged quantity.
         """
+        return self.unmatched_maker_quantity()
+
+    def legacy_missing_hedge_quantity(self) -> float:
+        """Pre-remainder fallback for restored entries without V1 slices."""
         balanced = min(self.maker_leg_filled, self.target_quantity)
         return max(0.0, balanced - self.hedge_leg_filled)
+
+    def unmatched_maker_quantity(self) -> float:
+        """V1: PendingEntryHedge::unmatched_maker_quantity."""
+        remainder_quantity = sum(
+            max(0.0, item.quantity)
+            for item in self.maker_remainder_slices
+        )
+        if remainder_quantity > 0.0:
+            return remainder_quantity
+        return self.legacy_missing_hedge_quantity()
+
+    def unmatched_maker_weighted_average_price(self) -> float | None:
+        """V1: PendingEntryHedge::unmatched_maker_weighted_average_price."""
+        total_quantity = 0.0
+        total_notional_quote = 0.0
+        for item in self.maker_remainder_slices:
+            quantity = max(0.0, item.quantity)
+            if quantity <= 0.0:
+                continue
+            total_quantity += quantity
+            total_notional_quote += max(0.0, item.average_price()) * quantity
+        if total_quantity > 0.0:
+            return total_notional_quote / total_quantity
+        if self.legacy_missing_hedge_quantity() > 0.0:
+            price = self.maker_fill_price if self.maker_fill_price > 0.0 else self.maker_price
+            return max(0.0, price)
+        return None
 
     def maker_completed(self) -> bool:
         """Whether the maker leg is fully filled or terminal.
@@ -351,6 +581,67 @@ class PendingEntry:
     def has_any_fill(self) -> bool:
         """Whether any leg has any fill quantity."""
         return self.maker_leg_filled > 1e-9 or self.hedge_leg_filled > 1e-9
+
+    def push_maker_remainder_slice(
+        self,
+        quantity: float,
+        average_price: float | None = None,
+        fill_at_ms: int | None = None,
+    ) -> None:
+        """V1: PendingEntryHedge::push_maker_remainder_slice."""
+        quantity = max(0.0, float(quantity or 0.0))
+        if quantity <= 1e-9:
+            return
+        price = average_price
+        if price is None or not math.isfinite(float(price)) or float(price) < 0.0:
+            price = self.maker_fill_price if self.maker_fill_price > 0.0 else self.maker_price
+        price = max(0.0, float(price or 0.0))
+        self.maker_remainder_slices.append(
+            PendingEntryRemainderSlice(
+                quantity=quantity,
+                notional_quote=price * quantity,
+                fill_at_ms=fill_at_ms if fill_at_ms and fill_at_ms > 0 else None,
+            )
+        )
+
+    def consume_hedge_quantity_fifo(self, hedge_quantity: float) -> float:
+        """V1: PendingEntryHedge::consume_hedge_quantity_fifo."""
+        remaining_quantity = max(0.0, float(hedge_quantity or 0.0))
+        if remaining_quantity <= 1e-9:
+            return 0.0
+        if not self.maker_remainder_slices:
+            legacy_quantity = self.legacy_missing_hedge_quantity()
+            if legacy_quantity > 1e-9:
+                self.push_maker_remainder_slice(
+                    legacy_quantity,
+                    self.maker_fill_price if self.maker_fill_price > 0.0 else self.maker_price,
+                    None,
+                )
+        consumed_quantity = 0.0
+        index = 0
+        while remaining_quantity > 1e-9 and index < len(self.maker_remainder_slices):
+            available_quantity = max(0.0, self.maker_remainder_slices[index].quantity)
+            if available_quantity <= 1e-9:
+                self.maker_remainder_slices.pop(index)
+                continue
+            take_quantity = min(remaining_quantity, available_quantity)
+            ratio = take_quantity / available_quantity if available_quantity > 0.0 else 0.0
+            slice_notional_quote = self.maker_remainder_slices[index].notional_quote
+            self.maker_remainder_slices[index].quantity = max(
+                0.0,
+                available_quantity - take_quantity,
+            )
+            self.maker_remainder_slices[index].notional_quote = max(
+                0.0,
+                slice_notional_quote - (slice_notional_quote * ratio),
+            )
+            if self.maker_remainder_slices[index].quantity <= 1e-9:
+                self.maker_remainder_slices.pop(index)
+            else:
+                index += 1
+            remaining_quantity -= take_quantity
+            consumed_quantity += take_quantity
+        return consumed_quantity
 
     def startup_recovery_ready(self) -> bool:
         """Whether this pending entry is ready for startup recovery.
@@ -490,6 +781,31 @@ class PassiveOrderManagerRuntime:
     ops_budget_remaining: int = 0
     ops_budget_reset_ms: int = 0
     last_operation_ms: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cooldown_until_ms": self.cooldown_until_ms,
+            "consecutive_failures": self.consecutive_failures,
+            "last_success_ms": self.last_success_ms,
+            "last_attempt_ms": self.last_attempt_ms,
+            "ops_budget_remaining": self.ops_budget_remaining,
+            "ops_budget_reset_ms": self.ops_budget_reset_ms,
+            "last_operation_ms": self.last_operation_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PassiveOrderManagerRuntime":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            cooldown_until_ms=_optional_int(data.get("cooldown_until_ms")),
+            consecutive_failures=int(data.get("consecutive_failures", 0) or 0),
+            last_success_ms=int(data.get("last_success_ms", 0) or 0),
+            last_attempt_ms=int(data.get("last_attempt_ms", 0) or 0),
+            ops_budget_remaining=int(data.get("ops_budget_remaining", 0) or 0),
+            ops_budget_reset_ms=int(data.get("ops_budget_reset_ms", 0) or 0),
+            last_operation_ms=int(data.get("last_operation_ms", 0) or 0),
+        )
 
 
 @dataclass
@@ -703,8 +1019,11 @@ class EngineState:
                     "short_quantity": pos.short_quantity,
                     "long_entry_price": pos.long_entry_price,
                     "short_entry_price": pos.short_entry_price,
+                    "entry_notional_quote": pos.entry_notional_quote,
                     "opened_at_ms": pos.opened_at_ms,
                     "matched_quantity": pos.matched_quantity,
+                    "initial_quantity": pos.initial_quantity,
+                    "entered_at_ms": pos.entered_at_ms,
                     "captured_funding_quote": pos.captured_funding_quote,
                     "funding_captured": pos.funding_captured,
                     "peak_net_quote": pos.peak_net_quote,
@@ -717,16 +1036,34 @@ class EngineState:
                     "protection_realized_exit_fee_quote": pos.protection_realized_exit_fee_quote,
                     "long_entry_fee_quote": pos.long_entry_fee_quote,
                     "short_entry_fee_quote": pos.short_entry_fee_quote,
+                    "total_entry_fee_quote": pos.total_entry_fee_quote,
                     "funding_edge_bps_entry": pos.funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": pos.expected_edge_bps_entry,
+                    "worst_case_edge_bps_entry": pos.worst_case_edge_bps_entry,
+                    "entry_cross_bps_entry": pos.entry_cross_bps_entry,
+                    "fee_bps_entry": pos.fee_bps_entry,
+                    "entry_slippage_bps_entry": pos.entry_slippage_bps_entry,
+                    "transfer_bias_bps_entry": pos.transfer_bias_bps_entry,
                     "transfer_state_at_entry": pos.transfer_state_at_entry,
                     "entry_liquidity_source_at_entry": pos.entry_liquidity_source_at_entry,
+                    "long_volume_24h_quote_at_entry": pos.long_volume_24h_quote_at_entry,
+                    "short_volume_24h_quote_at_entry": pos.short_volume_24h_quote_at_entry,
+                    "long_open_interest_quote_at_entry": pos.long_open_interest_quote_at_entry,
+                    "short_open_interest_quote_at_entry": pos.short_open_interest_quote_at_entry,
                     "long_entry_vwap": pos.long_entry_vwap,
                     "short_entry_vwap": pos.short_entry_vwap,
                     "entry_capacity_constrained": pos.entry_capacity_constrained,
+                    "entry_target_quantity": pos.entry_target_quantity,
+                    "long_max_executable_quantity": pos.long_max_executable_quantity,
+                    "short_max_executable_quantity": pos.short_max_executable_quantity,
+                    "entry_max_executable_quantity": pos.entry_max_executable_quantity,
+                    "entry_depth_shortfall_quantity": pos.entry_depth_shortfall_quantity,
+                    "entry_max_executable_notional_quote": pos.entry_max_executable_notional_quote,
+                    "entry_depth_capped_at_entry": pos.entry_depth_capped_at_entry,
                     "advisories": pos.advisories,
                     "blocked_reasons": pos.blocked_reasons,
+                    "entry_quality_completed_at_ms": pos.entry_quality_completed_at_ms,
                     "entry_quality_markout_5s_emitted": pos.entry_quality_markout_5s_emitted,
                     "entry_quality_markout_30s_emitted": pos.entry_quality_markout_30s_emitted,
                     "settlement_half_closed_quantity": pos.settlement_half_closed_quantity,
@@ -736,12 +1073,17 @@ class EngineState:
                     "last_risk_reason": pos.last_risk_reason,
                     "single_side_protection_triggered": pos.single_side_protection_triggered,
                     "funding_timestamp_ms": pos.funding_timestamp_ms,
+                    "long_funding_timestamp_ms": pos.long_funding_timestamp_ms,
+                    "short_funding_timestamp_ms": pos.short_funding_timestamp_ms,
                     "exit_after_first_stage": pos.exit_after_first_stage,
                     "opportunity_type": pos.opportunity_type,
+                    "first_funding_leg": pos.first_funding_leg,
                     "second_stage_enabled_at_entry": pos.second_stage_enabled_at_entry,
                     "second_funding_timestamp_ms": pos.second_funding_timestamp_ms,
                     "second_stage_funding_captured": pos.second_stage_funding_captured,
                     "second_stage_funding_quote": pos.second_stage_funding_quote,
+                    "entry_maker_leg": pos.entry_maker_leg,
+                    "exit_maker_leg": pos.exit_maker_leg,
                 }
                 for pid, pos in self.open_positions.items()
             },
@@ -785,7 +1127,50 @@ class EngineState:
                     "funding_edge_bps_entry": p.funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": p.expected_edge_bps_entry,
+                    "worst_case_edge_bps_entry": p.worst_case_edge_bps_entry,
+                    "entry_maker_leg": p.entry_maker_leg,
+                    "exit_maker_leg": p.exit_maker_leg,
+                    "entry_cross_bps_entry": p.entry_cross_bps_entry,
+                    "fee_bps_entry": p.fee_bps_entry,
+                    "entry_slippage_bps_entry": p.entry_slippage_bps_entry,
+                    "transfer_bias_bps_entry": p.transfer_bias_bps_entry,
+                    "transfer_state_at_entry": p.transfer_state_at_entry,
+                    "entry_liquidity_source_at_entry": p.entry_liquidity_source_at_entry,
+                    "long_volume_24h_quote_at_entry": p.long_volume_24h_quote_at_entry,
+                    "short_volume_24h_quote_at_entry": p.short_volume_24h_quote_at_entry,
+                    "long_open_interest_quote_at_entry": p.long_open_interest_quote_at_entry,
+                    "short_open_interest_quote_at_entry": p.short_open_interest_quote_at_entry,
+                    "long_entry_vwap": p.long_entry_vwap,
+                    "short_entry_vwap": p.short_entry_vwap,
+                    "entry_capacity_constrained": p.entry_capacity_constrained,
+                    "entry_target_quantity": p.entry_target_quantity,
+                    "long_max_executable_quantity": p.long_max_executable_quantity,
+                    "short_max_executable_quantity": p.short_max_executable_quantity,
+                    "entry_max_executable_quantity": p.entry_max_executable_quantity,
+                    "entry_depth_shortfall_quantity": p.entry_depth_shortfall_quantity,
+                    "entry_max_executable_notional_quote": p.entry_max_executable_notional_quote,
+                    "entry_depth_capped_at_entry": p.entry_depth_capped_at_entry,
+                    "advisories": p.advisories,
+                    "blocked_reasons": p.blocked_reasons,
                     "exit_after_first_stage": p.exit_after_first_stage,
+                    "phase_state": p.phase_state.to_dict() if p.phase_state else None,
+                    "passive_manager_runtime": (
+                        p.passive_manager_runtime.to_dict()
+                        if hasattr(p.passive_manager_runtime, "to_dict")
+                        else {}
+                    ),
+                    "created_cycle": p.created_cycle,
+                    "repost_attempt_count": p.repost_attempt_count,
+                    "passive_attempt_count": p.passive_attempt_count,
+                    "passive_ops_total": p.passive_ops_total,
+                    "maker_remainder_slices": [
+                        item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                        for item in p.maker_remainder_slices
+                    ],
+                    "lifetime_exhausted_logged_final_reason": (
+                        p.lifetime_exhausted_logged_final_reason
+                    ),
+                    "frozen_candidate": p.frozen_candidate,
                     "passive_order": p.passive_order.to_dict() if p.passive_order else None,
                     "next_progress_poll_ms": p.next_progress_poll_ms,
                 }

@@ -11,7 +11,10 @@ import pytest
 from lightfee.engine.state import (
     EngineState,
     OpenPosition,
+    PassiveOrderManagerRuntime,
     PendingEntry,
+    PendingEntryPassivePhaseState,
+    PendingEntryRemainderSlice,
     PendingClose,
     OperatorControlState,
 )
@@ -31,11 +34,13 @@ V1_OPENPOSITION_REQUIRED_FIELDS = {
     # Quantities
     "quantity",          # V1: quantity (total matched)
     "matched_quantity",  # V1: min(long_qty, short_qty)
+    "initial_quantity",
     "long_quantity",
     "short_quantity",
     # Entry prices / notional
     "long_entry_price",
     "short_entry_price",
+    "entry_notional_quote",
     # Review & origin
     "review_id",
     "opportunity_origin_tags",
@@ -44,20 +49,37 @@ V1_OPENPOSITION_REQUIRED_FIELDS = {
     "funding_edge_bps_entry",
     "total_funding_edge_bps_entry",
     "expected_edge_bps_entry",
+    "worst_case_edge_bps_entry",
+    "entry_cross_bps_entry",
+    "fee_bps_entry",
+    "entry_slippage_bps_entry",
     # Transfer & liquidity
+    "transfer_bias_bps_entry",
     "transfer_state_at_entry",
     "entry_liquidity_source_at_entry",
+    "long_volume_24h_quote_at_entry",
+    "short_volume_24h_quote_at_entry",
+    "long_open_interest_quote_at_entry",
+    "short_open_interest_quote_at_entry",
     # VWAP
     "long_entry_vwap",
     "short_entry_vwap",
     # Capacity constraints
     "entry_capacity_constrained",
+    "entry_target_quantity",
+    "long_max_executable_quantity",
+    "short_max_executable_quantity",
+    "entry_max_executable_quantity",
+    "entry_depth_shortfall_quantity",
+    "entry_max_executable_notional_quote",
+    "entry_depth_capped_at_entry",
     # Advisories & blocked reasons
     "advisories",
     "blocked_reasons",
     # Quality markouts
     "entry_quality_markout_5s_emitted",
     "entry_quality_markout_30s_emitted",
+    "entry_quality_completed_at_ms",
     # Risk/Protection PnL
     "risk_delever_realized_price_pnl_quote",
     "risk_delever_realized_exit_fee_quote",
@@ -73,6 +95,9 @@ V1_OPENPOSITION_REQUIRED_FIELDS = {
     "second_stage_funding_quote",
     "second_stage_enabled_at_entry",
     "opportunity_type",
+    "first_funding_leg",
+    "entry_maker_leg",
+    "exit_maker_leg",
     # Risk tracking
     "risk_delever_step_count",
     "last_risk_reason",
@@ -83,12 +108,16 @@ V1_OPENPOSITION_REQUIRED_FIELDS = {
     # Fees
     "long_entry_fee_quote",
     "short_entry_fee_quote",
+    "total_entry_fee_quote",
     # Net/Peak
     "peak_net_quote",
     "current_net_quote",
     # Timestamps
     "opened_at_ms",
+    "entered_at_ms",
     "funding_timestamp_ms",
+    "long_funding_timestamp_ms",
+    "short_funding_timestamp_ms",
     "last_risk_action_at_ms",
     # Exit
     "exit_after_first_stage",
@@ -122,6 +151,26 @@ class TestOpenPositionFieldCompleteness:
             f"V1 OpenPosition fields missing in V2: {missing}\n"
             f"V2 fields: {sorted(v2_fields)}"
         )
+
+    def test_entry_notional_quote_field_exists(self):
+        pos = OpenPosition(position_id="p1", symbol="BTC-USDT",
+                           long_venue="binance", short_venue="okx",
+                           long_quantity=1.0, short_quantity=1.0,
+                           long_entry_price=50000.0, short_entry_price=50000.0,
+                           opened_at_ms=1000)
+        assert hasattr(pos, "entry_notional_quote")
+        assert pos.entry_notional_quote == 0.0
+
+    def test_initial_quantity_and_entered_at_fields_exist(self):
+        pos = OpenPosition(position_id="p1", symbol="BTC-USDT",
+                           long_venue="binance", short_venue="okx",
+                           long_quantity=1.0, short_quantity=1.0,
+                           long_entry_price=50000.0, short_entry_price=50000.0,
+                           opened_at_ms=1000)
+        assert hasattr(pos, "initial_quantity")
+        assert hasattr(pos, "entered_at_ms")
+        assert pos.initial_quantity == 1.0
+        assert pos.entered_at_ms == 1000
 
     def test_review_id_field_exists(self):
         pos = OpenPosition(position_id="p1", symbol="BTC-USDT",
@@ -306,7 +355,10 @@ class TestOpenPositionFieldCompleteness:
             long_entry_price=0.275,
             short_entry_price=0.274,
             opened_at_ms=1780163908797,
+            total_entry_fee_quote=1.23,
             funding_timestamp_ms=1780167600000,
+            long_funding_timestamp_ms=1780167600000,
+            short_funding_timestamp_ms=1780171200000,
             second_funding_timestamp_ms=1780171200000,
             opportunity_type="staggered",
             second_stage_enabled_at_entry=True,
@@ -314,18 +366,140 @@ class TestOpenPositionFieldCompleteness:
             funding_edge_bps_entry=7.45,
             total_funding_edge_bps_entry=7.45,
             expected_edge_bps_entry=6.9,
+            worst_case_edge_bps_entry=4.2,
+            first_funding_leg="long",
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            entry_cross_bps_entry=1.0,
+            fee_bps_entry=2.0,
+            entry_slippage_bps_entry=0.5,
+            transfer_bias_bps_entry=-0.25,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote_at_entry=1_000_000.0,
+            short_volume_24h_quote_at_entry=2_000_000.0,
+            long_open_interest_quote_at_entry=3_000_000.0,
+            short_open_interest_quote_at_entry=4_000_000.0,
+            long_entry_vwap=0.2751,
+            short_entry_vwap=0.2741,
+            entry_capacity_constrained=True,
+            entry_target_quantity=120.0,
+            long_max_executable_quantity=110.0,
+            short_max_executable_quantity=105.0,
+            entry_max_executable_quantity=105.0,
+            entry_depth_shortfall_quantity=15.0,
+            entry_max_executable_notional_quote=28.8,
+            entry_depth_capped_at_entry=True,
+            entry_quality_completed_at_ms=0,
         )
 
         pos = state.to_dict()["open_positions"]["entry-magma"]
 
         assert pos["funding_timestamp_ms"] == 1780167600000
+        assert pos["long_funding_timestamp_ms"] == 1780167600000
+        assert pos["short_funding_timestamp_ms"] == 1780171200000
         assert pos["second_funding_timestamp_ms"] == 1780171200000
+        assert pos["total_entry_fee_quote"] == pytest.approx(1.23)
+        assert pos["entry_quality_completed_at_ms"] == 0
         assert pos["opportunity_type"] == "staggered"
         assert pos["second_stage_enabled_at_entry"] is True
         assert pos["exit_after_first_stage"] is False
         assert pos["funding_edge_bps_entry"] == pytest.approx(7.45)
         assert pos["total_funding_edge_bps_entry"] == pytest.approx(7.45)
         assert pos["expected_edge_bps_entry"] == pytest.approx(6.9)
+        assert pos["worst_case_edge_bps_entry"] == pytest.approx(4.2)
+        assert pos["first_funding_leg"] == "long"
+        assert pos["entry_maker_leg"] == "long"
+        assert pos["exit_maker_leg"] == "short"
+        assert pos["entry_cross_bps_entry"] == pytest.approx(1.0)
+        assert pos["fee_bps_entry"] == pytest.approx(2.0)
+        assert pos["entry_slippage_bps_entry"] == pytest.approx(0.5)
+        assert pos["transfer_bias_bps_entry"] == pytest.approx(-0.25)
+        assert pos["transfer_state_at_entry"] == "ok"
+        assert pos["entry_liquidity_source_at_entry"] == "local_l2"
+        assert pos["long_volume_24h_quote_at_entry"] == pytest.approx(1_000_000.0)
+        assert pos["short_volume_24h_quote_at_entry"] == pytest.approx(2_000_000.0)
+        assert pos["long_open_interest_quote_at_entry"] == pytest.approx(3_000_000.0)
+        assert pos["short_open_interest_quote_at_entry"] == pytest.approx(4_000_000.0)
+        assert pos["long_entry_vwap"] == pytest.approx(0.2751)
+        assert pos["short_entry_vwap"] == pytest.approx(0.2741)
+        assert pos["entry_capacity_constrained"] is True
+        assert pos["entry_target_quantity"] == pytest.approx(120.0)
+        assert pos["long_max_executable_quantity"] == pytest.approx(110.0)
+        assert pos["short_max_executable_quantity"] == pytest.approx(105.0)
+        assert pos["entry_max_executable_quantity"] == pytest.approx(105.0)
+        assert pos["entry_depth_shortfall_quantity"] == pytest.approx(15.0)
+        assert pos["entry_max_executable_notional_quote"] == pytest.approx(28.8)
+        assert pos["entry_depth_capped_at_entry"] is True
+
+    def test_open_position_v1_entry_metadata_roundtrip(self):
+        from lightfee.core.domain import Venue
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        state = EngineState()
+        state.open_positions["entry-meta"] = OpenPosition(
+            position_id="entry-meta",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=0.1,
+            short_quantity=0.1,
+            long_entry_price=50000.0,
+            short_entry_price=50010.0,
+            opened_at_ms=1000,
+            worst_case_edge_bps_entry=4.0,
+            first_funding_leg="long",
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            entry_cross_bps_entry=1.25,
+            fee_bps_entry=2.1,
+            entry_slippage_bps_entry=0.75,
+            transfer_bias_bps_entry=-0.5,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote_at_entry=12_000_000.0,
+            short_volume_24h_quote_at_entry=15_000_000.0,
+            long_open_interest_quote_at_entry=8_000_000.0,
+            short_open_interest_quote_at_entry=9_000_000.0,
+            long_entry_vwap=50000.5,
+            short_entry_vwap=50010.5,
+            entry_capacity_constrained=True,
+            entry_target_quantity=0.2,
+            long_max_executable_quantity=0.18,
+            short_max_executable_quantity=0.16,
+            entry_max_executable_quantity=0.16,
+            entry_depth_shortfall_quantity=0.04,
+            entry_max_executable_notional_quote=8000.0,
+            entry_depth_capped_at_entry=True,
+        )
+
+        restored = _restore_state_from_snapshot_dict(state.to_dict())
+        pos = restored.open_positions["entry-meta"]
+
+        assert pos.worst_case_edge_bps_entry == pytest.approx(4.0)
+        assert pos.first_funding_leg == "long"
+        assert pos.entry_maker_leg == "long"
+        assert pos.exit_maker_leg == "short"
+        assert pos.entry_cross_bps_entry == pytest.approx(1.25)
+        assert pos.fee_bps_entry == pytest.approx(2.1)
+        assert pos.entry_slippage_bps_entry == pytest.approx(0.75)
+        assert pos.transfer_bias_bps_entry == pytest.approx(-0.5)
+        assert pos.transfer_state_at_entry == "ok"
+        assert pos.entry_liquidity_source_at_entry == "local_l2"
+        assert pos.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+        assert pos.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+        assert pos.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+        assert pos.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+        assert pos.long_entry_vwap == pytest.approx(50000.5)
+        assert pos.short_entry_vwap == pytest.approx(50010.5)
+        assert pos.entry_capacity_constrained is True
+        assert pos.entry_target_quantity == pytest.approx(0.2)
+        assert pos.long_max_executable_quantity == pytest.approx(0.18)
+        assert pos.short_max_executable_quantity == pytest.approx(0.16)
+        assert pos.entry_max_executable_quantity == pytest.approx(0.16)
+        assert pos.entry_depth_shortfall_quantity == pytest.approx(0.04)
+        assert pos.entry_max_executable_notional_quote == pytest.approx(8000.0)
+        assert pos.entry_depth_capped_at_entry is True
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +545,16 @@ V1_PENDINGENTRY_REQUIRED_FIELDS = {
     "funding_edge_bps_entry",
     "total_funding_edge_bps_entry",
     "expected_edge_bps_entry",
+    # Passive pending-entry lifecycle state from V1 PendingEntryHedge
+    "phase_state",
+    "passive_manager_runtime",
+    "created_cycle",
+    "repost_attempt_count",
+    "passive_attempt_count",
+    "passive_ops_total",
+    "maker_remainder_slices",
+    "lifetime_exhausted_logged_final_reason",
+    "frozen_candidate",
 }
 
 
@@ -433,6 +617,67 @@ class TestPendingEntryFieldCompleteness:
             funding_edge_bps_entry=7.45,
             total_funding_edge_bps_entry=7.45,
             expected_edge_bps_entry=6.9,
+            worst_case_edge_bps_entry=4.0,
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            entry_cross_bps_entry=1.25,
+            fee_bps_entry=2.1,
+            entry_slippage_bps_entry=0.75,
+            transfer_bias_bps_entry=-0.5,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote_at_entry=12_000_000.0,
+            short_volume_24h_quote_at_entry=15_000_000.0,
+            long_open_interest_quote_at_entry=8_000_000.0,
+            short_open_interest_quote_at_entry=9_000_000.0,
+            long_entry_vwap=50000.5,
+            short_entry_vwap=50010.5,
+            entry_capacity_constrained=True,
+            entry_target_quantity=0.2,
+            long_max_executable_quantity=0.18,
+            short_max_executable_quantity=0.16,
+            entry_max_executable_quantity=0.16,
+            entry_depth_shortfall_quantity=0.04,
+            entry_max_executable_notional_quote=8000.0,
+            entry_depth_capped_at_entry=True,
+            advisories=["thin_book"],
+            blocked_reasons=["capacity_cap"],
+            phase_state=PendingEntryPassivePhaseState(
+                execution_kind="entry",
+                preferred_maker_leg="long",
+                active_maker_leg="short",
+                phase="low_slippage_maker",
+                zero_fill_cycles_in_phase=2,
+                cycle_attempt=3,
+                next_cycle_delay_ms=250,
+                small_fill_min_notional_attempts=1,
+                hedge_deadline_at_ms=1780163909999,
+                hedge_timeout_grace_deadline_at_ms=1780163910999,
+                phase_started_at_ms=1780163908000,
+                cycle_started_at_ms=1780163908500,
+            ),
+            passive_manager_runtime=PassiveOrderManagerRuntime(
+                cooldown_until_ms=1780163910000,
+                consecutive_failures=2,
+                last_success_ms=1780163900000,
+                last_attempt_ms=1780163901000,
+                ops_budget_remaining=7,
+                ops_budget_reset_ms=1780163920000,
+                last_operation_ms=1780163902000,
+            ),
+            created_cycle=42,
+            repost_attempt_count=4,
+            passive_attempt_count=5,
+            passive_ops_total=9,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.5,
+                    notional_quote=30.0,
+                    fill_at_ms=1780163909000,
+                )
+            ],
+            lifetime_exhausted_logged_final_reason="passive_entry_lifetime_exhausted",
+            frozen_candidate={"pair_id": "magmausdt:aster->bybit", "ranking_edge_bps": 7.45},
         )
 
         snap = state.to_dict()
@@ -447,6 +692,48 @@ class TestPendingEntryFieldCompleteness:
         assert pending["funding_edge_bps_entry"] == pytest.approx(7.45)
         assert pending["total_funding_edge_bps_entry"] == pytest.approx(7.45)
         assert pending["expected_edge_bps_entry"] == pytest.approx(6.9)
+        assert pending["phase_state"]["execution_kind"] == "entry"
+        assert pending["phase_state"]["active_maker_leg"] == "short"
+        assert pending["phase_state"]["next_cycle_delay_ms"] == 250
+        assert pending["passive_manager_runtime"]["cooldown_until_ms"] == 1780163910000
+        assert pending["created_cycle"] == 42
+        assert pending["repost_attempt_count"] == 4
+        assert pending["passive_attempt_count"] == 5
+        assert pending["passive_ops_total"] == 9
+        assert pending["maker_remainder_slices"] == [
+            {
+                "quantity": 1.5,
+                "notional_quote": 30.0,
+                "fill_at_ms": 1780163909000,
+            }
+        ]
+        assert pending["lifetime_exhausted_logged_final_reason"] == "passive_entry_lifetime_exhausted"
+        assert pending["frozen_candidate"]["pair_id"] == "magmausdt:aster->bybit"
+        assert pending["worst_case_edge_bps_entry"] == pytest.approx(4.0)
+        assert pending["entry_maker_leg"] == "long"
+        assert pending["exit_maker_leg"] == "short"
+        assert pending["entry_cross_bps_entry"] == pytest.approx(1.25)
+        assert pending["fee_bps_entry"] == pytest.approx(2.1)
+        assert pending["entry_slippage_bps_entry"] == pytest.approx(0.75)
+        assert pending["transfer_bias_bps_entry"] == pytest.approx(-0.5)
+        assert pending["transfer_state_at_entry"] == "ok"
+        assert pending["entry_liquidity_source_at_entry"] == "local_l2"
+        assert pending["long_volume_24h_quote_at_entry"] == pytest.approx(12_000_000.0)
+        assert pending["short_volume_24h_quote_at_entry"] == pytest.approx(15_000_000.0)
+        assert pending["long_open_interest_quote_at_entry"] == pytest.approx(8_000_000.0)
+        assert pending["short_open_interest_quote_at_entry"] == pytest.approx(9_000_000.0)
+        assert pending["long_entry_vwap"] == pytest.approx(50000.5)
+        assert pending["short_entry_vwap"] == pytest.approx(50010.5)
+        assert pending["entry_capacity_constrained"] is True
+        assert pending["entry_target_quantity"] == pytest.approx(0.2)
+        assert pending["long_max_executable_quantity"] == pytest.approx(0.18)
+        assert pending["short_max_executable_quantity"] == pytest.approx(0.16)
+        assert pending["entry_max_executable_quantity"] == pytest.approx(0.16)
+        assert pending["entry_depth_shortfall_quantity"] == pytest.approx(0.04)
+        assert pending["entry_max_executable_notional_quote"] == pytest.approx(8000.0)
+        assert pending["entry_depth_capped_at_entry"] is True
+        assert pending["advisories"] == ["thin_book"]
+        assert pending["blocked_reasons"] == ["capacity_cap"]
 
         restored = _restore_state_from_snapshot_dict(snap)
         restored_pending = restored.pending_entries["entry-magma"]
@@ -460,6 +747,45 @@ class TestPendingEntryFieldCompleteness:
         assert restored_pending.funding_edge_bps_entry == pytest.approx(7.45)
         assert restored_pending.total_funding_edge_bps_entry == pytest.approx(7.45)
         assert restored_pending.expected_edge_bps_entry == pytest.approx(6.9)
+        assert restored_pending.phase_state is not None
+        assert restored_pending.phase_state.execution_kind == "entry"
+        assert restored_pending.phase_state.active_maker_leg == "short"
+        assert restored_pending.phase_state.next_cycle_delay_ms == 250
+        assert restored_pending.passive_manager_runtime.cooldown_until_ms == 1780163910000
+        assert restored_pending.created_cycle == 42
+        assert restored_pending.repost_attempt_count == 4
+        assert restored_pending.passive_attempt_count == 5
+        assert restored_pending.passive_ops_total == 9
+        assert len(restored_pending.maker_remainder_slices) == 1
+        assert restored_pending.maker_remainder_slices[0].average_price() == pytest.approx(20.0)
+        assert restored_pending.maker_remainder_slices[0].fill_at_ms == 1780163909000
+        assert restored_pending.lifetime_exhausted_logged_final_reason == "passive_entry_lifetime_exhausted"
+        assert restored_pending.frozen_candidate["pair_id"] == "magmausdt:aster->bybit"
+        assert restored_pending.worst_case_edge_bps_entry == pytest.approx(4.0)
+        assert restored_pending.entry_maker_leg == "long"
+        assert restored_pending.exit_maker_leg == "short"
+        assert restored_pending.entry_cross_bps_entry == pytest.approx(1.25)
+        assert restored_pending.fee_bps_entry == pytest.approx(2.1)
+        assert restored_pending.entry_slippage_bps_entry == pytest.approx(0.75)
+        assert restored_pending.transfer_bias_bps_entry == pytest.approx(-0.5)
+        assert restored_pending.transfer_state_at_entry == "ok"
+        assert restored_pending.entry_liquidity_source_at_entry == "local_l2"
+        assert restored_pending.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+        assert restored_pending.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+        assert restored_pending.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+        assert restored_pending.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+        assert restored_pending.long_entry_vwap == pytest.approx(50000.5)
+        assert restored_pending.short_entry_vwap == pytest.approx(50010.5)
+        assert restored_pending.entry_capacity_constrained is True
+        assert restored_pending.entry_target_quantity == pytest.approx(0.2)
+        assert restored_pending.long_max_executable_quantity == pytest.approx(0.18)
+        assert restored_pending.short_max_executable_quantity == pytest.approx(0.16)
+        assert restored_pending.entry_max_executable_quantity == pytest.approx(0.16)
+        assert restored_pending.entry_depth_shortfall_quantity == pytest.approx(0.04)
+        assert restored_pending.entry_max_executable_notional_quote == pytest.approx(8000.0)
+        assert restored_pending.entry_depth_capped_at_entry is True
+        assert restored_pending.advisories == ["thin_book"]
+        assert restored_pending.blocked_reasons == ["capacity_cap"]
 
 
 # ---------------------------------------------------------------------------

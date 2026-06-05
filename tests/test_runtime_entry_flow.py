@@ -160,8 +160,7 @@ def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_jour
             self.calls.append((candidate, now_ms))
             return EntryReadinessDecision.allow()
 
-    config.strategy.min_scan_minutes_before_funding = 0
-    config.strategy.entry_min_first_funding_remaining_secs = 60
+    config.strategy.min_scan_minutes_before_funding = 1
     runtime = LiveRuntime(config, venue_adapters={})
     runtime.journal = tmp_journal
     readiness_provider = ReadinessProvider()
@@ -701,8 +700,7 @@ async def test_dispatch_entry_rechecks_first_funding_horizon_after_selection_del
             self.called = True
             raise AssertionError("dispatch lifecycle gate must block before execute")
 
-    config.strategy.min_scan_minutes_before_funding = 0
-    config.strategy.entry_min_first_funding_remaining_secs = 60
+    config.strategy.min_scan_minutes_before_funding = 1
     runtime = LiveRuntime(config, venue_adapters={})
     runtime.journal = tmp_journal
     executor = FailingEntryExecutor()
@@ -953,6 +951,7 @@ class TestPlannerDispatchIntegration:
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
         runtime = LiveRuntime(config, venue_adapters=adapters)
         runtime.journal = tmp_journal
+        runtime.state.tick_count = 77
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
@@ -963,6 +962,9 @@ class TestPlannerDispatchIntegration:
         assert binance.last_request.post_only is True
         assert binance.last_request.price == 50000.0
         assert len(runtime.state.pending_entries) == 1
+        pending = next(iter(runtime.state.pending_entries.values()))
+        assert pending.created_cycle == 77
+        assert pending.passive_manager_runtime.consecutive_failures == 0
 
     @pytest.mark.asyncio
     async def test_final_gate_blocks_fresh_bbo_with_excessive_leg_skew(
@@ -1463,6 +1465,16 @@ class TestPlannerDispatchIntegration:
                 return EntryExecutionResult(
                     route=ExecutionRoute.PASSIVE_INCREMENTAL,
                     state=EntryState.COMPLETED,
+                    pending_entry=PendingEntry(
+                        pending_id=ctx.entry_id,
+                        symbol=ctx.symbol,
+                        long_venue=ctx.long_venue,
+                        short_venue=ctx.short_venue,
+                        target_quantity=ctx.long_quantity,
+                        long_side=Side.BUY,
+                        short_side=Side.SELL,
+                        created_at_ms=ctx.created_at_ms,
+                    ),
                 )
 
         executor = CapturingExecutor()
@@ -1484,6 +1496,7 @@ class TestPlannerDispatchIntegration:
             transfer_bias_bps=0.0,
             opportunity_type="staggered",
             blocked=False,
+            blocked_reasons=[],
             entry_notional_quote=500.0,
             funding_timestamp_ms=first_funding_ms,
             first_funding_timestamp_ms=first_funding_ms,
@@ -1491,6 +1504,28 @@ class TestPlannerDispatchIntegration:
             short_funding_timestamp_ms=second_funding_ms,
             second_funding_timestamp_ms=second_funding_ms,
             first_funding_leg="long",
+            entry_maker_leg="long",
+            exit_maker_leg="short",
+            entry_cross_bps=1.25,
+            fee_bps=2.1,
+            entry_slippage_bps=0.75,
+            transfer_state_at_entry="ok",
+            entry_liquidity_source_at_entry="local_l2",
+            long_volume_24h_quote=12_000_000.0,
+            short_volume_24h_quote=15_000_000.0,
+            long_open_interest_quote_at_entry=8_000_000.0,
+            short_open_interest_quote_at_entry=9_000_000.0,
+            long_entry_vwap=50000.5,
+            short_entry_vwap=50010.5,
+            entry_capacity_constrained=True,
+            entry_target_quantity=0.2,
+            long_max_executable_quantity=0.18,
+            short_max_executable_quantity=0.16,
+            entry_max_executable_quantity=0.16,
+            entry_depth_shortfall_quantity=0.04,
+            entry_max_executable_notional_quote=8000.0,
+            entry_depth_capped_at_entry=True,
+            advisories=["thin_book"],
         )
 
         dispatched = await runtime._dispatch_entry(candidate, 1780163908797, price_hint=0.275)
@@ -1507,6 +1542,40 @@ class TestPlannerDispatchIntegration:
         assert executor.ctx.funding_edge_bps_entry == pytest.approx(7.45)
         assert executor.ctx.total_funding_edge_bps_entry == pytest.approx(7.45)
         assert executor.ctx.expected_edge_bps_entry == pytest.approx(6.9)
+        assert executor.ctx.worst_case_edge_bps_entry == pytest.approx(2.0)
+        assert executor.ctx.entry_maker_leg == "long"
+        assert executor.ctx.exit_maker_leg == "short"
+        assert executor.ctx.entry_cross_bps_entry == pytest.approx(1.25)
+        assert executor.ctx.fee_bps_entry == pytest.approx(2.1)
+        assert executor.ctx.entry_slippage_bps_entry == pytest.approx(0.75)
+        assert executor.ctx.transfer_bias_bps_entry == pytest.approx(0.0)
+        assert executor.ctx.transfer_state_at_entry == "ok"
+        assert executor.ctx.entry_liquidity_source_at_entry == "local_l2"
+        assert executor.ctx.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+        assert executor.ctx.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+        assert executor.ctx.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+        assert executor.ctx.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+        assert executor.ctx.long_entry_vwap == pytest.approx(50000.5)
+        assert executor.ctx.short_entry_vwap == pytest.approx(50010.5)
+        assert executor.ctx.entry_capacity_constrained is True
+        assert executor.ctx.entry_target_quantity == pytest.approx(0.2)
+        assert executor.ctx.long_max_executable_quantity == pytest.approx(0.18)
+        assert executor.ctx.short_max_executable_quantity == pytest.approx(0.16)
+        assert executor.ctx.entry_max_executable_quantity == pytest.approx(0.16)
+        assert executor.ctx.entry_depth_shortfall_quantity == pytest.approx(0.04)
+        assert executor.ctx.entry_max_executable_notional_quote == pytest.approx(8000.0)
+        assert executor.ctx.entry_depth_capped_at_entry is True
+        assert executor.ctx.advisories == ["thin_book"]
+        assert executor.ctx.blocked_reasons == []
+        pending = next(iter(runtime.state.pending_entries.values()))
+        assert pending.frozen_candidate is not None
+        assert pending.frozen_candidate["symbol"] == "MAGMAUSDT"
+        assert pending.frozen_candidate["pair_id"] == ""
+        assert pending.frozen_candidate["ranking_edge_bps"] == pytest.approx(7.45)
+        assert pending.frozen_candidate["entry_notional_quote"] == pytest.approx(500.0)
+        assert pending.frozen_candidate["first_funding_leg"] == "long"
+        assert pending.frozen_candidate["entry_maker_leg"] == "long"
+        assert pending.frozen_candidate["exit_maker_leg"] == "short"
 
         selected = [
             r for r in runtime.journal.read_all()

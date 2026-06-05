@@ -45,7 +45,7 @@ def test_entry_horizon_allows_when_remaining_meets_existing_min_scan():
     assert decision.effective_min_before_ms == 180_000
 
 
-def test_entry_horizon_uses_60s_when_min_scan_is_zero():
+def test_entry_horizon_uses_v1_min_scan_only_when_min_scan_is_zero():
     cfg = StrategyConfig()
     cfg.min_scan_minutes_before_funding = 0
     cfg.entry_min_first_funding_remaining_secs = 60
@@ -54,8 +54,9 @@ def test_entry_horizon_uses_60s_when_min_scan_is_zero():
 
     decision = FundingLifecycle.entry_horizon(candidate, now_ms, cfg)
 
-    assert decision.allowed is False
-    assert decision.effective_min_before_ms == 60_000
+    assert decision.allowed is True
+    assert decision.reason == ""
+    assert decision.effective_min_before_ms == 0
 
 
 def test_entry_horizon_blocks_missing_first_funding():

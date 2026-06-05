@@ -41,7 +41,12 @@ from lightfee.engine.residual import (
     ResidualOrigin,
     split_entry_fill_residual,
 )
-from lightfee.engine.state import OpenPosition, PendingEntry, PendingPassiveOrder
+from lightfee.engine.state import (
+    OpenPosition,
+    PendingEntry,
+    PendingEntryPassivePhaseState,
+    PendingPassiveOrder,
+)
 from lightfee.persistence.journal import Journal
 
 
@@ -476,6 +481,8 @@ class EntrySyncExecutor:
 
         # --- V1: build PendingPassiveOrder when maker order is resting ---
         passive_order: Optional[PendingPassiveOrder] = None
+        phase_state: PendingEntryPassivePhaseState | None = None
+        passive_attempt_count = 0
         if passive_order_ack is not None:
             ack_accepted_at_ms = getattr(passive_order_ack, "accepted_at_ms", 0) or now_ms
             ack_order_id = getattr(passive_order_ack, "order_id", "") or maker_order_id
@@ -496,6 +503,17 @@ class EntrySyncExecutor:
                 cancel_requested_at_ms=0,
                 last_progress_state=ack_state if ack_state is not None else PassiveOrderState.UNKNOWN,
             )
+            maker_leg_label = "long" if maker_is_long else "short"
+            phase_state = PendingEntryPassivePhaseState(
+                execution_kind="entry",
+                preferred_maker_leg=maker_leg_label,
+                active_maker_leg=maker_leg_label,
+                phase="high_slippage_maker",
+                cycle_attempt=1,
+                phase_started_at_ms=ack_accepted_at_ms,
+                cycle_started_at_ms=ack_accepted_at_ms,
+            )
+            passive_attempt_count = 1
 
         return PendingEntry(
             pending_id=ctx.entry_id,
@@ -530,8 +548,36 @@ class EntrySyncExecutor:
             funding_edge_bps_entry=ctx.funding_edge_bps_entry,
             total_funding_edge_bps_entry=ctx.total_funding_edge_bps_entry,
             expected_edge_bps_entry=ctx.expected_edge_bps_entry,
+            worst_case_edge_bps_entry=ctx.worst_case_edge_bps_entry,
+            entry_maker_leg=ctx.entry_maker_leg,
+            exit_maker_leg=ctx.exit_maker_leg,
+            entry_cross_bps_entry=ctx.entry_cross_bps_entry,
+            fee_bps_entry=ctx.fee_bps_entry,
+            entry_slippage_bps_entry=ctx.entry_slippage_bps_entry,
+            transfer_bias_bps_entry=ctx.transfer_bias_bps_entry,
+            transfer_state_at_entry=ctx.transfer_state_at_entry,
+            entry_liquidity_source_at_entry=ctx.entry_liquidity_source_at_entry,
+            long_volume_24h_quote_at_entry=ctx.long_volume_24h_quote_at_entry,
+            short_volume_24h_quote_at_entry=ctx.short_volume_24h_quote_at_entry,
+            long_open_interest_quote_at_entry=ctx.long_open_interest_quote_at_entry,
+            short_open_interest_quote_at_entry=ctx.short_open_interest_quote_at_entry,
+            long_entry_vwap=ctx.long_entry_vwap,
+            short_entry_vwap=ctx.short_entry_vwap,
+            entry_capacity_constrained=ctx.entry_capacity_constrained,
+            entry_target_quantity=ctx.entry_target_quantity,
+            long_max_executable_quantity=ctx.long_max_executable_quantity,
+            short_max_executable_quantity=ctx.short_max_executable_quantity,
+            entry_max_executable_quantity=ctx.entry_max_executable_quantity,
+            entry_depth_shortfall_quantity=ctx.entry_depth_shortfall_quantity,
+            entry_max_executable_notional_quote=ctx.entry_max_executable_notional_quote,
+            entry_depth_capped_at_entry=ctx.entry_depth_capped_at_entry,
+            advisories=list(ctx.advisories),
+            blocked_reasons=list(ctx.blocked_reasons),
             exit_after_first_stage=ctx.exit_after_first_stage,
+            phase_state=phase_state,
+            passive_attempt_count=passive_attempt_count,
             repost_count=next_repost_count,
+            repost_attempt_count=0 if passive_order_ack is not None else next_repost_count,
             zero_fill_since_ms=zero_fill_since_ms,
             maker_leg="long" if maker_is_long else "short",
             passive_order=passive_order,

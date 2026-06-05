@@ -8,7 +8,7 @@ Rust references:
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional
 
@@ -81,6 +81,31 @@ class EntryContext:
     funding_edge_bps_entry: float = 0.0
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
+    worst_case_edge_bps_entry: float = 0.0
+    entry_maker_leg: str = ""
+    exit_maker_leg: str = ""
+    entry_cross_bps_entry: float = 0.0
+    fee_bps_entry: float = 0.0
+    entry_slippage_bps_entry: float = 0.0
+    transfer_bias_bps_entry: float = 0.0
+    transfer_state_at_entry: str | None = None
+    entry_liquidity_source_at_entry: str | None = None
+    long_volume_24h_quote_at_entry: float = 0.0
+    short_volume_24h_quote_at_entry: float = 0.0
+    long_open_interest_quote_at_entry: float = 0.0
+    short_open_interest_quote_at_entry: float = 0.0
+    long_entry_vwap: float | None = None
+    short_entry_vwap: float | None = None
+    entry_capacity_constrained: bool = False
+    entry_target_quantity: float = 0.0
+    long_max_executable_quantity: float = 0.0
+    short_max_executable_quantity: float = 0.0
+    entry_max_executable_quantity: float = 0.0
+    entry_depth_shortfall_quantity: float = 0.0
+    entry_max_executable_notional_quote: float = 0.0
+    entry_depth_capped_at_entry: bool = False
+    advisories: list[str] = field(default_factory=list)
+    blocked_reasons: list[str] = field(default_factory=list)
     exit_after_first_stage: bool = False
 
 
@@ -209,6 +234,23 @@ def build_open_position(
         long_entry_price = hedge_fill.price
         short_entry_price = maker_fill.price
 
+    long_entry_fee_quote = (
+        float(long_fill.fee_quote or 0.0) * (matched_qty / long_fill.quantity)
+        if long_fill.quantity > 0.0
+        else 0.0
+    )
+    short_entry_fee_quote = (
+        float(short_fill.fee_quote or 0.0) * (matched_qty / short_fill.quantity)
+        if short_fill.quantity > 0.0
+        else 0.0
+    )
+    total_entry_fee_quote = long_entry_fee_quote + short_entry_fee_quote
+    entry_notional_quote = (
+        matched_qty * (long_entry_price + short_entry_price) * 0.5
+        if matched_qty > 0.0 and long_entry_price > 0.0 and short_entry_price > 0.0
+        else 0.0
+    )
+
     long_funding_timestamp_ms = _positive_int(ctx.long_funding_timestamp_ms)
     short_funding_timestamp_ms = _positive_int(ctx.short_funding_timestamp_ms)
     inferred_first_funding_ms = _first_positive(
@@ -243,10 +285,21 @@ def build_open_position(
         long_entry_price=long_entry_price,
         short_entry_price=short_entry_price,
         opened_at_ms=now_ms,
+        entry_notional_quote=entry_notional_quote,
+        matched_quantity=matched_qty,
+        initial_quantity=matched_qty,
+        entered_at_ms=max(maker_fill.filled_at_ms or 0, hedge_fill.filled_at_ms or 0),
         review_id=review_id,
         long_fill=long_fill,
         short_fill=short_fill,
+        long_entry_fee_quote=long_entry_fee_quote,
+        short_entry_fee_quote=short_entry_fee_quote,
+        total_entry_fee_quote=total_entry_fee_quote,
+        current_net_quote=-total_entry_fee_quote,
+        peak_net_quote=-total_entry_fee_quote,
         funding_timestamp_ms=inferred_first_funding_ms,
+        long_funding_timestamp_ms=long_funding_timestamp_ms,
+        short_funding_timestamp_ms=short_funding_timestamp_ms,
         second_funding_timestamp_ms=inferred_second_funding_ms,
         opportunity_type=opportunity_type,
         second_stage_enabled_at_entry=second_stage_enabled,
@@ -256,4 +309,33 @@ def build_open_position(
             ctx.total_funding_edge_bps_entry or ctx.funding_edge_bps_entry or 0.0
         ),
         expected_edge_bps_entry=float(ctx.expected_edge_bps_entry or 0.0),
+        worst_case_edge_bps_entry=float(ctx.worst_case_edge_bps_entry or 0.0),
+        first_funding_leg=str(ctx.first_funding_leg or ""),
+        entry_maker_leg=str(ctx.entry_maker_leg or ""),
+        exit_maker_leg=str(ctx.exit_maker_leg or ""),
+        entry_cross_bps_entry=float(ctx.entry_cross_bps_entry or 0.0),
+        fee_bps_entry=float(ctx.fee_bps_entry or 0.0),
+        entry_slippage_bps_entry=float(ctx.entry_slippage_bps_entry or 0.0),
+        transfer_bias_bps_entry=float(ctx.transfer_bias_bps_entry or 0.0),
+        transfer_state_at_entry=ctx.transfer_state_at_entry,
+        entry_liquidity_source_at_entry=ctx.entry_liquidity_source_at_entry,
+        long_volume_24h_quote_at_entry=float(ctx.long_volume_24h_quote_at_entry or 0.0),
+        short_volume_24h_quote_at_entry=float(ctx.short_volume_24h_quote_at_entry or 0.0),
+        long_open_interest_quote_at_entry=float(ctx.long_open_interest_quote_at_entry or 0.0),
+        short_open_interest_quote_at_entry=float(ctx.short_open_interest_quote_at_entry or 0.0),
+        long_entry_vwap=ctx.long_entry_vwap,
+        short_entry_vwap=ctx.short_entry_vwap,
+        entry_capacity_constrained=bool(ctx.entry_capacity_constrained),
+        entry_target_quantity=float(ctx.entry_target_quantity or 0.0),
+        long_max_executable_quantity=float(ctx.long_max_executable_quantity or 0.0),
+        short_max_executable_quantity=float(ctx.short_max_executable_quantity or 0.0),
+        entry_max_executable_quantity=float(ctx.entry_max_executable_quantity or 0.0),
+        entry_depth_shortfall_quantity=float(ctx.entry_depth_shortfall_quantity or 0.0),
+        entry_max_executable_notional_quote=float(
+            ctx.entry_max_executable_notional_quote or 0.0
+        ),
+        entry_depth_capped_at_entry=bool(ctx.entry_depth_capped_at_entry),
+        advisories=list(ctx.advisories),
+        blocked_reasons=list(ctx.blocked_reasons),
+        entry_quality_completed_at_ms=0,
     )

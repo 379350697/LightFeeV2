@@ -156,6 +156,31 @@ async def test_incident_live_position_hydrates_pending_entry_instead_of_live_rec
         maker_client_order_id=submitted["client_order_id"],
         hedge_order_id="",
         hedge_fill_price=0.0,
+        worst_case_edge_bps_entry=4.0,
+        entry_maker_leg="long",
+        exit_maker_leg="short",
+        entry_cross_bps_entry=1.25,
+        fee_bps_entry=2.1,
+        entry_slippage_bps_entry=0.75,
+        transfer_bias_bps_entry=-0.5,
+        transfer_state_at_entry="ok",
+        entry_liquidity_source_at_entry="local_l2",
+        long_volume_24h_quote_at_entry=12_000_000.0,
+        short_volume_24h_quote_at_entry=15_000_000.0,
+        long_open_interest_quote_at_entry=8_000_000.0,
+        short_open_interest_quote_at_entry=9_000_000.0,
+        long_entry_vwap=live["long_entry_price"],
+        short_entry_vwap=live["short_entry_price"],
+        entry_capacity_constrained=True,
+        entry_target_quantity=selected["target_quantity"],
+        long_max_executable_quantity=live["long_quantity"],
+        short_max_executable_quantity=live["short_quantity"],
+        entry_max_executable_quantity=live["matched_quantity"],
+        entry_depth_shortfall_quantity=1.0,
+        entry_max_executable_notional_quote=100.0,
+        entry_depth_capped_at_entry=True,
+        advisories=["thin_book"],
+        blocked_reasons=["capacity_cap"],
     )
     runtime.state.pending_entries[pending.pending_id] = pending
 
@@ -166,6 +191,31 @@ async def test_incident_live_position_hydrates_pending_entry_instead_of_live_rec
     assert opened.long_quantity == pytest.approx(live["matched_quantity"])
     assert opened.short_quantity == pytest.approx(live["matched_quantity"])
     assert opened.short_entry_price == pytest.approx(live["short_entry_price"])
+    assert opened.worst_case_edge_bps_entry == pytest.approx(4.0)
+    assert opened.entry_maker_leg == "long"
+    assert opened.exit_maker_leg == "short"
+    assert opened.entry_cross_bps_entry == pytest.approx(1.25)
+    assert opened.fee_bps_entry == pytest.approx(2.1)
+    assert opened.entry_slippage_bps_entry == pytest.approx(0.75)
+    assert opened.transfer_bias_bps_entry == pytest.approx(-0.5)
+    assert opened.transfer_state_at_entry == "ok"
+    assert opened.entry_liquidity_source_at_entry == "local_l2"
+    assert opened.long_volume_24h_quote_at_entry == pytest.approx(12_000_000.0)
+    assert opened.short_volume_24h_quote_at_entry == pytest.approx(15_000_000.0)
+    assert opened.long_open_interest_quote_at_entry == pytest.approx(8_000_000.0)
+    assert opened.short_open_interest_quote_at_entry == pytest.approx(9_000_000.0)
+    assert opened.long_entry_vwap == pytest.approx(live["long_entry_price"])
+    assert opened.short_entry_vwap == pytest.approx(live["short_entry_price"])
+    assert opened.entry_capacity_constrained is True
+    assert opened.entry_target_quantity == pytest.approx(selected["target_quantity"])
+    assert opened.long_max_executable_quantity == pytest.approx(live["long_quantity"])
+    assert opened.short_max_executable_quantity == pytest.approx(live["short_quantity"])
+    assert opened.entry_max_executable_quantity == pytest.approx(live["matched_quantity"])
+    assert opened.entry_depth_shortfall_quantity == pytest.approx(1.0)
+    assert opened.entry_max_executable_notional_quote == pytest.approx(100.0)
+    assert opened.entry_depth_capped_at_entry is True
+    assert opened.advisories == ["thin_book"]
+    assert opened.blocked_reasons == ["capacity_cap"]
     kinds = [event["kind"] for event in tmp_journal.read_all()]
     assert "entry.opened" in kinds
     assert "pending_entry.finalize_deferred_incomplete_fill" not in kinds
