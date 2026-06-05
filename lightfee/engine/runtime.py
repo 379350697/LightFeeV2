@@ -6086,7 +6086,8 @@ class LiveRuntime:
         if pending.maker_completed():
             return False
 
-        adapter = self.get_venue_adapter(pending.maker_venue())
+        maker_venue = pending.maker_venue()
+        adapter = self.get_venue_adapter(maker_venue)
         if adapter is None:
             return True
 
@@ -6109,20 +6110,66 @@ class LiveRuntime:
                 {
                     "entry_id": entry_id,
                     "symbol": pending.symbol,
-                    "maker_venue": pending.maker_venue().value,
+                    "maker_venue": maker_venue.value,
                     "error": str(e),
                 },
             )
             return True
 
         if progress is None:
+            matches, open_order_error = await self._pending_entry_maker_open_order_matches(
+                pending,
+                adapter,
+                maker_venue,
+            )
+            if matches is not None:
+                if matches:
+                    self.journal.append(
+                        "pending_entry.maker_open_order_retained",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "maker_venue": maker_venue.value,
+                            "maker_order_id": order_id,
+                            "maker_client_order_id": client_order_id,
+                            "open_order_count": len(matches),
+                            "reason": "passive_order_progress_none",
+                        },
+                    )
+                    return True
+                if not self._pending_entry_maker_cancel_requested(pending):
+                    self.journal.append(
+                        "pending_entry.maker_cancel_required_before_flat_abandon",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "maker_venue": maker_venue.value,
+                            "maker_order_id": order_id,
+                            "maker_client_order_id": client_order_id,
+                            "reason": "passive_order_progress_none_open_order_absent",
+                        },
+                    )
+                    return True
+                self.journal.append(
+                    "pending_entry.maker_terminal_no_open_order",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_order_id": order_id,
+                        "maker_client_order_id": client_order_id,
+                        "reason": "passive_order_progress_none_open_order_absent",
+                    },
+                )
+                return False
             self.journal.append(
                 "pending_entry.maker_terminal_evidence_unavailable",
                 {
                     "entry_id": entry_id,
                     "symbol": pending.symbol,
-                    "maker_venue": pending.maker_venue().value,
+                    "maker_venue": maker_venue.value,
                     "reason": "passive_order_progress_none",
+                    "open_order_error": open_order_error,
                 },
             )
             return True

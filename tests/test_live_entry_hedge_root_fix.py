@@ -1864,6 +1864,7 @@ class _FakeVenueAdapter:
         self.normalized_quantity: float | None = None
         self.min_notional_quote: float = 0.0
         self.open_orders: list[dict] = []
+        self.fetch_open_orders_raises: Exception | None = None
         self.order_fill_reconciliation: OrderFillReconciliation | None = None
         self.passive_progress: PassiveOrderProgress | None = None
         self.query_passive_progress_raises: Exception | None = None
@@ -1882,6 +1883,8 @@ class _FakeVenueAdapter:
         return self.position
 
     async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        if self.fetch_open_orders_raises is not None:
+            raise self.fetch_open_orders_raises
         return list(self.open_orders)
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
@@ -2356,6 +2359,248 @@ class TestRealPathAbortCleanupDeadline:
         )
 
         assert abandoned is True
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_allows_missing_progress_when_open_order_absent(
+        self, tmp_path
+    ):
+        """No passive progress plus no matching live open order is terminal
+        enough for zero-fill stale entries.
+
+        Hyperliquid can return unknownoid/execution_not_found after a maker
+        cancel while all-position and open-order truth are flat. V1 parity is
+        to close the zero-fill pending owner; retaining it leaves runtime in
+        risk_only with no exchange artifact left to recover.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BABYUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = None
+        maker.open_orders = []
+        hedge = _FakeVenueAdapter(Venue.OKX)
+        hedge.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BABYUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = maker
+        runtime._venue_adapters[Venue.OKX] = hedge
+        pending = PendingEntry(
+            pending_id="entry-missing-progress-no-open-order",
+            symbol="BABYUSDT",
+            long_venue=Venue.HYPERLIQUID,
+            short_venue=Venue.OKX,
+            target_quantity=1211.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="459087402459",
+            maker_client_order_id="maker-cid",
+            passive_order=PendingPassiveOrder(
+                order_id="459087402459",
+                client_order_id="maker-cid",
+                target_quantity=1211.0,
+                cancel_requested_at_ms=1100,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is True
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_terminal_evidence_unavailable" not in kinds
+        assert "pending_entry.maker_terminal_no_open_order" in kinds
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_requires_cancel_before_missing_progress_no_open_order_abandon(
+        self, tmp_path
+    ):
+        """Open-order absence is not enough to abandon a maker owner before
+        the passive cancel lifecycle has started."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BABYUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = None
+        maker.open_orders = []
+        hedge = _FakeVenueAdapter(Venue.OKX)
+        hedge.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BABYUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = maker
+        runtime._venue_adapters[Venue.OKX] = hedge
+        pending = PendingEntry(
+            pending_id="entry-missing-progress-no-cancel",
+            symbol="BABYUSDT",
+            long_venue=Venue.HYPERLIQUID,
+            short_venue=Venue.OKX,
+            target_quantity=1211.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="459087402459",
+            maker_client_order_id="maker-cid",
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_cancel_required_before_flat_abandon" in kinds
+        assert "pending_entry.maker_terminal_no_open_order" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_retains_missing_progress_when_open_order_matches(
+        self, tmp_path
+    ):
+        """Missing passive progress is not terminal while the maker order is
+        still visible in live open-order truth."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BABYUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = None
+        maker.open_orders = [
+            {
+                "orderId": "459087402459",
+                "clientOrderId": "maker-cid",
+                "symbol": "BABYUSDT",
+            }
+        ]
+        hedge = _FakeVenueAdapter(Venue.OKX)
+        hedge.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BABYUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = maker
+        runtime._venue_adapters[Venue.OKX] = hedge
+        pending = PendingEntry(
+            pending_id="entry-missing-progress-open-order",
+            symbol="BABYUSDT",
+            long_venue=Venue.HYPERLIQUID,
+            short_venue=Venue.OKX,
+            target_quantity=1211.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="459087402459",
+            maker_client_order_id="maker-cid",
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_open_order_retained" in kinds
+        assert "pending_entry.maker_terminal_no_open_order" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_retains_missing_progress_when_open_order_truth_unavailable(
+        self, tmp_path
+    ):
+        """Missing passive progress plus unavailable open-order truth remains
+        unresolved, matching the V1 single-leg safety boundary."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="BABYUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        maker.passive_progress = None
+        maker.fetch_open_orders_raises = RuntimeError("open orders unavailable")
+        hedge = _FakeVenueAdapter(Venue.OKX)
+        hedge.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BABYUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+        runtime._venue_adapters[Venue.HYPERLIQUID] = maker
+        runtime._venue_adapters[Venue.OKX] = hedge
+        pending = PendingEntry(
+            pending_id="entry-missing-progress-open-order-unavailable",
+            symbol="BABYUSDT",
+            long_venue=Venue.HYPERLIQUID,
+            short_venue=Venue.OKX,
+            target_quantity=1211.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="459087402459",
+            maker_client_order_id="maker-cid",
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        events = runtime.journal.read_all()
+        assert any(
+            event["kind"] == "pending_entry.maker_terminal_evidence_unavailable"
+            and event["payload"].get("open_order_error") == "open orders unavailable"
+            for event in events
+        )
+        assert not any(
+            event["kind"] == "pending_entry.maker_terminal_no_open_order"
+            for event in events
+        )
 
     @pytest.mark.asyncio
     async def test_hard_ceiling_zero_fill_flat_pending_cancels_then_aborts_before_flat_retain(
