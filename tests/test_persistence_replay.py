@@ -1080,6 +1080,9 @@ class TestJournalOnlyClassification:
 
     def test_lifecycle_events_are_journal_only(self):
         from lightfee.offline.replay.dataset import _is_journal_only
+        assert _is_journal_only("pending_entry.viability_blocked")
+        assert _is_journal_only("runtime.entry_blocked_lifecycle")
+        assert _is_journal_only("runtime.entry_blocked_lifecycle_selection")
         assert _is_journal_only("runtime.lifecycle_changed")
         assert _is_journal_only("runtime.risk_mode_changed")
         assert _is_journal_only("runtime.booting")

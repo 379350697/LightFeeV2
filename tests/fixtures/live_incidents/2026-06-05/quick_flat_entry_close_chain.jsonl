@@ -1,0 +1,5 @@
+{"ts_ms":1780163908000,"kind":"execution.entry_selected","payload":{"entry_id":"entry-quick-flat","symbol":"MAGMAUSDT","first_funding_timestamp_ms":1780163940000,"funding_timestamp_ms":1780163940000}}
+{"ts_ms":1780163910000,"kind":"entry.opened","payload":{"position_id":"entry-quick-flat","symbol":"MAGMAUSDT","funding_timestamp_ms":1780163940000,"opportunity_type":"aligned","exit_after_first_stage":false}}
+{"ts_ms":1780163940000,"kind":"runtime.funding_capture_state_updated","payload":{"position_id":"entry-quick-flat","symbol":"MAGMAUSDT","funding_captured_before":false,"funding_captured_after":true}}
+{"ts_ms":1780163940001,"kind":"runtime.normal_close_routing_passive","payload":{"position_id":"entry-quick-flat","reason":"funding_capture"}}
+{"ts_ms":1780163940100,"kind":"exit.closed","payload":{"position_id":"entry-quick-flat","reason":"funding_capture","close_id":"close-quick-flat"}}

@@ -905,6 +905,24 @@ class TestProjectionContractsClassification:
             assert is_journal_only_kind(kind) is True
             assert is_projected_kind(kind) is False
 
+    def test_entry_blocked_lifecycle_selection_is_journal_only(self):
+        kind = "runtime.entry_blocked_lifecycle_selection"
+        assert classify_kind(kind) == "journal_only"
+        assert is_journal_only_kind(kind) is True
+        assert is_projected_kind(kind) is False
+
+    def test_entry_blocked_lifecycle_dispatch_is_journal_only(self):
+        kind = "runtime.entry_blocked_lifecycle"
+        assert classify_kind(kind) == "journal_only"
+        assert is_journal_only_kind(kind) is True
+        assert is_projected_kind(kind) is False
+
+    def test_pending_entry_viability_blocked_is_journal_only(self):
+        kind = "pending_entry.viability_blocked"
+        assert classify_kind(kind) == "journal_only"
+        assert is_journal_only_kind(kind) is True
+        assert is_projected_kind(kind) is False
+
     def test_no_overlap_between_projected_and_journal_only(self):
         overlap = ALL_PROJECTED_KINDS & ALL_JOURNAL_ONLY_KINDS
         assert overlap == set(), f"Overlap found: {overlap}"

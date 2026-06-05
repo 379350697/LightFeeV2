@@ -17,12 +17,18 @@ from tests.test_live_startup_preflight import make_test_config
 
 pytestmark = pytest.mark.live_harness
 
+_ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
+
 
 def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespace:
     return SimpleNamespace(
         symbol=symbol,
         long_venue=long_venue,
         short_venue=short_venue,
+        first_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        long_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        short_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
         entry_notional_quote=50.0,
         ranking_edge_bps=10.0,
         expected_edge_bps=10.0,

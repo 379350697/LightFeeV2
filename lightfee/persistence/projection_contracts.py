@@ -162,6 +162,9 @@ JOURNAL_ONLY_RECOVERY_KINDS: frozenset[str] = frozenset({
 })
 
 JOURNAL_ONLY_LIFECYCLE_KINDS: frozenset[str] = frozenset({
+    "pending_entry.viability_blocked",
+    "runtime.entry_blocked_lifecycle",
+    "runtime.entry_blocked_lifecycle_selection",
     "runtime.lifecycle_changed",
     "runtime.risk_mode_changed",
     "runtime.booting",

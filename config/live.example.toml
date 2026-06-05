@@ -30,6 +30,7 @@ auto_trade_enabled = true
 [strategy]
 entry_window_secs = 480
 entry_local_l2_prewarm_window_secs = 480
+entry_min_first_funding_remaining_secs = 60
 entry_notional_cap_quote = 1000.0
 live_entry_notional_cap_quote = 50.0
 min_entry_leg_notional_quote = 8.0

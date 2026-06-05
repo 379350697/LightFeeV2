@@ -8,6 +8,8 @@ Rust references:
 from __future__ import annotations
 
 import asyncio
+import json
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -143,6 +145,293 @@ def binance_fake():
 @pytest.fixture
 def okx_fake():
     return FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+
+
+def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_journal):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class ReadinessProvider:
+        def __init__(self):
+            self.calls = []
+
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            self.calls.append((candidate, now_ms))
+            return EntryReadinessDecision.allow()
+
+    config.strategy.min_scan_minutes_before_funding = 0
+    config.strategy.entry_min_first_funding_remaining_secs = 60
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    readiness_provider = ReadinessProvider()
+    runtime.entry_readiness_provider = readiness_provider
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="BTCUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 59_000,
+        funding_timestamp_ms=now_ms + 59_000,
+    )
+    blockers = {}
+    counts = Counter()
+
+    selected = runtime._select_entry_candidates(
+        [candidate],
+        now_ms=now_ms,
+        remaining_slots=1,
+        selection_blocker_counts=counts,
+        candidate_blockers=blockers,
+    )
+
+    assert selected == []
+    assert counts["entry_blocked_first_funding_too_close"] == 1
+    pair_id = "btcusdt:binance->bybit"
+    assert blockers[pair_id] == "entry_blocked_first_funding_too_close"
+    assert readiness_provider.calls == []
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    kind_counts = Counter(record["kind"] for record in records)
+    assert kind_counts["runtime.entry_blocked_lifecycle_selection"] == 1
+    assert kind_counts["runtime.entry_blocked_local_l2_selection"] == 0
+    lifecycle_records = [
+        record
+        for record in records
+        if record["kind"] == "runtime.entry_blocked_lifecycle_selection"
+    ]
+    payload = lifecycle_records[0]["payload"]
+    assert payload["reason"] == "entry_blocked_first_funding_too_close"
+    assert payload["pair_id"] == pair_id
+    assert payload["lifecycle_evidence"] == {
+        "first_funding_timestamp_ms": now_ms + 59_000,
+        "remaining_to_first_funding_ms": 59_000,
+        "effective_min_before_ms": 60_000,
+        "source": "selection",
+    }
+    assert "readiness_evidence" not in payload
+
+
+def test_select_entry_candidates_blocks_recovery_ledger_before_readiness(
+    config, tmp_journal
+):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class ReadinessProvider:
+        def __init__(self):
+            self.calls = []
+
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            self.calls.append((candidate, now_ms))
+            return EntryReadinessDecision.allow()
+
+    config.strategy.min_scan_minutes_before_funding = 0
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    readiness_provider = ReadinessProvider()
+    runtime.entry_readiness_provider = readiness_provider
+    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"open_positions": [], "pending_entries": []},
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "bybit",
+                    "symbol": "TRXUSDT",
+                    "side": "buy",
+                    "quantity": 72.0,
+                    "reduce_only": False,
+                }
+            ],
+        },
+    )
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="BTCUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+    blockers = {}
+    counts = Counter()
+
+    selected = runtime._select_entry_candidates(
+        [candidate],
+        now_ms=now_ms,
+        remaining_slots=1,
+        selection_blocker_counts=counts,
+        candidate_blockers=blockers,
+    )
+
+    pair_id = "btcusdt:binance->bybit"
+    assert selected == []
+    assert counts["entry_blocked_recovery_ledger"] == 1
+    assert blockers[pair_id] == "entry_blocked_recovery_ledger"
+    assert readiness_provider.calls == []
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    kind_counts = Counter(record["kind"] for record in records)
+    assert kind_counts["runtime.entry_blocked_lifecycle_selection"] == 1
+    assert kind_counts["runtime.entry_blocked_local_l2_selection"] == 0
+    lifecycle_records = [
+        record
+        for record in records
+        if record["kind"] == "runtime.entry_blocked_lifecycle_selection"
+    ]
+    payload = lifecycle_records[0]["payload"]
+    assert payload["reason"] == "entry_blocked_recovery_ledger"
+    evidence = payload["lifecycle_evidence"]
+    assert evidence["source"] == "selection"
+    assert evidence["truth_available"] is True
+    assert evidence["blocking_work"][0]["kind"] == "orphan_maker_order"
+
+
+def test_select_entry_candidates_does_not_attach_lifecycle_evidence_to_readiness_block(
+    config, tmp_journal
+):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class DenyProvider:
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            return EntryReadinessDecision.block(
+                "entry_readiness_provider_denied",
+                evidence={"provider": "unit"},
+            )
+
+    config.strategy.min_scan_minutes_before_funding = 0
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.entry_readiness_provider = DenyProvider()
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="BTCUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+
+    selected = runtime._select_entry_candidates(
+        [candidate],
+        now_ms=now_ms,
+        remaining_slots=1,
+        selection_blocker_counts=Counter(),
+        candidate_blockers={},
+    )
+
+    assert selected == []
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert not [
+        record
+        for record in records
+        if record["kind"] == "runtime.entry_blocked_lifecycle_selection"
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_blocked_local_l2_selection"
+    )
+    assert payload["reason"] == "entry_readiness_provider_denied"
+    assert "lifecycle_evidence" not in payload
+    assert payload["readiness_evidence"] == {"provider": "unit"}
+
+
+def test_v1_tradeable_no_entry_reason_classifies_lifecycle_blockers():
+    from lightfee.engine.runtime import LiveRuntime
+
+    assert (
+        LiveRuntime._v1_tradeable_no_entry_reason(
+            Counter({"entry_blocked_first_funding_too_close": 1})
+        )
+        == "tradeable_candidates_blocked_by_lifecycle"
+    )
+    assert (
+        LiveRuntime._v1_tradeable_no_entry_reason(
+            Counter({"entry_blocked_recovery_ledger": 1})
+        )
+        == "tradeable_candidates_blocked_by_recovery_ledger"
+    )
+
+
+def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
+    config, tmp_journal
+):
+    from lightfee.engine.runtime import LiveRuntime
+
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+
+    runtime._emit_scan_no_entry_diagnostics(
+        reason="tradeable_candidates_blocked_by_lifecycle",
+        snapshot=SimpleNamespace(candidates=[]),
+        tradeable=[],
+        selected_candidate_count=0,
+        dispatched_candidate_count=0,
+        remaining_slots=1,
+        tradeable_selection_blocker_counts=Counter({
+            "entry_blocked_first_funding_too_close": 1,
+            "entry_blocked_recovery_ledger": 1,
+            "entry_local_l2_waiting_for_dual_ready": 2,
+        }),
+        candidate_blockers={},
+        now_ms=1_000_000,
+        admission_blocker_counts=Counter({
+            "entry_local_l2_waiting_for_primary_tracking": 3,
+        }),
+    )
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert payload["selection_bucket_counts"] == {
+        "not_primary_tracked": 3,
+        "primary_tracked_not_ready": 2,
+        "lifecycle_selection_blocked": 2,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +686,53 @@ class TestPendingEntryTracking:
         assert reason == ""
 
 
+@pytest.mark.asyncio
+async def test_dispatch_entry_rechecks_first_funding_horizon_after_selection_delay(
+    config, tmp_journal
+):
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class FailingEntryExecutor:
+        def __init__(self):
+            self.called = False
+
+        async def execute(self, _ctx):
+            self.called = True
+            raise AssertionError("dispatch lifecycle gate must block before execute")
+
+    config.strategy.min_scan_minutes_before_funding = 0
+    config.strategy.entry_min_first_funding_remaining_secs = 60
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    executor = FailingEntryExecutor()
+    runtime.entry_executor = executor
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="BTCUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 59_000,
+        funding_timestamp_ms=now_ms + 59_000,
+    )
+
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0)
+
+    assert dispatched is False
+    assert executor.called is False
+    assert any(
+        event["kind"] == "runtime.entry_blocked_lifecycle"
+        and event["payload"]["reason"] == "entry_blocked_first_funding_too_close"
+        for event in tmp_journal.read_all()
+    )
+
+
 # ---------------------------------------------------------------------------
 # EN-001: Planner-driven route and maker-leg decisions
 # ---------------------------------------------------------------------------
@@ -433,6 +769,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=500.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
     @pytest.mark.asyncio
@@ -1043,6 +1381,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=500.0,  # large enough to pass min-notional
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
         # Dispatch with valid price hint
@@ -1091,6 +1431,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=176.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
@@ -1177,6 +1519,7 @@ class TestPlannerDispatchIntegration:
     @pytest.mark.asyncio
     async def test_dispatch_entry_sets_first_stage_exit_from_v1_config(self, config, tmp_journal):
         config.strategy.staggered_exit_mode = "after_first_stage"
+        config.strategy.min_scan_minutes_before_funding = 0
         binance = FakeVenueAdapter(Venue.BINANCE)
         aster = FakeVenueAdapter(Venue.ASTER)
         adapters = {Venue.BINANCE: binance, Venue.ASTER: aster}
@@ -1515,6 +1858,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=500.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
@@ -1699,6 +2044,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=1.0,  # too small
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
@@ -1735,6 +2082,8 @@ class TestPlannerDispatchIntegration:
             opportunity_type="funding_arb",
             blocked=False,
             entry_notional_quote=500.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
         )
 
         await runtime._dispatch_entry(candidate, 5000, price_hint=0.0)

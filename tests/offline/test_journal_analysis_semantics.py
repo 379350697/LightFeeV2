@@ -11,6 +11,7 @@ from lightfee.offline.analysis.journal import (
     analyze_journal_records,
     analyze_from_store,
     analyze_journal_or_store,
+    summarize_quick_flat_events,
     VenueOrderStats,
     DailyPnLSummary,
 )
@@ -98,6 +99,106 @@ class TestEntryExitPnL:
         assert report.daily.total_pnl_quote == 12.5
         assert report.daily.total_fee_quote == 0.3
         assert report.daily.entry_count == 0
+
+
+# ── Quick-flat observability ───────────────────────────────────────────────
+
+
+class TestQuickFlatObservability:
+    def test_quick_flat_close_count_deduplicates_double_exit_closed_projection(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 1
+        assert summary["duplicate_event_count"] == 1
+
+    def test_journal_report_exposes_deduplicated_quick_flat_counts(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+        ]
+
+        report = analyze_journal_records(records)
+
+        assert report.quick_flat_count == 1
+        assert report.quick_flat_duplicate_event_count == 1
+
+    def test_quick_flat_close_without_close_id_uses_lower_confidence_key(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {"position_id": "p1", "reason": "funding_capture"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.closed",
+                "payload": {"position_id": "p1", "reason": "funding_capture"},
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 1
+        assert summary["duplicate_event_count"] == 1
+        assert summary["close_identity_confidence"] == "lower"
 
 
 # ── Recovery Evidence ──────────────────────────────────────────────────────

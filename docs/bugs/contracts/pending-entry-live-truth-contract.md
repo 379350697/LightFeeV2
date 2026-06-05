@@ -127,10 +127,19 @@ The minimum semantic surface from V1 is:
     false-green split for local-flat/exchange-nonzero or local-flat/open-order
     states.
 
+## Lifecycle Core Rows
+
+| ID | Evidence shape | Required decision | Must not happen |
+|---|---|---|---|
+| LC-01 | candidate or pending normal-entry work is inside the effective first-funding minimum horizon with no positive exposure | block normal entry risk with stable lifecycle evidence | submit new maker/hedge risk that close lane will immediately capture |
+| LC-02 | positive fill or live exposure already exists inside the funding horizon | own, recover, residualize, close, or fail-closed with evidence | discard exposure or call local flat |
+| LC-03 | quick-flat report sees duplicate `exit.closed` projections for one close identity | count one real quick flat and one duplicate observation | inflate quick-flat frequency |
+
 ## Decision Matrix
 
 | ID | Evidence shape | Required decision | Must not happen |
 |---|---|---|---|
+| LC-01 | candidate or pending normal-entry work is inside the effective first-funding minimum horizon with no positive exposure | block normal entry risk with `entry_blocked_first_funding_too_close` or `pending_entry_viability_first_funding_too_close` | submit new maker/hedge risk that close lane will immediately capture |
 | PE-01 | maker=0, hedge=0, maker order terminal no-fill, no live order, no live position | finalize `passive_unfilled`, remove pending | retain forever |
 | PE-02 | maker=0, hedge=0, maker order open or open-order truth unavailable | retain pending with `uncertain_outcome` and backoff | emit `entry.passive_unfilled` |
 | PE-03 | maker=0, hedge=0, order terminality uncertain, live maker position nonzero | retain/hydrate/cleanup/fail-closed from live truth | finalize `unfilled_zero_balanced` |

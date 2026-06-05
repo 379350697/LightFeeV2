@@ -376,6 +376,66 @@ def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_deduplicates_duplicate_quick_flat_close_events(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816040000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1779816040500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "symbol": "BTCUSDT",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+            {
+                "ts_ms": 1779816040500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "p1",
+                    "symbol": "BTCUSDT",
+                    "reason": "funding_capture",
+                    "close_id": "c1",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BTCUSDT",
+            venues=["binance", "bybit"],
+            now_ms=1779816055000,
+        )
+
+        summary = result["quick_flat_summary"]
+        assert summary["quick_flat_count"] == 1
+        assert summary["duplicate_event_count"] == 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_does_not_count_okx_global_recovery_for_non_okx_venues(monkeypatch):
     from scripts import diagnose_live as dl
 

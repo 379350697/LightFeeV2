@@ -38,6 +38,9 @@ _JOURNAL_ONLY_PREFIXES = (
 )
 
 _JOURNAL_ONLY_KINDS = frozenset({
+    "pending_entry.viability_blocked",
+    "runtime.entry_blocked_lifecycle",
+    "runtime.entry_blocked_lifecycle_selection",
     "runtime.lifecycle_changed",
     "runtime.risk_mode_changed",
 })

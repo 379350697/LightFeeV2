@@ -17,6 +17,21 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest V1 trading lifecycle core local follow-up, 2026-06-05: entry,
+pending-entry, recovery, close-facing funding facts, and quick-flat
+observability now route through a shared lifecycle semantic surface instead of
+symbol-specific branches. The local implementation added shared
+`FundingLifecycle` facts, a pure `V1TradingLifecycle` facade, selection and
+dispatch lifecycle gates, pending-entry zero-fill viability gating, sanitized
+quick-flat replay coverage, and duplicate `exit.closed` de-duplication in
+offline/diagnose summaries. Task 10 found no duplicate runtime first-funding
+horizon branch to remove; the remaining `60_000` literals were unrelated
+diagnostic/rate-limit or V1 finalization/prewarm timing, so that task was
+accepted as a no-op/mismatch inventory rather than an unsafe broad cleanup. New
+contract rows `LC-01` through `LC-03` document the shared lifecycle decisions.
+This pass is local evidence only: no orders, cancels, runtime-state edits,
+commit, deploy, or production acceptance claim.
+
 Latest exchange-truth recovery ledger V1 parity follow-up, 2026-06-05: the
 post-contract `TRXUSDT` and `SEIUSDT` evidence is now handled as one V1-style
 runtime recovery-ledger boundary, not another CL-specific patch. V2 now has a

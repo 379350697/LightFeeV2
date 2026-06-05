@@ -84,12 +84,15 @@ _FAIL_CLOSED_PREFIX = "runtime.fail_closed"
 # These stay journal-first. Selected recovery kinds still get rebuildable
 # lifecycle-ledger rows, but never drive runtime recovery from the projection.
 _JOURNAL_ONLY_KINDS = frozenset({
+    "pending_entry.viability_blocked",
     "recovery.live_detected",
     "recovery.flat",
     "recovery.blocked",
     "recovery.mismatch_detected",
     "recovery.mismatch_flattened",
     "recovery.resumed",
+    "runtime.entry_blocked_lifecycle",
+    "runtime.entry_blocked_lifecycle_selection",
     "runtime.lifecycle_changed",
     "runtime.risk_mode_changed",
     "runtime.booting",

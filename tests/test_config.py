@@ -12,6 +12,26 @@ from lightfee.config.validation import validate_config
 from lightfee.core.errors import ConfigError
 
 
+def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
+    from lightfee.config.schema import StrategyConfig
+
+    cfg = StrategyConfig()
+
+    assert cfg.entry_min_first_funding_remaining_secs == 60
+
+
+def test_strategy_config_rejects_negative_first_funding_horizon():
+    from lightfee.config.schema import AppConfig
+    from lightfee.config.validation import validate_config
+
+    cfg = AppConfig()
+    cfg.strategy.entry_min_first_funding_remaining_secs = -1
+
+    issues = validate_config(cfg)
+
+    assert any("entry_min_first_funding_remaining_secs" in issue for issue in issues)
+
+
 class TestChillybotRejection:
     def test_rejects_chillybot_api_base_in_raw_toml(self):
         raw = {"runtime": {"chillybot_api_base": "https://api.chillybot.xyz"}}

@@ -67,6 +67,33 @@ def make_test_config(temp_dir: str) -> AppConfig:
     )
 
 
+_ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
+
+
+def _admissible_dispatch_candidate(
+    *,
+    symbol: str,
+    long_venue: str,
+    short_venue: str,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        symbol=symbol,
+        long_venue=long_venue,
+        short_venue=short_venue,
+        first_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        long_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        short_funding_timestamp_ms=_ADMISSIBLE_FIRST_FUNDING_MS,
+        entry_notional_quote=50.0,
+        ranking_edge_bps=10.0,
+        expected_edge_bps=10.0,
+        funding_edge_bps=0.0,
+        worst_case_edge_bps=8.0,
+        blocked=False,
+        blocked_reasons=[],
+    )
+
+
 class TestBootstrapHelpers:
     """Test bootstrap utility functions."""
 
@@ -180,17 +207,10 @@ class TestRuntimePreflight:
 
             executor = RejectingExecutor()
             runtime.entry_executor = executor
-            candidate = SimpleNamespace(
+            candidate = _admissible_dispatch_candidate(
                 symbol="LITEUSDT",
                 long_venue="bybit",
                 short_venue="binance",
-                entry_notional_quote=50.0,
-                ranking_edge_bps=10.0,
-                expected_edge_bps=10.0,
-                funding_edge_bps=0.0,
-                worst_case_edge_bps=8.0,
-                blocked=False,
-                blocked_reasons=[],
             )
 
             first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
@@ -228,17 +248,10 @@ class TestRuntimePreflight:
 
             executor = RejectingExecutor()
             runtime.entry_executor = executor
-            candidate = SimpleNamespace(
+            candidate = _admissible_dispatch_candidate(
                 symbol="ESPORTSUSDT",
                 long_venue="aster",
                 short_venue="bybit",
-                entry_notional_quote=50.0,
-                ranking_edge_bps=10.0,
-                expected_edge_bps=10.0,
-                funding_edge_bps=0.0,
-                worst_case_edge_bps=8.0,
-                blocked=False,
-                blocked_reasons=[],
             )
 
             first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
@@ -326,17 +339,10 @@ class TestRuntimePreflight:
 
             executor = RejectingExecutor()
             runtime.entry_executor = executor
-            candidate = SimpleNamespace(
+            candidate = _admissible_dispatch_candidate(
                 symbol=symbol,
                 long_venue=venue,
                 short_venue="bybit" if venue != "bybit" else "binance",
-                entry_notional_quote=50.0,
-                ranking_edge_bps=10.0,
-                expected_edge_bps=10.0,
-                funding_edge_bps=0.0,
-                worst_case_edge_bps=8.0,
-                blocked=False,
-                blocked_reasons=[],
             )
 
             assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0) is True

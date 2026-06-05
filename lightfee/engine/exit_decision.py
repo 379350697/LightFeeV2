@@ -15,6 +15,7 @@ from typing import Optional
 
 from lightfee.config.schema import StrategyConfig
 from lightfee.engine.exit import ExitReason
+from lightfee.engine.funding_lifecycle import FundingLifecycle
 from lightfee.engine.state import OpenPosition
 
 # Rust V1 const (line 38): POSITION_DELTA_WARNING_STOP_LOSS_FRACTION
@@ -197,9 +198,10 @@ def remaining_close_delay_active(
     """
     # Aligned position: delay from funding_timestamp_ms
     if position.opportunity_type == "aligned" and position.matched_quantity > 0:
-        if position.funding_timestamp_ms <= 0:
+        funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+        if funding_ms <= 0:
             return False
-        if now_ms < position.funding_timestamp_ms + delay_ms:
+        if now_ms < funding_ms + delay_ms:
             return True
 
     # Post-settlement-half-close delay
@@ -223,9 +225,10 @@ def aligned_settlement_delay_elapsed(
         return False
     if position.matched_quantity <= 0:
         return False
-    if position.funding_timestamp_ms <= 0:
+    funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+    if funding_ms <= 0:
         return False
-    return now_ms >= position.funding_timestamp_ms + delay_ms
+    return now_ms >= funding_ms + delay_ms
 
 
 def force_close_due(
@@ -241,10 +244,11 @@ def force_close_due(
         return False
     if position.matched_quantity <= 0:
         return False
-    if position.funding_timestamp_ms <= 0:
+    funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+    if funding_ms <= 0:
         return False
     force_ms = config.settlement_force_close_delay_secs * 1000
-    return now_ms >= position.funding_timestamp_ms + force_ms
+    return now_ms >= funding_ms + force_ms
 
 
 def passive_close_fallback_due(
@@ -269,9 +273,14 @@ def passive_close_fallback_due(
         and position.second_stage_enabled_at_entry
         and not position.exit_after_first_stage
     ):
-        base_ms = max(position.second_funding_timestamp_ms, position.funding_timestamp_ms)
+        funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+        second_funding_ms = FundingLifecycle.position_positive_ms(
+            position.second_funding_timestamp_ms
+        )
+        base_ms = max(second_funding_ms, funding_ms)
     else:
-        base_ms = position.funding_timestamp_ms
+        funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+        base_ms = funding_ms
 
     if base_ms <= 0:
         return False
@@ -299,26 +308,32 @@ def update_position_funding_capture_state(
     second_stage_funding_quote, and peak_net_quote on capture events.
     """
     # Stage 1: primary funding
-    if position.funding_timestamp_ms <= 0:
+    funding_ms = FundingLifecycle.position_positive_ms(position.funding_timestamp_ms)
+    if funding_ms <= 0:
         return
-    hold_deadline = position.funding_timestamp_ms + post_funding_hold_ms
+    hold_deadline = funding_ms + post_funding_hold_ms
     if not position.funding_captured and now_ms >= hold_deadline:
         position.funding_captured = True
         # captured_funding_quote is set by entry; keep existing if already computed
         if position.captured_funding_quote > 0:
             position.peak_net_quote = max(position.peak_net_quote, position.current_net_quote)
 
-    # Stage 2: second funding leg (Staggered only)
     if (
         position.funding_captured
         and position.second_stage_enabled_at_entry
         and not position.second_stage_funding_captured
-        and position.second_funding_timestamp_ms > position.funding_timestamp_ms
     ):
-        second_hold = position.second_funding_timestamp_ms + post_funding_hold_ms
-        if now_ms >= second_hold:
-            position.second_stage_funding_captured = True
-            position.peak_net_quote = max(position.peak_net_quote, position.current_net_quote)
+        # Stage 2: second funding leg (Staggered only)
+        second_funding_ms = FundingLifecycle.position_positive_ms(
+            position.second_funding_timestamp_ms
+        )
+        if second_funding_ms > funding_ms:
+            second_hold = second_funding_ms + post_funding_hold_ms
+            if now_ms >= second_hold:
+                position.second_stage_funding_captured = True
+                position.peak_net_quote = max(
+                    position.peak_net_quote, position.current_net_quote
+                )
 
 
 # ---------------------------------------------------------------------------

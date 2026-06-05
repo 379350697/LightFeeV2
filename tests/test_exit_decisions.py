@@ -29,6 +29,7 @@ from lightfee.engine.exit_decision import (
     standard_close_reason,
     update_position_funding_capture_state,
 )
+from lightfee.engine.funding_lifecycle import FundingLifecycle
 from lightfee.engine.state import OpenPosition
 
 
@@ -59,6 +60,30 @@ def _make_position(**overrides) -> OpenPosition:
 
 def _config(**overrides) -> StrategyConfig:
     return StrategyConfig(**overrides)
+
+
+# ---------------------------------------------------------------------------
+# Funding lifecycle parity
+# ---------------------------------------------------------------------------
+
+
+class TestFundingLifecycleParity:
+    def test_first_funding_timestamp_matches_open_position_primary_timestamp(self):
+        pos = _make_position(funding_timestamp_ms=1000000)
+
+        assert FundingLifecycle.first_funding_ms(pos) == 1000000
+
+    def test_entry_horizon_uses_existing_strategy_min_scan_floor(self):
+        now_ms = 1000000
+        pos = _make_position(funding_timestamp_ms=now_ms + 299999)
+        cfg = _config()
+
+        decision = FundingLifecycle.entry_horizon(pos, now_ms, cfg, source="position")
+
+        assert decision.allowed is False
+        assert decision.reason == "entry_blocked_first_funding_too_close"
+        assert decision.effective_min_before_ms == 300_000
+        assert decision.source == "position"
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +485,17 @@ class TestForceCloseDue:
 
 
 class TestPassiveCloseFallbackDue:
+    def test_settlement_half_base_ignores_malformed_funding_timestamps(self):
+        pos = _make_position(
+            matched_quantity=0.01,
+            funding_timestamp_ms="malformed-primary",
+            second_funding_timestamp_ms="malformed-second",
+            settlement_half_closed_at_ms=5000000,
+        )
+        cfg = _config(settlement_force_close_delay_secs=1200)
+
+        assert passive_close_fallback_due(pos, cfg, 6200001) is True
+
     def test_staggered_after_first_stage_past_force_deadline(self):
         pos = _make_position(
             opportunity_type="staggered",
@@ -515,6 +551,47 @@ class TestUpdateFundingCaptureState:
         )
         update_position_funding_capture_state(pos, 1001000, post_funding_hold_ms=30000)
         assert pos.funding_captured is False
+
+    def test_close_funding_capture_still_waits_until_funding_timestamp_plus_hold(self):
+        cfg = _config(post_funding_hold_secs=30)
+        pos = _make_position(
+            funding_timestamp_ms=1000000,
+            funding_captured=False,
+            current_net_quote=0.0,
+        )
+        hold_ms = cfg.post_funding_hold_secs * 1000
+
+        update_position_funding_capture_state(pos, 1029999, post_funding_hold_ms=hold_ms)
+        assert pos.funding_captured is False
+
+        update_position_funding_capture_state(pos, 1030000, post_funding_hold_ms=hold_ms)
+        assert pos.funding_captured is True
+
+    def test_malformed_string_funding_timestamp_preserves_legacy_type_error(self):
+        pos = _make_position(
+            funding_timestamp_ms="1000000",
+            funding_captured=False,
+        )
+
+        with pytest.raises(TypeError):
+            update_position_funding_capture_state(
+                pos,
+                1_030_000,
+                post_funding_hold_ms=30_000,
+            )
+
+    def test_second_stage_disabled_ignores_malformed_second_funding_timestamp(self):
+        pos = _make_position(
+            funding_timestamp_ms=1000000,
+            second_funding_timestamp_ms="malformed-second",
+            funding_captured=True,
+            second_stage_enabled_at_entry=False,
+            second_stage_funding_captured=False,
+        )
+
+        update_position_funding_capture_state(pos, 2000000, post_funding_hold_ms=30000)
+
+        assert pos.second_stage_funding_captured is False
 
     def test_stage1_not_captured_without_funding_timestamp(self):
         pos = _make_position(

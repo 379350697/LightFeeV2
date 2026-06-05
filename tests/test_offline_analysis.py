@@ -902,6 +902,8 @@ class TestProjectionClassification:
         assert is_journal_only_kind("recovery.mismatch_detected")
         assert is_journal_only_kind("recovery.mismatch_flattened")
         assert is_journal_only_kind("recovery.resumed")
+        assert is_journal_only_kind("pending_entry.viability_blocked")
+        assert is_journal_only_kind("runtime.entry_blocked_lifecycle_selection")
         assert is_journal_only_kind("runtime.lifecycle_changed")
         assert is_journal_only_kind("runtime.risk_mode_changed")
         assert is_journal_only_kind("runtime.booting")

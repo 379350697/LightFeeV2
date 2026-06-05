@@ -200,3 +200,9 @@ a live position without a proven owner becomes blocking `unpaired_live_position`
    the state safe. A live position, non-reduce open order, unavailable exchange
    truth, or positive fill evidence must map to ledger work before any
    production-health conclusion or entry-risk decision.
+17. For quick-flat reports, join `execution.entry_selected`, `entry.opened`,
+    `runtime.funding_capture_state_updated`, `runtime.normal_close_routing_*`,
+    and `exit.closed` by `position_id`.
+18. Deduplicate duplicate `exit.closed` projections before judging frequency.
+19. Classify each quick flat as bug, avoidable timing, unavoidable recovery, or
+    duplicate observation.

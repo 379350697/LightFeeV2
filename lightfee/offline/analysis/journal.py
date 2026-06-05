@@ -81,6 +81,12 @@ class JournalAnalysisReport:
     paper_outcome_joined_count: int = 0
     paper_outcome_by_label: dict[str, int] = field(default_factory=dict)
 
+    # Quick-flat observability
+    quick_flat_count: int = 0
+    quick_flat_duplicate_event_count: int = 0
+    quick_flat_low_confidence_event_count: int = 0
+    quick_flat_close_identity_confidence: str = "high"
+
 
 _RECOVERY_KINDS = frozenset({
     "recovery.live_detected",
@@ -111,6 +117,86 @@ _PAPER_OUTCOME_KINDS = frozenset({
     "opportunity.paper_closed",
     "opportunity.real_vs_paper_joined",
 })
+
+
+def _event_payload(event: dict) -> dict:
+    payload = event.get("payload", {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _event_ts_ms(event: dict) -> int:
+    return int(event.get("ts_ms", 0) or 0)
+
+
+def quick_flat_event_key(event: dict) -> tuple:
+    """Return the best available duplicate key for an exit.closed event."""
+    payload = _event_payload(event)
+    position_id = str(payload.get("position_id", "") or "")
+    reason = str(payload.get("reason", "") or "")
+    ts_ms = _event_ts_ms(event)
+    close_id = payload.get("close_id")
+    if close_id:
+        return (position_id, reason, str(close_id), ts_ms)
+    return (position_id, reason, ts_ms)
+
+
+def summarize_quick_flat_events(
+    records: list[dict],
+    *,
+    quick_flat_window_ms: int = 60_000,
+) -> dict[str, int | str]:
+    """Summarize quick-flat close observations without double-counting exits."""
+    entry_opened_at: dict[str, int] = {}
+    for record in records:
+        if record.get("kind") != "entry.opened":
+            continue
+        payload = _event_payload(record)
+        position_id = str(payload.get("position_id", "") or "")
+        if not position_id:
+            continue
+        ts_ms = _event_ts_ms(record)
+        if position_id not in entry_opened_at or ts_ms < entry_opened_at[position_id]:
+            entry_opened_at[position_id] = ts_ms
+
+    seen_exit_keys: set[tuple] = set()
+    quick_flat_count = 0
+    duplicate_event_count = 0
+    low_confidence_event_count = 0
+    window_ms = int(quick_flat_window_ms or 0)
+
+    for record in records:
+        if record.get("kind") != "exit.closed":
+            continue
+        payload = _event_payload(record)
+        position_id = str(payload.get("position_id", "") or "")
+        if not position_id:
+            continue
+
+        key = quick_flat_event_key(record)
+        has_close_id = bool(payload.get("close_id"))
+        if not has_close_id:
+            low_confidence_event_count += 1
+        if key in seen_exit_keys:
+            duplicate_event_count += 1
+            continue
+        seen_exit_keys.add(key)
+
+        opened_at_ms = entry_opened_at.get(position_id)
+        if opened_at_ms is None:
+            continue
+        closed_at_ms = _event_ts_ms(record)
+        elapsed_ms = closed_at_ms - opened_at_ms
+        if 0 <= elapsed_ms <= window_ms:
+            quick_flat_count += 1
+
+    close_identity_confidence = "lower" if low_confidence_event_count else "high"
+    return {
+        "quick_flat_count": quick_flat_count,
+        "duplicate_event_count": duplicate_event_count,
+        "quick_flat_duplicate_event_count": duplicate_event_count,
+        "low_confidence_event_count": low_confidence_event_count,
+        "close_identity_confidence": close_identity_confidence,
+    }
 
 
 def analyze_journal_records(
@@ -213,6 +299,18 @@ def analyze_journal_records(
             report.paper_outcome_by_label[label] = (
                 report.paper_outcome_by_label.get(label, 0) + 1
             )
+
+    quick_flat_summary = summarize_quick_flat_events(records)
+    report.quick_flat_count = int(quick_flat_summary["quick_flat_count"])
+    report.quick_flat_duplicate_event_count = int(
+        quick_flat_summary["duplicate_event_count"]
+    )
+    report.quick_flat_low_confidence_event_count = int(
+        quick_flat_summary["low_confidence_event_count"]
+    )
+    report.quick_flat_close_identity_confidence = str(
+        quick_flat_summary["close_identity_confidence"]
+    )
 
     return report
 

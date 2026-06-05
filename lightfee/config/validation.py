@@ -71,6 +71,9 @@ def validate_config(config: AppConfig) -> list[str]:
     if config.strategy.max_concurrent_positions < 0:
         issues.append("strategy.max_concurrent_positions must be >= 0")
 
+    if config.strategy.entry_min_first_funding_remaining_secs < 0:
+        issues.append("strategy.entry_min_first_funding_remaining_secs must be >= 0")
+
     if config.strategy.entry_notional_cap_quote <= 0:
         issues.append("strategy.entry_notional_cap_quote must be > 0")
 

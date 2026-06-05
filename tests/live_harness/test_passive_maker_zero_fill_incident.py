@@ -22,6 +22,7 @@ from tests.test_live_full_closure import make_test_config
 pytestmark = pytest.mark.live_harness
 
 FIXTURE = Path("tests/fixtures/live_incidents/2026-05-27/passive_maker_zero_fill.jsonl")
+_VIABLE_FIRST_FUNDING_MS = 1779816647600
 
 
 class _ZeroFillMakerAdapter:
@@ -141,6 +142,10 @@ def _pending_from_fixture() -> PendingEntry:
         maker_price=float(submitted["price"]),
         long_quantity=float(submitted["quantity"]),
         short_quantity=float(submitted["quantity"]),
+        first_funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
+        funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
+        long_funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
+        short_funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
         repost_count=1,
         zero_fill_since_ms=int(submitted["accepted_at_ms"]),
         passive_order=PendingPassiveOrder(

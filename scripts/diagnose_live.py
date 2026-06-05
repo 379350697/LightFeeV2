@@ -27,6 +27,7 @@ from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+from lightfee.offline.analysis.journal import summarize_quick_flat_events
 
 # Schema version — bump when output shape changes
 SCHEMA_VERSION = 2
@@ -2148,6 +2149,7 @@ def run_diagnose(
     for rec in all_events:
         kind = str(rec.get("kind", ""))
         event_counts[kind] = event_counts.get(kind, 0) + 1
+    quick_flat_summary = summarize_quick_flat_events(all_events)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2174,6 +2176,7 @@ def run_diagnose(
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,
+        "quick_flat_summary": quick_flat_summary,
         "l2_evidence": l2_evidence,
         "runtime_warnings": runtime_warnings,
         "production_acceptance_gate": production_acceptance_gate,

@@ -217,6 +217,11 @@ class LiveRuntime:
     _NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS = 5 * 60_000
     _ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS = 60_000
     _CANDIDATE_SYMBOL_SKIPPED_LOG_INTERVAL_MS = 60_000
+    _V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS = frozenset({
+        "entry_blocked_first_funding_too_close",
+        "entry_blocked_first_funding_missing",
+        "entry_blocked_recovery_ledger",
+    })
     _BYBIT_ERROR_DOC_URL = "https://bybit-exchange.github.io/docs/v5/error"
     _BINANCE_USDM_ERROR_DOC_URL = (
         "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
@@ -4976,6 +4981,29 @@ class LiveRuntime:
             if not await self._finalize_pending_entry(pending, entry_id, now_ms):
                 self._apply_reconcile_backoff(pending, now_ms)
             return True
+
+        if not pending.has_any_fill():
+            from lightfee.engine.v1_lifecycle import V1TradingLifecycle
+
+            decision = V1TradingLifecycle.pending_entry_viability(
+                pending,
+                now_ms=now_ms,
+                strategy=strategy,
+            )
+            if not decision.allowed:
+                self.journal.append(
+                    "pending_entry.viability_blocked",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": decision.reason,
+                        **decision.evidence,
+                        "ts_ms": now_ms,
+                    },
+                )
+                if not await self._finalize_pending_entry(pending, entry_id, now_ms):
+                    self._apply_reconcile_backoff(pending, now_ms)
+                return True
 
         metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
         pending.metadata = metadata
@@ -12069,6 +12097,11 @@ class LiveRuntime:
             return "tradeable_candidates_waiting_for_entry_local_l2_prewarm_window"
         if blockers == {"entry_local_l2_waiting_for_dual_ready"}:
             return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
+        lifecycle_blockers = LiveRuntime._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
+        if "entry_blocked_recovery_ledger" in blockers:
+            return "tradeable_candidates_blocked_by_recovery_ledger"
+        if blockers & lifecycle_blockers:
+            return "tradeable_candidates_blocked_by_lifecycle"
         return "tradeable_candidates_blocked_by_entry_local_l2_readiness"
 
     @staticmethod
@@ -12194,14 +12227,25 @@ class LiveRuntime:
         not_primary_tracked = int(
             admission_counts.get("entry_local_l2_waiting_for_primary_tracking", 0)
         )
+        lifecycle_selection_blocked = sum(
+            int(v) for k, v in tradeable_selection_blocker_counts.items()
+            if str(k) in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
+        )
         primary_tracked_not_ready = sum(
             int(v) for k, v in tradeable_selection_blocker_counts.items()
-            if k not in {"entry_local_l2_waiting_for_primary_tracking"}
+            if (
+                k not in {"entry_local_l2_waiting_for_primary_tracking"}
+                and str(k) not in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
+            )
         )
         selection_bucket_counts = {
             "not_primary_tracked": not_primary_tracked,
             "primary_tracked_not_ready": primary_tracked_not_ready,
         }
+        if lifecycle_selection_blocked > 0:
+            selection_bucket_counts[
+                "lifecycle_selection_blocked"
+            ] = lifecycle_selection_blocked
 
         payload = {
             "reason": reason,
@@ -12585,6 +12629,8 @@ class LiveRuntime:
         admission_blocker_counts: Counter | None = None,
     ) -> list:
         """V1 select_entry_candidates_from_refs parity for the final entry list."""
+        from lightfee.engine.v1_lifecycle import V1TradingLifecycle
+
         target = self._entry_selection_target(remaining_slots)
         if target <= 0:
             return []
@@ -12609,12 +12655,25 @@ class LiveRuntime:
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._candidate_pair_id(candidate)
             readiness_evidence: dict = {}
-            first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
-            blocker = (
-                self._entry_finalization_window_blocker(first_funding_ts, now_ms)
-                if first_funding_ts > 0
-                else None
+            lifecycle_evidence: dict = {}
+            decision = V1TradingLifecycle.entry_admissibility(
+                candidate,
+                now_ms=now_ms,
+                strategy=self.config.strategy,
+                recovery_ledger=getattr(self, "recovery_ledger", None),
+                source="selection",
             )
+            blocker = None
+            if not decision.allowed:
+                lifecycle_evidence = dict(getattr(decision, "evidence", {}) or {})
+                blocker = decision.reason
+            first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
+            if not blocker:
+                blocker = (
+                    self._entry_finalization_window_blocker(first_funding_ts, now_ms)
+                    if first_funding_ts > 0
+                    else None
+                )
             if not blocker:
                 blocker, readiness_evidence = (
                     self._entry_ws_bbo_subscription_blocker(candidate)
@@ -12648,10 +12707,17 @@ class LiveRuntime:
                         "reason": blocker_str,
                         "ts_ms": now_ms,
                     }
+                    if lifecycle_evidence:
+                        diagnostic_payload["lifecycle_evidence"] = lifecycle_evidence
                     if readiness_evidence:
                         diagnostic_payload["readiness_evidence"] = readiness_evidence
+                    event_kind = (
+                        "runtime.entry_blocked_lifecycle_selection"
+                        if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
+                        else "runtime.entry_blocked_local_l2_selection"
+                    )
                     self._append_runtime_diagnostic_event(
-                        "runtime.entry_blocked_local_l2_selection",
+                        event_kind,
                         diagnostic_payload,
                         now_ms=now_ms,
                         key_parts=(symbol, pair_id, blocker_str),
@@ -13050,6 +13116,7 @@ class LiveRuntime:
             ExecutionRoute,
             plan_incremental_entry_execution,
         )
+        from lightfee.engine.v1_lifecycle import V1TradingLifecycle
 
         admission_block = self._candidate_admission_block(candidate, now_ms)
         if admission_block:
@@ -13073,6 +13140,27 @@ class LiveRuntime:
                     "long_venue": getattr(candidate, "long_venue", ""),
                     "short_venue": getattr(candidate, "short_venue", ""),
                     "reason": "candidate_not_tradeable_for_selection",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
+        decision = V1TradingLifecycle.entry_admissibility(
+            candidate,
+            now_ms=now_ms,
+            strategy=self.config.strategy,
+            recovery_ledger=getattr(self, "recovery_ledger", None),
+            source="dispatch",
+        )
+        if not decision.allowed:
+            self.journal.append(
+                "runtime.entry_blocked_lifecycle",
+                {
+                    "symbol": getattr(candidate, "symbol", ""),
+                    "long_venue": getattr(candidate, "long_venue", ""),
+                    "short_venue": getattr(candidate, "short_venue", ""),
+                    "reason": decision.reason,
+                    **dict(getattr(decision, "evidence", {}) or {}),
                     "ts_ms": now_ms,
                 },
             )

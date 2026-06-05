@@ -3413,6 +3413,103 @@ class TestRealPathAbortCleanupDeadline:
         assert pending.passive_order.last_progress_state == PassiveOrderState.CANCELED
 
     @pytest.mark.asyncio
+    async def test_zero_fill_passive_repost_blocks_when_first_funding_too_close(self, tmp_path):
+        """Zero-fill pending work must not repost normal maker risk inside horizon."""
+
+        class PassiveRepostAdapter(_FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.submit_passive_order_calls: list[OrderRequest] = []
+
+            async def submit_passive_order(self, request: OrderRequest):
+                from lightfee.core.domain import PassiveOrderAck
+
+                self.submit_passive_order_calls.append(request)
+                return PassiveOrderAck(
+                    venue=request.venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    order_id="reposted-maker-order",
+                    client_order_id=request.client_order_id or "",
+                    price=request.price or 0.0,
+                    quantity=request.quantity,
+                    accepted_at_ms=1_000_000,
+                )
+
+        runtime = _make_open_runtime(
+            tmp_path,
+            min_scan_minutes_before_funding=0,
+            entry_min_first_funding_remaining_secs=60,
+            maker_entry_max_reposts=2,
+            maker_cycle_retry_delays_ms=[0],
+        )
+        maker = PassiveRepostAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = maker
+
+        pending = PendingEntry(
+            pending_id="entry-zero-fill-too-close",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=900_000,
+            maker_leg="long",
+            maker_order_id="maker-old",
+            maker_client_order_id="maker-old-cid",
+            metadata={
+                "passive_zero_fill_retry_pending": True,
+                "passive_zero_fill_retry_at_ms": 999_000,
+            },
+            first_funding_timestamp_ms=1_059_000,
+            funding_timestamp_ms=1_059_000,
+            long_funding_timestamp_ms=1_059_000,
+            short_funding_timestamp_ms=1_059_000,
+            passive_order=PendingPassiveOrder(
+                order_id="maker-old",
+                client_order_id="maker-old-cid",
+                limit_price=0.0012,
+                target_quantity=3920.0,
+                accepted_at_ms=900_000,
+                timeout_at_ms=906_000,
+                cancel_requested_at_ms=999_000,
+                last_progress_state=PassiveOrderState.CANCELED,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        handled = await runtime._handle_pending_passive_zero_fill_completion(
+            pending,
+            pending.pending_id,
+            pending.passive_order,
+            maker,
+            1_000_000,
+        )
+
+        assert handled is True
+        assert maker.submit_passive_order_calls == []
+        assert pending.pending_id not in runtime.state.pending_entries
+        records = runtime.journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "pending_entry.viability_blocked" in kinds
+        assert "entry.passive_unfilled" in kinds
+        assert "passive_maintenance.passive_entry_reposted" not in kinds
+        payload = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "pending_entry.viability_blocked"
+        ][-1]
+        assert payload["entry_id"] == pending.pending_id
+        assert payload["symbol"] == pending.symbol
+        assert payload["reason"] == "pending_entry_viability_first_funding_too_close"
+        assert payload["first_funding_timestamp_ms"] == 1_059_000
+        assert payload["remaining_to_first_funding_ms"] == 59_000
+        assert payload["effective_min_before_ms"] == 60_000
+        assert payload["source"] == "pending_entry"
+        assert payload["ts_ms"] == 1_000_000
+
+    @pytest.mark.asyncio
     async def test_abort_pending_entry_retains_when_maker_open_order_still_resting(self, tmp_path):
         """Do not remove a pending entry while its maker order is still open."""
         from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode

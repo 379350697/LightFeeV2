@@ -113,6 +113,7 @@ class RuntimeConfig:
 class StrategyConfig:
     entry_window_secs: int = 300
     entry_local_l2_prewarm_window_secs: int = 480
+    entry_min_first_funding_remaining_secs: int = 60
     post_funding_hold_secs: int = 0
     entry_notional_cap_quote: float = 1000.0
     live_entry_notional_cap_quote: float = 30.0
