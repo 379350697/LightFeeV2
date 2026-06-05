@@ -1771,7 +1771,7 @@ class TestRuntimePreflight:
 
     @pytest.mark.asyncio
     async def test_startup_builds_recovery_ledger_before_running_with_live_open_order(self):
-        """Startup must not require tests to seed runtime.recovery_ledger manually."""
+        """Startup should probe owner-evidence symbols before entering RUNNING."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.symbols = ["TRXUSDT"]
@@ -1795,11 +1795,25 @@ class TestRuntimePreflight:
                 config,
                 venue_adapters={Venue.BYBIT: OpenOrderAdapter(Venue.BYBIT)},
             )
+            runtime.journal.open()
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-trx",
+                    "symbol": "TRXUSDT",
+                    "order_id": "a84df707-efb3-4e40-bab1-641a4eb0f3d4",
+                    "client_order_id": "entry-1780595698673-TRXUSDT",
+                },
+            )
+            runtime.journal.close()
 
             await runtime.start()
 
             assert runtime.recovery_ledger is not None
-            assert runtime.recovery_ledger.work_items[0].kind == "orphan_maker_order"
+            item = runtime.recovery_ledger.work_items[0]
+            assert item.kind == "owned_pending_entry"
+            assert item.owner.owner_id == "entry-trx"
+            assert item.owner.confidence == "probable"
             assert runtime.state.recovery_blocked_reason == (
                 "exchange_truth_recovery_ledger_blocked"
             )
@@ -1810,6 +1824,65 @@ class TestRuntimePreflight:
             ]
 
             await runtime.stop()
+
+    def test_startup_recovery_ledger_symbols_include_journal_owner_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["BTCUSDT", "ETHUSDT", "TRXUSDT"]
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-trx",
+                    "symbol": "TRXUSDT",
+                    "order_id": "maker-order",
+                    "client_order_id": "maker-client",
+                },
+            )
+
+            assert runtime._startup_recovery_ledger_symbols(
+                {"resolved_symbols": config.symbols}
+            ) == ["TRXUSDT"]
+            runtime.journal.close()
+
+    def test_startup_recovery_ledger_symbols_exclude_terminal_journal_owner_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["SEIUSDT", "TRXUSDT", "WLDUSDT"]
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "order_id": "old-maker-order",
+                    "client_order_id": "old-maker-client",
+                },
+            )
+            runtime.journal.append(
+                "pending_entry.pending_entry_finalized",
+                {
+                    "entry_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "position_id": None,
+                },
+            )
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "order_id": "live-maker-order",
+                    "client_order_id": "live-maker-client",
+                },
+            )
+
+            assert runtime._startup_recovery_ledger_symbols(
+                {"resolved_symbols": config.symbols}
+            ) == ["WLDUSDT"]
+            runtime.journal.close()
 
     def test_recovery_ledger_uses_journal_owner_evidence_for_local_flat_order(self):
         """Journal order evidence should reconstruct ownership after local state is flat."""

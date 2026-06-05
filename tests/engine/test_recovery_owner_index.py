@@ -148,6 +148,45 @@ def test_journal_event_reconstructs_missing_pending_owner():
     assert owner.confidence == "probable"
 
 
+def test_terminal_journal_event_removes_reconstructed_pending_owner():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "order.passive_submitted",
+                "payload": {
+                    "entry_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "venue": "bybit",
+                    "order_id": "journal-maker-order",
+                    "client_order_id": "journal-maker-client",
+                },
+            },
+            {
+                "kind": "pending_entry.pending_entry_finalized",
+                "payload": {
+                    "entry_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "position_id": None,
+                },
+            },
+        ],
+    )
+
+    owner = index.owner_for_order(
+        ExchangeArtifact(
+            kind="open_order",
+            venue="bybit",
+            symbol="SEIUSDT",
+            order_id="journal-maker-order",
+        )
+    )
+
+    assert owner.owner_type == "exchange_order"
+    assert owner.owner_id == "journal-maker-order"
+    assert owner.confidence == "orphan"
+
+
 def test_trxusdt_order_without_owner_remains_orphan():
     index = RecoveryOwnerIndex.from_state({"pending_entries": [], "open_positions": []})
 

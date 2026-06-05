@@ -8,6 +8,18 @@ from typing import Any, Iterable, Mapping
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
 
 
+_TERMINAL_PENDING_OWNER_EVENT_KINDS = {
+    "entry.aborted",
+    "entry.opened",
+    "entry.passive_unfilled",
+    "pending_entry.hedge_residual_below_min_notional_terminalized",
+    "pending_entry.pending_entry_finalized",
+    "reconciliation.entry_cleared_flat",
+    "recovery.pending_entry_finalized",
+    "runtime.position_opened",
+}
+
+
 @dataclass
 class RecoveryOwnerIndex:
     _orders_by_id: dict[str, RecoveryOwner] = field(default_factory=dict)
@@ -31,6 +43,27 @@ class RecoveryOwnerIndex:
         index = cls.from_state(state)
         index._add_journal_events(journal_events)
         return index
+
+    @classmethod
+    def active_journal_owner_events(cls, journal_events: Iterable[Any]) -> list[Any]:
+        active_events: list[Any | None] = []
+        indexes_by_owner: dict[str, list[int]] = {}
+        for event in journal_events:
+            payload = _get(event, "payload", {})
+            if not isinstance(payload, Mapping):
+                continue
+            owner_key = _journal_owner_key(payload)
+            if _is_terminal_pending_owner_event(event) and owner_key:
+                for index in indexes_by_owner.pop(owner_key, []):
+                    active_events[index] = None
+                continue
+            order_id, client_order_id = _journal_order_identifiers(payload)
+            if not order_id and not client_order_id:
+                continue
+            active_events.append(event)
+            if owner_key:
+                indexes_by_owner.setdefault(owner_key, []).append(len(active_events) - 1)
+        return [event for event in active_events if event is not None]
 
     def owner_for_order(self, artifact: ExchangeArtifact | Any) -> RecoveryOwner:
         order_id = _text(_get(artifact, "order_id", ""))
@@ -119,28 +152,14 @@ class RecoveryOwnerIndex:
                 self._residuals_by_key[(venue, symbol)] = owner
 
     def _add_journal_events(self, journal_events: Iterable[Any]) -> None:
-        for event in journal_events:
+        for event in self.active_journal_owner_events(journal_events):
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
                 continue
-            order_id = _text(
-                payload.get("order_id")
-                or payload.get("maker_order_id")
-                or payload.get("exchange_order_id")
-            )
-            client_order_id = _text(
-                payload.get("client_order_id")
-                or payload.get("maker_client_order_id")
-                or payload.get("clientOrderId")
-            )
+            order_id, client_order_id = _journal_order_identifiers(payload)
             if not order_id and not client_order_id:
                 continue
-            owner_id = _text(
-                payload.get("entry_id")
-                or payload.get("pending_id")
-                or payload.get("position_id")
-                or payload.get("source_entry_id")
-            )
+            owner_id = _journal_owner_key(payload)
             symbol = _text(payload.get("symbol")).upper()
             owner = RecoveryOwner(
                 owner_type="journal_pending_entry",
@@ -211,6 +230,34 @@ def _normalize_venue(value: Any) -> str:
     if hasattr(value, "value"):
         value = value.value
     return _text(value).lower()
+
+
+def _journal_order_identifiers(payload: Mapping[str, Any]) -> tuple[str, str]:
+    order_id = _text(
+        payload.get("order_id")
+        or payload.get("maker_order_id")
+        or payload.get("exchange_order_id")
+    )
+    client_order_id = _text(
+        payload.get("client_order_id")
+        or payload.get("maker_client_order_id")
+        or payload.get("clientOrderId")
+    )
+    return order_id, client_order_id
+
+
+def _journal_owner_key(payload: Mapping[str, Any]) -> str:
+    return _text(
+        payload.get("entry_id")
+        or payload.get("pending_id")
+        or payload.get("position_id")
+        or payload.get("source_entry_id")
+        or payload.get("internal_entry_id")
+    )
+
+
+def _is_terminal_pending_owner_event(event: Any) -> bool:
+    return _text(_get(event, "kind", "")) in _TERMINAL_PENDING_OWNER_EVENT_KINDS
 
 
 def _text(value: Any) -> str:

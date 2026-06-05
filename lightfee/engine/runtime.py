@@ -1296,7 +1296,38 @@ class LiveRuntime:
 
     def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
         symbols = set(self._startup_position_probe_symbols(symbol_info))
+        symbols.update(self._startup_recovery_owner_journal_symbols())
         return sorted(symbol.upper() for symbol in symbols if symbol)
+
+    def _startup_recovery_owner_journal_symbols(self) -> list[str]:
+        symbols: set[str] = set()
+        for event in RecoveryOwnerIndex.active_journal_owner_events(
+            self._recovery_owner_journal_events()
+        ):
+            if isinstance(event, dict):
+                payload = event.get("payload", {})
+            else:
+                payload = getattr(event, "payload", {})
+            if not isinstance(payload, dict):
+                continue
+            symbol = str(payload.get("symbol") or "").upper()
+            if symbol and self._has_journal_order_owner_evidence(payload):
+                symbols.add(symbol)
+        return sorted(symbols)
+
+    @staticmethod
+    def _has_journal_order_owner_evidence(payload: dict[str, Any]) -> bool:
+        order_id = (
+            payload.get("order_id")
+            or payload.get("maker_order_id")
+            or payload.get("exchange_order_id")
+        )
+        client_order_id = (
+            payload.get("client_order_id")
+            or payload.get("maker_client_order_id")
+            or payload.get("clientOrderId")
+        )
+        return bool(str(order_id or "") or str(client_order_id or ""))
 
     def _recovery_owner_journal_events(self) -> list[dict[str, Any]]:
         try:
