@@ -1296,9 +1296,6 @@ class LiveRuntime:
 
     def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
         symbols = set(self._startup_position_probe_symbols(symbol_info))
-        if isinstance(symbol_info, dict):
-            symbols.update(str(item) for item in symbol_info.get("resolved_symbols", []) or [])
-        symbols.update(str(item) for item in getattr(self.config, "symbols", []) or [])
         return sorted(symbol.upper() for symbol in symbols if symbol)
 
     def _recovery_owner_journal_events(self) -> list[dict[str, Any]]:

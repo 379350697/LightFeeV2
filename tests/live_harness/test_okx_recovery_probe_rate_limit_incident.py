@@ -93,6 +93,32 @@ def test_startup_probe_symbols_do_not_expand_clean_state_to_config_universe():
         ) == ["ETHUSDT"]
 
 
+def test_startup_recovery_ledger_symbols_do_not_expand_clean_state_to_config_universe():
+    case = _load_case()
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td, case["probe_symbols"])
+        runtime = LiveRuntime(config)
+
+        assert runtime._startup_recovery_ledger_symbols(
+            {"resolved_symbols": case["probe_symbols"]}
+        ) == []
+
+        runtime.state.pending_entries["pending-eth"] = PendingEntry(
+            pending_id="pending-eth",
+            symbol="ETHUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BINANCE,
+            target_quantity=0.1,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1779804000000,
+        )
+
+        assert runtime._startup_recovery_ledger_symbols(
+            {"resolved_symbols": case["probe_symbols"]}
+        ) == ["ETHUSDT"]
+
+
 @pytest.mark.asyncio
 async def test_okx_recovery_probe_prefers_single_bulk_positions_request(monkeypatch):
     case = _load_case()
