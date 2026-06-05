@@ -1846,7 +1846,7 @@ class TestRuntimePreflight:
             ) == ["TRXUSDT"]
             runtime.journal.close()
 
-    def test_startup_recovery_ledger_symbols_exclude_terminal_journal_owner_evidence(self):
+    def test_startup_recovery_ledger_symbols_include_terminal_order_owner_facts(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.symbols = ["SEIUSDT", "TRXUSDT", "WLDUSDT"]
@@ -1881,7 +1881,7 @@ class TestRuntimePreflight:
 
             assert runtime._startup_recovery_ledger_symbols(
                 {"resolved_symbols": config.symbols}
-            ) == ["WLDUSDT"]
+            ) == ["SEIUSDT", "WLDUSDT"]
             runtime.journal.close()
 
     def test_recovery_ledger_uses_journal_owner_evidence_for_local_flat_order(self):
@@ -1922,6 +1922,60 @@ class TestRuntimePreflight:
             assert item.kind == "owned_pending_entry"
             assert item.owner.confidence == "probable"
             assert item.owner.owner_id == "entry-trx"
+            runtime.journal.close()
+
+    def test_recovery_ledger_keeps_terminal_journal_order_owned_if_exchange_order_is_live(self):
+        """V1 order facts survive terminal local events until exchange truth is flat."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "order.passive_submitted",
+                {
+                    "entry_id": "entry-stable",
+                    "symbol": "STABLEUSDT",
+                    "venue": "bybit",
+                    "order_id": "5b9dd1ec-c1be-4f9b-bf35-b34087be810a",
+                    "client_order_id": "stable-maker-client",
+                },
+            )
+            runtime.journal.append(
+                "entry.aborted",
+                {
+                    "entry_id": "entry-stable",
+                    "symbol": "STABLEUSDT",
+                    "reason": "exchange_rejected",
+                },
+            )
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "STABLEUSDT",
+                            "side": "buy",
+                            "quantity": 680.0,
+                            "price": 0.035049,
+                            "reduce_only": False,
+                            "order_id": "5b9dd1ec-c1be-4f9b-bf35-b34087be810a",
+                        }
+                    ],
+                },
+                now_ms=1780665150176,
+            )
+
+            item = ledger.work_items[0]
+            assert item.kind == "owned_pending_entry"
+            assert item.owner.owner_id == "entry-stable"
+            assert item.owner.confidence == "probable"
+            assert item.decision.reason == "live_order_has_runtime_owner"
+            assert runtime.state.recovery_blocked_reason == (
+                "exchange_truth_recovery_ledger_blocked"
+            )
             runtime.journal.close()
 
     def test_clean_recovery_ledger_clears_previous_ledger_blocker(self):

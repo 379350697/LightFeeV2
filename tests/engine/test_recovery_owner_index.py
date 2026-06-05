@@ -148,7 +148,7 @@ def test_journal_event_reconstructs_missing_pending_owner():
     assert owner.confidence == "probable"
 
 
-def test_terminal_journal_event_removes_reconstructed_pending_owner():
+def test_terminal_journal_event_keeps_submitted_order_owner_fact():
     index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},
         [
@@ -182,9 +182,9 @@ def test_terminal_journal_event_removes_reconstructed_pending_owner():
         )
     )
 
-    assert owner.owner_type == "exchange_order"
-    assert owner.owner_id == "journal-maker-order"
-    assert owner.confidence == "orphan"
+    assert owner.owner_type == "journal_pending_entry"
+    assert owner.owner_id == "entry-sei"
+    assert owner.confidence == "probable"
 
 
 def test_trxusdt_order_without_owner_remains_orphan():

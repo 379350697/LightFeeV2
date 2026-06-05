@@ -8,18 +8,6 @@ from typing import Any, Iterable, Mapping
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
 
 
-_TERMINAL_PENDING_OWNER_EVENT_KINDS = {
-    "entry.aborted",
-    "entry.opened",
-    "entry.passive_unfilled",
-    "pending_entry.hedge_residual_below_min_notional_terminalized",
-    "pending_entry.pending_entry_finalized",
-    "reconciliation.entry_cleared_flat",
-    "recovery.pending_entry_finalized",
-    "runtime.position_opened",
-}
-
-
 @dataclass
 class RecoveryOwnerIndex:
     _orders_by_id: dict[str, RecoveryOwner] = field(default_factory=dict)
@@ -46,24 +34,16 @@ class RecoveryOwnerIndex:
 
     @classmethod
     def active_journal_owner_events(cls, journal_events: Iterable[Any]) -> list[Any]:
-        active_events: list[Any | None] = []
-        indexes_by_owner: dict[str, list[int]] = {}
+        active_events: list[Any] = []
         for event in journal_events:
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
-                continue
-            owner_key = _journal_owner_key(payload)
-            if _is_terminal_pending_owner_event(event) and owner_key:
-                for index in indexes_by_owner.pop(owner_key, []):
-                    active_events[index] = None
                 continue
             order_id, client_order_id = _journal_order_identifiers(payload)
             if not order_id and not client_order_id:
                 continue
             active_events.append(event)
-            if owner_key:
-                indexes_by_owner.setdefault(owner_key, []).append(len(active_events) - 1)
-        return [event for event in active_events if event is not None]
+        return active_events
 
     def owner_for_order(self, artifact: ExchangeArtifact | Any) -> RecoveryOwner:
         order_id = _text(_get(artifact, "order_id", ""))
@@ -254,10 +234,6 @@ def _journal_owner_key(payload: Mapping[str, Any]) -> str:
         or payload.get("source_entry_id")
         or payload.get("internal_entry_id")
     )
-
-
-def _is_terminal_pending_owner_event(event: Any) -> bool:
-    return _text(_get(event, "kind", "")) in _TERMINAL_PENDING_OWNER_EVENT_KINDS
 
 
 def _text(value: Any) -> str:
