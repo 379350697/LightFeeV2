@@ -369,11 +369,14 @@ class TestPendingEntryTracking:
         )
 
         assert runtime._gate_recovery_ledger(
-            SimpleNamespace(symbol="SEIUSDT", long_venue="binance", short_venue="okx")
+            SimpleNamespace(symbol="SEIUSDT", long_venue="bybit", short_venue="okx")
         ) == (False, "recovery_ledger_blocked")
         assert runtime._gate_recovery_ledger(
             SimpleNamespace(symbol="BTCUSDT", long_venue="bybit", short_venue="okx")
-        ) == (False, "recovery_ledger_blocked")
+        ) == (True, "")
+        assert runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="SEIUSDT", long_venue="binance", short_venue="okx")
+        ) == (True, "")
         assert runtime._gate_recovery_ledger(
             SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
         ) == (True, "")
@@ -431,6 +434,101 @@ class TestPlannerDispatchIntegration:
             blocked=False,
             entry_notional_quote=500.0,
         )
+
+    @pytest.mark.asyncio
+    async def test_tick_refreshes_recovery_ledger_before_dispatch(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+
+        config.runtime.live_scan_recovery_success_count = 1
+        config.runtime.sidecar_snapshot_max_age_ms = 10_000
+        config.runtime.max_market_age_ms = 10_000
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
+                Venue.OKX: FakeVenueAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+        runtime.entry_executor = object()
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        candidate = self._candidate("BTCUSDT")
+        candidate.first_funding_timestamp_ms = 7_001 + 10 * 60_000
+        snapshot = SidecarSnapshot(
+            published_at_ms=7_000,
+            market_observed_at_ms=7_000,
+            candidates=[candidate],
+            quotes={
+                "binance:BTCUSDT": QuoteSnapshot(
+                    venue="binance",
+                    symbol="BTCUSDT",
+                    bid=50_000.0,
+                    ask=50_010.0,
+                    observed_at_ms=7_000,
+                ),
+                "okx:BTCUSDT": QuoteSnapshot(
+                    venue="okx",
+                    symbol="BTCUSDT",
+                    bid=50_000.0,
+                    ask=50_010.0,
+                    observed_at_ms=7_000,
+                )
+            },
+        )
+        order: list[str] = []
+        refreshed_symbols: list[str] = []
+
+        async def refresh(symbols, now_ms):
+            order.append("refresh")
+            refreshed_symbols.extend(symbols)
+            return None
+
+        async def dispatch(candidate, now_ms, price_hint=0.0):
+            order.append("dispatch")
+            return False
+
+        def select_candidates(candidates, **_kwargs):
+            return list(candidates)
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
+        monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.discover_tradeable_candidates",
+            lambda candidates, _strategy, _now_ms: list(candidates),
+        )
+        monkeypatch.setattr(runtime, "_refresh_recovery_ledger_for_symbols", refresh)
+        monkeypatch.setattr(runtime, "_dispatch_entry", dispatch)
+        monkeypatch.setattr(runtime, "_select_entry_candidates", select_candidates)
+
+        await runtime.tick()
+
+        assert order[:2] == ["refresh", "dispatch"]
+        assert refreshed_symbols == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_recovery_ledger_refresh_skips_metadata_only_adapter(
+        self, config, tmp_journal,
+    ):
+        class MetadataOnlyAdapter:
+            trading_capability_trusted = True
+
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.OKX: MetadataOnlyAdapter()},
+        )
+        runtime.journal = tmp_journal
+
+        ledger = await runtime._refresh_recovery_ledger_for_symbols(
+            ["BTCUSDT"],
+            7_001,
+        )
+
+        assert ledger is None
+        assert runtime.recovery_ledger is None
+        assert runtime.state.recovery_blocked_reason is None
 
     def test_untrusted_hyperliquid_transport_is_not_tradeable_for_selection(
         self, config, tmp_journal,

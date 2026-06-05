@@ -1764,6 +1764,112 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_startup_builds_recovery_ledger_before_running_with_live_open_order(self):
+        """Startup must not require tests to seed runtime.recovery_ledger manually."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["TRXUSDT"]
+
+            class OpenOrderAdapter(FakeVenueAdapter):
+                async def fetch_open_orders(self, symbol: str):
+                    assert symbol == "TRXUSDT"
+                    return [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "side": "buy",
+                            "quantity": 72.0,
+                            "price": 0.33044,
+                            "reduce_only": False,
+                            "order_id": "a84df707-efb3-4e40-bab1-641a4eb0f3d4",
+                        }
+                    ]
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BYBIT: OpenOrderAdapter(Venue.BYBIT)},
+            )
+
+            await runtime.start()
+
+            assert runtime.recovery_ledger is not None
+            assert runtime.recovery_ledger.work_items[0].kind == "orphan_maker_order"
+            assert runtime.state.recovery_blocked_reason == (
+                "exchange_truth_recovery_ledger_blocked"
+            )
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert [
+                event["kind"] for event in runtime.journal.read_all()
+                if event["kind"] == "recovery.ledger_blocked"
+            ]
+
+            await runtime.stop()
+
+    def test_recovery_ledger_uses_journal_owner_evidence_for_local_flat_order(self):
+        """Journal order evidence should reconstruct ownership after local state is flat."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-trx",
+                    "symbol": "TRXUSDT",
+                    "order_id": "maker-order",
+                    "client_order_id": "maker-client",
+                },
+            )
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "side": "buy",
+                            "quantity": 72.0,
+                            "reduce_only": False,
+                            "order_id": "maker-order",
+                        }
+                    ],
+                },
+                now_ms=1778787000000,
+            )
+
+            item = ledger.work_items[0]
+            assert item.kind == "owned_pending_entry"
+            assert item.owner.confidence == "probable"
+            assert item.owner.owner_id == "entry-trx"
+            runtime.journal.close()
+
+    def test_clean_recovery_ledger_clears_previous_ledger_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+            runtime.state.recovery_blocked_at_ms = 123
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert not ledger.has_blocking_work()
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_startup_clears_stale_blocked_reason_when_snapshot_is_clean(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)

@@ -339,3 +339,24 @@ recovery ledger boundary:
   truth, and same-symbol/venue overlap with unresolved work.
 - Production health now treats local-flat plus live non-reduce open orders as a
   critical exchange-truth mismatch, not green service health.
+
+Review-closure follow-up on 2026-06-05 closed the remaining implementation
+drift in that boundary:
+
+- Startup and tick runtime paths now refresh the ledger before startup complete
+  / entry dispatch when supported private truth probes are available.
+- Unsupported private-truth probes are skipped rather than converted into
+  ambiguous exchange-truth blockers.
+- Startup live-position mismatch cleanup and
+  `live_position_mismatch_flatten_failed` blockers remain the specific V1
+  authority and are not overwritten by generic ledger blockers.
+- Journal order evidence feeds `RecoveryOwnerIndex`, allowing live local-flat
+  orders to map to probable owned pending work.
+- `PendingEntryTerminalizer` is the removal authority for terminal pending
+  entries, including recovery normalization drops.
+- Invalid pending entries with order/fill/inflight evidence are retained and
+  risk-only blocked instead of silently dropped.
+- Ledger candidate gating blocks V1 same-symbol venue overlap but no longer
+  blocks unrelated same-venue symbols.
+- Legacy `available=False` exchange-truth payloads are treated as unavailable
+  truth.

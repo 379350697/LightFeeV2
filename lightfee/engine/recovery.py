@@ -11,9 +11,14 @@ Rust references:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from lightfee.engine.pending_entry_terminalizer import (
+    PendingEntryTerminalDecision,
+    PendingEntryTerminalizer,
+)
 from lightfee.engine.state import (
     ActiveMakerLeg,
     CloseLegRecord,
@@ -1246,7 +1251,6 @@ def normalize_engine_state(state: EngineState) -> None:
     # 0. V1 parity: migrate stale FAIL_CLOSED lifecycle → RISK_ONLY
     #    V1 has no FAIL_CLOSED lifecycle variant; FailClosed = RISK_ONLY + FAIL_CLOSED risk
     if state.lifecycle.value == "fail_closed":  # type: ignore[attr-defined]
-        from lightfee.risk.modes import EngineLifecycle
         state.lifecycle = EngineLifecycle.RISK_ONLY
         state.risk_mode = GlobalRiskMode.FAIL_CLOSED
 
@@ -1327,26 +1331,39 @@ def normalize_engine_state(state: EngineState) -> None:
     _logger = logging.getLogger("lightfee.engine.recovery")
     bad_entry_ids: list[str] = []
     for entry_id, pe in list(state.pending_entries.items()):
+        def block_or_drop_invalid(reason: str) -> bool:
+            if _pending_entry_has_exchange_evidence(pe):
+                state.recovery_blocked_reason = (
+                    "invalid_pending_entry_with_exchange_evidence"
+                )
+                state.recovery_blocked_at_ms = int(time.time() * 1000)
+                state.lifecycle = EngineLifecycle.RISK_ONLY
+                _logger.warning(
+                    "recovery: retaining pending entry %s — %s with exchange evidence",
+                    entry_id,
+                    reason,
+                )
+                return False
+            bad_entry_ids.append(entry_id)
+            _logger.warning("recovery: dropping pending entry %s — %s", entry_id, reason)
+            return True
+
         # Must have a valid symbol
         if not pe.symbol or not isinstance(pe.symbol, str) or not pe.symbol.strip():
-            bad_entry_ids.append(entry_id)
-            _logger.warning("recovery: dropping pending entry %s — empty symbol", entry_id)
+            block_or_drop_invalid("empty symbol")
             continue
         # Must have valid venues
         if not pe.long_venue or not pe.short_venue:
-            bad_entry_ids.append(entry_id)
-            _logger.warning("recovery: dropping pending entry %s — missing venue", entry_id)
+            block_or_drop_invalid("missing venue")
             continue
         # Must have positive target quantity
         try:
             qty = float(pe.target_quantity)
             if qty <= 0:
-                bad_entry_ids.append(entry_id)
-                _logger.warning("recovery: dropping pending entry %s — zero quantity", entry_id)
+                block_or_drop_invalid("zero quantity")
                 continue
         except (ValueError, TypeError):
-            bad_entry_ids.append(entry_id)
-            _logger.warning("recovery: dropping pending entry %s — unparseable quantity", entry_id)
+            block_or_drop_invalid("unparseable quantity")
             continue
         # Backfill missing timestamps
         if pe.created_at_ms <= 0:
@@ -1354,8 +1371,19 @@ def normalize_engine_state(state: EngineState) -> None:
         # Ensure reconcile backoff defaults
         if pe.reconcile_next_attempt_ms <= 0:
             pe.reconcile_next_attempt_ms = pe.created_at_ms
+    drop_decision = PendingEntryTerminalDecision(
+        outcome="invalid_pending_entry_dropped",
+        reason="invalid_pending_entry_without_exchange_evidence",
+        terminal=True,
+        allows_pending_removal=True,
+        healthy=False,
+    )
     for eid in bad_entry_ids:
-        state.pending_entries.pop(eid, None)
+        PendingEntryTerminalizer.remove_if_allowed(
+            state.pending_entries,
+            eid,
+            drop_decision,
+        )
     if bad_entry_ids:
         _logger.warning("recovery: dropped %d bad pending entries: %s", len(bad_entry_ids), bad_entry_ids)
 
@@ -1384,6 +1412,27 @@ def normalize_engine_state(state: EngineState) -> None:
     for pos in state.open_positions.values():
         if not pos.opportunity_type:
             pos.opportunity_type = "aligned"
+
+
+def _pending_entry_has_exchange_evidence(pending: PendingEntry) -> bool:
+    """True when an otherwise invalid pending entry still points at live venue truth."""
+    if (
+        pending.maker_order_id
+        or pending.hedge_order_id
+        or pending.maker_client_order_id
+        or pending.hedge_client_order_id
+        or pending.maker_inflight
+        or pending.hedge_inflight
+    ):
+        return True
+
+    def _positive_float(value: Any) -> bool:
+        try:
+            return float(value or 0.0) > 0.0
+        except (TypeError, ValueError):
+            return False
+
+    return _positive_float(pending.maker_leg_filled) or _positive_float(pending.hedge_leg_filled)
 
 
 # ---------------------------------------------------------------------------

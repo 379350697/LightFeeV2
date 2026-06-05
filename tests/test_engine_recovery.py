@@ -17,10 +17,11 @@ from lightfee.engine.recovery import (
     build_recovery_snapshot,
     clear_stale_fail_closed_if_recovery_clean,
     clear_stale_recovery_block_if_recovery_clean,
+    normalize_engine_state,
     recover_from_snapshot,
 )
-from lightfee.engine.state import EngineState, OpenPosition
-from lightfee.core.domain import Venue
+from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
+from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -169,6 +170,29 @@ class TestRecovery:
 
         assert rs.ambiguous_state
         assert getattr(rs, "has_pending_residual_repairs") is True
+
+    def test_normalize_retains_invalid_pending_entry_with_exchange_evidence(self):
+        """Bad local shape with fill/order evidence must not bypass live-truth recovery."""
+        state = EngineState(lifecycle=EngineLifecycle.RECONCILING)
+        state.pending_entries["bad-with-evidence"] = PendingEntry(
+            pending_id="bad-with-evidence",
+            symbol="",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=0.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1778787000000,
+            maker_order_id="maker-order",
+            maker_client_order_id="maker-client",
+            maker_leg_filled=1.0,
+        )
+
+        normalize_engine_state(state)
+
+        assert "bad-with-evidence" in state.pending_entries
+        assert state.recovery_blocked_reason == "invalid_pending_entry_with_exchange_evidence"
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
 
     def test_current_state_export_exposes_pending_residual_repairs(self, tmp_path):
         from lightfee.config.schema import AppConfig

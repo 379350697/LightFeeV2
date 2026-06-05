@@ -4719,6 +4719,12 @@ class TestZeroFillFinalizeV1ParityGate:
         assert unfilled[0].get("payload", {}).get("reason") == "zero_fill_unfilled_removal"
         assert unfilled[0].get("payload", {}).get("maker_leg_filled") == 0.0
         assert unfilled[0].get("payload", {}).get("hedge_leg_filled") == 0.0
+        terminalizer = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "pending_entry.terminalizer_decision"
+        ]
+        assert terminalizer[-1]["payload"]["outcome"] == "passive_unfilled"
+        assert terminalizer[-1]["payload"]["allows_pending_removal"] is True
         finalized = [
             e for e in runtime.journal.read_all()
             if e.get("kind") == "pending_entry.pending_entry_finalized"

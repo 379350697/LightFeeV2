@@ -432,7 +432,15 @@ class RecoveryLedger:
             if not item.blocking:
                 continue
             if candidate_symbol and item.symbol and candidate_symbol == item.symbol:
-                return False
+                if not candidate_venues or not item.venues or candidate_venues & item.venues:
+                    return False
+                continue
+            if (
+                candidate_symbol
+                and item.symbol
+                and candidate_symbol != item.symbol
+            ):
+                continue
             if candidate_venues and item.venues and candidate_venues & item.venues:
                 return False
         return True
@@ -479,6 +487,10 @@ def _as_items(value: Any) -> list[Any]:
 def _truth_available(exchange_truth: Any) -> bool:
     if exchange_truth is None:
         return False
+    if isinstance(exchange_truth, Mapping) and "truth_available" in exchange_truth:
+        return bool(exchange_truth.get("truth_available"))
+    if isinstance(exchange_truth, Mapping) and "available" in exchange_truth:
+        return bool(exchange_truth.get("available"))
     return bool(_get(exchange_truth, "truth_available", True))
 
 

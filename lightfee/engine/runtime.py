@@ -59,6 +59,11 @@ from lightfee.engine.recovery import (
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+from lightfee.engine.pending_entry_terminalizer import (
+    PendingEntryLiveTruth,
+    PendingEntryTerminalDecision,
+    PendingEntryTerminalizer,
+)
 from lightfee.engine.state import EngineState, HedgeInflight, OpenPosition
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
@@ -844,7 +849,7 @@ class LiveRuntime:
         # Build recovery dedup index from recovered pending state
         self._recovery_dedup_index = build_recovery_dedup_index(self.state)
         startup_live_probe_ms = wall_clock_now_ms()
-        await self._recover_startup_live_positions(
+        startup_live_recovery_result = await self._recover_startup_live_positions(
             self._startup_position_probe_symbols(symbol_info),
             startup_live_probe_ms,
         )
@@ -995,6 +1000,14 @@ class LiveRuntime:
         await self._recover_passive_closes()
         if not current_startup_recovery_block:
             clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
+        if startup_live_recovery_result not in {
+            "mismatch_flattened",
+            "mismatch_blocked",
+        }:
+            await self._refresh_recovery_ledger_for_symbols(
+                self._startup_recovery_ledger_symbols(symbol_info),
+                wall_clock_now_ms(),
+            )
 
         self.journal.append(
             "runtime.started",
@@ -1012,7 +1025,10 @@ class LiveRuntime:
         *,
         now_ms: int,
     ) -> RecoveryLedger:
-        owner_index = RecoveryOwnerIndex.from_state(self.state)
+        owner_index = RecoveryOwnerIndex.from_state_and_journal(
+            self.state,
+            self._recovery_owner_journal_events(),
+        )
         ledger = RecoveryLedger.from_local_and_exchange_truth(
             local=self.state,
             exchange_truth=exchange_truth,
@@ -1036,7 +1052,266 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
+        elif (
+            self.state.recovery_blocked_reason
+            == "exchange_truth_recovery_ledger_blocked"
+        ):
+            self.state.recovery_blocked_reason = None
+            self.state.recovery_blocked_at_ms = 0
+            if not self._has_local_recovery_work():
+                set_lifecycle(self.state, EngineLifecycle.RUNNING)
+            self.journal.append(
+                "recovery.ledger_clear",
+                {
+                    "reason": "exchange_truth_recovery_ledger_clean",
+                    "ts_ms": now_ms,
+                },
+            )
         return ledger
+
+    async def _refresh_recovery_ledger_for_symbols(
+        self,
+        symbols: list[str],
+        now_ms: int,
+    ) -> RecoveryLedger | None:
+        symbols = sorted({str(symbol or "").upper() for symbol in symbols if symbol})
+        if not symbols or not self._venue_adapters:
+            return None
+        exchange_truth = await self._collect_recovery_ledger_exchange_truth(
+            symbols,
+            now_ms,
+        )
+        if not exchange_truth.get("truth_supported", True):
+            return None
+        return self._refresh_recovery_ledger_from_exchange_truth(
+            exchange_truth,
+            now_ms=now_ms,
+        )
+
+    async def _collect_recovery_ledger_exchange_truth(
+        self,
+        symbols: list[str],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        positions: list[dict[str, Any]] = []
+        open_orders: list[dict[str, Any]] = []
+        probe_evidence: list[dict[str, Any]] = []
+        errors: list[str] = []
+        truth_probe_count = 0
+
+        for venue, adapter in self._venue_adapters.items():
+            venue_name = venue.value if hasattr(venue, "value") else str(venue)
+            for symbol in symbols:
+                fetch_position = getattr(adapter, "fetch_position", None)
+                if not callable(fetch_position):
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "endpoint": "fetch_position",
+                            "method": "fetch_position",
+                            "finished_at_ms": now_ms,
+                            "classification": "position_truth_unsupported",
+                        }
+                    )
+                else:
+                    try:
+                        position = await fetch_position(symbol)
+                        truth_probe_count += 1
+                        positions.append(
+                            self._recovery_ledger_position_payload(
+                                position,
+                                venue_name=venue_name,
+                                symbol=symbol,
+                            )
+                        )
+                        probe_evidence.append(
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol,
+                                "endpoint": "fetch_position",
+                                "method": "fetch_position",
+                                "finished_at_ms": now_ms,
+                                "classification": "position_truth",
+                            }
+                        )
+                    except NotImplementedError:
+                        probe_evidence.append(
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol,
+                                "endpoint": "fetch_position",
+                                "method": "fetch_position",
+                                "finished_at_ms": now_ms,
+                                "classification": "position_truth_unsupported",
+                            }
+                        )
+                    except Exception as exc:
+                        truth_probe_count += 1
+                        errors.append(f"{venue_name}:{symbol}:position:{exc}")
+                        probe_evidence.append(
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol,
+                                "endpoint": "fetch_position",
+                                "method": "fetch_position",
+                                "finished_at_ms": now_ms,
+                                "classification": "position_truth_error",
+                                "error": str(exc),
+                            }
+                        )
+
+                fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+                if not callable(fetch_open_orders):
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "endpoint": "fetch_open_orders",
+                            "method": "fetch_open_orders",
+                            "finished_at_ms": now_ms,
+                            "classification": "open_order_truth_unsupported",
+                        }
+                    )
+                    continue
+                try:
+                    rows = await fetch_open_orders(symbol)
+                    truth_probe_count += 1
+                    for row in self._recovery_ledger_open_order_payloads(
+                        rows,
+                        venue_name=venue_name,
+                        symbol=symbol,
+                    ):
+                        open_orders.append(row)
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "endpoint": "fetch_open_orders",
+                            "method": "fetch_open_orders",
+                            "finished_at_ms": now_ms,
+                            "classification": "open_order_truth",
+                        }
+                    )
+                except NotImplementedError:
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "endpoint": "fetch_open_orders",
+                            "method": "fetch_open_orders",
+                            "finished_at_ms": now_ms,
+                            "classification": "open_order_truth_unsupported",
+                        }
+                    )
+                except Exception as exc:
+                    truth_probe_count += 1
+                    errors.append(f"{venue_name}:{symbol}:open_orders:{exc}")
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "endpoint": "fetch_open_orders",
+                            "method": "fetch_open_orders",
+                            "finished_at_ms": now_ms,
+                            "classification": "open_order_truth_error",
+                            "error": str(exc),
+                        }
+                    )
+
+        return {
+            "truth_supported": truth_probe_count > 0,
+            "truth_available": not errors,
+            "positions": positions,
+            "open_orders": open_orders,
+            "probe_evidence": probe_evidence,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def _recovery_ledger_position_payload(
+        position: Any,
+        *,
+        venue_name: str,
+        symbol: str,
+    ) -> dict[str, Any]:
+        side = getattr(position, "side", "")
+        if hasattr(side, "value"):
+            side = side.value
+        return {
+            "venue": str(getattr(position, "venue", venue_name) or venue_name).lower(),
+            "symbol": str(getattr(position, "symbol", symbol) or symbol).upper(),
+            "side": str(side or "").lower(),
+            "quantity": float(getattr(position, "quantity", 0.0) or 0.0),
+            "entry_price": float(getattr(position, "entry_price", 0.0) or 0.0),
+            "observed_at_ms": int(getattr(position, "observed_at_ms", 0) or 0),
+        }
+
+    @staticmethod
+    def _recovery_ledger_open_order_payloads(
+        rows: Any,
+        *,
+        venue_name: str,
+        symbol: str,
+    ) -> list[dict[str, Any]]:
+        if rows is None:
+            return []
+        if isinstance(rows, dict) and rows.get("error"):
+            raise RuntimeError(str(rows.get("error")))
+        if isinstance(rows, dict):
+            iterable = list(rows.values())
+        elif isinstance(rows, (list, tuple, set)):
+            iterable = list(rows)
+        else:
+            iterable = [rows]
+
+        result: list[dict[str, Any]] = []
+        for row in iterable:
+            if isinstance(row, dict):
+                result.append(
+                    {
+                        "venue": str(row.get("venue") or venue_name).lower(),
+                        "symbol": str(row.get("symbol") or symbol).upper(),
+                        "side": str(row.get("side") or "").lower(),
+                        "quantity": float(
+                            row.get("quantity", row.get("qty", 0.0)) or 0.0
+                        ),
+                        "price": float(row.get("price", 0.0) or 0.0),
+                        "reduce_only": bool(row.get("reduce_only", False)),
+                        "order_id": str(row.get("order_id") or row.get("id") or ""),
+                        "client_order_id": str(
+                            row.get("client_order_id")
+                            or row.get("clientOrderId")
+                            or row.get("order_link_id")
+                            or ""
+                        ),
+                    }
+                )
+        return result
+
+    def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
+        symbols = set(self._startup_position_probe_symbols(symbol_info))
+        if isinstance(symbol_info, dict):
+            symbols.update(str(item) for item in symbol_info.get("resolved_symbols", []) or [])
+        symbols.update(str(item) for item in getattr(self.config, "symbols", []) or [])
+        return sorted(symbol.upper() for symbol in symbols if symbol)
+
+    def _recovery_owner_journal_events(self) -> list[dict[str, Any]]:
+        try:
+            return self.journal.read_all()
+        except Exception:
+            return []
+
+    def _has_local_recovery_work(self) -> bool:
+        return any(
+            (
+                self.state.open_positions,
+                self.state.pending_entries,
+                self.state.pending_closes,
+                self.state.pending_passive_closes,
+                getattr(self.state, "pending_residual_repairs", []) or [],
+            )
+        )
 
     @staticmethod
     def _recovery_ledger_work_item_payload(item) -> dict[str, Any]:
@@ -1106,23 +1381,23 @@ class LiveRuntime:
         now_ms: int,
         *,
         source: str = "startup_live_position_probe",
-    ) -> None:
+    ) -> str:
         """Detect balanced exchange positions that local snapshot/journal missed."""
         if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
-            return
+            return "skipped"
         if not self._venue_adapters:
-            return
+            return "skipped"
         if (
             self.state.open_positions
             or self.state.pending_entries
             or self.state.pending_closes
             or self.state.pending_passive_closes
         ):
-            return
+            return "local_recovery_work"
 
         snapshots = await self._fetch_startup_live_position_snapshots(symbols)
         if not snapshots:
-            return
+            return "no_live_positions"
 
         created, recovered_indices = self._hydrate_balanced_startup_live_positions(
             snapshots, now_ms, source=source
@@ -1143,7 +1418,7 @@ class LiveRuntime:
                     recovered_open_positions=created,
                     reason="live_position_mismatch_flatten_failed",
                 )
-                return
+                return "mismatch_blocked"
         if created or mismatches:
             self.journal.append(
                 "recovery.live_position_probe_complete",
@@ -1154,6 +1429,11 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
+        if mismatches:
+            return "mismatch_flattened"
+        if created:
+            return "balanced_recovered"
+        return "no_recovery_needed"
 
     def _block_unpaired_startup_live_positions(
         self,
@@ -3590,6 +3870,16 @@ class LiveRuntime:
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
             self.state.last_scan["dispatched_candidate_count"] = 0
+            await self._refresh_recovery_ledger_for_symbols(
+                sorted(
+                    {
+                        str(getattr(candidate, "symbol", "") or "").upper()
+                        for candidate in tradeable
+                        if getattr(candidate, "symbol", "")
+                    }
+                ),
+                now_ms,
+            )
             if not tradeable:
                 self.state.last_scan["no_entry_reason"] = "no_tradeable_candidates"
             if tradeable:
@@ -8257,6 +8547,25 @@ class LiveRuntime:
                     now_ms,
                 ):
                     return False
+                decision = PendingEntryTerminalizer().decide(
+                    pending,
+                    live_truth=PendingEntryLiveTruth(
+                        available=True,
+                        has_live_open_order=False,
+                        has_live_position=False,
+                    ),
+                )
+                self.journal.append(
+                    "pending_entry.terminalizer_decision",
+                    self._pending_entry_terminalizer_decision_payload(
+                        entry_id,
+                        pending,
+                        decision,
+                        now_ms,
+                    ),
+                )
+                if not decision.allows_pending_removal:
+                    return False
                 # V1: !has_any_fill → zero-fill, safe to remove as passive_unfilled
                 self.journal.append(
                     "entry.passive_unfilled",
@@ -8294,6 +8603,21 @@ class LiveRuntime:
             # entry_sync.rs:5436-5443: if let Some(task) = residual_task {
             #   persist_pending_residual_repair(task, "incremental_entry_open_unmatched_residual")
             # }
+            decision = PendingEntryTerminalizer().decide(
+                pending,
+                live_truth=PendingEntryLiveTruth(available=True),
+            )
+            self.journal.append(
+                "pending_entry.terminalizer_decision",
+                self._pending_entry_terminalizer_decision_payload(
+                    entry_id,
+                    pending,
+                    decision,
+                    now_ms,
+                ),
+            )
+            if not decision.allows_pending_removal:
+                return False
             if residual_task is not None:
                 self._queue_pending_residual_repair(
                     residual_task,
@@ -8334,6 +8658,22 @@ class LiveRuntime:
             return True
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
+        decision = PendingEntryTerminalizer().decide(
+            pending,
+            live_truth=PendingEntryLiveTruth(available=True),
+        )
+        self.journal.append(
+            "pending_entry.terminalizer_decision",
+            self._pending_entry_terminalizer_decision_payload(
+                entry_id,
+                pending,
+                decision,
+                now_ms,
+            ),
+        )
+        if not decision.allows_pending_removal:
+            return False
+
         open_maker_fill_quantity = min(
             float(pending.maker_leg_filled or 0.0),
             balanced_quantity,
@@ -10218,6 +10558,30 @@ class LiveRuntime:
         no longer the V1-safe action.
         """
         self.state.pending_entries.pop(entry_id, None)
+
+    @staticmethod
+    def _pending_entry_terminalizer_decision_payload(
+        entry_id: str,
+        pending: Any,
+        decision: PendingEntryTerminalDecision,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        return {
+            "entry_id": entry_id,
+            "symbol": getattr(pending, "symbol", ""),
+            "outcome": decision.outcome,
+            "reason": decision.reason,
+            "terminal": decision.terminal,
+            "allows_pending_removal": decision.allows_pending_removal,
+            "healthy": decision.healthy,
+            "operator_block_required": decision.operator_block_required,
+            "matched_quantity": decision.matched_quantity,
+            "residual_quantity": decision.residual_quantity,
+            "contains_positive_fill_evidence": (
+                decision.contains_positive_fill_evidence
+            ),
+            "ts_ms": now_ms,
+        }
 
     def _gate_entry_sizing(self, candidate) -> tuple[bool, str]:
         """Block entry if notional quote is zero or negative."""

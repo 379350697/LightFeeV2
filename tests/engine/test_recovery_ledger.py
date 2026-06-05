@@ -155,10 +155,40 @@ def test_unresolved_work_blocks_same_symbol_or_venue_overlap():
     assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is False
     assert ledger.allows_new_entry(
         SimpleNamespace(symbol="BTCUSDT", long_venue="bybit", short_venue="okx")
-    ) is False
+    ) is True
     assert ledger.allows_new_entry(
         SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
     ) is True
+
+
+def test_unresolved_work_blocks_same_symbol_with_venue_overlap():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_entries": [
+                {
+                    "pending_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "hyperliquid",
+                }
+            ]
+        },
+        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+    )
+
+    assert ledger.allows_new_entry(
+        SimpleNamespace(symbol="SEIUSDT", long_venue="bybit", short_venue="okx")
+    ) is False
+
+
+def test_legacy_unavailable_exchange_truth_blocks_even_without_truth_available_key():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"open_positions": [], "pending_entries": []},
+        exchange_truth={"available": False, "positions": [], "open_orders": []},
+    )
+
+    assert ledger.has_blocking_work()
+    assert ledger.work_items[0].kind == "ambiguous_exchange_truth"
 
 
 def test_owned_non_reduce_maker_order_returns_owned_cancel_decision():
