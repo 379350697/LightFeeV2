@@ -1664,6 +1664,113 @@ def _okx_instrument_missing_skipped_count(payload: dict[str, Any]) -> int:
     return 1 if payload.get("instrument_missing_error") else 0
 
 
+def _event_recovery_key(payload: dict[str, Any]) -> str:
+    for key in (
+        "position_id",
+        "entry_id",
+        "pending_id",
+        "source_entry_id",
+        "internal_entry_id",
+        "pair_id",
+    ):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    symbol = payload.get("symbol")
+    return str(symbol or "").upper()
+
+
+def _event_symbol(payload: dict[str, Any]) -> str:
+    return str(payload.get("symbol") or "").upper()
+
+
+def _is_flat_lifecycle_terminal(kind: str, payload: dict[str, Any]) -> bool:
+    if kind == "runtime.position_lifecycle_terminal":
+        return str(payload.get("terminal_state", "") or "").lower() == "flat"
+    if kind in {
+        "exit.closed",
+        "exit.passive_close_fallback_terminal_flat",
+        "exit.passive_close_recovery_probe_flat",
+        "recovery.flat",
+    }:
+        return True
+    if kind == "runtime.position_drift_corrected":
+        to_state = str(payload.get("to", payload.get("state", "")) or "").lower()
+        return to_state in {"flat", "closed"}
+    return False
+
+
+def _is_residual_completion(kind: str, payload: dict[str, Any]) -> bool:
+    if kind in {
+        "execution.residual_repair_completed",
+        "recovery.residual_repairs_complete",
+    }:
+        return True
+    if kind == "execution.residual_repair_terminal":
+        reason = str(payload.get("terminal_reason", "") or "").lower()
+        return bool(reason)
+    return False
+
+
+def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    opened_keys: set[str] = set()
+    terminal_keys: set[str] = set()
+    residual_keys: set[str] = set()
+    residual_completed_keys: set[str] = set()
+    all_residuals_completed = False
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = _payload_dict(rec)
+        reason = str(payload.get("reason", "") or "")
+        key = _event_recovery_key(payload)
+        symbol = _event_symbol(payload)
+
+        if kind in {"entry.opened", "runtime.position_opened"} and key:
+            opened_keys.add(key)
+
+        if key and _is_flat_lifecycle_terminal(kind, payload):
+            terminal_keys.add(key)
+
+        if "residual" in kind or "residual" in reason:
+            residual_key = symbol or key
+            if residual_key:
+                residual_keys.add(residual_key)
+            elif kind == "recovery.residual_repairs_complete":
+                all_residuals_completed = True
+
+        if _is_residual_completion(kind, payload):
+            residual_key = symbol or key
+            if residual_key:
+                residual_completed_keys.add(residual_key)
+            else:
+                all_residuals_completed = True
+
+    closed_open_keys = opened_keys & terminal_keys
+    unclosed_open_keys = opened_keys - terminal_keys
+    if all_residuals_completed:
+        unclosed_residual_keys: set[str] = set()
+    else:
+        unclosed_residual_keys = residual_keys - residual_completed_keys
+
+    return {
+        "opened_keys": sorted(opened_keys),
+        "closed_open_keys": sorted(closed_open_keys),
+        "unclosed_open_keys": sorted(unclosed_open_keys),
+        "residual_keys": sorted(residual_keys),
+        "closed_residual_keys": sorted(residual_completed_keys),
+        "unclosed_residual_keys": sorted(unclosed_residual_keys),
+        "closed_trade_lifecycle_count": len(closed_open_keys),
+        "unclosed_trade_lifecycle_count": len(unclosed_open_keys),
+        "closed_residual_lifecycle_count": (
+            len(residual_keys)
+            if all_residuals_completed
+            else len(residual_keys & residual_completed_keys)
+        ),
+        "unclosed_residual_lifecycle_count": len(unclosed_residual_keys),
+    }
+
+
 def _exchange_truth_flat(exchange_truth: dict[str, Any]) -> bool:
     if not exchange_truth.get("available"):
         return False
@@ -1777,19 +1884,56 @@ def _build_production_acceptance_gate(
         sum(fill_ratios) / len(fill_ratios)
         if fill_ratios else 0.0
     )
+    quick_flat_summary = summarize_quick_flat_events(events)
+    quick_flat_count = int(quick_flat_summary.get("quick_flat_count", 0) or 0)
+    recovery_lifecycle = _build_recovery_lifecycle_summary(events)
     open_position_count = int(local_state.get("open_position_count", 0) or 0)
     pending_entry_count = int(local_state.get("pending_entry_count", 0) or 0)
     pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
+    pending_residual_repair_count = int(
+        local_state.get(
+            "pending_residual_repair_count",
+            len(local_state.get("pending_residual_repairs", []) or []),
+        )
+        or 0
+    )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
+    local_recovery_clean = (
+        open_position_count == 0
+        and pending_entry_count == 0
+        and pending_close_count == 0
+        and pending_residual_repair_count == 0
+    )
+    exchange_recovery_clean = exchange_truth_flat and exchange_truth_no_open_orders
+    residual_lifecycle_closed = (
+        residual_count == 0
+        or (
+            local_recovery_clean
+            and exchange_recovery_clean
+            and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
+        )
+    )
+    trade_lifecycle_closed = (
+        not (entry_opened_count or position_opened_count)
+        or (
+            local_recovery_clean
+            and exchange_recovery_clean
+            and recovery_lifecycle["unclosed_trade_lifecycle_count"] == 0
+        )
+    )
 
     blocking_reasons: list[str] = []
     if open_position_count:
         blocking_reasons.append("local_open_positions_present")
     if pending_entry_count or pending_close_count:
         blocking_reasons.append("local_pending_entries_or_closes_present")
-    if residual_count:
+    if pending_residual_repair_count:
+        blocking_reasons.append("local_pending_residual_repairs_present")
+    if residual_count and not residual_lifecycle_closed:
         blocking_reasons.append("residual_events_present")
+    if quick_flat_count:
+        blocking_reasons.append("quick_flat_events_present")
     if not exchange_truth.get("available"):
         blocking_reasons.append("exchange_truth_unavailable")
     else:
@@ -1797,7 +1941,7 @@ def _build_production_acceptance_gate(
             blocking_reasons.append("exchange_truth_nonzero_position")
         if not exchange_truth_no_open_orders:
             blocking_reasons.append("exchange_truth_open_orders_present")
-    if entry_opened_count or position_opened_count:
+    if (entry_opened_count or position_opened_count) and not trade_lifecycle_closed:
         blocking_reasons.append("entry_or_position_opened_without_fixture_finalized_evidence")
 
     diagnostic_counts = {
@@ -1835,7 +1979,17 @@ def _build_production_acceptance_gate(
         "open_position_count": open_position_count,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,
+        "pending_residual_repair_count": pending_residual_repair_count,
         "residual_count": residual_count,
+        "quick_flat_count": quick_flat_count,
+        "quick_flat_duplicate_event_count": int(
+            quick_flat_summary.get("duplicate_event_count", 0) or 0
+        ),
+        "closed_trade_lifecycle_count": recovery_lifecycle["closed_trade_lifecycle_count"],
+        "unclosed_trade_lifecycle_count": recovery_lifecycle["unclosed_trade_lifecycle_count"],
+        "closed_residual_lifecycle_count": recovery_lifecycle["closed_residual_lifecycle_count"],
+        "unclosed_residual_lifecycle_count": recovery_lifecycle["unclosed_residual_lifecycle_count"],
+        "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
         "exception_conclusions": exception_conclusions,

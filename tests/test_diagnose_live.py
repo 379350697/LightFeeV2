@@ -376,6 +376,159 @@ def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_accepts_completed_residual_lifecycle(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1780657210000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1780656885719,
+                "kind": "pending_entry.missing_hedge_detected",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "maker_leg_filled": 43.8,
+                    "hedge_leg_filled": 0.0,
+                },
+            },
+            {
+                "ts_ms": 1780656919170,
+                "kind": "pending_entry.hedge_residual_below_min_notional_terminalized",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "balanced_quantity": 43.0,
+                    "residual_quantity": 0.8,
+                },
+            },
+            {
+                "ts_ms": 1780656919335,
+                "kind": "pending_entry.terminalizer_decision",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "outcome": "open_position_with_residual",
+                    "reason": "positive_fill_terminalized_with_matched_exposure",
+                    "residual_quantity": 0.8,
+                },
+            },
+            {
+                "ts_ms": 1780656917063,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "quantity": 43.0,
+                },
+            },
+            {
+                "ts_ms": 1780656919337,
+                "kind": "runtime.position_opened",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "quantity": 43.0,
+                },
+            },
+            {
+                "ts_ms": 1780656919337,
+                "kind": "execution.residual_repair_queued",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "reason": "incremental_entry_open_partially_matched",
+                },
+            },
+            {
+                "ts_ms": 1780656920603,
+                "kind": "recovery.residual_repair_failed",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "reason": "transient_retryable_exchange_error",
+                },
+            },
+            {
+                "ts_ms": 1780656926839,
+                "kind": "execution.residual_repair_completed",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "result": "filled",
+                },
+            },
+            {
+                "ts_ms": 1780656926839,
+                "kind": "recovery.residual_repairs_complete",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                },
+            },
+            {
+                "ts_ms": 1780657201807,
+                "kind": "runtime.normal_close_routing_passive",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "reason": "first_stage_capture",
+                },
+            },
+            {
+                "ts_ms": 1780657208742,
+                "kind": "exit.passive_close_fallback_terminal_flat",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                },
+            },
+            {
+                "ts_ms": 1780657208742,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-wld",
+                    "symbol": "WLDUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "pending_passive_close_flat_probe",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="WLDUSDT",
+            venues=["bybit", "hyperliquid"],
+            now_ms=1780657215000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["entry_opened_count"] == 1
+        assert gate["position_opened_count"] == 1
+        assert gate["residual_count"] >= 1
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["closed_trade_lifecycle_count"] == 1
+        assert gate["closed_residual_lifecycle_count"] == 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_deduplicates_duplicate_quick_flat_close_events(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -431,6 +584,10 @@ def test_run_diagnose_deduplicates_duplicate_quick_flat_close_events(monkeypatch
         summary = result["quick_flat_summary"]
         assert summary["quick_flat_count"] == 1
         assert summary["duplicate_event_count"] == 1
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert gate["quick_flat_count"] == 1
+        assert gate["blocking_reasons"] == ["quick_flat_events_present"]
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
