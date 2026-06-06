@@ -9,7 +9,10 @@ Validates that V2 recovery blocks/resumes with V1-equivalent semantics:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -165,6 +168,27 @@ class TestRecoveryBlockResume:
         assert state.recovery_blocked_at_ms == 0
         assert state.global_risk_reason is None
         assert hasattr(state, "last_error") is False
+
+    def test_clear_legacy_recovery_block_does_not_assign_last_error(self):
+        source = textwrap.dedent(
+            inspect.getsource(clear_legacy_recovery_block_via_core)
+        )
+        tree = ast.parse(source)
+
+        last_error_assignments = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "last_error"
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "state"
+                ):
+                    last_error_assignments.append(target)
+
+        assert last_error_assignments == []
 
 
 class TestRecoverySnapshot:

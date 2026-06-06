@@ -176,7 +176,7 @@ class TestLifecycle:
             "startup_recovery_pending_work_without_open_positions"
         )
 
-    def test_legacy_recovery_clearer_clears_obsolete_block_after_core_gap(self):
+    def test_legacy_recovery_clearer_clears_obsolete_block_without_last_error(self):
         state = EngineState()
         enter_fail_closed(state)
         state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
@@ -200,7 +200,7 @@ class TestLifecycle:
         assert state.risk_mode == GlobalRiskMode.RUNNING
         assert state.recovery_blocked_reason is None
         assert state.recovery_blocked_at_ms == 0
-        assert state.last_error is None
+        assert state.last_error == "old pending work"
 
     def test_legacy_recovery_clearer_requires_core_clear_decision(self):
         state = EngineState()

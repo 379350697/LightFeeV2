@@ -1492,8 +1492,6 @@ def clear_legacy_recovery_block_via_core(
     state.risk_mode = GlobalRiskMode.RUNNING
     state.recovery_blocked_reason = None
     state.recovery_blocked_at_ms = 0
-    if hasattr(state, "last_error"):
-        state.last_error = None
     state.global_risk_reason = None
 
     if journal is not None:
