@@ -66,6 +66,15 @@ truth-required/recovery-required evidence marks them as recovery work. Latest
 local verification passed focused core/pending-entry checks (`14 passed`), full
 pytest (`3602 passed`, `9 skipped`, `1 warning`), compileall, diff-check, and a
 fresh GitNexus detect-changes audit in the intended recovery/runtime scope.
+Cloud redeploy then fast-forwarded `/opt/lightfee-v2` to the final main closure:
+manifest verification and compileall passed, sidecar/live restarted as
+singletons with `NRestarts=0`, credentialed `.venv` diagnose reported
+high-confidence flat/no-open-orders on all seven venues, local open/pending
+counts zero, `RUNNING_CLEAN`, `gate_passed=true`, and deploy-window
+`recovery.ledger_clear=1`. The only remaining non-green signal is the default
+15s verifier tick threshold, while observed live-state ticks advance about every
+25s and the 60s verifier is green; track that as production-health cadence, not
+as recovery-core semantics.
 
 Latest pending-entry passive opening source-port closure, 2026-06-05: the
 post-quick-flat pending-entry work has been re-centered on V1 source functions
