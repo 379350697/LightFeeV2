@@ -2065,6 +2065,130 @@ class TestFallbackResidualReal:
         assert terminals[-1]["problem_reason"] == "normal_one_sided_flatten_failed_force_close"
         assert terminals[-1]["client_order_ids"]
 
+    def test_live_flat_force_close_problem_does_not_enqueue_reconciliation_in_paper(self):
+        """V1: pending-close reconciliation work is a live-runtime concern."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
+        )
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-force-reconcile",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        executor._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source="passive_close_live_one_sided_force_close_problem",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+            extra={
+                "flattened_venue": Venue.BYBIT.value,
+                "flattened_quantity": 20.0,
+                "problem": True,
+                "force_close_client_order_ids": ["bybit-force-cid"],
+                "force_close_order_ids": ["bybit-force-order"],
+            },
+        )
+
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert state.pending_close_reconciliations == []
+        assert "exit.pending_close_reconciliation_registered" not in [
+            record["kind"] for record in journal.read_all()
+        ]
+
+    def test_live_flat_force_close_problem_keeps_close_reconciliation_work(self):
+        """V1: lifecycle can clear flat while fill/PnL reconciliation continues."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-force-reconcile",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        executor._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source="passive_close_live_one_sided_force_close_problem",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+            extra={
+                "flattened_venue": Venue.BYBIT.value,
+                "flattened_quantity": 20.0,
+                "problem": True,
+                "force_close_client_order_ids": ["bybit-force-cid"],
+                "force_close_order_ids": ["bybit-force-order"],
+            },
+        )
+
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert len(state.pending_close_reconciliations) == 1
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["position_id"] == position.position_id
+        assert reconciliation["symbol"] == "BEATUSDT"
+        assert reconciliation["reason"] == "funding_capture"
+        assert reconciliation["created_cycle"] == 0
+        assert reconciliation["next_attempt_ms"] == reconciliation["closed_at_ms"]
+        assert reconciliation["position_snapshot"]["short_venue"] == Venue.BYBIT.value
+        assert reconciliation["short_legs"] == [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-force-order",
+            "client_order_id": "bybit-force-cid",
+            "quantity": 20.0,
+            "average_price": 0.0,
+            "fee_quote": 0.0,
+        }]
+
     def test_beatusdt_live_imbalanced_under_min_excess_compensates_flat(self):
         """Both live legs nonzero but imbalanced must not retry stale local dust."""
         journal = _open_journal()

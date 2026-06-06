@@ -235,6 +235,7 @@ class PassiveCloseExecutor:
         self._adapters = adapters
         self._journal = journal
         overrides = config_overrides or {}
+        self._runtime_mode = str(overrides.get("runtime_mode", "live") or "live").lower()
         self._config = PassiveCloseConfig(
             max_zero_fill_cycles=overrides.get("max_zero_fill_cycles", PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES),
             progress_poll_interval_ms=overrides.get("progress_poll_interval_ms", PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS),
@@ -2849,6 +2850,234 @@ class PassiveCloseExecutor:
         )
         return True
 
+    @staticmethod
+    def _position_snapshot_for_close_reconciliation(position: OpenPosition) -> dict[str, Any]:
+        return {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "long_venue": position.long_venue.value,
+            "short_venue": position.short_venue.value,
+            "long_quantity": position.long_quantity,
+            "short_quantity": position.short_quantity,
+            "matched_quantity": position.matched_quantity,
+            "long_entry_price": position.long_entry_price,
+            "short_entry_price": position.short_entry_price,
+            "long_entry_fee_quote": position.long_entry_fee_quote,
+            "short_entry_fee_quote": position.short_entry_fee_quote,
+            "total_entry_fee_quote": position.total_entry_fee_quote,
+            "captured_funding_quote": position.captured_funding_quote,
+            "opened_at_ms": position.opened_at_ms,
+        }
+
+    @staticmethod
+    def _close_reconciliation_record(
+        *,
+        venue: Venue,
+        order_id: str = "",
+        client_order_id: str = "",
+        quantity: float = 0.0,
+        average_price: float = 0.0,
+        fee_quote: float = 0.0,
+    ) -> dict[str, Any]:
+        return {
+            "venue": venue.value,
+            "order_id": str(order_id or ""),
+            "client_order_id": str(client_order_id or ""),
+            "quantity": float(quantity or 0.0),
+            "average_price": float(average_price or 0.0),
+            "fee_quote": float(fee_quote or 0.0),
+        }
+
+    def _pending_close_reconciliation_records(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        extra: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        long_records: list[dict[str, Any]] = []
+        short_records: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add_record(target: list[dict[str, Any]], record: dict[str, Any]) -> None:
+            key = (
+                str(record.get("venue") or ""),
+                str(record.get("order_id") or ""),
+                str(record.get("client_order_id") or ""),
+            )
+            has_identity = bool(key[1] or key[2])
+            has_fill = float(record.get("quantity") or 0.0) > 1e-12
+            if not has_identity and not has_fill:
+                return
+            if key in seen:
+                return
+            seen.add(key)
+            target.append(record)
+
+        def add_fill_state(
+            target: list[dict[str, Any]],
+            fill_state: PendingPassiveLegFill,
+            venue: Venue,
+        ) -> None:
+            add_record(
+                target,
+                self._close_reconciliation_record(
+                    venue=venue,
+                    order_id=fill_state.order_id,
+                    client_order_id=fill_state.client_order_id,
+                    quantity=fill_state.quantity,
+                    average_price=fill_state.average_price,
+                    fee_quote=fill_state.fee_quote,
+                ),
+            )
+
+        for leg in pending.long_legs:
+            fill = leg.fill
+            if fill is None:
+                continue
+            add_record(
+                long_records,
+                self._close_reconciliation_record(
+                    venue=fill.venue,
+                    order_id=fill.order_id,
+                    client_order_id=leg.client_order_id or fill.client_order_id or "",
+                    quantity=fill.quantity,
+                    average_price=fill.price,
+                    fee_quote=fill.fee_quote or 0.0,
+                ),
+            )
+        for leg in pending.short_legs:
+            fill = leg.fill
+            if fill is None:
+                continue
+            add_record(
+                short_records,
+                self._close_reconciliation_record(
+                    venue=fill.venue,
+                    order_id=fill.order_id,
+                    client_order_id=leg.client_order_id or fill.client_order_id or "",
+                    quantity=fill.quantity,
+                    average_price=fill.price,
+                    fee_quote=fill.fee_quote or 0.0,
+                ),
+            )
+
+        if pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG:
+            add_fill_state(long_records, pending.maker_fill, position.long_venue)
+            add_fill_state(short_records, pending.hedge_fill, position.short_venue)
+        else:
+            add_fill_state(short_records, pending.maker_fill, position.short_venue)
+            add_fill_state(long_records, pending.hedge_fill, position.long_venue)
+
+        if extra:
+            flattened_venue = str(extra.get("flattened_venue") or "")
+            flattened_quantity = float(extra.get("flattened_quantity") or 0.0)
+            try:
+                venue = Venue.from_str(flattened_venue)
+            except ValueError:
+                venue = None
+            if venue is not None:
+                target = (
+                    long_records
+                    if venue == position.long_venue
+                    else short_records
+                    if venue == position.short_venue
+                    else None
+                )
+                if target is not None:
+                    client_ids = [str(v) for v in extra.get("force_close_client_order_ids", []) if v]
+                    order_ids = [str(v) for v in extra.get("force_close_order_ids", []) if v]
+                    count = max(len(client_ids), len(order_ids))
+                    for idx in range(count):
+                        add_record(
+                            target,
+                            self._close_reconciliation_record(
+                                venue=venue,
+                                order_id=order_ids[idx] if idx < len(order_ids) else "",
+                                client_order_id=client_ids[idx] if idx < len(client_ids) else "",
+                                quantity=flattened_quantity if idx == 0 else 0.0,
+                            ),
+                        )
+
+        return long_records, short_records
+
+    def _register_close_reconciliation_after_live_flat(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        payload: dict[str, Any],
+        extra: dict[str, Any] | None,
+    ) -> None:
+        if self._runtime_mode != "live":
+            return
+
+        long_legs, short_legs = self._pending_close_reconciliation_records(
+            pending,
+            position,
+            extra=extra,
+        )
+        if not long_legs and not short_legs:
+            return
+
+        order_key = tuple(
+            sorted(
+                str(record.get("order_id") or record.get("client_order_id") or "")
+                for record in [*long_legs, *short_legs]
+                if record.get("order_id") or record.get("client_order_id")
+            )
+        )
+        for existing in state.pending_close_reconciliations:
+            if not isinstance(existing, dict):
+                continue
+            existing_key = tuple(
+                sorted(
+                    str(record.get("order_id") or record.get("client_order_id") or "")
+                    for record in [
+                        *existing.get("long_legs", []),
+                        *existing.get("short_legs", []),
+                    ]
+                    if isinstance(record, dict)
+                    and (record.get("order_id") or record.get("client_order_id"))
+                )
+            )
+            if (
+                existing.get("position_id") == pending.position_id
+                and existing_key == order_key
+            ):
+                return
+
+        closed_at_ms = self._now_ms()
+        reconciliation = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "kind": "final",
+            "reason": pending.reason,
+            "source": source,
+            "closed_at_ms": closed_at_ms,
+            "created_cycle": int(getattr(state, "tick_count", 0) or 0),
+            "position_snapshot": self._position_snapshot_for_close_reconciliation(position),
+            "original_payload": dict(payload),
+            "long_legs": long_legs,
+            "short_legs": short_legs,
+            "attempt_count": 0,
+            "next_attempt_ms": closed_at_ms,
+        }
+        state.pending_close_reconciliations.append(reconciliation)
+        self._journal.append(
+            "exit.pending_close_reconciliation_registered",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "source": source,
+                "long_leg_count": len(long_legs),
+                "short_leg_count": len(short_legs),
+                "order_ids": order_key,
+            },
+        )
+
     def _clear_live_flat_state(
         self,
         state: EngineState,
@@ -2923,6 +3152,14 @@ class PassiveCloseExecutor:
                     or ""
                 ),
             },
+        )
+        self._register_close_reconciliation_after_live_flat(
+            state,
+            pending,
+            position,
+            source=source,
+            payload=payload,
+            extra=extra,
         )
 
         state.pending_passive_closes.pop(pending.position_id, None)

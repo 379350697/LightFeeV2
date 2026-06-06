@@ -9,7 +9,8 @@ from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, 
 from lightfee.core.domain import OrderFillReconciliation, PositionSnapshot, Side, Venue
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import PendingEntry
+from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -33,6 +34,11 @@ def config(tmp_path):
         ),
         strategy=StrategyConfig(local_l2_enabled=False),
     )
+
+
+def _mark_live(config):
+    config.runtime.mode = "live"
+    return config
 
 
 @dataclass
@@ -172,6 +178,73 @@ class _RecordingFillAdapter(_NoFillReconciliationAdapter):
         return None
 
 
+class _CloseLegFillAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, venue: Venue, fills: dict[tuple[str, str], OrderFillReconciliation]):
+        self.venue = venue
+        self.fills = fills
+        self.fill_reconciliation_calls: list[dict] = []
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        self.fill_reconciliation_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
+        return self.fills.get((order_id, client_order_id))
+
+    async def fetch_position(self, symbol):
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY if self.venue == Venue.OKX else Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        )
+
+
+class _UnavailableCloseLegAdapter(_CloseLegFillAdapter):
+    def __init__(self, venue: Venue, *, live_quantity: float):
+        super().__init__(venue, {})
+        self.live_quantity = live_quantity
+        self.position_calls: list[str] = []
+
+    async def fetch_position(self, symbol):
+        self.position_calls.append(symbol)
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY if self.venue == Venue.OKX else Side.SELL,
+            quantity=self.live_quantity,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        )
+
+
+class _PrivateConfirmedCloseLegAdapter(_CloseLegFillAdapter):
+    def __init__(
+        self,
+        venue: Venue,
+        fills: dict[tuple[str, str], OrderFillReconciliation],
+        *,
+        cached_position: PositionSnapshot,
+    ):
+        super().__init__(venue, fills)
+        self._cached_position = cached_position
+        self.supports_private_health = True
+
+    def private_ws_worker_count(self):
+        return 1
+
+    def cached_private_connection_health(self):
+        return ConnectionHealth()
+
+    def cached_position(self, symbol):
+        if symbol == self._cached_position.symbol:
+            return self._cached_position
+        return None
+
+
 class _MetadataAdapter(_NoFillReconciliationAdapter):
     def __init__(self, venue: Venue, metadata: dict, *, venue_symbol: str | None = None):
         self.venue = venue
@@ -205,6 +278,55 @@ def _runtime(config, tmp_journal, reconciler):
     runtime.journal = tmp_journal
     runtime.reconciler = reconciler
     return runtime
+
+
+def _open_position(**overrides) -> OpenPosition:
+    values = {
+        "position_id": "active-pos",
+        "symbol": "ARIAUSDT",
+        "long_venue": Venue.OKX,
+        "short_venue": Venue.BYBIT,
+        "long_quantity": 5.0,
+        "short_quantity": 5.0,
+        "long_entry_price": 1.0,
+        "short_entry_price": 1.01,
+        "opened_at_ms": 500,
+    }
+    values.update(overrides)
+    return OpenPosition(**values)
+
+
+def _pending_close_reconciliation(**overrides) -> dict:
+    values = {
+        "position_id": "entry-force-reconcile",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "closed_at_ms": 1000,
+        "created_cycle": 1,
+        "next_attempt_ms": 1000,
+        "attempt_count": 0,
+        "position_snapshot": {
+            "position_id": "entry-force-reconcile",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    }
+    values.update(overrides)
+    return values
 
 
 def _pending_entry(**overrides):
@@ -265,6 +387,704 @@ async def test_flat_reconcile_with_not_found_maker_retains_pending_entry_like_v1
     kinds = [event["kind"] for event in tmp_journal.read_all()]
     assert "reconciliation.entry_flat_unresolved_maker_retained" in kinds
     assert "reconciliation.entry_cleared_flat" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_uses_snapshot_after_lifecycle_flat(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.0100,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+            fee_quote=0.02,
+            filled_at_ms=2000,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-force-order", "bybit-force-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.0200,
+            order_id="bybit-force-order",
+            client_order_id="bybit-force-cid",
+            fee_quote=0.03,
+            filled_at_ms=2001,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-force-reconcile", symbol="BEATUSDT")
+    )
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-force-reconcile",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-force-reconcile",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "matched_quantity": 20.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+            "quantity": 20.0,
+            "average_price": 0.0,
+            "fee_quote": 0.0,
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-force-order",
+            "client_order_id": "bybit-force-cid",
+            "quantity": 20.0,
+            "average_price": 0.0,
+            "fee_quote": 0.0,
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert long_adapter.fill_reconciliation_calls == [{
+        "symbol": "BEATUSDT",
+        "order_id": "okx-close-order",
+        "client_order_id": "okx-close-cid",
+    }]
+    assert short_adapter.fill_reconciliation_calls == [{
+        "symbol": "BEATUSDT",
+        "order_id": "bybit-force-order",
+        "client_order_id": "bybit-force-cid",
+    }]
+    records = tmp_journal.read_all()
+    kinds = [record["kind"] for record in records]
+    assert "exit.reconciled" in kinds
+    assert "reconciliation.pending_close_orphaned" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_is_live_only(config, tmp_journal):
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.01,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.02,
+            order_id="bybit-close-order",
+            client_order_id="bybit-close-cid",
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-paper-reconcile", symbol="BEATUSDT")
+    )
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-paper-reconcile",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "created_cycle": 0,
+        "next_attempt_ms": 0,
+        "position_snapshot": {
+            "position_id": "entry-paper-reconcile",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    assert long_adapter.fill_reconciliation_calls == []
+    assert short_adapter.fill_reconciliation_calls == []
+    assert "exit.reconciled" not in [record["kind"] for record in tmp_journal.read_all()]
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_waits_until_next_live_cycle(config, tmp_journal):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.01,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.02,
+            order_id="bybit-close-order",
+            client_order_id="bybit-close-cid",
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-next-cycle", symbol="BEATUSDT")
+    )
+    runtime.state.tick_count = 7
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-next-cycle",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "created_cycle": 7,
+        "next_attempt_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-next-cycle",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    assert long_adapter.fill_reconciliation_calls == []
+    assert short_adapter.fill_reconciliation_calls == []
+
+    runtime.state.tick_count = 8
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert long_adapter.fill_reconciliation_calls == [{
+        "symbol": "BEATUSDT",
+        "order_id": "okx-close-order",
+        "client_order_id": "okx-close-cid",
+    }]
+    assert short_adapter.fill_reconciliation_calls == [{
+        "symbol": "BEATUSDT",
+        "order_id": "bybit-close-order",
+        "client_order_id": "bybit-close-cid",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_drain_restores_running_lifecycle(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.01,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.02,
+            order_id="bybit-close-order",
+            client_order_id="bybit-close-cid",
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-drained", symbol="BEATUSDT")
+    )
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.state.last_error = "pending_close_reconciliations_active"
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-drained",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "created_cycle": 1,
+        "next_attempt_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-drained",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    assert runtime.state.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_unavailable(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _UnavailableCloseLegAdapter(Venue.OKX, live_quantity=0.0)
+    short_adapter = _UnavailableCloseLegAdapter(Venue.BYBIT, live_quantity=0.0)
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.state.last_error = "pending_close_reconciliations_active"
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation())
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert long_adapter.position_calls == ["BEATUSDT"]
+    assert short_adapter.position_calls == ["BEATUSDT"]
+    records = tmp_journal.read_all()
+    abandoned = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.reconciliation_abandoned"
+    ][0]
+    assert abandoned["terminal_reason"] == "fill_reconciliation_unavailable_after_terminal_budget"
+    assert abandoned["attempt_count"] == 1
+    assert abandoned["long_live_size"] == pytest.approx(0.0)
+    assert abandoned["short_live_size"] == pytest.approx(0.0)
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.last_error is None
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
+    )
+    assert allowed is True
+    assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_retains_when_terminal_live_size_nonzero(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _UnavailableCloseLegAdapter(Venue.OKX, live_quantity=3.0)
+    short_adapter = _UnavailableCloseLegAdapter(Venue.BYBIT, live_quantity=0.0)
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation())
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert retained["attempt_count"] == 1
+    assert retained["next_attempt_ms"] > 3000
+    assert long_adapter.position_calls == ["BEATUSDT"]
+    assert short_adapter.position_calls == ["BEATUSDT"]
+    assert "exit.reconciliation_abandoned" not in [
+        record["kind"] for record in tmp_journal.read_all()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_drain_preserves_existing_reduce_only_risk_mode(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.01,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.02,
+            order_id="bybit-close-order",
+            client_order_id="bybit-close-cid",
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.risk_mode = GlobalRiskMode.REDUCE_ONLY
+    runtime.state.last_error = "pending_close_reconciliations_active"
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation())
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.risk_mode == GlobalRiskMode.REDUCE_ONLY
+    assert runtime.state.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_background_recovers_with_confirmed_open_positions(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    active = _open_position()
+    long_adapter = _PrivateConfirmedCloseLegAdapter(
+        Venue.OKX,
+        {
+            ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+                venue=Venue.OKX,
+                symbol="BEATUSDT",
+                side=Side.SELL,
+                quantity=20.0,
+                average_price=1.01,
+                order_id="okx-close-order",
+                client_order_id="okx-close-cid",
+            ),
+        },
+        cached_position=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol=active.symbol,
+            side=Side.BUY,
+            quantity=active.long_quantity,
+            entry_price=active.long_entry_price,
+            observed_at_ms=3000,
+        ),
+    )
+    short_adapter = _PrivateConfirmedCloseLegAdapter(
+        Venue.BYBIT,
+        {
+            ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="BEATUSDT",
+                side=Side.BUY,
+                quantity=20.0,
+                average_price=1.02,
+                order_id="bybit-close-order",
+                client_order_id="bybit-close-cid",
+            ),
+        },
+        cached_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol=active.symbol,
+            side=Side.SELL,
+            quantity=active.short_quantity,
+            entry_price=active.short_entry_price,
+            observed_at_ms=3000,
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.state.last_error = "pending_close_reconciliations_active"
+    runtime.state.tick_count = 2
+    runtime.state.open_positions[active.position_id] = active
+    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation())
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    assert runtime.state.last_error is None
+
+
+def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_journal):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
+    ))
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "pos-close-gate",
+        "symbol": "BEATUSDT",
+        "position_snapshot": {
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [],
+        "short_legs": [],
+    })
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
+    )
+    reversed_allowed, reversed_reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="BEATUSDT", long_venue="bybit", short_venue="okx")
+    )
+
+    assert allowed is False
+    assert reason == "pending_close_reconciliation_conflict"
+    assert reversed_allowed is False
+    assert reversed_reason == "pending_close_reconciliation_conflict"
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_fetches_all_v1_leg_records(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-1", "okx-cid-1"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=7.0,
+            average_price=1.01,
+            order_id="okx-close-1",
+            client_order_id="okx-cid-1",
+            fee_quote=0.01,
+        ),
+        ("okx-close-2", "okx-cid-2"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=13.0,
+            average_price=1.02,
+            order_id="okx-close-2",
+            client_order_id="okx-cid-2",
+            fee_quote=0.02,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-1", "bybit-cid-1"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=8.0,
+            average_price=1.03,
+            order_id="bybit-close-1",
+            client_order_id="bybit-cid-1",
+            fee_quote=0.03,
+        ),
+        ("bybit-close-2", "bybit-cid-2"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=12.0,
+            average_price=1.04,
+            order_id="bybit-close-2",
+            client_order_id="bybit-cid-2",
+            fee_quote=0.04,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-force-reconcile", symbol="BEATUSDT")
+    )
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-force-reconcile",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-force-reconcile",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.05,
+            "captured_funding_quote": 0.5,
+            "total_entry_fee_quote": 0.1,
+        },
+        "long_legs": [
+            {"venue": Venue.OKX.value, "order_id": "okx-close-1", "client_order_id": "okx-cid-1"},
+            {"venue": Venue.OKX.value, "order_id": "okx-close-2", "client_order_id": "okx-cid-2"},
+        ],
+        "short_legs": [
+            {"venue": Venue.BYBIT.value, "order_id": "bybit-close-1", "client_order_id": "bybit-cid-1"},
+            {"venue": Venue.BYBIT.value, "order_id": "bybit-close-2", "client_order_id": "bybit-cid-2"},
+        ],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert long_adapter.fill_reconciliation_calls == [
+        {"symbol": "BEATUSDT", "order_id": "okx-close-1", "client_order_id": "okx-cid-1"},
+        {"symbol": "BEATUSDT", "order_id": "okx-close-2", "client_order_id": "okx-cid-2"},
+    ]
+    assert short_adapter.fill_reconciliation_calls == [
+        {"symbol": "BEATUSDT", "order_id": "bybit-close-1", "client_order_id": "bybit-cid-1"},
+        {"symbol": "BEATUSDT", "order_id": "bybit-close-2", "client_order_id": "bybit-cid-2"},
+    ]
+    reconciled = [
+        record for record in tmp_journal.read_all()
+        if record["kind"] == "exit.reconciled"
+    ][0]["payload"]
+    assert reconciled["long_closed_qty"] == pytest.approx(20.0)
+    assert reconciled["short_closed_qty"] == pytest.approx(20.0)
+    assert reconciled["exit_fee_quote"] == pytest.approx(0.10)
+    assert reconciled["venue_statement_reconciled"] is True
+    assert reconciled["evidence_gap"] is False
+    assert reconciled["long_legs"][1]["order_id"] == "okx-close-2"
+    assert reconciled["short_legs"][1]["order_id"] == "bybit-close-2"
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.01,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-force-order", "bybit-force-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=1.02,
+            order_id="bybit-force-order",
+            client_order_id="bybit-force-cid",
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-force-reconcile",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-force-reconcile",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-force-order",
+            "client_order_id": "bybit-force-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert "exit.reconciled" in [record["kind"] for record in tmp_journal.read_all()]
 
 
 @pytest.mark.asyncio

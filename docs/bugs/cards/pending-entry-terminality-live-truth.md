@@ -39,6 +39,12 @@ evidence must map to the matrix before runtime code changes.
 - `ambiguous_exchange_truth`
 - local state is flat while exchange truth has a non-reduce-only open maker
   order.
+- `pending_close_reconciliations_active` remains after both close venues are
+  terminal flat and no managed open position exists.
+- final close fill/PnL reconciliation is unavailable, but terminal live
+  position truth is flat on both close venues.
+- pending-close reconciliation drops close venues from supervision after
+  `open_positions` is empty.
 
 ## Current Effective Rule
 
@@ -75,6 +81,16 @@ lifecycle, entry, and diagnose semantics. Local empty `open_positions`,
 Runtime must classify exchange positions, exchange open orders, pending work,
 residual repair, passive close work, owner evidence, and evidence quality before
 normal entry risk is allowed.
+
+Pending-close reconciliation is close accounting work after a close has already
+flattened the live legs. In live runtime, passive close may register final
+close-leg reconciliation from stored order/client ids and the removed position
+snapshot. If close-fill reconciliation is unavailable, V1 requires terminal
+live-position truth before deciding: flat/flat with no managed open position
+may abandon stale final accounting work, while any nonzero terminal live size
+stays fail-safe risk-only/backoff. Paper mode must not create this live
+accounting work, and supervisor venue coverage must still include the stored
+close snapshot.
 
 `ambiguous_exchange_truth` is evidence quality, not standalone recovery work. If
 local state has no open/pending/residual/passive work and there is no concrete
@@ -129,6 +145,10 @@ owner becomes blocking `unpaired_live_position`.
   proves account/venue capacity is exhausted, V2 must block new entries through
   that venue before maker submit, not discover the same condition after another
   maker exposure.
+- V1 pending-close reconciliation can continue as background accounting after
+  lifecycle close when private position truth is confirmed. It must not force
+  normal lifecycle risk-only solely because fill/PnL reconciliation is still
+  pending, and it must not abandon if terminal live size remains nonzero.
 
 ## Attempts Ledger
 
@@ -149,6 +169,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-05 | Exchange-truth recovery ledger V1 parity | locally implemented, not deployed in this pass | Added sanitized `TRXUSDT` and `SEIUSDT` incident fixtures, pure `RecoveryLedger`, shared exchange-truth normalizer, recovery owner index, pending-entry terminalizer, runtime recovery-ledger refresh/entry gate, shared pending-entry post-terminal removal helper, and production-health local-flat/live-open-order critical classification. Focused tests passed: core ledger/owner/truth/terminalizer `27 passed`, startup/runtime/passive-close `359 passed`, diagnose/health `66 passed`, pending-entry parity `35 passed`; full pytest `3479 passed`, `9 skipped`, `1 warning`; compileall and diff-check passed; GitNexus staged detect-changes reported medium risk, 23 files, 47 symbols, and 3 affected verifier flows. |
 | 2026-06-05 | Exchange-truth recovery ledger review closure | locally implemented, not deployed in this pass | Closed post-review drift without CL-specific branches: startup/tick now refresh the ledger from supported private truth probes; metadata-only adapters do not create ambiguous ledger blockers; startup mismatch cleanup outcomes are not overwritten by generic ledger blockers; journal owner evidence feeds the owner index; terminal pending removal stays behind `PendingEntryTerminalizer`; invalid pending entries with exchange evidence are retained and risk-only blocked; same-symbol venue-overlap still blocks while unrelated same-venue symbols do not; legacy `available=False` truth is treated as unavailable. Focused and adjacent suites passed, and full pytest now reports `3487 passed`, `9 skipped`, `1 warning`. |
 | 2026-06-06 | V1 recovery decision core closed-loop implementation | final root-closure deployed and cloud diagnosed healthy; default 15s tick verifier threshold remains a separate ops follow-up | Block and clear are now owned by one pure core, not by a ledger blocker plus a stale-clean helper. `ambiguous_exchange_truth` becomes a typed evidence gap unless local recovery work, owner evidence, unresolved work, a live artifact, or operator fail-closed makes truth required. Review closure tightened owner matching so same-symbol-only evidence cannot hide unmatched live positions or unrelated maker orders, and diagnose count-only pending/residual/passive state still blocks when truth is unavailable. Cloud deploy passed manifest, compileall, and service restart, but post-deploy `risk_only` showed a missing closure edge: successful runtime live mismatch flatten did not immediately refresh exchange truth and route back through the core. The follow-up makes startup/runtime live mismatch flatten refresh the recovery ledger for the mismatch symbols so `recovery.ledger_clear` is emitted by the same core decision. Final local closure removes the old stale cleaner entirely, prevents startup/housekeeping from clearing without core evidence, and routes passive-close live-flat legacy cleanup through `V1RecoveryDecisionCore` instead of a hand-built decision. Final review narrowed evidence-gap clearability so it cannot clear live-artifact blockers, and clarified that managed local open positions become truth-required recovery work only with explicit recovery/truth-required evidence. Cloud diagnose after redeploy showed `RUNNING_CLEAN`, high-confidence flat/no-open-orders, and production gate passed. |
+| 2026-06-06 | Pending-close reconciliation V1 lifecycle closure | locally fixed; pending cloud redeploy | Passive-close live-flat cleanup now registers live-only final close reconciliation records with V1 leg identity snapshots; runtime processes those records through close-leg fill reconciliation or terminal live-size proof; flat/flat plus no managed open position abandons stale final accounting work, nonzero live size retains fail-safe risk-only/backoff, confirmed managed opens allow background reconciliation, and supervisor venue coverage includes pending-close snapshots. |
 
 ## Recurrences
 
@@ -167,6 +188,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-05 | `TRXUSDT` Bybit live open maker order local-flat; `SEIUSDT` Bybit positive-fill local false-flat | local implementation pending deploy | Mapped to the unified exchange-truth recovery ledger. `TRXUSDT` local-flat/live-open-order becomes blocking `orphan_maker_order`; `SEIUSDT` positive-fill evidence prevents proven-flat and routes into blocking recovery work. Runtime entry gating now asks the ledger before dispatch, and production health flags live non-reduce open orders as critical exchange-truth mismatches. | [daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity](../daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity) |
 | 2026-06-05 | Review closure for exchange-truth recovery ledger wiring and terminalizer authority | local implementation pending deploy | Startup and tick wiring, clean-blocker release, journal owner mapping, unsupported-probe handling, V1 same-symbol venue-overlap scope, and terminalizer-only pending removal are now covered by RED/GREEN regression tests. This is a closure of the ledger contract, not a new symbol-specific bug. | [daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity](../daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity) |
 | 2026-06-06 | `ambiguous_exchange_truth` / stale recovery-block oscillation | final root-closure deployed and cloud diagnosed healthy; default 15s tick verifier threshold remains a separate ops follow-up | Mapped to the V1 recovery decision core closed-loop. Flat/no-local-work plus probe gap becomes `RUNNING_WITH_EVIDENCE_GAP`; local recovery work plus missing truth remains risk-only/blocking; live artifacts remain orphan/unpaired blockers unless exact owner evidence exists. Production confirmed the new decision payload was active, then exposed a remaining edge: `WLDUSDT` Bybit unpaired live-position block was followed by successful live mismatch flatten, but no immediate core clear. The follow-up adds RED/GREEN coverage and refreshes recovery ledger truth after successful live mismatch flatten so startup/runtime recovery returns to the same core for clear. Final local review removed unconditional stale cleanup paths and made legacy block clear require the same core decision, including passive-close live-flat cleanup. It also prevents evidence-gap decisions from clearing prior live-artifact blockers and keeps managed open positions out of recovery work unless explicit truth-required evidence is present. Cloud diagnose after redeploy showed high-confidence flat/no-open-orders, `RUNNING_CLEAN`, `gate_passed=true`, and `recovery.ledger_clear=1` in the deploy window. | [daily/2026-06-06.md#contract-follow-up-v1-recovery-decision-core-closed-loop](../daily/2026-06-06.md#contract-follow-up-v1-recovery-decision-core-closed-loop) |
+| 2026-06-06 | pending-close reconciliation lifecycle | local implementation pending deploy | Mapped to `PC-01` through `PC-05`. The root is close accounting work outliving lifecycle close: V1 allows background reconciliation after live-flat close, abandons stale final accounting only with terminal flat live truth, and retains nonzero terminal live exposure. | [daily/2026-06-06.md#pending-close-reconciliation-v1-closure-before-next-deploy](../daily/2026-06-06.md#pending-close-reconciliation-v1-closure-before-next-deploy) |
 
 ## Regression Harness
 
@@ -224,3 +246,11 @@ owner becomes blocking `unpaired_live_position`.
 18. Deduplicate duplicate `exit.closed` projections before judging frequency.
 19. Classify each quick flat as bug, avoidable timing, unavoidable recovery, or
     duplicate observation.
+20. If `pending_close_reconciliations` remains after a close, inspect stored
+    close-leg identities, close-fill reconciliation availability, and terminal
+    live sizes on both close venues before judging lifecycle unhealthy.
+21. Do not clear final pending-close accounting work from local flat alone:
+    require terminal flat live truth, and retain/backoff if either close venue
+    still reports nonzero size.
+22. Confirm supervisor risk snapshots include venues from pending-close
+    reconciliation snapshots even after `open_positions` is empty.

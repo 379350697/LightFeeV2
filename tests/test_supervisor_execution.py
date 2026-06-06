@@ -95,6 +95,19 @@ def _snapshot(venue: Venue, equity: float, margin: float, observed_ms: int = 100
     )
 
 
+def test_supervised_venues_normalizes_pending_close_reconciliation_snapshot():
+    state = EngineState()
+    state.pending_close_reconciliations.append({
+        "position_snapshot": {
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+    })
+    supervisor = Supervisor(_make_config(), state, _make_journal())
+
+    assert supervisor._supervised_venues() == {Venue.OKX, Venue.BYBIT}
+
+
 # ---------------------------------------------------------------------------
 # Global risk mode updates
 # ---------------------------------------------------------------------------

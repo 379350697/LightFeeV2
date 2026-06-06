@@ -181,12 +181,28 @@ class Supervisor:
         V1: supervised_venues (risk.rs:257-268).
         """
         venues: set[Venue] = set()
+
+        def add_venue(value) -> None:
+            if isinstance(value, Venue):
+                venues.add(value)
+                return
+            if isinstance(value, str) and value:
+                try:
+                    venues.add(Venue.from_str(value))
+                except ValueError:
+                    return
+
         for pos in self.state.open_positions.values():
-            venues.add(pos.long_venue)
-            venues.add(pos.short_venue)
+            add_venue(pos.long_venue)
+            add_venue(pos.short_venue)
         for rec in self.state.pending_close_reconciliations:
-            venues.add(rec.get("position_snapshot", {}).get("long_venue", Venue.BINANCE))
-            venues.add(rec.get("position_snapshot", {}).get("short_venue", Venue.BINANCE))
+            if not isinstance(rec, dict):
+                continue
+            snapshot = rec.get("position_snapshot", {})
+            if not isinstance(snapshot, dict):
+                continue
+            add_venue(snapshot.get("long_venue", Venue.BINANCE))
+            add_venue(snapshot.get("short_venue", Venue.BINANCE))
         return venues
 
     def _fetch_risk_snapshot_for_venue(

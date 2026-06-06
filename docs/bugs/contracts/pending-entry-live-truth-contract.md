@@ -1,10 +1,10 @@
 # Pending Entry Live Truth Contract
 
 Purpose: define the unified V1 contract for pending-entry recovery,
-live-position truth, and residual / reduce-only cleanup. This is the gate for
-CL-048, CL-049, CL-050, and future CL-048-family recurrences: do not add a
-symbol-specific patch until the relevant row in this matrix is covered by a
-failing test.
+live-position truth, residual / reduce-only cleanup, and pending-close
+reconciliation lifecycle. This is the gate for CL-048, CL-049, CL-050, and
+future CL-048-family recurrences: do not add a symbol-specific patch until the
+relevant row in this matrix is covered by a failing test.
 
 ## V1 Sources
 
@@ -18,6 +18,11 @@ failing test.
 - `/Users/wl/projects/LightFee/src/engine/state.rs`
   - `recovery_work_snapshot`
   - lifecycle/risk-mode recompute from recovery work
+- `/Users/wl/projects/LightFee/src/engine/recovery.rs`
+  - `process_pending_close_reconciliations`
+  - final close reconciliation abandon after terminal flat live truth
+- `/Users/wl/projects/LightFee/src/execution_core/engine.rs`
+  - private position confirmation for background reconciliation lifecycle
 - `/Users/wl/projects/LightFee/README.md`
   - unattended recovery: live position discovery when local state is gone
 
@@ -83,6 +88,12 @@ The minimum semantic surface from V1 is:
   blocks the same symbol when either venue overlaps with an unresolved pending
   entry. A live-truth-deferred pending entry must not be bypassed by swapping
   only one venue.
+- pending-close reconciliation: after a close has already flattened the live
+  legs and removed managed open state, final fill/PnL accounting
+  reconciliation is background work unless live truth shows remaining exposure.
+  Unavailable final close-fill reconciliation may be abandoned only after both
+  close venues prove terminal flat; nonzero terminal live size remains
+  fail-safe blocking.
 
 ## Unified Invariants
 
@@ -184,6 +195,11 @@ The minimum semantic surface from V1 is:
 | DG-02 | local flat, exchange open order present | unhealthy / high risk / gate failed | service-health green |
 | DG-03 | exchange truth unavailable for production high-confidence acceptance | missing evidence / not high-confidence green | assume production flat |
 | DG-04 | local flat, no local recovery work, no live artifact, and only a timeout/unsupported/partial probe gap | runtime `RUNNING_WITH_EVIDENCE_GAP`; normal entry remains governed by normal candidate gates; production acceptance may still be incomplete | create `exchange_truth_recovery_ledger_blocked` or block all normal entry |
+| PC-01 | live passive close flattened both legs and final close-leg fill reconciliation is available from stored order/client ids | rebuild final close accounting from the stored leg snapshot and remove the pending reconciliation | depend on entry reconciliation or require a still-managed open position |
+| PC-02 | final pending-close reconciliation, no managed open position, fill reconciliation unavailable, both close venues prove terminal live size zero | abandon stale final reconciliation and release lifecycle/gate with explicit terminal-flat evidence | retain risk-only forever solely because fill/PnL accounting is unavailable |
+| PC-03 | final pending-close reconciliation, fill reconciliation unavailable, either close venue reports nonzero terminal live size | retain reconciliation as fail-safe risk-only/backoff | abandon or mark healthy while live exposure remains |
+| PC-04 | managed local open positions remain and venue private-position truth is confirmed while close accounting reconciliation is pending | allow reconciliation to continue in background without forcing normal lifecycle to risk-only, unless another explicit risk policy is active | make normal trading harder solely due to background accounting work |
+| PC-05 | pending-close reconciliation exists only as a stored position snapshot after the managed position was removed | supervisor/risk venue coverage includes the snapshot venues | drop venues from supervision because `open_positions` is empty |
 
 ## Current Test Coverage
 
@@ -191,6 +207,7 @@ The minimum semantic surface from V1 is:
 |---|---|---|
 | PE-02, PE-05, PE-10, RC-01 through RC-04, DG-01 through DG-03 | `tests/engine/test_recovery_ledger.py`; `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py` | covered for pure recovery-ledger classification of local-flat/live-open-order, local-flat/live-position, positive-fill false-flat, residual repair, ambiguous truth, and proven-flat states |
 | RC-09, RC-10, DG-04 | `tests/engine/test_recovery_decision_core.py`; `tests/engine/test_recovery_ledger.py`; `tests/test_live_startup_preflight.py`; `tests/test_runtime_entry_flow.py`; `tests/test_diagnose_live.py`; `tests/ops/test_production_health.py` | covered for flat/no-local-work evidence gap, local work plus unavailable truth, core-owned clear, runtime block/clear authority, diagnose/health core classification, and review closure for same-symbol-but-unowned live artifacts |
+| PC-01 through PC-05 | `tests/test_pending_entry_v1_semantic_drift.py`; `tests/test_passive_close.py`; `tests/test_supervisor_execution.py` | covered for live-only registration, V1 close-leg snapshots, fill-based terminal accounting, unavailable-fill terminal-flat abandon, nonzero terminal-live retention, background lifecycle with private confirmation, risk-mode preservation, and supervisor venue coverage |
 | PE-01 through PE-03, PE-07 through PE-10, PE-16, PE-18 | `tests/engine/test_pending_entry_terminalizer.py` | covered for pure terminal decision outcomes; runtime finalizer remains the integration authority |
 | PE-01 | `tests/test_live_entry_hedge_root_fix.py::TestZeroFillFinalizeV1ParityGate` | covered |
 | PE-02 | `tests/test_pending_entry_v1_semantic_drift.py::test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists` | covered for open-order truth |
@@ -291,6 +308,13 @@ The minimum semantic surface from V1 is:
     for same-symbol but unmatched live positions, same-symbol unrelated maker
     orders, and diagnose count-only pending work.
 
+12. `PC-01` through `PC-05` / pending-close reconciliation lifecycle:
+    RED/GREEN coverage must prove close accounting work is registered only in
+    live runtime, uses stored close-leg identities, abandons stale final work
+    only after terminal flat live truth, retains nonzero terminal live exposure,
+    preserves explicit reduce-only/fail-closed policy, and keeps snapshot venues
+    supervised after managed open state is removed.
+
 ## Bug Mapping
 
 | Bug / family | Contract rows | Coverage judgement | Next action |
@@ -300,6 +324,7 @@ The minimum semantic surface from V1 is:
 | CL-050 BIOUSDT local false-flat with live position | PE-03, RC-07, RC-08, DG-01 | covered and cloud-verified at `68a979b`; production verifier and service-env diagnose were high-confidence flat/no-open-orders across all seven venues | keep as regression; if it recurs, map evidence first and only add code after an uncovered RED row |
 | 2026-06-05 V1 recovery ledger architecture | PE-02, PE-05, PE-10, PE-16, RC-01 through RC-04, DG-01 through DG-03 | locally covered by pure ledger, shared exchange-truth normalizer, owner index, terminalizer, startup ledger blocker, entry ledger gate, and production-health open-order mismatch tests | keep as the common runtime boundary for future CL-048-family recurrences; do not add CL-specific branches |
 | 2026-06-06 V1 recovery decision core closed-loop | RC-09, RC-10, DG-04, plus DG-01/DG-02 live-artifact preservation | final root-closure deployed and cloud diagnosed healthy; default 15s tick verifier threshold remains a separate ops follow-up | keep one pure core as the shared authority for block/clear/lifecycle/entry/diagnose/health; no-work probe gaps are evidence warnings, local work plus missing truth remains risk-only, and live artifacts remain blockers unless exact owner evidence exists. The post-deploy `risk_only` recurrence showed that successful live mismatch flatten must immediately recollect truth and route to the same core for `recovery.ledger_clear`; RED/GREEN coverage now protects startup and runtime clean-live-position recovery paths. Final local closure removes stale recovery-block cleanup as an authority and routes legacy migration clear, including passive-close live-flat cleanup, through `V1RecoveryDecisionCore` decisions. Final review also narrowed evidence-gap clearability so `RUNNING_WITH_EVIDENCE_GAP` cannot clear `orphan_maker_order`/`unpaired_live_position`, and clarified that managed local open positions require explicit truth-required/recovery-required evidence before becoming recovery work. Cloud diagnose after redeploy showed high-confidence flat/no-open-orders, `RUNNING_CLEAN`, `gate_passed=true`, and `recovery.ledger_clear=1` after the startup recovery block |
+| 2026-06-06 pending-close reconciliation lifecycle gap | PC-01 through PC-05 | locally covered; pending cloud redeploy | keep close accounting reconciliation as V1 background work after live-flat lifecycle closure; abandon stale final work only with terminal flat live truth, retain nonzero terminal live exposure, and keep supervision/risk venues from the stored snapshot |
 | Bybit duplicate `110072` stale-fill/live-nonzero family | RC-06, RC-07, RC-08 | covered locally | keep repeated-loop/fail-closed regression |
 | Residual repair live truth card | RC-01 through RC-05 | mostly covered | add any BIOUSDT residual variant if evidence proves residual path |
 | Hyperliquid insufficient margin admission | PE-11 | covered for symbol and venue-level containment | keep admission regression; if it recurs with same evidence, update docs/evidence only |
@@ -339,6 +364,12 @@ The minimum semantic surface from V1 is:
    items, but it must not independently decide that a probe gap is global
    recovery work. Legacy stale-block cleanup may remain only as migration
    fallback when the core already chose clean/evidence-gap.
+
+8. Keep pending-close reconciliation separate from pending-entry/order-entry
+   reconciliation. It is close accounting work backed by stored close-leg
+   identities and terminal live-position truth; it must not force risk-only
+   when V1 would run it in the background, and it must not clear when terminal
+   live size remains nonzero.
 
 Before editing any production function, run GitNexus freshness and impact for
 the target symbols named in the RED tests.
@@ -401,3 +432,17 @@ drift in that boundary:
   blocks unrelated same-venue symbols.
 - Legacy `available=False` exchange-truth payloads are treated as unavailable
   truth.
+
+Pending-close follow-up on 2026-06-06 closed the related lifecycle gap:
+
+- `PassiveCloseExecutor` registers live-only final close reconciliation records
+  after live-flat cleanup using stored close-leg order/client ids and the
+  removed position snapshot.
+- `LiveRuntime` processes those records through close-leg fill reconciliation,
+  and when fills are unavailable it probes terminal live sizes before deciding
+  abandon versus fail-safe retention.
+- Lifecycle drain preserves explicit reduce-only/fail-closed state and allows
+  background reconciliation while private position truth for managed open
+  positions is confirmed.
+- `Supervisor` includes pending-close snapshot venues in supervised venues after
+  the managed open position is gone.
