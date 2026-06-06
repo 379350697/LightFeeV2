@@ -98,6 +98,8 @@ class ExchangeTruthProbeEvidence:
 class ExchangeTruthSnapshot:
     available: bool
     confidence: str = "low"
+    schema_version: str = ""
+    snapshot_version: Any | None = None
     venues: tuple[str, ...] = ()
     positions: tuple[ExchangeTruthPosition, ...] = ()
     open_orders: tuple[ExchangeTruthOpenOrder, ...] = ()
@@ -138,6 +140,10 @@ class ExchangeTruthSnapshot:
             "errors": list(self.errors),
             "missing_evidence": list(self.missing_evidence),
         }
+        if self.schema_version:
+            payload["schema_version"] = self.schema_version
+        if self.snapshot_version is not None:
+            payload["snapshot_version"] = self.snapshot_version
         return normalize_exchange_truth_payload(payload)
 
 
@@ -151,7 +157,10 @@ def normalize_exchange_truth_payload(payload: Mapping[str, Any]) -> dict[str, An
     normalized.setdefault("confidence", "low")
     normalized.setdefault("positions", {})
     normalized.setdefault("open_orders", {})
-    normalized.setdefault("errors", [])
+    normalized["errors"] = _merge_fetch_status_errors(
+        normalized.get("errors", []),
+        normalized.get("fetch_status", {}),
+    )
     normalized.setdefault("missing_evidence", [])
     normalized.setdefault(
         "has_nonzero_position",
@@ -224,6 +233,8 @@ def snapshot_from_legacy_payload(payload: Mapping[str, Any]) -> ExchangeTruthSna
     return ExchangeTruthSnapshot(
         available=bool(normalized.get("available")),
         confidence=str(normalized.get("confidence") or "low"),
+        schema_version=str(normalized.get("schema_version") or ""),
+        snapshot_version=normalized.get("snapshot_version"),
         venues=tuple(str(v) for v in normalized.get("available_venues", []) or []),
         positions=tuple(positions),
         open_orders=tuple(open_orders),
@@ -346,6 +357,25 @@ def _available_venues_from_status(fetch_status: Any) -> list[str]:
         if isinstance(status, Mapping)
         and status.get("status") in {"ok", "partial"}
     ]
+
+
+def _merge_fetch_status_errors(existing: Any, fetch_status: Any) -> list[str]:
+    errors = [str(item) for item in existing or []]
+    seen = set(errors)
+    if not isinstance(fetch_status, Mapping):
+        return errors
+    for venue, status in fetch_status.items():
+        if not isinstance(status, Mapping):
+            continue
+        error = str(status.get("error") or "")
+        if not error:
+            continue
+        item = f"{venue}: {error}"
+        if item in seen:
+            continue
+        seen.add(item)
+        errors.append(item)
+    return errors
 
 
 def _float(value: Any) -> float:

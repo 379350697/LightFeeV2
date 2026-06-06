@@ -775,6 +775,64 @@ def test_diagnose_recovery_decision_treats_count_only_pending_as_required_work()
     assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
 
 
+def test_diagnose_and_runtime_recovery_decision_agree_on_partial_truth_payload(tmp_path):
+    from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+    from lightfee.engine.runtime import LiveRuntime
+    from scripts.diagnose_live import _recovery_decision_payload
+    from tests.test_live_startup_preflight import make_test_config
+
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "open_positions": [],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+    }
+    exchange_truth = normalize_exchange_truth_payload(
+        {
+            "available": True,
+            "truth_available": True,
+            "confidence": "partial",
+            "positions": {},
+            "open_orders": {},
+            "fetch_status": {
+                "bybit": {"status": "ok"},
+                "okx": {
+                    "status": "timeout",
+                    "error": "exchange truth probe timed out after 2s",
+                },
+            },
+            "probe_evidence": [
+                {
+                    "venue": "okx",
+                    "symbol": "TRXUSDT",
+                    "classification": "open_order_probe_timeout",
+                    "error": "exchange truth probe timed out after 2s",
+                }
+            ],
+            "missing_evidence": ["okx:TRXUSDT:open_order_probe_timeout"],
+        }
+    )
+    runtime = LiveRuntime(make_test_config(str(tmp_path)))
+    runtime.journal.open()
+
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        exchange_truth,
+        now_ms=1778787000000,
+    )
+    diagnose_decision = _recovery_decision_payload(local_state, exchange_truth)
+
+    assert runtime.recovery_decision is not None
+    assert diagnose_decision["kind"] == runtime.recovery_decision.kind.value
+    assert diagnose_decision["entry_allowed"] == runtime.recovery_decision.entry_allowed
+    assert diagnose_decision["block_reason"] == runtime.recovery_decision.block_reason
+    assert diagnose_decision["evidence_quality"] == (
+        runtime.recovery_decision.evidence_quality
+    )
+    runtime.journal.close()
+
+
 def test_run_diagnose_conclusion_is_unhealthy_when_acceptance_gate_has_open_order(
     monkeypatch,
 ):

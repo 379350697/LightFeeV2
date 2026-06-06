@@ -628,6 +628,117 @@ def test_verify_production_services_exchange_truth_probe_times_out(
     assert "timed out" in enriched["exchange_truth"]["errors"][0].lower()
 
 
+def test_verify_production_services_preserves_exchange_truth_probe_evidence(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+    }
+
+    def fake_exchange_truth(_runtime_dir_arg, _symbols, _venues=None):
+        return {
+            "available": True,
+            "truth_available": True,
+            "confidence": "partial",
+            "positions": {},
+            "open_orders": {},
+            "fetch_status": {
+                "bybit": {"status": "ok"},
+                "okx": {
+                    "status": "retryable_error",
+                    "error": "HTTP 429 rate limit; retry after 1s",
+                },
+            },
+            "open_order_probe_evidence": {
+                "okx": {
+                    "TRXUSDT": {
+                        "classification": "open_order_probe_retryable_error",
+                        "endpoint": "/api/v5/trade/orders-pending",
+                        "method": "GET",
+                        "error": "HTTP 429 rate limit; retry after 1s",
+                    }
+                }
+            },
+        }
+
+    enriched = vps._attach_exchange_truth_if_missing(
+        state,
+        current_state_path=current_state,
+        unit_texts={},
+        exchange_truth_builder=fake_exchange_truth,
+    )
+
+    exchange_truth = enriched["exchange_truth"]
+    assert exchange_truth["fetch_status"]["okx"]["status"] == "retryable_error"
+    assert exchange_truth["errors"] == ["okx: HTTP 429 rate limit; retry after 1s"]
+    assert exchange_truth["probe_evidence"][0]["classification"] == (
+        "open_order_probe_retryable_error"
+    )
+    assert exchange_truth["probe_evidence"][0]["error"] == (
+        "HTTP 429 rate limit; retry after 1s"
+    )
+
+
+def test_production_gate_does_not_report_clean_when_open_orders_present():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "last_scan": {"candidate_count": 1, "tradeable_count": 1},
+        "exchange_truth": {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {"bybit": {}},
+            "open_orders": {
+                "bybit": {
+                    "TRXUSDT": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "side": "buy",
+                            "quantity": 72.0,
+                            "reduce_only": False,
+                            "order_id": "live-maker",
+                        }
+                    ]
+                }
+            },
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert report.severity == "critical"
+    assert "exchange_truth_mismatch" in report.fingerprints
+    assert "live_open_order" in report.fingerprints
+    assert report.details["recovery_decision"]["kind"] == (
+        "BLOCK_OR_FLATTEN_LIVE_ARTIFACT"
+    )
+    assert report.details["exchange_truth_mismatches"][0]["check"] == (
+        "unexpected_live_open_order"
+    )
+
+
 def test_verify_production_services_cli_json_failure(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()

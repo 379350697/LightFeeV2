@@ -343,3 +343,166 @@ def test_orphan_reduce_only_order_is_cleanup_work_not_ignored():
     assert item.kind == "orphan_reduce_only_order"
     assert item.owner.confidence == "orphan"
     assert item.decision.outcome == "reduce_only_cleanup_submitted"
+
+
+def test_multi_symbol_owned_work_blocks_same_symbol_without_global_block():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_entries": [
+                {
+                    "pending_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "hyperliquid",
+                },
+                {
+                    "pending_id": "entry-trx",
+                    "symbol": "TRXUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                },
+            ]
+        },
+        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+    )
+
+    items_by_symbol = {item.symbol: item for item in ledger.work_items}
+    assert set(items_by_symbol) == {"SEIUSDT", "TRXUSDT"}
+    assert all(item.kind == "owned_pending_entry" for item in ledger.work_items)
+    assert all(item.owner.confidence == "proven" for item in ledger.work_items)
+    assert all(item.blocks_all_new_entries is False for item in ledger.work_items)
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="TRXUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
+def test_multi_symbol_orphan_maker_order_globally_blocks_while_owned_work_remains_visible():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_entries": [
+                {
+                    "pending_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "hyperliquid",
+                }
+            ]
+        },
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "okx",
+                    "symbol": "TRXUSDT",
+                    "side": "buy",
+                    "quantity": 72.0,
+                    "reduce_only": False,
+                    "order_id": "orphan-trx-maker",
+                }
+            ],
+        },
+    )
+
+    kinds = {item.kind for item in ledger.work_items}
+    orphan = next(item for item in ledger.work_items if item.kind == "orphan_maker_order")
+    owned = next(item for item in ledger.work_items if item.kind == "owned_pending_entry")
+    assert kinds == {"owned_pending_entry", "orphan_maker_order"}
+    assert orphan.owner.confidence == "orphan"
+    assert orphan.blocks_all_new_entries is True
+    assert owned.owner.confidence == "proven"
+    assert owned.symbol == "SEIUSDT"
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+
+
+def test_partial_truth_with_local_pending_entry_records_owned_work_and_truth_gap():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_entries": [
+                {
+                    "pending_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "hyperliquid",
+                }
+            ]
+        },
+        exchange_truth={
+            "truth_available": False,
+            "available": True,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": [
+                {
+                    "venue": "bybit",
+                    "symbol": "SEIUSDT",
+                    "classification": "position_probe_succeeded",
+                },
+                {
+                    "venue": "okx",
+                    "symbol": "SEIUSDT",
+                    "classification": "open_order_probe_timeout",
+                    "error": "exchange truth probe timed out after 2s",
+                },
+            ],
+            "missing_evidence": ["okx:SEIUSDT:open_order_probe_timeout"],
+        },
+    )
+
+    owned = next(item for item in ledger.work_items if item.kind == "owned_pending_entry")
+    gap = next(item for item in ledger.work_items if item.kind == "ambiguous_exchange_truth")
+    assert owned.symbol == "SEIUSDT"
+    assert owned.owner.confidence == "proven"
+    assert owned.blocking is True
+    assert gap.blocking is False
+    assert gap.decision.outcome == "evidence_gap_observed"
+    assert ledger.is_proven_flat("SEIUSDT") is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
+def test_journal_owned_order_is_owned_pending_entry_when_local_pending_is_absent():
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "order.passive_submitted",
+                "payload": {
+                    "entry_id": "entry-sei",
+                    "symbol": "SEIUSDT",
+                    "venue": "bybit",
+                    "order_id": "journal-maker-order",
+                    "client_order_id": "journal-maker-client",
+                },
+            }
+        ],
+    )
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"open_positions": [], "pending_entries": []},
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "bybit",
+                    "symbol": "SEIUSDT",
+                    "side": "buy",
+                    "quantity": 455.0,
+                    "reduce_only": False,
+                    "order_id": "journal-maker-order",
+                }
+            ],
+        },
+        owner_index=owner_index,
+    )
+
+    item = ledger.work_items[0]
+    assert item.kind == "owned_pending_entry"
+    assert item.symbol == "SEIUSDT"
+    assert item.owner.owner_type == "journal_pending_entry"
+    assert item.owner.owner_id == "entry-sei"
+    assert item.owner.confidence == "probable"
+    assert item.blocks_all_new_entries is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
