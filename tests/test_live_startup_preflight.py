@@ -25,6 +25,7 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
 from lightfee.engine.state import (
     ActiveMakerLeg,
     OpenPosition,
@@ -1696,6 +1697,61 @@ class TestRuntimePreflight:
             )
 
     @pytest.mark.asyncio
+    async def test_runtime_position_flat_truth_clears_unpaired_live_position_block(self):
+        """A later flat position probe terminalizes a prior unpaired-position block."""
+
+        class FlatBulkPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.recovery_decision.clear_reason == "core_running_clean"
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_position_flat_truth_does_not_clear_orphan_order_block(self):
+        """Position-flat truth alone cannot clear an order-artifact blocker."""
+
+        class FlatBulkPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "orphan_maker_order"
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
+            assert runtime.state.recovery_blocked_at_ms == 1234
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_live_mismatch_flatten_closes_core_ledger_block(self):
         """A successful runtime flatten must return to the core to clear its block."""
         with tempfile.TemporaryDirectory() as td:
@@ -2189,6 +2245,33 @@ class TestRuntimePreflight:
             )
 
             assert not any(item.blocking for item in ledger.work_items)
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            runtime.journal.close()
+
+    def test_complete_flat_truth_clears_previous_live_artifact_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 123
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert not any(item.blocking for item in ledger.work_items)
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.recovery_decision.clear_reason == "core_running_clean"
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING

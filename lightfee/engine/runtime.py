@@ -40,6 +40,7 @@ from lightfee.engine.bootstrap import (
 )
 from lightfee.engine.lifecycle import (
     can_enter_new_positions,
+    clear_risk_mode_for_recovery,
     enter_fail_closed,
     set_lifecycle,
     transition_to_reconciling,
@@ -1122,10 +1123,7 @@ class LiveRuntime:
             core_decision.clear_previous_block
             and self.state.recovery_blocked_reason in CORE_CLEARABLE_BLOCK_REASONS
         ):
-            self.state.recovery_blocked_reason = None
-            self.state.recovery_blocked_at_ms = 0
-            if not self._has_local_recovery_work():
-                set_lifecycle(self.state, EngineLifecycle.RUNNING)
+            clear_risk_mode_for_recovery(self.state, core_decision)
             self.journal.append(
                 "recovery.ledger_clear",
                 {
@@ -1683,11 +1681,33 @@ class LiveRuntime:
 
         self._last_private_position_probe_ms = now_ms
         open_positions_before = len(self.state.open_positions)
-        await self._recover_startup_live_positions(
+        recovery_result = await self._recover_startup_live_positions(
             self._startup_position_probe_symbols({}),
             now_ms,
             source="runtime_live_position_probe",
         )
+        if (
+            recovery_result == "no_live_positions"
+            and self.state.recovery_blocked_reason == "unpaired_live_position"
+            and not self._has_local_recovery_work()
+            and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+        ):
+            self._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [
+                        {
+                            "endpoint": "fetch_all_positions",
+                            "method": "fetch_all_positions",
+                            "classification": "position_truth_flat",
+                            "finished_at_ms": now_ms,
+                        }
+                    ],
+                },
+                now_ms=now_ms,
+            )
         if (
             self.state.recovery_blocked_reason in CORE_CLEARABLE_BLOCK_REASONS
             and len(self.state.open_positions) > open_positions_before
@@ -11405,10 +11425,7 @@ class LiveRuntime:
                 and self.state.recovery_blocked_reason
                 in CORE_CLEARABLE_BLOCK_REASONS
             ):
-                self.state.recovery_blocked_reason = None
-                self.state.recovery_blocked_at_ms = 0
-                if not self._has_local_recovery_work():
-                    set_lifecycle(self.state, EngineLifecycle.RUNNING)
+                clear_risk_mode_for_recovery(self.state, core_decision)
                 self.journal.append(
                     "recovery.residual_repairs_core_clear",
                     {

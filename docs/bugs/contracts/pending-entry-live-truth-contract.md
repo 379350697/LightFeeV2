@@ -371,6 +371,12 @@ The minimum semantic surface from V1 is:
    when V1 would run it in the background, and it must not clear when terminal
    live size remains nonzero.
 
+9. Treat live-artifact clears by artifact class. Later flat position truth may
+   clear a prior `unpaired_live_position` latch only by routing through the V1
+   recovery decision core. The same position-flat evidence must not clear an
+   `orphan_maker_order` blocker; maker-order artifacts require open-order
+   truth.
+
 Before editing any production function, run GitNexus freshness and impact for
 the target symbols named in the RED tests.
 
@@ -446,3 +452,15 @@ Pending-close follow-up on 2026-06-06 closed the related lifecycle gap:
   positions is confirmed.
 - `Supervisor` includes pending-close snapshot venues in supervised venues after
   the managed open position is gone.
+
+Post-deploy live-artifact latch follow-up on 2026-06-06 closed the position-flat
+runtime recovery gap:
+
+- `_maybe_recover_clean_live_positions()` now feeds `no_live_positions` evidence
+  for a prior `unpaired_live_position` back into the recovery ledger and
+  `V1RecoveryDecisionCore` instead of leaving the old latch untouched.
+- The path is deliberately not used for `orphan_maker_order`; position-flat
+  evidence alone is insufficient to clear an order-artifact blocker.
+- Runtime ledger clear application now uses the core-aware lifecycle helper so
+  a valid clear resets `recovery_blocked_reason`, `recovery_blocked_at_ms`,
+  `lifecycle`, and `risk_mode` together.
