@@ -33,8 +33,16 @@ unavailable. The spec and execution plan are recorded in
 [`../superpowers/specs/2026-06-06-v1-recovery-decision-core-closed-loop-design.md`](../superpowers/specs/2026-06-06-v1-recovery-decision-core-closed-loop-design.md)
 and
 [`../superpowers/plans/2026-06-06-v1-recovery-decision-core-closed-loop-implementation-plan.md`](../superpowers/plans/2026-06-06-v1-recovery-decision-core-closed-loop-implementation-plan.md).
-This closure does not include manual orders, cancels, or production runtime-state
-edits.
+Local closure commit `a89d64d` passed focused suites, compileall, diff-check, and
+full pytest; deploy-manifest commit `41ab11e` was pushed and deployed to
+`/opt/lightfee-v2`. Remote manifest verification and compileall passed, both
+services restarted active/running with `NRestarts=0`, and `.deploy_version`
+matches `41ab11e`. Production acceptance is still blocked: verification from the
+shell lacks credentialed exchange truth, the core reports
+`RUNNING_WITH_EVIDENCE_GAP` with `entry_allowed=true` and no block reason, and a
+later post-deploy check observed `lifecycle=risk_only` after the restarted live
+runtime submitted and then recovery-flattened live Bybit legs. No manual order,
+cancel, or runtime-state edit was performed outside the deploy/restart.
 
 Latest pending-entry passive opening source-port closure, 2026-06-05: the
 post-quick-flat pending-entry work has been re-centered on V1 source functions
