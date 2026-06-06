@@ -24,7 +24,13 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.reconciliation import PositionReconciliationResult
-from lightfee.engine.state import PendingEntry, PendingPassiveOrder
+from lightfee.engine.state import (
+    HedgeInflight,
+    PendingEntry,
+    PendingEntryPassivePhaseState,
+    PendingEntryRemainderSlice,
+    PendingPassiveOrder,
+)
 from lightfee.venues.hyperliquid import HyperliquidAdapter
 from lightfee.venues.symbol_rules import SymbolRule
 
@@ -1956,6 +1962,16 @@ class _FakeVenueAdapter:
         }
 
 
+class _CountingVenueAdapter(_FakeVenueAdapter):
+    def __init__(self, venue: Venue):
+        super().__init__(venue)
+        self.normalize_quantity_calls: list[tuple[str, float]] = []
+
+    async def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        self.normalize_quantity_calls.append((symbol, quantity))
+        return await super().normalize_quantity(symbol, quantity)
+
+
 def _make_test_config(tmp_path, **strategy_overrides):
     """Create a minimal AppConfig for runtime testing."""
     from lightfee.config.schema import (
@@ -1987,6 +2003,296 @@ def _make_open_runtime(tmp_path, **strategy_overrides):
     runtime = LiveRuntime(_make_test_config(tmp_path, **strategy_overrides))
     runtime.journal.open()
     return runtime
+
+
+def _make_pending_entry_for_hedge_delta(**overrides) -> PendingEntry:
+    values = {
+        "pending_id": "entry-v1-hedge-runtime",
+        "symbol": "BTCUSDT",
+        "long_venue": Venue.BINANCE,
+        "short_venue": Venue.BYBIT,
+        "target_quantity": 2.0,
+        "long_side": Side.BUY,
+        "short_side": Side.SELL,
+        "created_at_ms": 1_000,
+        "maker_leg": "long",
+        "maker_leg_filled": 0.5,
+        "hedge_leg_filled": 0.0,
+        "maker_price": 20.0,
+        "maker_fill_price": 20.0,
+        "maker_order_id": "maker-oid",
+        "maker_client_order_id": "maker-cid",
+        "passive_order": PendingPassiveOrder(
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            limit_price=20.0,
+            target_quantity=2.0,
+            accepted_at_ms=1_000,
+            timeout_at_ms=10_000,
+            last_progress_state=PassiveOrderState.OPEN,
+        ),
+        "phase_state": PendingEntryPassivePhaseState(
+            execution_kind="entry",
+            preferred_maker_leg="long",
+            active_maker_leg="long",
+            phase="high_slippage_maker",
+            cycle_attempt=1,
+            phase_started_at_ms=1_000,
+            cycle_started_at_ms=1_000,
+        ),
+        "maker_remainder_slices": [
+            PendingEntryRemainderSlice(quantity=0.5, notional_quote=10.0, fill_at_ms=1_100),
+        ],
+    }
+    values.update(overrides)
+    return PendingEntry(**values)
+
+
+class TestV1PendingEntryHedgeDeltaRuntimeClosure:
+    def test_adaptive_hedge_deadline_enforcement_uses_started_deadline(self, tmp_path):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_hedge_deadline_ms=2_500,
+            maker_hedge_soft_deadline_ms=800,
+        )
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
+            ],
+        )
+        pending.hedge_inflight = HedgeInflight(
+            client_order_id="hedge-cid",
+            venue=Venue.BYBIT,
+            side=Side.SELL,
+            quantity=2.0,
+            attempt=1,
+            submitted_at_ms=2_000,
+        )
+        assert pending.phase_state is not None
+        pending.phase_state.hedge_deadline_at_ms = 5_300
+
+        decision = runtime._pending_entry_hedge_deadline_decision(pending, 4_600)
+
+        assert decision["hard_breached"] is False
+        assert decision["hard_deadline_ms"] == 3_300
+        assert decision["hedge_elapsed_ms"] == 2_600
+
+    @pytest.mark.asyncio
+    async def test_live_drive_missing_hedge_buffers_sub_chunk_delta_without_submit(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_entry_progress_poll_ms=250,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.min_notional_quote = 25.0
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta()
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2_000)
+
+        assert driven is False
+        assert hedge_adapter.normalize_quantity_calls == []
+        assert hedge_adapter._place_order_calls == []
+        assert pending.next_progress_poll_ms == 2_250
+        events = runtime.journal.read_all()
+        assert events[-1]["kind"] == "execution.pending_entry_hedge_chunk_buffering"
+        assert pending.phase_state is not None
+        assert pending.phase_state.small_fill_min_notional_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_live_drive_missing_hedge_sets_hedge_deadline_before_submit(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_hedge_deadline_ms=2_500,
+            maker_hedge_soft_deadline_ms=800,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
+            ],
+        )
+
+        class DeadlineAssertingAdapter(_CountingVenueAdapter):
+            async def place_order(self, request: OrderRequest) -> OrderFill:
+                assert pending.phase_state is not None
+                assert pending.phase_state.hedge_deadline_at_ms == 2_000 + 3_300
+                return await super().place_order(request)
+
+        hedge_adapter = DeadlineAssertingAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=2.0,
+            price=20.0,
+            order_id="hedge-oid",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2_000)
+
+        assert driven is True
+        assert len(hedge_adapter._place_order_calls) == 1
+        assert pending.phase_state is not None
+        assert pending.phase_state.hedge_deadline_at_ms is None
+        assert pending.phase_state.small_fill_min_notional_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_startup_recovery_and_normal_tick_share_small_fill_decision(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_entry_progress_poll_ms=250,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.min_notional_quote = 25.0
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        normal_pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-normal-small-fill"
+        )
+        recovery_pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-recovery-small-fill"
+        )
+
+        normal = await runtime._drive_missing_hedge_live(
+            normal_pending,
+            normal_pending.pending_id,
+            2_000,
+        )
+        recovery = await runtime._recover_drive_missing_hedge(
+            recovery_pending,
+            "startup_recovery",
+        )
+
+        assert normal is False
+        assert recovery is False
+        assert hedge_adapter.normalize_quantity_calls == []
+        assert hedge_adapter._place_order_calls == []
+        assert normal_pending.next_progress_poll_ms == 2_250
+        assert recovery_pending.next_progress_poll_ms > 0
+        events = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.pending_entry_hedge_chunk_buffering"
+        ]
+        assert [event["payload"]["entry_id"] for event in events] == [
+            "entry-normal-small-fill",
+            "entry-recovery-small-fill",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_min_notional_attempt_exhaustion_routes_to_abort_cleanup(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_min_notional_accumulation_attempts=1,
+        )
+        maker_adapter = _FakeVenueAdapter(Venue.BINANCE)
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.min_notional_quote = 1_000.0
+        runtime._venue_adapters[Venue.BINANCE] = maker_adapter
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-min-notional-abort",
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            2_000,
+        )
+
+        assert driven is False
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert hedge_adapter._place_order_calls == []
+        events = runtime.journal.read_all()
+        assert any(event["kind"] == "execution.min_notional_abort_and_flatten" for event in events)
+        assert any(event["kind"] == "entry.aborted" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_recovery_rejected_hedge_submit_reconciles_and_clears_inflight(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "quantity below exchange minimum",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-recovery-rejected-hedge",
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
+            ],
+        )
+
+        driven = await runtime._recover_drive_missing_hedge(pending, "startup_recovery")
+
+        assert driven is False
+        assert pending.hedge_inflight is None
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("BTCUSDT", "", pending.hedge_client_order_id)
+        ]
+        events = runtime.journal.read_all()
+        assert events[-1]["kind"] == "recovery.hedge_submit_error"
+
+    @pytest.mark.asyncio
+    async def test_recovery_submit_error_reconciles_current_submit_cid_not_stale_pending_cid(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_raises = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "quantity below exchange minimum",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-recovery-stale-cid",
+            hedge_client_order_id="stale-previous-hedge-cid",
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
+            ],
+        )
+
+        driven = await runtime._recover_drive_missing_hedge(pending, "startup_recovery")
+
+        submitted_cid = hedge_adapter._place_order_calls[0].client_order_id
+        assert driven is False
+        assert submitted_cid != "stale-previous-hedge-cid"
+        assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
+            ("BTCUSDT", "", submitted_cid)
+        ]
 
 
 class TestRealPathAbortCleanupDeadline:

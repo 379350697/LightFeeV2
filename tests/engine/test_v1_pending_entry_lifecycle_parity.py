@@ -208,6 +208,64 @@ def test_v1_apply_pending_entry_passive_progress_pushes_remainder_slice():
     assert pending.passive_order.last_progress_state == PassiveOrderState.PARTIALLY_FILLED
 
 
+def test_v1_partial_fill_phase_switch_preserves_remainder_and_releases_whole_chunks():
+    """V1: phase switching keeps maker FIFO remainder for the hedge delta driver."""
+
+    from lightfee.engine.pending_entry_hedge_delta import (
+        PendingEntryHedgeabilityPlan,
+        decide_pending_entry_hedge_delta_pre_submit,
+    )
+    from lightfee.engine.pending_entry_lifecycle import (
+        advance_pending_entry_zero_fill_phase,
+        apply_pending_entry_passive_progress,
+    )
+
+    strategy = StrategyConfig()
+    strategy.pending_entry_phase_zero_fill_budget = 2
+    strategy.passive_small_fill_buffer_notional_quote = 0.0
+    pending = _pending_entry(maker_leg_filled=0.0, maker_fill_price=10.0)
+    progress = SimpleNamespace(
+        state=PassiveOrderState.PARTIALLY_FILLED,
+        cumulative_quantity=1.4,
+        average_price=12.0,
+        observed_at_ms=2_500,
+    )
+
+    assert apply_pending_entry_passive_progress(pending, progress) is True
+    assert pending.phase_state is not None
+    pending.phase_state.zero_fill_cycles_in_phase = 2
+    pending.phase_state.hedge_deadline_at_ms = 9_999
+
+    action = advance_pending_entry_zero_fill_phase(
+        pending,
+        strategy,
+        now_ms=3_000,
+        candidate=SimpleNamespace(blocked=False, blocked_reasons=[]),
+    )
+
+    assert action.kind == "submit_next_cycle"
+    assert action.reason == "phase_switched_to_low_slippage_maker"
+    assert pending.phase_state.hedge_deadline_at_ms is None
+    assert len(pending.maker_remainder_slices) == 1
+    assert pending.maker_remainder_slices[0].quantity == pytest.approx(1.4)
+    assert pending.maker_remainder_slices[0].notional_quote == pytest.approx(16.8)
+    assert pending.unmatched_maker_weighted_average_price() == pytest.approx(12.0)
+
+    decision = decide_pending_entry_hedge_delta_pre_submit(
+        pending,
+        strategy=strategy,
+        hedgeability_plan=PendingEntryHedgeabilityPlan(min_hedgeable_chunk=0.5),
+        normalized_quantity=1.0,
+        min_notional_violation=None,
+        now_ms=3_000,
+        maker_progress_updated=True,
+    )
+
+    assert decision.kind == "submit_hedge"
+    assert decision.releasable_quantity == pytest.approx(1.0)
+    assert decision.normalized_quantity == pytest.approx(1.0)
+
+
 def test_v1_terminal_taker_fallback_skips_blocked_frozen_candidate():
     """V1: try_terminal_taker_fallback skips non-tradeable frozen candidate."""
 

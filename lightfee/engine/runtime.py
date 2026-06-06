@@ -87,6 +87,15 @@ from lightfee.engine.pending_entry_lifecycle import (
     record_pending_entry_zero_fill_cycle,
     terminal_recheck_is_tradeable,
 )
+from lightfee.engine.pending_entry_hedge_delta import (
+    PendingEntryHedgeabilityPlan,
+    PendingEntryHedgeDeltaDecision,
+    adaptive_entry_hedge_deadline_decision,
+    decide_pending_entry_hedge_delta_pre_submit,
+    note_pending_entry_hedge_filled,
+    note_pending_entry_hedge_submitted,
+    releasable_hedge_quantity,
+)
 from lightfee.engine.state import (
     EngineState,
     HedgeInflight,
@@ -743,6 +752,129 @@ class LiveRuntime:
         if spec is not None:
             return float(getattr(spec, "min_notional", 0.0) or 0.0)
         return 0.0
+
+    def _pending_entry_hedge_price_hint(self, pending) -> float:
+        price_hint = 0.0
+        weighted_average = getattr(pending, "unmatched_maker_weighted_average_price", None)
+        if callable(weighted_average):
+            try:
+                price_hint = float(weighted_average() or 0.0)
+            except (TypeError, ValueError):
+                price_hint = 0.0
+        if price_hint <= 0.0:
+            price_hint = float(getattr(pending, "maker_fill_price", 0.0) or 0.0)
+        if price_hint <= 0.0:
+            price_hint = float(getattr(pending, "maker_price", 0.0) or 0.0)
+        return max(0.0, price_hint)
+
+    def _pending_entry_hedgeability_plan(
+        self,
+        pending,
+        hedge_venue: Venue,
+        desired_quantity: float,
+        price_hint: float,
+    ) -> PendingEntryHedgeabilityPlan:
+        min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
+        min_hedgeable_chunk = 0.0
+        if min_notional > 0.0 and price_hint > 0.0:
+            min_hedgeable_chunk = min_notional / price_hint
+        adapter = self.get_venue_adapter(hedge_venue)
+        quantity_step = 0.0
+        passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
+        if callable(passive_metadata):
+            try:
+                metadata = passive_metadata(pending.symbol) or {}
+                quantity_step = float(
+                    metadata.get("quantity_step", metadata.get("step_size", 0.0)) or 0.0
+                )
+            except Exception:
+                quantity_step = 0.0
+        if quantity_step > 0.0:
+            min_hedgeable_chunk = max(min_hedgeable_chunk, quantity_step)
+        aligned = releasable_hedge_quantity(desired_quantity, min_hedgeable_chunk)
+        blocked_reason = "target_below_min_hedgeable_chunk" if aligned <= 1e-9 else ""
+        return PendingEntryHedgeabilityPlan(
+            min_hedgeable_chunk=min_hedgeable_chunk,
+            aligned_target_quantity=aligned,
+            blocked_reason=blocked_reason,
+            diagnostics={
+                "maker_venue": pending.maker_venue().value,
+                "hedge_venue": hedge_venue.value,
+                "exchange_min_notional_quote": min_notional,
+                "price_hint": price_hint,
+                "quantity_step": quantity_step,
+            },
+        )
+
+    def _pending_entry_min_notional_violation(
+        self,
+        pending,
+        hedge_venue: Venue,
+        normalized_quantity: float,
+        price_hint: float,
+    ) -> tuple[float, float] | None:
+        if normalized_quantity <= 1e-9:
+            return None
+        min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
+        if min_notional <= 0.0 or price_hint <= 0.0:
+            return None
+        leg_notional = abs(float(normalized_quantity or 0.0) * price_hint)
+        if leg_notional + 1e-9 < min_notional:
+            return (leg_notional, min_notional)
+        return None
+
+    def _append_pending_entry_hedge_decision_event(
+        self,
+        decision: PendingEntryHedgeDeltaDecision,
+    ) -> None:
+        if not decision.event:
+            return
+        self.journal.append(decision.event, dict(decision.evidence))
+
+    def _pending_entry_hedge_deadline_started(
+        self,
+        pending,
+        *,
+        submitted_at_ms: int,
+        normalized_quantity: float,
+        hedge_price: float,
+        hedge_attempt: int,
+        hedge_venue: Venue,
+    ) -> None:
+        strategy = self.config.strategy
+        hard_ms = int(getattr(strategy, "maker_hedge_deadline_ms", 0) or 0)
+        soft_ms = int(
+            getattr(
+                strategy,
+                "maker_hedge_soft_deadline_ms",
+                min(hard_ms, 800) if hard_ms > 0 else 800,
+            )
+            or 0
+        )
+        hedge_notional = abs(float(normalized_quantity or 0.0) * max(0.0, hedge_price))
+        decision = note_pending_entry_hedge_submitted(
+            pending,
+            submitted_at_ms=submitted_at_ms,
+            base_soft_deadline_ms=soft_ms,
+            base_hard_deadline_ms=hard_ms,
+            hedge_notional_quote=hedge_notional,
+            quote_fresh=hedge_price > 0.0,
+        )
+        phase_state = ensure_pending_entry_phase_state(pending, submitted_at_ms)
+        self.journal.append(
+            "execution.hedge_deadline_started",
+            {
+                "entry_id": pending.pending_id,
+                "symbol": pending.symbol,
+                "hedge_venue": hedge_venue.value,
+                "hedge_attempt": hedge_attempt,
+                "soft_budget_ms": decision.effective_soft_deadline_ms,
+                "budget_ms": decision.effective_hard_deadline_ms,
+                "deadline_at_ms": phase_state.hedge_deadline_at_ms,
+                "requested_quantity": normalized_quantity,
+                "missing_hedge_quantity": pending.missing_hedge_quantity(),
+            },
+        )
 
     def _emit_startup_order_path_preflight(self) -> None:
         """Emit sanitized startup visibility for order signing/dependency readiness."""
@@ -7991,9 +8123,36 @@ class LiveRuntime:
 
         hedge_elapsed_ms = pending.hedge_inflight.elapsed_ms(now_ms)
         strategy = self.config.strategy
-        base_deadline_ms = getattr(strategy, "maker_hedge_deadline_ms", 800)
-        soft_deadline_ms = base_deadline_ms // 2
-        hard_deadline_ms = base_deadline_ms
+        base_hard_ms = int(getattr(strategy, "maker_hedge_deadline_ms", 800) or 800)
+        base_soft_ms = int(
+            getattr(
+                strategy,
+                "maker_hedge_soft_deadline_ms",
+                min(base_hard_ms, 800) if base_hard_ms > 0 else 800,
+            )
+            or 0
+        )
+        hedge_price = self._pending_entry_hedge_price_hint(pending)
+        hedge_notional = abs(float(pending.hedge_inflight.quantity or 0.0) * hedge_price)
+        deadline_decision = adaptive_entry_hedge_deadline_decision(
+            hedge_elapsed_ms=hedge_elapsed_ms,
+            base_soft_deadline_ms=base_soft_ms,
+            base_hard_deadline_ms=base_hard_ms,
+            hedge_notional_quote=hedge_notional,
+            quote_fresh=hedge_price > 0.0,
+            has_execution_progress=float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0) > 1e-9,
+            reconciled=False,
+        )
+        hard_deadline_ms = deadline_decision.effective_hard_deadline_ms
+        soft_deadline_ms = deadline_decision.effective_soft_deadline_ms
+        phase_state = getattr(pending, "phase_state", None)
+        stored_deadline_at_ms = getattr(phase_state, "hedge_deadline_at_ms", None)
+        if stored_deadline_at_ms is not None and pending.hedge_inflight.submitted_at_ms > 0:
+            hard_deadline_ms = max(
+                1,
+                int(stored_deadline_at_ms or 0) - pending.hedge_inflight.submitted_at_ms,
+            )
+            soft_deadline_ms = min(soft_deadline_ms, hard_deadline_ms)
 
         # V1: legacy inflight (submitted_at_ms=0) has no timestamp — fall back
         # to entry lifetime as a conservative proxy so old production pending
@@ -8004,15 +8163,8 @@ class LiveRuntime:
             if entry_lifetime >= getattr(strategy, "pending_entry_hard_ceiling_ms", 120000):
                 hedge_elapsed_ms = entry_lifetime
 
-        # Adaptive: if hedge has execution progress (partial fill) or quote is
-        # not fresh, extend deadlines.  V1 uses adaptive_hedge_deadline_status().
-        has_progress = pending.hedge_leg_filled > 1e-9
-
-        if has_progress:
-            hard_deadline_ms = base_deadline_ms * 2
-
-        hard_breached = hedge_elapsed_ms >= hard_deadline_ms
-        soft_breached = hedge_elapsed_ms >= soft_deadline_ms
+        hard_breached = hedge_elapsed_ms > hard_deadline_ms
+        soft_breached = hedge_elapsed_ms > soft_deadline_ms
 
         return {
             "hard_breached": hard_breached,
@@ -9514,14 +9666,72 @@ class LiveRuntime:
                 {"entry_id": pending.pending_id, "reason": reason},
             )
             return False
+        if pending.hedge_inflight is not None:
+            return False
 
         try:
             from lightfee.core.domain import OrderRequest
 
-            # V1: normalize to exchange lot size
-            normalized = missing
+            now_ms = wall_clock_now_ms()
+            hedge_price = self._pending_entry_hedge_price_hint(pending)
+            hedgeability_plan = self._pending_entry_hedgeability_plan(
+                pending,
+                hedge_venue,
+                missing,
+                hedge_price,
+            )
+            releasable = releasable_hedge_quantity(
+                missing,
+                hedgeability_plan.min_hedgeable_chunk,
+            )
+            early_decision = decide_pending_entry_hedge_delta_pre_submit(
+                pending,
+                strategy=self.config.strategy,
+                hedgeability_plan=hedgeability_plan,
+                normalized_quantity=None,
+                min_notional_violation=None,
+                now_ms=now_ms,
+                maker_progress_updated=False,
+            )
+            if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
+                self._append_pending_entry_hedge_decision_event(early_decision)
+                return False
+
+            # V1: normalize to exchange lot size after releasable chunk planning.
+            normalized = releasable
             if hasattr(adapter, "normalize_quantity"):
-                normalized = await adapter.normalize_quantity(pending.symbol, missing)
+                normalized = await adapter.normalize_quantity(pending.symbol, releasable)
+            min_notional_violation = self._pending_entry_min_notional_violation(
+                pending,
+                hedge_venue,
+                normalized,
+                hedge_price,
+            )
+            decision = decide_pending_entry_hedge_delta_pre_submit(
+                pending,
+                strategy=self.config.strategy,
+                hedgeability_plan=hedgeability_plan,
+                normalized_quantity=normalized,
+                min_notional_violation=min_notional_violation,
+                now_ms=now_ms,
+                maker_progress_updated=False,
+            )
+            self._append_pending_entry_hedge_decision_event(decision)
+            if decision.kind in {
+                "buffer_small_fill",
+                "wait_min_notional_accumulation",
+                "wait_passive_small_fill_buffer",
+                "keep_pending",
+            }:
+                return False
+            if decision.kind == "abort_and_flatten":
+                await self._abort_pending_entry(
+                    pending,
+                    pending.pending_id,
+                    "entry hedge leg below minimum notional",
+                )
+                return False
+            normalized = decision.normalized_quantity
 
             if normalized <= 1e-9:
                 self.journal.append(
@@ -9531,16 +9741,28 @@ class LiveRuntime:
                 )
                 return False
 
-            # V1: use maker fill price as hedge price hint (live fill preferred)
-            hedge_price = (
-                pending.unmatched_maker_weighted_average_price()
-                or pending.maker_fill_price
-                or pending.maker_price
-            )
-
             from lightfee.venues.cid import generate_exchange_cid
             recovery_cid = generate_exchange_cid(pending.pending_id, "h", hedge_venue)
-            pending.hedge_client_order_id = pending.hedge_client_order_id or recovery_cid
+            pending.hedge_client_order_id = recovery_cid
+            pending.hedge_attempt_count = int(
+                getattr(pending, "hedge_attempt_count", 0) or 0
+            ) + 1
+            self._pending_entry_hedge_deadline_started(
+                pending,
+                submitted_at_ms=now_ms,
+                normalized_quantity=normalized,
+                hedge_price=hedge_price,
+                hedge_attempt=pending.hedge_attempt_count,
+                hedge_venue=hedge_venue,
+            )
+            pending.hedge_inflight = HedgeInflight(
+                client_order_id=recovery_cid,
+                venue=hedge_venue,
+                side=pending.hedge_side(),
+                quantity=normalized,
+                attempt=pending.hedge_attempt_count,
+                submitted_at_ms=now_ms,
+            )
 
             req = OrderRequest(
                 venue=hedge_venue,
@@ -9559,10 +9781,74 @@ class LiveRuntime:
                 pending.consume_hedge_quantity_fifo(fill.quantity)
                 pending.hedge_order_id = fill.order_id
                 pending.hedge_fill_price = fill.price
+                pending.hedge_inflight = None
+                note_pending_entry_hedge_filled(pending)
                 if pending.missing_hedge_quantity() <= 1e-9:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
                 return True
+            pending.hedge_inflight = None
+            note_pending_entry_hedge_filled(pending)
+            return False
+        except OrderSubmitError as e:
+            hedge_client_order_id = (
+                pending.hedge_inflight.client_order_id
+                if pending.hedge_inflight
+                else pending.hedge_client_order_id
+            )
+            reconciliation_error_text = ""
+            try:
+                reconciliation = await adapter.fetch_order_fill_reconciliation(
+                    pending.symbol,
+                    "",
+                    hedge_client_order_id,
+                )
+            except Exception as reconcile_error:
+                reconciliation = None
+                reconciliation_error_text = str(reconcile_error)
+            reconciliation_quantity = (
+                float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+                if reconciliation is not None
+                else 0.0
+            )
+            if reconciliation is not None and reconciliation_quantity > 0:
+                fill_qty = reconciliation_quantity
+                pending.hedge_leg_filled += fill_qty
+                pending.consume_hedge_quantity_fifo(fill_qty)
+                pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
+                pending.hedge_fill_price = float(
+                    getattr(reconciliation, "average_price", 0.0)
+                    or getattr(reconciliation, "price", 0.0)
+                    or pending.hedge_fill_price
+                    or 0.0
+                )
+                pending.hedge_inflight = None
+                note_pending_entry_hedge_filled(pending)
+                if pending.missing_hedge_quantity() <= 1e-9:
+                    pending.uncertain_outcome = False
+                    pending.outcome = "filled"
+                return True
+            if e.is_rejected:
+                pending.hedge_inflight = None
+                phase_state = ensure_pending_entry_phase_state(pending)
+                phase_state.hedge_deadline_at_ms = None
+            self.journal.append(
+                "recovery.hedge_submit_error",
+                {
+                    "entry_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "error": str(e),
+                    "reason": reason,
+                    "is_rejected": e.is_rejected,
+                    "hedge_client_order_id": hedge_client_order_id,
+                    "fill_reconciliation_attempted": True,
+                    "fill_reconciliation_result": (
+                        "error" if reconciliation_error_text else "missing_or_zero_fill"
+                    ),
+                    "fill_reconciliation_error": reconciliation_error_text,
+                    "fill_reconciliation_quantity": reconciliation_quantity,
+                },
+            )
             return False
         except Exception as e:
             self.journal.append(
@@ -9607,9 +9893,64 @@ class LiveRuntime:
         try:
             from lightfee.core.domain import OrderRequest
 
-            normalized = missing
+            hedge_price = self._pending_entry_hedge_price_hint(pending)
+            hedgeability_plan = self._pending_entry_hedgeability_plan(
+                pending,
+                hedge_venue,
+                missing,
+                hedge_price,
+            )
+            releasable = releasable_hedge_quantity(
+                missing,
+                hedgeability_plan.min_hedgeable_chunk,
+            )
+            early_decision = decide_pending_entry_hedge_delta_pre_submit(
+                pending,
+                strategy=self.config.strategy,
+                hedgeability_plan=hedgeability_plan,
+                normalized_quantity=None,
+                min_notional_violation=None,
+                now_ms=now_ms,
+                maker_progress_updated=True,
+            )
+            if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
+                self._append_pending_entry_hedge_decision_event(early_decision)
+                return False
+
+            normalized = releasable
             if hasattr(adapter, "normalize_quantity"):
-                normalized = await adapter.normalize_quantity(pending.symbol, missing)
+                normalized = await adapter.normalize_quantity(pending.symbol, releasable)
+            min_notional_violation = self._pending_entry_min_notional_violation(
+                pending,
+                hedge_venue,
+                normalized,
+                hedge_price,
+            )
+            decision = decide_pending_entry_hedge_delta_pre_submit(
+                pending,
+                strategy=self.config.strategy,
+                hedgeability_plan=hedgeability_plan,
+                normalized_quantity=normalized,
+                min_notional_violation=min_notional_violation,
+                now_ms=now_ms,
+                maker_progress_updated=True,
+            )
+            self._append_pending_entry_hedge_decision_event(decision)
+            if decision.kind in {
+                "buffer_small_fill",
+                "wait_min_notional_accumulation",
+                "wait_passive_small_fill_buffer",
+                "keep_pending",
+            }:
+                return False
+            if decision.kind == "abort_and_flatten":
+                await self._abort_pending_entry(
+                    pending,
+                    entry_id,
+                    "entry hedge leg below minimum notional",
+                )
+                return False
+            normalized = decision.normalized_quantity
 
             if normalized <= 1e-9:
                 self.journal.append(
@@ -9619,37 +9960,19 @@ class LiveRuntime:
                 )
                 return False
 
-            hedge_price = (
-                pending.unmatched_maker_weighted_average_price()
-                or pending.maker_fill_price
-                or pending.maker_price
-            )
-
-            # Terminal policy: compute notional and check against venue min_notional
-            hedge_notional = abs(normalized * hedge_price)
-            min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
-            if min_notional > 0 and hedge_notional < min_notional:
-                pending.repair_state = "hedge_residual_below_min_notional"
-                self.journal.append(
-                    "pending_entry.hedge_residual_below_min_notional",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "hedge_venue": hedge_venue.value,
-                        "hedge_notional": hedge_notional,
-                        "hedge_min_notional": min_notional,
-                        "missing_quantity": missing,
-                        "normalized_quantity": normalized,
-                        "hedge_price": hedge_price,
-                    },
-                )
-                return False
-
             from lightfee.venues.cid import generate_exchange_cid
             attempt = int(getattr(pending, "hedge_attempt_count", 0) or 0) + 1
             pending.hedge_attempt_count = attempt
             hedge_cloid = generate_exchange_cid(entry_id, f"h{attempt}", hedge_venue)
             pending.hedge_client_order_id = hedge_cloid
+            self._pending_entry_hedge_deadline_started(
+                pending,
+                submitted_at_ms=now_ms,
+                normalized_quantity=normalized,
+                hedge_price=hedge_price,
+                hedge_attempt=attempt,
+                hedge_venue=hedge_venue,
+            )
             pending.hedge_inflight = HedgeInflight(
                 client_order_id=hedge_cloid,
                 venue=hedge_venue,
@@ -9696,6 +10019,7 @@ class LiveRuntime:
                 pending.hedge_order_id = fill.order_id
                 pending.hedge_fill_price = fill.price
                 pending.hedge_inflight = None
+                note_pending_entry_hedge_filled(pending)
 
                 self.journal.append(
                     "pending_entry.hedge_submit_result",
@@ -9720,6 +10044,7 @@ class LiveRuntime:
 
             # Zero fill — hedge order was placed but didn't fill (IOC/taker)
             pending.hedge_inflight = None
+            note_pending_entry_hedge_filled(pending)
             self.journal.append(
                 "pending_entry.hedge_submit_result",
                 {
@@ -9764,6 +10089,7 @@ class LiveRuntime:
             if reconciliation is not None and reconciliation_quantity > 0:
                 fill_qty = reconciliation_quantity
                 pending.hedge_leg_filled += fill_qty
+                pending.consume_hedge_quantity_fifo(fill_qty)
                 pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
                 pending.hedge_fill_price = float(
                     getattr(reconciliation, "average_price", 0.0)
@@ -9772,6 +10098,7 @@ class LiveRuntime:
                     or 0.0
                 )
                 pending.hedge_inflight = None
+                note_pending_entry_hedge_filled(pending)
                 self._flush_adapter_order_diagnostics(adapter)
                 self.journal.append(
                     "pending_entry.hedge_submit_result",
