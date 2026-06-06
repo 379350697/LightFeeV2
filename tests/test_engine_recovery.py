@@ -100,6 +100,19 @@ class TestLifecycle:
         assert state.recovery_blocked_at_ms == 0
         assert state.last_error is None
 
+    def test_stale_recovery_cleaner_does_not_clear_core_owned_ledger_block(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+        state.recovery_blocked_at_ms = 1234
+        state.last_error = "exchange truth recovery ledger blocked"
+
+        block_cleared = clear_stale_recovery_block_if_recovery_clean(state, None)
+
+        assert block_cleared is False
+        assert state.recovery_blocked_reason == "exchange_truth_recovery_ledger_blocked"
+        assert state.recovery_blocked_at_ms == 1234
+
 
 class TestRecovery:
     def test_empty_snapshot_starts_running(self):

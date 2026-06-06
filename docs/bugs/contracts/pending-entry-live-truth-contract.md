@@ -47,6 +47,16 @@ Runtime pending-entry removal must route through the pending-entry terminality
 authority or the shared post-terminal removal helper; a direct pop outside that
 boundary is a contract bypass.
 
+Recovery block and clear governance: the V1 recovery decision core is the
+single active authority for core-owned recovery block, clear, lifecycle, entry,
+diagnose, and production-health semantics. `ambiguous_exchange_truth` is an
+evidence quality label, not standalone global recovery work. It becomes blocking
+only when local recovery work, unresolved pending/passive/residual work, owner
+evidence, a concrete live artifact, or operator fail-closed policy requires
+truth. A flat/no-local-work probe gap may warn or keep production acceptance
+incomplete, but it must not create `exchange_truth_recovery_ledger_blocked` or
+block normal entry by itself.
+
 ## V1 Coverage Floor
 
 The minimum semantic surface from V1 is:
@@ -80,10 +90,12 @@ The minimum semantic surface from V1 is:
    Local `open_positions=[]` or `pending_entries=[]` is not healthy if a
    credentialed venue probe reports a nonzero position or live open order.
 
-2. Local flat must be ledger-proven flat.
-   A state is flat only when the recovery ledger has classified live positions,
-   live open orders, pending entries, residual repairs, passive closes, and
-   ambiguous truth. Local empty collections are inputs, not the conclusion.
+2. Local flat must be core-proven flat or explicitly evidence-gapped.
+   A state is flat only when the recovery ledger and V1 recovery decision core
+   have classified live positions, live open orders, pending entries, residual
+   repairs, passive closes, owner evidence, and evidence quality. Local empty
+   collections are inputs, not the conclusion. A pure probe gap with no local
+   recovery work and no live artifact is not recovery work by itself.
 
 3. Zero-fill is terminal only with terminal no-fill evidence.
    A local zero fill, stale accepted order, missing fill record, or uncertain
@@ -166,15 +178,19 @@ The minimum semantic surface from V1 is:
 | RC-06 | Bybit duplicate client id, reconciled fill, live flat/target | complete idempotently | resubmit unnecessary cleanup |
 | RC-07 | Bybit duplicate client id, old fill, live still nonzero | classify stale/partial, retry with fresh bounded CID or fail closed | clear state from old fill |
 | RC-08 | duplicate cleanup keeps failing and live remains nonzero | stop new-entry risk and expose deterministic blocker | unbounded retry loop with repeated CIDs |
+| RC-09 | local open/pending/residual/passive work exists and exchange truth is unavailable or partial | risk-only / no new entry until required truth or deterministic cleanup path is available | treat missing truth as clean or open new entry risk |
+| RC-10 | previous core-owned `exchange_truth_recovery_ledger_blocked` exists, but the core classifies the current snapshot as `RUNNING_CLEAN` or `RUNNING_WITH_EVIDENCE_GAP` | clear through the core with explicit clear reason | clear through an independent stale-clean helper that can contradict the core |
 | DG-01 | local flat, exchange position nonzero | unhealthy / high risk / gate failed | service-health green |
 | DG-02 | local flat, exchange open order present | unhealthy / high risk / gate failed | service-health green |
-| DG-03 | exchange truth unavailable | missing evidence, not green | assume flat |
+| DG-03 | exchange truth unavailable for production high-confidence acceptance | missing evidence / not high-confidence green | assume production flat |
+| DG-04 | local flat, no local recovery work, no live artifact, and only a timeout/unsupported/partial probe gap | runtime `RUNNING_WITH_EVIDENCE_GAP`; normal entry remains governed by normal candidate gates; production acceptance may still be incomplete | create `exchange_truth_recovery_ledger_blocked` or block all normal entry |
 
 ## Current Test Coverage
 
 | Matrix IDs | Current coverage | Status |
 |---|---|---|
 | PE-02, PE-05, PE-10, RC-01 through RC-04, DG-01 through DG-03 | `tests/engine/test_recovery_ledger.py`; `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py` | covered for pure recovery-ledger classification of local-flat/live-open-order, local-flat/live-position, positive-fill false-flat, residual repair, ambiguous truth, and proven-flat states |
+| RC-09, RC-10, DG-04 | `tests/engine/test_recovery_decision_core.py`; `tests/engine/test_recovery_ledger.py`; `tests/test_live_startup_preflight.py`; `tests/test_runtime_entry_flow.py`; `tests/test_diagnose_live.py`; `tests/ops/test_production_health.py` | covered for flat/no-local-work evidence gap, local work plus unavailable truth, core-owned clear, runtime block/clear authority, diagnose/health core classification, and review closure for same-symbol-but-unowned live artifacts |
 | PE-01 through PE-03, PE-07 through PE-10, PE-16, PE-18 | `tests/engine/test_pending_entry_terminalizer.py` | covered for pure terminal decision outcomes; runtime finalizer remains the integration authority |
 | PE-01 | `tests/test_live_entry_hedge_root_fix.py::TestZeroFillFinalizeV1ParityGate` | covered |
 | PE-02 | `tests/test_pending_entry_v1_semantic_drift.py::test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists` | covered for open-order truth |
@@ -266,6 +282,15 @@ The minimum semantic surface from V1 is:
     order becomes blocking `orphan_maker_order`; the `SEIUSDT` fixture proves
     positive maker-fill evidence prevents local false-flat/proven-flat.
 
+11. V1 recovery decision core closed-loop:
+    RED/GREEN coverage now proves flat/no-local-work plus unavailable or
+    partial truth returns `RUNNING_WITH_EVIDENCE_GAP` with normal entry allowed,
+    while local recovery work plus unavailable truth returns risk-only/blocking.
+    Prior `exchange_truth_recovery_ledger_blocked` clears through the core, not
+    an independent stale-clean helper. Review closure adds RED/GREEN coverage
+    for same-symbol but unmatched live positions, same-symbol unrelated maker
+    orders, and diagnose count-only pending work.
+
 ## Bug Mapping
 
 | Bug / family | Contract rows | Coverage judgement | Next action |
@@ -274,6 +299,7 @@ The minimum semantic surface from V1 is:
 | CL-049 SEIUSDT open maker order terminality | PE-02, PE-11, DG-02 | covered for open-order shape; historical cluster now maps into this contract | keep as regression |
 | CL-050 BIOUSDT local false-flat with live position | PE-03, RC-07, RC-08, DG-01 | covered and cloud-verified at `68a979b`; production verifier and service-env diagnose were high-confidence flat/no-open-orders across all seven venues | keep as regression; if it recurs, map evidence first and only add code after an uncovered RED row |
 | 2026-06-05 V1 recovery ledger architecture | PE-02, PE-05, PE-10, PE-16, RC-01 through RC-04, DG-01 through DG-03 | locally covered by pure ledger, shared exchange-truth normalizer, owner index, terminalizer, startup ledger blocker, entry ledger gate, and production-health open-order mismatch tests | keep as the common runtime boundary for future CL-048-family recurrences; do not add CL-specific branches |
+| 2026-06-06 V1 recovery decision core closed-loop | RC-09, RC-10, DG-04, plus DG-01/DG-02 live-artifact preservation | locally implemented, pending deploy | keep one pure core as the shared authority for block/clear/lifecycle/entry/diagnose/health; no-work probe gaps are evidence warnings, local work plus missing truth remains risk-only, and live artifacts remain blockers unless exact owner evidence exists |
 | Bybit duplicate `110072` stale-fill/live-nonzero family | RC-06, RC-07, RC-08 | covered locally | keep repeated-loop/fail-closed regression |
 | Residual repair live truth card | RC-01 through RC-05 | mostly covered | add any BIOUSDT residual variant if evidence proves residual path |
 | Hyperliquid insufficient margin admission | PE-11 | covered for symbol and venue-level containment | keep admission regression; if it recurs with same evidence, update docs/evidence only |
@@ -307,6 +333,12 @@ The minimum semantic surface from V1 is:
 6. Apply V1 pending-entry protection before dispatch. Same symbol plus either
    venue overlap is enough to block a new candidate while the old pending entry
    is unresolved.
+
+7. Route recovery block, clear, lifecycle, entry, diagnose, and production
+   health through the V1 recovery decision core. RecoveryLedger may build work
+   items, but it must not independently decide that a probe gap is global
+   recovery work. Legacy stale-block cleanup may remain only as migration
+   fallback when the core already chose clean/evidence-gap.
 
 Before editing any production function, run GitNexus freshness and impact for
 the target symbols named in the RED tests.

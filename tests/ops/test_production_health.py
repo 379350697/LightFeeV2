@@ -519,6 +519,10 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
     ][0]
     assert "exchange_truth_missing" in current_report["fingerprints"]
     assert current_report["details"]["exchange_truth_required"] is True
+    assert (
+        current_report["details"]["recovery_decision"]["kind"]
+        == "RUNNING_WITH_EVIDENCE_GAP"
+    )
 
 
 def test_verify_production_services_attaches_exchange_truth_from_systemd_env_file(

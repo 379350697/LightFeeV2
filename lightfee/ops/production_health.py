@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
+
 
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
 KNOWN_GOOD_RESOLVERS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"}
@@ -294,6 +299,7 @@ def analyze_current_state(
         fingerprints.append("last_scan_missing")
     exchange_truth = state.get("exchange_truth")
     exchange_truth_mismatches: list[dict[str, Any]] = []
+    recovery_decision = _recovery_decision_payload(state, exchange_truth)
     exchange_truth_available = (
         isinstance(exchange_truth, dict)
         and bool(exchange_truth.get("available"))
@@ -370,9 +376,56 @@ def analyze_current_state(
             "exchange_truth_required": require_exchange_truth,
             "exchange_truth_available": exchange_truth_available,
             "exchange_truth_confidence": exchange_truth_confidence,
+            "recovery_decision": recovery_decision,
             "exchange_truth_mismatches": exchange_truth_mismatches,
         },
     )
+
+
+def _recovery_decision_payload(
+    state: dict[str, Any],
+    exchange_truth: Any,
+) -> dict[str, Any]:
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            local_open_positions=_state_collection_or_count(
+                state, "open_positions", "open_position_count"
+            ),
+            pending_entries=_state_collection_or_count(
+                state, "pending_entries", "pending_entry_count"
+            ),
+            residual_repairs=_state_collection_or_count(
+                state, "pending_residual_repairs", "pending_residual_repair_count"
+            ),
+            passive_closes=_state_collection_or_count(
+                state, "pending_passive_closes", "pending_close_count"
+            ),
+            exchange_truth=exchange_truth if isinstance(exchange_truth, dict) else None,
+            prior_recovery_block_reason=state.get("recovery_blocked_reason"),
+        )
+    )
+    return {
+        "kind": decision.kind.value,
+        "evidence_quality": decision.evidence_quality,
+        "entry_allowed": decision.entry_allowed,
+        "block_reason": decision.block_reason,
+        "clear_reason": decision.clear_reason,
+        "diagnostic_severity": decision.diagnostic_severity,
+    }
+
+
+def _state_collection_or_count(
+    state: dict[str, Any],
+    collection_key: str,
+    count_key: str,
+) -> tuple[Any, ...]:
+    collection = state.get(collection_key)
+    if isinstance(collection, dict):
+        return tuple(collection.values())
+    if isinstance(collection, (list, tuple, set)):
+        return tuple(collection)
+    count = int(state.get(count_key) or 0)
+    return tuple({"source": count_key} for _ in range(max(count, 0)))
 
 
 def analyze_resolver_config(text: str) -> HealthReport:

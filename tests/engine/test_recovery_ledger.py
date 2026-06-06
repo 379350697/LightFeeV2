@@ -105,7 +105,7 @@ def test_residual_repair_with_live_flat_records_repair_work_and_flat_decision():
     assert ledger.is_proven_flat("SEIUSDT") is False
 
 
-def test_unavailable_exchange_truth_blocks_as_ambiguous_exchange_truth():
+def test_unavailable_exchange_truth_records_nonblocking_ambiguous_evidence_gap():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"open_positions": [], "pending_entries": []},
         exchange_truth={
@@ -116,8 +116,46 @@ def test_unavailable_exchange_truth_blocks_as_ambiguous_exchange_truth():
         },
     )
 
-    assert ledger.has_blocking_work()
+    assert ledger.has_blocking_work() is False
     assert ledger.work_items[0].kind == "ambiguous_exchange_truth"
+    assert ledger.work_items[0].blocking is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
+def test_flat_no_local_work_unavailable_truth_is_nonblocking_evidence_gap():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_residual_repairs": [],
+            "pending_passive_closes": [],
+        },
+        exchange_truth={
+            "truth_available": False,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": [{"venue": "bybit", "error": "timeout"}],
+        },
+    )
+
+    assert ledger.has_blocking_work() is False
+    assert [item.kind for item in ledger.work_items] == ["ambiguous_exchange_truth"]
+    assert ledger.work_items[0].blocking is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
+def test_local_work_unavailable_truth_remains_blocking():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "open_positions": [],
+            "pending_entries": [{"pending_id": "entry-sei", "symbol": "SEIUSDT"}],
+            "pending_residual_repairs": [],
+        },
+        exchange_truth={"truth_available": False, "positions": [], "open_orders": []},
+    )
+
+    assert ledger.has_blocking_work()
+    assert any(item.kind == "ambiguous_exchange_truth" for item in ledger.work_items)
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
@@ -181,14 +219,15 @@ def test_unresolved_work_blocks_same_symbol_with_venue_overlap():
     ) is False
 
 
-def test_legacy_unavailable_exchange_truth_blocks_even_without_truth_available_key():
+def test_legacy_unavailable_exchange_truth_records_nonblocking_gap():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"open_positions": [], "pending_entries": []},
         exchange_truth={"available": False, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work()
+    assert ledger.has_blocking_work() is False
     assert ledger.work_items[0].kind == "ambiguous_exchange_truth"
+    assert ledger.work_items[0].blocking is False
 
 
 def test_owned_non_reduce_maker_order_returns_owned_cancel_decision():

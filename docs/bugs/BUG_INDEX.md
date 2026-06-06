@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest V1 recovery decision core closed-loop implementation, 2026-06-06: the
+`ambiguous_exchange_truth -> runtime.stale_recovery_block_cleared` pattern is
+now handled as a single-authority recovery semantics gap, not as another
+single-condition bug. A pure `V1RecoveryDecisionCore` owns evidence
+classification, ownership resolution, recovery work planning, lifecycle, entry
+policy, diagnostic severity, and block/clear decisions. The boundary keeps
+normal entry available for flat/no-local-work evidence gaps, while still
+blocking/managing concrete live artifacts, local recovery work, operator
+fail-closed, and unresolved pending/passive/residual/open work. Post-review
+closure tightened live-artifact ownership so same-symbol evidence is not enough
+to own an unmatched live position or unrelated maker order; diagnose also treats
+count-only pending/residual/passive state as required recovery work when truth is
+unavailable. The spec and execution plan are recorded in
+[`../superpowers/specs/2026-06-06-v1-recovery-decision-core-closed-loop-design.md`](../superpowers/specs/2026-06-06-v1-recovery-decision-core-closed-loop-design.md)
+and
+[`../superpowers/plans/2026-06-06-v1-recovery-decision-core-closed-loop-implementation-plan.md`](../superpowers/plans/2026-06-06-v1-recovery-decision-core-closed-loop-implementation-plan.md).
+This closure does not include manual orders, cancels, or production runtime-state
+edits.
+
 Latest pending-entry passive opening source-port closure, 2026-06-05: the
 post-quick-flat pending-entry work has been re-centered on V1 source functions
 rather than incident patches. The required matrix now classifies current hunks

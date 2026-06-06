@@ -30,6 +30,7 @@ evidence must map to the matrix before runtime code changes.
 - `_finalize_pending_entry()` emits deferred evidence, but the caller still
   resolves or removes the pending entry.
 - `exchange_truth_recovery_ledger_blocked`
+- `ambiguous_exchange_truth` followed by `runtime.stale_recovery_block_cleared`
 - `orphan_maker_order`
 - `unpaired_live_position`
 - `ambiguous_exchange_truth`
@@ -64,13 +65,23 @@ While a pending entry is unresolved, V1 protects the same pair and the same
 symbol with either venue overlapping. A new route cannot bypass live-truth
 recovery by swapping only one venue.
 
-The V1-style recovery ledger is now the shared intake for this family. Local
-empty `open_positions`, `pending_entries`, and `pending_residual_repairs` are
-not enough to prove flat. Runtime must classify exchange positions, exchange
-open orders, pending work, residual repair, passive close work, owner evidence,
-and ambiguous probe evidence before normal entry risk is allowed. A live
-non-reduce order without a proven owner becomes blocking `orphan_maker_order`;
-a live position without a proven owner becomes blocking `unpaired_live_position`.
+The V1-style recovery ledger is the shared intake for this family, and the
+V1 recovery decision core is the closed-loop authority for block, clear,
+lifecycle, entry, and diagnose semantics. Local empty `open_positions`,
+`pending_entries`, and `pending_residual_repairs` are not enough to prove flat.
+Runtime must classify exchange positions, exchange open orders, pending work,
+residual repair, passive close work, owner evidence, and evidence quality before
+normal entry risk is allowed.
+
+`ambiguous_exchange_truth` is evidence quality, not standalone recovery work. If
+local state has no open/pending/residual/passive work and there is no concrete
+live exchange artifact, partial or unavailable probe evidence is
+`RUNNING_WITH_EVIDENCE_GAP`: it may warn or keep production acceptance
+incomplete, but it must not create a global recovery block or block normal
+entry. If truth is unavailable while local recovery work or a live artifact needs
+truth, it remains risk-only/blocking. A live non-reduce order without a proven
+owner becomes blocking `orphan_maker_order`; a live position without a proven
+owner becomes blocking `unpaired_live_position`.
 
 ## V1 / Exchange Semantics
 
@@ -134,6 +145,7 @@ a live position without a proven owner becomes blocking `unpaired_live_position`
 | 2026-06-05 | Full-loop V1 parity follow-up after post-deploy pending churn | deployed; production acceptance blocked by live open order | Hyperliquid insufficient-margin now creates both symbol and venue admission cooldowns; same-symbol venue-overlap pending entries block with `pending_entry_protection`; `_finalize_pending_entry()` returns terminality status and runtime callers retain/backoff on deferred finalization instead of resolving/popping; force-terminal zero-fill routes through the finalizer so positive/live evidence cannot be discarded. Cloud deployed `3af002d` and services stayed active, but diagnose still found one Bybit `TRXUSDT` non-reduce-only open maker order from pre-deploy state, so acceptance remains blocked by `DG-02`. |
 | 2026-06-05 | Exchange-truth recovery ledger V1 parity | locally implemented, not deployed in this pass | Added sanitized `TRXUSDT` and `SEIUSDT` incident fixtures, pure `RecoveryLedger`, shared exchange-truth normalizer, recovery owner index, pending-entry terminalizer, runtime recovery-ledger refresh/entry gate, shared pending-entry post-terminal removal helper, and production-health local-flat/live-open-order critical classification. Focused tests passed: core ledger/owner/truth/terminalizer `27 passed`, startup/runtime/passive-close `359 passed`, diagnose/health `66 passed`, pending-entry parity `35 passed`; full pytest `3479 passed`, `9 skipped`, `1 warning`; compileall and diff-check passed; GitNexus staged detect-changes reported medium risk, 23 files, 47 symbols, and 3 affected verifier flows. |
 | 2026-06-05 | Exchange-truth recovery ledger review closure | locally implemented, not deployed in this pass | Closed post-review drift without CL-specific branches: startup/tick now refresh the ledger from supported private truth probes; metadata-only adapters do not create ambiguous ledger blockers; startup mismatch cleanup outcomes are not overwritten by generic ledger blockers; journal owner evidence feeds the owner index; terminal pending removal stays behind `PendingEntryTerminalizer`; invalid pending entries with exchange evidence are retained and risk-only blocked; same-symbol venue-overlap still blocks while unrelated same-venue symbols do not; legacy `available=False` truth is treated as unavailable. Focused and adjacent suites passed, and full pytest now reports `3487 passed`, `9 skipped`, `1 warning`. |
+| 2026-06-06 | V1 recovery decision core closed-loop implementation | locally implemented, pending deploy | Block and clear are now owned by one pure core, not by a ledger blocker plus a stale-clean helper. `ambiguous_exchange_truth` becomes a typed evidence gap unless local recovery work, owner evidence, unresolved work, a live artifact, or operator fail-closed makes truth required. Review closure tightened owner matching so same-symbol-only evidence cannot hide unmatched live positions or unrelated maker orders, and diagnose count-only pending/residual/passive state still blocks when truth is unavailable. |
 
 ## Recurrences
 
@@ -151,6 +163,7 @@ a live position without a proven owner becomes blocking `unpaired_live_position`
 | 2026-06-05 | `WLDUSDT`, `XLMUSDT`, `MONUSDT`, `MOVEUSDT` Hyperliquid margin rejects; `XLMUSDT` overlapping pending route; post-deploy `TRXUSDT` Bybit open maker order | deployed `3af002d`; acceptance blocked | Mapped to `PE-11`, `PE-17`, `PE-18`, plus `PE-02`/`DG-02` for the remaining Bybit open order. Local RED/GREEN covers venue-level margin cooldown, same-symbol venue-overlap pending protection, deferred-finalizer retention, and force-terminal zero-fill finalizer routing. Cloud deploy passed manifest/services, but diagnose found Bybit open order `a84df707-efb3-4e40-bab1-641a4eb0f3d4` for `72.0` `TRXUSDT`; no manual order/state mutation was performed. | [daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity](../daily/2026-06-05.md#contract-follow-up-pending-entry-v1-full-loop-parity) |
 | 2026-06-05 | `TRXUSDT` Bybit live open maker order local-flat; `SEIUSDT` Bybit positive-fill local false-flat | local implementation pending deploy | Mapped to the unified exchange-truth recovery ledger. `TRXUSDT` local-flat/live-open-order becomes blocking `orphan_maker_order`; `SEIUSDT` positive-fill evidence prevents proven-flat and routes into blocking recovery work. Runtime entry gating now asks the ledger before dispatch, and production health flags live non-reduce open orders as critical exchange-truth mismatches. | [daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity](../daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity) |
 | 2026-06-05 | Review closure for exchange-truth recovery ledger wiring and terminalizer authority | local implementation pending deploy | Startup and tick wiring, clean-blocker release, journal owner mapping, unsupported-probe handling, V1 same-symbol venue-overlap scope, and terminalizer-only pending removal are now covered by RED/GREEN regression tests. This is a closure of the ledger contract, not a new symbol-specific bug. | [daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity](../daily/2026-06-05.md#contract-follow-up-exchange-truth-recovery-ledger-v1-parity) |
+| 2026-06-06 | `ambiguous_exchange_truth` / stale recovery-block oscillation | locally implemented, pending deploy | Mapped to the V1 recovery decision core closed-loop. Flat/no-local-work plus probe gap becomes `RUNNING_WITH_EVIDENCE_GAP`; local recovery work plus missing truth remains risk-only/blocking; live artifacts remain orphan/unpaired blockers unless exact owner evidence exists. | [daily/2026-06-06.md#contract-follow-up-v1-recovery-decision-core-closed-loop](../daily/2026-06-06.md#contract-follow-up-v1-recovery-decision-core-closed-loop) |
 
 ## Regression Harness
 
@@ -196,10 +209,12 @@ a live position without a proven owner becomes blocking `unpaired_live_position`
    evidence releases the risk.
 15. If finalization emits a deferred event, check that the caller retained the
    pending entry and did not append it to a resolved list or pop it afterward.
-16. If local state is flat, build or inspect the recovery ledger before calling
-   the state safe. A live position, non-reduce open order, unavailable exchange
-   truth, or positive fill evidence must map to ledger work before any
-   production-health conclusion or entry-risk decision.
+16. If local state is flat, build or inspect the recovery ledger and V1 recovery
+   decision before calling the state safe. A live position, non-reduce open
+   order, local recovery work, or positive fill evidence must map to recovery
+   work before any production-health conclusion or entry-risk decision. An
+   unavailable/partial truth probe with no local work and no live artifact is an
+   evidence gap, not a global recovery block.
 17. For quick-flat reports, join `execution.entry_selected`, `entry.opened`,
     `runtime.funding_capture_state_updated`, `runtime.normal_close_routing_*`,
     and `exit.closed` by `position_id`.

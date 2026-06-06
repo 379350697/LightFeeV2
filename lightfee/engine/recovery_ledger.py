@@ -9,6 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
+
 
 EPSILON = 1e-9
 
@@ -109,23 +114,42 @@ class RecoveryLedger:
             seen_work.add(key)
             work_items.append(item)
 
-        if not truth_available:
-            add_work(
-                RecoveryWorkItem(
-                    kind="ambiguous_exchange_truth",
-                    decision=RecoveryDecision(
-                        outcome="fail_closed_operator_block",
-                        reason="exchange_truth_unavailable",
-                    ),
-                    blocking=True,
-                )
-            )
-
         local_open_positions = list(_local_collection(local, "open_positions"))
         local_pending_entries = list(_local_collection(local, "pending_entries"))
         local_residuals = list(_local_collection(local, "pending_residual_repairs"))
         local_passive_closes = list(_local_collection(local, "pending_passive_closes"))
         local_fill_evidence = list(_local_collection(local, "fill_evidence"))
+
+        core_decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                local_open_positions=tuple(local_open_positions),
+                pending_entries=tuple(local_pending_entries),
+                residual_repairs=tuple(local_residuals),
+                passive_closes=tuple(local_passive_closes),
+                exchange_truth=exchange_truth,
+            )
+        )
+
+        if not truth_available:
+            blocking = not core_decision.entry_allowed
+            add_work(
+                RecoveryWorkItem(
+                    kind="ambiguous_exchange_truth",
+                    decision=RecoveryDecision(
+                        outcome=(
+                            "fail_closed_operator_block"
+                            if blocking
+                            else "evidence_gap_observed"
+                        ),
+                        reason=(
+                            core_decision.block_reason
+                            or "exchange_truth_unavailable_without_recovery_work"
+                        ),
+                        blocking=blocking,
+                    ),
+                    blocking=blocking,
+                )
+            )
 
         open_position_symbols = {
             _symbol(item)

@@ -27,6 +27,10 @@ from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
 
 # Schema version — bump when output shape changes
@@ -1899,6 +1903,7 @@ def _build_production_acceptance_gate(
     )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
+    recovery_decision = _recovery_decision_payload(local_state, exchange_truth)
     local_recovery_clean = (
         open_position_count == 0
         and pending_entry_count == 0
@@ -1992,12 +1997,59 @@ def _build_production_acceptance_gate(
         "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        "recovery_decision": recovery_decision,
         "exception_conclusions": exception_conclusions,
         "unclassified_exceptions": unclassified_exceptions,
         "insufficient_evidence_exceptions": insufficient_evidence_exceptions,
         "blocking_reasons": blocking_reasons,
         "gate_passed": not blocking_reasons,
     }
+
+
+def _recovery_decision_payload(
+    local_state: dict[str, Any],
+    exchange_truth: dict[str, Any] | None,
+) -> dict[str, Any]:
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            local_open_positions=_state_collection_or_count(
+                local_state, "open_positions", "open_position_count"
+            ),
+            pending_entries=_state_collection_or_count(
+                local_state, "pending_entries", "pending_entry_count"
+            ),
+            residual_repairs=_state_collection_or_count(
+                local_state, "pending_residual_repairs", "pending_residual_repair_count"
+            ),
+            passive_closes=_state_collection_or_count(
+                local_state, "pending_passive_closes", "pending_close_count"
+            ),
+            exchange_truth=exchange_truth,
+            prior_recovery_block_reason=local_state.get("recovery_blocked_reason"),
+        )
+    )
+    return {
+        "kind": decision.kind.value,
+        "evidence_quality": decision.evidence_quality,
+        "entry_allowed": decision.entry_allowed,
+        "block_reason": decision.block_reason,
+        "clear_reason": decision.clear_reason,
+        "diagnostic_severity": decision.diagnostic_severity,
+    }
+
+
+def _state_collection_or_count(
+    state: dict[str, Any],
+    collection_key: str,
+    count_key: str,
+) -> tuple[Any, ...]:
+    collection = state.get(collection_key)
+    if isinstance(collection, dict):
+        return tuple(collection.values())
+    if isinstance(collection, (list, tuple, set)):
+        return tuple(collection)
+    count = int(state.get(count_key) or 0)
+    return tuple({"source": count_key} for _ in range(max(count, 0)))
 
 
 # ---------------------------------------------------------------------------

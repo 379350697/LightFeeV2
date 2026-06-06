@@ -42,6 +42,7 @@ from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+from lightfee.engine.recovery_decision_core import CORE_OWNED_BLOCK_REASONS
 
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1332,10 @@ def clear_stale_recovery_block_if_recovery_clean(
     if not state.recovery_blocked_reason:
         return False
     if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
+        return False
+    # Migration fallback only: core-owned blockers are cleared by
+    # V1RecoveryDecisionCore after fresh exchange/local evidence is classified.
+    if state.recovery_blocked_reason in CORE_OWNED_BLOCK_REASONS:
         return False
     if needs_reconciliation(state):
         return False

@@ -755,9 +755,24 @@ def test_run_diagnose_gate_fails_when_exchange_truth_unavailable(monkeypatch):
         assert gate["exchange_truth_no_open_orders"] is False
         assert gate["gate_passed"] is False
         assert gate["blocking_reasons"] == ["exchange_truth_unavailable"]
+        assert gate["recovery_decision"]["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+        assert gate["recovery_decision"]["entry_allowed"] is True
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_diagnose_recovery_decision_treats_count_only_pending_as_required_work():
+    from scripts.diagnose_live import _recovery_decision_payload
+
+    decision = _recovery_decision_payload(
+        {"pending_entry_count": 1},
+        {"available": False, "positions": {}, "open_orders": {}},
+    )
+
+    assert decision["kind"] == "RISK_ONLY_WAIT_FOR_TRUTH"
+    assert decision["entry_allowed"] is False
+    assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
 
 
 def test_run_diagnose_conclusion_is_unhealthy_when_acceptance_gate_has_open_order(

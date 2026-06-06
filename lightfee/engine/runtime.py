@@ -59,6 +59,10 @@ from lightfee.engine.recovery import (
     clear_stale_recovery_block_if_recovery_clean,
     build_persistent_state_view,
 )
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.pending_entry_terminalizer import (
@@ -1077,8 +1081,33 @@ class LiveRuntime:
             owner_index=owner_index,
         )
         self.recovery_ledger = ledger
+        core_decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                local_open_positions=tuple(
+                    self._recovery_state_collection("open_positions")
+                ),
+                pending_entries=tuple(
+                    self._recovery_state_collection("pending_entries")
+                ),
+                residual_repairs=tuple(
+                    self._recovery_state_collection("pending_residual_repairs")
+                ),
+                passive_closes=tuple(
+                    self._recovery_state_collection("pending_passive_closes")
+                ),
+                exchange_truth=exchange_truth,
+                prior_recovery_block_reason=self.state.recovery_blocked_reason,
+                operator_fail_closed=(
+                    self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+                ),
+                recovery_work_items=tuple(ledger.work_items),
+            )
+        )
 
-        if ledger.has_blocking_work():
+        # Block and clear are both driven by V1RecoveryDecisionCore so
+        # evidence-gap states cannot oscillate between ledger block and stale
+        # block cleanup.
+        if core_decision.block_reason:
             self.state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
             self.state.recovery_blocked_at_ms = now_ms
             set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
@@ -1086,6 +1115,8 @@ class LiveRuntime:
                 "recovery.ledger_blocked",
                 {
                     "reason": self.state.recovery_blocked_reason,
+                    "core_reason": core_decision.block_reason,
+                    "decision": core_decision.kind.value,
                     "work_items": [
                         self._recovery_ledger_work_item_payload(item)
                         for item in ledger.work_items
@@ -1095,6 +1126,8 @@ class LiveRuntime:
                 },
             )
         elif (
+            core_decision.clear_previous_block
+            and
             self.state.recovery_blocked_reason
             == "exchange_truth_recovery_ledger_blocked"
         ):
@@ -1105,11 +1138,22 @@ class LiveRuntime:
             self.journal.append(
                 "recovery.ledger_clear",
                 {
-                    "reason": "exchange_truth_recovery_ledger_clean",
+                    "reason": core_decision.clear_reason,
+                    "decision": core_decision.kind.value,
                     "ts_ms": now_ms,
                 },
             )
         return ledger
+
+    def _recovery_state_collection(self, name: str) -> list[Any]:
+        value = getattr(self.state, name, [])
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return list(value.values())
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return [value]
 
     async def _refresh_recovery_ledger_for_symbols(
         self,

@@ -2002,6 +2002,48 @@ class TestRuntimePreflight:
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
             runtime.journal.close()
 
+    def test_evidence_gap_clears_previous_ledger_blocker_through_core(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+            runtime.state.recovery_blocked_at_ms = 123
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": False,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "TRXUSDT",
+                            "endpoint": "fetch_position",
+                            "error": "timeout",
+                        }
+                    ],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert not ledger.has_blocking_work()
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            events = runtime.journal.read_all()
+            assert [
+                event for event in events
+                if event["kind"] == "recovery.ledger_blocked"
+            ] == []
+            clears = [
+                event for event in events
+                if event["kind"] == "recovery.ledger_clear"
+            ]
+            assert clears[-1]["payload"]["reason"] == "core_evidence_gap_no_local_work"
+            runtime.journal.close()
+
     @pytest.mark.asyncio
     async def test_startup_clears_stale_blocked_reason_when_snapshot_is_clean(self):
         with tempfile.TemporaryDirectory() as td:
