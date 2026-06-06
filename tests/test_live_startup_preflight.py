@@ -1696,6 +1696,62 @@ class TestRuntimePreflight:
             )
 
     @pytest.mark.asyncio
+    async def test_runtime_live_mismatch_flatten_closes_core_ledger_block(self):
+        """A successful runtime flatten must return to the core to clear its block."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FakeVenueAdapter(Venue.BYBIT)
+            bybit.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=53.6,
+                    entry_price=0.4469,
+                    observed_at_ms=1700000005000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=53.6,
+                    entry_price=0.4469,
+                    observed_at_ms=1700000005000,
+                ),
+            ]
+            bybit.default_position_side = Side.BUY
+            bybit.default_position_qty = 0.0
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = (
+                "exchange_truth_recovery_ledger_blocked"
+            )
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert bybit.place_order_call_count == 1
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "recovery.live_mismatch_flattened"
+                for event in events
+            )
+            clears = [
+                event for event in events
+                if event["kind"] == "recovery.ledger_clear"
+            ]
+            assert clears[-1]["payload"]["decision"] in {
+                "RUNNING_CLEAN",
+                "RUNNING_WITH_EVIDENCE_GAP",
+            }
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_startup_flattens_unpaired_live_exchange_position(self):
         """Unpaired live exposure should be reduce-only flattened, not shown as clean."""
         with tempfile.TemporaryDirectory() as td:
@@ -1709,10 +1765,18 @@ class TestRuntimePreflight:
                     quantity=0.05,
                     entry_price=65000.0,
                     observed_at_ms=1700000010000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
                 )
             ]
             binance.default_position_side = Side.BUY
-            binance.default_position_qty = 0.05
+            binance.default_position_qty = 0.0
 
             runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
 
@@ -2069,6 +2133,65 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_at_ms == 0
 
     @pytest.mark.asyncio
+    async def test_startup_live_mismatch_flatten_closes_core_ledger_block(self):
+        """Startup mismatch flatten must not skip the core-owned clear decision."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "risk_only",
+                "risk_mode": "running",
+                "recovery_blocked_reason": "exchange_truth_recovery_ledger_blocked",
+                "recovery_blocked_at_ms": 1234,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+            })
+            bybit = FakeVenueAdapter(Venue.BYBIT)
+            bybit.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=53.6,
+                    entry_price=0.4469,
+                    observed_at_ms=1700000010000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=53.6,
+                    entry_price=0.4469,
+                    observed_at_ms=1700000010000,
+                ),
+            ]
+            bybit.default_position_side = Side.BUY
+            bybit.default_position_qty = 0.0
+
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            await runtime.start()
+            await runtime.stop()
+
+            assert bybit.place_order_call_count == 1
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            assert any(
+                event["kind"] == "recovery.live_mismatch_flattened"
+                for event in records
+            )
+            assert any(
+                event["kind"] == "recovery.ledger_clear"
+                for event in records
+            )
+
+    @pytest.mark.asyncio
     async def test_startup_flattens_size_mismatched_live_exchange_positions(self):
         """A long/short pair with unequal size is mismatch exposure, not recovery."""
         with tempfile.TemporaryDirectory() as td:
@@ -2076,6 +2199,14 @@ class TestRuntimePreflight:
             binance = FakeVenueAdapter(Venue.BINANCE)
             okx = FakeVenueAdapter(Venue.OKX)
             binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                ),
                 PositionSnapshot(
                     venue=Venue.BINANCE,
                     symbol="BTCUSDT",
@@ -2093,12 +2224,20 @@ class TestRuntimePreflight:
                     quantity=0.03,
                     entry_price=65010.0,
                     observed_at_ms=1700000010000,
+                ),
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTC-USDT-SWAP",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
                 )
             ]
             binance.default_position_side = Side.BUY
-            binance.default_position_qty = 0.05
+            binance.default_position_qty = 0.0
             okx.default_position_side = Side.SELL
-            okx.default_position_qty = 0.03
+            okx.default_position_qty = 0.0
 
             runtime = LiveRuntime(
                 config,
@@ -2122,6 +2261,7 @@ class TestRuntimePreflight:
             assert binance.last_request.client_order_id
             assert okx.last_request.client_order_id
             assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason is None
 
     @pytest.mark.asyncio
     async def test_startup_blocks_unpaired_live_exchange_position_when_flatten_fails(self):

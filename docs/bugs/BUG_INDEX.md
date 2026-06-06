@@ -44,6 +44,18 @@ later post-deploy check observed `lifecycle=risk_only` after the restarted live
 runtime submitted and then recovery-flattened live Bybit legs. No manual order,
 cancel, or runtime-state edit was performed outside the deploy/restart.
 
+Follow-up closure after the post-deploy `risk_only`, 2026-06-06: the remaining
+gap was not a bad core decision, but a missing return edge into the core after
+side effects. Production showed `exchange_truth_recovery_ledger_blocked` for an
+unpaired Bybit `WLDUSDT` live position, then successful
+`recovery.live_mismatch_flattened` events, but no `recovery.ledger_clear`.
+Runtime now refreshes recovery-ledger exchange truth for the live mismatch
+symbols immediately after successful startup/runtime mismatch flatten, so the
+same `V1RecoveryDecisionCore` clears the core-owned blocker. RED/GREEN coverage
+protects both startup and runtime clean-live-position paths; focused suites,
+compileall, diff-check, and full pytest (`3592 passed`, `9 skipped`, `1
+warning`) passed before deployment.
+
 Latest pending-entry passive opening source-port closure, 2026-06-05: the
 post-quick-flat pending-entry work has been re-centered on V1 source functions
 rather than incident patches. The required matrix now classifies current hunks

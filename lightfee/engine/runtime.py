@@ -1544,10 +1544,29 @@ class LiveRuntime:
                 },
             )
         if mismatches:
+            await self._refresh_recovery_ledger_for_symbols(
+                self._live_position_snapshot_symbols(mismatches),
+                now_ms,
+            )
             return "mismatch_flattened"
         if created:
             return "balanced_recovered"
         return "no_recovery_needed"
+
+    @staticmethod
+    def _live_position_snapshot_symbols(
+        snapshots: list[tuple[str, PositionSnapshot]],
+    ) -> list[str]:
+        symbols: set[str] = set()
+        for requested_symbol, position in snapshots:
+            requested = str(requested_symbol or "").upper()
+            if requested:
+                symbols.add(requested)
+                continue
+            symbol = str(getattr(position, "symbol", "") or "").upper()
+            if symbol:
+                symbols.add(symbol)
+        return sorted(symbols)
 
     def _block_unpaired_startup_live_positions(
         self,
