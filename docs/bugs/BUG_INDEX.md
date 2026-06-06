@@ -56,6 +56,17 @@ protects both startup and runtime clean-live-position paths; focused suites,
 compileall, diff-check, and full pytest (`3592 passed`, `9 skipped`, `1
 warning`) passed before deployment.
 
+Final root-closure review before the next main/cloud deploy, 2026-06-06:
+unconditional stale cleanup is removed as an authority, passive-close live-flat
+legacy cleanup routes through `V1RecoveryDecisionCore`, and evidence-gap clear
+is narrowed so `RUNNING_WITH_EVIDENCE_GAP` cannot clear live-artifact blockers
+such as `orphan_maker_order` or `unpaired_live_position`. Managed local open
+positions continue normal V1 trading under a probe gap unless explicit
+truth-required/recovery-required evidence marks them as recovery work. Latest
+local verification passed focused core/pending-entry checks (`14 passed`), full
+pytest (`3602 passed`, `9 skipped`, `1 warning`), compileall, diff-check, and a
+fresh GitNexus detect-changes audit in the intended recovery/runtime scope.
+
 Latest pending-entry passive opening source-port closure, 2026-06-05: the
 post-quick-flat pending-entry work has been re-centered on V1 source functions
 rather than incident patches. The required matrix now classifies current hunks

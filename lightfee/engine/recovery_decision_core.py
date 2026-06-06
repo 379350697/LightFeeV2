@@ -22,8 +22,16 @@ CORE_OWNED_BLOCK_REASONS = frozenset(
     }
 )
 
+LIVE_ARTIFACT_BLOCK_REASONS = frozenset(
+    {
+        "orphan_maker_order",
+        "unpaired_live_position",
+    }
+)
+
 LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS = frozenset(
     {
+        "position_drift_correction_failed",
         "startup_recovery_pending_work_without_open_positions",
     }
 )
@@ -32,6 +40,9 @@ CORE_CLEARABLE_BLOCK_REASONS = (
     CORE_OWNED_BLOCK_REASONS | LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
 )
 
+EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS = (
+    CORE_CLEARABLE_BLOCK_REASONS - LIVE_ARTIFACT_BLOCK_REASONS
+)
 
 class RecoveryEvidenceClass(StrEnum):
     COMPLETE_FLAT = "complete_flat"
@@ -52,6 +63,14 @@ class RecoveryDecisionKind(StrEnum):
     MANAGE_OWNED_RECOVERY_WORK = "MANAGE_OWNED_RECOVERY_WORK"
     BLOCK_OR_FLATTEN_LIVE_ARTIFACT = "BLOCK_OR_FLATTEN_LIVE_ARTIFACT"
     OPERATOR_FAIL_CLOSED_PRESERVED = "OPERATOR_FAIL_CLOSED_PRESERVED"
+
+
+class RecoveryManagementAction(StrEnum):
+    NONE = "none"
+    WAIT_FOR_TRUTH = "wait_for_truth"
+    MANAGE_OWNED_RECOVERY_WORK = "manage_owned_recovery_work"
+    FLATTEN_OR_BLOCK_LIVE_ARTIFACT = "flatten_or_block_live_artifact"
+    PRESERVE_OPERATOR_FAIL_CLOSED = "preserve_operator_fail_closed"
 
 
 @dataclass(frozen=True)
@@ -82,6 +101,7 @@ class RecoveryDecision:
     evidence_quality: str = "complete_flat"
     journal_event_name: str = "recovery.core.running_clean"
     maintenance_note: str = ""
+    management_action: RecoveryManagementAction = RecoveryManagementAction.NONE
 
 
 class V1RecoveryDecisionCore:
@@ -105,6 +125,7 @@ class V1RecoveryDecisionCore:
                 evidence_quality=RecoveryEvidenceClass.OPERATOR_FAIL_CLOSED.value,
                 journal_event_name="recovery.core.operator_fail_closed_preserved",
                 maintenance_note="Operator fail-closed state is preserved by policy.",
+                management_action=RecoveryManagementAction.PRESERVE_OPERATOR_FAIL_CLOSED,
             )
 
         live_artifact_reason = self._live_artifact_block_reason(snapshot)
@@ -123,11 +144,15 @@ class V1RecoveryDecisionCore:
                     "Concrete exchange live artifacts fail safe until ownership "
                     "or flatten policy resolves them."
                 ),
+                management_action=RecoveryManagementAction.FLATTEN_OR_BLOCK_LIVE_ARTIFACT,
             )
 
         has_local_work = self._has_local_recovery_work(snapshot)
+        has_truth_required_work = has_local_work or self._has_truth_required_recovery_context(
+            snapshot
+        )
         truth_available = self._truth_available(snapshot.exchange_truth)
-        if has_local_work and not truth_available:
+        if has_truth_required_work and not truth_available:
             reason = RecoveryEvidenceClass.TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY.value
             return RecoveryDecision(
                 kind=RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH,
@@ -143,6 +168,7 @@ class V1RecoveryDecisionCore:
                     "Existing recovery work requires exchange truth before "
                     "new entry risk can be admitted."
                 ),
+                management_action=RecoveryManagementAction.WAIT_FOR_TRUTH,
             )
 
         if has_local_work:
@@ -160,6 +186,7 @@ class V1RecoveryDecisionCore:
                     "Local recovery work is managed before conflicting new "
                     "entry risk is allowed."
                 ),
+                management_action=RecoveryManagementAction.MANAGE_OWNED_RECOVERY_WORK,
             )
 
         if not truth_available or self._has_partial_evidence_gap(snapshot.exchange_truth):
@@ -170,7 +197,7 @@ class V1RecoveryDecisionCore:
                 kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
                 evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
                 entry_allowed=True,
-                clear_previous_block=self._should_clear_core_block(snapshot),
+                clear_previous_block=self._should_clear_evidence_gap_block(snapshot),
                 clear_reason="core_evidence_gap_no_local_work",
                 recovery_work_items=(),
                 diagnostic_severity="warning",
@@ -227,9 +254,25 @@ class V1RecoveryDecisionCore:
             )
         )
 
+    def _has_truth_required_recovery_context(
+        self, snapshot: RecoveryEvidenceSnapshot
+    ) -> bool:
+        if self._has_truth_required_recovery_work_item(snapshot.recovery_work_items):
+            return True
+        return any(
+            _local_position_requires_truth(item)
+            for item in _as_items(snapshot.local_open_positions)
+        )
+
     def _has_blocking_recovery_work_item(self, work_items: Any) -> bool:
         for item in _as_items(work_items):
             if bool(_get(item, "blocking", True)):
+                return True
+        return False
+
+    def _has_truth_required_recovery_work_item(self, work_items: Any) -> bool:
+        for item in _as_items(work_items):
+            if _bool(_get(item, "requires_truth", _get(item, "truth_required", False))):
                 return True
         return False
 
@@ -256,6 +299,12 @@ class V1RecoveryDecisionCore:
     def _should_clear_core_block(self, snapshot: RecoveryEvidenceSnapshot) -> bool:
         reason = snapshot.prior_recovery_block_reason
         return reason is None or reason in CORE_CLEARABLE_BLOCK_REASONS
+
+    def _should_clear_evidence_gap_block(
+        self, snapshot: RecoveryEvidenceSnapshot
+    ) -> bool:
+        reason = snapshot.prior_recovery_block_reason
+        return reason is None or reason in EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -353,6 +402,19 @@ def _position_matches_local_open(position: Any, local_open_positions: tuple[Any,
     return any(
         _symbol(item) == symbol and venue in _venues(item)
         for item in local_open_positions
+    )
+
+
+def _local_position_requires_truth(position: Any) -> bool:
+    return any(
+        _bool(_get(position, key, False))
+        for key in (
+            "requires_truth",
+            "truth_required",
+            "recovery_required",
+            "reconcile_required",
+            "needs_recovery",
+        )
     )
 
 

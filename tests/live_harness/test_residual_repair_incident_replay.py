@@ -3,6 +3,13 @@ from __future__ import annotations
 import pytest
 
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.engine.recovery_decision_core import (
+    RecoveryDecision,
+    RecoveryDecisionKind,
+    RecoveryEvidenceClass,
+)
+from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.risk.modes import EngineLifecycle
 from tests.test_live_entry_hedge_root_fix import _FakeVenueAdapter, _make_open_runtime
 
 
@@ -175,6 +182,109 @@ async def test_residual_repair_completed_records_live_truth_evidence(tmp_path):
     assert completed["live_positions"]["binance"]["quantity"] == pytest.approx(0.0)
     assert completed["baseline_quantity"] == pytest.approx(0.0)
     assert completed["live_excess_quantity"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_completion_refreshes_stale_core_block(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.recovery_blocked_reason = "truth_unavailable_for_required_recovery"
+    runtime.state.recovery_blocked_at_ms = now_ms - 1000
+    runtime.recovery_decision = RecoveryDecision(
+        kind=RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH,
+        evidence_class=RecoveryEvidenceClass.TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY,
+        entry_allowed=False,
+        block_reason="truth_unavailable_for_required_recovery",
+    )
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    binance = IncidentVenueAdapter(Venue.BINANCE)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx = IncidentVenueAdapter(Venue.OKX)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert runtime.state.recovery_blocked_reason is None
+    assert runtime.state.recovery_blocked_at_ms == 0
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.recovery_decision.entry_allowed is True
+    assert runtime._gate_recovery_ledger(object()) == (True, "")
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_completion_core_allow_ignores_stale_ledger_veto(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+    runtime.state.recovery_blocked_reason = "truth_unavailable_for_required_recovery"
+    runtime.state.recovery_blocked_at_ms = now_ms - 1000
+    runtime.recovery_decision = RecoveryDecision(
+        kind=RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH,
+        evidence_class=RecoveryEvidenceClass.TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY,
+        entry_allowed=False,
+        block_reason="truth_unavailable_for_required_recovery",
+    )
+    runtime.state.live_recovery_reduce_only_pairs.append({
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+    })
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=runtime.state,
+        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+    )
+
+    binance = IncidentVenueAdapter(Venue.BINANCE)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx = IncidentVenueAdapter(Venue.OKX)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert runtime.recovery_decision.entry_allowed is True
+    assert runtime._gate_recovery_ledger(
+        type("Candidate", (), {
+            "symbol": "OPGUSDT",
+            "long_venue": "binance",
+            "short_venue": "okx",
+        })()
+    ) == (True, "")
 
 
 @pytest.mark.asyncio

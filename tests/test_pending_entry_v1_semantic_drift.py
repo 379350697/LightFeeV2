@@ -1095,9 +1095,11 @@ async def test_startup_rejected_positive_fill_finalizes_open_and_residual(
     assert residual["repair_venue"] == "bybit"
     assert residual["repair_side"] == "sell"
     assert residual["repair_quantity"] == pytest.approx(387.0)
-    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
     assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
-    assert runtime.state.recovery_blocked_reason is None
+    assert runtime.state.recovery_blocked_reason == (
+        "truth_unavailable_for_required_recovery"
+    )
     events = tmp_journal.read_all()
     kinds = [event["kind"] for event in events]
     assert "reconciliation.rejected_pending_retained_with_fill" not in kinds

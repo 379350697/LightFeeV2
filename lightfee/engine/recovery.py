@@ -47,6 +47,8 @@ from lightfee.engine.recovery_decision_core import (
     LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS,
     RecoveryDecision,
     RecoveryDecisionKind,
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
 )
 
 
@@ -953,23 +955,63 @@ def recover_from_snapshot(
 
     # Assess recovery needs
     recovery = build_recovery_snapshot(state)
+    core_decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            local_open_positions=tuple(state.open_positions.values()),
+            pending_entries=tuple(state.pending_entries.values()),
+            residual_repairs=tuple(
+                getattr(state, "pending_residual_repairs", ()) or ()
+            ),
+            passive_closes=tuple(state.pending_passive_closes.values()),
+            exchange_truth=None,
+            prior_recovery_block_reason=state.recovery_blocked_reason,
+            operator_fail_closed=(
+                state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+            ),
+        )
+    )
 
-    if recovery.has_open_positions:
-        if recovery.ambiguous_state:
-            state.lifecycle = EngineLifecycle.RECONCILING
-            state.risk_mode = state.risk_mode.max(GlobalRiskMode.REDUCE_ONLY)
-            _try_emit_recovery(journal, "recovery.blocked", {
-                "reason": "ambiguous_live_truth",
-                "open_position_count": len(state.open_positions),
-            })
-        else:
-            state.lifecycle = EngineLifecycle.RECONCILING
+    if (
+        core_decision.block_reason
+        and core_decision.kind == RecoveryDecisionKind.OPERATOR_FAIL_CLOSED_PRESERVED
+    ):
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+        state.recovery_blocked_reason = core_decision.block_reason
+        state.recovery_blocked_at_ms = int(time.time() * 1000)
+        _try_emit_recovery(journal, "recovery.blocked", {
+            "reason": core_decision.block_reason,
+            "decision": core_decision.kind.value,
+            "management_action": core_decision.management_action.value,
+            "open_position_count": len(state.open_positions),
+        })
+    elif core_decision.block_reason:
+        state.lifecycle = EngineLifecycle.RECONCILING
+        _try_emit_recovery(journal, core_decision.journal_event_name, {
+            "reason": core_decision.block_reason,
+            "decision": core_decision.kind.value,
+            "management_action": core_decision.management_action.value,
+            "open_position_count": len(state.open_positions),
+        })
+    elif recovery.has_open_positions:
+        state.lifecycle = EngineLifecycle.RECONCILING
+        _try_emit_recovery(journal, core_decision.journal_event_name, {
+            "reason": core_decision.clear_reason,
+            "decision": core_decision.kind.value,
+            "management_action": core_decision.management_action.value,
+            "open_position_count": len(state.open_positions),
+        })
 
     if state.lifecycle == EngineLifecycle.BOOTING:
         state.lifecycle = EngineLifecycle.RECONCILING
 
     # Clean state with no recovery work → can run
-    if not recovery.has_open_positions and not recovery.has_pending_entries and not recovery.has_pending_closes:
+    if (
+        not recovery.has_open_positions
+        and not recovery.has_pending_entries
+        and not recovery.has_pending_closes
+        and not recovery.has_pending_passive_closes
+        and not recovery.has_pending_residual_repairs
+    ):
         if state.lifecycle == EngineLifecycle.RECONCILING:
             state.lifecycle = EngineLifecycle.RUNNING
             _try_emit_recovery(journal, "runtime.running", {

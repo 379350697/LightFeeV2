@@ -1952,9 +1952,7 @@ class TestRuntimePreflight:
 
             assert any(item.blocking for item in ledger.work_items)
             assert ledger.work_items[0].kind == "orphan_maker_order"
-            assert runtime.state.recovery_blocked_reason == (
-                "exchange_truth_recovery_ledger_blocked"
-            )
+            assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
             events = [
                 event for event in runtime.journal.read_all()
@@ -2009,7 +2007,7 @@ class TestRuntimePreflight:
             assert item.owner.owner_id == "entry-trx"
             assert item.owner.confidence == "probable"
             assert runtime.state.recovery_blocked_reason == (
-                "exchange_truth_recovery_ledger_blocked"
+                "owned_recovery_work"
             )
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
             assert [
@@ -2168,7 +2166,7 @@ class TestRuntimePreflight:
             assert item.owner.confidence == "probable"
             assert item.decision.reason == "live_order_has_runtime_owner"
             assert runtime.state.recovery_blocked_reason == (
-                "exchange_truth_recovery_ledger_blocked"
+                "owned_recovery_work"
             )
             runtime.journal.close()
 

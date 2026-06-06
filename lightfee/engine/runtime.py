@@ -60,6 +60,7 @@ from lightfee.engine.recovery import (
     build_persistent_state_view,
 )
 from lightfee.engine.recovery_decision_core import (
+    CORE_CLEARABLE_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
@@ -1093,20 +1094,21 @@ class LiveRuntime:
                 recovery_work_items=tuple(ledger.work_items),
             )
         )
+        self.recovery_decision = core_decision
 
         # Block and clear are both driven by V1RecoveryDecisionCore so
         # evidence-gap states cannot oscillate between ledger block and stale
         # block cleanup.
         if core_decision.block_reason:
-            self.state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+            self.state.recovery_blocked_reason = core_decision.block_reason
             self.state.recovery_blocked_at_ms = now_ms
             set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
             self.journal.append(
                 "recovery.ledger_blocked",
                 {
                     "reason": self.state.recovery_blocked_reason,
-                    "core_reason": core_decision.block_reason,
                     "decision": core_decision.kind.value,
+                    "management_action": core_decision.management_action.value,
                     "work_items": [
                         self._recovery_ledger_work_item_payload(item)
                         for item in ledger.work_items
@@ -1117,9 +1119,7 @@ class LiveRuntime:
             )
         elif (
             core_decision.clear_previous_block
-            and
-            self.state.recovery_blocked_reason
-            == "exchange_truth_recovery_ledger_blocked"
+            and self.state.recovery_blocked_reason in CORE_CLEARABLE_BLOCK_REASONS
         ):
             self.state.recovery_blocked_reason = None
             self.state.recovery_blocked_at_ms = 0
@@ -1688,8 +1688,7 @@ class LiveRuntime:
             source="runtime_live_position_probe",
         )
         if (
-            self.state.recovery_blocked_reason
-            == "startup_recovery_pending_work_without_open_positions"
+            self.state.recovery_blocked_reason in CORE_CLEARABLE_BLOCK_REASONS
             and len(self.state.open_positions) > open_positions_before
             and not self.state.pending_entries
             and not self.state.pending_closes
@@ -10193,14 +10192,59 @@ class LiveRuntime:
         has_pending = len(self.state.pending_entries) > 0
         has_pending_closes = len(self.state.pending_closes) > 0
         has_passive_closes = len(self.state.pending_passive_closes) > 0
+        has_residual_repairs = bool(
+            getattr(self.state, "pending_residual_repairs", []) or []
+        )
+        core_decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                local_open_positions=tuple(
+                    self._recovery_state_collection("open_positions")
+                ),
+                pending_entries=tuple(
+                    self._recovery_state_collection("pending_entries")
+                ),
+                residual_repairs=tuple(
+                    self._recovery_state_collection("pending_residual_repairs")
+                ),
+                passive_closes=tuple(
+                    self._recovery_state_collection("pending_passive_closes")
+                ),
+                exchange_truth=None,
+                prior_recovery_block_reason=self.state.recovery_blocked_reason,
+                operator_fail_closed=(
+                    self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+                ),
+            )
+        )
+        self.recovery_decision = core_decision
 
-        if not has_opens and not has_pending and not has_pending_closes and not has_passive_closes:
+        if (
+            not has_opens
+            and not has_pending
+            and not has_pending_closes
+            and not has_passive_closes
+            and not has_residual_repairs
+        ):
             # All clear — transition to RUNNING
             from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
-            clear_risk_mode_for_recovery(self.state)
-            self.state.last_error = None
-            self._try_journal("runtime.running",
-                {"reason": "startup_recovery_completed", "ts_ms": wall_clock_now_ms()})
+            if clear_risk_mode_for_recovery(self.state, core_decision):
+                self.state.last_error = None
+                self._try_journal("runtime.running",
+                    {
+                        "reason": "startup_recovery_completed",
+                        "decision": core_decision.kind.value,
+                        "management_action": core_decision.management_action.value,
+                        "ts_ms": wall_clock_now_ms(),
+                    })
+            elif core_decision.block_reason:
+                self.state.recovery_blocked_reason = core_decision.block_reason
+                self.state.recovery_blocked_at_ms = wall_clock_now_ms()
+                self._try_journal("recovery.blocked", {
+                    "reason": core_decision.block_reason,
+                    "decision": core_decision.kind.value,
+                    "management_action": core_decision.management_action.value,
+                    "ts_ms": wall_clock_now_ms(),
+                })
             return
 
         if has_opens:
@@ -10216,30 +10260,54 @@ class LiveRuntime:
                 })
             else:
                 from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
-                clear_risk_mode_for_recovery(self.state)
-                self.state.last_error = None
-                self._try_journal("runtime.running", {
-                    "reason": "startup_recovery_completed_with_positions",
-                    "open_positions": len(self.state.open_positions),
-                    "ts_ms": wall_clock_now_ms(),
-                })
+                if clear_risk_mode_for_recovery(self.state, core_decision):
+                    self.state.last_error = None
+                    self._try_journal("runtime.running", {
+                        "reason": "startup_recovery_completed_with_positions",
+                        "decision": core_decision.kind.value,
+                        "management_action": core_decision.management_action.value,
+                        "open_positions": len(self.state.open_positions),
+                        "ts_ms": wall_clock_now_ms(),
+                    })
+                elif core_decision.block_reason:
+                    self.state.recovery_blocked_reason = (
+                        core_decision.block_reason
+                    )
+                    self.state.recovery_blocked_at_ms = wall_clock_now_ms()
+                    self.state.last_error = (
+                        f"startup recovery blocked: {core_decision.block_reason}"
+                    )
+                    set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+                    self._try_journal("recovery.blocked", {
+                        "reason": core_decision.block_reason,
+                        "decision": core_decision.kind.value,
+                        "management_action": (
+                            core_decision.management_action.value
+                        ),
+                        "open_positions": len(self.state.open_positions),
+                        "ts_ms": wall_clock_now_ms(),
+                    })
             return
 
         # No open positions but has pending work → RISK_ONLY
-        if has_pending or has_pending_closes or has_passive_closes:
+        if has_pending or has_pending_closes or has_passive_closes or has_residual_repairs:
             blocked_reason = (
-                "startup_recovery_pending_work_without_open_positions"
+                core_decision.block_reason
+                or "truth_unavailable_for_required_recovery"
             )
             self.state.recovery_blocked_reason = blocked_reason
             self.state.recovery_blocked_at_ms = wall_clock_now_ms()
             self.state.last_error = (
                 f"startup recovery blocked: pending_entries={len(self.state.pending_entries)}, "
                 f"pending_closes={len(self.state.pending_closes)}, "
-                f"pending_passive_closes={len(self.state.pending_passive_closes)}"
+                f"pending_passive_closes={len(self.state.pending_passive_closes)}, "
+                f"pending_residual_repairs={len(getattr(self.state, 'pending_residual_repairs', []) or [])}"
             )
             set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
             self._try_journal("recovery.blocked", {
                 "reason": blocked_reason,
+                "decision": core_decision.kind.value,
+                "management_action": core_decision.management_action.value,
                 "pending_entries": list(self.state.pending_entries.keys()),
                 "ts_ms": wall_clock_now_ms(),
             })
@@ -10859,6 +10927,46 @@ class LiveRuntime:
             )
 
         if repaired > 0:
+            core_decision = V1RecoveryDecisionCore().decide(
+                RecoveryEvidenceSnapshot(
+                    local_open_positions=tuple(
+                        self._recovery_state_collection("open_positions")
+                    ),
+                    pending_entries=tuple(
+                        self._recovery_state_collection("pending_entries")
+                    ),
+                    residual_repairs=tuple(
+                        self._recovery_state_collection("pending_residual_repairs")
+                    ),
+                    passive_closes=tuple(
+                        self._recovery_state_collection("pending_passive_closes")
+                    ),
+                    exchange_truth=None,
+                    prior_recovery_block_reason=self.state.recovery_blocked_reason,
+                    operator_fail_closed=(
+                        self.state.operator.requested_mode
+                        == GlobalRiskMode.FAIL_CLOSED
+                    ),
+                )
+            )
+            self.recovery_decision = core_decision
+            if (
+                core_decision.clear_previous_block
+                and self.state.recovery_blocked_reason
+                in CORE_CLEARABLE_BLOCK_REASONS
+            ):
+                self.state.recovery_blocked_reason = None
+                self.state.recovery_blocked_at_ms = 0
+                if not self._has_local_recovery_work():
+                    set_lifecycle(self.state, EngineLifecycle.RUNNING)
+                self.journal.append(
+                    "recovery.residual_repairs_core_clear",
+                    {
+                        "reason": core_decision.clear_reason,
+                        "decision": core_decision.kind.value,
+                        "ts_ms": now_ms,
+                    },
+                )
             self.journal.append(
                 "recovery.residual_repairs_complete",
                 {"repaired": repaired, "ts_ms": now_ms},
@@ -11870,6 +11978,11 @@ class LiveRuntime:
         return True, ""
 
     def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
+        core_decision = getattr(self, "recovery_decision", None)
+        if core_decision is not None:
+            if not core_decision.entry_allowed:
+                return False, "recovery_ledger_blocked"
+            return True, ""
         ledger = self.recovery_ledger
         if ledger is None:
             return True, ""
@@ -15340,7 +15453,6 @@ class LiveRuntime:
                 not self.state.pending_passive_closes
                 and self.state.recovery_blocked_reason
             ):
-                ledger = getattr(self, "recovery_ledger", None)
                 core_decision = V1RecoveryDecisionCore().decide(
                     RecoveryEvidenceSnapshot(
                         local_open_positions=tuple(
@@ -15367,11 +15479,9 @@ class LiveRuntime:
                             self.state.operator.requested_mode
                             == GlobalRiskMode.FAIL_CLOSED
                         ),
-                        recovery_work_items=tuple(
-                            getattr(ledger, "work_items", ()) or ()
-                        ),
                     )
                 )
+                self.recovery_decision = core_decision
                 clear_legacy_recovery_block_via_core(
                     self.state,
                     core_decision,

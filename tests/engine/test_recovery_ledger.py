@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_ledger import RecoveryLedger, RecoveryWorkItem
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 
 
@@ -126,6 +126,30 @@ def test_unavailable_exchange_truth_records_nonblocking_ambiguous_evidence_gap()
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
 
 
+def test_ambiguous_exchange_truth_kind_is_never_global_blocking():
+    item = RecoveryWorkItem(kind="ambiguous_exchange_truth", blocking=True)
+
+    assert item.blocks_all_new_entries is False
+
+
+def test_recovery_ledger_collects_evidence_without_calling_decision_core():
+    import lightfee.engine.recovery_ledger as recovery_ledger
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"open_positions": [], "pending_entries": []},
+        exchange_truth={
+            "truth_available": False,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": [{"venue": "bybit", "error": "timeout"}],
+        },
+    )
+
+    assert not hasattr(recovery_ledger, "V1RecoveryDecisionCore")
+    assert [item.kind for item in ledger.work_items] == ["ambiguous_exchange_truth"]
+    assert ledger.work_items[0].blocking is False
+
+
 def test_flat_no_local_work_unavailable_truth_is_nonblocking_evidence_gap():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={
@@ -160,7 +184,7 @@ def test_local_work_unavailable_truth_remains_blocking():
 
     assert _has_blocking_work(ledger)
     assert any(item.kind == "ambiguous_exchange_truth" for item in ledger.work_items)
-    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
 
 
 def test_no_live_artifacts_and_no_local_work_is_proven_flat():

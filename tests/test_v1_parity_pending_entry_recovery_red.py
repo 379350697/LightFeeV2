@@ -213,6 +213,7 @@ class TestRecoveryLifecycleTransition:
         RISK_ONLY (if work remains) or RUNNING (if clean).
         """
         from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import OpenPosition
         from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
 
         config = AppConfig(
@@ -267,6 +268,85 @@ class TestRecoveryLifecycleTransition:
         )
         assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
 
+    def test_operator_fail_closed_clean_state_does_not_emit_runtime_running(self):
+        """Core preserve policy must not be reported as startup running."""
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="paper"),
+            strategy=StrategyConfig(),
+            persistence=PersistenceConfig(),
+        )
+        runtime = LiveRuntime(config, venue_adapters=None)
+        runtime.journal.open()
+        existing_records = len(runtime.journal.read_all())
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+        runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        runtime.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+
+        runtime._finalize_startup_recovery()
+
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert not any(
+            record["kind"] == "runtime.running"
+            and record.get("payload", {}).get("reason") == "startup_recovery_completed"
+            for record in runtime.journal.read_all()[existing_records:]
+        )
+        runtime.journal.close()
+
+    def test_open_position_with_residual_work_blocks_instead_of_running(self):
+        """Open positions do not make local recovery work disappear."""
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import OpenPosition
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="paper"),
+            strategy=StrategyConfig(),
+            persistence=PersistenceConfig(),
+        )
+        runtime = LiveRuntime(config, venue_adapters=None)
+        runtime.journal.open()
+        existing_records = len(runtime.journal.read_all())
+        runtime.state.lifecycle = EngineLifecycle.RECONCILING
+        runtime.state.open_positions["entry-residual"] = OpenPosition(
+            position_id="entry-residual",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.1,
+            short_quantity=0.1,
+            long_entry_price=50000.0,
+            short_entry_price=50100.0,
+            opened_at_ms=1700000000000,
+            matched_quantity=0.1,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-residual",
+            "pair_id": "btcusdt:binance->okx",
+            "symbol": "BTCUSDT",
+            "repair_venue": "binance",
+            "repair_side": "sell",
+            "repair_quantity": 0.01,
+            "origin": "entry_open",
+        })
+
+        runtime._finalize_startup_recovery()
+
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.recovery_blocked_reason == (
+            "truth_unavailable_for_required_recovery"
+        )
+        assert not any(
+            record["kind"] == "runtime.running"
+            and record.get("payload", {}).get("reason")
+            == "startup_recovery_completed_with_positions"
+            for record in runtime.journal.read_all()[existing_records:]
+        )
+        runtime.journal.close()
+
     def test_pending_without_open_positions_becomes_risk_only(self):
         """Pending entries without open positions → RISK_ONLY with blocked reason."""
         from lightfee.engine.runtime import LiveRuntime
@@ -286,10 +366,58 @@ class TestRecoveryLifecycleTransition:
         runtime._finalize_startup_recovery()
 
         assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
-        assert runtime.state.recovery_blocked_reason is not None, (
-            "Must have recovery_blocked_reason set"
+        assert runtime.state.recovery_blocked_reason == (
+            "truth_unavailable_for_required_recovery"
         )
         assert runtime.state.recovery_blocked_at_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_passive_close_cleanup_updates_runtime_core_decision_gate(self):
+        """Passive-close cleanup must not leave entry gate reading stale core block."""
+        from types import SimpleNamespace
+
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+        from lightfee.engine.recovery_decision_core import (
+            RecoveryDecision,
+            RecoveryDecisionKind,
+            RecoveryEvidenceClass,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import PendingPassiveClose
+
+        class ClearingPassiveClose:
+            async def process_pending_passive_closes(self, state, now_ms):
+                state.pending_passive_closes.clear()
+                return set()
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="paper"),
+            strategy=StrategyConfig(),
+            persistence=PersistenceConfig(),
+        )
+        runtime = LiveRuntime(config, venue_adapters=None)
+        runtime.passive_close_executor = ClearingPassiveClose()
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+        runtime.state.recovery_blocked_reason = (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+        runtime.state.pending_passive_closes["entry-passive"] = PendingPassiveClose(
+            position_id="entry-passive",
+            reason="funding_capture",
+        )
+        runtime.recovery_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH,
+            evidence_class=RecoveryEvidenceClass.TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY,
+            entry_allowed=False,
+            block_reason="truth_unavailable_for_required_recovery",
+        )
+
+        await runtime._maybe_tick_passive_close(1778787000000)
+
+        assert runtime.state.recovery_blocked_reason is None
+        assert runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
+        ) == (True, "")
 
     def test_drive_pending_entry_recovery_with_adapters(self):
         """With venue adapters, recovery should attempt to resolve pending entries.

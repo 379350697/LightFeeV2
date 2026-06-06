@@ -221,7 +221,7 @@ def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_jour
     assert "readiness_evidence" not in payload
 
 
-def test_select_entry_candidates_blocks_recovery_ledger_before_readiness(
+def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
     config, tmp_journal
 ):
     from lightfee.engine.entry_readiness import EntryReadinessDecision
@@ -283,11 +283,10 @@ def test_select_entry_candidates_blocks_recovery_ledger_before_readiness(
         candidate_blockers=blockers,
     )
 
-    pair_id = "btcusdt:binance->bybit"
-    assert selected == []
-    assert counts["entry_blocked_recovery_ledger"] == 1
-    assert blockers[pair_id] == "entry_blocked_recovery_ledger"
-    assert readiness_provider.calls == []
+    assert selected == [candidate]
+    assert counts["entry_blocked_recovery_ledger"] == 0
+    assert blockers == {}
+    assert readiness_provider.calls == [(candidate, now_ms)]
 
     records = [
         json.loads(line)
@@ -295,19 +294,8 @@ def test_select_entry_candidates_blocks_recovery_ledger_before_readiness(
         if line.strip()
     ]
     kind_counts = Counter(record["kind"] for record in records)
-    assert kind_counts["runtime.entry_blocked_lifecycle_selection"] == 1
+    assert kind_counts["runtime.entry_blocked_lifecycle_selection"] == 0
     assert kind_counts["runtime.entry_blocked_local_l2_selection"] == 0
-    lifecycle_records = [
-        record
-        for record in records
-        if record["kind"] == "runtime.entry_blocked_lifecycle_selection"
-    ]
-    payload = lifecycle_records[0]["payload"]
-    assert payload["reason"] == "entry_blocked_recovery_ledger"
-    evidence = payload["lifecycle_evidence"]
-    assert evidence["source"] == "selection"
-    assert evidence["truth_available"] is True
-    assert evidence["blocking_work"][0]["kind"] == "orphan_maker_order"
 
 
 def test_select_entry_candidates_does_not_attach_lifecycle_evidence_to_readiness_block(
@@ -683,6 +671,27 @@ class TestPendingEntryTracking:
 
         assert allowed is True
         assert reason == ""
+
+    def test_recovery_core_blocks_unrelated_entry_when_truth_required_for_work(
+        self, config, tmp_journal
+    ):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.pending_entries["entry-sei"] = SimpleNamespace(
+            pending_id="entry-sei",
+            symbol="SEIUSDT",
+        )
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {"truth_available": False, "positions": [], "open_orders": []},
+            now_ms=1778787000000,
+        )
+
+        allowed, reason = runtime._gate_recovery_ledger(
+            SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
+        )
+
+        assert allowed is False
+        assert reason == "recovery_ledger_blocked"
 
 
 @pytest.mark.asyncio

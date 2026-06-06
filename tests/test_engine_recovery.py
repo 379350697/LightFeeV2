@@ -76,14 +76,25 @@ class TestLifecycle:
         state.risk_mode = GlobalRiskMode.ENTRY_PAUSED
         assert not can_enter_new_positions(state)
 
-    def test_clear_risk_mode_for_recovery_clears_blocked_reason(self):
+    def test_clear_risk_mode_for_recovery_requires_core_clear_decision(self):
         state = EngineState()
         enter_fail_closed(state)
-        state.recovery_blocked_reason = "live_position_mismatch_flatten_failed"
+        state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
         state.recovery_blocked_at_ms = 1234
 
-        clear_risk_mode_for_recovery(state)
+        assert clear_risk_mode_for_recovery(state) is False
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.recovery_blocked_reason == "exchange_truth_recovery_ledger_blocked"
 
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_CLEAN,
+            evidence_class=RecoveryEvidenceClass.COMPLETE_FLAT,
+            entry_allowed=True,
+            clear_previous_block=True,
+            clear_reason="core_running_clean",
+        )
+        assert clear_risk_mode_for_recovery(state, core_decision) is True
         assert state.lifecycle == EngineLifecycle.RUNNING
         assert state.risk_mode == GlobalRiskMode.RUNNING
         assert state.recovery_blocked_reason is None
@@ -390,8 +401,8 @@ class TestRecovery:
         assert state.local_l2_books_snapshot[0]["symbol"] == "ETHUSDT"
         assert len(state.local_l2_session_snapshot) == 1
 
-    def test_recovery_blocked_preserves_diagnostic_open_positions(self):
-        """Rust V1: recovery.blocked must include open_position_count for audit."""
+    def test_ambiguous_open_positions_are_core_evidence_gap_not_recovery_block(self):
+        """Ambiguous replay truth is evidence quality, not an independent block."""
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "events.jsonl"
             snap_path = Path(td) / "state.json"
@@ -423,15 +434,24 @@ class TestRecovery:
             journal.close()
 
             state = recover_from_snapshot(snap, journal)
-            # Has open positions with booting lifecycle → ambiguous → blocked + RECONCILING
             assert state.lifecycle == EngineLifecycle.RECONCILING
             assert len(state.open_positions) == 3
 
-            # Read journal to check recovery.blocked event was emitted
             records = journal.read_all()
-            blocked = [r for r in records if r.get("kind") == "recovery.blocked"]
-            assert len(blocked) >= 1, "ambiguous recovery must emit recovery.blocked"
-            assert blocked[0]["payload"]["open_position_count"] == 3
+            blocked = [
+                r
+                for r in records
+                if r.get("kind") == "recovery.blocked"
+                and r.get("payload", {}).get("reason") == "ambiguous_live_truth"
+            ]
+            assert blocked == []
+            core_events = [
+                r
+                for r in records
+                if r.get("kind") == "recovery.core.running_with_evidence_gap"
+            ]
+            assert len(core_events) >= 1
+            assert core_events[0]["payload"]["open_position_count"] == 3
 
     def test_recovery_flat_emitted_when_position_closed_in_journal(self):
         """Rust V1: recovery.flat emitted when snapshot position is closed by journal events."""

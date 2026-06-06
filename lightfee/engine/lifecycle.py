@@ -54,16 +54,33 @@ def transition_to_running(state: EngineState) -> None:
     set_global_risk_mode(state, GlobalRiskMode.RUNNING)
 
 
-def clear_risk_mode_for_recovery(state: EngineState) -> None:
-    """Explicitly reset risk_mode to RUNNING after successful startup recovery.
+def clear_risk_mode_for_recovery(state: EngineState, core_decision: object | None = None) -> bool:
+    """Reset risk mode only after the recovery decision core permits clear.
 
-    V1: EngineState.clear_recovery_blocked_state() in recovery.rs —
-    when recovery completes without blocking work, the fail_closed / reduced
-    risk mode must be cleared. set_global_risk_mode uses .max() which keeps
-    FAIL_CLOSED(3) > RUNNING(0) sticky — this bypass exists specifically
-    for the recovery completion path.
+    V1 clears recovery state at recovery completion. In V2 the decision that
+    recovery is complete must come from V1RecoveryDecisionCore, so this helper
+    is a state-application adapter rather than an independent stale cleaner.
     """
+    from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
+
+    if core_decision is None:
+        return False
+    if getattr(core_decision, "block_reason", None):
+        return False
+    if not bool(getattr(core_decision, "entry_allowed", False)):
+        return False
+    if getattr(core_decision, "kind", None) not in {
+        RecoveryDecisionKind.RUNNING_CLEAN,
+        RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+    }:
+        return False
+    if state.recovery_blocked_reason and not bool(
+        getattr(core_decision, "clear_previous_block", False)
+    ):
+        return False
+
     state.risk_mode = GlobalRiskMode.RUNNING
     state.lifecycle = EngineLifecycle.RUNNING
     state.recovery_blocked_reason = None
     state.recovery_blocked_at_ms = 0
+    return True

@@ -207,7 +207,7 @@ class TestRecoveryFromSnapshot:
             # Has open positions → must enter RECONCILING
             assert state.lifecycle == EngineLifecycle.RECONCILING
 
-    def test_ambiguous_state_sets_reduce_only(self):
+    def test_ambiguous_state_records_core_evidence_gap_without_reduce_only(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "events.jsonl"
             snap_path = Path(td) / "state.json"
@@ -239,7 +239,58 @@ class TestRecoveryFromSnapshot:
 
             state = recover_from_snapshot(snap, journal)
             assert state.lifecycle == EngineLifecycle.RECONCILING
-            assert state.risk_mode.at_least(GlobalRiskMode.ENTRY_PAUSED)
+            assert state.risk_mode == GlobalRiskMode.RUNNING
+            records = journal.read_all()
+            assert not any(
+                r.get("kind") == "recovery.blocked"
+                and r.get("payload", {}).get("reason") == "ambiguous_live_truth"
+                for r in records
+            )
+            assert any(
+                r.get("kind") == "recovery.core.running_with_evidence_gap"
+                for r in records
+            )
+
+    def test_snapshot_residual_work_blocks_without_open_positions(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "events.jsonl"
+            snap_path = Path(td) / "state.json"
+
+            snap = SnapshotStore(snap_path)
+            snap.write({
+                "lifecycle": "booting",
+                "risk_mode": "running",
+                "pending_residual_repairs": [
+                    {
+                        "position_id": "entry-residual",
+                        "pair_id": "btcusdt:binance->okx",
+                        "symbol": "BTCUSDT",
+                        "repair_venue": "binance",
+                        "repair_side": "sell",
+                        "repair_quantity": 0.01,
+                        "origin": "entry_open",
+                    }
+                ],
+            })
+
+            journal = Journal(journal_path)
+            journal.open()
+            journal.close()
+
+            state = recover_from_snapshot(snap, journal)
+
+            assert state.lifecycle == EngineLifecycle.RECONCILING
+            assert state.recovery_blocked_reason is None
+            records = journal.read_all()
+            assert not any(
+                r.get("kind") == "runtime.running"
+                and r.get("payload", {}).get("reason") == "startup_no_recovery_work"
+                for r in records
+            )
+            assert any(
+                r.get("kind") == "recovery.core.truth_required_blocked"
+                for r in records
+            )
 
     def test_snapshot_restores_risk_mode(self):
         with tempfile.TemporaryDirectory() as td:
