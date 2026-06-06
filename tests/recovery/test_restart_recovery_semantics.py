@@ -19,6 +19,7 @@ from lightfee.engine.recovery import (
     build_recovery_dedup_index,
     build_recovery_snapshot,
     classify_startup_recovery_state,
+    clear_legacy_recovery_block_via_core,
     has_lifecycle_blocking_work,
     is_ambiguous_live_truth,
     is_safe_to_resume,
@@ -26,8 +27,14 @@ from lightfee.engine.recovery import (
     normalize_engine_state,
     recover_from_snapshot,
 )
+from lightfee.engine.recovery_decision_core import (
+    RecoveryDecision,
+    RecoveryDecisionKind,
+    RecoveryEvidenceClass,
+)
 from lightfee.engine.state import (
     EngineState,
+    HedgeInflight,
     OpenPosition,
     PendingClose,
     PendingEntry,
@@ -130,6 +137,34 @@ class TestRecoveryBlockResume:
         )
         state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
         assert not is_safe_to_resume(state)
+
+    def test_clear_legacy_recovery_block_does_not_create_last_error_attribute(self):
+        state = EngineState(
+            lifecycle=EngineLifecycle.RISK_ONLY,
+            risk_mode=GlobalRiskMode.FAIL_CLOSED,
+            recovery_blocked_reason="startup_recovery_pending_work_without_open_positions",
+            recovery_blocked_at_ms=1234,
+        )
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+            entry_allowed=True,
+            clear_previous_block=True,
+        )
+
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            None,
+        )
+
+        assert block_cleared is True
+        assert state.lifecycle == EngineLifecycle.RUNNING
+        assert state.risk_mode == GlobalRiskMode.RUNNING
+        assert state.recovery_blocked_reason is None
+        assert state.recovery_blocked_at_ms == 0
+        assert state.global_risk_reason is None
+        assert hasattr(state, "last_error") is False
 
 
 class TestRecoverySnapshot:
@@ -277,6 +312,43 @@ class TestNormalizeEngineState:
         normalize_engine_state(state)
         assert state.open_positions["p1"].matched_quantity == 2.0
 
+    def test_invalid_pending_entry_with_hedge_inflight_blocks_instead_of_crashing(self):
+        state = EngineState()
+        from lightfee.core.domain import Side, Venue
+        state.pending_entries["pe1"] = PendingEntry(
+            pending_id="pe1",
+            symbol="",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            hedge_inflight=HedgeInflight(
+                client_order_id="hedge-cid-1",
+                venue=Venue.OKX,
+                side=Side.SELL,
+                quantity=1.0,
+                attempt=1,
+                submitted_at_ms=1100,
+            ),
+        )
+
+        normalize_engine_state(state)
+
+        assert "pe1" in state.pending_entries
+        assert state.recovery_blocked_reason == "invalid_pending_entry_with_exchange_evidence"
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+
+    def test_pending_close_without_symbol_field_is_retained(self):
+        state = EngineState()
+        _add_pending_close(state, "c1", "p1")
+
+        normalize_engine_state(state)
+
+        assert "c1" in state.pending_closes
+        assert state.pending_closes["c1"].reconcile_next_attempt_ms == 1000
+
 
 class TestSnapshotRecovery:
     """REC-001: Recovery from snapshot + journal replay."""
@@ -346,3 +418,50 @@ class TestSnapshotRecovery:
         journal = Journal(journal_path)
         state = recover_from_snapshot(snap, journal)
         assert "p1" not in state.open_positions
+
+    def test_journal_replay_restores_pending_entry_registered_event(self, tmp_path):
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        journal_path = tmp_path / "journal.jsonl"
+
+        snap.write({
+            "lifecycle": "running",
+            "run_id": "test-run",
+        })
+        journal = Journal(journal_path)
+        journal.open()
+        try:
+            journal.append(
+                "entry.pending_registered",
+                {
+                    "position_id": "entry-1",
+                    "symbol": "BTC-USDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "target_quantity": 2.5,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "created_at_ms": 1234,
+                    "maker_order_id": "maker-order-1",
+                    "maker_client_order_id": "maker-client-1",
+                    "hedge_order_id": "hedge-order-1",
+                    "hedge_client_order_id": "hedge-client-1",
+                    "maker_leg_filled": 0.4,
+                    "hedge_leg_filled": 0.1,
+                },
+                flush=True,
+                ts_ms=1300,
+            )
+        finally:
+            journal.close()
+
+        state = recover_from_snapshot(snap, Journal(journal_path))
+
+        assert "entry-1" in state.pending_entries
+        pending = state.pending_entries["entry-1"]
+        assert pending.pending_id == "entry-1"
+        assert pending.symbol == "BTC-USDT"
+        assert pending.target_quantity == 2.5
+        assert pending.maker_order_id == "maker-order-1"
+        assert pending.hedge_client_order_id == "hedge-client-1"
+        assert pending.maker_leg_filled == 0.4
+        assert pending.hedge_leg_filled == 0.1

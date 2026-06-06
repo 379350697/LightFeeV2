@@ -7,6 +7,11 @@ V2-native structures.
 
 from __future__ import annotations
 
+import ast
+import dataclasses
+import inspect
+import textwrap
+
 import pytest
 from lightfee.engine.state import (
     EngineState,
@@ -830,13 +835,49 @@ class TestEngineStateFieldCompleteness:
     """STATE-003: EngineState preserves V1 lifecycle and control fields."""
 
     def test_all_v1_fields_present(self):
-        import dataclasses
         v2_fields = {f.name for f in dataclasses.fields(EngineState)}
         missing = sorted(V1_ENGINESTATE_REQUIRED_FIELDS - v2_fields)
         assert not missing, (
             f"V1 EngineState fields missing in V2: {missing}\n"
             f"V2 fields: {sorted(v2_fields)}"
         )
+
+    def test_engine_state_declares_hyperliquid_disabled_reason_once(self):
+        v2_fields = [
+            f.name
+            for f in dataclasses.fields(EngineState)
+            if f.name == "hyperliquid_trading_disabled_reason"
+        ]
+        source = textwrap.dedent(inspect.getsource(EngineState))
+        tree = ast.parse(source)
+        class_node = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef)
+        )
+        source_declarations = [
+            node.target.id
+            for node in class_node.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "hyperliquid_trading_disabled_reason"
+        ]
+
+        assert v2_fields == ["hyperliquid_trading_disabled_reason"]
+        assert source_declarations == ["hyperliquid_trading_disabled_reason"]
+
+    def test_engine_state_to_dict_emits_hyperliquid_disabled_reason_once(self):
+        source = textwrap.dedent(inspect.getsource(EngineState.to_dict))
+        tree = ast.parse(source)
+        return_node = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.Return)
+        )
+        assert isinstance(return_node.value, ast.Dict)
+        literal_keys = [
+            key.value
+            for key in return_node.value.keys
+            if isinstance(key, ast.Constant)
+        ]
+
+        assert literal_keys.count("hyperliquid_trading_disabled_reason") == 1
 
     def test_recovery_blocked_state(self):
         state = EngineState()

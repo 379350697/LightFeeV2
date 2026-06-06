@@ -768,7 +768,12 @@ def _apply_journal_replay_to_state(
 
         # V1: entry.pending_registered — recreate pending entry from journal
         elif kind == "entry.pending_registered":
-            pid = payload.get("position_id", "")
+            pid = (
+                payload.get("position_id")
+                or payload.get("pending_id")
+                or payload.get("entry_id")
+                or ""
+            )
             if pid and pid not in state.pending_entries:
                 pe = _restore_pending_entry_from_journal(payload)
                 if pe is not None:
@@ -855,48 +860,126 @@ def _apply_journal_replay_to_state(
 def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
     """V1: restore PendingEntry from journal replay payload."""
     try:
-        from lightfee.engine.state import PendingEntry, HedgeInflight
-        maker_venue_str = payload.get("maker_venue", payload.get("long_venue", "binance"))
-        hedge_venue_str = payload.get("hedge_venue", payload.get("short_venue", "okx"))
-        try:
-            maker_venue = Venue.from_str(maker_venue_str) if hasattr(Venue, 'from_str') else Venue.BINANCE
-        except (ValueError, AttributeError):
-            maker_venue = Venue.BINANCE
-        try:
-            hedge_venue = Venue.from_str(hedge_venue_str) if hasattr(Venue, 'from_str') else Venue.OKX
-        except (ValueError, AttributeError):
-            hedge_venue = Venue.OKX
+        def venue_from(value: Any, default: Venue) -> Venue:
+            if isinstance(value, Venue):
+                return value
+            try:
+                return Venue.from_str(str(value))
+            except (ValueError, AttributeError, TypeError):
+                return default
+
+        def side_from(value: Any, default: Side) -> Side:
+            if isinstance(value, Side):
+                return value
+            try:
+                return Side(str(value).strip().lower())
+            except (ValueError, TypeError):
+                return default
+
+        def float_from(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def int_from(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        long_venue = venue_from(
+            payload.get("long_venue", payload.get("maker_venue", "binance")),
+            Venue.BINANCE,
+        )
+        short_venue = venue_from(
+            payload.get("short_venue", payload.get("hedge_venue", "okx")),
+            Venue.OKX,
+        )
+        long_side = side_from(payload.get("long_side", "buy"), Side.BUY)
+        short_side = side_from(payload.get("short_side", "sell"), Side.SELL)
+        maker_venue = venue_from(payload.get("maker_venue", long_venue), long_venue)
+        maker_leg = str(
+            payload.get("maker_leg", payload.get("entry_maker_leg", "")) or ""
+        ).lower()
+        if maker_leg not in ("long", "short"):
+            maker_leg = "short" if maker_venue == short_venue else "long"
+        hedge_venue = short_venue if maker_leg == "long" else long_venue
+        hedge_side = short_side if maker_leg == "long" else long_side
+
+        target_quantity = float_from(payload.get("target_quantity"), 0.0)
+        if target_quantity <= 0.0:
+            target_quantity = max(
+                float_from(payload.get("long_quantity"), 0.0),
+                float_from(payload.get("short_quantity"), 0.0),
+            )
 
         hedge_inflight = None
         hi_data = payload.get("hedge_inflight")
         if isinstance(hi_data, dict):
             hedge_inflight = HedgeInflight(
-                client_order_id=hi_data.get("client_order_id", ""),
+                client_order_id=str(hi_data.get("client_order_id", "")),
+                venue=venue_from(hi_data.get("venue", hedge_venue), hedge_venue),
+                side=side_from(hi_data.get("side", hedge_side.value), hedge_side),
+                quantity=float_from(hi_data.get("quantity"), 0.0),
+                attempt=int_from(hi_data.get("attempt"), 0),
+                submitted_at_ms=int_from(hi_data.get("submitted_at_ms"), 0),
+                soft_deadline_logged=bool(hi_data.get("soft_deadline_logged", False)),
+            )
+        elif hi_data:
+            hedge_inflight = HedgeInflight(
+                client_order_id=str(hi_data),
                 venue=hedge_venue,
-                side=Side.BUY if hi_data.get("side", "buy") == "buy" else Side.SELL,
-                quantity=float(hi_data.get("quantity", 0)),
-                attempt=int(hi_data.get("attempt", 0)),
-                submitted_at_ms=int(hi_data.get("submitted_at_ms", 0)),
+                side=hedge_side,
+                quantity=0.0,
             )
 
+        pending_id = str(
+            payload.get("pending_id")
+            or payload.get("position_id")
+            or payload.get("entry_id")
+            or ""
+        )
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
         return PendingEntry(
-            entry_id=payload.get("position_id", payload.get("entry_id", "")),
-            symbol=payload.get("symbol", ""),
-            maker_venue=maker_venue,
-            hedge_venue=hedge_venue,
-            long_venue=maker_venue if maker_venue_str != hedge_venue_str else Venue.BINANCE,
-            short_venue=hedge_venue,
-            long_quantity=float(payload.get("target_quantity", payload.get("long_quantity", 0))),
-            short_quantity=float(payload.get("target_quantity", payload.get("short_quantity", 0))),
-            maker_price=float(payload.get("maker_price", 0)),
-            maker_order_id=payload.get("maker_order_id", ""),
-            maker_client_order_id=payload.get("maker_client_order_id", ""),
-            hedge_order_id=payload.get("hedge_order_id", ""),
-            hedge_client_order_id=payload.get("hedge_client_order_id", ""),
-            hedge_inflight=hedge_inflight,
-            maker_leg_filled=float(payload.get("maker_leg_filled", 0)),
-            hedge_leg_filled=float(payload.get("hedge_leg_filled", 0)),
+            pending_id=pending_id,
+            symbol=str(payload.get("symbol", "")),
+            long_venue=long_venue,
+            short_venue=short_venue,
+            target_quantity=target_quantity,
+            long_side=long_side,
+            short_side=short_side,
+            created_at_ms=int_from(payload.get("created_at_ms"), 0),
+            metadata=metadata,
+            maker_order_id=str(payload.get("maker_order_id", "")),
+            hedge_order_id=str(payload.get("hedge_order_id", "")),
+            maker_client_order_id=str(payload.get("maker_client_order_id", "")),
+            hedge_client_order_id=str(payload.get("hedge_client_order_id", "")),
+            maker_leg_filled=float_from(payload.get("maker_leg_filled"), 0.0),
+            hedge_leg_filled=float_from(payload.get("hedge_leg_filled"), 0.0),
+            deadline_ms=int_from(payload.get("deadline_ms"), 0),
+            fallback_route=str(payload.get("fallback_route", "")),
             uncertain_outcome=bool(payload.get("uncertain_outcome", False)),
+            reconcile_attempt=int_from(payload.get("reconcile_attempt"), 0),
+            reconcile_next_attempt_ms=int_from(payload.get("reconcile_next_attempt_ms"), 0),
+            entry_type=str(payload.get("entry_type", "")),
+            maker_price=float_from(payload.get("maker_price"), 0.0),
+            long_quantity=float_from(payload.get("long_quantity"), target_quantity),
+            short_quantity=float_from(payload.get("short_quantity"), target_quantity),
+            run_id=str(payload.get("run_id", "")),
+            entry_route=str(payload.get("entry_route", "")),
+            outcome=str(payload.get("outcome", "")),
+            opportunity_type=str(
+                payload.get("opportunity_type", "aligned") or "aligned"
+            ),
+            maker_leg=maker_leg,
+            hedge_inflight=hedge_inflight,
+            hedge_attempt_count=int_from(payload.get("hedge_attempt_count"), 0),
+            maker_fill_price=float_from(payload.get("maker_fill_price"), 0.0),
+            hedge_fill_price=float_from(payload.get("hedge_fill_price"), 0.0),
         )
     except Exception:
         return None
@@ -1409,7 +1492,8 @@ def clear_legacy_recovery_block_via_core(
     state.risk_mode = GlobalRiskMode.RUNNING
     state.recovery_blocked_reason = None
     state.recovery_blocked_at_ms = 0
-    state.last_error = None
+    if hasattr(state, "last_error"):
+        state.last_error = None
     state.global_risk_reason = None
 
     if journal is not None:
@@ -1607,7 +1691,7 @@ def normalize_engine_state(state: EngineState) -> None:
     # 10. Validate pending closes similarly
     bad_close_ids: list[str] = []
     for close_id, pc in list(state.pending_closes.items()):
-        if not pc.position_id or not pc.symbol:
+        if not pc.position_id:
             bad_close_ids.append(close_id)
             continue
         if pc.created_at_ms <= 0:
@@ -1638,8 +1722,7 @@ def _pending_entry_has_exchange_evidence(pending: PendingEntry) -> bool:
         or pending.hedge_order_id
         or pending.maker_client_order_id
         or pending.hedge_client_order_id
-        or pending.maker_inflight
-        or pending.hedge_inflight
+        or getattr(pending, "hedge_inflight", None)
     ):
         return True
 
