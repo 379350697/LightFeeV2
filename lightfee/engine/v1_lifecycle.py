@@ -23,14 +23,6 @@ class V1TradingLifecycle:
             if callable(allows_new_entry):
                 return not bool(allows_new_entry(candidate))
             return not bool(allows_new_entry)
-        if hasattr(recovery_ledger, "allows_new_entries"):
-            allows_new_entries = recovery_ledger.allows_new_entries
-            if callable(allows_new_entries):
-                return not bool(allows_new_entries())
-            return not bool(allows_new_entries)
-        has_blocking_work = getattr(recovery_ledger, "has_blocking_work", None)
-        if callable(has_blocking_work):
-            return bool(has_blocking_work())
         return False
 
     @staticmethod

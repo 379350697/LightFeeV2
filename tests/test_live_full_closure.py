@@ -302,7 +302,34 @@ class TestLiveFullClosure:
             assert runtime.state.recovery_blocked_at_ms == 0
             records = runtime.journal.read_all()
             assert any(
-                r.get("kind") == "runtime.stale_recovery_block_cleared"
+                r.get("kind") == "recovery.legacy_block_cleared"
+                for r in records
+            )
+
+    @pytest.mark.asyncio
+    async def test_housekeeping_does_not_clear_legacy_block_without_core_decision(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = (
+                "startup_recovery_pending_work_without_open_positions"
+            )
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await runtime._post_tick_housekeeping(5000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == (
+                "startup_recovery_pending_work_without_open_positions"
+            )
+            records = runtime.journal.read_all()
+            assert not any(
+                r.get("kind") == "recovery.legacy_block_cleared"
                 for r in records
             )
 

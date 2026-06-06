@@ -440,13 +440,6 @@ class RecoveryLedger:
             _positive_fill_symbols=positive_fill_symbols,
         )
 
-    @property
-    def allows_new_entries(self) -> bool:
-        return not self.has_blocking_work()
-
-    def has_blocking_work(self) -> bool:
-        return any(item.blocking for item in self.work_items)
-
     def allows_new_entry(self, candidate: Any) -> bool:
         if any(item.blocks_all_new_entries for item in self.work_items):
             return False

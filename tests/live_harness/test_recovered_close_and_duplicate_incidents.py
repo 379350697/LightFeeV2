@@ -143,7 +143,7 @@ async def test_beatusdt_recovered_passive_close_live_flat_clears_before_orders(t
     assert "exit.passive_close_recovery_probe_flat" in kinds
     assert "recovery.flat" in kinds
     assert "runtime.position_drift_corrected" in kinds
-    assert "runtime.stale_recovery_block_cleared" in kinds
+    assert "recovery.legacy_block_cleared" in kinds
     assert "order.submit_attempt" not in kinds
     assert "exit.passive_close_hedge_dust_aborted" not in kinds
 

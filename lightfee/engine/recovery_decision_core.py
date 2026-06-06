@@ -22,6 +22,16 @@ CORE_OWNED_BLOCK_REASONS = frozenset(
     }
 )
 
+LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS = frozenset(
+    {
+        "startup_recovery_pending_work_without_open_positions",
+    }
+)
+
+CORE_CLEARABLE_BLOCK_REASONS = (
+    CORE_OWNED_BLOCK_REASONS | LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
+)
+
 
 class RecoveryEvidenceClass(StrEnum):
     COMPLETE_FLAT = "complete_flat"
@@ -245,7 +255,7 @@ class V1RecoveryDecisionCore:
 
     def _should_clear_core_block(self, snapshot: RecoveryEvidenceSnapshot) -> bool:
         reason = snapshot.prior_recovery_block_reason
-        return reason is None or reason in CORE_OWNED_BLOCK_REASONS
+        return reason is None or reason in CORE_CLEARABLE_BLOCK_REASONS
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:

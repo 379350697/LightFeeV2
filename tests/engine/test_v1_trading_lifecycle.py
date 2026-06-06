@@ -140,8 +140,6 @@ def test_entry_admissibility_blocks_recovery_ledger_before_funding_horizon():
 
 def test_entry_admissibility_raises_unexpected_ledger_type_error():
     class ExplodingLedger:
-        allows_new_entries = True
-
         def allows_new_entry(self, candidate):
             raise TypeError("boom")
 
@@ -168,54 +166,40 @@ def test_ledger_blocks_uses_non_callable_allows_new_entry(
     )
 
 
-@pytest.mark.parametrize(
-    ("allows", "expected_blocks"),
-    [(True, False), (False, True)],
-)
-def test_ledger_blocks_uses_callable_allows_new_entries(allows, expected_blocks):
+@pytest.mark.parametrize("allows", [True, False])
+def test_ledger_blocks_ignores_legacy_allows_new_entries(allows):
     class Ledger:
         def allows_new_entries(self):
             return allows
 
-    assert (
-        V1TradingLifecycle._ledger_blocks(_candidate(), Ledger())
-        is expected_blocks
-    )
+    assert V1TradingLifecycle._ledger_blocks(_candidate(), Ledger()) is False
 
 
-def test_ledger_blocks_propagates_callable_allows_new_entries_type_error():
+def test_ledger_blocks_does_not_call_legacy_allows_new_entries():
     class Ledger:
         def allows_new_entries(self):
             raise TypeError("bad allows")
 
-    with pytest.raises(TypeError, match="bad allows"):
-        V1TradingLifecycle._ledger_blocks(_candidate(), Ledger())
+    assert V1TradingLifecycle._ledger_blocks(_candidate(), Ledger()) is False
 
 
-@pytest.mark.parametrize(
-    ("blocking_work", "expected_blocks"),
-    [(True, True), (False, False)],
-)
-def test_ledger_blocks_falls_back_to_callable_has_blocking_work(
-    blocking_work, expected_blocks
+@pytest.mark.parametrize("blocking_work", [True, False])
+def test_ledger_blocks_ignores_legacy_has_blocking_work_without_core_entry_policy(
+    blocking_work,
 ):
     class Ledger:
         def has_blocking_work(self):
             return blocking_work
 
-    assert (
-        V1TradingLifecycle._ledger_blocks(_candidate(), Ledger())
-        is expected_blocks
-    )
+    assert V1TradingLifecycle._ledger_blocks(_candidate(), Ledger()) is False
 
 
-def test_ledger_blocks_propagates_callable_has_blocking_work_type_error():
+def test_ledger_blocks_does_not_call_legacy_has_blocking_work():
     class Ledger:
         def has_blocking_work(self):
             raise TypeError("bad blocking work")
 
-    with pytest.raises(TypeError, match="bad blocking work"):
-        V1TradingLifecycle._ledger_blocks(_candidate(), Ledger())
+    assert V1TradingLifecycle._ledger_blocks(_candidate(), Ledger()) is False
 
 
 def test_ledger_evidence_omits_malformed_work_items_but_keeps_source_and_truth():

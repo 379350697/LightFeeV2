@@ -16,9 +16,16 @@ from lightfee.engine.lifecycle import (
 from lightfee.engine.recovery import (
     build_recovery_snapshot,
     clear_stale_fail_closed_if_recovery_clean,
-    clear_stale_recovery_block_if_recovery_clean,
+    clear_legacy_recovery_block_via_core,
     normalize_engine_state,
     recover_from_snapshot,
+)
+from lightfee.engine.recovery_decision_core import (
+    RecoveryDecision,
+    RecoveryDecisionKind,
+    RecoveryEvidenceClass,
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
 )
 from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
 from lightfee.core.domain import Side, Venue
@@ -82,36 +89,161 @@ class TestLifecycle:
         assert state.recovery_blocked_reason is None
         assert state.recovery_blocked_at_ms == 0
 
-    def test_clean_live_mismatch_fail_closed_latch_auto_clears_like_v1(self):
+    def test_live_mismatch_fail_closed_latch_is_not_stale_cleanable(self):
         state = EngineState()
         enter_fail_closed(state)
         state.recovery_blocked_reason = "live_position_mismatch_flatten_failed"
         state.recovery_blocked_at_ms = 1234
         state.last_error = "live exchange position mismatch cleanup failed"
 
-        block_cleared = clear_stale_recovery_block_if_recovery_clean(state, None)
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+            entry_allowed=True,
+            clear_previous_block=False,
+        )
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            None,
+        )
         fail_closed_cleared = clear_stale_fail_closed_if_recovery_clean(state, None)
 
-        assert block_cleared is True
+        assert block_cleared is False
         assert fail_closed_cleared is False
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.recovery_blocked_reason == "live_position_mismatch_flatten_failed"
+        assert state.recovery_blocked_at_ms == 1234
+        assert state.last_error == "live exchange position mismatch cleanup failed"
+
+    def test_legacy_recovery_clearer_does_not_clear_core_owned_ledger_block(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+        state.recovery_blocked_at_ms = 1234
+        state.last_error = "exchange truth recovery ledger blocked"
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+            entry_allowed=True,
+            clear_previous_block=True,
+        )
+
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            None,
+        )
+
+        assert block_cleared is False
+        assert state.recovery_blocked_reason == "exchange_truth_recovery_ledger_blocked"
+        assert state.recovery_blocked_at_ms == 1234
+
+    def test_legacy_recovery_clearer_requires_core_running_decision(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
+        state.recovery_blocked_at_ms = 1234
+        blocked_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT,
+            evidence_class=RecoveryEvidenceClass.ORPHAN_LIVE_ARTIFACT,
+            entry_allowed=False,
+            block_reason="unpaired_live_position",
+        )
+
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            blocked_decision,
+            None,
+        )
+
+        assert block_cleared is False
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.recovery_blocked_reason == (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+
+    def test_legacy_recovery_clearer_clears_obsolete_block_after_core_gap(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
+        state.recovery_blocked_at_ms = 1234
+        state.last_error = "old pending work"
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+            entry_allowed=True,
+            clear_previous_block=True,
+        )
+
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            None,
+        )
+
+        assert block_cleared is True
         assert state.lifecycle == EngineLifecycle.RUNNING
         assert state.risk_mode == GlobalRiskMode.RUNNING
         assert state.recovery_blocked_reason is None
         assert state.recovery_blocked_at_ms == 0
         assert state.last_error is None
 
-    def test_stale_recovery_cleaner_does_not_clear_core_owned_ledger_block(self):
+    def test_legacy_recovery_clearer_requires_core_clear_decision(self):
         state = EngineState()
         enter_fail_closed(state)
-        state.recovery_blocked_reason = "exchange_truth_recovery_ledger_blocked"
+        state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
         state.recovery_blocked_at_ms = 1234
-        state.last_error = "exchange truth recovery ledger blocked"
+        core_decision = RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+            entry_allowed=True,
+            clear_previous_block=False,
+        )
 
-        block_cleared = clear_stale_recovery_block_if_recovery_clean(state, None)
+        block_cleared = clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            None,
+        )
 
         assert block_cleared is False
-        assert state.recovery_blocked_reason == "exchange_truth_recovery_ledger_blocked"
-        assert state.recovery_blocked_at_ms == 1234
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.recovery_blocked_reason == (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+
+    def test_legacy_recovery_clearer_requires_explicit_core_decision(self):
+        state = EngineState()
+        enter_fail_closed(state)
+        state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
+        state.recovery_blocked_at_ms = 1234
+
+        block_cleared = clear_legacy_recovery_block_via_core(state, None, None)
+
+        assert block_cleared is False
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert state.recovery_blocked_reason == (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+
+    def test_core_marks_clear_for_legacy_migration_block_with_no_local_work(self):
+        decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                exchange_truth=None,
+                prior_recovery_block_reason=(
+                    "startup_recovery_pending_work_without_open_positions"
+                ),
+            )
+        )
+
+        assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+        assert decision.entry_allowed is True
+        assert decision.clear_previous_block is True
 
 
 class TestRecovery:

@@ -1752,6 +1752,136 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_live_mismatch_flatten_failure_stays_blocked_after_housekeeping_cleaner(self):
+        """A failed runtime live flatten is a live-artifact block, not stale state."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FakeVenueAdapter(Venue.BYBIT)
+            live_position = PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=53.6,
+                entry_price=0.4469,
+                observed_at_ms=1700000005000,
+            )
+            bybit.position_snapshots = [
+                live_position,
+                live_position,
+                live_position,
+                live_position,
+                live_position,
+                live_position,
+                live_position,
+            ]
+            bybit.default_position_side = Side.BUY
+            bybit.default_position_qty = 53.6
+            bybit.place_order_outcomes = [
+                make_uncertain_error("cleanup timeout 1"),
+                make_uncertain_error("cleanup timeout 2"),
+                make_uncertain_error("cleanup timeout 3"),
+            ]
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+            from lightfee.engine.recovery import (
+                clear_legacy_recovery_block_via_core,
+            )
+            from lightfee.engine.recovery_decision_core import (
+                RecoveryDecision,
+                RecoveryDecisionKind,
+                RecoveryEvidenceClass,
+            )
+            core_decision = RecoveryDecision(
+                kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+                evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
+                entry_allowed=True,
+                clear_previous_block=True,
+            )
+            cleared = clear_legacy_recovery_block_via_core(
+                runtime.state,
+                core_decision,
+                runtime.journal,
+            )
+
+            assert bybit.place_order_call_count == 3
+            assert cleared is False
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == (
+                "live_position_mismatch_flatten_failed"
+            )
+            assert not any(
+                event["kind"] == "recovery.legacy_block_cleared"
+                for event in runtime.journal.read_all()
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_live_mismatch_cleanup_uses_fresh_cids_across_probe_cycles(self):
+        """Repeated recovery probes must not resubmit already-used Bybit cleanup CIDs."""
+
+        class DuplicateRecordingAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT)
+                self.cleanup_client_order_ids: list[str] = []
+
+            async def place_order(self, request):
+                self.cleanup_client_order_ids.append(request.client_order_id)
+                return await super().place_order(request)
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = DuplicateRecordingAdapter()
+            live_position = PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=53.6,
+                entry_price=0.4469,
+                observed_at_ms=1700000005000,
+            )
+            bybit.position_snapshots = [
+                live_position,
+                live_position,
+                live_position,
+                live_position,
+            ]
+            bybit.default_position_side = Side.BUY
+            bybit.default_position_qty = 53.6
+            bybit.place_order_outcomes = [
+                make_uncertain_error(
+                    "bybit order failed: bybit retCode=110072 "
+                    "retMsg=OrderLinkedID is duplicate"
+                ),
+                make_uncertain_error(
+                    "bybit order failed: bybit retCode=110072 "
+                    "retMsg=OrderLinkedID is duplicate"
+                ),
+            ]
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+
+            await runtime._flatten_startup_live_position_mismatches(
+                [("BTCUSDT", live_position)],
+                1700000005000,
+                source="runtime_live_position_probe",
+            )
+            await runtime._flatten_startup_live_position_mismatches(
+                [("BTCUSDT", live_position)],
+                1700000020000,
+                source="runtime_live_position_probe",
+            )
+
+            assert len(bybit.cleanup_client_order_ids) == 2
+            assert (
+                bybit.cleanup_client_order_ids[0]
+                != bybit.cleanup_client_order_ids[1]
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_startup_flattens_unpaired_live_exchange_position(self):
         """Unpaired live exposure should be reduce-only flattened, not shown as clean."""
         with tempfile.TemporaryDirectory() as td:
@@ -1820,7 +1950,7 @@ class TestRuntimePreflight:
                 now_ms=1778787000000,
             )
 
-            assert ledger.has_blocking_work()
+            assert any(item.blocking for item in ledger.work_items)
             assert ledger.work_items[0].kind == "orphan_maker_order"
             assert runtime.state.recovery_blocked_reason == (
                 "exchange_truth_recovery_ledger_blocked"
@@ -2060,7 +2190,7 @@ class TestRuntimePreflight:
                 now_ms=1778787000000,
             )
 
-            assert not ledger.has_blocking_work()
+            assert not any(item.blocking for item in ledger.work_items)
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
@@ -2092,7 +2222,7 @@ class TestRuntimePreflight:
                 now_ms=1778787000000,
             )
 
-            assert not ledger.has_blocking_work()
+            assert not any(item.blocking for item in ledger.work_items)
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
@@ -2109,7 +2239,7 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
-    async def test_startup_clears_stale_blocked_reason_when_snapshot_is_clean(self):
+    async def test_startup_preserves_live_mismatch_blocked_reason_when_snapshot_is_clean(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             SnapshotStore(config.persistence.snapshot_path).write({
@@ -2127,10 +2257,12 @@ class TestRuntimePreflight:
             await runtime.start()
             await runtime.stop()
 
-            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
-            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
-            assert runtime.state.recovery_blocked_reason is None
-            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == (
+                "live_position_mismatch_flatten_failed"
+            )
+            assert runtime.state.recovery_blocked_at_ms == 1234
 
     @pytest.mark.asyncio
     async def test_startup_live_mismatch_flatten_closes_core_ledger_block(self):

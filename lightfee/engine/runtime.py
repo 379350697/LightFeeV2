@@ -56,7 +56,7 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
     has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
-    clear_stale_recovery_block_if_recovery_clean,
+    clear_legacy_recovery_block_via_core,
     build_persistent_state_view,
 )
 from lightfee.engine.recovery_decision_core import (
@@ -908,15 +908,6 @@ class LiveRuntime:
         from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
 
         classified_recovery_state = classify_startup_recovery_state(self.state)
-        if (
-            classified_recovery_state == "clean"
-            and not current_startup_recovery_block
-            and clear_stale_recovery_block_if_recovery_clean(
-                self.state,
-                self.journal,
-            )
-        ):
-            classified_recovery_state = "clean"
 
         stale_block_with_recovery_work = (
             bool(self.state.recovery_blocked_reason)
@@ -990,7 +981,6 @@ class LiveRuntime:
             # 6. manage_open_positions — if still over max, enter fail_closed
             max_positions = self.config.strategy.max_concurrent_positions
             if len(self.state.open_positions) > max_positions:
-                from lightfee.engine.lifecycle import enter_fail_closed
                 enter_fail_closed(self.state)
                 self.journal.append(
                     "runtime.recovery_fail_closed",
@@ -1006,6 +996,8 @@ class LiveRuntime:
                 # (e.g. no venue adapters) without finalizing, do it now.
                 self._finalize_startup_recovery()
         else:
+            if self.state.recovery_blocked_reason:
+                enter_fail_closed(self.state)
             self.journal.append(
                 "runtime.recovery_blocked",
                 {
@@ -1044,8 +1036,6 @@ class LiveRuntime:
 
         # Phase 8 – Recover pending passive closes
         await self._recover_passive_closes()
-        if not current_startup_recovery_block:
-            clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
         if startup_live_recovery_result not in {
             "mismatch_flattened",
             "mismatch_blocked",
@@ -1618,7 +1608,10 @@ class LiveRuntime:
             ok = await self._cleanup_failed_leg_exposure(
                 pos.venue,
                 requested_symbol,
-                f"live-recovery:{source}:{requested_symbol}:{pos.venue.value}",
+                (
+                    f"live-recovery:{source}:{requested_symbol}:"
+                    f"{pos.venue.value}:{now_ms}"
+                ),
                 "live_recovery_mismatch",
             )
             payload = {
@@ -11513,7 +11506,6 @@ class LiveRuntime:
         # V1 latch parity: a fail-closed state with no operator override,
         # no recovery block, and no recovery work is stale even after live
         # entry/recovery cleanup, not only during startup snapshot recovery.
-        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
         clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
 
         # V1: ensure private WS workers are running for live adapters
@@ -11539,7 +11531,6 @@ class LiveRuntime:
 
         # Detect false-clean state where exchanges hold positions but V2 missed them.
         await self._maybe_recover_clean_live_positions(now_ms)
-        clear_stale_recovery_block_if_recovery_clean(self.state, self.journal)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(
@@ -15345,6 +15336,47 @@ class LiveRuntime:
             await self.passive_close_executor.process_pending_passive_closes(
                 self.state, now_ms,
             )
+            if (
+                not self.state.pending_passive_closes
+                and self.state.recovery_blocked_reason
+            ):
+                ledger = getattr(self, "recovery_ledger", None)
+                core_decision = V1RecoveryDecisionCore().decide(
+                    RecoveryEvidenceSnapshot(
+                        local_open_positions=tuple(
+                            self._recovery_state_collection("open_positions")
+                        ),
+                        pending_entries=tuple(
+                            self._recovery_state_collection("pending_entries")
+                        ),
+                        residual_repairs=tuple(
+                            self._recovery_state_collection(
+                                "pending_residual_repairs"
+                            )
+                        ),
+                        passive_closes=tuple(
+                            self._recovery_state_collection(
+                                "pending_passive_closes"
+                            )
+                        ),
+                        exchange_truth=None,
+                        prior_recovery_block_reason=(
+                            self.state.recovery_blocked_reason
+                        ),
+                        operator_fail_closed=(
+                            self.state.operator.requested_mode
+                            == GlobalRiskMode.FAIL_CLOSED
+                        ),
+                        recovery_work_items=tuple(
+                            getattr(ledger, "work_items", ()) or ()
+                        ),
+                    )
+                )
+                clear_legacy_recovery_block_via_core(
+                    self.state,
+                    core_decision,
+                    journal=self.journal,
+                )
         except Exception as e:
             self.journal.append(
                 "runtime.passive_close_tick_error",

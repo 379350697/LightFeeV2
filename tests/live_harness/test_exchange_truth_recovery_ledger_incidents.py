@@ -21,15 +21,15 @@ def test_trxusdt_open_maker_order_local_flat_is_blocking_recovery_work():
     fixture = load_incident("trxusdt_open_order_local_flat.json")
     ledger = RecoveryLedger.from_incident_fixture(fixture)
 
-    assert ledger.has_blocking_work()
+    assert any(item.blocking for item in ledger.work_items)
     assert ledger.work_items[0].kind == "orphan_maker_order"
-    assert ledger.allows_new_entries is False
+    assert ledger.allows_new_entry(object()) is False
 
 
 def test_seiusdt_positive_fill_local_false_flat_is_not_proven_flat():
     fixture = load_incident("seiusdt_positive_fill_local_false_flat.json")
     ledger = RecoveryLedger.from_incident_fixture(fixture)
 
-    assert ledger.has_blocking_work()
+    assert any(item.blocking for item in ledger.work_items)
     assert ledger.contains_positive_fill_evidence("SEIUSDT")
     assert ledger.is_proven_flat("SEIUSDT") is False

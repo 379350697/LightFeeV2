@@ -6,6 +6,10 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 
 
+def _has_blocking_work(ledger: RecoveryLedger) -> bool:
+    return any(item.blocking for item in ledger.work_items)
+
+
 def test_local_flat_plus_live_non_reduce_open_order_blocks_as_orphan_maker_order():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={
@@ -29,10 +33,10 @@ def test_local_flat_plus_live_non_reduce_open_order_blocks_as_orphan_maker_order
         },
     )
 
-    assert ledger.has_blocking_work()
+    assert _has_blocking_work(ledger)
     assert [item.kind for item in ledger.work_items] == ["orphan_maker_order"]
     assert ledger.is_proven_flat("TRXUSDT") is False
-    assert ledger.allows_new_entries is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
 def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
@@ -53,7 +57,7 @@ def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
         },
     )
 
-    assert ledger.has_blocking_work()
+    assert _has_blocking_work(ledger)
     assert [item.kind for item in ledger.work_items] == ["unpaired_live_position"]
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
@@ -76,7 +80,7 @@ def test_pending_entry_positive_maker_fill_blocks_as_owned_pending_entry():
         exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work()
+    assert _has_blocking_work(ledger)
     assert ledger.work_items[0].kind == "owned_pending_entry"
     assert ledger.contains_positive_fill_evidence("SEIUSDT")
     assert ledger.is_proven_flat("SEIUSDT") is False
@@ -99,7 +103,7 @@ def test_residual_repair_with_live_flat_records_repair_work_and_flat_decision():
         exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work()
+    assert _has_blocking_work(ledger)
     assert ledger.work_items[0].kind == "pending_residual_repair"
     assert ledger.work_items[0].decision.outcome == "proven_flat"
     assert ledger.is_proven_flat("SEIUSDT") is False
@@ -116,7 +120,7 @@ def test_unavailable_exchange_truth_records_nonblocking_ambiguous_evidence_gap()
         },
     )
 
-    assert ledger.has_blocking_work() is False
+    assert _has_blocking_work(ledger) is False
     assert ledger.work_items[0].kind == "ambiguous_exchange_truth"
     assert ledger.work_items[0].blocking is False
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
@@ -138,7 +142,7 @@ def test_flat_no_local_work_unavailable_truth_is_nonblocking_evidence_gap():
         },
     )
 
-    assert ledger.has_blocking_work() is False
+    assert _has_blocking_work(ledger) is False
     assert [item.kind for item in ledger.work_items] == ["ambiguous_exchange_truth"]
     assert ledger.work_items[0].blocking is False
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
@@ -154,7 +158,7 @@ def test_local_work_unavailable_truth_remains_blocking():
         exchange_truth={"truth_available": False, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work()
+    assert _has_blocking_work(ledger)
     assert any(item.kind == "ambiguous_exchange_truth" for item in ledger.work_items)
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
@@ -169,8 +173,7 @@ def test_no_live_artifacts_and_no_local_work_is_proven_flat():
         exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work() is False
-    assert ledger.allows_new_entries is True
+    assert _has_blocking_work(ledger) is False
     assert ledger.is_proven_flat("SEIUSDT") is True
     assert ledger.allows_new_entry(SimpleNamespace(symbol="SEIUSDT")) is True
 
@@ -225,7 +228,7 @@ def test_legacy_unavailable_exchange_truth_records_nonblocking_gap():
         exchange_truth={"available": False, "positions": [], "open_orders": []},
     )
 
-    assert ledger.has_blocking_work() is False
+    assert _has_blocking_work(ledger) is False
     assert ledger.work_items[0].kind == "ambiguous_exchange_truth"
     assert ledger.work_items[0].blocking is False
 

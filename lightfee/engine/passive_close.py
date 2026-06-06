@@ -71,7 +71,12 @@ from lightfee.venues.common import (
 from lightfee.venues.capabilities import get_capability_flags
 from lightfee.venues.specs import get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
-from lightfee.engine.recovery import clear_stale_recovery_block_if_recovery_clean
+from lightfee.engine.recovery import clear_legacy_recovery_block_via_core
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
+from lightfee.risk.modes import GlobalRiskMode
 
 # ---------------------------------------------------------------------------
 # V1 constants
@@ -2947,7 +2952,31 @@ class PassiveCloseExecutor:
                 "source": source,
             },
         )
-        clear_stale_recovery_block_if_recovery_clean(state, self._journal)
+        core_decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                local_open_positions=tuple(state.open_positions.values()),
+                pending_entries=tuple(state.pending_entries.values()),
+                residual_repairs=tuple(
+                    getattr(state, "pending_residual_repairs", ()) or ()
+                ),
+                passive_closes=tuple(state.pending_passive_closes.values()),
+                exchange_truth={
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                prior_recovery_block_reason=state.recovery_blocked_reason,
+                operator_fail_closed=(
+                    getattr(state.operator, "requested_mode", None)
+                    == GlobalRiskMode.FAIL_CLOSED
+                ),
+            )
+        )
+        clear_legacy_recovery_block_via_core(
+            state,
+            core_decision,
+            journal=self._journal,
+        )
 
     @staticmethod
     def _is_recovered_position(position: OpenPosition) -> bool:

@@ -42,7 +42,15 @@ from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from lightfee.engine.recovery_decision_core import CORE_OWNED_BLOCK_REASONS
+from lightfee.engine.recovery_decision_core import (
+    CORE_OWNED_BLOCK_REASONS,
+    LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS,
+    RecoveryDecision,
+    RecoveryDecisionKind,
+)
+
+
+LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS = LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
 
 
 # ---------------------------------------------------------------------------
@@ -1318,24 +1326,36 @@ def clear_stale_fail_closed_if_recovery_clean(state: EngineState, journal: Journ
     return True
 
 
-def clear_stale_recovery_block_if_recovery_clean(
+def clear_legacy_recovery_block_via_core(
     state: EngineState,
+    core_decision: RecoveryDecision | None = None,
     journal: Journal | None = None,
 ) -> bool:
-    """Clear a stale recovery block after its recovery work is gone.
+    """Clear obsolete pre-core recovery blocks only after a core running decision.
 
-    Mirrors the startup clean-snapshot recovery path: a recovery_blocked_reason
-    is authoritative while recovery work still exists, but it must not keep the
-    runtime in risk_only/fail_closed after all open/pending/passive work has
-    been resolved.
+    This is a migration bridge, not an independent stale-clean authority.
+    V1RecoveryDecisionCore classifies the current local/exchange evidence first;
+    only an allowlisted legacy reason may clear after the core says the runtime
+    is RUNNING_CLEAN or RUNNING_WITH_EVIDENCE_GAP.
     """
     if not state.recovery_blocked_reason:
         return False
     if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
         return False
-    # Migration fallback only: core-owned blockers are cleared by
-    # V1RecoveryDecisionCore after fresh exchange/local evidence is classified.
     if state.recovery_blocked_reason in CORE_OWNED_BLOCK_REASONS:
+        return False
+    if state.recovery_blocked_reason not in LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS:
+        return False
+    if core_decision is None:
+        return False
+    if not core_decision.clear_previous_block:
+        return False
+    if core_decision.kind not in {
+        RecoveryDecisionKind.RUNNING_CLEAN,
+        RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+    }:
+        return False
+    if core_decision.block_reason or not core_decision.entry_allowed:
         return False
     if needs_reconciliation(state):
         return False
@@ -1351,11 +1371,13 @@ def clear_stale_recovery_block_if_recovery_clean(
     state.global_risk_reason = None
 
     if journal is not None:
-        _try_emit_recovery(journal, "runtime.stale_recovery_block_cleared", {
-            "reason": "clean_recovery_work_resolved",
+        _try_emit_recovery(journal, "recovery.legacy_block_cleared", {
+            "reason": "core_allowed_legacy_recovery_block_clear",
             "previous_recovery_blocked_reason": previous_reason,
             "previous_lifecycle": previous_lifecycle,
             "previous_risk_mode": previous_risk_mode,
+            "decision": core_decision.kind.value,
+            "clear_reason": core_decision.clear_reason,
         })
     return True
 
