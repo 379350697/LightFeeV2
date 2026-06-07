@@ -741,6 +741,70 @@ async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_un
 
 
 @pytest.mark.asyncio
+async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_queue(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-1780771924982-BABYUSDT", symbol="BABYUSDT")
+    ))
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations = {
+        "entry-1780771924982-BABYUSDT": {
+            "position_id": "entry-1780771924982-BABYUSDT",
+            "symbol": "BABYUSDT",
+            "kind": "final",
+            "closed_at_ms": 1780771929000,
+            "created_cycle": 1,
+            "next_attempt_ms": 1000,
+            "position_snapshot": {
+                "position_id": "entry-1780771924982-BABYUSDT",
+                "symbol": "BABYUSDT",
+                "long_venue": Venue.OKX.value,
+                "short_venue": Venue.BYBIT.value,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }
+    }
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    assert isinstance(runtime.state.pending_close_reconciliations, list)
+    assert all(
+        isinstance(item, dict)
+        for item in runtime.state.pending_close_reconciliations
+    )
+    assert [
+        record["kind"] for record in tmp_journal.read_all()
+    ].count("reconciliation.pending_close_reconciliation_invalid") == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_processor_retains_invalid_item_with_evidence(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-invalid", symbol="BABYUSDT")
+    ))
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations = [
+        "poisoned-pending-close-reconciliation"
+    ]
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    invalid = runtime.state.pending_close_reconciliations[0]
+    assert invalid["invalid_pending_close_reconciliation"] is True
+    assert invalid["raw_type"] == "str"
+    assert [
+        record["kind"] for record in tmp_journal.read_all()
+    ].count("reconciliation.pending_close_reconciliation_invalid") == 1
+
+
+@pytest.mark.asyncio
 async def test_pending_close_reconciliation_retains_when_terminal_live_size_nonzero(
     config, tmp_journal,
 ):
@@ -914,6 +978,54 @@ def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_jou
     assert reason == "pending_close_reconciliation_conflict"
     assert reversed_allowed is False
     assert reversed_reason == "pending_close_reconciliation_conflict"
+
+
+def test_pending_close_reconciliation_gate_normalizes_dict_shaped_queue(config, tmp_journal):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
+    ))
+    runtime.state.pending_close_reconciliations = {
+        "pos-close-gate": {
+            "position_id": "pos-close-gate",
+            "symbol": "BEATUSDT",
+            "position_snapshot": {
+                "symbol": "BEATUSDT",
+                "long_venue": Venue.OKX.value,
+                "short_venue": Venue.BYBIT.value,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }
+    }
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
+    )
+
+    assert allowed is False
+    assert reason == "pending_close_reconciliation_conflict"
+
+
+def test_pending_close_reconciliation_gate_blocks_malformed_task_with_top_level_evidence(config, tmp_journal):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
+    ))
+    runtime.state.pending_close_reconciliations = {
+        "position_id": "pos-close-gate",
+        "symbol": "BEATUSDT",
+        "long_venue": Venue.OKX.value,
+        "short_venue": Venue.BYBIT.value,
+        "kind": "final",
+        "closed_at_ms": 1780771929000,
+    }
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
+    )
+
+    assert allowed is False
+    assert reason == "pending_close_reconciliation_conflict"
+    assert isinstance(runtime.state.pending_close_reconciliations, list)
 
 
 @pytest.mark.asyncio

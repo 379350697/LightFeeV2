@@ -108,6 +108,39 @@ def test_supervised_venues_normalizes_pending_close_reconciliation_snapshot():
     assert supervisor._supervised_venues() == {Venue.OKX, Venue.BYBIT}
 
 
+def test_supervised_venues_normalizes_dict_shaped_pending_close_reconciliation_snapshot():
+    state = EngineState()
+    state.pending_close_reconciliations = {
+        "entry-1780771924982-BABYUSDT": {
+            "position_id": "entry-1780771924982-BABYUSDT",
+            "symbol": "BABYUSDT",
+            "position_snapshot": {
+                "long_venue": Venue.OKX.value,
+                "short_venue": Venue.BYBIT.value,
+            },
+        }
+    }
+    supervisor = Supervisor(_make_config(), state, _make_journal())
+
+    assert supervisor._supervised_venues() == {Venue.OKX, Venue.BYBIT}
+
+
+def test_supervised_venues_preserves_single_task_dict_top_level_venue_evidence():
+    state = EngineState()
+    state.pending_close_reconciliations = {
+        "position_id": "entry-1780771924982-BABYUSDT",
+        "symbol": "BABYUSDT",
+        "long_venue": Venue.OKX.value,
+        "short_venue": Venue.BYBIT.value,
+        "kind": "final",
+        "closed_at_ms": 1780771929000,
+    }
+    supervisor = Supervisor(_make_config(), state, _make_journal())
+
+    assert supervisor._supervised_venues() == {Venue.OKX, Venue.BYBIT}
+    assert isinstance(state.pending_close_reconciliations, list)
+
+
 # ---------------------------------------------------------------------------
 # Global risk mode updates
 # ---------------------------------------------------------------------------

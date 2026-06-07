@@ -195,14 +195,17 @@ class Supervisor:
         for pos in self.state.open_positions.values():
             add_venue(pos.long_venue)
             add_venue(pos.short_venue)
+        self.state.set_pending_close_reconciliations(
+            getattr(self.state, "pending_close_reconciliations", [])
+        )
         for rec in self.state.pending_close_reconciliations:
             if not isinstance(rec, dict):
                 continue
             snapshot = rec.get("position_snapshot", {})
             if not isinstance(snapshot, dict):
-                continue
-            add_venue(snapshot.get("long_venue", Venue.BINANCE))
-            add_venue(snapshot.get("short_venue", Venue.BINANCE))
+                snapshot = {}
+            add_venue(rec.get("long_venue") or snapshot.get("long_venue"))
+            add_venue(rec.get("short_venue") or snapshot.get("short_venue"))
         return venues
 
     def _fetch_risk_snapshot_for_venue(

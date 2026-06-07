@@ -14,6 +14,8 @@ residuals, and live-flat cleanup.
 - `price_unavailable_for_min_notional`
 - `passive_close_maker_filled_under_chunk`
 - `entry.cleanup_leg_exposure`
+- `runtime.passive_close_tick_error` with
+  `"'dict' object has no attribute 'append'"`
 - Recurrence shape: local pending passive close/open state keeps retrying while exchange truth is already flat or while terminal maker/under-min branches need V1 compensation.
 
 ## Current Effective Rule
@@ -24,6 +26,14 @@ Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry
 backoff, enter fail-closed, compensate any unhedged gap when possible, and
 probe live flat truth before clearing local state.
+
+The pending-close reconciliation queue is part of the terminal-flat contract.
+It must be normalized before passive-close cleanup emits terminal lifecycle or
+drift-correction events. A cleanup path must not journal terminal-flat evidence
+and then throw before `open_positions` / `pending_passive_closes` are removed
+or before the V1 recovery decision core sees the clear evidence.
+The same normalized queue boundary applies to pending-close reconciliation
+processing, supervisor venue coverage, and entry-conflict gating.
 
 ## V1 / Exchange Semantics
 
@@ -46,6 +56,7 @@ probe live flat truth before clearing local state.
 | 2026-05-31 | Live-truth precheck before first passive maker submit | fixed, deployed, cloud verified | ID/HOME reproduced Bybit `110017` because the chosen short maker leg was already live-flat before first maker submit. V2 now probes both legs first and routes maker-flat truth to existing one-sided flatten or both-flat recovery. Cloud `70a1a8c` targeted HOME/ID probes are flat/no-open-orders. |
 | 2026-06-03 | WS BBO close fallback missing-quote evidence | local green, deploy pending | Post-`e087513` had two passive close missing-price events after current state recovered flat. Runtime now emits `runtime.close_price_evidence_missing` for active WS BBO fallback missing cache/quote/budget branches without changing fail-closed behavior. |
 | 2026-06-04 | V1 passive close hedge/fallback hard deadline | local full gate green, cloud deploy pending | Bybit abnormal close samples exposed passive close retry/fallback paths that could continue after the V1 deadline. V2 now arms overdue passive closes into DUAL_TAKER, converts hedge/fallback hard breaches into fail-closed plus compensation/live-flat probing, and avoids same-cycle maker submit after live truth has already driven one-sided flatten. |
+| 2026-06-07 | Post-`bff33ec` live-flat cleanup re-entry | local `PC-06`/`PC-07`/`PC-08` green, deploy pending | `BABYUSDT` exchange truth is flat while local open/passive state remains. The local fix restores the canonical pending-close reconciliation queue boundary, keeps cleanup success journals behind queue/state/core clear, and hardens malformed queue consumers. |
 
 ## Recurrences
 
@@ -58,6 +69,7 @@ probe live flat truth before clearing local state.
 | 2026-05-31 | `IDUSDT`, `HOMEUSDT` Binance/Bybit | `70a1a8c` | deployed; post-restart window has no opens or maker-submit errors; targeted probes flat/no-open-orders | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 | 2026-06-03 | `STEEMUSDT`, `TRIAUSDT` | working tree | local green, deploy pending | [daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up](../daily/2026-06-03.md#cluster-cl-035-post-e087513-long-window-follow-up) |
 | 2026-06-04 | `MEUUSDT`, `LDOUSDT`, `SEIUSDT`, `ICPUSDT`, `BSBUSDT` Bybit-related close samples | main push in this session | full pytest `3432 passed`, `9 skipped`, `1 warning`; cloud deploy pending | [daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop](../daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) |
+| 2026-06-07 | `BABYUSDT` OKX/Bybit plus unowned Bybit `MORPHOUSDT`, `MONUSDT`, `SEIUSDT` live artifacts | working tree | local RED/GREEN coverage complete for `PC-06`/`PC-07`/`PC-08`; deploy and production verification pending | [daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry](../daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry) |
 
 ## Regression Harness
 
@@ -68,6 +80,9 @@ probe live flat truth before clearing local state.
 - `tests/live_harness/test_opgusdt_passive_close_stuck_incident.py`
 - `tests/live_harness/test_20260529_jct_parti_regressions.py`
 - `tests/live_harness/test_historical_passive_close_incidents.py`
+- `tests/persistence/test_v1_state_snapshot_semantics.py -k "pending_close_reconciliation"`
+- `tests/test_passive_close.py -k "live_flat_cleanup"`
+- `tests/test_pending_entry_v1_semantic_drift.py tests/test_supervisor_execution.py -k "pending_close_reconciliation"`
 
 ## Next Recurrence Checklist
 
@@ -82,4 +97,11 @@ probe live flat truth before clearing local state.
    `execution.hedge_deadline_breached`, or
    `execution.close_deadline_breached` fired before any retry backoff.
 7. If live truth is flat, bug is stale local terminality. If live truth is nonzero, bug is compensation/repair path.
-8. Closure requires harness replay plus credentialed flat/no-open-orders probe.
+8. Inspect the restored `pending_close_reconciliations` container type before
+   assuming a passive-close semantic decision failure.
+9. Check whether terminal-flat events were emitted before state removal or core
+   clear evidence.
+10. Check whether malformed pending-close reconciliation items are being
+    silently retained, skipped by supervisor venue coverage, or skipped by entry
+    conflict gating.
+11. Closure requires harness replay plus credentialed flat/no-open-orders probe.

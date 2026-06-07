@@ -200,6 +200,9 @@ The minimum semantic surface from V1 is:
 | PC-03 | final pending-close reconciliation, fill reconciliation unavailable, either close venue reports nonzero terminal live size | retain reconciliation as fail-safe risk-only/backoff | abandon or mark healthy while live exposure remains |
 | PC-04 | managed local open positions remain and venue private-position truth is confirmed while close accounting reconciliation is pending | allow reconciliation to continue in background without forcing normal lifecycle to risk-only, unless another explicit risk policy is active | make normal trading harder solely due to background accounting work |
 | PC-05 | pending-close reconciliation exists only as a stored position snapshot after the managed position was removed | supervisor/risk venue coverage includes the snapshot venues | drop venues from supervision because `open_positions` is empty |
+| PC-06 | restored or serialized `pending_close_reconciliations` has a legacy dict/map shape or invalid item shape before passive-close live-flat cleanup | normalize or migrate into the canonical V1-style queue before enqueue/process paths run, and never persist a poisoned non-list shape without explicit evidence | let raw runtime code call `.append()` on unnormalized restored state or write the bad shape back to snapshot |
+| PC-07 | passive-close live-flat cleanup must register final accounting work and remove managed open/passive state | terminal-flat/drift events, state removal, and core clear are one observable success path; a failed registration emits cleanup-failed evidence without pretending terminality succeeded | journal terminal lifecycle/drift events and then throw before state mutation or core clear |
+| PC-08 | pending-close reconciliation queue contains malformed tasks when processed by reconciliation, supervisor venue coverage, or entry-conflict gate | invalid tasks are normalized, rejected with explicit evidence, or retained as fail-safe recovery work with venue/symbol evidence preserved | silently retain forever, skip supervised venues, or allow a conflicting new entry because an item is not dict-shaped |
 
 ## Current Test Coverage
 
@@ -208,6 +211,10 @@ The minimum semantic surface from V1 is:
 | PE-02, PE-05, PE-10, RC-01 through RC-04, DG-01 through DG-03 | `tests/engine/test_recovery_ledger.py`; `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py` | covered for pure recovery-ledger classification of local-flat/live-open-order, local-flat/live-position, positive-fill false-flat, residual repair, ambiguous truth, and proven-flat states |
 | RC-09, RC-10, DG-04 | `tests/engine/test_recovery_decision_core.py`; `tests/engine/test_recovery_ledger.py`; `tests/test_live_startup_preflight.py`; `tests/test_runtime_entry_flow.py`; `tests/test_diagnose_live.py`; `tests/ops/test_production_health.py` | covered for flat/no-local-work evidence gap, local work plus unavailable truth, core-owned clear, runtime block/clear authority, diagnose/health core classification, and review closure for same-symbol-but-unowned live artifacts |
 | PC-01 through PC-05 | `tests/test_pending_entry_v1_semantic_drift.py`; `tests/test_passive_close.py`; `tests/test_supervisor_execution.py` | covered for live-only registration, V1 close-leg snapshots, fill-based terminal accounting, unavailable-fill terminal-flat abandon, nonzero terminal-live retention, background lifecycle with private confirmation, risk-mode preservation, and supervisor venue coverage |
+| PC-06 | `tests/persistence/test_v1_state_snapshot_semantics.py -k "pending_close_reconciliation"` | covered locally for keyed-map restore, single-task dict migration, invalid non-dict evidence retention, canonical serialization, state-owned enqueue/dedupe/cap/remove, and helper normalization before enqueue |
+| PC-07 | `tests/test_passive_close.py -k "live_flat_cleanup"` | covered locally for dict-shaped queue live-flat cleanup, registration failure retention, core-clear failure retention, success journals after registration/state/core clear, and no `runtime.passive_close_tick_error` masking |
+| PC-08 | `tests/test_pending_entry_v1_semantic_drift.py tests/test_supervisor_execution.py -k "pending_close_reconciliation"` | covered locally for processor normalization/invalid evidence retention, entry-gate conflict on dict and single-task top-level venue evidence, and supervisor venue preservation |
+| RC-09 live-artifact regression | `tests/engine/test_recovery_ledger.py::test_local_baby_state_does_not_own_same_window_unpaired_bybit_positions` | covered locally for `MORPHOUSDT`, `MONUSDT`, and `SEIUSDT` Bybit live positions remaining blocking `unpaired_live_position` work even when local state contains only `BABYUSDT` |
 | PE-01 through PE-03, PE-07 through PE-10, PE-16, PE-18 | `tests/engine/test_pending_entry_terminalizer.py` | covered for pure terminal decision outcomes; runtime finalizer remains the integration authority |
 | PE-01 | `tests/test_live_entry_hedge_root_fix.py::TestZeroFillFinalizeV1ParityGate` | covered |
 | PE-02 | `tests/test_pending_entry_v1_semantic_drift.py::test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists` | covered for open-order truth |
@@ -314,6 +321,26 @@ The minimum semantic surface from V1 is:
     only after terminal flat live truth, retains nonzero terminal live exposure,
     preserves explicit reduce-only/fail-closed policy, and keeps snapshot venues
     supervised after managed open state is removed.
+
+13. `PC-06` / restored queue shape:
+    replay a sanitized `BABYUSDT` state snapshot where
+    `pending_close_reconciliations` is dict-shaped, local open/passive state
+    remains, and close-venue exchange truth is flat. Expected: restore
+    normalizes/migrates the queue before passive-close registration; no raw
+    `.append()` crash.
+
+14. `PC-07` / live-flat cleanup atomicity:
+    force close-reconciliation registration to fail during live-flat cleanup.
+    Expected: no terminal lifecycle/drift event is emitted unless managed state
+    removal and core clear can complete; otherwise the state is retained with a
+    specific cleanup-failed event and no misleading terminal-flat success.
+
+15. `PC-08` / malformed queue consumer boundaries:
+    feed malformed pending-close reconciliation queue data into
+    `_process_pending_close_reconciliations`, supervisor venue coverage, and the
+    entry-conflict gate. Expected: explicit invalid/migration evidence and
+    fail-safe retention with venue/symbol evidence; no silent loss of
+    supervision or entry protection.
 
 ## Bug Mapping
 

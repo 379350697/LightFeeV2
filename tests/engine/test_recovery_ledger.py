@@ -62,6 +62,54 @@ def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
+def test_local_baby_state_does_not_own_same_window_unpaired_bybit_positions():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "open_positions": [
+                {
+                    "position_id": "entry-1780771924982-BABYUSDT",
+                    "symbol": "BABYUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                }
+            ],
+            "pending_entries": [],
+        },
+        exchange_truth={
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": "bybit",
+                    "symbol": "MORPHOUSDT",
+                    "side": "buy",
+                    "quantity": 14.0,
+                },
+                {
+                    "venue": "bybit",
+                    "symbol": "MONUSDT",
+                    "side": "buy",
+                    "quantity": 1150.0,
+                },
+                {
+                    "venue": "bybit",
+                    "symbol": "SEIUSDT",
+                    "side": "buy",
+                    "quantity": 341.0,
+                },
+            ],
+            "open_orders": [],
+        },
+    )
+
+    items_by_symbol = {item.symbol: item for item in ledger.work_items}
+    assert set(items_by_symbol) == {"MORPHOUSDT", "MONUSDT", "SEIUSDT"}
+    assert {item.kind for item in items_by_symbol.values()} == {
+        "unpaired_live_position"
+    }
+    assert all(item.blocking for item in items_by_symbol.values())
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+
+
 def test_pending_entry_positive_maker_fill_blocks_as_owned_pending_entry():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={

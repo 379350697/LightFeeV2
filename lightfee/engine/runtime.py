@@ -6911,7 +6911,10 @@ class LiveRuntime:
         }
 
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
-        pending_reconciliations = getattr(self.state, "pending_close_reconciliations", [])
+        self.state.set_pending_close_reconciliations(
+            getattr(self.state, "pending_close_reconciliations", [])
+        )
+        pending_reconciliations = self.state.pending_close_reconciliations
         if not pending_reconciliations:
             return
         if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
@@ -12503,18 +12506,23 @@ class LiveRuntime:
         sym = getattr(candidate, 'symbol', '')
         long_v = getattr(candidate, 'long_venue', '')
         short_v = getattr(candidate, 'short_venue', '')
-        for rec in getattr(self.state, "pending_close_reconciliations", []):
+        self.state.set_pending_close_reconciliations(
+            getattr(self.state, "pending_close_reconciliations", [])
+        )
+        for rec in self.state.pending_close_reconciliations:
             if not isinstance(rec, dict):
                 continue
             snapshot = rec.get("position_snapshot", {})
             if not isinstance(snapshot, dict):
-                continue
+                snapshot = {}
             if (rec.get("symbol") or snapshot.get("symbol") or "") != sym:
                 continue
-            pc_long = snapshot.get("long_venue")
-            pc_short = snapshot.get("short_venue")
+            pc_long = rec.get("long_venue") or snapshot.get("long_venue")
+            pc_short = rec.get("short_venue") or snapshot.get("short_venue")
             pc_long_s = pc_long.value if hasattr(pc_long, "value") else str(pc_long)
             pc_short_s = pc_short.value if hasattr(pc_short, "value") else str(pc_short)
+            if not pc_long_s or not pc_short_s:
+                return False, "pending_close_reconciliation_invalid"
             if (pc_long_s == long_v and pc_short_s == short_v) or \
                (pc_long_s == short_v and pc_short_s == long_v):
                 return False, "pending_close_reconciliation_conflict"

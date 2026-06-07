@@ -3065,7 +3065,7 @@ class PassiveCloseExecutor:
             "attempt_count": 0,
             "next_attempt_ms": closed_at_ms,
         }
-        state.pending_close_reconciliations.append(reconciliation)
+        state.enqueue_pending_close_reconciliation(reconciliation)
         self._journal.append(
             "exit.pending_close_reconciliation_registered",
             {
@@ -3137,6 +3137,95 @@ class PassiveCloseExecutor:
         }
         if extra:
             payload.update(extra)
+        missing = object()
+        original_pending = state.pending_passive_closes.get(pending.position_id, missing)
+        original_open = state.open_positions.get(pending.position_id, missing)
+        original_last_error = getattr(state, "last_error", None)
+        original_lifecycle = state.lifecycle
+        original_risk_mode = state.risk_mode
+        original_recovery_blocked_reason = state.recovery_blocked_reason
+        original_recovery_blocked_at_ms = state.recovery_blocked_at_ms
+        original_global_risk_reason = state.global_risk_reason
+        state.set_pending_close_reconciliations(
+            getattr(state, "pending_close_reconciliations", [])
+        )
+        original_reconciliations = [
+            dict(item) for item in state.pending_close_reconciliations
+        ]
+        failure_reason = "pending_close_reconciliation_registration_failed"
+        try:
+            self._register_close_reconciliation_after_live_flat(
+                state,
+                pending,
+                position,
+                source=source,
+                payload=payload,
+                extra=extra,
+            )
+            failure_reason = "managed_state_clear_failed"
+            state.pending_passive_closes.pop(pending.position_id, None)
+            state.open_positions.pop(pending.position_id, None)
+            last_error = getattr(state, "last_error", None)
+            if isinstance(last_error, str) and self._last_error_matches_live_flat_cleanup(
+                last_error,
+                position_id=pending.position_id,
+                symbol=position.symbol,
+            ):
+                state.last_error = None
+            failure_reason = "recovery_core_clear_failed"
+            core_decision = V1RecoveryDecisionCore().decide(
+                RecoveryEvidenceSnapshot(
+                    local_open_positions=tuple(state.open_positions.values()),
+                    pending_entries=tuple(state.pending_entries.values()),
+                    residual_repairs=tuple(
+                        getattr(state, "pending_residual_repairs", ()) or ()
+                    ),
+                    passive_closes=tuple(state.pending_passive_closes.values()),
+                    exchange_truth={
+                        "truth_available": True,
+                        "positions": [],
+                        "open_orders": [],
+                    },
+                    prior_recovery_block_reason=state.recovery_blocked_reason,
+                    operator_fail_closed=(
+                        getattr(state.operator, "requested_mode", None)
+                        == GlobalRiskMode.FAIL_CLOSED
+                    ),
+                )
+            )
+            clear_legacy_recovery_block_via_core(
+                state,
+                core_decision,
+                journal=self._journal,
+            )
+        except Exception as error:
+            state.pending_close_reconciliations = original_reconciliations
+            if original_pending is missing:
+                state.pending_passive_closes.pop(pending.position_id, None)
+            else:
+                state.pending_passive_closes[pending.position_id] = original_pending
+            if original_open is missing:
+                state.open_positions.pop(pending.position_id, None)
+            else:
+                state.open_positions[pending.position_id] = original_open
+            state.last_error = original_last_error
+            state.lifecycle = original_lifecycle
+            state.risk_mode = original_risk_mode
+            state.recovery_blocked_reason = original_recovery_blocked_reason
+            state.recovery_blocked_at_ms = original_recovery_blocked_at_ms
+            state.global_risk_reason = original_global_risk_reason
+            self._journal.append(
+                "exit.passive_close_live_flat_cleanup_failed",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "source": source,
+                    "reason": failure_reason,
+                    "error": str(error),
+                },
+            )
+            return
+
         self._journal.append("runtime.position_drift_detected", payload)
         self._journal.append("exit.passive_close_fallback_terminal_flat", payload)
         self._journal.append(
@@ -3153,24 +3242,6 @@ class PassiveCloseExecutor:
                 ),
             },
         )
-        self._register_close_reconciliation_after_live_flat(
-            state,
-            pending,
-            position,
-            source=source,
-            payload=payload,
-            extra=extra,
-        )
-
-        state.pending_passive_closes.pop(pending.position_id, None)
-        state.open_positions.pop(pending.position_id, None)
-        last_error = getattr(state, "last_error", None)
-        if isinstance(last_error, str) and self._last_error_matches_live_flat_cleanup(
-            last_error,
-            position_id=pending.position_id,
-            symbol=position.symbol,
-        ):
-            state.last_error = None
         self._journal.append(
             "recovery.flat",
             {
@@ -3188,31 +3259,6 @@ class PassiveCloseExecutor:
                 "new_quantity": 0.0,
                 "source": source,
             },
-        )
-        core_decision = V1RecoveryDecisionCore().decide(
-            RecoveryEvidenceSnapshot(
-                local_open_positions=tuple(state.open_positions.values()),
-                pending_entries=tuple(state.pending_entries.values()),
-                residual_repairs=tuple(
-                    getattr(state, "pending_residual_repairs", ()) or ()
-                ),
-                passive_closes=tuple(state.pending_passive_closes.values()),
-                exchange_truth={
-                    "truth_available": True,
-                    "positions": [],
-                    "open_orders": [],
-                },
-                prior_recovery_block_reason=state.recovery_blocked_reason,
-                operator_fail_closed=(
-                    getattr(state.operator, "requested_mode", None)
-                    == GlobalRiskMode.FAIL_CLOSED
-                ),
-            )
-        )
-        clear_legacy_recovery_block_via_core(
-            state,
-            core_decision,
-            journal=self._journal,
         )
 
     @staticmethod

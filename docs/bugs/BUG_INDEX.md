@@ -17,6 +17,32 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest passive-close live-flat recurrence, 2026-06-07: post-`bff33ec`
+production is not failing because the deploy is mismatched or services failed
+to restart. The live red path is a connected recovery-contract recurrence:
+`BABYUSDT` is locally open/pending passive close while OKX/Bybit exchange truth
+is flat, and passive-close cleanup repeats
+`runtime.passive_close_tick_error` with the error string
+`"'dict' object has no attribute 'append'"`. Source tracing maps this to a restored
+`pending_close_reconciliations` shape hole plus a cleanup atomicity hole:
+terminal-flat/drift events are journaled before queue registration and managed
+state removal can succeed, so the V1 recovery decision core never receives the
+successful clear evidence. Focused probes also found unowned Bybit live
+positions on `MORPHOUSDT`, `MONUSDT`, and `SEIUSDT`; those are the same
+live-artifact ownership contract family, not a separate deploy issue. Root plan
+and required RED coverage are recorded in
+[`daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry`](daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry),
+[`cards/passive-close-terminal-flatness.md`](cards/passive-close-terminal-flatness.md),
+and
+[`contracts/pending-entry-live-truth-contract.md`](contracts/pending-entry-live-truth-contract.md).
+Formal execution artifacts are
+[`../superpowers/specs/2026-06-07-v1-pending-close-reconciliation-queue-closure-design.md`](../superpowers/specs/2026-06-07-v1-pending-close-reconciliation-queue-closure-design.md)
+and
+[`../superpowers/plans/2026-06-07-v1-pending-close-reconciliation-queue-closure-implementation-plan.md`](../superpowers/plans/2026-06-07-v1-pending-close-reconciliation-queue-closure-implementation-plan.md).
+This update is local implementation and local tests only: no deploy, no
+production verification, no production state mutation, and no order/cancel is
+claimed.
+
 Latest V1 recovery decision core closed-loop implementation, 2026-06-06: the
 `ambiguous_exchange_truth -> runtime.stale_recovery_block_cleared` pattern is
 now handled as a single-authority recovery semantics gap, not as another

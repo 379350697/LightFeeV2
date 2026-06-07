@@ -928,6 +928,57 @@ class RecoveryWorkSnapshot:
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
 
 
+MAX_PENDING_CLOSE_RECONCILIATIONS = 256
+
+
+def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        if _looks_like_pending_close_reconciliation(raw):
+            items = [raw]
+        else:
+            items = list(raw.values())
+    else:
+        return [_invalid_pending_close_reconciliation(raw, "invalid_container")]
+
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+        else:
+            normalized.append(_invalid_pending_close_reconciliation(item, "invalid_item"))
+    return normalized
+
+
+def _looks_like_pending_close_reconciliation(raw: dict[Any, Any]) -> bool:
+    return any(
+        key in raw
+        for key in (
+            "position_id",
+            "symbol",
+            "kind",
+            "closed_at_ms",
+            "position_snapshot",
+            "long_venue",
+            "short_venue",
+            "long_legs",
+            "short_legs",
+        )
+    )
+
+
+def _invalid_pending_close_reconciliation(raw: Any, reason: str) -> dict[str, Any]:
+    return {
+        "invalid_pending_close_reconciliation": True,
+        "reason": reason,
+        "raw_type": type(raw).__name__,
+        "raw_repr": repr(raw)[:240],
+    }
+
+
 @dataclass
 class EngineState:
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
@@ -962,7 +1013,7 @@ class EngineState:
     # --- Entry liquidity qualification records (V1 entry_liquidity_qualification_records) ---
     entry_liquidity_qualification_records: list = field(default_factory=list)
     # --- Pending close reconciliations (V1 pending_close_reconciliations) ---
-    pending_close_reconciliations: list = field(default_factory=list)
+    pending_close_reconciliations: list[dict[str, Any]] = field(default_factory=list)
     # --- Local-L2 state for persistence/recovery (V1 parity) ---
     retained_local_l2_books: list[dict] = field(default_factory=list)
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
@@ -971,6 +1022,47 @@ class EngineState:
     # --- V1 PassiveOrderManager runtime state persistence ---
     # Maps entry_id -> PassiveOrderManager.runtime_dict()
     passive_order_manager_states: dict[str, dict] = field(default_factory=dict)
+
+    def set_pending_close_reconciliations(self, raw: Any) -> None:
+        self.pending_close_reconciliations = normalize_pending_close_reconciliations(raw)[
+            -MAX_PENDING_CLOSE_RECONCILIATIONS:
+        ]
+
+    def enqueue_pending_close_reconciliation(self, item: dict[str, Any]) -> None:
+        self.set_pending_close_reconciliations(self.pending_close_reconciliations)
+        position_id = str(item.get("position_id") or "")
+        kind = str(item.get("kind") or "final")
+        for existing in self.pending_close_reconciliations:
+            if (
+                str(existing.get("position_id") or "") == position_id
+                and str(existing.get("kind") or "final") == kind
+            ):
+                return
+        self.pending_close_reconciliations.append(dict(item))
+        if len(self.pending_close_reconciliations) > MAX_PENDING_CLOSE_RECONCILIATIONS:
+            self.pending_close_reconciliations = self.pending_close_reconciliations[
+                -MAX_PENDING_CLOSE_RECONCILIATIONS:
+            ]
+
+    def remove_pending_close_reconciliation(self, task: dict[str, Any]) -> bool:
+        self.set_pending_close_reconciliations(self.pending_close_reconciliations)
+        before = len(self.pending_close_reconciliations)
+        target = (
+            str(task.get("position_id") or ""),
+            str(task.get("kind") or "final"),
+            int(task.get("closed_at_ms") or 0),
+        )
+        self.pending_close_reconciliations = [
+            item
+            for item in self.pending_close_reconciliations
+            if (
+                str(item.get("position_id") or ""),
+                str(item.get("kind") or "final"),
+                int(item.get("closed_at_ms") or 0),
+            )
+            != target
+        ]
+        return len(self.pending_close_reconciliations) != before
 
     def to_dict(self) -> dict:
         return {
@@ -994,7 +1086,9 @@ class EngineState:
             "venue_market_data_degradations": self.venue_market_data_degradations,
             "transfer_truth": self.transfer_truth,
             "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,
-            "pending_close_reconciliations": self.pending_close_reconciliations,
+            "pending_close_reconciliations": normalize_pending_close_reconciliations(
+                self.pending_close_reconciliations
+            ),
             "last_scan": self.last_scan,
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,

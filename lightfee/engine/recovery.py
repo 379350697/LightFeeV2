@@ -37,6 +37,7 @@ from lightfee.engine.state import (
     PendingPassiveLegFill,
     PendingPassiveOrder,
     RecoveryWorkSnapshot,
+    normalize_pending_close_reconciliations,
 )
 from lightfee.core.domain import Side, Venue
 from lightfee.persistence.journal import Journal
@@ -485,7 +486,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.venue_market_data_degradations = snap.get("venue_market_data_degradations", {})
     state.transfer_truth = snap.get("transfer_truth", {})
     state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
-    state.pending_close_reconciliations = snap.get("pending_close_reconciliations", [])
+    state.set_pending_close_reconciliations(snap.get("pending_close_reconciliations", []))
     state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
 
     # Restore operator control state
@@ -1141,7 +1142,9 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     view["venue_market_data_degradations"] = state.venue_market_data_degradations
     view["transfer_truth"] = state.transfer_truth
     view["entry_liquidity_qualification_records"] = state.entry_liquidity_qualification_records
-    view["pending_close_reconciliations"] = state.pending_close_reconciliations
+    view["pending_close_reconciliations"] = normalize_pending_close_reconciliations(
+        state.pending_close_reconciliations
+    )
 
     # Add open position details
     view["open_positions"] = {

@@ -22,6 +22,7 @@ from lightfee.engine.state import (
     PendingEntryRemainderSlice,
     PendingClose,
     OperatorControlState,
+    normalize_pending_close_reconciliations,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -920,6 +921,155 @@ class TestEngineStateFieldCompleteness:
         state = EngineState()
         assert hasattr(state, "pending_close_reconciliations")
         assert isinstance(state.pending_close_reconciliations, list)
+
+    def test_restore_migrates_dict_shaped_pending_close_reconciliations(self):
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        snapshot = {
+            "lifecycle": "risk_only",
+            "risk_mode": "fail_closed",
+            "pending_close_reconciliations": {
+                "entry-1780771924982-BABYUSDT": {
+                    "position_id": "entry-1780771924982-BABYUSDT",
+                    "symbol": "BABYUSDT",
+                    "kind": "final",
+                    "reason": "pending_passive_close_flat_probe",
+                    "closed_at_ms": 1780771929000,
+                    "created_cycle": 42,
+                    "position_snapshot": {
+                        "position_id": "entry-1780771924982-BABYUSDT",
+                        "symbol": "BABYUSDT",
+                        "long_venue": "okx",
+                        "short_venue": "bybit",
+                    },
+                    "long_legs": [],
+                    "short_legs": [],
+                    "attempt_count": 0,
+                    "next_attempt_ms": 1780771929000,
+                }
+            },
+        }
+
+        state = _restore_state_from_snapshot_dict(snapshot)
+
+        assert isinstance(state.pending_close_reconciliations, list)
+        assert (
+            state.pending_close_reconciliations[0]["position_id"]
+            == "entry-1780771924982-BABYUSDT"
+        )
+        assert isinstance(state.to_dict()["pending_close_reconciliations"], list)
+
+    def test_pending_close_reconciliation_enqueue_deduplicates_position_and_kind(self):
+        state = EngineState()
+        item = {
+            "position_id": "entry-1780771924982-BABYUSDT",
+            "symbol": "BABYUSDT",
+            "kind": "final",
+            "closed_at_ms": 1780771929000,
+        }
+
+        state.enqueue_pending_close_reconciliation(item)
+        state.enqueue_pending_close_reconciliation({**item, "reason": "duplicate"})
+
+        assert state.pending_close_reconciliations == [item]
+
+    def test_pending_close_reconciliation_enqueue_caps_oldest_at_256(self):
+        state = EngineState()
+
+        for index in range(260):
+            state.enqueue_pending_close_reconciliation(
+                {
+                    "position_id": f"entry-{index}",
+                    "symbol": "BABYUSDT",
+                    "kind": "final",
+                    "closed_at_ms": 1780771929000 + index,
+                }
+            )
+
+        assert len(state.pending_close_reconciliations) == 256
+        assert state.pending_close_reconciliations[0]["position_id"] == "entry-4"
+
+    def test_pending_close_reconciliation_enqueue_remove_matches_closed_at_ms(self):
+        state = EngineState()
+        first = {
+            "position_id": "entry-1780771924982-BABYUSDT",
+            "symbol": "BABYUSDT",
+            "kind": "final",
+            "closed_at_ms": 1780771929000,
+        }
+        second = {**first, "closed_at_ms": 1780771929001}
+        state.pending_close_reconciliations = [first, second]
+
+        removed = state.remove_pending_close_reconciliation(first)
+
+        assert removed is True
+        assert state.pending_close_reconciliations == [second]
+
+    def test_pending_close_reconciliation_enqueue_normalizes_existing_dict_shape(self):
+        state = EngineState()
+        state.pending_close_reconciliations = {
+            "entry-1780771924982-BABYUSDT": {
+                "position_id": "entry-1780771924982-BABYUSDT",
+                "symbol": "BABYUSDT",
+                "kind": "final",
+                "closed_at_ms": 1780771929000,
+            }
+        }
+
+        state.enqueue_pending_close_reconciliation(
+            {
+                "position_id": "entry-1780771924982-MORPHOUSDT",
+                "symbol": "MORPHOUSDT",
+                "kind": "final",
+                "closed_at_ms": 1780771929001,
+            }
+        )
+
+        assert isinstance(state.pending_close_reconciliations, list)
+        assert [
+            item["position_id"] for item in state.pending_close_reconciliations
+        ] == [
+            "entry-1780771924982-BABYUSDT",
+            "entry-1780771924982-MORPHOUSDT",
+        ]
+
+    def test_pending_close_reconciliation_normalizes_single_task_dict_shape(self):
+        raw = {
+            "position_id": "entry-1780771924982-BABYUSDT",
+            "symbol": "BABYUSDT",
+            "kind": "final",
+            "reason": "pending_passive_close_flat_probe",
+            "closed_at_ms": 1780771929000,
+            "position_snapshot": {
+                "position_id": "entry-1780771924982-BABYUSDT",
+                "symbol": "BABYUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }
+
+        normalized = normalize_pending_close_reconciliations(raw)
+
+        assert normalized == [raw]
+
+    def test_pending_close_reconciliation_preserves_invalid_evidence_task(self):
+        raw = [
+            "poisoned-item",
+            {
+                "position_id": "entry-1780771924982-BABYUSDT",
+                "symbol": "BABYUSDT",
+                "kind": "final",
+                "closed_at_ms": 1780771929000,
+            },
+        ]
+
+        normalized = normalize_pending_close_reconciliations(raw)
+
+        assert normalized[0]["invalid_pending_close_reconciliation"] is True
+        assert normalized[0]["raw_type"] == "str"
+        assert normalized[1]["position_id"] == "entry-1780771924982-BABYUSDT"
 
     def test_global_risk_reason(self):
         state = EngineState()

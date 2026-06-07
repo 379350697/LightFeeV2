@@ -43,6 +43,7 @@ from lightfee.core.domain import (
 )
 from lightfee.engine.close_executor import CloseExecutionLeg
 from lightfee.engine.exit import CloseExecution
+import lightfee.engine.passive_close as passive_close_module
 from lightfee.engine.passive_close import (
     PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES,
     PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES,
@@ -4042,6 +4043,163 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         kinds = [e.get("kind") for e in journal.read_all()]
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
+
+    def test_live_flat_cleanup_normalizes_dict_shaped_pending_close_reconciliation_queue(self):
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        position.position_id = "entry-1780771924982-BABYUSDT"
+        position.symbol = "BABYUSDT"
+        position.long_venue = Venue.OKX
+        position.short_venue = Venue.BYBIT
+        executor._adapters = {Venue.OKX: long_adapter, Venue.BYBIT: short_adapter}
+        long_adapter.venue = Venue.OKX
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        pending.reason = "pending_passive_close_flat_probe"
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations = {
+            position.position_id: {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "kind": "final",
+                "closed_at_ms": 1780771929000,
+            }
+        }
+
+        asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert isinstance(state.pending_close_reconciliations, list)
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "recovery.flat" in kinds
+        assert "runtime.passive_close_tick_error" not in kinds
+
+    def test_live_flat_cleanup_does_not_emit_terminal_success_when_registration_fails(self, monkeypatch):
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+        pending = state.pending_passive_closes[position.position_id]
+
+        def fail_registration(*args, **kwargs):
+            raise RuntimeError("simulated queue registration failure")
+
+        monkeypatch.setattr(
+            executor,
+            "_register_close_reconciliation_after_live_flat",
+            fail_registration,
+        )
+
+        try:
+            executor._clear_live_flat_state(
+                state,
+                pending,
+                position,
+                source="pending_passive_close_flat_probe",
+                actual_long_size=0.0,
+                actual_short_size=0.0,
+            )
+        except RuntimeError:
+            pass
+
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "runtime.position_lifecycle_terminal" not in kinds
+        assert "exit.passive_close_live_flat_cleanup_failed" in kinds
+
+    def test_live_flat_cleanup_does_not_emit_terminal_success_when_core_clear_fails(self, monkeypatch):
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+        pending = state.pending_passive_closes[position.position_id]
+
+        def fail_core_clear(*args, **kwargs):
+            raise RuntimeError("simulated core clear failure")
+
+        monkeypatch.setattr(
+            passive_close_module,
+            "clear_legacy_recovery_block_via_core",
+            fail_core_clear,
+        )
+
+        try:
+            executor._clear_live_flat_state(
+                state,
+                pending,
+                position,
+                source="pending_passive_close_flat_probe",
+                actual_long_size=0.0,
+                actual_short_size=0.0,
+            )
+        except RuntimeError:
+            pass
+
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "runtime.position_drift_detected" not in kinds
+        assert "exit.passive_close_fallback_terminal_flat" not in kinds
+        assert "runtime.position_lifecycle_terminal" not in kinds
+        assert "recovery.flat" not in kinds
+        assert "runtime.position_drift_corrected" not in kinds
+        assert "exit.passive_close_live_flat_cleanup_failed" in kinds
+
+    def test_live_flat_cleanup_restores_recovery_risk_state_when_legacy_clear_journal_fails(self, monkeypatch):
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+        pending = state.pending_passive_closes[position.position_id]
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        state.recovery_blocked_reason = (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+        state.recovery_blocked_at_ms = 123
+        state.global_risk_reason = (
+            "startup_recovery_pending_work_without_open_positions"
+        )
+        original_append = journal.append
+
+        def fail_legacy_clear_journal(kind, *args, **kwargs):
+            if kind == "recovery.legacy_block_cleared":
+                raise RuntimeError("simulated legacy clear journal failure")
+            return original_append(kind, *args, **kwargs)
+
+        monkeypatch.setattr(journal, "append", fail_legacy_clear_journal)
+
+        executor._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source="pending_passive_close_flat_probe",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+        )
+
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        assert state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert (
+            state.recovery_blocked_reason
+            == "startup_recovery_pending_work_without_open_positions"
+        )
+        assert state.recovery_blocked_at_ms == 123
+        assert (
+            state.global_risk_reason
+            == "startup_recovery_pending_work_without_open_positions"
+        )
+        events = journal.read_all()
+        kinds = [e.get("kind") for e in events]
+        assert "runtime.position_lifecycle_terminal" not in kinds
+        assert "recovery.flat" not in kinds
+        assert "runtime.position_drift_corrected" not in kinds
+        failure = next(
+            e for e in events
+            if e.get("kind") == "exit.passive_close_live_flat_cleanup_failed"
+        )
+        assert failure["payload"]["reason"] == "recovery_core_clear_failed"
 
     def test_live_flat_cleanup_records_v1_recovery_payload_fields(self):
         """V1 recovery logs exact flat-probe position and venue sizing evidence."""
