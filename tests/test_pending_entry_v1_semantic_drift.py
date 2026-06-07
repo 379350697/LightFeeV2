@@ -7,6 +7,8 @@ import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import OrderFillReconciliation, PositionSnapshot, Side, Venue
+from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import OpenPosition, PendingEntry
@@ -132,6 +134,100 @@ class _TerminalNoFillOpenMakerAdapter(_NoFillReconciliationAdapter):
                 "reduceOnly": False,
             }
         ]
+
+
+class _TerminalNoFillOpenMakerFlatPositionAdapter(_TerminalNoFillOpenMakerAdapter):
+    async def fetch_position(self, symbol):
+        return PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584323000,
+        )
+
+
+class _TerminalNoFillUnavailableOpenOrdersAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, *, venue: Venue = Venue.BYBIT, error: str = "open order timeout"):
+        self.venue = venue
+        self.error = error
+        self.open_order_calls: list[str] = []
+        self.position_calls: list[str] = []
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return OrderFillReconciliation(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            average_price=0.0,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            metadata={"status": "canceled"},
+        )
+
+    async def fetch_open_orders(self, symbol):
+        self.open_order_calls.append(symbol)
+        raise TimeoutError(self.error)
+
+    async def fetch_position(self, symbol):
+        self.position_calls.append(symbol)
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584320000,
+        )
+
+
+class _TerminalNoFillClearOpenOrdersFlatPositionAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, *, venue: Venue = Venue.BYBIT):
+        self.venue = venue
+        self.open_order_calls: list[str] = []
+        self.position_calls: list[str] = []
+
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return OrderFillReconciliation(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            average_price=0.0,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            metadata={"status": "canceled"},
+        )
+
+    async def fetch_open_orders(self, symbol):
+        self.open_order_calls.append(symbol)
+        return []
+
+    async def fetch_position(self, symbol):
+        self.position_calls.append(symbol)
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584325000,
+        )
+
+
+class _CancelableUnavailableOpenOrdersAdapter(_TerminalNoFillUnavailableOpenOrdersAdapter):
+    def __init__(self):
+        super().__init__(error="open order truth unavailable before cancel")
+        self.cancel_calls: list[dict] = []
+
+    async def cancel_passive_order(self, symbol, order_id="", client_order_id=None):
+        self.cancel_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
 
 
 class _TerminalNoFillLivePositionAdapter(_NoFillReconciliationAdapter):
@@ -382,6 +478,59 @@ async def test_flat_reconcile_with_not_found_maker_retains_pending_entry_like_v1
     runtime.state.pending_entries[pending.pending_id] = pending
 
     await runtime._reconcile_pending_state(now_ms=2000)
+
+    assert pending.pending_id in runtime.state.pending_entries
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "reconciliation.entry_flat_unresolved_maker_retained" in kinds
+    assert "reconciliation.entry_cleared_flat" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_live_flat_reconcile_without_maker_order_reference_retains_pending(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    result = PositionReconciliationResult(
+        position_id="entry-v1-drift",
+        symbol="JTOUSDT",
+        long_status="not_found",
+        short_status="not_found",
+        long_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="JTOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584326000,
+        ),
+        short_position=PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="JTOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584326000,
+        ),
+        is_flat=True,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: object(), Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(result)
+    pending = _pending_entry(
+        pending_id="entry-v1-drift",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        created_at_ms=1780584325000,
+        maker_order_id="",
+        maker_client_order_id="",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=1780584326000)
 
     assert pending.pending_id in runtime.state.pending_entries
     kinds = [event["kind"] for event in tmp_journal.read_all()]
@@ -1281,6 +1430,412 @@ async def test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_ex
     assert "pending_entry.finalize_deferred_maker_open_order" in kinds
     assert "entry.passive_unfilled" not in kinds
     assert "pending_entry.pending_entry_finalized" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_finalize_zero_fill_retains_pending_when_open_order_truth_unavailable(
+    config, tmp_journal,
+):
+    adapter = _TerminalNoFillUnavailableOpenOrdersAdapter(
+        error="bybit eventual consistency timeout"
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id="jto-maker-order",
+        maker_client_order_id="jto-maker-client",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584321700,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.uncertain_outcome is True
+    assert pending.reconcile_next_attempt_ms >= 1780584322700
+    assert adapter.open_order_calls == ["JTOUSDT"]
+    assert adapter.position_calls == ["JTOUSDT"]
+
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.finalize_maker_open_order_truth_unavailable" in kinds
+    assert "pending_entry.terminalizer_decision" in kinds
+    decisions = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.terminalizer_decision"
+    ]
+    assert decisions[-1]["outcome"] == "deferred_missing_live_truth"
+    assert decisions[-1]["allows_pending_removal"] is False
+    assert "entry.passive_unfilled" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_open_order_reappears_as_owned_pending_entry_not_orphan(
+    config, tmp_journal,
+):
+    order_id = "jto-maker-order"
+    client_order_id = "jto-maker-client"
+    adapter = _TerminalNoFillOpenMakerAdapter(
+        order_id=order_id,
+        client_order_id=client_order_id,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id=order_id,
+        maker_client_order_id=client_order_id,
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584323000,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+
+    owner_index = RecoveryOwnerIndex.from_state(
+        {
+            "pending_entries": [
+                {
+                    "pending_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "long_venue": pending.long_venue.value,
+                    "short_venue": pending.short_venue.value,
+                    "maker_order_id": order_id,
+                    "maker_client_order_id": client_order_id,
+                }
+            ]
+        }
+    )
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"open_positions": [], "pending_entries": []},
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "bybit",
+                    "symbol": "JTOUSDT",
+                    "side": "buy",
+                    "quantity": 31.0,
+                    "reduce_only": False,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                }
+            ],
+        },
+        owner_index=owner_index,
+    )
+
+    item = ledger.work_items[0]
+    assert item.kind == "owned_pending_entry"
+    assert item.owner.owner_id == pending.pending_id
+    assert item.owner.confidence == "proven"
+    assert item.decision.outcome == "owned_order_cancel_requested"
+
+
+@pytest.mark.asyncio
+async def test_live_zero_fill_open_order_match_routes_to_deferred_live_open_order(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    order_id = "jto-maker-order"
+    client_order_id = "jto-maker-client"
+    adapter = _TerminalNoFillOpenMakerFlatPositionAdapter(
+        order_id=order_id,
+        client_order_id=client_order_id,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id=order_id,
+        maker_client_order_id=client_order_id,
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584323000,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.uncertain_outcome is True
+
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.finalize_deferred_maker_open_order" in kinds
+    decisions = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.terminalizer_decision"
+    ]
+    assert decisions[-1]["outcome"] == "deferred_live_open_order"
+    assert decisions[-1]["allows_pending_removal"] is False
+    assert "entry.passive_unfilled" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_live_zero_fill_without_maker_order_reference_retains_pending(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    adapter = _LivePositionOpenOrdersAdapter(
+        PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="JTOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584324000,
+        )
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id="",
+        maker_client_order_id="",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584324000,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.uncertain_outcome is True
+    assert pending.reconcile_next_attempt_ms >= 1780584325000
+
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.finalize_maker_order_reference_unavailable" in kinds
+    decisions = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.terminalizer_decision"
+    ]
+    assert decisions[-1]["outcome"] == "deferred_missing_live_truth"
+    assert decisions[-1]["reason"] == "maker_order_reference_unavailable"
+    assert decisions[-1]["allows_pending_removal"] is False
+    assert "entry.passive_unfilled" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_live_stale_abandon_without_maker_order_reference_retains_pending(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    maker = _LivePositionOpenOrdersAdapter(
+        PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="JTOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584327000,
+        )
+    )
+    hedge = _LivePositionAdapter(
+        PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="JTOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584327000,
+        )
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="",
+        maker_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+
+    abandoned = await runtime._try_abandon_stale_entry(pending, pending.pending_id)
+
+    assert abandoned is False
+    events = tmp_journal.read_all()
+    assert any(
+        event["kind"] == "pending_entry.maker_terminal_evidence_unavailable"
+        and event["payload"].get("reason") == "maker_order_reference_unavailable"
+        for event in events
+    )
+    assert "reconciliation.entry_abandoned_flat" not in [
+        event["kind"] for event in events
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_terminal_zero_fill_with_clear_truth_allows_passive_unfilled(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    adapter = _TerminalNoFillClearOpenOrdersFlatPositionAdapter()
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id="jto-maker-order",
+        maker_client_order_id="jto-maker-client",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584325000,
+    )
+
+    assert finalized is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert adapter.open_order_calls == ["JTOUSDT"]
+    assert adapter.position_calls == ["JTOUSDT"]
+
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    decisions = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.terminalizer_decision"
+    ]
+    assert decisions[-1]["outcome"] == "passive_unfilled"
+    assert decisions[-1]["allows_pending_removal"] is True
+    assert "entry.passive_unfilled" in kinds
+    assert "pending_entry.pending_entry_finalized" in kinds
+
+
+@pytest.mark.asyncio
+async def test_deferred_zero_fill_owner_cancel_uses_pending_maker_order_ids(
+    config, tmp_journal,
+):
+    adapter = _CancelableUnavailableOpenOrdersAdapter()
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        maker_order_id="jto-maker-order",
+        maker_client_order_id="jto-maker-client",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        now_ms=1780584321700,
+    )
+
+    assert finalized is False
+    retained = runtime.state.pending_entries[pending.pending_id]
+
+    canceled = await runtime._recover_cancel_maker_order(
+        retained,
+        pending.pending_id,
+        reason="owned_pending_entry_live_order",
+    )
+
+    assert canceled is True
+    assert adapter.cancel_calls == [
+        {
+            "symbol": "JTOUSDT",
+            "order_id": "jto-maker-order",
+            "client_order_id": "jto-maker-client",
+        }
+    ]
 
 
 @pytest.mark.asyncio

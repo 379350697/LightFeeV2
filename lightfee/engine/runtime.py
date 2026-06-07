@@ -7869,7 +7869,7 @@ class LiveRuntime:
 
     def _pending_entry_flat_clear_has_terminal_maker_evidence(self, pending, result) -> bool:
         if not self._pending_entry_has_maker_order_reference(pending):
-            return True
+            return self.config.runtime.mode != "live"
         maker_status = self._pending_entry_reconcile_maker_status(pending, result)
         return self._order_status_is_terminal_no_fill(maker_status)
 
@@ -7877,6 +7877,18 @@ class LiveRuntime:
         self, pending, entry_id: str
     ) -> bool:
         if not self._pending_entry_has_maker_order_reference(pending):
+            if self.config.runtime.mode == "live":
+                maker_venue = pending.maker_venue()
+                self.journal.append(
+                    "pending_entry.maker_terminal_evidence_unavailable",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": maker_venue.value,
+                        "reason": "maker_order_reference_unavailable",
+                    },
+                )
+                return True
             return False
         if pending.maker_completed():
             return False
@@ -10410,17 +10422,69 @@ class LiveRuntime:
         pending,
         entry_id: str,
         now_ms: int,
-    ) -> bool:
+    ) -> PendingEntryLiveTruth:
         if not self._pending_entry_has_maker_order_reference(pending):
-            return False
-        if pending.maker_completed():
-            return False
+            if str(getattr(self.config.runtime, "mode", "") or "") == "live":
+                pending.uncertain_outcome = True
+                pending.reconcile_next_attempt_ms = max(
+                    int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                    now_ms + 1_000,
+                )
+                self.journal.append(
+                    "pending_entry.finalize_maker_order_reference_unavailable",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": pending.maker_venue().value,
+                        "reason": "zero_fill_finalize_maker_order_reference_unavailable",
+                    },
+                )
+                return PendingEntryLiveTruth(
+                    available=False,
+                    has_live_open_order=False,
+                    has_live_position=False,
+                    error="maker_order_reference_unavailable",
+                )
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=False,
+            )
 
         maker_venue = pending.maker_venue()
         adapter = self.get_venue_adapter(maker_venue)
         order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
         if adapter is None:
-            return False
+            if str(getattr(self.config.runtime, "mode", "") or "") != "live":
+                return PendingEntryLiveTruth(
+                    available=True,
+                    has_live_open_order=False,
+                    has_live_position=False,
+                )
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
+            return PendingEntryLiveTruth(
+                available=False,
+                has_live_open_order=False,
+                has_live_position=False,
+                error="maker_adapter_unavailable",
+            )
+
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        transport = getattr(adapter, "_transport", None)
+        if (
+            str(getattr(self.config.runtime, "mode", "") or "") != "live"
+            and not callable(fetch_open_orders)
+            and (transport is None or not hasattr(transport, "_request"))
+        ):
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=False,
+            )
 
         matches, open_order_error = await self._pending_entry_maker_open_order_matches(
             pending,
@@ -10428,6 +10492,11 @@ class LiveRuntime:
             maker_venue,
         )
         if matches is None:
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
             self.journal.append(
                 "pending_entry.finalize_maker_open_order_truth_unavailable",
                 {
@@ -10440,9 +10509,18 @@ class LiveRuntime:
                     "reason": "zero_fill_finalize_open_order_truth_unavailable",
                 },
             )
-            return False
+            return PendingEntryLiveTruth(
+                available=False,
+                has_live_open_order=False,
+                has_live_position=False,
+                error=open_order_error or "open_order_truth_unavailable",
+            )
         if not matches:
-            return False
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=False,
+            )
 
         pending.uncertain_outcome = True
         pending.reconcile_next_attempt_ms = max(
@@ -10463,22 +10541,58 @@ class LiveRuntime:
                 "reason": "maker_open_order_truth_present",
             },
         )
-        return True
+        return PendingEntryLiveTruth(
+            available=True,
+            has_live_open_order=True,
+            has_live_position=False,
+        )
 
     async def _pending_entry_zero_fill_has_live_maker_position(
         self,
         pending,
         entry_id: str,
         now_ms: int,
-    ) -> bool:
+    ) -> PendingEntryLiveTruth:
         maker_venue = pending.maker_venue()
         adapter = self.get_venue_adapter(maker_venue)
         if adapter is None:
-            return False
+            if str(getattr(self.config.runtime, "mode", "") or "") != "live":
+                return PendingEntryLiveTruth(
+                    available=True,
+                    has_live_open_order=False,
+                    has_live_position=False,
+                )
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
+            return PendingEntryLiveTruth(
+                available=False,
+                has_live_open_order=False,
+                has_live_position=False,
+                error="maker_adapter_unavailable",
+            )
+
+        fetch_position = getattr(adapter, "fetch_position", None)
+        if (
+            str(getattr(self.config.runtime, "mode", "") or "") != "live"
+            and not callable(fetch_position)
+        ):
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=False,
+            )
 
         try:
-            position = await adapter.fetch_position(pending.symbol)
+            position = await fetch_position(pending.symbol)
         except Exception as exc:
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
             self.journal.append(
                 "pending_entry.finalize_maker_live_position_truth_unavailable",
                 {
@@ -10489,11 +10603,20 @@ class LiveRuntime:
                     "reason": "zero_fill_finalize_live_position_truth_unavailable",
                 },
             )
-            return False
+            return PendingEntryLiveTruth(
+                available=False,
+                has_live_open_order=False,
+                has_live_position=False,
+                error=str(exc) or exc.__class__.__name__,
+            )
 
         live_qty = abs(float(getattr(position, "quantity", 0.0) or 0.0)) if position else 0.0
         if live_qty <= 1e-9:
-            return False
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=False,
+            )
 
         pending.uncertain_outcome = True
         pending.reconcile_next_attempt_ms = max(
@@ -10518,7 +10641,11 @@ class LiveRuntime:
                 "reason": "maker_live_position_truth_present",
             },
         )
-        return True
+        return PendingEntryLiveTruth(
+            available=True,
+            has_live_open_order=False,
+            has_live_position=True,
+        )
 
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
@@ -10533,10 +10660,11 @@ class LiveRuntime:
            exists → persist as "incremental_entry_open_partially_matched".
         3. balanced_quantity == 0 with residual (has_any_fill): persist as
            "incremental_entry_open_unmatched_residual", no open position.
-        4. balanced_quantity == 0 with no fill (zero-fill): emit
-           entry.passive_unfilled, remove pending.
+        4. balanced_quantity == 0 with no fill (zero-fill): retain unless
+           terminal no-fill, open-order truth, and live-position truth prove no
+           live maker artifact; only then emit entry.passive_unfilled.
 
-        Zero-fill (maker=0, hedge=0) entries are safely removed as passive_unfilled.
+        Zero-fill (maker=0, hedge=0) entries are not immediate terminality.
         One-sided fill (maker>0, hedge=0) creates an unmatched residual task for
         cleanup but does NOT create an open position or emit entry.opened.
         """
@@ -10643,25 +10771,30 @@ class LiveRuntime:
 
         if balanced_quantity <= 0.0:
             if not pending.has_any_fill():
-                if await self._pending_entry_zero_fill_has_live_maker_open_order(
+                open_order_truth = await self._pending_entry_zero_fill_has_live_maker_open_order(
                     pending,
                     entry_id,
                     now_ms,
-                ):
-                    return False
-                if await self._pending_entry_zero_fill_has_live_maker_position(
+                )
+                live_position_truth = await self._pending_entry_zero_fill_has_live_maker_position(
                     pending,
                     entry_id,
                     now_ms,
-                ):
-                    return False
+                )
+                missing_truth_errors = [
+                    truth.error
+                    for truth in (open_order_truth, live_position_truth)
+                    if not truth.available and truth.error
+                ]
+                live_truth = PendingEntryLiveTruth(
+                    available=open_order_truth.available and live_position_truth.available,
+                    has_live_open_order=open_order_truth.has_live_open_order,
+                    has_live_position=live_position_truth.has_live_position,
+                    error=";".join(missing_truth_errors),
+                )
                 decision = PendingEntryTerminalizer().decide(
                     pending,
-                    live_truth=PendingEntryLiveTruth(
-                        available=True,
-                        has_live_open_order=False,
-                        has_live_position=False,
-                    ),
+                    live_truth=live_truth,
                 )
                 self.journal.append(
                     "pending_entry.terminalizer_decision",
@@ -10674,7 +10807,8 @@ class LiveRuntime:
                 )
                 if not decision.allows_pending_removal:
                     return False
-                # V1: !has_any_fill → zero-fill, safe to remove as passive_unfilled
+                # V1: zero-fill is removable only after terminal no-fill plus
+                # available clear open-order and live-position truth.
                 self.journal.append(
                     "entry.passive_unfilled",
                     {
