@@ -421,6 +421,19 @@ def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
     }
 
 
+def test_v1_tradeable_no_entry_reason_classifies_admission_blocks():
+    from lightfee.engine.runtime import LiveRuntime
+
+    reason = LiveRuntime._v1_tradeable_no_entry_reason(
+        Counter(),
+        admission_blocker_counts=Counter({
+            "insufficient_margin_admission_blocked": 2,
+        }),
+    )
+
+    assert reason == "tradeable_candidates_blocked_by_entry_admission"
+
+
 # ---------------------------------------------------------------------------
 # EntrySyncExecutor integration with Journal
 # ---------------------------------------------------------------------------

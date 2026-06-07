@@ -2965,6 +2965,21 @@ class TestEntryReadinessProviderFactory:
         assert blockers == {
             "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_stale_quote",
         }
+        import json
+
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        payload = [
+            r["payload"] for r in records
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+        ][-1]
+        evidence = payload["readiness_evidence"]
+        assert evidence["blocker_family"] == "stale_quote"
+        assert evidence["quote_age_ms"]["long"] == 100
+        assert evidence["quote_age_ms"]["short"] == 5000
 
     def test_ws_bbo_quote_lease_refreshes_stale_tracked_quote_from_rest_top_book(
         self,

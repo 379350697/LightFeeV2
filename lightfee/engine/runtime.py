@@ -408,6 +408,7 @@ class LiveRuntime:
 
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
         symbol = str(getattr(candidate, "symbol", "") or "")
+        candidate_pair_id = self._candidate_pair_id(candidate)
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),
@@ -418,6 +419,7 @@ class LiveRuntime:
                 continue
             key = (venue.value, symbol)
             payload = {}
+            payload_state_key = ""
             state_until_ms = 0
             for state_key in (f"{venue.value}:{symbol}", f"{venue.value}:*"):
                 candidate_payload = dict(
@@ -432,6 +434,7 @@ class LiveRuntime:
                 if candidate_until_ms > state_until_ms:
                     state_until_ms = candidate_until_ms
                     payload = candidate_payload
+                    payload_state_key = state_key
             until_ms = max(
                 self._symbol_admission_blocked_until_ms.get(key, 0),
                 state_until_ms,
@@ -445,12 +448,18 @@ class LiveRuntime:
                         payload["symbol"] = symbol
                     else:
                         payload.setdefault("symbol", symbol)
+                    payload.setdefault(
+                        "block_scope",
+                        "venue" if payload_state_key.endswith(":*") else "symbol",
+                    )
                     payload.setdefault("reason", "symbol_admission_blocked")
                     payload["blocked_until_ms"] = until_ms
                     payload.setdefault("ttl_ms", self._SYMBOL_ADMISSION_BLOCK_TTL_MS)
                     payload.setdefault("raw_error", "")
                     payload.setdefault("official_doc_url", "")
                     payload.setdefault("evidence_gap", True)
+                    payload.setdefault("candidate_pair_id", candidate_pair_id)
+                    payload.setdefault("pair_id", candidate_pair_id)
                     return payload
                 return {
                     "venue": venue.value,
@@ -461,6 +470,8 @@ class LiveRuntime:
                     "raw_error": "",
                     "official_doc_url": "",
                     "evidence_gap": True,
+                    "candidate_pair_id": candidate_pair_id,
+                    "pair_id": candidate_pair_id,
                 }
         return None
 
@@ -473,6 +484,8 @@ class LiveRuntime:
         raw_error: str,
         now_ms: int,
         evidence: dict | None = None,
+        source: str = "initial_entry",
+        candidate_pair_id: str = "",
     ) -> None:
         until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         key = (venue.value, symbol)
@@ -487,11 +500,16 @@ class LiveRuntime:
             "raw_error": raw_error[:500],
             "official_doc_url": evidence["official_doc_url"],
             "evidence_gap": evidence["evidence_gap"],
+            "source": source,
         }
+        if candidate_pair_id:
+            base_payload["candidate_pair_id"] = candidate_pair_id
+            base_payload["pair_id"] = candidate_pair_id
         for state_key in self._entry_admission_block_state_keys(venue, symbol, reason):
             payload = dict(base_payload)
             if state_key.endswith(":*"):
                 payload["symbol"] = "*"
+                payload["blocked_symbol"] = symbol
                 payload["block_scope"] = "venue"
             else:
                 payload["block_scope"] = "symbol"
@@ -513,12 +531,20 @@ class LiveRuntime:
                 "runtime.venue_cooldown_started",
                 {
                     "venue": venue.value,
-                    "reason": "aster_max_notional_limit",
+                    "reason": (
+                        "aster_max_notional_limit"
+                        if venue == Venue.ASTER and reason == "max_notional_admission_blocked"
+                        else reason
+                    ),
                     "blocked_until_ms": until_ms,
                     "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
                     "raw_error": raw_error[:500],
                     "official_doc_url": evidence["official_doc_url"],
                     "evidence_gap": evidence["evidence_gap"],
+                    "source": source,
+                    "symbol": symbol,
+                    "candidate_pair_id": candidate_pair_id,
+                    "pair_id": candidate_pair_id,
                     "ts_ms": now_ms,
                 },
             )
@@ -540,6 +566,17 @@ class LiveRuntime:
             return False
 
         reason = str(metadata["reason"])
+        candidate_pair_id = self._pending_entry_pair_id(pending)
+        block_scope = (
+            "venue"
+            if f"{hedge_venue.value}:*" in self._entry_admission_block_state_keys(
+                hedge_venue,
+                pending.symbol,
+                reason,
+            )
+            else "symbol"
+        )
+        blocked_until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         self._record_symbol_admission_block(
             venue=hedge_venue,
             symbol=pending.symbol,
@@ -547,6 +584,8 @@ class LiveRuntime:
             raw_error=error_text,
             now_ms=now_ms,
             evidence=metadata,
+            source="pending_hedge",
+            candidate_pair_id=candidate_pair_id,
         )
         pending.hedge_inflight = None
         pending.repair_state = f"hedge_admission_blocked:{reason}"
@@ -560,6 +599,12 @@ class LiveRuntime:
                 "hedge_client_order_id": hedge_client_order_id,
                 "hedge_attempt": hedge_attempt,
                 "reason": reason,
+                "source": "pending_hedge",
+                "block_scope": block_scope,
+                "blocked_until_ms": blocked_until_ms,
+                "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
                 "raw_error": error_text[:500],
                 "official_doc_url": metadata["official_doc_url"],
                 "evidence_gap": metadata["evidence_gap"],
@@ -575,6 +620,7 @@ class LiveRuntime:
 
     def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
         symbol = str(getattr(candidate, "symbol", "") or "")
+        candidate_pair_id = self._candidate_pair_id(candidate)
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),
@@ -593,6 +639,8 @@ class LiveRuntime:
                     raw_error=reject_reason,
                     now_ms=now_ms,
                     evidence=metadata,
+                    source="initial_entry",
+                    candidate_pair_id=candidate_pair_id,
                 )
 
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
@@ -633,6 +681,22 @@ class LiveRuntime:
             if parsed > 0:
                 budgets.append(parsed)
         return min(budgets) if budgets else 0
+
+    @staticmethod
+    def _quote_lease_blocker_family(reason: str) -> str:
+        if reason in {"missing_quote_lease_provider", "missing_quote_lease"}:
+            return "waiting_for_subscription"
+        if reason in {"expired_quote_lease", "stale_quote_lease"}:
+            return "stale_quote"
+        if reason in {
+            "quote_lease_provider_mismatch",
+            "quote_lease_symbol_mismatch",
+            "quote_lease_long_venue_mismatch",
+            "quote_lease_short_venue_mismatch",
+            "invalid_quote_lease",
+        }:
+            return "invalid_quote"
+        return "unknown"
 
     def _entry_ws_bbo_subscription_blocker(
         self,
@@ -709,6 +773,11 @@ class LiveRuntime:
         return reason, {
             "provider": "ws_bbo_quote_lease",
             "source": "ws_bbo_subscription",
+            "blocker_family": (
+                "budget_exhausted"
+                if budget_exhausted
+                else "waiting_for_subscription"
+            ),
             "coverage_reason": coverage_reason,
             "symbol": symbol,
             "missing_long_subscription": missing_long_subscription,
@@ -2358,13 +2427,20 @@ class LiveRuntime:
             max_static = self._MAX_STATIC_RECOVERY_PROBE_SYMBOLS
             if len(static_symbols) > max_static:
                 if getattr(self.journal, "_file", None) is not None:
+                    sample_symbols = static_symbols[:10]
                     self.journal.append(
                         "recovery.live_position_static_config_probe_skipped",
                         {
+                            "event_scope": "bounded_summary",
                             "venue": venue.value,
                             "static_symbol_count": len(static_symbols),
                             "max_static_symbol_count": max_static,
                             "requested_symbol_count": len(requested_symbols),
+                            "sample_symbols": sample_symbols,
+                            "omitted_symbol_count": max(
+                                len(static_symbols) - len(sample_symbols),
+                                0,
+                            ),
                             "reason": "static_universe_too_large",
                             "decision": "skip_per_symbol_fallback",
                         },
@@ -4076,6 +4152,10 @@ class LiveRuntime:
                 "runtime.live_scan_revalidate_required",
                 {
                     "reason": "live_scan_revalidate_required:last_good_sidecar",
+                    "fallback_source": "last_good_sidecar",
+                    "targeted_revalidate_required": True,
+                    "targeted_revalidate_outcome": "required_before_entry",
+                    "targeted_revalidate_scope": "entry_candidate",
                     "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
                     "edge_buffer_bps": self.config.runtime.live_scan_revalidate_edge_buffer_bps,
                     "blocking": False,
@@ -14455,6 +14535,13 @@ class LiveRuntime:
             return "tradeable_candidates_waiting_for_entry_local_l2_prewarm_window"
         if blockers == {"entry_local_l2_waiting_for_dual_ready"}:
             return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
+        admission_blockers = {
+            key for key in blockers
+            if key.endswith("_admission_blocked")
+            or key in {"bybit_trading_terms_required"}
+        }
+        if admission_blockers and blockers <= admission_blockers:
+            return "tradeable_candidates_blocked_by_entry_admission"
         lifecycle_blockers = LiveRuntime._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
         if "entry_blocked_recovery_ledger" in blockers:
             return "tradeable_candidates_blocked_by_recovery_ledger"
@@ -14734,6 +14821,23 @@ class LiveRuntime:
             str(getattr(candidate, "short_venue", "")),
         )
 
+    def _pending_entry_pair_id(self, pending) -> str:
+        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+        pair_id = getattr(pending, "pair_id", "")
+        if pair_id:
+            return str(pair_id)
+
+        def venue_value(value) -> str:
+            raw = getattr(value, "value", value)
+            return str(raw or "")
+
+        return make_candidate_pair_id(
+            str(getattr(pending, "symbol", "")),
+            venue_value(getattr(pending, "long_venue", "")),
+            venue_value(getattr(pending, "short_venue", "")),
+        )
+
     def _candidate_is_tradeable_for_selection(self, candidate) -> bool:
         if bool(getattr(candidate, "blocked", False)):
             return False
@@ -14993,7 +15097,14 @@ class LiveRuntime:
         if target <= 0:
             return []
 
-        admission_reasons = {"entry_local_l2_waiting_for_primary_tracking"}
+        admission_reasons = {
+            "entry_local_l2_waiting_for_primary_tracking",
+            "bybit_trading_terms_required",
+            "insufficient_balance_admission_blocked",
+            "insufficient_margin_admission_blocked",
+            "leverage_admission_blocked",
+            "max_notional_admission_blocked",
+        }
 
         active_symbols = {
             str(getattr(position, "symbol", ""))
@@ -15014,15 +15125,35 @@ class LiveRuntime:
             pair_id = self._candidate_pair_id(candidate)
             readiness_evidence: dict = {}
             lifecycle_evidence: dict = {}
-            decision = V1TradingLifecycle.entry_admissibility(
-                candidate,
-                now_ms=now_ms,
-                strategy=self.config.strategy,
-                recovery_ledger=getattr(self, "recovery_ledger", None),
-                source="selection",
-            )
             blocker = None
-            if not decision.allowed:
+            admission_block = self._candidate_admission_block(candidate, now_ms)
+            if admission_block:
+                blocker = str(admission_block.get("reason") or "symbol_admission_blocked")
+                readiness_evidence = dict(admission_block)
+                if readiness_evidence.get("source"):
+                    readiness_evidence["cooldown_source"] = readiness_evidence["source"]
+                readiness_evidence["source"] = "initial_entry"
+                readiness_evidence["candidate_pair_id"] = pair_id
+                readiness_evidence["pair_id"] = pair_id
+                self.journal.append(
+                    "runtime.entry_admission_blocked",
+                    {
+                        **readiness_evidence,
+                        "long_venue": getattr(candidate, "long_venue", ""),
+                        "short_venue": getattr(candidate, "short_venue", ""),
+                        "ts_ms": now_ms,
+                    },
+                )
+            decision = None
+            if not blocker:
+                decision = V1TradingLifecycle.entry_admissibility(
+                    candidate,
+                    now_ms=now_ms,
+                    strategy=self.config.strategy,
+                    recovery_ledger=getattr(self, "recovery_ledger", None),
+                    source="selection",
+                )
+            if decision is not None and not decision.allowed:
                 lifecycle_evidence = dict(getattr(decision, "evidence", {}) or {})
                 blocker = decision.reason
             first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
@@ -15298,6 +15429,10 @@ class LiveRuntime:
             "short_venue": str(getattr(candidate, "short_venue", "")),
             "max_age_ms": self._entry_quote_lease_max_age_ms(),
         }
+        def blocked(reason: str, lease: object | None):
+            evidence["blocker_family"] = self._quote_lease_blocker_family(reason)
+            return reason, lease, evidence
+
         if (
             self.config.runtime.mode != "live"
             or not self._entry_readiness_provider_uses_quote_lease()
@@ -15306,10 +15441,10 @@ class LiveRuntime:
 
         get_lease = getattr(self.entry_readiness_provider, "get_lease", None)
         if not callable(get_lease):
-            return "missing_quote_lease_provider", None, evidence
+            return blocked("missing_quote_lease_provider", None)
         lease = get_lease(evidence["pair_id"])
         if lease is None:
-            return "missing_quote_lease", None, evidence
+            return blocked("missing_quote_lease", None)
 
         evidence.update(
             {
@@ -15329,30 +15464,34 @@ class LiveRuntime:
             }
         )
         if evidence["lease_provider"] != provider_name:
-            return "quote_lease_provider_mismatch", lease, evidence
+            return blocked("quote_lease_provider_mismatch", lease)
         if str(getattr(lease, "symbol", "")) != evidence["symbol"]:
-            return "quote_lease_symbol_mismatch", lease, evidence
+            return blocked("quote_lease_symbol_mismatch", lease)
         if str(getattr(lease, "long_venue", "")) != evidence["long_venue"]:
-            return "quote_lease_long_venue_mismatch", lease, evidence
+            return blocked("quote_lease_long_venue_mismatch", lease)
         if str(getattr(lease, "short_venue", "")) != evidence["short_venue"]:
-            return "quote_lease_short_venue_mismatch", lease, evidence
+            return blocked("quote_lease_short_venue_mismatch", lease)
 
         expires_at_ms = evidence["expires_at_ms"]
         if expires_at_ms <= 0 or now_ms >= expires_at_ms:
-            return "expired_quote_lease", lease, evidence
+            return blocked("expired_quote_lease", lease)
 
         max_age_ms = int(evidence["max_age_ms"] or 0)
+        quote_age_ms: dict[str, int | None] = {}
         for leg in ("long", "short"):
             observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
             age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
             evidence[f"{leg}_age_ms"] = age_ms
+            quote_age_ms[leg] = age_ms
             if (
                 observed_at_ms <= 0
                 or max_age_ms <= 0
                 or age_ms is None
                 or age_ms > max_age_ms
             ):
-                return "stale_quote_lease", lease, evidence
+                evidence["quote_age_ms"] = quote_age_ms
+                return blocked("stale_quote_lease", lease)
+        evidence["quote_age_ms"] = quote_age_ms
 
         if (
             evidence["long_bid"] <= 0.0
@@ -15360,7 +15499,7 @@ class LiveRuntime:
             or evidence["short_bid"] <= 0.0
             or evidence["short_ask"] <= evidence["short_bid"]
         ):
-            return "invalid_quote_lease", lease, evidence
+            return blocked("invalid_quote_lease", lease)
         return "", lease, evidence
 
     def _refresh_entry_quote_lease_for_execution(
@@ -15478,12 +15617,18 @@ class LiveRuntime:
 
         admission_block = self._candidate_admission_block(candidate, now_ms)
         if admission_block:
+            pair_id = self._candidate_pair_id(candidate)
             payload = {
                 **admission_block,
                 "long_venue": getattr(candidate, "long_venue", ""),
                 "short_venue": getattr(candidate, "short_venue", ""),
+                "candidate_pair_id": pair_id,
+                "pair_id": pair_id,
                 "ts_ms": now_ms,
             }
+            if payload.get("source"):
+                payload["cooldown_source"] = payload["source"]
+            payload["source"] = "initial_entry"
             self.journal.append(
                 "runtime.entry_admission_blocked",
                 payload,

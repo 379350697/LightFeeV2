@@ -762,6 +762,66 @@ def test_run_diagnose_gate_fails_when_exchange_truth_unavailable(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_loads_exchange_truth_credentials_from_systemd_env_file(tmp_path, monkeypatch):
+    from scripts import diagnose_live as dl
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    env_file = tmp_path / "lightfee.env"
+    env_file.write_text(
+        "LIGHTFEE_BYBIT_API_KEY=key-from-systemd\n"
+        "LIGHTFEE_BYBIT_API_SECRET=secret-from-systemd\n"
+    )
+    (unit_dir / "lightfee-live.service").write_text(
+        "[Service]\n"
+        f"EnvironmentFile={env_file}\n"
+    )
+    (unit_dir / "lightfee-sidecar.service").write_text("[Service]\n")
+    _write_json(runtime_dir / "state-current.json", {
+        "schema": "lightfee.current_state.v1",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "open_positions": [],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "last_tick_ms": 1779816050000,
+    })
+    _write_jsonl(runtime_dir / "events.jsonl", [])
+    seen: dict[str, object] = {}
+
+    def fake_exchange_truth(runtime_dir_arg, symbols, venues=None):
+        seen["api_key"] = os.environ.get("LIGHTFEE_BYBIT_API_KEY")
+        seen["api_secret"] = os.environ.get("LIGHTFEE_BYBIT_API_SECRET")
+        return {
+            "available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        }
+
+    monkeypatch.delenv("LIGHTFEE_BYBIT_API_KEY", raising=False)
+    monkeypatch.delenv("LIGHTFEE_BYBIT_API_SECRET", raising=False)
+    monkeypatch.setattr(dl, "_build_exchange_truth", fake_exchange_truth)
+
+    result = dl.run_diagnose(
+        runtime_dir=str(runtime_dir),
+        unit_dir=str(unit_dir),
+        symbol="RIVERUSDT",
+        venues=["bybit"],
+        now_ms=1779816055000,
+    )
+
+    assert seen["api_key"] == "key-from-systemd"
+    assert seen["api_secret"] == "secret-from-systemd"
+    assert result["exchange_truth_env_files_loaded"] == [str(env_file)]
+    assert result["exchange_truth"]["available"] is True
+
+
 def test_diagnose_recovery_decision_treats_count_only_pending_as_required_work():
     from scripts.diagnose_live import _recovery_decision_payload
 

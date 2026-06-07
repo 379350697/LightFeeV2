@@ -436,6 +436,9 @@ async def test_runtime_last_good_fallback_emits_non_blocking_revalidate_diagnost
         if record["kind"] == "runtime.live_scan_revalidate_required"
     )
     assert revalidate["blocking"] is False
+    assert revalidate["fallback_source"] == "last_good_sidecar"
+    assert revalidate["targeted_revalidate_required"] is True
+    assert revalidate["targeted_revalidate_outcome"] == "required_before_entry"
     assert runtime.state.last_scan["no_entry_reason"] is None
 
 

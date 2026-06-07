@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -190,6 +191,66 @@ def _try_read_unit(unit_dir: str, name: str) -> str:
         return p.read_text()
     except (OSError, PermissionError):
         return ""
+
+
+def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
+    paths: list[Path] = []
+    for text in unit_texts.values():
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line.startswith("EnvironmentFile="):
+                continue
+            value = line.split("=", 1)[1].strip()
+            try:
+                items = shlex.split(value)
+            except ValueError:
+                items = value.split()
+            for item in items:
+                path = item[1:] if item.startswith("-") else item
+                if path:
+                    paths.append(Path(path))
+    return paths
+
+
+def _load_environment_files(paths: list[Path]) -> list[str]:
+    loaded: list[str] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        loaded.append(str(path))
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, PermissionError):
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or not key.replace("_", "").isalnum():
+                continue
+            value = value.strip()
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    return loaded
+
+
+def _load_systemd_environment_files(unit_dir: str) -> list[str]:
+    unit_texts = {
+        name: _try_read_unit(unit_dir, name)
+        for name in SERVICE_NAMES
+    }
+    return _load_environment_files(_environment_file_paths(unit_texts))
 
 
 def _git_head(project_dir: str = "/opt/lightfee-v2") -> str:
@@ -2290,6 +2351,7 @@ def run_diagnose(
 
     deploy_status = _build_deploy_status(runtime_dir)
     service_status = _build_service_status(unit_dir)
+    exchange_truth_env_files_loaded = _load_systemd_environment_files(unit_dir)
 
     if event_paths:
         event_files = [Path(p) for p in event_paths]
@@ -2378,6 +2440,7 @@ def run_diagnose(
         "risk_mode": str(state.get("risk_mode", "unknown")),
         "local_state": local_state,
         "exchange_truth": exchange_truth,
+        "exchange_truth_env_files_loaded": exchange_truth_env_files_loaded,
         "state_consistency": state_consistency,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,

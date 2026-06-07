@@ -107,6 +107,33 @@ async def test_unsupported_symbols_are_aggregate_evidence_not_probe_errors():
 
 
 @pytest.mark.asyncio
+async def test_static_config_probe_skip_is_bounded_summary_evidence():
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td)
+        config.symbols = [f"SYM{i}USDT" for i in range(100)]
+        adapter = _CatalogAdapter()
+        runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: adapter})
+        runtime.journal.open()
+        try:
+            await runtime._fetch_startup_live_position_snapshots([])
+        finally:
+            runtime.journal.close()
+
+        payload = next(
+            record["payload"]
+            for record in _records(config)
+            if record["kind"] == "recovery.live_position_static_config_probe_skipped"
+        )
+
+    assert payload["event_scope"] == "bounded_summary"
+    assert payload["static_symbol_count"] == 100
+    assert payload["max_static_symbol_count"] == runtime._MAX_STATIC_RECOVERY_PROBE_SYMBOLS
+    assert payload["sample_symbols"] == [f"SYM{i}USDT" for i in range(10)]
+    assert payload["omitted_symbol_count"] == 90
+    assert payload["decision"] == "skip_per_symbol_fallback"
+
+
+@pytest.mark.asyncio
 async def test_timeout_probe_error_is_structured_and_non_empty():
     class TimeoutAdapter(_CatalogAdapter):
         async def fetch_position(self, symbol: str) -> PositionSnapshot:

@@ -209,20 +209,29 @@ class RestTopBookEntryReadinessProvider:
         bid = float(getattr(quote, "bid", 0.0) or 0.0)
         ask = float(getattr(quote, "ask", 0.0) or 0.0)
         if bid <= 0.0 or ask <= 0.0:
-            return self._reason("invalid_quote"), self._quote_base_evidence(quote, now_ms)
+            evidence = self._quote_base_evidence(quote, now_ms)
+            evidence["blocker_family"] = "invalid_quote"
+            return self._reason("invalid_quote"), evidence
         if bid >= ask:
-            return self._reason("crossed_quote"), self._quote_base_evidence(quote, now_ms)
+            evidence = self._quote_base_evidence(quote, now_ms)
+            evidence["blocker_family"] = "invalid_quote"
+            return self._reason("crossed_quote"), evidence
         price = ask if executable_side == "ask" else bid
         if price <= 0.0:
-            return self._reason("invalid_quote"), self._quote_base_evidence(quote, now_ms)
+            evidence = self._quote_base_evidence(quote, now_ms)
+            evidence["blocker_family"] = "invalid_quote"
+            return self._reason("invalid_quote"), evidence
         observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
         max_age_ms = int(getattr(self._runtime.config.runtime, "max_market_age_ms", 0) or 0)
         if observed_at_ms <= 0 or max_age_ms <= 0:
-            return self._reason("stale_quote"), self._quote_base_evidence(quote, now_ms)
+            evidence = self._quote_base_evidence(quote, now_ms)
+            evidence["blocker_family"] = "stale_quote"
+            return self._reason("stale_quote"), evidence
         age_ms = max(now_ms - observed_at_ms, 0)
         if age_ms > max_age_ms:
             evidence = self._quote_base_evidence(quote, now_ms)
             evidence["max_age_ms"] = max_age_ms
+            evidence["blocker_family"] = "stale_quote"
             return self._reason("stale_quote"), evidence
         return None
 
@@ -500,6 +509,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         if long_quote is None or short_quote is None:
             evidence = {
                 "provider": self.provider_name,
+                "blocker_family": "waiting_for_subscription",
                 "missing_long_quote": long_quote is None,
                 "missing_short_quote": short_quote is None,
                 "source": "ws_bbo_cache",
@@ -521,6 +531,13 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         if quote_error:
             reason, evidence = quote_error
             evidence.update({"provider": self.provider_name, "source": "ws_bbo_cache"})
+            evidence.setdefault(
+                "quote_age_ms",
+                {
+                    "long": self._quote_base_evidence(long_quote, now_ms)["age_ms"],
+                    "short": self._quote_base_evidence(short_quote, now_ms)["age_ms"],
+                },
+            )
             if rest_refresh_evidence:
                 evidence["rest_refresh"] = rest_refresh_evidence
             return EntryReadinessDecision.block(
@@ -553,6 +570,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             evidence = self._quote_base_evidence(quote, now_ms)
             evidence["max_age_ms"] = max_age_ms
             evidence["age_budget_source"] = "entry_quote_lease_ttl_ms"
+            evidence["blocker_family"] = "stale_quote"
             return self._reason("stale_quote"), evidence
         return None
 

@@ -370,22 +370,51 @@ async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_witho
             "hedge_admission_blocked:insufficient_margin_admission_blocked"
         )
         cooldown = runtime.state.venue_entry_cooldowns["hyperliquid:SEIUSDT"]
+        expected_pair_id = "seiusdt:bybit->hyperliquid"
         assert cooldown["reason"] == "insufficient_margin_admission_blocked"
+        assert cooldown["source"] == "pending_hedge"
+        assert cooldown["block_scope"] == "symbol"
+        expected_blocked_until_ms = 1778787001000 + runtime._SYMBOL_ADMISSION_BLOCK_TTL_MS
+        assert cooldown["blocked_until_ms"] == expected_blocked_until_ms
+        assert cooldown["candidate_pair_id"] == expected_pair_id
         assert cooldown["official_doc_url"] == (
             "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
         )
+        assert cooldown["evidence_gap"] is False
         venue_cooldown = runtime.state.venue_entry_cooldowns["hyperliquid:*"]
         assert venue_cooldown["reason"] == "insufficient_margin_admission_blocked"
         assert venue_cooldown["block_scope"] == "venue"
+        assert venue_cooldown["source"] == "pending_hedge"
+        assert venue_cooldown["blocked_symbol"] == "SEIUSDT"
+        assert venue_cooldown["candidate_pair_id"] == expected_pair_id
         assert runtime._candidate_admission_block(
             _candidate("WLDUSDT", "bybit", "hyperliquid"),
             1778787002000,
         )["reason"] == "insufficient_margin_admission_blocked"
         records = runtime.journal.read_all()
-        assert [
+        pending_payload = [
             record for record in records
             if record["kind"] == "pending_entry.hedge_admission_blocked"
-        ][-1]["payload"]["reason"] == "insufficient_margin_admission_blocked"
+        ][-1]["payload"]
+        assert pending_payload["reason"] == "insufficient_margin_admission_blocked"
+        assert pending_payload["source"] == "pending_hedge"
+        assert pending_payload["block_scope"] == "venue"
+        assert pending_payload["blocked_until_ms"] == expected_blocked_until_ms
+        assert pending_payload["candidate_pair_id"] == expected_pair_id
+        assert pending_payload["official_doc_url"] == (
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+        )
+        assert pending_payload["evidence_gap"] is False
+        venue_cooldown_payload = [
+            record for record in records
+            if record["kind"] == "runtime.venue_cooldown_started"
+        ][-1]["payload"]
+        assert venue_cooldown_payload["reason"] == "insufficient_margin_admission_blocked"
+        assert venue_cooldown_payload["source"] == "pending_hedge"
+        assert venue_cooldown_payload["official_doc_url"] == (
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+        )
+        assert venue_cooldown_payload["evidence_gap"] is False
         assert [
             record for record in records
             if record["kind"] == "entry.aborted"
@@ -527,6 +556,9 @@ async def test_recovered_admission_block_prevents_dispatch_until_ttl_expires():
         assert payload["venue"] == "bybit"
         assert payload["symbol"] == "LITEUSDT"
         assert payload["reason"] == "bybit_trading_terms_required"
+        assert payload["source"] == "initial_entry"
+        assert payload["block_scope"] == "symbol"
+        assert payload["candidate_pair_id"] == "liteusdt:bybit->binance"
         assert payload["raw_error"] == "bybit retCode=110126 retMsg=must sign required agreement"
         assert payload["blocked_until_ms"] == 1778787600000
         assert payload["official_doc_url"] == ""

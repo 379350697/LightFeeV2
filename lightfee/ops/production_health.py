@@ -287,12 +287,24 @@ def analyze_current_state(
     open_count = int(state.get("open_position_count") or 0)
     pending_entries = int(state.get("pending_entry_count") or 0)
     pending_closes = int(state.get("pending_close_count") or 0)
-    clean = open_count == 0 and pending_entries == 0 and pending_closes == 0
+    pending_residual_repairs = int(state.get("pending_residual_repair_count") or 0)
+    clean = (
+        open_count == 0
+        and pending_entries == 0
+        and pending_closes == 0
+        and pending_residual_repairs == 0
+    )
+    last_scan = state.get("last_scan")
+    last_scan_ts_ms = 0
+    if isinstance(last_scan, dict):
+        try:
+            last_scan_ts_ms = int(last_scan.get("ts_ms", 0) or 0)
+        except (TypeError, ValueError):
+            last_scan_ts_ms = 0
+    last_scan_age_ms = now_ms - last_scan_ts_ms if last_scan_ts_ms > 0 else None
 
     if state.get("lifecycle") != "running":
         fingerprints.append("live_lifecycle_not_running")
-    if tick_age_ms is None or tick_age_ms < 0 or tick_age_ms > max_tick_age_ms:
-        fingerprints.append("live_tick_stale")
     if state.get("risk_mode") == "fail_closed" and clean and not state.get("recovery_blocked_reason"):
         fingerprints.append("stale_fail_closed_clean_state")
     if state.get("last_scan") is None:
@@ -309,6 +321,29 @@ def analyze_current_state(
         if isinstance(exchange_truth, dict)
         else ""
     )
+    exchange_truth_high_confidence_flat = (
+        exchange_truth_available
+        and exchange_truth_confidence == "high"
+        and not bool(exchange_truth.get("has_nonzero_position"))
+        and not bool(exchange_truth.get("has_open_order"))
+        if isinstance(exchange_truth, dict)
+        else False
+    )
+    progress_budget_ms = max(int(max_tick_age_ms or 0) * 4, 60_000)
+    recent_runtime_progress = (
+        last_scan_age_ms is not None
+        and last_scan_age_ms >= 0
+        and last_scan_age_ms <= progress_budget_ms
+    )
+    tick_stale = tick_age_ms is None or tick_age_ms < 0 or tick_age_ms > max_tick_age_ms
+    tick_stale_suppressed_by_runtime_progress = (
+        tick_stale
+        and clean
+        and exchange_truth_high_confidence_flat
+        and recent_runtime_progress
+    )
+    if tick_stale and not tick_stale_suppressed_by_runtime_progress:
+        fingerprints.append("live_tick_stale")
     if require_exchange_truth:
         if not isinstance(exchange_truth, dict):
             fingerprints.append("exchange_truth_missing")
@@ -372,7 +407,9 @@ def analyze_current_state(
             "open_position_count": open_count,
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
-            "pending_residual_repair_count": int(state.get("pending_residual_repair_count") or 0),
+            "pending_residual_repair_count": pending_residual_repairs,
+            "last_scan_age_ms": last_scan_age_ms,
+            "tick_stale_suppressed_by_runtime_progress": tick_stale_suppressed_by_runtime_progress,
             "exchange_truth_required": require_exchange_truth,
             "exchange_truth_available": exchange_truth_available,
             "exchange_truth_confidence": exchange_truth_confidence,
