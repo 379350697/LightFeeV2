@@ -131,6 +131,32 @@ async def test_static_config_probe_skip_is_bounded_summary_evidence():
     assert payload["sample_symbols"] == [f"SYM{i}USDT" for i in range(10)]
     assert payload["omitted_symbol_count"] == 90
     assert payload["decision"] == "skip_per_symbol_fallback"
+    assert payload["suppressed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_static_config_probe_skip_suppresses_repeated_same_venue_evidence():
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td)
+        config.symbols = [f"SYM{i}USDT" for i in range(100)]
+        adapter = _CatalogAdapter()
+        runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: adapter})
+        runtime.journal.open()
+        try:
+            await runtime._fetch_startup_live_position_snapshots([])
+            await runtime._fetch_startup_live_position_snapshots([])
+        finally:
+            runtime.journal.close()
+
+        events = [
+            record
+            for record in _records(config)
+            if record["kind"] == "recovery.live_position_static_config_probe_skipped"
+        ]
+
+    assert len(events) == 1
+    assert events[0]["payload"]["event_scope"] == "bounded_summary"
+    assert events[0]["payload"]["suppressed_count"] == 0
 
 
 @pytest.mark.asyncio

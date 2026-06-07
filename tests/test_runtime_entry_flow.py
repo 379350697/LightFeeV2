@@ -298,6 +298,70 @@ def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
     assert kind_counts["runtime.entry_blocked_local_l2_selection"] == 0
 
 
+def test_select_entry_candidates_falls_back_to_next_candidate_when_top_is_blocked(
+    config, tmp_journal
+):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class ReadinessProvider:
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            if candidate.symbol == "TOPUSDT":
+                return EntryReadinessDecision.block(
+                    "entry_quote_stale",
+                    evidence={"blocker_family": "stale_quote", "quote_age_ms": 9000},
+                )
+            return EntryReadinessDecision.allow()
+
+    config.strategy.min_scan_minutes_before_funding = 0
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.entry_readiness_provider = ReadinessProvider()
+    now_ms = 1_000_000
+    top_candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="TOPUSDT",
+        funding_diff_bps=20.0,
+        funding_edge_bps=20.0,
+        expected_edge_bps=15.0,
+        worst_case_edge_bps=10.0,
+        ranking_edge_bps=20.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+    fallback_candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="NEXTUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=10.0,
+        expected_edge_bps=8.0,
+        worst_case_edge_bps=6.0,
+        ranking_edge_bps=10.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+    blockers = {}
+    selection_counts = Counter()
+
+    selected = runtime._select_entry_candidates(
+        [top_candidate, fallback_candidate],
+        now_ms=now_ms,
+        remaining_slots=1,
+        selection_blocker_counts=selection_counts,
+        candidate_blockers=blockers,
+    )
+
+    assert selected == [fallback_candidate]
+    assert blockers["topusdt:binance->bybit"] == "entry_quote_stale"
+    assert "nextusdt:binance->bybit" not in blockers
+    assert selection_counts["entry_quote_stale"] == 1
+
+
 def test_select_entry_candidates_does_not_attach_lifecycle_evidence_to_readiness_block(
     config, tmp_journal
 ):
@@ -419,6 +483,103 @@ def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
         "primary_tracked_not_ready": 2,
         "lifecycle_selection_blocked": 2,
     }
+
+
+def test_scan_no_entry_diagnostics_includes_entry_admission_prefilter_stage(
+    config, tmp_journal
+):
+    from lightfee.engine.runtime import LiveRuntime
+
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime._last_entry_admission_filter_blockers = Counter({
+        "insufficient_margin_admission_blocked": 2,
+    })
+    runtime._last_entry_admission_filter_samples = [{
+        "candidate_pair_id": "wldusdt:bybit->hyperliquid",
+        "symbol": "WLDUSDT",
+        "venue": "hyperliquid",
+        "reason": "insufficient_margin_admission_blocked",
+        "block_scope": "venue",
+    }]
+
+    runtime._emit_scan_no_entry_diagnostics(
+        reason="no_tradeable_candidates",
+        snapshot=SimpleNamespace(candidates=[]),
+        tradeable=[],
+        selected_candidate_count=0,
+        dispatched_candidate_count=0,
+        remaining_slots=1,
+        tradeable_selection_blocker_counts=Counter(),
+        candidate_blockers={},
+        now_ms=1_000_000,
+        admission_blocker_counts=Counter(),
+    )
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert payload["reason"] == "tradeable_candidates_blocked_by_entry_admission"
+    assert payload["entry_admission_venue_degraded_counts"] == {
+        "insufficient_margin_admission_blocked": 2
+    }
+    assert payload["candidate_stage_blocked_counts"]["entry_admission_venue_degraded"] == 2
+    assert payload["entry_admission_venue_degraded_samples"][0]["venue"] == "hyperliquid"
+
+
+def test_scan_no_entry_diagnostics_includes_unsupported_symbol_stage(
+    config, tmp_journal
+):
+    from lightfee.engine.runtime import LiveRuntime
+
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime._last_candidate_catalog_filter_blockers = Counter({
+        "unsupported_symbol": 2,
+    })
+    runtime._last_candidate_catalog_filter_samples = [{
+        "candidate_pair_id": "delistedusdt:bitget->bybit",
+        "pair_id": "delistedusdt:bitget->bybit",
+        "symbol": "DELISTEDUSDT",
+        "long_venue": "bitget",
+        "short_venue": "bybit",
+        "reason": "unsupported_symbol",
+    }]
+
+    runtime._emit_scan_no_entry_diagnostics(
+        reason="no_tradeable_candidates",
+        snapshot=SimpleNamespace(candidates=[]),
+        tradeable=[],
+        selected_candidate_count=0,
+        dispatched_candidate_count=0,
+        remaining_slots=1,
+        tradeable_selection_blocker_counts=Counter(),
+        candidate_blockers={},
+        now_ms=1_000_000,
+        admission_blocker_counts=Counter(),
+    )
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert payload["reason"] == "tradeable_candidates_blocked_by_unsupported_symbol"
+    assert payload["unsupported_symbol_blocked_counts"] == {"unsupported_symbol": 2}
+    assert payload["candidate_stage_blocked_counts"]["unsupported_symbol"] == 2
+    assert payload["unsupported_symbol_blocked_samples"][0]["symbol"] == "DELISTEDUSDT"
 
 
 def test_v1_tradeable_no_entry_reason_classifies_admission_blocks():

@@ -24,6 +24,9 @@ Deterministic hedge admission reject must:
 5. Abort through the existing pending-entry cleanup path so maker exposure is flattened or retained fail-closed if cleanup cannot prove flat.
 6. Prevent repeated same-pending hedge attempts for the same deterministic admission blocker.
 7. Carry the same evidence shape on initial-entry, shortlist/cooldown, and pending-hedge paths: `venue`, `symbol`, `block_scope`, `blocked_until_ms`, `source=initial_entry|pending_hedge`, `candidate_pair_id`/`pair_id`, `official_doc_url`, and `evidence_gap=false` when the reject family is exchange-documented.
+8. Venue-scope admission cooldowns must prune new-entry candidates before
+   shortlist tracking or maker submit. This is a new-entry admission downgrade
+   only; exchange truth, close, cancel, and residual repair must remain usable.
 
 ## V1 / Exchange Semantics
 
@@ -41,6 +44,7 @@ Deterministic hedge admission reject must:
 | 2026-05-30 | Binance `-2027` leverage-cap classification | fixed, deployed, probe verified | Binance USD-M official `-2027 MAX_LEVERAGE_RATIO` now blocks initial entry and pending hedge like the existing Aster family, using Binance's official error-code doc URL. Cloud `HEIUSDT` reproduced the family and aborted cleanly. |
 | 2026-06-04 | Hyperliquid insufficient-margin admission classification | deployed/cloud verified | Hyperliquid `Insufficient margin to place order.` now creates deterministic admission evidence for initial entry dispatch and pending hedge recovery, emits `pending_entry.hedge_admission_blocked`, and aborts through the existing cleanup path instead of retrying. |
 | 2026-06-07 | Post-`21e5d44` Hyperliquid evidence-shape closure | local implementation pending deploy | The existing admission classifier was present, but the whole chain lacked uniform `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false` evidence on pending hedge and entry cooldown events. RED/GREEN now pins those fields and keeps the Aster-specific venue cooldown reason from leaking into Hyperliquid. |
+| 2026-06-07 | Hyperliquid venue-scope pre-shortlist admission downgrade | local implementation pending deploy | Active `venue_entry_cooldowns["hyperliquid:*"]` now prune Hyperliquid new-entry candidates before Local-L2/quote tracking. Selection and dispatch keep their existing admission blocks as bypass safety. |
 
 ## Recurrences
 
@@ -65,5 +69,8 @@ Deterministic hedge admission reject must:
 3. Check `runtime.entry_admission_blocked` and `state.venue_entry_cooldowns`.
 4. For Aster `-5018`, check `runtime.venue_cooldown_started` reason `aster_max_notional_limit`.
 5. For Hyperliquid insufficient margin, check the symbol and venue cooldown events carry `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false`.
-6. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
-7. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+6. If `hyperliquid:*` venue cooldown is active, confirm
+   `runtime.entry_admission_venue_degraded` prunes Hyperliquid candidates before
+   shortlist/Local-L2 tracking while close/cancel/recovery truth still runs.
+7. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
+8. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.

@@ -229,6 +229,10 @@ class LiveRuntime:
         self._last_no_entry_summary_fingerprint: str = ""
         self._no_entry_suppressed_full_payload_count: int = 0
         self._last_no_entry_diagnostics: dict | None = None
+        self._last_candidate_catalog_filter_blockers: Counter[str] = Counter()
+        self._last_candidate_catalog_filter_samples: list[dict] = []
+        self._last_entry_admission_filter_blockers: Counter[str] = Counter()
+        self._last_entry_admission_filter_samples: list[dict] = []
         self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
         self._last_snapshot_freshness_filter_samples: list[dict] = []
         self._snapshot_freshness_decision_last_emit_ms: dict[tuple[str, str, str, str], int] = {}
@@ -265,6 +269,7 @@ class LiveRuntime:
     _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
     _SYMBOL_ADMISSION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000
     _SNAPSHOT_FRESHNESS_DECISION_LOG_INTERVAL_MS = 60_000
+    _ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS = 60_000
     _NO_ENTRY_DIAGNOSTICS_COMPACT_INTERVAL_MS = 60_000
     _NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS = 5 * 60_000
     _ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS = 60_000
@@ -444,7 +449,11 @@ class LiveRuntime:
                 if payload:
                     payload.setdefault("venue", venue.value)
                     if payload.get("block_scope") == "venue":
-                        payload["blocked_symbol"] = payload.get("symbol", "*")
+                        payload["blocked_symbol"] = (
+                            payload.get("blocked_symbol")
+                            or payload.get("symbol")
+                            or "*"
+                        )
                         payload["symbol"] = symbol
                     else:
                         payload.setdefault("symbol", symbol)
@@ -474,6 +483,111 @@ class LiveRuntime:
                     "pair_id": candidate_pair_id,
                 }
         return None
+
+    def _filter_candidates_by_entry_admission(
+        self,
+        candidates: list,
+        *,
+        now_ms: int,
+        stage: str,
+    ) -> list:
+        """V1-style pre-shortlist entry admission gate for venue-scope cooldowns."""
+        self._last_entry_admission_filter_blockers = Counter()
+        self._last_entry_admission_filter_samples = []
+        if not candidates:
+            return []
+
+        allowed: list = []
+        blocked_samples: list[dict] = []
+        blocked_until_ms = 0
+        blocked_venues: set[str] = set()
+        blocked_sources: set[str] = set()
+        official_doc_urls: set[str] = set()
+        evidence_gap_values: set[bool] = set()
+        for candidate in candidates:
+            block = self._candidate_admission_block(candidate, now_ms)
+            if not block or block.get("block_scope") != "venue":
+                allowed.append(candidate)
+                continue
+
+            reason = str(block.get("reason") or "venue_admission_blocked")
+            venue = str(block.get("venue") or "")
+            try:
+                candidate_blocked_until_ms = int(block.get("blocked_until_ms", 0) or 0)
+            except (TypeError, ValueError):
+                candidate_blocked_until_ms = 0
+            blocked_until_ms = max(blocked_until_ms, candidate_blocked_until_ms)
+            if venue:
+                blocked_venues.add(venue)
+            source = str(block.get("source") or "entry_admission_cooldown")
+            if source:
+                blocked_sources.add(source)
+            doc_url = str(block.get("official_doc_url") or "")
+            if doc_url:
+                official_doc_urls.add(doc_url)
+            evidence_gap_values.add(bool(block.get("evidence_gap", True)))
+            self._last_entry_admission_filter_blockers[reason] += 1
+            if len(blocked_samples) < 24:
+                blocked_samples.append({
+                    "candidate_pair_id": self._candidate_pair_id(candidate),
+                    "pair_id": self._candidate_pair_id(candidate),
+                    "symbol": str(getattr(candidate, "symbol", "") or ""),
+                    "long_venue": str(getattr(candidate, "long_venue", "") or ""),
+                    "short_venue": str(getattr(candidate, "short_venue", "") or ""),
+                    "venue": venue,
+                    "reason": reason,
+                    "block_scope": "venue",
+                    "blocked_until_ms": candidate_blocked_until_ms,
+                    "blocked_symbol": str(block.get("blocked_symbol") or ""),
+                    "source": source,
+                    "official_doc_url": doc_url,
+                    "evidence_gap": bool(block.get("evidence_gap", True)),
+                    "stage": stage,
+                })
+
+        self._last_entry_admission_filter_samples = blocked_samples
+        blocked_count = sum(self._last_entry_admission_filter_blockers.values())
+        if blocked_count <= 0:
+            return allowed
+
+        sorted_reasons = sorted(self._last_entry_admission_filter_blockers)
+        venue = next(iter(blocked_venues)) if len(blocked_venues) == 1 else "multiple"
+        reason = sorted_reasons[0] if len(sorted_reasons) == 1 else "multiple_entry_admission_blocks"
+        source = next(iter(blocked_sources)) if len(blocked_sources) == 1 else "multiple"
+        official_doc_url = (
+            next(iter(official_doc_urls)) if len(official_doc_urls) == 1 else ""
+        )
+        evidence_gap = (
+            next(iter(evidence_gap_values))
+            if len(evidence_gap_values) == 1
+            else True
+        )
+        self._append_runtime_diagnostic_event(
+            "runtime.entry_admission_venue_degraded",
+            {
+                "venue": venue,
+                "reason": reason,
+                "block_scope": "venue",
+                "blocked_until_ms": blocked_until_ms,
+                "source": source,
+                "official_doc_url": official_doc_url,
+                "evidence_gap": evidence_gap,
+                "stage": stage,
+                "candidate_count": len(candidates),
+                "blocked_count": blocked_count,
+                "allowed_count": len(allowed),
+                "blocked_reason_counts": dict(
+                    sorted(self._last_entry_admission_filter_blockers.items())
+                ),
+                "samples": blocked_samples[:10],
+                "suppressed_count": 0,
+                "ts_ms": now_ms,
+            },
+            now_ms=now_ms,
+            key_parts=(stage, venue, reason, source),
+            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+        )
+        return allowed
 
     def _record_symbol_admission_block(
         self,
@@ -2294,6 +2408,8 @@ class LiveRuntime:
         rows for symbols that are not orderable on one venue, so runtime applies
         the same catalog gate before shortlist/tracking/entry selection.
         """
+        self._last_candidate_catalog_filter_blockers = Counter()
+        self._last_candidate_catalog_filter_samples = []
         if self.config.runtime.mode == "paper":
             return list(candidates)
 
@@ -2348,26 +2464,31 @@ class LiveRuntime:
                 continue
 
             skipped += 1
+            self._last_candidate_catalog_filter_blockers["unsupported_symbol"] += 1
+            sample_payload = {
+                "symbol": symbol,
+                "candidate_pair_id": self._candidate_pair_id(candidate),
+                "pair_id": self._candidate_pair_id(candidate),
+                "long_venue": (
+                    long_venue.value
+                    if long_venue
+                    else str(getattr(candidate, "long_venue", ""))
+                ),
+                "short_venue": (
+                    short_venue.value
+                    if short_venue
+                    else str(getattr(candidate, "short_venue", ""))
+                ),
+                "long_supported": long_supported,
+                "short_supported": short_supported,
+                "reason": "unsupported_symbol",
+            }
+            if len(self._last_candidate_catalog_filter_samples) < 24:
+                self._last_candidate_catalog_filter_samples.append(sample_payload)
             if getattr(self.journal, "_file", None) is not None:
                 self._append_runtime_diagnostic_event(
                     skip_event_kind,
-                    {
-                        "symbol": symbol,
-                        "pair_id": self._candidate_pair_id(candidate),
-                        "long_venue": (
-                            long_venue.value
-                            if long_venue
-                            else str(getattr(candidate, "long_venue", ""))
-                        ),
-                        "short_venue": (
-                            short_venue.value
-                            if short_venue
-                            else str(getattr(candidate, "short_venue", ""))
-                        ),
-                        "long_supported": long_supported,
-                        "short_supported": short_supported,
-                        "reason": "unsupported_symbol",
-                    },
+                    sample_payload,
                     now_ms=wall_clock_now_ms(),
                     key_parts=(
                         symbol,
@@ -2386,6 +2507,10 @@ class LiveRuntime:
                     "input_count": len(candidates),
                     "output_count": len(filtered_candidates),
                     "skipped_count": skipped,
+                    "blocked_reason_counts": dict(
+                        sorted(self._last_candidate_catalog_filter_blockers.items())
+                    ),
+                    "samples": self._last_candidate_catalog_filter_samples[:10],
                 },
             )
         return filtered_candidates
@@ -2428,7 +2553,7 @@ class LiveRuntime:
             if len(static_symbols) > max_static:
                 if getattr(self.journal, "_file", None) is not None:
                     sample_symbols = static_symbols[:10]
-                    self.journal.append(
+                    self._append_runtime_diagnostic_event(
                         "recovery.live_position_static_config_probe_skipped",
                         {
                             "event_scope": "bounded_summary",
@@ -2443,7 +2568,12 @@ class LiveRuntime:
                             ),
                             "reason": "static_universe_too_large",
                             "decision": "skip_per_symbol_fallback",
+                            "suppressed_count": 0,
+                            "ts_ms": global_probe_started_at_ms,
                         },
+                        now_ms=global_probe_started_at_ms,
+                        key_parts=(venue.value, "static_universe_too_large"),
+                        interval_ms=self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
                     )
                 return []
             return await self._position_probe_symbols_for_venue(
@@ -4169,17 +4299,38 @@ class LiveRuntime:
         # --- Build price lookup from snapshot quotes ---
         price_hints: dict[str, float] = {}
         stale_order_quote_count = 0
-        for quote in snapshot.quotes.values():
+        stale_order_quote_samples: list[dict] = []
+        for quote_key, quote in snapshot.quotes.items():
             quote_observed_at_ms = (
                 int(getattr(quote, "observed_at_ms", 0) or 0)
                 or int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
             )
+            quote_age_ms = now_ms - quote_observed_at_ms if quote_observed_at_ms > 0 else 0
             if (
                 quote_observed_at_ms > 0
-                and now_ms - quote_observed_at_ms
-                > self.config.runtime.max_order_quote_age_ms
+                and quote_age_ms > self.config.runtime.max_order_quote_age_ms
             ):
                 stale_order_quote_count += 1
+                if len(stale_order_quote_samples) < 10:
+                    venue = str(getattr(quote, "venue", "") or "")
+                    symbol = str(getattr(quote, "symbol", "") or "")
+                    if (not venue or not symbol) and ":" in str(quote_key):
+                        key_venue, key_symbol = str(quote_key).split(":", 1)
+                        venue = venue or key_venue
+                        symbol = symbol or key_symbol
+                    stale_order_quote_samples.append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "quote_age_ms": quote_age_ms,
+                        "observed_at_ms": quote_observed_at_ms,
+                        "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                        "fallback_source": getattr(
+                            snapshot,
+                            "acquisition_mode",
+                            "sidecar_snapshot",
+                        ),
+                        "blocker_family": "stale_quote",
+                    })
                 continue
             price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0 if quote.bid > 0 and quote.ask > 0 else 0.0
         if stale_order_quote_count > 0:
@@ -4188,6 +4339,7 @@ class LiveRuntime:
                 {
                     "count": stale_order_quote_count,
                     "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                    "samples": stale_order_quote_samples,
                     "ts_ms": now_ms,
                 },
             )
@@ -4214,6 +4366,11 @@ class LiveRuntime:
             )
             tradeable = await self._filter_candidates_supported_by_venue_catalog(
                 tradeable,
+            )
+            tradeable = self._filter_candidates_by_entry_admission(
+                tradeable,
+                now_ms=now_ms,
+                stage="shortlist",
             )
             l2_tracking_tradeable = list(tradeable)
             tradeable = self._filter_candidates_by_snapshot_freshness(
@@ -14593,11 +14750,14 @@ class LiveRuntime:
             "remaining_slots",
             "blocked_reason_counts",
             "entry_candidate_blocked_counts",
+            "unsupported_symbol_blocked_counts",
+            "entry_admission_venue_degraded_counts",
             "snapshot_freshness_blocked_counts",
             "execution_liquidity_blocked_counts",
             "entry_final_gate_blocked_counts",
             "tradeable_selection_blocker_counts",
             "selection_bucket_counts",
+            "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
             "entry_local_l2_primary_not_ready_reason_counts",
             "entry_local_l2_primary_not_ready_reason_totals",
@@ -14630,14 +14790,41 @@ class LiveRuntime:
         for candidate in getattr(snapshot, "candidates", []) or []:
             for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
                 blocked_reason_counts[str(blocked_reason)] += 1
+        catalog_filter_blockers = Counter(
+            getattr(self, "_last_candidate_catalog_filter_blockers", Counter())
+        )
         snapshot_freshness_blockers = Counter(
             getattr(self, "_last_snapshot_freshness_filter_blockers", Counter())
         )
+        entry_admission_filter_blockers = Counter(
+            getattr(self, "_last_entry_admission_filter_blockers", Counter())
+        )
         if reason == "no_tradeable_candidates":
-            reason = self._no_tradeable_reason_from_candidate_blockers(
-                blocked_reason_counts,
-                snapshot_freshness_blockers,
-            )
+            if (
+                entry_admission_filter_blockers
+                and not blocked_reason_counts
+                and not catalog_filter_blockers
+                and not snapshot_freshness_blockers
+            ):
+                reason = (
+                    self._v1_tradeable_no_entry_reason(
+                        Counter(),
+                        admission_blocker_counts=entry_admission_filter_blockers,
+                    )
+                    or "tradeable_candidates_blocked_by_entry_admission"
+                )
+            elif (
+                catalog_filter_blockers
+                and not blocked_reason_counts
+                and not entry_admission_filter_blockers
+                and not snapshot_freshness_blockers
+            ):
+                reason = "tradeable_candidates_blocked_by_unsupported_symbol"
+            else:
+                reason = self._no_tradeable_reason_from_candidate_blockers(
+                    blocked_reason_counts,
+                    snapshot_freshness_blockers,
+                )
 
         readiness = self._entry_l2_readiness_diagnostics_payload()
         candidate_samples = []
@@ -14692,6 +14879,25 @@ class LiveRuntime:
                 "lifecycle_selection_blocked"
             ] = lifecycle_selection_blocked
 
+        candidate_stage_blocked_counts = {
+            "candidate_universe": sum(int(v) for v in blocked_reason_counts.values()),
+            "unsupported_symbol": sum(
+                int(v) for v in catalog_filter_blockers.values()
+            ),
+            "entry_admission_venue_degraded": sum(
+                int(v) for v in entry_admission_filter_blockers.values()
+            ),
+            "snapshot_quote_or_freshness": sum(
+                int(v) for v in snapshot_freshness_blockers.values()
+            ),
+            "execution_liquidity": sum(
+                int(v) for v in execution_liquidity_blocked_counts.values()
+            ),
+            "entry_selection": sum(
+                int(v) for v in tradeable_selection_blocker_counts.values()
+            ),
+        }
+
         payload = {
             "reason": reason,
             "generic_reason": (
@@ -14710,6 +14916,18 @@ class LiveRuntime:
             "remaining_slots": max(int(remaining_slots), 0),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
+            "unsupported_symbol_blocked_counts": dict(
+                sorted(catalog_filter_blockers.items())
+            ),
+            "unsupported_symbol_blocked_samples": list(
+                getattr(self, "_last_candidate_catalog_filter_samples", []) or []
+            )[:24],
+            "entry_admission_venue_degraded_counts": dict(
+                sorted(entry_admission_filter_blockers.items())
+            ),
+            "entry_admission_venue_degraded_samples": list(
+                getattr(self, "_last_entry_admission_filter_samples", []) or []
+            )[:24],
             "snapshot_freshness_blocked_counts": dict(
                 sorted(snapshot_freshness_blockers.items())
             ),
@@ -14726,6 +14944,11 @@ class LiveRuntime:
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
             ),
             "selection_bucket_counts": selection_bucket_counts,
+            "candidate_stage_blocked_counts": {
+                key: value
+                for key, value in candidate_stage_blocked_counts.items()
+                if value > 0
+            },
             "entry_local_l2_primary_ready_filter_active": bool(
                 self.config.strategy.local_l2_enabled and self._tracked_primary_pair_ids
             ),
@@ -14757,8 +14980,14 @@ class LiveRuntime:
             "reason": payload["reason"],
             "generic_reason": payload["generic_reason"],
             "blocked_reason_keys": sorted(payload["blocked_reason_counts"].keys()),
+            "unsupported_symbol_blocked_keys": sorted(
+                payload["unsupported_symbol_blocked_counts"].keys()
+            ),
             "snapshot_freshness_blocker_keys": sorted(
                 payload["snapshot_freshness_blocked_counts"].keys()
+            ),
+            "entry_admission_venue_degraded_keys": sorted(
+                payload["entry_admission_venue_degraded_counts"].keys()
             ),
             "tradeable_selection_blocker_keys": sorted(
                 payload["tradeable_selection_blocker_counts"].keys()

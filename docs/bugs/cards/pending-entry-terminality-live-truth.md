@@ -230,8 +230,9 @@ owner becomes blocking `unpaired_live_position`.
    residualize, or issue deterministic reduce-only cleanup instead of looping
    in local false-flat/risk-only.
 13. If Hyperliquid insufficient margin appears, confirm whether the block is
-   account/venue scoped. If yes, future candidates through Hyperliquid must be
-   blocked before maker submit.
+   account/venue scoped. If yes, future new-entry candidates through Hyperliquid
+   must be pruned before shortlist tracking and maker submit. This must not
+   disable Hyperliquid exchange truth, close, cancel, or residual repair.
 14. If a pending entry remains unresolved, block same-symbol candidates that
    share either venue until finalization, residual cleanup, or fail-closed
    evidence releases the risk.

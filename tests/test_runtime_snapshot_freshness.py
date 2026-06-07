@@ -512,6 +512,16 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
     ]
     kinds = [record["kind"] for record in records]
     assert "runtime.order_quote_stale_skipped" in kinds
+    order_quote_stale = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.order_quote_stale_skipped"
+    )
+    assert order_quote_stale["count"] == 1
+    assert order_quote_stale["samples"][0]["venue"] == "binance"
+    assert order_quote_stale["samples"][0]["symbol"] == "BTCUSDT"
+    assert order_quote_stale["samples"][0]["quote_age_ms"] == 10000
+    assert order_quote_stale["samples"][0]["blocker_family"] == "stale_quote"
     assert "runtime.snapshot_freshness_decision" in kinds
     assert "runtime.quote_stale" in kinds
     assert "runtime.entry_skipped_no_quote" not in kinds

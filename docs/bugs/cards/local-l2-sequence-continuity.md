@@ -28,6 +28,9 @@ Last-good / quote fallback rules:
 - `last_good_sidecar` can keep coarse shortlist diagnostics alive, but live entry still requires targeted revalidate or an explicit block before dispatch.
 - Quote lease and ws-bbo blockers must distinguish `budget_exhausted`, `waiting_for_subscription`, `stale_quote`, and `invalid_quote`; a blocked top candidate must not turn the whole scan into an unowned incident if another candidate satisfies admission, L2, and quote gates.
 - Diagnostic payloads must include candidate universe/counts, selected/tracked pair, blocker-family counts, quote age, fallback source, and targeted revalidate outcome. These are evidence fields only; they do not relax Local-L2 sequence continuity.
+- New-entry admission venue downgrades run before Local-L2/quote tracking, so a
+  degraded venue should not consume hot Local-L2 or ws-bbo budget for fresh
+  entry candidates during the cooldown TTL.
 
 ## V1 / Exchange Semantics
 
@@ -44,6 +47,7 @@ Last-good / quote fallback rules:
 | 2026-05-29 | OKX `seqId/prevSeqId` and checksum classification | effective for evidence classification | Cloud post-deploy Local-L2 classification had `L2_INSUFFICIENT=[]`. |
 | 2026-05-30 | Post-`bbcd7b9` high rebuild/snapshot watch | deployed/probe verified | Current evidence remains official continuity/rebuild behavior; no Local-L2 readiness relaxation is allowed without new docs or V1 proof. |
 | 2026-06-07 | Post-`21e5d44` fallback/quote evidence closure | local implementation pending deploy | Added RED/GREEN contracts that `runtime.live_scan_revalidate_required` marks `fallback_source=last_good_sidecar` and `targeted_revalidate_required=true`; quote readiness evidence carries blocker families and quote ages; static recovery-probe skip evidence is bounded summary rather than noisy per-universe spam. No sequence continuity relaxation was made. |
+| 2026-06-07 | Entry admission prefilter and no-entry stage breakdown | local implementation pending deploy | `runtime.entry_admission_venue_degraded` now summarizes venue-scope admission pruning before Local-L2/quote tracking. `scan.no_entry_diagnostics` includes stage counts for candidate universe, unsupported symbol, entry-admission venue downgrade, snapshot/quote freshness, liquidity, and entry selection. |
 
 ## Recurrences
 
@@ -70,4 +74,6 @@ Last-good / quote fallback rules:
 5. Do not change data-plane readiness until official docs or V1 behavior proves the current rule wrong.
 6. If last-good fallback appears, confirm it only feeds coarse shortlist evidence and that entry dispatch still has targeted revalidate or blocks.
 7. Split quote blockers by blocker family and quote age before treating them as incidents.
-8. Closure requires local harness plus cloud classification showing no unexplained entry-blocking Local-L2 samples.
+8. If venue-scope admission cooldown is active, confirm degraded-venue candidates
+   are pruned before Local-L2/ws-bbo budget allocation.
+9. Closure requires local harness plus cloud classification showing no unexplained entry-blocking Local-L2 samples.

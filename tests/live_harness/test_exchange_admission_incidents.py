@@ -424,6 +424,71 @@ async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_witho
         runtime.journal.close()
 
 
+def test_hyperliquid_venue_cooldown_prunes_new_entry_candidates_before_shortlist():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: FlatAdapter()},
+        )
+        runtime.journal.open()
+        now_ms = 1778787002000
+        blocked_until_ms = now_ms + runtime._SYMBOL_ADMISSION_BLOCK_TTL_MS
+        runtime.state.venue_entry_cooldowns["hyperliquid:*"] = {
+            "venue": "hyperliquid",
+            "symbol": "*",
+            "blocked_symbol": "SEIUSDT",
+            "reason": "insufficient_margin_admission_blocked",
+            "source": "pending_hedge",
+            "block_scope": "venue",
+            "blocked_until_ms": blocked_until_ms,
+            "candidate_pair_id": "seiusdt:bybit->hyperliquid",
+            "pair_id": "seiusdt:bybit->hyperliquid",
+            "official_doc_url": (
+                "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+            ),
+            "evidence_gap": False,
+        }
+
+        filtered = runtime._filter_candidates_by_entry_admission(
+            [
+                _candidate("WLDUSDT", "bybit", "hyperliquid"),
+                _candidate("BTCUSDT", "bybit", "binance"),
+            ],
+            now_ms=now_ms,
+            stage="shortlist",
+        )
+
+        assert [candidate.symbol for candidate in filtered] == ["BTCUSDT"]
+        assert runtime._last_entry_admission_filter_blockers == {
+            "insufficient_margin_admission_blocked": 1
+        }
+        sample = runtime._last_entry_admission_filter_samples[0]
+        assert sample["candidate_pair_id"] == "wldusdt:bybit->hyperliquid"
+        assert sample["venue"] == "hyperliquid"
+        assert sample["symbol"] == "WLDUSDT"
+        assert sample["blocked_symbol"] == "SEIUSDT"
+        assert sample["block_scope"] == "venue"
+        assert sample["blocked_until_ms"] == blocked_until_ms
+        assert sample["official_doc_url"] == (
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+        )
+        assert sample["evidence_gap"] is False
+        payload = [
+            record["payload"] for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_degraded"
+        ][-1]
+        assert payload["venue"] == "hyperliquid"
+        assert payload["reason"] == "insufficient_margin_admission_blocked"
+        assert payload["block_scope"] == "venue"
+        assert payload["source"] == "pending_hedge"
+        assert payload["candidate_count"] == 2
+        assert payload["blocked_count"] == 1
+        assert payload["allowed_count"] == 1
+        assert payload["suppressed_count"] == 0
+        assert payload["samples"][0]["candidate_pair_id"] == "wldusdt:bybit->hyperliquid"
+        runtime.journal.close()
+
+
 @pytest.mark.asyncio
 async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
     with tempfile.TemporaryDirectory() as td:
