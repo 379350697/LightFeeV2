@@ -1129,6 +1129,56 @@ class TestPlannerDispatchIntegration:
         assert payload["reason"] == "missing_quote_lease"
         assert payload["provider"] == "ws_bbo_quote_lease"
 
+    def test_ws_bbo_provider_stale_execution_lease_records_both_leg_ages(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                observed_at_ms=1000,
+                received_at_ms=1000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="okx_bbo_ws",
+            )
+        )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 2500)
+        assert readiness.allowed
+
+        reason, _lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            3001,
+        )
+
+        assert reason == "stale_quote_lease"
+        assert evidence["blocker_family"] == "stale_quote"
+        assert evidence["quote_age_ms"] == {"long": 2001, "short": 501}
+        assert evidence["long_age_ms"] == 2001
+        assert evidence["short_age_ms"] == 501
+
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_uses_selected_quote_lease_prices(
         self,

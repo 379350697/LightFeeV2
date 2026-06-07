@@ -15483,15 +15483,17 @@ class LiveRuntime:
             age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
             evidence[f"{leg}_age_ms"] = age_ms
             quote_age_ms[leg] = age_ms
+        evidence["quote_age_ms"] = quote_age_ms
+        for leg in ("long", "short"):
+            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
+            age_ms = evidence[f"{leg}_age_ms"]
             if (
                 observed_at_ms <= 0
                 or max_age_ms <= 0
                 or age_ms is None
                 or age_ms > max_age_ms
             ):
-                evidence["quote_age_ms"] = quote_age_ms
                 return blocked("stale_quote_lease", lease)
-        evidence["quote_age_ms"] = quote_age_ms
 
         if (
             evidence["long_bid"] <= 0.0
