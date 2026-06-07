@@ -329,6 +329,13 @@ def analyze_current_state(
         if isinstance(exchange_truth, dict)
         else False
     )
+    exchange_truth_available_flat = (
+        exchange_truth_available
+        and not bool(exchange_truth.get("has_nonzero_position"))
+        and not bool(exchange_truth.get("has_open_order"))
+        if isinstance(exchange_truth, dict)
+        else False
+    )
     progress_budget_ms = max(int(max_tick_age_ms or 0) * 4, 60_000)
     recent_runtime_progress = (
         last_scan_age_ms is not None
@@ -339,7 +346,7 @@ def analyze_current_state(
     tick_stale_suppressed_by_runtime_progress = (
         tick_stale
         and clean
-        and exchange_truth_high_confidence_flat
+        and exchange_truth_available_flat
         and recent_runtime_progress
     )
     if tick_stale and not tick_stale_suppressed_by_runtime_progress:

@@ -44,6 +44,12 @@ processing, supervisor venue coverage, and entry-conflict gating.
 - Missing close price evidence must explain whether Local-L2 was stale, WS BBO
   fallback was stale, or WS BBO fallback had no cache/quote/budget. A bare
   `price_hint=0.0` is not enough to choose a semantic fix.
+- An accepted taker hedge ACK without fill confirmation is not a terminal close
+  fill. It must carry order-truth probe paths and stay in reconcile/live-truth
+  flow before passive close can advance or clear.
+- OKX amend `50115 Invalid request type` from the amend-order endpoint is an
+  amend-path capability failure for that call. Route through cancel-replace and
+  keep the existing double-order guard.
 
 ## Attempts Ledger
 
@@ -57,6 +63,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-03 | WS BBO close fallback missing-quote evidence | local green, deploy pending | Post-`e087513` had two passive close missing-price events after current state recovered flat. Runtime now emits `runtime.close_price_evidence_missing` for active WS BBO fallback missing cache/quote/budget branches without changing fail-closed behavior. |
 | 2026-06-04 | V1 passive close hedge/fallback hard deadline | local full gate green, cloud deploy pending | Bybit abnormal close samples exposed passive close retry/fallback paths that could continue after the V1 deadline. V2 now arms overdue passive closes into DUAL_TAKER, converts hedge/fallback hard breaches into fail-closed plus compensation/live-flat probing, and avoids same-cycle maker submit after live truth has already driven one-sided flatten. |
 | 2026-06-07 | Post-`bff33ec` live-flat cleanup re-entry | local `PC-06`/`PC-07`/`PC-08` green, deploy pending | `BABYUSDT` exchange truth is flat while local open/passive state remains. The local fix restores the canonical pending-close reconciliation queue boundary, keeps cleanup success journals behind queue/state/core clear, and hardens malformed queue consumers. |
+| 2026-06-08 | ACK-only hedge evidence and OKX amend fallback | local RED/GREEN, deploy pending | Passive-close hedge errors now share pending-entry order-truth-gap evidence (`order_ack_only`, accepted ids, missing fill fields, probe paths, next action, reconciliation result). OKX amend endpoint HTTP 405 / code `50115` / `Invalid request type` now routes to existing cancel-replace without changing signing, CID, sizing, or close execution. |
 
 ## Recurrences
 

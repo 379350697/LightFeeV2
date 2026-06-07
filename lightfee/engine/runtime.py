@@ -51,6 +51,10 @@ from lightfee.engine.loop_control import (
     maybe_export_current_state_snapshot,
     maybe_export_runtime_metrics,
 )
+from lightfee.engine.order_submit_uncertainty import (
+    build_order_submit_uncertainty_payload,
+    order_truth_probe_paths,
+)
 from lightfee.engine.recovery import (
     recover_from_snapshot,
     build_recovery_dedup_index,
@@ -12012,6 +12016,17 @@ class LiveRuntime:
                     pass
                 else:
                     self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
+                    order_gap_evidence = (
+                        self._order_submit_error_runtime_evidence(
+                            e,
+                            venue=repair_venue,
+                            operation="place_order",
+                            request=req,
+                            default_client_order_id=req.client_order_id or "",
+                        )
+                        if isinstance(e, OrderSubmitError)
+                        else {}
+                    )
                     if duplicate_live_nonzero_evidence is not None:
                         task["last_duplicate_cleanup"] = dict(
                             duplicate_live_nonzero_evidence
@@ -12037,9 +12052,7 @@ class LiveRuntime:
                                 "recovery.residual_repair_duplicate_live_nonzero_blocked",
                                 blocker_payload,
                             )
-                    self.journal.append(
-                        "recovery.residual_repair_failed",
-                        {
+                    failed_payload = {
                             "position_id": position_id,
                             "pair_id": pair_id,
                             "symbol": symbol,
@@ -12052,7 +12065,11 @@ class LiveRuntime:
                             "open_order_count": open_order_count,
                             "open_order_counts_by_venue": open_order_counts_by_venue,
                             "error": str(e),
-                        },
+                    }
+                    failed_payload.update(order_gap_evidence)
+                    self.journal.append(
+                        "recovery.residual_repair_failed",
+                        failed_payload,
                     )
                     continue
 
@@ -12330,92 +12347,20 @@ class LiveRuntime:
         request: Any = None,
         default_client_order_id: str = "",
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
         try:
-            from lightfee.core.exchange_errors import (
-                RequestContext,
-                build_evidence_from_order_submit_error,
-            )
-
-            request_context = (
-                RequestContext.from_order_request(request)
-                if request is not None
-                else RequestContext(client_order_id=default_client_order_id)
-            )
-            exchange_evidence = build_evidence_from_order_submit_error(
+            return build_order_submit_uncertainty_payload(
                 error,
-                venue=venue.value if venue is not None else "",
+                venue=venue,
                 operation=operation,
-                endpoint="",
-                request_context=request_context,
+                request=request,
+                default_client_order_id=default_client_order_id,
             )
-            payload["exchange_error"] = exchange_evidence.to_dict()
-            payload["missing_evidence"] = list(exchange_evidence.missing_evidence)
-            payload["evidence_completeness"] = exchange_evidence.evidence_completeness
         except Exception:
-            pass
-        if bool(getattr(error, "order_ack_only", False)):
-            payload["order_ack_only"] = True
-            payload["accepted_order_id"] = str(
-                getattr(error, "accepted_order_id", "") or ""
-            )
-            payload["accepted_client_order_id"] = str(
-                getattr(error, "accepted_client_order_id", "")
-                or default_client_order_id
-                or ""
-            )
-            missing = getattr(error, "fill_confirmation_missing_fields", []) or []
-            payload["fill_confirmation_missing_fields"] = [
-                str(field) for field in missing
-            ]
-            raw_body = str(getattr(error, "exchange_response_body", "") or "")
-            if raw_body:
-                payload["exchange_response_body"] = raw_body[:4000]
-            if "missing_evidence" not in payload:
-                payload["missing_evidence"] = []
-            for item in (
-                "fill_confirmation",
-                "order_realtime_status",
-                "private_ws_execution",
-                "open_order_truth",
-            ):
-                if item not in payload["missing_evidence"]:
-                    payload["missing_evidence"].append(item)
-            payload["order_truth_probe_paths"] = self._order_truth_probe_paths(venue)
-            payload["next_action"] = (
-                "reconcile_accepted_order_or_probe_live_position"
-            )
-        return payload
+            return {}
 
     @staticmethod
     def _order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
-        if venue == Venue.BYBIT:
-            return {
-                "rest_order_status": "GET /v5/order/realtime",
-                "open_order_truth": "GET /v5/order/realtime",
-                "private_ws_order_topic": "order",
-                "private_ws_execution_topic": "execution",
-                "live_position_probe": "GET /v5/position/list",
-            }
-        if venue == Venue.OKX:
-            return {
-                "rest_order_status": "GET /api/v5/trade/order",
-                "open_order_truth": "GET /api/v5/trade/orders-pending",
-                "private_ws_order_topic": "orders",
-                "live_position_probe": "GET /api/v5/account/positions",
-            }
-        if venue in (Venue.BINANCE, Venue.ASTER):
-            return {
-                "rest_order_status": "GET /fapi/v1/order",
-                "open_order_truth": "GET /fapi/v1/openOrders",
-                "private_ws_order_topic": "ORDER_TRADE_UPDATE",
-                "live_position_probe": "GET /fapi/v2/positionRisk",
-            }
-        return {
-            "rest_order_status": "adapter.fetch_order_fill_reconciliation",
-            "open_order_truth": "adapter.fetch_open_orders",
-            "live_position_probe": "adapter.fetch_position",
-        }
+        return order_truth_probe_paths(venue)
 
     async def _fetch_residual_repair_open_orders(
         self, adapter: VenueAdapter, venue: Venue, symbol: str,

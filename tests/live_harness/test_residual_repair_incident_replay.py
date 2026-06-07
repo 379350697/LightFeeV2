@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.recovery_decision_core import (
     RecoveryDecision,
     RecoveryDecisionKind,
@@ -182,6 +183,63 @@ async def test_residual_repair_completed_records_live_truth_evidence(tmp_path):
     assert completed["live_positions"]["binance"]["quantity"] == pytest.approx(0.0)
     assert completed["baseline_quantity"] == pytest.approx(0.0)
     assert completed["live_excess_quantity"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_ack_only_submit_preserves_order_truth_gap_evidence(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-ack-only",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 30_000,
+        "retry_count": 0,
+        "last_attempt_at_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        entry_price=1.0,
+        observed_at_ms=now_ms,
+    )
+    ack_error = OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN,
+        "order accepted (id=repair-ack-oid) but fill not confirmed",
+    )
+    ack_error.order_ack_only = True
+    ack_error.accepted_order_id = "repair-ack-oid"
+    ack_error.accepted_client_order_id = "repair-ack-cid"
+    ack_error.fill_confirmation_missing_fields = ["executedQty", "cumQty"]
+    ack_error.exchange_response_body = (
+        '{"retCode":0,"result":{"orderId":"repair-ack-oid","orderLinkId":"repair-ack-cid"}}'
+    )
+    bybit.place_order_raises = ack_error
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs
+    failed = [
+        event["payload"] for event in runtime.journal.read_all()
+        if event["kind"] == "recovery.residual_repair_failed"
+    ][-1]
+    assert failed["order_ack_only"] is True
+    assert failed["accepted_order_id"] == "repair-ack-oid"
+    assert failed["accepted_client_order_id"] == "repair-ack-cid"
+    assert failed["fill_confirmation_missing_fields"] == ["executedQty", "cumQty"]
+    assert "fill_confirmation" in failed["missing_evidence"]
+    assert failed["order_truth_probe_paths"]["rest_order_status"] == "GET /v5/order/realtime"
+    assert failed["next_action"] == "reconcile_accepted_order_or_probe_live_position"
 
 
 @pytest.mark.asyncio

@@ -811,6 +811,46 @@ def test_current_state_tick_stale_is_not_critical_when_flat_with_recent_scan_pro
     assert report.details["tick_stale_suppressed_by_runtime_progress"] is True
 
 
+def test_current_state_tick_stale_is_not_critical_when_flat_with_recent_progress_and_medium_truth():
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786960000,
+        "last_scan": {
+            "ts_ms": 1778786995000,
+            "candidate_count": 12,
+            "selected_candidate_count": 0,
+            "dispatched_candidate_count": 0,
+        },
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "medium",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=15_000,
+        require_exchange_truth=True,
+    )
+
+    assert "live_tick_stale" not in report.fingerprints
+    assert "exchange_truth_confidence_not_high" in report.fingerprints
+    assert report.severity == "critical"
+    assert report.details["tick_stale_suppressed_by_runtime_progress"] is True
+
+
 def test_current_state_tick_stale_remains_critical_without_runtime_progress():
     state = {
         "schema": "lightfee.current_state.v1",

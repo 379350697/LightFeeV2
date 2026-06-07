@@ -50,6 +50,10 @@ from lightfee.engine.close_executor import (
     compute_close_chunks,
 )
 from lightfee.engine.lifecycle import enter_fail_closed
+from lightfee.engine.order_submit_uncertainty import (
+    build_order_submit_uncertainty_payload,
+    is_order_truth_gap,
+)
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
@@ -94,6 +98,27 @@ PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES = 3
 PASSIVE_CLOSE_MANAGER_COOLDOWN_MS = 30_000
 PASSIVE_CLOSE_DEFAULT_AMEND_THRESHOLD_BPS = 5.0
 PASSIVE_CLOSE_DEFAULT_CANCEL_REPLACE_THRESHOLD_BPS = 20.0
+
+
+def _is_okx_amend_invalid_request_type_error(error: Exception) -> bool:
+    text = str(error).lower()
+    endpoint = str(getattr(error, "endpoint", "") or "").lower()
+    exchange_code = str(getattr(error, "exchange_code", "") or "")
+    exchange_msg = str(getattr(error, "exchange_msg", "") or "").lower()
+    try:
+        http_status = int(getattr(error, "http_status", 0) or 0)
+    except (TypeError, ValueError):
+        http_status = 0
+    is_amend_endpoint = "amend" in endpoint or "amend-order" in text
+    has_invalid_request_code = exchange_code == "50115" or "50115" in text
+    has_invalid_request_msg = (
+        "invalid request type" in text or "invalid request type" in exchange_msg
+    )
+    return (
+        is_amend_endpoint
+        and has_invalid_request_code
+        and (has_invalid_request_msg or http_status == 405)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1835,11 +1860,25 @@ class PassiveCloseExecutor:
             fill = await adapter.place_order(request)
         except Exception as e:
             req_ctx = RequestContext.from_order_request(request)
-            evidence = (
-                build_evidence_from_order_submit_error(e, venue=hedge_venue.value, operation="place_order", endpoint="", request_context=req_ctx)
-                if isinstance(e, OrderSubmitError)
-                else build_fallback_evidence(e, venue=hedge_venue.value, operation="place_order", request_context=req_ctx)
-            )
+            uncertainty_payload: dict[str, Any] = {}
+            if isinstance(e, OrderSubmitError):
+                uncertainty_payload = build_order_submit_uncertainty_payload(
+                    e,
+                    venue=hedge_venue,
+                    operation="place_order",
+                    request=request,
+                    default_client_order_id=hedge_cid,
+                )
+                evidence = ExchangeErrorEvidence.from_dict(
+                    uncertainty_payload.get("exchange_error", {})
+                )
+            else:
+                evidence = build_fallback_evidence(
+                    e,
+                    venue=hedge_venue.value,
+                    operation="place_order",
+                    request_context=req_ctx,
+                )
             is_bybit_duplicate = (
                 hedge_venue == Venue.BYBIT
                 and _is_bybit_duplicate_order_link_id(str(e))
@@ -2020,13 +2059,17 @@ class PassiveCloseExecutor:
                 )
 
             should_reconcile = isinstance(e, OrderSubmitError) or is_bybit_duplicate
+            fill_reconciliation_attempted = False
+            fill_reconciliation_result = ""
             if should_reconcile:
                 reconciliation = None
+                fill_reconciliation_attempted = True
                 try:
                     reconciliation = await adapter.fetch_order_fill_reconciliation(
                         position.symbol, "", hedge_cid,
                     )
                 except Exception as reconcile_error:
+                    fill_reconciliation_result = "error"
                     self._journal.append(
                         "exit.passive_close_hedge_reconcile_failed",
                         {
@@ -2041,6 +2084,7 @@ class PassiveCloseExecutor:
                 recon_qty_raw = getattr(reconciliation, "quantity", 0.0) if reconciliation is not None else 0.0
                 recon_qty = float(recon_qty_raw) if isinstance(recon_qty_raw, (int, float)) else 0.0
                 if recon_qty > 1e-12:
+                    fill_reconciliation_result = "filled"
                     recon_price_raw = getattr(reconciliation, "average_price", hedge_price or 0.0)
                     recon_price = float(recon_price_raw) if isinstance(recon_price_raw, (int, float)) else (hedge_price or 0.0)
                     fill = OrderFill(
@@ -2096,10 +2140,10 @@ class PassiveCloseExecutor:
                             "error": str(e),
                         },
                     )
+                elif not fill_reconciliation_result:
+                    fill_reconciliation_result = "missing_or_zero_fill"
 
-            self._journal.append(
-                "exit.passive_close_hedge_error",
-                {
+            hedge_error_payload = {
                     "position_id": position.position_id,
                     "hedge_venue": hedge_venue.value,
                     "hedge_leg": hedge_leg_label,
@@ -2108,7 +2152,19 @@ class PassiveCloseExecutor:
                     "exchange_error": evidence.to_dict(),
                     "request_context": req_ctx.to_dict(),
                     "evidence_completeness": evidence.evidence_completeness,
-                },
+            }
+            hedge_error_payload.update(uncertainty_payload)
+            if is_order_truth_gap(e):
+                hedge_error_payload["fill_reconciliation_attempted"] = (
+                    fill_reconciliation_attempted
+                )
+                hedge_error_payload["fill_reconciliation_result"] = (
+                    fill_reconciliation_result or "not_attempted"
+                )
+                hedge_error_payload["fill_reconciliation_client_order_id"] = hedge_cid
+            self._journal.append(
+                "exit.passive_close_hedge_error",
+                hedge_error_payload,
             )
             return HedgeDeltaResult(
                 requested=delta, filled=0.0, residual=delta, success=False,
@@ -2358,6 +2414,40 @@ class PassiveCloseExecutor:
                 maker_leg_label, target_price, remaining_quantity, tick_size, reference_mid,
             )
         except Exception as e:
+            if maker_venue == Venue.OKX and _is_okx_amend_invalid_request_type_error(e):
+                self._journal.append(
+                    "exit.passive_close_amend_unsupported_cancel_replace",
+                    {
+                        "position_id": position.position_id,
+                        "venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
+                        "order_id": pending.phase_state.maker_order_id,
+                        "client_order_id": pending.phase_state.maker_client_order_id,
+                        "reason": "okx_amend_invalid_request_type",
+                        "exchange_code": str(getattr(e, "exchange_code", "") or "50115"),
+                        "exchange_msg": str(
+                            getattr(e, "exchange_msg", "") or "Invalid request type"
+                        ),
+                        "endpoint": str(
+                            getattr(e, "endpoint", "")
+                            or "POST /api/v5/trade/amend-order"
+                        ),
+                        "official_doc_url": "https://www.okx.com/docs-v5/en/#order-book-trading-trade-amend-order",
+                    },
+                )
+                await self._cancel_replace_maker_order(
+                    state,
+                    pending,
+                    position,
+                    maker_venue,
+                    maker_side,
+                    maker_leg_label,
+                    target_price,
+                    remaining_quantity,
+                    tick_size,
+                    reference_mid,
+                )
+                return
             # Transport/auth/rate-limit failure — journal, set retry, let drive loop escalate
             self._journal.append(
                 "exit.passive_close_amend_failed",

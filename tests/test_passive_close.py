@@ -2693,6 +2693,79 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_resolved" in kinds
         assert "exit.passive_close_hedge_error" not in kinds
 
+    def test_ack_only_delta_hedge_error_preserves_order_truth_gap_evidence(self):
+        """Accepted taker hedge ACK without fill is a pending truth gap, not a plain failure."""
+        journal = _open_journal()
+
+        ack_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-oid) but fill not confirmed",
+        )
+        ack_error.order_ack_only = True
+        ack_error.accepted_order_id = "ack-oid"
+        ack_error.accepted_client_order_id = "ack-cid"
+        ack_error.fill_confirmation_missing_fields = ["executedQty", "cumQty"]
+        ack_error.exchange_response_body = (
+            '{"retCode":0,"result":{"orderId":"ack-oid","orderLinkId":"ack-cid"}}'
+        )
+
+        adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        adapter.place_order = AsyncMock(side_effect=ack_error)
+        adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.99, 1.01))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-passive-ack-only",
+            symbol="EDENUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                state,
+                pending,
+                position,
+                10.0,
+                maker_terminal=True,
+            )
+        )
+
+        assert result.success is False
+        assert result.residual == pytest.approx(10.0)
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_hedge_error"
+        ][-1]
+        assert payload["order_ack_only"] is True
+        assert payload["accepted_order_id"] == "ack-oid"
+        assert payload["accepted_client_order_id"] == "ack-cid"
+        assert payload["fill_confirmation_missing_fields"] == ["executedQty", "cumQty"]
+        assert "fill_confirmation" in payload["missing_evidence"]
+        assert payload["order_truth_probe_paths"]["rest_order_status"] == "GET /v5/order/realtime"
+        assert payload["next_action"] == "reconcile_accepted_order_or_probe_live_position"
+        assert payload["fill_reconciliation_attempted"] is True
+        assert payload["fill_reconciliation_result"] == "missing_or_zero_fill"
+
     def test_ubusdt_bybit_duplicate_partial_retries_remaining_with_new_cid(self):
         """UBUSDT regression: partial duplicate evidence retries remaining reduce-only."""
         journal = _open_journal()
@@ -3792,6 +3865,86 @@ class TestAmendCancelReplace:
             )
         )
         assert pending.phase_state.maker_order_id == "new-oid"
+
+    def test_okx_amend_invalid_request_type_falls_back_to_cancel_replace(self):
+        """OKX amend endpoint 405/50115 is an amend-path failure, not a generic retry."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-okx-amend-50115",
+            symbol="ZECUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BINANCE,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.1,
+            chunk_quantities=[0.1],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-okx-oid",
+                maker_client_order_id="old-okx-cid",
+                maker_resting_limit_price=10.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        amend_error = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            'HTTP 405: {"code":"50115","data":[],"msg":"Invalid request type"}',
+        )
+        amend_error.endpoint = "POST /api/v5/trade/amend-order"
+        amend_error.http_status = 405
+        amend_error.exchange_code = "50115"
+        amend_error.exchange_msg = "Invalid request type"
+
+        mock_adapter = _mock_adapter_with_tick(Venue.OKX)
+        mock_adapter.amend_passive_order = AsyncMock(side_effect=amend_error)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.OKX,
+            order_id="old-okx-oid",
+            client_order_id="old-okx-cid",
+        ))
+        mock_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            venue=Venue.OKX,
+            order_id="new-okx-oid",
+            client_order_id="new-okx-cid",
+            price=10.2,
+            quantity=0.1,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.OKX: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 10.2)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (10.19, 10.21))
+
+        asyncio.run(
+            executor._amend_maker_order(
+                state,
+                pending,
+                position,
+                Venue.OKX,
+                Side.SELL,
+                "long",
+                10.2,
+                0.1,
+                0.1,
+                10.2,
+            )
+        )
+
+        assert pending.phase_state.maker_order_id == "new-okx-oid"
+        events = journal.read_all()
+        fallback = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.passive_close_amend_unsupported_cancel_replace"
+        ][-1]
+        assert fallback["venue"] == "okx"
+        assert fallback["reason"] == "okx_amend_invalid_request_type"
+        assert fallback["exchange_code"] == "50115"
+        assert "exit.passive_close_amend_failed" not in [event["kind"] for event in events]
 
     def test_cancel_fails_old_order_alive_blocks_new_order(self):
         """When cancel fails and old order is still alive → refuse new order (double-order guard)."""
