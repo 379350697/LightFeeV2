@@ -497,7 +497,7 @@ class TestAsterOrderRequestShape:
             await adapter.place_order(req)
             assert len(captured_url) == 1
             url = captured_url[0]
-            assert "https://fapi3.asterdex.com/fapi/v3/order" in url
+            assert "https://fapi.asterdex.com/fapi/v3/order" in url
             assert "signer=" in url, f"Missing signer in URL: {url}"
             assert "nonce=" in url, f"Missing nonce in URL: {url}"
             assert "signature=" in url, f"Missing signature in URL: {url}"

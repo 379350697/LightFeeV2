@@ -253,7 +253,7 @@ def aster_spec() -> VenueSpec:
     return VenueSpec(
         venue_id=Venue.ASTER,
         public_base_url="https://fapi.asterdex.com",
-        private_base_url="https://fapi3.asterdex.com",
+        private_base_url="https://fapi.asterdex.com",
         auth_scheme=AuthScheme.EIP712,
         account_contract=VenueAccountContract.SINGLE_OR_MULTI_ASSET,
         quantity_step=0.001,

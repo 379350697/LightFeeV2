@@ -38,7 +38,7 @@ from lightfee.venues.transport import (
 )
 
 
-ASTER_V3_PRIVATE_BASE_URL = "https://fapi3.asterdex.com"
+ASTER_V3_PRIVATE_BASE_URL = "https://fapi.asterdex.com"
 ASTER_V3_DOC_URL = (
     "https://github.com/asterdex/api-docs/blob/master/"
     "V3%28Recommended%29/EN/aster-finance-futures-api-v3.md"

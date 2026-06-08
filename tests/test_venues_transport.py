@@ -167,7 +167,7 @@ class TestSigning:
         spec = aster_spec()
         assert spec.auth_scheme == AuthScheme.EIP712
         assert spec.requires_wallet_key is True
-        assert spec.private_base_url == "https://fapi3.asterdex.com"
+        assert spec.private_base_url == "https://fapi.asterdex.com"
 
     def test_hyperliquid_signing_is_eip712(self):
         spec = hyperliquid_spec()
@@ -310,7 +310,7 @@ class TestBinanceAsterPostSigning:
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
         async def handler(request):
-            assert request.url.host == "fapi3.asterdex.com"
+            assert request.url.host == "fapi.asterdex.com"
             assert request.url.path == "/fapi/v3/positionRisk"
             params = dict(request.url.params)
             assert params["symbol"] == "ASTERUSDT"
@@ -351,7 +351,7 @@ class TestBinanceAsterPostSigning:
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
         async def handler(request):
-            assert request.url.host == "fapi3.asterdex.com"
+            assert request.url.host == "fapi.asterdex.com"
             assert request.url.path == "/fapi/v3/accountWithJoinMargin"
             params = dict(request.url.params)
             assert "nonce" in params
@@ -5833,7 +5833,7 @@ class TestAsterSpec:
     def test_aster_spec_uses_official_asterdex_hosts(self):
         spec = aster_spec()
         assert spec.public_base_url == "https://fapi.asterdex.com"
-        assert spec.private_base_url == "https://fapi3.asterdex.com"
+        assert spec.private_base_url == "https://fapi.asterdex.com"
         assert spec.l2_snapshot_path == "/fapi/v1/depth"
 
 
