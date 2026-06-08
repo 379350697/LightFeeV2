@@ -36,6 +36,13 @@ verification passed focused RED/GREEN and related recovery/residual/admission/
 snapshot/entry/diagnose/order-uncertainty regression scope. Full evidence is
 recorded in
 [`daily/2026-06-08.md#cluster-cl-056-production-error-evidence-contract-split`](daily/2026-06-08.md#cluster-cl-056-production-error-evidence-contract-split).
+Cloud deploy of `c44be73` fast-forwarded `/opt/lightfee-v2`, wrote
+`.deploy_version=c44be73`, passed deploy-manifest and remote compileall checks,
+restarted sidecar/live active/running with `NRestarts=0`, and passed singleton,
+`verify_production_services.py --json`, and
+`diagnose_live.py --json --since-deploy` with healthy/running state,
+`gate_passed=true`, required truth/residual/open/pending counts all zero, and
+high-confidence flat/no-open-orders exchange truth on all venues.
 
 Latest recovery truth-probe and residual-repair ACK-only closure, 2026-06-08:
 production issue 2 (`recovery.live_position_bulk_probe_error`) and issue 3
