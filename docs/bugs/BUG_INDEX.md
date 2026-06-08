@@ -45,9 +45,12 @@ not terminal; structural perp open-interest degraded events record endpoint,
 floor/current value, fallback source, and targeted revalidate scope. Local
 verification passed focused RED/GREEN, relevant suites, affected file suites,
 compileall, diff-check, full pytest (`3711 passed`, `9 skipped`, `1 warning`),
-and GitNexus detect-changes (`risk=low`, affected processes `0`). This is local
-green and code-review accepted for deployment only: no deploy, no production
-connection, no manual order/cancel, and no runtime-state mutation are claimed.
+and GitNexus detect-changes (`risk=low`, affected processes `0`). This was then
+deployed on `89e2b93` and verified `ok=true` by both
+`scripts/verify_production_services.py --json` and
+`scripts/diagnose_live.py --json --since-deploy`:
+`health.ok=true`, `version_mismatch=false`, `lifecycle=running`,
+`risk_mode=running`, all counts zero, and no exchange-truth mismatches.
 Full evidence is recorded in
 [`daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening`](daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening).
 
