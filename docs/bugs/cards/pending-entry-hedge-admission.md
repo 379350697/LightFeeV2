@@ -31,6 +31,16 @@ Deterministic hedge admission reject must:
 ## V1 / Exchange Semantics
 
 - Aster `-5018`: V1 detects max-notional submit reject and starts venue entry cooldown with reason `aster_max_notional_limit`. V2 should keep symbol evidence and also create venue-scope cooldown for this family.
+- Aster Pro API V3 credentials are API-wallet/Web3 credentials, not Binance
+  HMAC credentials. Aster public market data can keep Binance-compatible FAPI
+  paths, but private account/order/open-order probes must use Aster V3
+  `https://fapi3.asterdex.com/fapi/v3/*` with `nonce`, `signer`, and EIP-712
+  `signature`. Aster private failures on old `/fapi/v1|v2|v4` HMAC paths are
+  transport-integration drift, not admission rejects.
+- Aster account-risk truth specifically uses Pro API V3
+  `GET /fapi/v3/accountWithJoinMargin`. Capability metadata must not advertise
+  Binance-style private WS/listen-key health for Aster V3; passive progress and
+  accepted-order uncertainty truth rely on REST V3 polling/probes.
 - Bybit trading-terms rejects: no matching V1 definition found. Treat as exchange-documented admission/permission block, not as V1 copy work.
 - Hyperliquid insufficient-margin rejects: no matching V1 exchange family found. Hyperliquid's official error response documents `Insufficient margin to place order.` under the perp margin family; V2 treats it as deterministic admission evidence with symbol cooldown, venue cooldown, shortlist/dispatch admission blocking, and pending hedge abort. Official doc: <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses>.
 - Transport-level classification alone is insufficient unless runtime consumes it in the pending hedge branch.
@@ -45,6 +55,7 @@ Deterministic hedge admission reject must:
 | 2026-06-04 | Hyperliquid insufficient-margin admission classification | deployed/cloud verified | Hyperliquid `Insufficient margin to place order.` now creates deterministic admission evidence for initial entry dispatch and pending hedge recovery, emits `pending_entry.hedge_admission_blocked`, and aborts through the existing cleanup path instead of retrying. |
 | 2026-06-07 | Post-`21e5d44` Hyperliquid evidence-shape closure | local implementation pending deploy | The existing admission classifier was present, but the whole chain lacked uniform `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false` evidence on pending hedge and entry cooldown events. RED/GREEN now pins those fields and keeps the Aster-specific venue cooldown reason from leaking into Hyperliquid. |
 | 2026-06-07 | Hyperliquid venue-scope pre-shortlist admission downgrade | local implementation pending deploy | Active `venue_entry_cooldowns["hyperliquid:*"]` now prune Hyperliquid new-entry candidates before Local-L2/quote tracking. Selection and dispatch keep their existing admission blocks as bypass safety. |
+| 2026-06-08 | Aster Pro API V3 private transport isolation | local implementation pending deploy | Aster private account/order/open-order probes are no longer routed through shared Binance HMAC transport. V2 now keeps public Aster FAPI market data separate from a dedicated V3 Web3 signer client, so V3 API-wallet credentials do not produce false `Signature for this request is not valid` private-truth failures. Review closure also pins `accountWithJoinMargin`, Aster V3 capability truth, and REST V3 order-truth probe paths. |
 
 ## Recurrences
 

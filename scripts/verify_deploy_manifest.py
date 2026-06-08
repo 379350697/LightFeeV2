@@ -132,7 +132,26 @@ def check_critical_files(manifest: dict[str, str]) -> list[str]:
     return missing
 
 
-def verify_remote_manifest(remote_host: str, remote_path: str, local_manifest: dict[str, str]) -> bool:
+def _ssh_command(remote_host: str, command: str, ssh_port: int) -> list[str]:
+    return [
+        "ssh",
+        "-p",
+        str(ssh_port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        remote_host,
+        command,
+    ]
+
+
+def verify_remote_manifest(
+    remote_host: str,
+    remote_path: str,
+    local_manifest: dict[str, str],
+    ssh_port: int = 2222,
+) -> bool:
     """Single-SSH-call sha256 verification of all critical files on remote."""
     cmds = []
     for f in CRITICAL_FILES:
@@ -142,8 +161,9 @@ def verify_remote_manifest(remote_host: str, remote_path: str, local_manifest: d
     batch_cmd = "; ".join(cmds)
 
     result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", remote_host, batch_cmd],
-        capture_output=True, text=True,
+        _ssh_command(remote_host, batch_cmd, ssh_port),
+        capture_output=True,
+        text=True,
     )
 
     all_ok = True
@@ -177,17 +197,17 @@ def verify_remote_manifest(remote_host: str, remote_path: str, local_manifest: d
     return all_ok
 
 
-def read_deploy_version(remote_host: str, remote_path: str) -> str | None:
+def read_deploy_version(remote_host: str, remote_path: str, ssh_port: int = 2222) -> str | None:
     """Read .deploy_version from remote."""
     cmd = f"cat {remote_path}/.deploy_version 2>/dev/null"
     result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", remote_host, cmd],
+        _ssh_command(remote_host, cmd, ssh_port),
         capture_output=True, text=True,
     )
     return result.stdout.strip() or None
 
 
-def check_deploy_version_matches(remote_host: str, remote_path: str) -> bool:
+def check_deploy_version_matches(remote_host: str, remote_path: str, ssh_port: int = 2222) -> bool:
     """Verify .deploy_version on remote matches local HEAD."""
     root = repo_root()
     local_head = subprocess.run(
@@ -195,7 +215,7 @@ def check_deploy_version_matches(remote_host: str, remote_path: str) -> bool:
         capture_output=True, text=True, cwd=root,
     ).stdout.strip()
 
-    remote_ver = read_deploy_version(remote_host, remote_path)
+    remote_ver = read_deploy_version(remote_host, remote_path, ssh_port)
     if remote_ver is None:
         print("  WARN: .deploy_version not found on remote")
         return False
@@ -210,7 +230,12 @@ def check_deploy_version_matches(remote_host: str, remote_path: str) -> bool:
     return True
 
 
-def generate_deploy_script(root: Path, remote_host: str, remote_path: str) -> str:
+def generate_deploy_script(
+    root: Path,
+    remote_host: str,
+    remote_path: str,
+    ssh_port: int = 2222,
+) -> str:
     """Generate a safe rsync deploy script that syncs all tracked files."""
     manifest = build_manifest(root)
     # Write manifest
@@ -236,22 +261,37 @@ REMOTE="{remote_host}:{remote_path}"
 REMOTE_HOST="{remote_host}"
 REMOTE_PATH="{remote_path}"
 LOCAL="{root}"
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
+REMOTE_PYTHONPATH="PYTHONPATH=$REMOTE_PATH"
+SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
+SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 
 echo "=== Generating deploy manifest ==="
 python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
 
 echo "=== Syncing files to $REMOTE ==="
-rsync -avz --delete {' '.join(exclude_args)} "$LOCAL/" "$REMOTE/"
+rsync -avz --delete {' '.join(exclude_args)} -e "ssh $SSH_OPTS" "$LOCAL/" "$REMOTE/"
 
 echo "=== Uploading deploy manifest ==="
-scp -o BatchMode=yes -o ConnectTimeout=10 "$LOCAL/.deploy_manifest.json" "$REMOTE/.deploy_manifest.json"
+scp $SCP_OPTS "$LOCAL/.deploy_manifest.json" "$REMOTE/.deploy_manifest.json"
 
 echo "=== Writing .deploy_version ==="
 echo "{head}" | ssh $SSH_OPTS {remote_host} "cat > {remote_path}/.deploy_version"
 
 echo "=== Verifying deployment integrity on remote ==="
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && python3 scripts/verify_deploy_manifest.py --check {remote_path}"
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
+
+echo "=== Restarting production services ==="
+ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service"
+
+echo "=== Verifying production health ==="
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
+if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+  echo "=== Production health failed; collecting diagnose evidence ==="
+  ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
+  exit 1
+fi
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
 
 echo "=== Deploy complete: {head} ==="
 """
@@ -263,6 +303,12 @@ def main() -> None:
     parser.add_argument("--local", action="store_true", help="Build and save local manifest")
     parser.add_argument("--remote", type=str, help="SSH host (e.g., root@38.60.253.248)")
     parser.add_argument("--path", type=str, default="/opt/lightfee-v2", help="Remote path")
+    parser.add_argument(
+        "--ssh-port",
+        type=int,
+        default=int(os.environ.get("LIGHTFEE_DEPLOY_SSH_PORT", "2222")),
+        help="SSH port for remote deploy/check commands (default: 2222)",
+    )
     parser.add_argument("--check", type=str, help="Verify manifest at given path (local)")
     parser.add_argument("--generate-deploy", action="store_true", help="Generate deploy script")
     args = parser.parse_args()
@@ -270,7 +316,12 @@ def main() -> None:
     root = repo_root()
 
     if args.generate_deploy:
-        script = generate_deploy_script(root, args.remote or "root@YOUR_HOST", args.path)
+        script = generate_deploy_script(
+            root,
+            args.remote or "root@YOUR_HOST",
+            args.path,
+            ssh_port=args.ssh_port,
+        )
         script_path = root / "scripts" / "deploy.sh"
         with open(script_path, "w") as f:
             f.write(script)
@@ -338,10 +389,10 @@ def main() -> None:
         print(f"Manifest: {len(manifest)} files")
 
         print(f"\nChecking .deploy_version on {args.remote}...")
-        ver_ok = check_deploy_version_matches(args.remote, args.path)
+        ver_ok = check_deploy_version_matches(args.remote, args.path, args.ssh_port)
 
         print(f"\nVerifying critical files on {args.remote}:{args.path}...")
-        files_ok = verify_remote_manifest(args.remote, args.path, manifest)
+        files_ok = verify_remote_manifest(args.remote, args.path, manifest, args.ssh_port)
 
         if ver_ok and files_ok:
             print("\nPASS: deployment integrity verified")

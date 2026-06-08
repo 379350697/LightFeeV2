@@ -641,25 +641,25 @@ class TestBinanceAsterParamOrderV1:
         )
 
     @pytest.mark.asyncio
-    async def test_aster_param_order_recvwindow_before_timestamp(self):
-        """Construct Aster private request → query order is ...&recvWindow=10000&timestamp=...&signature=..."""
-        from lightfee.venues.transport import VenueTransport, LiveCredential
-        from lightfee.venues.specs import aster_spec
+    async def test_aster_v3_private_request_uses_signer_nonce_not_recvwindow(self):
+        """Aster Pro API V3 private requests are EIP-712 signed, not Binance HMAC."""
+        from lightfee.venues.aster_v3 import AsterV3Client
+        from lightfee.venues.transport import LiveCredential
 
-        spec = aster_spec()
-        cred = LiveCredential(api_key="test_api_key", api_secret="test_api_secret")
-        transport = VenueTransport(spec, mode="live", credential=cred)
-
-        transport._time_offset_ms = 0
+        cred = LiveCredential(
+            api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+            account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+        )
+        client = AsterV3Client(credential=cred)
 
         params = {"symbol": "ETHUSDT", "side": "SELL", "type": "LIMIT",
                    "price": "3000.00", "quantity": "0.5", "timeInForce": "GTC"}
 
-        qs, headers, req_body = await transport._build_signed_request_async(
-            "POST", "/fapi/v1/order", params=params, private=True,
+        qs, headers, req_body = client.build_signed_request(
+            "POST", "/fapi/v3/order", params=params, nonce=1748310859508867,
         )
 
-        await transport.close()
+        await client.close()
 
         qs_no_q = qs[1:] if qs.startswith("?") else qs
         pairs = qs_no_q.split("&")
@@ -669,21 +669,9 @@ class TestBinanceAsterParamOrderV1:
         ts_idx = keys.index("timestamp") if "timestamp" in keys else -1
         sig_idx = keys.index("signature") if "signature" in keys else -1
 
-        assert recv_idx < ts_idx, (
-            f"Aster: recvWindow (idx={recv_idx}) must be BEFORE timestamp (idx={ts_idx})"
-        )
-        assert ts_idx < sig_idx, (
-            f"Aster: timestamp (idx={ts_idx}) must be BEFORE signature (idx={sig_idx})"
-        )
-
-        # Recompute signature on pre-sign payload
-        from lightfee.venues.transport import _sign_payload
-
-        sig_pair = pairs[sig_idx]
-        actual_sig = sig_pair.split("=", 1)[1]
-        pre_sig_qs = "&".join(pairs[:sig_idx])
-        expected_sig = _sign_payload(spec.auth_scheme, cred.api_secret, pre_sig_qs)
-
-        assert actual_sig == expected_sig, (
-            f"Aster signature mismatch. Pre-sign payload: {pre_sig_qs[:200]}"
-        )
+        assert recv_idx == -1
+        assert ts_idx == -1
+        assert sig_idx > keys.index("signer")
+        assert sig_idx > keys.index("nonce")
+        assert "X-MBX-APIKEY" not in headers
+        assert req_body is None

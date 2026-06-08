@@ -44,6 +44,22 @@ ADAPTERS = [
 
 FIXTURE_DIR = "tests/fixtures/venues"
 HL_FIXTURE_PRIVATE_KEY = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
+ASTER_FIXTURE_PRIVATE_KEY = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+ASTER_FIXTURE_ACCOUNT_ADDRESS = "0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e"
+
+
+def _fixture_wallet_private_key(venue_id: Venue) -> str:
+    if venue_id == Venue.HYPERLIQUID:
+        return HL_FIXTURE_PRIVATE_KEY
+    if venue_id == Venue.ASTER:
+        return ASTER_FIXTURE_PRIVATE_KEY
+    return "0x" + "1" * 64
+
+
+def _fixture_account_address(venue_id: Venue) -> str:
+    if venue_id == Venue.ASTER:
+        return ASTER_FIXTURE_ACCOUNT_ADDRESS
+    return "0xbeef"
 
 
 def _trust_hyperliquid_transport_for_test(transport) -> None:
@@ -61,6 +77,14 @@ def _load_fixture(venue_name: str, name: str):
     path = f"{FIXTURE_DIR}/{venue_name}/{name}.json"
     with open(path) as f:
         return json.load(f)
+
+
+def _attach_mock_transport(adapter, transport, mock) -> None:
+    transport._client = httpx.AsyncClient(transport=mock)
+    private = getattr(adapter, "_private", None)
+    if private is not None:
+        private._client = httpx.AsyncClient(transport=mock)
+        private._owns_client = True
 
 
 # ---------------------------------------------------------------------------
@@ -233,17 +257,13 @@ class TestFixtureDrivenMarketSnapshot:
 
         cred = LiveCredential(api_key="k", api_secret="s",
                               api_passphrase="p",
-                              wallet_private_key=(
-                                  HL_FIXTURE_PRIVATE_KEY
-                                  if venue_id == Venue.HYPERLIQUID
-                                  else "0xdead"
-                              ),
-                              account_address="0xbeef")
+                              wallet_private_key=_fixture_wallet_private_key(venue_id),
+                              account_address=_fixture_account_address(venue_id))
         adapter = adapter_cls(mode="live", credential=cred)
 
         # Inject the mock transport
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -273,15 +293,11 @@ class TestFixtureDrivenPosition:
 
         cred = LiveCredential(api_key="k", api_secret="s",
                               api_passphrase="p",
-                              wallet_private_key=(
-                                  HL_FIXTURE_PRIVATE_KEY
-                                  if venue_id == Venue.HYPERLIQUID
-                                  else "0xdead"
-                              ),
-                              account_address="0xbeef")
+                              wallet_private_key=_fixture_wallet_private_key(venue_id),
+                              account_address=_fixture_account_address(venue_id))
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         if venue_id == Venue.OKX:
             transport.set_symbol_metadata({
@@ -323,16 +339,12 @@ class TestFixtureDrivenOrderSuccess:
             api_key="k",
             api_secret="" if venue_id == Venue.HYPERLIQUID else "s",
             api_passphrase="p",
-            wallet_private_key=(
-                HL_FIXTURE_PRIVATE_KEY
-                if venue_id == Venue.HYPERLIQUID
-                else "0xdead"
-            ),
-            account_address="0xbeef",
+            wallet_private_key=_fixture_wallet_private_key(venue_id),
+            account_address=_fixture_account_address(venue_id),
         )
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         # Hyperliquid needs the asset index pre-populated so the mock
@@ -394,12 +406,12 @@ class TestFixtureDrivenOrderReject:
             api_key="k",
             api_secret="" if venue_id == Venue.HYPERLIQUID else "s",
             api_passphrase="p",
-            wallet_private_key=hl_privkey if venue_id == Venue.HYPERLIQUID else "0xdead",
-            account_address="0xbeef",
+            wallet_private_key=hl_privkey if venue_id == Venue.HYPERLIQUID else _fixture_wallet_private_key(venue_id),
+            account_address=_fixture_account_address(venue_id),
         )
         adapter = adapter_cls(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         # Pre-populate Hyperliquid asset index so mock only handles the order
@@ -440,7 +452,7 @@ class TestBinanceOrderRequestShape:
         cred = LiveCredential(api_key="bk", api_secret="bs")
         adapter = BinanceAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -458,38 +470,42 @@ class TestBinanceOrderRequestShape:
 
 
 class TestAsterOrderRequestShape:
-    """Verify Aster POST order includes timestamp, signature in query string."""
+    """Verify Aster POST order uses Pro API V3 signer params, not Binance HMAC."""
 
     @pytest.mark.asyncio
-    async def test_post_order_has_timestamp_and_signature_in_url(self):
+    async def test_post_order_has_signer_nonce_and_signature_in_url(self):
         fixture = _load_fixture("aster", "place_order_success")
         captured_url = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured_url.append(str(request.url))
-            if request.url.path.endswith("/positionSide/dual"):
-                return httpx.Response(200, json={"dualSidePosition": False})
             return httpx.Response(200, json=fixture)
 
         mock = httpx.MockTransport(handler)
-        cred = LiveCredential(api_key="ak", api_secret="as")
+        cred = LiveCredential(
+            api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+            account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+        )
         adapter = AsterAdapter(mode="live", credential=cred)
-        transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
-        transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
+        assert adapter._private is not None
+        adapter._private._client = httpx.AsyncClient(transport=mock)
+        adapter._private._owns_client = True
 
         try:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
                               side=Side.SELL, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 2
-            assert "/fapi/v1/positionSide/dual" in captured_url[0]
-            url = captured_url[1]
-            assert "/fapi/v1/order" in url
-            assert "timestamp=" in url, f"Missing timestamp in URL: {url}"
+            assert len(captured_url) == 1
+            url = captured_url[0]
+            assert "https://fapi3.asterdex.com/fapi/v3/order" in url
+            assert "signer=" in url, f"Missing signer in URL: {url}"
+            assert "nonce=" in url, f"Missing nonce in URL: {url}"
             assert "signature=" in url, f"Missing signature in URL: {url}"
+            assert "timestamp=" not in url
+            assert "recvWindow=" not in url
+            assert "X-MBX-APIKEY" not in url
         finally:
-            await transport.close()
+            await adapter.shutdown()
 
 
 class TestHyperliquidLiveOrderNowSupported:
@@ -505,7 +521,7 @@ class TestHyperliquidLiveOrderNowSupported:
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         # Pre-populate asset index cache to avoid mock needing metadata response
         transport._hl_meta_cache["BTC"] = 0
@@ -553,7 +569,7 @@ class TestBitgetProfileDetectionIntegration:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -586,7 +602,7 @@ class TestBitgetProfileDetectionIntegration:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -615,7 +631,7 @@ class TestLiveModeNoSilentFakeData:
         cred = LiveCredential(api_key="k", api_secret="s")
         adapter = BinanceAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -658,7 +674,7 @@ class TestBitgetProfileDetectionFullFlow:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -676,7 +692,7 @@ class TestBitgetProfileDetectionFullFlow:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -697,7 +713,7 @@ class TestBitgetProfileDetectionFullFlow:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -741,7 +757,7 @@ class TestBitgetProfileDetectionFullFlow:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -792,7 +808,7 @@ class TestHyperliquidCapabilityConsistency:
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
         transport._hl_meta_cache["BTC"] = 0
         _trust_hyperliquid_transport_for_test(transport)
@@ -816,7 +832,7 @@ class TestHyperliquidCapabilityConsistency:
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -836,7 +852,7 @@ class TestHyperliquidCapabilityConsistency:
                               account_address="0xbeef")
         adapter = HyperliquidAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -863,7 +879,7 @@ class TestAckOnlyOrderIntegration:
         cred = LiveCredential(api_key="k", api_secret="s")
         adapter = BybitAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:
@@ -883,7 +899,7 @@ class TestAckOnlyOrderIntegration:
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
         adapter = BitgetAdapter(mode="live", credential=cred)
         transport = adapter._transport
-        transport._client = httpx.AsyncClient(transport=mock)
+        _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
 
         try:

@@ -6,8 +6,8 @@ Run on the production host:
 
 ```bash
 cd /opt/lightfee-v2
-python3 scripts/verify_production_services.py --json
-python3 scripts/check_process_singleton.py --strict
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/check_process_singleton.py --strict
 ```
 
 Expected:
@@ -25,8 +25,8 @@ evidence first. Keep the evidence compact enough to paste into a bug ledger entr
 
 ```bash
 cd /opt/lightfee-v2
-python3 scripts/verify_production_services.py --json
-python3 scripts/check_process_singleton.py --strict
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/check_process_singleton.py --strict
 systemctl show lightfee-live.service lightfee-sidecar.service \
   --property=Id,ActiveState,SubState,ExecMainStartTimestamp,ExecMainPID
 ```
@@ -51,8 +51,8 @@ sudo systemctl restart lightfee-sidecar.service
 Before deploying, verify no open work on remote:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json"
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json"
 ```
 
 Must show `ok: true`, no open orders, no pending entries, no recovery work.
@@ -62,11 +62,14 @@ Must show `ok: true`, no open orders, no pending entries, no recovery work.
 Run the auto-generated deploy script or manual equivalent:
 
 ```bash
-python3 scripts/verify_deploy_manifest.py --generate-deploy --remote root@38.60.253.248 --path /opt/lightfee-v2
+python3 scripts/verify_deploy_manifest.py --generate-deploy --remote root@38.60.253.248 --path /opt/lightfee-v2 --ssh-port 2222
 bash scripts/deploy.sh
 ```
 
-The script syncs code, uploads `.deploy_manifest.json`, writes `.deploy_version`, and runs remote verification. Any step failure exits non-zero.
+The script syncs code, uploads `.deploy_manifest.json`, writes `.deploy_version`,
+runs remote verification with `/opt/lightfee-v2/.venv/bin/python3`, restarts the
+live services, and collects `diagnose_live.py --since-deploy` evidence. Any step
+failure exits non-zero.
 
 ## Post-Deploy Verification
 
@@ -74,27 +77,31 @@ After every deploy, verify integrity on the remote host:
 
 ```bash
 # 1. Git HEAD and .deploy_version must match the expected commit
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
   "cd /opt/lightfee-v2 && echo \"HEAD: \$(git rev-parse --short HEAD)\" && echo \"VERSION: \$(cat .deploy_version)\""
 
 # 2. Manifest integrity (single SSH call, checks all critical files)
-python3 scripts/verify_deploy_manifest.py --remote root@38.60.253.248 --path /opt/lightfee-v2
+python3 scripts/verify_deploy_manifest.py --remote root@38.60.253.248 --path /opt/lightfee-v2 --ssh-port 2222
 
 # 3. Remote --check (manifest count and critical file hashes)
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && python3 scripts/verify_deploy_manifest.py --check /opt/lightfee-v2"
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_deploy_manifest.py --check /opt/lightfee-v2"
 
 # 4. Systemd fragments must match repo templates
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
   "systemctl show lightfee-live.service lightfee-sidecar.service | grep -E '^(Id|ExecStart|ExecMainStartTimestamp)='"
 
 # 5. Process start time must be later than code sync time
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
   "systemctl show lightfee-live.service | grep ExecMainStartTimestamp"
 
 # 6. No-orders health probe (must not submit orders)
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json"
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json"
+
+# 7. Since-deploy diagnostic evidence (same interpreter as production)
+ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/diagnose_live.py --json --since-deploy"
 ```
 
 All checks must pass before marking a deploy complete. If any check fails, do NOT resume trading — diagnose and re-deploy.

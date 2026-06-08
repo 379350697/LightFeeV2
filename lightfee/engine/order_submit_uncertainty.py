@@ -37,12 +37,18 @@ def order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
             "private_ws_order_topic": "orders",
             "live_position_probe": "GET /api/v5/account/positions",
         }
-    if venue in (Venue.BINANCE, Venue.ASTER):
+    if venue == Venue.BINANCE:
         return {
             "rest_order_status": "GET /fapi/v1/order",
             "open_order_truth": "GET /fapi/v1/openOrders",
             "private_ws_order_topic": "ORDER_TRADE_UPDATE",
             "live_position_probe": "GET /fapi/v2/positionRisk",
+        }
+    if venue == Venue.ASTER:
+        return {
+            "rest_order_status": "GET /fapi/v3/order",
+            "open_order_truth": "GET /fapi/v3/openOrders",
+            "live_position_probe": "GET /fapi/v3/positionRisk",
         }
     return {
         "rest_order_status": "adapter.fetch_order_fill_reconciliation",

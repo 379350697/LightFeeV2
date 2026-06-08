@@ -766,7 +766,15 @@ async def _fetch_unfiltered_open_orders(
     if "binance" in venue_lower:
         raw = await transport._request("GET", "/fapi/v1/openOrders", params={}, private=True)
     elif "aster" in venue_lower:
-        raw = await transport._request("GET", "/fapi/v1/openOrders", params={}, private=True)
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            rows = await fetch_open_orders(None)
+            return [
+                _summarize_open_order(row)
+                for row in rows[:50]
+                if isinstance(row, dict)
+            ]
+        raw = await transport._request("GET", "/fapi/v3/openOrders", params={}, private=True)
     elif "bybit" in venue_lower:
         raw = await transport._request(
             "GET", "/v5/order/realtime",
@@ -865,11 +873,15 @@ async def _fetch_venue_open_orders(
                     private=True,
                 )
             elif "aster" in venue.lower():
-                raw = await transport._request(
-                    "GET", "/fapi/v1/openOrders",
-                    params={"symbol": venue_symbol},
-                    private=True,
-                )
+                fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+                if callable(fetch_open_orders):
+                    raw = await fetch_open_orders(venue_symbol)
+                else:
+                    raw = await transport._request(
+                        "GET", "/fapi/v3/openOrders",
+                        params={"symbol": venue_symbol},
+                        private=True,
+                    )
             elif "okx" in venue.lower():
                 raw = await transport._request(
                     "GET", "/api/v5/trade/orders-pending",

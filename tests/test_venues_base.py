@@ -8,6 +8,7 @@ from lightfee.venues.base import (
     ExecutionLiquidityCapability,
     ReconcileQuality,
     VenueCapabilities,
+    VenuePrivateApiContract,
 )
 from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
 
@@ -50,7 +51,15 @@ class TestVenueCapabilities:
         bitget = VenueCapabilities.for_venue(Venue.BITGET)
         assert binance.market_api_contract != aster.market_api_contract
         assert aster.private_api_contract != binance.private_api_contract
+        assert aster.private_api_contract == VenuePrivateApiContract.ASTER_PRO_API_V3
         assert bitget.market_api_contract.value == "bitget_market_v3"
+
+    def test_aster_v3_risk_health_is_rest_without_private_ws_health(self):
+        caps = VenueCapabilities.for_venue(Venue.ASTER)
+        assert caps.risk_health == CapabilitySupport.SUPPORTED
+        assert caps.private_health == CapabilitySupport.UNSUPPORTED
+        assert caps.supports_risk_health()
+        assert not caps.supports_private_health()
 
 
 class TestReduceOnlyExemptions:

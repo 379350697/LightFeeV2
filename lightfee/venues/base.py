@@ -51,6 +51,7 @@ class VenueMarketApiContract(Enum):
 class VenuePrivateApiContract(Enum):
     BINANCE_USDM_PRIVATE_V3 = "binance_usdm_private_v3"
     ASTER_BALANCE_V2 = "aster_balance_v2_account_v4_position_v2"
+    ASTER_PRO_API_V3 = "aster_pro_api_v3"
     OKX_V5 = "okx_v5"
     BYBIT_V5 = "bybit_v5"
     BITGET_MIX_PRIVATE_V2 = "bitget_mix_private_v2"
@@ -108,12 +109,12 @@ class VenueCapabilities:
             Venue.ASTER: cls(
                 venue=Venue.ASTER,
                 risk_health=CapabilitySupport.SUPPORTED,
-                private_health=CapabilitySupport.SUPPORTED,
+                private_health=CapabilitySupport.UNSUPPORTED,
                 execution_liquidity=ExecutionLiquidityCapability.TRUE_L2,
                 reconcile_quality=ReconcileQuality.ORDER_FILL,
                 testnet_support=TestnetSupport.UNKNOWN,
                 market_api_contract=VenueMarketApiContract.ASTER_PERPETUALS_FAPI,
-                private_api_contract=VenuePrivateApiContract.ASTER_BALANCE_V2,
+                private_api_contract=VenuePrivateApiContract.ASTER_PRO_API_V3,
                 account_contract=VenueAccountContract.SINGLE_OR_MULTI_ASSET,
             ),
             Venue.OKX: cls(

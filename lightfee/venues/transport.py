@@ -1236,7 +1236,12 @@ class VenueTransport(MarketDataClient):
         rate_limiter: Optional[EndpointRateLimiter] = None,
     ) -> None:
         super().__init__(spec, exchange_http_timeout_ms=exchange_http_timeout_ms, rate_limiter=rate_limiter)
-        if mode == "live" and spec.requires_wallet_key and credential is not None:
+        if (
+            mode == "live"
+            and spec.requires_wallet_key
+            and spec.venue_id == Venue.HYPERLIQUID
+            and credential is not None
+        ):
             credential = _normalize_hyperliquid_credential(credential)
         self.mode = mode
         self._credential = credential
@@ -1328,9 +1333,26 @@ class VenueTransport(MarketDataClient):
             raise ValueError(
                 f"live mode requires credentials for {self._spec.venue_id.value}"
             )
-        # Wallet-key venues (Hyperliquid) use private key + account address,
-        # not api_key + api_secret.
         if self._spec.requires_wallet_key:
+            if self._spec.venue_id == Venue.ASTER:
+                from lightfee.venues.aster_v3 import (
+                    credential_has_aster_v3_signer,
+                    _missing_aster_v3_signing_dependencies,
+                )
+
+                if not credential_has_aster_v3_signer(credential):
+                    missing = _missing_aster_v3_signing_dependencies()
+                    if missing:
+                        raise ValueError(
+                            "live mode missing signing dependencies for aster: "
+                            f"{', '.join(missing)}"
+                        )
+                    raise ValueError(
+                        "live mode requires LIGHTFEE_ASTER_WALLET_PRIVATE_KEY "
+                        "or LIGHTFEE_ASTER_API_SECRET containing the Aster API-wallet private key"
+                    )
+                return
+            # Hyperliquid uses private key + account address, not api_key + api_secret.
             if not credential.wallet_private_key:
                 raise ValueError(
                     f"live mode requires wallet_private_key for {self._spec.venue_id.value}"

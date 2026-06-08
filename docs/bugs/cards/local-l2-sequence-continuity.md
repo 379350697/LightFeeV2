@@ -35,6 +35,9 @@ Last-good / quote fallback rules:
 ## V1 / Exchange Semantics
 
 - Binance/Aster: V1 and exchange docs require `pu == previous u`; mismatch means reinitialize local book.
+- Aster public Local-L2 semantics remain Binance-compatible FAPI. This does not
+  imply Aster private account/order APIs are Binance-HMAC compatible; private
+  Aster V3 account/order/open-order paths use a separate Web3 signer client.
 - OKX: older V1/V2 parity included checksum support, but OKX later documented JSON checksum deprecation and sequence validation using `seqId/prevSeqId`. Use exchange docs for OKX classification instead of forcing Binance/Aster `pu` wording.
 - Do not accept broken deltas as a "fix"; that is semantic drift and can create a false-ready book.
 

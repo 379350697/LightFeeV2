@@ -59,6 +59,7 @@ from lightfee.venues.transport import (
     build_hmac_sha512_hex,
     classify_transport_error,
 )
+from lightfee.venues.aster_v3 import AsterV3Client
 
 
 def _trust_hyperliquid_transport_for_test(transport: VenueTransport) -> None:
@@ -162,9 +163,11 @@ class TestSigning:
         spec = gate_spec()
         assert spec.auth_scheme == AuthScheme.HMAC_SHA512_HEX
 
-    def test_aster_signing_is_hmac_sha256_hex(self):
+    def test_aster_signing_is_eip712(self):
         spec = aster_spec()
-        assert spec.auth_scheme == AuthScheme.HMAC_SHA256_HEX
+        assert spec.auth_scheme == AuthScheme.EIP712
+        assert spec.requires_wallet_key is True
+        assert spec.private_base_url == "https://fapi3.asterdex.com"
 
     def test_hyperliquid_signing_is_eip712(self):
         spec = hyperliquid_spec()
@@ -237,8 +240,7 @@ class TestOkxBitgetHeaders:
 # ---------------------------------------------------------------------------
 
 class TestBinanceAsterPostSigning:
-    """Binance and Aster POST orders MUST include timestamp and signature in
-    the query string, not just when GET params are present."""
+    """Binance stays HMAC; Aster V3 must not share that private signing path."""
 
     def test_binance_post_request_includes_timestamp_signature(self):
         spec = binance_spec()
@@ -255,18 +257,135 @@ class TestBinanceAsterPostSigning:
         # Headers should contain API key
         assert headers.get("X-MBX-APIKEY") == "bk"
 
-    def test_aster_post_request_includes_timestamp_signature(self):
+    def test_aster_post_request_does_not_use_binance_hmac(self):
         spec = aster_spec()
-        cred = LiveCredential(api_key="ak", api_secret="as")
+        cred = LiveCredential(
+            api_key="legacy-ak",
+            api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+        )
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
         qs, headers, body = transport._build_signed_request(
-            "POST", "/fapi/v1/order",
+            "POST", "/fapi/v3/order",
             body={"symbol": "BTCUSDT", "side": "SELL", "quantity": "0.01"},
             private=True,
         )
-        assert "timestamp=" in qs
-        assert "signature=" in qs
-        assert headers.get("X-MBX-APIKEY") == "ak"
+        assert "timestamp=" not in qs
+        assert "recvWindow=" not in qs
+        assert "X-MBX-APIKEY" not in headers
+        assert body is not None
+
+    def test_aster_v3_client_builds_web3_signed_query(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        credential = LiveCredential(
+            api_secret=private_key,
+            account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+        )
+        client = AsterV3Client(credential=credential)
+
+        query, headers, body = client.build_signed_request(
+            "POST",
+            "/fapi/v3/order",
+            params={
+                "symbol": "ASTERUSDT",
+                "type": "LIMIT",
+                "side": "BUY",
+                "quantity": "20",
+                "price": "0.5",
+            },
+            nonce=1748310859508867,
+        )
+
+        assert "user=0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e" in query
+        assert "signer=0x21cF8Ae13Bb72632562c6Fff438652Ba1a151bb0" in query
+        assert "nonce=1748310859508867" in query
+        assert "signature=" in query
+        assert "timestamp=" not in query
+        assert "recvWindow=" not in query
+        assert "X-MBX-APIKEY" not in headers
+        assert headers["Content-Type"] == "application/x-www-form-urlencoded"
+        assert body is None
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_fetch_position_accepts_list_response(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.host == "fapi3.asterdex.com"
+            assert request.url.path == "/fapi/v3/positionRisk"
+            params = dict(request.url.params)
+            assert params["symbol"] == "ASTERUSDT"
+            assert "nonce" in params
+            assert "signer" in params
+            assert "signature" in params
+            assert "timestamp" not in params
+            assert "recvWindow" not in params
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "symbol": "ASTERUSDT",
+                        "positionAmt": "12.5",
+                        "entryPrice": "0.91",
+                        "unRealizedProfit": "0.25",
+                    }
+                ],
+            )
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            position = await client.fetch_position("ASTERUSDT")
+        finally:
+            await client.close()
+
+        assert position.venue == Venue.ASTER
+        assert position.symbol == "ASTERUSDT"
+        assert position.quantity == pytest.approx(12.5)
+        assert position.entry_price == pytest.approx(0.91)
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_account_risk_uses_account_with_join_margin(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.host == "fapi3.asterdex.com"
+            assert request.url.path == "/fapi/v3/accountWithJoinMargin"
+            params = dict(request.url.params)
+            assert "nonce" in params
+            assert "signer" in params
+            assert "signature" in params
+            assert "timestamp" not in params
+            assert "recvWindow" not in params
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "totalMarginBalance": "125.5",
+                        "totalMaintMargin": "25.1",
+                        "availableBalance": "74.25",
+                    }
+                },
+            )
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            snapshot = await client.fetch_account_risk_snapshot()
+        finally:
+            await client.close()
+
+        assert snapshot is not None
+        assert snapshot.venue == Venue.ASTER
+        assert snapshot.equity_quote == pytest.approx(125.5)
+        assert snapshot.maintenance_margin_quote == pytest.approx(25.1)
+        assert snapshot.available_balance_quote == pytest.approx(74.25)
+        assert snapshot.source == "aster_v3_account_with_join_margin"
 
     def test_binance_post_signature_matches_signed_payload(self):
         """The signature must be HMAC-SHA256 of the URL-encoded query params (V1 order, with recvWindow)."""
@@ -4373,156 +4492,103 @@ class TestAckOnlyResponses:
 
 class TestV1PassiveBusinessFlowParity:
     @pytest.mark.asyncio
-    async def test_aster_passive_submit_clamps_to_remaining_openable_notional(
-        self, monkeypatch,
-    ):
-        from lightfee.venues.symbol_rules import SymbolRule
+    async def test_aster_passive_submit_uses_v3_order_without_legacy_headroom(self):
+        from lightfee.venues.aster import AsterAdapter
 
-        class FakeRulesCache:
-            async def get(self, transport, venue, venue_symbol):
-                return SymbolRule(
-                    tick_size=0.001,
-                    qty_step=1.0,
-                    min_qty=1.0,
-                    min_notional=0.0,
-                    rule_source="test_aster_rules",
-                )
-
-        monkeypatch.setattr(
-            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
-            lambda: FakeRulesCache(),
-        )
-        monkeypatch.setattr(
-            "lightfee.venues.transport.get_symbol_rules_cache",
-            lambda: FakeRulesCache(),
-        )
-
-        transport = VenueTransport(
-            aster_spec(),
+        adapter = AsterAdapter(
             mode="live",
-            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
         )
-        transport._fapi_position_hedge_mode_cache = False
+        assert adapter._private is not None
         calls = []
 
-        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
-            calls.append((method, path, dict(params or body or {})))
-            if path == "/fapi/v1/remainingOpenableNotionalValue":
-                return {"remainingOpenableNotionalValue": "30"}
-            if path == "/fapi/v1/order":
-                return {
-                    "orderId": "aster-oid-1",
-                    "clientOrderId": (params or {}).get("newClientOrderId", ""),
-                    "status": "NEW",
-                    "price": (params or {}).get("price", "0"),
-                    "origQty": (params or {}).get("quantity", "0"),
-                }
-            return {}
+        async def fake_request(method, path, *, params=None):
+            calls.append((method, path, dict(params or {})))
+            return {
+                "orderId": "aster-oid-1",
+                "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                "status": "NEW",
+                "price": (params or {}).get("price", "0"),
+                "origQty": (params or {}).get("quantity", "0"),
+            }
 
-        transport._request = fake_request
+        adapter._private._request = fake_request
         req = OrderRequest(
             venue=Venue.ASTER,
             symbol="GUAUSDT",
             side=Side.BUY,
-            quantity=100.0,
+            quantity=15.0,
             price=2.0,
             post_only=True,
             client_order_id="aster-maker-1",
         )
 
-        ack = await transport.submit_passive_order(req)
+        ack = await adapter.submit_passive_order(req)
 
-        order_call = [call for call in calls if call[1] == "/fapi/v1/order"][0]
+        order_call = [call for call in calls if call[1] == "/fapi/v3/order"][0]
         assert order_call[2]["quantity"] == "15"
+        assert order_call[2]["timeInForce"] == "GTX"
         assert ack.quantity == 15.0
-        attempt = next(
-            e["payload"] for e in transport.order_diagnostics
-            if e["kind"] == "order.submit_attempt"
-        )
-        assert attempt["aster_headroom_source"] == "remaining_openable_notional"
-        assert attempt["aster_requested_qty"] == 100.0
-        assert attempt["normalized_qty"] == 15.0
+        assert not any(call[1] == "/fapi/v1/remainingOpenableNotionalValue" for call in calls)
+        await adapter.shutdown()
 
     @pytest.mark.asyncio
-    async def test_aster_passive_submit_retries_smaller_after_max_notional_reject(
-        self, monkeypatch,
-    ):
-        from lightfee.venues.symbol_rules import SymbolRule
+    async def test_aster_v3_passive_submit_reject_raises_order_submit_error(self):
+        from lightfee.venues.aster import AsterAdapter
 
-        class FakeRulesCache:
-            async def get(self, transport, venue, venue_symbol):
-                return SymbolRule(
-                    tick_size=0.001,
-                    qty_step=1.0,
-                    min_qty=1.0,
-                    min_notional=0.0,
-                    rule_source="test_aster_rules",
-                )
-
-        monkeypatch.setattr(
-            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
-            lambda: FakeRulesCache(),
-        )
-        monkeypatch.setattr(
-            "lightfee.venues.transport.get_symbol_rules_cache",
-            lambda: FakeRulesCache(),
-        )
-
-        transport = VenueTransport(
-            aster_spec(),
+        adapter = AsterAdapter(
             mode="live",
-            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
         )
-        transport._fapi_position_hedge_mode_cache = False
+        assert adapter._private is not None
         order_attempts = []
-        headroom_calls = 0
 
-        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
-            nonlocal headroom_calls
-            if path == "/fapi/v1/remainingOpenableNotionalValue":
-                headroom_calls += 1
-                if headroom_calls == 1:
-                    raise TransportError(
-                        TransportErrorCategory.TRANSPORT_FAILURE,
-                        "headroom endpoint temporarily unavailable",
-                    )
-                return {"remainingOpenableNotionalValue": "30"}
-            if path == "/fapi/v1/order":
-                order_attempts.append(dict(params or {}))
-                if len(order_attempts) == 1:
-                    raise TransportError(
-                        TransportErrorCategory.REQUEST_REJECTED,
-                        "HTTP 400: max notional",
-                        status_code=400,
-                        body='{"code":-5018,"msg":"maximum notional value limit"}',
-                    )
-                return {
-                    "orderId": "aster-oid-2",
-                    "clientOrderId": (params or {}).get("newClientOrderId", ""),
-                    "status": "NEW",
-                    "price": (params or {}).get("price", "0"),
-                    "origQty": (params or {}).get("quantity", "0"),
-                }
-            return {}
+        async def fake_request(method, path, *, params=None):
+            order_attempts.append((method, path, dict(params or {})))
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: max notional",
+                status_code=400,
+                body='{"code":-5018,"msg":"maximum notional value limit"}',
+            )
 
-        transport._request = fake_request
+        adapter._private._request = fake_request
         req = OrderRequest(
             venue=Venue.ASTER,
             symbol="GUAUSDT",
             side=Side.BUY,
-            quantity=100.0,
+            quantity=15.0,
             price=2.0,
             post_only=True,
             client_order_id="aster-maker-2",
         )
 
-        ack = await transport.submit_passive_order(req)
+        with pytest.raises(OrderSubmitError) as exc:
+            await adapter.submit_passive_order(req)
 
-        assert [attempt["quantity"] for attempt in order_attempts] == ["100", "15"]
-        assert ack.quantity == 15.0
-        result = transport.order_diagnostics[-1]["payload"]
-        assert result["response_classification"] == "ack_accepted"
-        assert result["aster_retry_after_max_notional"] is True
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert order_attempts == [
+            (
+                "POST",
+                "/fapi/v3/order",
+                {
+                    "symbol": "GUAUSDT",
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "quantity": "15",
+                    "price": "2",
+                    "timeInForce": "GTX",
+                    "newClientOrderId": "aster-maker-2",
+                },
+            )
+        ]
+        await adapter.shutdown()
 
     @pytest.mark.asyncio
     async def test_binance_post_only_would_take_is_classified_explicitly(
@@ -5741,7 +5807,7 @@ class TestAsterSpec:
     def test_aster_spec_uses_official_asterdex_hosts(self):
         spec = aster_spec()
         assert spec.public_base_url == "https://fapi.asterdex.com"
-        assert spec.private_base_url == "https://fapi.asterdex.com"
+        assert spec.private_base_url == "https://fapi3.asterdex.com"
         assert spec.l2_snapshot_path == "/fapi/v1/depth"
 
 

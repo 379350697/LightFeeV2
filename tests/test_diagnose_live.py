@@ -1178,8 +1178,7 @@ def test_exchange_truth_targets_aster_for_xcnusdt_pair(monkeypatch):
                 assert path == "/v5/order/realtime"
                 assert kwargs["params"]["symbol"] == "XCNUSDT"
                 return {"result": {"list": []}}
-            assert path == "/fapi/v1/openOrders"
-            assert kwargs["params"]["symbol"] == "XCNUSDT"
+            raise AssertionError("aster open orders must use adapter V3 path")
             return []
 
     class FakeAdapter:
@@ -1193,6 +1192,11 @@ def test_exchange_truth_targets_aster_for_xcnusdt_pair(monkeypatch):
                 venue=venue, symbol=symbol, side=Side.BUY,
                 quantity=0.0, entry_price=0.0, observed_at_ms=1700000000000,
             )
+
+        async def fetch_open_orders(self, symbol=None):
+            assert self.venue == "aster"
+            assert symbol == "XCNUSDT"
+            return []
 
         async def shutdown(self):
             pass

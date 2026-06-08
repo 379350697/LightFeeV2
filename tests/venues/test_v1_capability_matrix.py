@@ -15,6 +15,7 @@ from lightfee.venues.base import (
     ReconcileQuality,
     TestnetSupport,
     VenueCapabilities,
+    VenuePrivateApiContract,
 )
 from lightfee.venues.capabilities import (
     OrderSizingMode,
@@ -54,6 +55,14 @@ class TestCapabilityMatrixMatchesV1:
     def test_aster_risk_health_supported(self):
         caps = get_capability_flags(Venue.ASTER)
         assert caps.risk_health == CapabilitySupport.SUPPORTED
+
+    def test_aster_v3_private_health_is_not_legacy_private_ws(self):
+        caps = get_capability_flags(Venue.ASTER)
+        assert caps.private_health == CapabilitySupport.UNSUPPORTED
+        assert caps.cached_private_health is False
+        assert caps.passive_progress_mode == PassiveProgressMode.PERIODIC_POLL
+        assert caps.passive_wakeups is False
+        assert caps.private_api_contract == VenuePrivateApiContract.ASTER_PRO_API_V3
 
     def test_bitget_risk_health_unsupported_v1_parity(self):
         """DEV-002 fix: Bitget risk_health must be UNSUPPORTED per V1."""
@@ -231,6 +240,12 @@ class TestCapabilityFlagsSanity:
         """Venues with risk_health should also support cached_private_health."""
         matrix = capability_matrix()
         for venue, flags in matrix.items():
+            if venue == Venue.ASTER:
+                # Aster Pro API V3 exposes REST account risk, but no Binance-style
+                # private WS/listen-key health contract.
+                assert flags.risk_health == CapabilitySupport.SUPPORTED
+                assert flags.private_health == CapabilitySupport.UNSUPPORTED
+                continue
             if flags.risk_health == CapabilitySupport.SUPPORTED:
                 assert flags.private_health == CapabilitySupport.SUPPORTED, (
                     f"{venue}: risk_health requires private_health"
