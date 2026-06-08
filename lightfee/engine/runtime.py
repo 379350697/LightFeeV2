@@ -2945,26 +2945,60 @@ class LiveRuntime:
                         recovery_required_only=True,
                     )
                     core_decision = truth_unavailable_core_decision(venue)
+                    fallback_planned = bool(planned_fallback_symbols)
+                    blocking_required_truth = (
+                        bool(recovery_truth_required_sources)
+                        and not fallback_planned
+                        and not core_decision.entry_allowed
+                    )
                     payload.update(
                         {
                             "fallback_symbol_count": len(planned_fallback_symbols),
                             "fallback_symbols_sample": planned_fallback_symbols[:10],
+                            "fallback_planned": fallback_planned,
                             "truth_required_by": recovery_truth_required_sources,
                             "truth_required_symbol_sources": (
                                 recovery_truth_required_symbol_source_payload
                             ),
                             "core_decision": core_decision.kind.value,
                             "core_block_reason": core_decision.block_reason,
+                            "blocking": blocking_required_truth,
                         }
                     )
-                    self.journal.append(
-                        "recovery.live_position_bulk_probe_error",
-                        payload,
-                    )
                     if not recovery_truth_required_sources:
+                        payload.update(
+                            {
+                                "diagnostic_scope": "best_effort_bulk_positions",
+                                "decision": (
+                                    "running_with_nonblocking_health_diagnostic"
+                                ),
+                                "blocking": False,
+                            }
+                        )
+                        self._append_runtime_diagnostic_event(
+                            "recovery.live_position_bulk_diagnostic_error",
+                            payload,
+                            now_ms=probe_finished_at_ms,
+                            key_parts=(venue.value, str(payload.get("classification", ""))),
+                            interval_ms=self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
+                        )
                         return (venue, [])
                     if not planned_fallback_symbols:
+                        payload["diagnostic_scope"] = "required_recovery_truth"
+                        payload["decision"] = (
+                            "truth_unavailable_for_required_recovery"
+                        )
+                        self.journal.append(
+                            "recovery.required_position_truth_unavailable",
+                            payload,
+                        )
                         return (venue, [])
+                    payload["diagnostic_scope"] = "required_recovery_truth"
+                    payload["decision"] = "bounded_symbol_fallback_required"
+                    self.journal.append(
+                        "recovery.required_position_bulk_fallback_planned",
+                        payload,
+                    )
                     fallback_probe_symbol_cache[(venue, False)] = (
                         planned_fallback_symbols
                     )
@@ -2982,6 +3016,8 @@ class LiveRuntime:
                         if is_active_bulk_position(pos)
                     ],
                 )
+
+        fallback_probe_failures: dict[Venue, list[dict]] = {}
 
         async def fetch_one(venue: Venue, adapter: VenueAdapter, symbol: str):
             async with semaphore:
@@ -3009,6 +3045,8 @@ class LiveRuntime:
                             "recovery.live_position_probe_error",
                             payload,
                         )
+                    if recovery_truth_required_sources:
+                        fallback_probe_failures.setdefault(venue, []).append(payload)
                     return None
 
         bulk_results = await asyncio.gather(
@@ -3050,6 +3088,47 @@ class LiveRuntime:
             for symbol in fallback_probe_symbols[venue]
         ]
         results = await asyncio.gather(*tasks) if tasks else []
+        if recovery_truth_required_sources and fallback_probe_failures:
+            failed_symbols: list[str] = []
+            failed_samples: list[dict] = []
+            for venue, failures in fallback_probe_failures.items():
+                for failure in failures:
+                    symbol = str(
+                        failure.get("normalized_symbol")
+                        or failure.get("symbol")
+                        or failure.get("venue_symbol")
+                        or ""
+                    )
+                    if symbol:
+                        failed_symbols.append(symbol)
+                    if len(failed_samples) < 10:
+                        failed_samples.append(
+                            {
+                                "venue": venue.value,
+                                "symbol": symbol,
+                                "classification": failure.get("classification", ""),
+                                "endpoint": failure.get("endpoint", ""),
+                            }
+                        )
+            self.journal.append(
+                "recovery.required_position_truth_unavailable",
+                {
+                    "probe_scope": "bounded_symbol_positions",
+                    "diagnostic_scope": "required_recovery_truth",
+                    "classification": "truth_unavailable",
+                    "truth_required_by": recovery_truth_required_sources,
+                    "truth_required_symbol_sources": (
+                        recovery_truth_required_symbol_source_payload
+                    ),
+                    "failed_symbol_count": len(failed_symbols),
+                    "failed_symbols_sample": failed_symbols[:10],
+                    "failure_samples": failed_samples,
+                    "fallback_planned": True,
+                    "blocking": True,
+                    "decision": "truth_unavailable_for_required_recovery",
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
         snapshots.extend(
             item for item in results
             if item is not None and abs(getattr(item[1], "quantity", 0.0)) > 1e-9
@@ -4576,51 +4655,96 @@ class LiveRuntime:
 
         # --- Build price lookup from snapshot quotes ---
         price_hints: dict[str, float] = {}
-        stale_order_quote_count = 0
-        stale_order_quote_samples: list[dict] = []
+        stale_quote_records: list[tuple[tuple[str, str], dict]] = []
+        stale_quote_diagnostics_emitted = False
         for quote_key, quote in snapshot.quotes.items():
             quote_observed_at_ms = (
                 int(getattr(quote, "observed_at_ms", 0) or 0)
                 or int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
             )
-            quote_age_ms = now_ms - quote_observed_at_ms if quote_observed_at_ms > 0 else 0
+            quote_age_ms = (
+                now_ms - quote_observed_at_ms
+                if quote_observed_at_ms > 0
+                else 0
+            )
+            venue = str(getattr(quote, "venue", "") or "")
+            symbol = str(getattr(quote, "symbol", "") or "")
+            if (not venue or not symbol) and ":" in str(quote_key):
+                key_venue, key_symbol = str(quote_key).split(":", 1)
+                venue = venue or key_venue
+                symbol = symbol or key_symbol
+            quote_scope_key = (venue.lower(), symbol.upper())
             if (
                 quote_observed_at_ms > 0
                 and quote_age_ms > self.config.runtime.max_order_quote_age_ms
             ):
-                stale_order_quote_count += 1
-                if len(stale_order_quote_samples) < 10:
-                    venue = str(getattr(quote, "venue", "") or "")
-                    symbol = str(getattr(quote, "symbol", "") or "")
-                    if (not venue or not symbol) and ":" in str(quote_key):
-                        key_venue, key_symbol = str(quote_key).split(":", 1)
-                        venue = venue or key_venue
-                        symbol = symbol or key_symbol
-                    stale_order_quote_samples.append({
-                        "venue": venue,
-                        "symbol": symbol,
-                        "quote_age_ms": quote_age_ms,
-                        "observed_at_ms": quote_observed_at_ms,
-                        "max_age_ms": self.config.runtime.max_order_quote_age_ms,
-                        "fallback_source": getattr(
-                            snapshot,
-                            "acquisition_mode",
-                            "sidecar_snapshot",
-                        ),
-                        "blocker_family": "stale_quote",
-                    })
+                sample = {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "quote_age_ms": quote_age_ms,
+                    "observed_at_ms": quote_observed_at_ms,
+                    "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                    "fallback_source": getattr(
+                        snapshot,
+                        "acquisition_mode",
+                        "sidecar_snapshot",
+                    ),
+                    "blocker_family": "stale_quote",
+                }
+                stale_quote_records.append((quote_scope_key, sample))
                 continue
             price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0 if quote.bid > 0 and quote.ask > 0 else 0.0
-        if stale_order_quote_count > 0:
-            self.journal.append(
-                "runtime.order_quote_stale_skipped",
-                {
-                    "count": stale_order_quote_count,
-                    "max_age_ms": self.config.runtime.max_order_quote_age_ms,
-                    "samples": stale_order_quote_samples,
-                    "ts_ms": now_ms,
-                },
-            )
+
+        def emit_stale_quote_diagnostics(
+            entry_quote_keys: set[tuple[str, str]],
+        ) -> None:
+            nonlocal stale_quote_diagnostics_emitted
+            if stale_quote_diagnostics_emitted:
+                return
+            stale_quote_diagnostics_emitted = True
+            stale_order_quote_samples: list[dict] = []
+            stale_health_quote_samples: list[dict] = []
+            stale_order_quote_count = 0
+            stale_health_quote_count = 0
+            for quote_scope_key, sample in stale_quote_records:
+                if quote_scope_key in entry_quote_keys:
+                    stale_order_quote_count += 1
+                    if len(stale_order_quote_samples) < 10:
+                        stale_order_quote_samples.append(sample)
+                else:
+                    stale_health_quote_count += 1
+                    if len(stale_health_quote_samples) < 10:
+                        stale_health_quote_samples.append({
+                            **sample,
+                            "diagnostic_scope": "all_snapshot_quotes",
+                            "blocking": False,
+                        })
+            if stale_order_quote_count > 0:
+                self.journal.append(
+                    "runtime.order_quote_stale_skipped",
+                    {
+                        "count": stale_order_quote_count,
+                        "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                        "samples": stale_order_quote_samples,
+                        "ts_ms": now_ms,
+                    },
+                )
+            if stale_health_quote_count > 0:
+                self._append_runtime_diagnostic_event(
+                    "runtime.order_quote_stale_health_summary",
+                    {
+                        "count": stale_health_quote_count,
+                        "max_age_ms": self.config.runtime.max_order_quote_age_ms,
+                        "samples": stale_health_quote_samples,
+                        "diagnostic_scope": "all_snapshot_quotes",
+                        "blocking": False,
+                        "suppressed_count": 0,
+                        "ts_ms": now_ms,
+                    },
+                    now_ms=now_ms,
+                    key_parts=("all_snapshot_quotes",),
+                    interval_ms=self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
+                )
 
         # --- Discover tradeable candidates ---
         # V1 live scan recovery gate: require consecutive fresh snapshots before entry
@@ -4650,6 +4774,16 @@ class LiveRuntime:
                 now_ms=now_ms,
                 stage="shortlist",
             )
+            entry_quote_keys: set[tuple[str, str]] = set()
+            for candidate in tradeable:
+                symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                if not symbol:
+                    continue
+                for venue_attr in ("long_venue", "short_venue"):
+                    venue = str(getattr(candidate, venue_attr, "") or "").lower()
+                    if venue:
+                        entry_quote_keys.add((venue, symbol))
+            emit_stale_quote_diagnostics(entry_quote_keys)
             l2_tracking_tradeable = list(tradeable)
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 tradeable,

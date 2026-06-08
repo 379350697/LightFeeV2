@@ -1890,6 +1890,9 @@ def _build_production_acceptance_gate(
     okx_instrument_missing_skipped_count = 0
     local_l2_official_rebuild_count = 0
     snapshot_fallback_blocking_count = 0
+    bulk_health_diagnostic_count = 0
+    contained_admission_count = 0
+    required_position_truth_unavailable_count = 0
     entry_opened_count = 0
     position_opened_count = 0
     residual_count = 0
@@ -1933,6 +1936,34 @@ def _build_production_acceptance_gate(
             if payload.get("instrument_missing_error"):
                 okx_instrument_missing_skipped_count += _okx_instrument_missing_skipped_count(payload)
                 exception_conclusions["okx_instrument_missing_skipped"] = "official_doc"
+
+        if kind == "recovery.live_position_bulk_diagnostic_error":
+            truth_required_by = payload.get("truth_required_by") or []
+            if not truth_required_by and payload.get("blocking") is not True:
+                bulk_health_diagnostic_count += 1
+                exception_conclusions["nonblocking_health_diagnostic"] = (
+                    "nonblocking_health_diagnostic"
+                )
+
+        if kind == "recovery.required_position_truth_unavailable":
+            required_position_truth_unavailable_count += 1
+            if payload.get("blocking") is True:
+                exception_conclusions["blocking_required_truth"] = (
+                    "blocking_required_truth"
+                )
+
+        if kind == "runtime.entry_admission_venue_degraded":
+            reason_text = f"{reason} {payload.get('source', '')}".lower()
+            if (
+                payload.get("block_scope") == "venue"
+                and payload.get("evidence_gap") is False
+                and (
+                    "admission" in reason_text
+                    or "insufficient_margin" in reason_text
+                )
+            ):
+                contained_admission_count += 1
+                exception_conclusions["contained_admission"] = "contained_admission"
 
         if kind in ("runtime.local_l2_sequence_gap_rebuild", "runtime.local_l2_snapshot_error"):
             if _has_official_sequence_rebuild_evidence(payload):
@@ -2021,6 +2052,10 @@ def _build_production_acceptance_gate(
             blocking_reasons.append("exchange_truth_open_orders_present")
     if (entry_opened_count or position_opened_count) and not trade_lifecycle_closed:
         blocking_reasons.append("entry_or_position_opened_without_fixture_finalized_evidence")
+    if required_position_truth_unavailable_count and exception_conclusions.get(
+        "blocking_required_truth"
+    ) == "blocking_required_truth":
+        blocking_reasons.append("blocking_required_truth")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -2029,6 +2064,14 @@ def _build_production_acceptance_gate(
         "okx_instrument_missing_skipped": okx_instrument_missing_skipped_count,
         "local_l2_official_rebuild": local_l2_official_rebuild_count,
         "snapshot_fallback_blocking": snapshot_fallback_blocking_count,
+        "nonblocking_health_diagnostic": bulk_health_diagnostic_count,
+        "contained_admission": contained_admission_count,
+        "blocking_required_truth": (
+            required_position_truth_unavailable_count
+            if exception_conclusions.get("blocking_required_truth")
+            == "blocking_required_truth"
+            else 0
+        ),
     }
     unclassified_exceptions = [
         name for name, count in diagnostic_counts.items()
@@ -2052,6 +2095,11 @@ def _build_production_acceptance_gate(
         "okx_instrument_missing_skipped_count": okx_instrument_missing_skipped_count,
         "local_l2_official_rebuild_count": local_l2_official_rebuild_count,
         "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
+        "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
+        "contained_admission_count": contained_admission_count,
+        "required_position_truth_unavailable_count": (
+            required_position_truth_unavailable_count
+        ),
         "entry_opened_count": entry_opened_count,
         "position_opened_count": position_opened_count,
         "open_position_count": open_position_count,

@@ -17,6 +17,26 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest production evidence contract split, 2026-06-08: CL-055 already closed
+the core trading risk for issue 2/3; this follow-up separates the diagnostic
+surface so healthy deploy windows are not misread as unclosed recovery risk.
+No-work bulk position timeout now emits
+`recovery.live_position_bulk_diagnostic_error` as nonblocking health evidence.
+Required recovery bulk timeout with bounded fallback now emits
+`recovery.required_position_bulk_fallback_planned`; only missing fallback or
+fallback failure emits the blocking
+`recovery.required_position_truth_unavailable`. Entry quote stale blockers are
+now admission-filtered candidate-leg scoped, while whole-snapshot stale quote
+noise becomes a rate-limited nonblocking health summary.
+`diagnose_live.py --since-deploy` classifies `blocking_required_truth`,
+`contained_admission`, and
+`nonblocking_health_diagnostic` separately so Hyperliquid admission cooldowns
+and full-snapshot health noise do not mask required recovery blockers. Local
+verification passed focused RED/GREEN and related recovery/residual/admission/
+snapshot/entry/diagnose/order-uncertainty regression scope. Full evidence is
+recorded in
+[`daily/2026-06-08.md#cluster-cl-056-production-error-evidence-contract-split`](daily/2026-06-08.md#cluster-cl-056-production-error-evidence-contract-split).
+
 Latest recovery truth-probe and residual-repair ACK-only closure, 2026-06-08:
 production issue 2 (`recovery.live_position_bulk_probe_error`) and issue 3
 (`recovery.residual_repair_failed` ACK-only) were closed as one recovery-truth

@@ -232,7 +232,7 @@ async def test_rate_limit_probe_error_is_structured_and_non_empty():
     [
         (
             asyncio.TimeoutError(),
-            "recovery.live_position_bulk_probe_error",
+            "recovery.live_position_bulk_diagnostic_error",
             "timeout",
         ),
         (
@@ -282,6 +282,11 @@ async def test_bulk_probe_errors_keep_aggregate_symbol_evidence(
     assert payload["classification"] == expected_classification
     assert payload["exception_class"]
     assert payload["error"]
+    if expected_kind == "recovery.live_position_bulk_diagnostic_error":
+        assert payload["truth_required_by"] == []
+        assert payload["diagnostic_scope"] == "best_effort_bulk_positions"
+        assert payload["blocking"] is False
+        assert payload["decision"] == "running_with_nonblocking_health_diagnostic"
 
 
 @pytest.mark.asyncio
@@ -388,7 +393,7 @@ async def test_bybit_bulk_timeout_falls_back_only_to_truth_required_symbols():
     bulk_error = next(
         record["payload"]
         for record in records
-        if record["kind"] == "recovery.live_position_bulk_probe_error"
+        if record["kind"] == "recovery.required_position_bulk_fallback_planned"
     )
     assert bulk_error["venue"] == "bybit"
     assert bulk_error["classification"] == "timeout"
@@ -401,6 +406,13 @@ async def test_bybit_bulk_timeout_falls_back_only_to_truth_required_symbols():
         "pending_residual_repair": ["OWNEDUSDT"],
     }
     assert bulk_error["core_decision"] == "RISK_ONLY_WAIT_FOR_TRUTH"
+    assert bulk_error["fallback_planned"] is True
+    assert bulk_error["blocking"] is False
+    assert bulk_error["decision"] == "bounded_symbol_fallback_required"
+    assert not any(
+        record["kind"] == "recovery.required_position_truth_unavailable"
+        for record in records
+    )
     assert not any(
         record["kind"] == "recovery.live_position_static_config_probe_skipped"
         for record in records
@@ -476,9 +488,12 @@ async def test_bybit_bulk_timeout_skips_truth_required_fallback_over_cap():
     bulk_error = next(
         record["payload"]
         for record in records
-        if record["kind"] == "recovery.live_position_bulk_probe_error"
+        if record["kind"] == "recovery.required_position_truth_unavailable"
     )
     assert bulk_error["fallback_symbol_count"] == 0
     assert bulk_error["truth_required_symbol_sources"][
         "pending_residual_repair"
     ] == [f"OWNED{i}USDT" for i in range(30)]
+    assert bulk_error["fallback_planned"] is False
+    assert bulk_error["blocking"] is True
+    assert bulk_error["decision"] == "truth_unavailable_for_required_recovery"

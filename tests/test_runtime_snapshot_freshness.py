@@ -545,6 +545,210 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
 
 
 @pytest.mark.asyncio
+async def test_runtime_ignores_non_candidate_stale_quotes_for_entry_blockers(tmp_path, monkeypatch):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    stale_quotes = {
+        f"binance:STALE{idx}USDT": QuoteSnapshot(
+            venue="binance",
+            symbol=f"STALE{idx}USDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=60000,
+        )
+        for idx in range(3000)
+    }
+    snapshot = SidecarSnapshot(
+        published_at_ms=65000,
+        market_observed_at_ms=65000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            **stale_quotes,
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=69000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=69000,
+            ),
+        },
+        candidates=[_freshness_candidate()],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [record["kind"] for record in records]
+    assert "runtime.order_quote_stale_skipped" not in kinds
+    assert "runtime.quote_stale" not in kinds
+    no_entry = [
+        record for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    ]
+    if no_entry:
+        assert no_entry[-1]["payload"]["reason"] != "candidate_snapshot_domain_stale"
+        assert (
+            no_entry[-1]["payload"]
+            .get("snapshot_freshness_blocked_counts", {})
+            .get("quote_stale", 0)
+            == 0
+        )
+    freshness_decisions = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert not any(
+        decision.get("reason") == "quote_stale"
+        for decision in freshness_decisions
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entry_blockers(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    runtime.state.venue_entry_cooldowns["hyperliquid:*"] = {
+        "venue": "hyperliquid",
+        "symbol": "*",
+        "reason": "insufficient_margin_admission_blocked",
+        "source": "pending_hedge",
+        "block_scope": "venue",
+        "blocked_until_ms": 130000,
+        "official_doc_url": (
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+        ),
+        "evidence_gap": False,
+    }
+    blocked_candidate = CandidateInput(
+        long_venue="bybit",
+        short_venue="hyperliquid",
+        symbol="SEIUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=10.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=10.0,
+        entry_notional_quote=50.0,
+        first_funding_timestamp_ms=400000,
+    )
+    snapshot = SidecarSnapshot(
+        published_at_ms=65000,
+        market_observed_at_ms=65000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "bybit:SEIUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="SEIUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=60000,
+            ),
+            "hyperliquid:SEIUSDT": QuoteSnapshot(
+                venue="hyperliquid",
+                symbol="SEIUSDT",
+                bid=100.2,
+                ask=101.2,
+                observed_at_ms=60000,
+            ),
+        },
+        candidates=[blocked_candidate],
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [record["kind"] for record in records]
+    assert "runtime.entry_admission_venue_degraded" in kinds
+    assert "runtime.order_quote_stale_skipped" not in kinds
+    assert "runtime.quote_stale" not in kinds
+    no_entry = [
+        record for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    ]
+    assert (
+        no_entry[-1]["payload"]["reason"]
+        == "tradeable_candidates_blocked_by_entry_admission"
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_invalid_quote_decision_carries_sanitized_quote_evidence(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(

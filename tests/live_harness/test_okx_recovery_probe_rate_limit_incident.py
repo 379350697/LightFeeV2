@@ -276,12 +276,20 @@ async def test_okx_recovery_bulk_timeout_does_not_fan_out_positions(monkeypatch)
     timeout = next(
         record["payload"]
         for record in records
-        if record["kind"] == "recovery.live_position_bulk_probe_error"
+        if record["kind"] == "recovery.live_position_bulk_diagnostic_error"
     )
     assert timeout["classification"] == "timeout"
     assert timeout["endpoint"] == "/api/v5/account/positions"
     assert timeout["symbol_count"] == 2
     assert timeout["requested_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert timeout["truth_required_by"] == []
+    assert timeout["diagnostic_scope"] == "best_effort_bulk_positions"
+    assert timeout["blocking"] is False
+    assert timeout["decision"] == "running_with_nonblocking_health_diagnostic"
+    assert not any(
+        record["kind"] == "recovery.required_position_truth_unavailable"
+        for record in records
+    )
 
 
 @pytest.mark.asyncio
@@ -336,12 +344,19 @@ async def test_okx_recovery_bulk_timeout_with_truth_required_work_uses_bounded_f
     timeout = next(
         record["payload"]
         for record in records
-        if record["kind"] == "recovery.live_position_bulk_probe_error"
+        if record["kind"] == "recovery.required_position_bulk_fallback_planned"
     )
     assert timeout["classification"] == "timeout"
     assert timeout["truth_required_by"] == ["pending_residual_repair"]
     assert timeout["fallback_symbol_count"] == 1
     assert timeout["fallback_symbols_sample"] == ["ETHUSDT"]
+    assert timeout["fallback_planned"] is True
+    assert timeout["blocking"] is False
+    assert timeout["decision"] == "bounded_symbol_fallback_required"
+    assert not any(
+        record["kind"] == "recovery.required_position_truth_unavailable"
+        for record in records
+    )
 
 
 def test_okx_instrument_missing_is_non_retryable_metadata_skip_not_health_critical():

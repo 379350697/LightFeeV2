@@ -27,6 +27,10 @@ Last-good / quote fallback rules:
 
 - `last_good_sidecar` can keep coarse shortlist diagnostics alive, but live entry still requires targeted revalidate or an explicit block before dispatch.
 - Quote lease and ws-bbo blockers must distinguish `budget_exhausted`, `waiting_for_subscription`, `stale_quote`, and `invalid_quote`; a blocked top candidate must not turn the whole scan into an unowned incident if another candidate satisfies admission, L2, and quote gates.
+- Whole-snapshot stale quote volume is health evidence only. Only
+  admission-filtered selected/tracked/recovery-owned candidate-leg stale quotes
+  may emit entry blockers such as `runtime.order_quote_stale_skipped` or
+  `runtime.quote_stale`.
 - Diagnostic payloads must include candidate universe/counts, selected/tracked pair, blocker-family counts, quote age, fallback source, and targeted revalidate outcome. These are evidence fields only; they do not relax Local-L2 sequence continuity.
 - New-entry admission venue downgrades run before Local-L2/quote tracking, so a
   degraded venue should not consume hot Local-L2 or ws-bbo budget for fresh
@@ -52,6 +56,7 @@ Last-good / quote fallback rules:
 | 2026-06-07 | Post-`21e5d44` fallback/quote evidence closure | local implementation pending deploy | Added RED/GREEN contracts that `runtime.live_scan_revalidate_required` marks `fallback_source=last_good_sidecar` and `targeted_revalidate_required=true`; quote readiness evidence carries blocker families and quote ages; static recovery-probe skip evidence is bounded summary rather than noisy per-universe spam. No sequence continuity relaxation was made. |
 | 2026-06-07 | Entry admission prefilter and no-entry stage breakdown | local implementation pending deploy | `runtime.entry_admission_venue_degraded` now summarizes venue-scope admission pruning before Local-L2/quote tracking. `scan.no_entry_diagnostics` includes stage counts for candidate universe, unsupported symbol, entry-admission venue downgrade, snapshot/quote freshness, liquidity, and entry selection. |
 | 2026-06-08 | Structural open-interest degraded evidence | local RED/GREEN, deploy pending | CL-052 adds endpoint, source, floor/current value, fallback source, and targeted revalidate scope to `perp_open_interest_structural` payloads. This is diagnostic evidence only and does not relax Local-L2 sequence continuity or entry dispatch truth requirements. |
+| 2026-06-08 | Whole-snapshot stale quote noise split | local RED/GREEN, deploy pending | CL-056 limits stale quote entry blockers to admission-filtered candidate-leg quote keys and emits non-candidate or admission-blocked stale quote volume as rate-limited `runtime.order_quote_stale_health_summary` with `blocking=false`. |
 
 ## Recurrences
 

@@ -231,6 +231,119 @@ def test_run_diagnose_acceptance_gate_blocks_insufficient_exception_evidence(mon
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_contained_admission(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "recovery.live_position_bulk_diagnostic_error",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "BTCUSDT",
+                    "classification": "timeout",
+                    "truth_required_by": [],
+                    "diagnostic_scope": "best_effort_bulk_positions",
+                    "blocking": False,
+                },
+            },
+            {
+                "ts_ms": 1779816049100,
+                "kind": "runtime.entry_admission_venue_degraded",
+                "payload": {
+                    "venue": "hyperliquid",
+                    "symbol": "BTCUSDT",
+                    "reason": "insufficient_margin_admission_blocked",
+                    "block_scope": "venue",
+                    "evidence_gap": False,
+                    "cooldown_active": True,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BTCUSDT",
+            venues=["okx", "hyperliquid"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["bulk_health_diagnostic_count"] == 1
+        assert gate["contained_admission_count"] == 1
+        assert gate["required_position_truth_unavailable_count"] == 0
+        assert gate["exception_conclusions"]["nonblocking_health_diagnostic"] == "nonblocking_health_diagnostic"
+        assert gate["exception_conclusions"]["contained_admission"] == "contained_admission"
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_acceptance_gate_blocks_required_position_truth_unavailable(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "risk_only",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "recovery.required_position_truth_unavailable",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "ETHUSDT",
+                    "classification": "timeout",
+                    "truth_required_by": ["pending_residual_repair"],
+                    "blocking": True,
+                    "decision": "truth_unavailable_for_required_recovery",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ETHUSDT",
+            venues=["okx"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["required_position_truth_unavailable_count"] == 1
+        assert gate["exception_conclusions"]["blocking_required_truth"] == "blocking_required_truth"
+        assert gate["blocking_reasons"] == ["blocking_required_truth"]
+        assert gate["gate_passed"] is False
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_classifies_scoped_snapshot_fallback_as_v1_parity(monkeypatch):
     from scripts import diagnose_live as dl
 

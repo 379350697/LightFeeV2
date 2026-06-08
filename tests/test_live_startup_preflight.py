@@ -1272,11 +1272,15 @@ class TestRuntimePreflight:
             ]
             payload = next(
                 r["payload"] for r in records
-                if r["kind"] == "recovery.live_position_bulk_probe_error"
+                if r["kind"] == "recovery.live_position_bulk_diagnostic_error"
             )
             assert payload["venue"] == "okx"
             assert payload["endpoint"] == "/api/v5/account/positions"
             assert payload["classification"] == "timeout"
+            assert payload["truth_required_by"] == []
+            assert payload["diagnostic_scope"] == "best_effort_bulk_positions"
+            assert payload["blocking"] is False
+            assert payload["decision"] == "running_with_nonblocking_health_diagnostic"
             assert payload["timeout_budget_ms"] == 10
             assert payload["timeout_budget_source"] == (
                 "runtime.live_recovery_rest_probe_timeout_ms"
