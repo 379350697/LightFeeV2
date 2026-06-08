@@ -3,6 +3,24 @@ from types import SimpleNamespace
 from scripts import verify_deploy_manifest as manifest
 
 
+def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch):
+    (tmp_path / ".deploy_manifest.json").write_text('{"old": "hash"}', encoding="utf-8")
+    deploy_file = tmp_path / "lightfee" / "engine" / "runtime.py"
+    deploy_file.parent.mkdir(parents=True)
+    deploy_file.write_text("print('runtime')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        manifest,
+        "git_tracked_files",
+        lambda root: [".deploy_manifest.json", "lightfee/engine/runtime.py"],
+    )
+
+    generated = manifest.build_manifest(tmp_path)
+
+    assert ".deploy_manifest.json" not in generated
+    assert "lightfee/engine/runtime.py" in generated
+
+
 def _stub_manifest_generation(monkeypatch):
     monkeypatch.setattr(manifest, "build_manifest", lambda root: {"lightfee/engine/runtime.py": "abc"})
 

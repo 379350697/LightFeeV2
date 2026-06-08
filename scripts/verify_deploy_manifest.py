@@ -44,6 +44,7 @@ CRITICAL_FILES = [
 
 # --- Files/dirs to exclude from sync ---
 EXCLUDE_PATTERNS = [
+    ".deploy_manifest.json",  # generated artifact; self-hash cannot be stable
     ".venv",
     "__pycache__",
     "*.pyc",
