@@ -34,8 +34,14 @@ instead of submitting another reduce-only blindly. Local verification passed
 focused RED/GREEN recovery and residual harnesses, related regression suites,
 full pytest (`3726 passed`, `9 skipped`, `1 warning`), diff-check, and
 GitNexus detect-changes at low indexed risk; `runtime.py` remains a GitNexus
-large-file skipped path, so runtime call impact was manually reviewed. Full
-evidence is recorded in
+large-file skipped path, so runtime call impact was manually reviewed. Cloud
+deploy of `4b02ec2` fast-forwarded `/opt/lightfee-v2`, passed deploy-manifest
+and compileall checks, restarted sidecar/live active/running with
+`NRestarts=0`, and post-deploy verification reported singleton PASS,
+`verify_production_services.py --json` `ok=true` with zero critical/warnings,
+and `diagnose_live.py --json --since-deploy` healthy/running with
+high-confidence flat/no-open-orders exchange truth on all venues. Full evidence
+is recorded in
 [`daily/2026-06-08.md#cluster-cl-055-recovery-bulk-timeout-and-residual-ack-only-truth-closure`](daily/2026-06-08.md#cluster-cl-055-recovery-bulk-timeout-and-residual-ack-only-truth-closure).
 
 Latest Aster V3 startup safety fix, 2026-06-08: cloud deploy to `e63d70e`
