@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderFillReconciliation,
+    PositionSnapshot,
+    Side,
+    Venue,
+)
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.recovery_decision_core import (
     RecoveryDecision,
@@ -240,6 +246,198 @@ async def test_residual_repair_ack_only_submit_preserves_order_truth_gap_evidenc
     assert "fill_confirmation" in failed["missing_evidence"]
     assert failed["order_truth_probe_paths"]["rest_order_status"] == "GET /v5/order/realtime"
     assert failed["next_action"] == "reconcile_accepted_order_or_probe_live_position"
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_ack_only_reconciled_fill_completes_without_second_submit(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-ack-reconciled",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 30_000,
+        "retry_count": 0,
+        "last_attempt_at_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        entry_price=1.0,
+        observed_at_ms=now_ms,
+    )
+    ack_error = OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN,
+        "order accepted (id=repair-ack-oid) but fill not confirmed",
+    )
+    ack_error.order_ack_only = True
+    ack_error.accepted_order_id = "repair-ack-oid"
+    ack_error.accepted_client_order_id = "repair-ack-cid"
+    bybit.place_order_raises = ack_error
+    bybit.order_fill_reconciliation = OrderFillReconciliation(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        average_price=1.0,
+        order_id="repair-ack-oid",
+        client_order_id="repair-ack-cid",
+        filled_at_ms=now_ms + 1,
+    )
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert len(bybit._place_order_calls) == 1
+    assert bybit._fetch_order_fill_reconciliation_calls == [
+        ("EDENUSDT", "repair-ack-oid", "repair-ack-cid")
+    ]
+    completed = [
+        event["payload"] for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_completed"
+    ][-1]
+    assert completed["result"] == "accepted_order_reconciled"
+    assert completed["fill_order_id"] == "repair-ack-oid"
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_ack_only_live_flat_open_orders_empty_completes(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-ack-flat",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 30_000,
+        "retry_count": 0,
+        "last_attempt_at_ms": 0,
+    })
+
+    class NonzeroThenFlatAdapter(IncidentVenueAdapter):
+        async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
+            self._fetch_position_calls.append(symbol)
+            if len(self._fetch_position_calls) == 1:
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=10.0,
+                    entry_price=1.0,
+                    observed_at_ms=now_ms,
+                )
+            return _flat_position(Venue.BYBIT, symbol, now_ms + 1)
+
+    bybit = NonzeroThenFlatAdapter(Venue.BYBIT)
+    ack_error = OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN,
+        "order accepted (id=repair-ack-oid) but fill not confirmed",
+    )
+    ack_error.order_ack_only = True
+    ack_error.accepted_order_id = "repair-ack-oid"
+    ack_error.accepted_client_order_id = "repair-ack-cid"
+    bybit.place_order_raises = ack_error
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert len(bybit._place_order_calls) == 1
+    assert bybit._fetch_order_fill_reconciliation_calls == [
+        ("EDENUSDT", "repair-ack-oid", "repair-ack-cid")
+    ]
+    completed = [
+        event["payload"] for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_completed"
+    ][-1]
+    assert completed["result"] == "accepted_order_live_flat"
+    assert completed["accepted_order_id"] == "repair-ack-oid"
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_ack_only_open_order_retains_then_reconciles_before_resubmit(
+    tmp_path,
+):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-ack-open",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 300_000,
+        "retry_count": 0,
+        "last_attempt_at_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        entry_price=1.0,
+        observed_at_ms=now_ms,
+    )
+    bybit.open_orders = [{"orderId": "repair-ack-oid", "orderLinkId": "repair-ack-cid"}]
+    ack_error = OrderSubmitError(
+        SubmitFailureClass.UNCERTAIN,
+        "order accepted (id=repair-ack-oid) but fill not confirmed",
+    )
+    ack_error.order_ack_only = True
+    ack_error.accepted_order_id = "repair-ack-oid"
+    ack_error.accepted_client_order_id = "repair-ack-cid"
+    bybit.place_order_raises = ack_error
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    retained = runtime.state.pending_residual_repairs[0]
+    assert retained["accepted_order_id"] == "repair-ack-oid"
+    assert retained["accepted_client_order_id"] == "repair-ack-cid"
+    assert retained["last_error"] == "accepted_order_truth_gap_open_order_present"
+    assert len(bybit._place_order_calls) == 1
+
+    bybit.open_orders = []
+    bybit.order_fill_reconciliation = OrderFillReconciliation(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        average_price=1.0,
+        order_id="repair-ack-oid",
+        client_order_id="repair-ack-cid",
+        filled_at_ms=now_ms + 2,
+    )
+
+    await runtime._recover_residual_repairs(now_ms + 60_000)
+
+    assert runtime.state.pending_residual_repairs == []
+    assert len(bybit._place_order_calls) == 1
+    assert bybit._fetch_order_fill_reconciliation_calls[-1] == (
+        "EDENUSDT",
+        "repair-ack-oid",
+        "repair-ack-cid",
+    )
 
 
 @pytest.mark.asyncio

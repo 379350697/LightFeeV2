@@ -2671,18 +2671,30 @@ class LiveRuntime:
             source: list(truth_required_symbol_sources.get(source, []))
             for source in truth_required_sources
         }
-        truth_required_symbols = list(
+        recovery_truth_required_symbol_sources = {
+            source: symbols
+            for source, symbols in truth_required_symbol_sources.items()
+            if source != "explicit_requested_symbol"
+        }
+        recovery_truth_required_sources = sorted(
+            recovery_truth_required_symbol_sources
+        )
+        recovery_truth_required_symbol_source_payload = {
+            source: list(recovery_truth_required_symbol_sources.get(source, []))
+            for source in recovery_truth_required_sources
+        }
+        recovery_truth_required_symbols = list(
             dict.fromkeys(
                 symbol
-                for source in truth_required_sources
-                for symbol in truth_required_symbol_sources.get(source, [])
+                for source in recovery_truth_required_sources
+                for symbol in recovery_truth_required_symbol_sources.get(source, [])
             )
         )
-        fallback_probe_symbol_cache: dict[Venue, list[str]] = {}
+        fallback_probe_symbol_cache: dict[tuple[Venue, bool], list[str]] = {}
 
         def truth_unavailable_core_decision(venue: Venue):
             synthetic_work_items = ()
-            if truth_required_sources:
+            if recovery_truth_required_sources:
                 synthetic_work_items = (
                     SimpleNamespace(
                         kind="truth_required_position_probe",
@@ -2723,18 +2735,22 @@ class LiveRuntime:
         async def fallback_symbols_for_venue(
             venue: Venue,
             adapter: VenueAdapter,
+            *,
+            recovery_required_only: bool = False,
         ) -> list[str]:
-            if venue in fallback_probe_symbol_cache:
-                return fallback_probe_symbol_cache[venue]
-            symbols_for_venue = probe_symbols_by_venue.get(venue, [])
-            if symbols_for_venue:
-                fallback_probe_symbol_cache[venue] = symbols_for_venue
-                return symbols_for_venue
-            if truth_required_symbols:
+            cache_key = (venue, recovery_required_only)
+            if cache_key in fallback_probe_symbol_cache:
+                return fallback_probe_symbol_cache[cache_key]
+            if not recovery_required_only:
+                symbols_for_venue = probe_symbols_by_venue.get(venue, [])
+                if symbols_for_venue:
+                    fallback_probe_symbol_cache[cache_key] = symbols_for_venue
+                    return symbols_for_venue
+            if recovery_truth_required_symbols:
                 bounded_symbols = await self._position_probe_symbols_for_venue(
                     venue,
                     adapter,
-                    truth_required_symbols,
+                    recovery_truth_required_symbols,
                 )
                 max_bounded = self._MAX_BOUNDED_RECOVERY_FALLBACK_SYMBOLS
                 if len(bounded_symbols) > max_bounded:
@@ -2753,9 +2769,9 @@ class LiveRuntime:
                                     len(bounded_symbols) - len(sample_symbols),
                                     0,
                                 ),
-                                "truth_required_by": truth_required_sources,
+                                "truth_required_by": recovery_truth_required_sources,
                                 "truth_required_symbol_sources": (
-                                    truth_required_symbol_source_payload
+                                    recovery_truth_required_symbol_source_payload
                                 ),
                                 "reason": "truth_required_symbol_cap_exceeded",
                                 "decision": "truth_unavailable_for_required_recovery",
@@ -2774,10 +2790,13 @@ class LiveRuntime:
                                 self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS
                             ),
                         )
-                    fallback_probe_symbol_cache[venue] = []
+                    fallback_probe_symbol_cache[cache_key] = []
                     return []
-                fallback_probe_symbol_cache[venue] = bounded_symbols
+                fallback_probe_symbol_cache[cache_key] = bounded_symbols
                 return bounded_symbols
+            if recovery_required_only:
+                fallback_probe_symbol_cache[cache_key] = []
+                return []
             static_symbols = [
                 str(symbol)
                 for symbol in getattr(self.config, "symbols", [])
@@ -2809,14 +2828,14 @@ class LiveRuntime:
                         key_parts=(venue.value, "static_universe_too_large"),
                         interval_ms=self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
                     )
-                fallback_probe_symbol_cache[venue] = []
+                fallback_probe_symbol_cache[cache_key] = []
                 return []
-            fallback_probe_symbol_cache[venue] = await self._position_probe_symbols_for_venue(
+            fallback_probe_symbol_cache[cache_key] = await self._position_probe_symbols_for_venue(
                 venue,
                 adapter,
                 static_symbols,
             )
-            return fallback_probe_symbol_cache[venue]
+            return fallback_probe_symbol_cache[cache_key]
 
         def canonical_position_symbol(
             venue: Venue,
@@ -2923,15 +2942,16 @@ class LiveRuntime:
                     planned_fallback_symbols = await fallback_symbols_for_venue(
                         venue,
                         adapter,
+                        recovery_required_only=True,
                     )
                     core_decision = truth_unavailable_core_decision(venue)
                     payload.update(
                         {
                             "fallback_symbol_count": len(planned_fallback_symbols),
                             "fallback_symbols_sample": planned_fallback_symbols[:10],
-                            "truth_required_by": truth_required_sources,
+                            "truth_required_by": recovery_truth_required_sources,
                             "truth_required_symbol_sources": (
-                                truth_required_symbol_source_payload
+                                recovery_truth_required_symbol_source_payload
                             ),
                             "core_decision": core_decision.kind.value,
                             "core_block_reason": core_decision.block_reason,
@@ -2941,8 +2961,13 @@ class LiveRuntime:
                         "recovery.live_position_bulk_probe_error",
                         payload,
                     )
-                    if venue == Venue.OKX:
+                    if not recovery_truth_required_sources:
                         return (venue, [])
+                    if not planned_fallback_symbols:
+                        return (venue, [])
+                    fallback_probe_symbol_cache[(venue, False)] = (
+                        planned_fallback_symbols
+                    )
                     return (venue, None)
                 if positions is None:
                     return (venue, None)
@@ -11829,6 +11854,112 @@ class LiveRuntime:
                     if parsed not in probe_venues and self.get_venue_adapter(parsed) is not None:
                         probe_venues.append(parsed)
 
+            baseline = self._residual_repair_baseline_size(task, repair_venue)
+            accepted_order_id = str(task.get("accepted_order_id", "") or "")
+            accepted_client_order_id = str(
+                task.get("accepted_client_order_id", "") or ""
+            )
+            if accepted_order_id or accepted_client_order_id:
+                status, accepted_fill, accepted_payload = (
+                    await self._resolve_residual_repair_accepted_order(
+                        task=task,
+                        adapter=adapter,
+                        repair_venue=repair_venue,
+                        repair_side=repair_side,
+                        symbol=symbol,
+                        baseline=baseline,
+                        probe_venues=probe_venues,
+                        accepted_order_id=accepted_order_id,
+                        accepted_client_order_id=accepted_client_order_id,
+                        now_ms=now_ms,
+                    )
+                )
+                if status == "filled" and accepted_fill is not None:
+                    live_excess_quantity = float(
+                        task.get("repair_quantity", task_repair_quantity) or 0.0
+                    )
+                    remaining_quantity = max(
+                        live_excess_quantity - float(accepted_fill.quantity or 0.0),
+                        0.0,
+                    )
+                    self.state.pending_residual_repairs.remove(task)
+                    self._clear_residual_repair_accepted_order_gap(task)
+                    if remaining_quantity > 1e-9:
+                        updated = dict(task)
+                        updated["repair_venue"] = repair_venue.value
+                        updated["repair_side"] = repair_side.value
+                        updated["repair_quantity"] = remaining_quantity
+                        updated["retry_count"] = 0
+                        updated["last_attempt_at_ms"] = now_ms
+                        updated["next_attempt_ms"] = now_ms
+                        self.state.pending_residual_repairs.append(updated)
+                    else:
+                        self._release_residual_repair_pair_gate(pair_id, symbol)
+                        repaired += 1
+                    completed_payload = {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "origin": task.get("origin", ""),
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "result": "accepted_order_reconciled",
+                        "requested_quantity": live_excess_quantity,
+                        "filled_quantity": float(accepted_fill.quantity or 0.0),
+                        "remaining_quantity": remaining_quantity,
+                        "fill_order_id": getattr(accepted_fill, "order_id", ""),
+                        "fill_price": float(getattr(accepted_fill, "price", 0.0) or 0.0),
+                    }
+                    completed_payload.update(accepted_payload)
+                    self.journal.append(
+                        "execution.residual_repair_completed",
+                        completed_payload,
+                    )
+                    continue
+                if status == "live_flat":
+                    self.state.pending_residual_repairs.remove(task)
+                    self._clear_residual_repair_accepted_order_gap(task)
+                    self._release_residual_repair_pair_gate(pair_id, symbol)
+                    repaired += 1
+                    completed_payload = {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "origin": task.get("origin", ""),
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "result": "accepted_order_live_flat",
+                    }
+                    completed_payload.update(accepted_payload)
+                    self.journal.append(
+                        "execution.residual_repair_completed",
+                        completed_payload,
+                    )
+                    continue
+
+                self._retain_residual_repair_accepted_order_gap(
+                    task,
+                    now_ms,
+                    status=status,
+                    accepted_order_id=accepted_order_id,
+                    accepted_client_order_id=accepted_client_order_id,
+                )
+                failed_payload = {
+                    "position_id": position_id,
+                    "pair_id": pair_id,
+                    "symbol": symbol,
+                    "repair_venue": repair_venue.value,
+                    "repair_side": repair_side.value,
+                    "repair_quantity": task_repair_quantity,
+                    "error": task["last_error"],
+                }
+                failed_payload.update(accepted_payload)
+                self.journal.append(
+                    "recovery.residual_repair_failed",
+                    failed_payload,
+                )
+                continue
+
             live_positions: dict[Venue, PositionSnapshot | None] = {}
             open_order_count = 0
             open_order_counts_by_venue: dict[str, int] = {}
@@ -11890,7 +12021,6 @@ class LiveRuntime:
                 )
                 continue
 
-            baseline = self._residual_repair_baseline_size(task, repair_venue)
             live_position = live_positions.get(repair_venue)
             live_size = self._signed_position_size(live_position)
             if repair_side == Side.SELL:
@@ -12271,6 +12401,149 @@ class LiveRuntime:
                 if fill is not None:
                     pass
                 else:
+                    if isinstance(e, OrderSubmitError) and bool(
+                        getattr(e, "order_ack_only", False)
+                    ):
+                        order_gap_evidence = self._order_submit_error_runtime_evidence(
+                            e,
+                            venue=repair_venue,
+                            operation="place_order",
+                            request=req,
+                            default_client_order_id=req.client_order_id or "",
+                        )
+                        accepted_order_id = str(
+                            getattr(e, "accepted_order_id", "") or ""
+                        )
+                        accepted_client_order_id = str(
+                            getattr(e, "accepted_client_order_id", "")
+                            or req.client_order_id
+                            or ""
+                        )
+                        status, accepted_fill, accepted_payload = (
+                            await self._resolve_residual_repair_accepted_order(
+                                task=task,
+                                adapter=adapter,
+                                repair_venue=repair_venue,
+                                repair_side=repair_side,
+                                symbol=symbol,
+                                baseline=baseline,
+                                probe_venues=probe_venues,
+                                accepted_order_id=accepted_order_id,
+                                accepted_client_order_id=accepted_client_order_id,
+                                now_ms=now_ms,
+                            )
+                        )
+                        accepted_payload = {
+                            **order_gap_evidence,
+                            **accepted_payload,
+                        }
+                        if status == "filled" and accepted_fill is not None:
+                            remaining_quantity = max(
+                                live_excess_quantity
+                                - float(accepted_fill.quantity or 0.0),
+                                0.0,
+                            )
+                            self.state.pending_residual_repairs.remove(task)
+                            self._clear_residual_repair_accepted_order_gap(task)
+                            if remaining_quantity > 1e-9:
+                                updated = dict(task)
+                                updated["repair_venue"] = repair_venue.value
+                                updated["repair_side"] = repair_side.value
+                                updated["repair_quantity"] = remaining_quantity
+                                updated.pop("exposure_venue", None)
+                                updated.pop("exposure_side", None)
+                                updated.pop("exposure_quantity", None)
+                                updated["retry_count"] = 0
+                                updated["last_attempt_at_ms"] = now_ms
+                                updated["next_attempt_ms"] = now_ms
+                                self.state.pending_residual_repairs.append(updated)
+                            else:
+                                self._release_residual_repair_pair_gate(pair_id, symbol)
+                                repaired += 1
+                            completed_payload = {
+                                "position_id": position_id,
+                                "pair_id": pair_id,
+                                "symbol": symbol,
+                                "origin": task.get("origin", ""),
+                                "repair_venue": repair_venue.value,
+                                "repair_side": repair_side.value,
+                                "result": "accepted_order_reconciled",
+                                "requested_quantity": repair_quantity,
+                                "filled_quantity": float(accepted_fill.quantity or 0.0),
+                                "remaining_quantity": remaining_quantity,
+                                "open_order_count": open_order_count,
+                                "open_order_counts_by_venue": open_order_counts_by_venue,
+                                "live_truth_venues": [
+                                    venue.value for venue in probe_venues
+                                ],
+                                "live_positions": self._live_positions_evidence(
+                                    live_positions
+                                ),
+                                "live_excess_quantity": live_excess_quantity,
+                                "baseline_quantity": baseline,
+                                "live_size": live_size,
+                                "fill_order_id": getattr(accepted_fill, "order_id", ""),
+                                "fill_price": float(
+                                    getattr(accepted_fill, "price", 0.0) or 0.0
+                                ),
+                            }
+                            completed_payload.update(accepted_payload)
+                            self.journal.append(
+                                "execution.residual_repair_completed",
+                                completed_payload,
+                            )
+                            continue
+                        if status == "live_flat":
+                            self.state.pending_residual_repairs.remove(task)
+                            self._clear_residual_repair_accepted_order_gap(task)
+                            self._release_residual_repair_pair_gate(pair_id, symbol)
+                            repaired += 1
+                            completed_payload = {
+                                "position_id": position_id,
+                                "pair_id": pair_id,
+                                "symbol": symbol,
+                                "origin": task.get("origin", ""),
+                                "repair_venue": repair_venue.value,
+                                "repair_side": repair_side.value,
+                                "result": "accepted_order_live_flat",
+                                "requested_quantity": repair_quantity,
+                                "filled_quantity": 0.0,
+                                "remaining_quantity": 0.0,
+                            }
+                            completed_payload.update(accepted_payload)
+                            self.journal.append(
+                                "execution.residual_repair_completed",
+                                completed_payload,
+                            )
+                            continue
+                        self._retain_residual_repair_accepted_order_gap(
+                            task,
+                            now_ms,
+                            status=status,
+                            accepted_order_id=accepted_order_id,
+                            accepted_client_order_id=accepted_client_order_id,
+                        )
+                        failed_payload = {
+                            "position_id": position_id,
+                            "pair_id": pair_id,
+                            "symbol": symbol,
+                            "repair_venue": repair_venue.value,
+                            "repair_side": repair_side.value,
+                            "repair_quantity": repair_quantity,
+                            "live_excess_quantity": live_excess_quantity,
+                            "baseline_quantity": baseline,
+                            "live_size": live_size,
+                            "open_order_count": open_order_count,
+                            "open_order_counts_by_venue": open_order_counts_by_venue,
+                            "error": task["last_error"],
+                        }
+                        failed_payload.update(accepted_payload)
+                        self.journal.append(
+                            "recovery.residual_repair_failed",
+                            failed_payload,
+                        )
+                        continue
+
                     self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
                     order_gap_evidence = (
                         self._order_submit_error_runtime_evidence(
@@ -12617,6 +12890,147 @@ class LiveRuntime:
     @staticmethod
     def _order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
         return order_truth_probe_paths(venue)
+
+    async def _resolve_residual_repair_accepted_order(
+        self,
+        *,
+        task: dict,
+        adapter: VenueAdapter,
+        repair_venue: Venue,
+        repair_side: Side,
+        symbol: str,
+        baseline: float,
+        probe_venues: list[Venue],
+        accepted_order_id: str,
+        accepted_client_order_id: str,
+        now_ms: int,
+    ) -> tuple[str, OrderFill | None, dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "accepted_order_id": accepted_order_id,
+            "accepted_client_order_id": accepted_client_order_id,
+            "accepted_order_truth_gap": True,
+            "truth_required_by": "accepted_order_truth_gap",
+            "terminal_without_truth": False,
+            "next_action": "reconcile_accepted_order_or_probe_live_position",
+            "order_truth_probe_paths": self._order_truth_probe_paths(repair_venue),
+        }
+
+        fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
+        if callable(fetch_reconciliation) and (accepted_order_id or accepted_client_order_id):
+            try:
+                reconciliation = await fetch_reconciliation(
+                    symbol,
+                    accepted_order_id,
+                    accepted_client_order_id or None,
+                )
+                self._flush_adapter_order_diagnostics(adapter)
+            except Exception as e:
+                payload["fill_reconciliation_result"] = "error"
+                payload["fill_reconciliation_error"] = str(e) or e.__class__.__name__
+                return "truth_unavailable", None, payload
+
+            recon_qty = self._close_reconciliation_fill_qty(reconciliation)
+            if recon_qty > 1e-12:
+                payload["fill_reconciliation_result"] = "filled"
+                fill = OrderFill(
+                    venue=repair_venue,
+                    symbol=symbol,
+                    side=getattr(reconciliation, "side", repair_side) or repair_side,
+                    quantity=recon_qty,
+                    price=_recon_fill_price(reconciliation),
+                    order_id=(
+                        str(getattr(reconciliation, "order_id", "") or "")
+                        or accepted_order_id
+                    ),
+                    client_order_id=(
+                        str(getattr(reconciliation, "client_order_id", "") or "")
+                        or accepted_client_order_id
+                        or None
+                    ),
+                    fee_quote=getattr(reconciliation, "fee_quote", None),
+                    filled_at_ms=int(
+                        getattr(reconciliation, "filled_at_ms", 0) or now_ms
+                    ),
+                )
+                return "filled", fill, payload
+            payload["fill_reconciliation_result"] = "missing_or_zero_fill"
+        else:
+            payload["fill_reconciliation_result"] = "not_available"
+
+        live_positions: dict[Venue, PositionSnapshot | None] = {}
+        open_order_count = 0
+        open_order_counts_by_venue: dict[str, int] = {}
+        for probe_venue in probe_venues:
+            probe_adapter = self.get_venue_adapter(probe_venue)
+            if probe_adapter is None:
+                continue
+            try:
+                live_positions[probe_venue] = await probe_adapter.fetch_position(symbol)
+                open_orders = await self._fetch_residual_repair_open_orders(
+                    probe_adapter,
+                    probe_venue,
+                    symbol,
+                )
+            except Exception as e:
+                payload["live_truth_error"] = str(e) or e.__class__.__name__
+                return "truth_unavailable", None, payload
+            venue_open_order_count = len(open_orders)
+            open_order_count += venue_open_order_count
+            open_order_counts_by_venue[probe_venue.value] = venue_open_order_count
+
+        live_position = live_positions.get(repair_venue)
+        live_size = self._signed_position_size(live_position)
+        if repair_side == Side.SELL:
+            live_excess_quantity = max(live_size - baseline, 0.0)
+        else:
+            live_excess_quantity = max(baseline - live_size, 0.0)
+        payload.update(
+            {
+                "open_order_count": open_order_count,
+                "open_order_counts_by_venue": open_order_counts_by_venue,
+                "live_truth_venues": [venue.value for venue in probe_venues],
+                "live_positions": self._live_positions_evidence(live_positions),
+                "live_excess_quantity": live_excess_quantity,
+                "baseline_quantity": baseline,
+                "live_size": live_size,
+            }
+        )
+        if open_order_count > 0:
+            return "open_order_present", None, payload
+        if live_excess_quantity <= 1e-9:
+            return "live_flat", None, payload
+        return "truth_gap", None, payload
+
+    def _retain_residual_repair_accepted_order_gap(
+        self,
+        task: dict,
+        now_ms: int,
+        *,
+        status: str,
+        accepted_order_id: str,
+        accepted_client_order_id: str,
+    ) -> None:
+        retry_count = self._residual_repair_attempt_count(task) + 1
+        task["retry_count"] = retry_count
+        task["attempt_count"] = retry_count
+        task["last_attempt_at_ms"] = now_ms
+        task["next_attempt_ms"] = now_ms + self._residual_repair_retry_delay_ms(
+            retry_count
+        )
+        task["accepted_order_truth_gap"] = True
+        if accepted_order_id:
+            task["accepted_order_id"] = accepted_order_id
+        if accepted_client_order_id:
+            task["accepted_client_order_id"] = accepted_client_order_id
+        task["last_error"] = f"accepted_order_truth_gap_{status}"
+
+    def _clear_residual_repair_accepted_order_gap(self, task: dict) -> None:
+        for key in (
+            "accepted_order_truth_gap",
+            "accepted_order_id",
+            "accepted_client_order_id",
+        ):
+            task.pop(key, None)
 
     async def _fetch_residual_repair_open_orders(
         self, adapter: VenueAdapter, venue: Venue, symbol: str,

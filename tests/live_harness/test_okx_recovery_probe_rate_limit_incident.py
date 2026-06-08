@@ -284,6 +284,66 @@ async def test_okx_recovery_bulk_timeout_does_not_fan_out_positions(monkeypatch)
     assert timeout["requested_symbols"] == ["BTCUSDT", "ETHUSDT"]
 
 
+@pytest.mark.asyncio
+async def test_okx_recovery_bulk_timeout_with_truth_required_work_uses_bounded_fallback(
+    monkeypatch,
+):
+    case = _load_case()
+    adapter = _okx_adapter_with_catalog(case)
+    requested_position_symbols: list[str] = []
+
+    async def fetch_all_positions():
+        raise asyncio.TimeoutError()
+
+    async def fetch_position(symbol: str):
+        requested_position_symbols.append(symbol)
+        return PositionSnapshot(
+            venue=Venue.OKX,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1779804000000,
+        )
+
+    monkeypatch.setattr(adapter, "fetch_all_positions", fetch_all_positions)
+    monkeypatch.setattr(adapter, "fetch_position", fetch_position)
+
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td, case["probe_symbols"])
+        runtime = LiveRuntime(config, venue_adapters={Venue.OKX: adapter})
+        runtime.state.pending_residual_repairs.append(
+            {
+                "position_id": "entry-okx-timeout-repair",
+                "pair_id": "ethusdt:binance->okx",
+                "symbol": "ETHUSDT",
+                "origin": "entry_open",
+                "repair_venue": "okx",
+                "repair_side": "buy",
+                "repair_quantity": 1.0,
+            }
+        )
+        runtime.journal.open()
+        try:
+            snapshots = await runtime._fetch_startup_live_position_snapshots([])
+        finally:
+            runtime.journal.close()
+
+        records = _records(config)
+
+    assert snapshots == []
+    assert requested_position_symbols == ["ETHUSDT"]
+    timeout = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "recovery.live_position_bulk_probe_error"
+    )
+    assert timeout["classification"] == "timeout"
+    assert timeout["truth_required_by"] == ["pending_residual_repair"]
+    assert timeout["fallback_symbol_count"] == 1
+    assert timeout["fallback_symbols_sample"] == ["ETHUSDT"]
+
+
 def test_okx_instrument_missing_is_non_retryable_metadata_skip_not_health_critical():
     case = _load_case()
     adapter = _okx_adapter_with_catalog(case)

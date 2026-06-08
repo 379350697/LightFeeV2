@@ -17,6 +17,27 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest recovery truth-probe and residual-repair ACK-only closure, 2026-06-08:
+production issue 2 (`recovery.live_position_bulk_probe_error`) and issue 3
+(`recovery.residual_repair_failed` ACK-only) were closed as one recovery-truth
+chain, not as venue-specific one-off patches. Startup/recovery live-position
+truth now treats full-position bulk fetch as diagnostic/supplemental: whenever
+pending residual/passive/pending-entry work requires truth, a bulk timeout must
+fall through to bounded symbol fallback for only recovery-owned/truth-required
+symbols, including OKX, and failed fallback becomes
+`truth_unavailable_for_required_recovery` / risk-only evidence rather than
+false flat. Residual repair now shares the accepted-order uncertainty resolver:
+ACK-only reduce-only responses immediately reconcile execution/order/open-order/
+position truth, complete on confirmed fill or live-flat/no-open-orders, and
+retain accepted ids for the next tick when an open order or truth gap remains
+instead of submitting another reduce-only blindly. Local verification passed
+focused RED/GREEN recovery and residual harnesses, related regression suites,
+full pytest (`3726 passed`, `9 skipped`, `1 warning`), diff-check, and
+GitNexus detect-changes at low indexed risk; `runtime.py` remains a GitNexus
+large-file skipped path, so runtime call impact was manually reviewed. Full
+evidence is recorded in
+[`daily/2026-06-08.md#cluster-cl-055-recovery-bulk-timeout-and-residual-ack-only-truth-closure`](daily/2026-06-08.md#cluster-cl-055-recovery-bulk-timeout-and-residual-ack-only-truth-closure).
+
 Latest Aster V3 startup safety fix, 2026-06-08: cloud deploy to `e63d70e`
 passed manifest/compileall and wrote `.deploy_version=e63d70e`, but
 `lightfee-live.service` entered `activating/auto-restart` because Aster V3

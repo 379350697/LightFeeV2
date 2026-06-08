@@ -18,6 +18,7 @@ tracked as separate active root-fix branches.
 - `execution.residual_repair_terminal`
 - `recovery.residual_repair_failed`
 - `recovery.residual_repairs_complete`
+- `truth_unavailable_for_required_recovery`
 - `residual_repair_live_open_orders_present`
 - `residual_repair_live_position_nonzero`
 - `residual_repair_live_truth_untrusted`
@@ -34,10 +35,12 @@ with structured evidence. If live excess is official dust, terminalize it and
 release the gate with rule-source evidence.
 
 Accepted reduce-only repair ACKs without fill confirmation are order-truth gaps,
-not terminal repair failures. The failed/rescheduled event must preserve
-accepted ids, missing fill fields, venue probe paths, and the next reconciliation
-action while the existing pending repair task remains in the retry/live-truth
-loop.
+not terminal repair failures. The same tick must reconcile accepted order truth
+before another reduce-only can be submitted: execution/fill truth wins first;
+live-flat plus trusted empty open-order truth completes and releases the gate;
+open order present or unavailable truth keeps the existing pending repair task,
+preserves accepted ids, and makes the next tick reconcile those ids before any
+resubmit.
 
 ## V1 / Exchange Semantics
 
@@ -57,6 +60,7 @@ loop.
 | 2026-05-30 | HMSTR open-order-present pause evidence | fixed, deployed, probe verified | RED/GREEN harness now requires paused-event payload to include aggregate and per-venue open-order truth evidence; `0fd9a74` deployed and affected-symbol probes are flat/no-open-orders. |
 | 2026-06-04 | BIOUSDT Bybit duplicate cleanup convergence | deployed/cloud verified | Repeated Bybit `110072` residual cleanup with stale-full/live-nonzero evidence now persists bounded CID attempt evidence, stops at `residual_repair_duplicate_live_nonzero_blocked`, enters fail-closed/risk-only, and retains the residual pair gate. Cloud `68a979b` final verifier/diagnose proved all seven venues flat/no-open-orders. |
 | 2026-06-08 | ACK-only reduce-only repair evidence | local RED/GREEN, deploy pending | `recovery.residual_repair_failed` now carries the same accepted-order truth-gap evidence as pending-entry/passive-close submit errors while preserving the existing reschedule/pending residual repair state machine. |
+| 2026-06-08 | ACK-only reduce-only repair closure | local RED/GREEN, deploy pending | ACK-only residual repair now resolves accepted order ids through fill/order/open-order/live-position truth in the same recovery loop; confirmed fill or trusted live-flat/open-order-empty completes without duplicate submit, while open order/truth gaps retain the task and reconcile first next tick. |
 
 ## Recurrences
 
