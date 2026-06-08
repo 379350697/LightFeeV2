@@ -629,6 +629,32 @@ class TestLiveModeFailFast:
         with pytest.raises(ValueError, match="wallet_private_key"):
             VenueTransport(spec=hyperliquid_spec(), mode="live", credential=creds)
 
+    def test_aster_invalid_legacy_secret_is_not_a_startup_crash(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.aster_v3 import credential_has_aster_v3_signer
+
+        creds = LiveCredential(api_key="k", api_secret="not-a-hex-wallet-private-key")
+
+        assert credential_has_aster_v3_signer(creds) is False
+        adapter = AsterAdapter(mode="live", credential=creds)
+
+        assert adapter._private is None
+
+    @pytest.mark.asyncio
+    async def test_aster_private_truth_reports_auth_failure_when_signer_invalid(self):
+        from lightfee.venues.aster import AsterAdapter
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="not-a-hex-wallet-private-key"),
+        )
+
+        with pytest.raises(TransportError) as exc:
+            await adapter.fetch_all_positions()
+
+        assert exc.value.category == TransportErrorCategory.AUTH_FAILURE
+        assert "aster private API disabled" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # Hyperliquid live order explicit unsupported (Deviation 4)

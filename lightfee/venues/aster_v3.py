@@ -575,8 +575,15 @@ class AsterV3Client:
 
 
 def credential_has_aster_v3_signer(credential: LiveCredential | None) -> bool:
-    return bool(
-        credential
-        and (credential.wallet_private_key or credential.api_secret)
-        and not _missing_aster_v3_signing_dependencies()
+    if credential is None or _missing_aster_v3_signing_dependencies():
+        return False
+    private_key = _normalize_private_key(
+        credential.wallet_private_key or credential.api_secret
     )
+    if not private_key:
+        return False
+    try:
+        _derive_signer_address(private_key)
+    except ValueError:
+        return False
+    return True

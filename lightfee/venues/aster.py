@@ -20,7 +20,12 @@ from lightfee.core.domain import (
 )
 from lightfee.venues.aster_v3 import AsterV3Client
 from lightfee.venues.specs import aster_spec
-from lightfee.venues.transport import LiveCredential, VenueTransport
+from lightfee.venues.transport import (
+    LiveCredential,
+    TransportError,
+    TransportErrorCategory,
+    VenueTransport,
+)
 
 
 class AsterAdapter(VenueAdapter):
@@ -41,12 +46,21 @@ class AsterAdapter(VenueAdapter):
             exchange_http_timeout_ms=exchange_http_timeout_ms,
             rate_limiter=rate_limiter,
         )
+        self._mode = mode
+        self._private_disabled_reason = ""
         self._private: AsterV3Client | None = None
         if mode == "live" and credential is not None:
-            self._private = AsterV3Client(
-                credential=credential,
-                exchange_http_timeout_ms=exchange_http_timeout_ms,
-            )
+            from lightfee.venues.aster_v3 import credential_has_aster_v3_signer
+
+            if credential_has_aster_v3_signer(credential):
+                self._private = AsterV3Client(
+                    credential=credential,
+                    exchange_http_timeout_ms=exchange_http_timeout_ms,
+                )
+            else:
+                self._private_disabled_reason = (
+                    "invalid_or_missing_aster_api_wallet_private_key"
+                )
 
     @property
     def venue(self) -> Venue:
@@ -64,6 +78,13 @@ class AsterAdapter(VenueAdapter):
         """Return loaded Aster trading symbols, if available."""
         metadata = getattr(self._transport, "_symbol_metadata", {}) or {}
         return sorted(str(symbol) for symbol in metadata.keys())
+
+    def _private_unavailable(self) -> TransportError:
+        reason = self._private_disabled_reason or "aster_v3_private_client_unavailable"
+        return TransportError(
+            TransportErrorCategory.AUTH_FAILURE,
+            f"aster private API disabled: {reason}",
+        )
 
     async def ensure_supported_symbols_loaded(self) -> None:
         """Populate the Aster contract catalog with actively trading symbols."""
@@ -93,31 +114,43 @@ class AsterAdapter(VenueAdapter):
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._private is not None:
             return await self._private.place_order(request)
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.place_order(request)
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         if self._private is not None:
             return await self._private.fetch_position(symbol)
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.fetch_position(symbol)
 
     async def fetch_all_positions(self) -> list[PositionSnapshot]:
         if self._private is not None:
             return await self._private.fetch_all_positions()
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.fetch_all_positions()
 
     async def fetch_account_risk_snapshot(self):
         if self._private is not None:
             return await self._private.fetch_account_risk_snapshot()
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.fetch_account_risk_snapshot()
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if self._private is not None:
             return await self._private.fetch_open_orders(symbol)
+        if self._mode == "live":
+            raise self._private_unavailable()
         return []
 
     async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
         if self._private is not None:
             return await self._private.submit_passive_order(request)
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.submit_passive_order(request)
 
     async def query_passive_order_progress(
@@ -131,6 +164,8 @@ class AsterAdapter(VenueAdapter):
             return await self._private.query_passive_order_progress(
                 symbol, order_id, client_order_id, side,
             )
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.query_passive_order_progress(
             symbol, order_id, client_order_id, side,
         )
@@ -145,6 +180,8 @@ class AsterAdapter(VenueAdapter):
             return await self._private.cancel_passive_order(
                 symbol, order_id, client_order_id,
             )
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.cancel_passive_order(
             symbol, order_id, client_order_id,
         )
@@ -159,6 +196,8 @@ class AsterAdapter(VenueAdapter):
             return await self._private.fetch_order_status(
                 symbol, order_id, client_order_id,
             )
+        if self._mode == "live":
+            raise self._private_unavailable()
         return await self._transport.fetch_order_status(
             symbol, order_id, client_order_id,
         )

@@ -1337,20 +1337,12 @@ class VenueTransport(MarketDataClient):
             if self._spec.venue_id == Venue.ASTER:
                 from lightfee.venues.aster_v3 import (
                     credential_has_aster_v3_signer,
-                    _missing_aster_v3_signing_dependencies,
                 )
 
                 if not credential_has_aster_v3_signer(credential):
-                    missing = _missing_aster_v3_signing_dependencies()
-                    if missing:
-                        raise ValueError(
-                            "live mode missing signing dependencies for aster: "
-                            f"{', '.join(missing)}"
-                        )
-                    raise ValueError(
-                        "live mode requires LIGHTFEE_ASTER_WALLET_PRIVATE_KEY "
-                        "or LIGHTFEE_ASTER_API_SECRET containing the Aster API-wallet private key"
-                    )
+                    # Aster public market data is still usable without a valid
+                    # Pro API V3 signer. The Aster adapter gates private calls.
+                    return
                 return
             # Hyperliquid uses private key + account address, not api_key + api_secret.
             if not credential.wallet_private_key:

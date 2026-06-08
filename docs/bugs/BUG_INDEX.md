@@ -17,6 +17,17 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Aster V3 startup safety fix, 2026-06-08: cloud deploy to `e63d70e`
+passed manifest/compileall and wrote `.deploy_version=e63d70e`, but
+`lightfee-live.service` entered `activating/auto-restart` because Aster V3
+startup attempted to derive a signer from the configured legacy secret and
+raised `ValueError: failed to derive aster signer from private key`. The root
+fix makes `credential_has_aster_v3_signer()` deterministic, allows Aster public
+live transport to start when private signing is invalid, and makes Aster private
+truth/order methods fail closed with explicit auth-failure evidence instead of
+crashing startup or returning false empty truth. Local RED/GREEN is recorded in
+[`daily/2026-06-08.md#cluster-cl-053-aster-v3-invalid-signer-startup-crash`](daily/2026-06-08.md#cluster-cl-053-aster-v3-invalid-signer-startup-crash).
+
 Latest production issues 3-11 root-closure evidence hardening, 2026-06-08:
 issues 1-2 remain explicitly out of scope. The existing V1/exchange-semantics
 fixes for admission, pending hedge, recovery ledger, pending close, shared
