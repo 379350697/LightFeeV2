@@ -131,6 +131,7 @@ class LiveRuntime:
     """Live trading runtime with multi-lane ticks and control-plane exports."""
 
     _MAX_STATIC_RECOVERY_PROBE_SYMBOLS = 1
+    _MAX_BOUNDED_RECOVERY_FALLBACK_SYMBOLS = 25
     _PASSIVE_POST_ONLY_LADDER_FRACTIONS = (0.0, 0.5, 0.75, 1.0)
     _PASSIVE_POST_ONLY_CLOSEST_PRICE_EXTRA_RETRIES = 2
     _PASSIVE_POST_ONLY_TIGHT_SPREAD_LADDER_FRACTIONS = (0.0, 1.0)
@@ -1797,6 +1798,50 @@ class LiveRuntime:
                 result.append(symbol)
         return result
 
+    def _truth_required_recovery_probe_symbol_sources(
+        self,
+        requested_symbols: list[str],
+    ) -> dict[str, list[str]]:
+        sources: dict[str, list[str]] = {}
+
+        def add_symbol(source: str, value: object) -> None:
+            symbol = str(value or "").upper()
+            if not symbol:
+                return
+            sources.setdefault(source, [])
+            if symbol not in sources[source]:
+                sources[source].append(symbol)
+
+        for symbol in requested_symbols:
+            add_symbol("explicit_requested_symbol", symbol)
+        for pos in self.state.open_positions.values():
+            add_symbol("open_position", getattr(pos, "symbol", ""))
+        for pending in self.state.pending_entries.values():
+            add_symbol("pending_entry", getattr(pending, "symbol", ""))
+        for pending in self.state.pending_closes.values():
+            position_id = getattr(pending, "position_id", "")
+            pos = self.state.open_positions.get(position_id)
+            add_symbol("pending_close", getattr(pos, "symbol", ""))
+            add_symbol("pending_close", getattr(pending, "symbol", ""))
+        for pending in self.state.pending_passive_closes.values():
+            snapshot = getattr(pending, "position_snapshot", None)
+            add_symbol("pending_passive_close", getattr(snapshot, "symbol", ""))
+            add_symbol("pending_passive_close", getattr(pending, "symbol", ""))
+        for repair in getattr(self.state, "pending_residual_repairs", []) or []:
+            if isinstance(repair, dict):
+                add_symbol("pending_residual_repair", repair.get("symbol", ""))
+            else:
+                add_symbol("pending_residual_repair", getattr(repair, "symbol", ""))
+        ledger = getattr(self, "recovery_ledger", None)
+        for item in getattr(ledger, "work_items", []) or []:
+            add_symbol("recovery_ledger_work", getattr(item, "symbol", ""))
+        for item in getattr(self.state, "live_recovery_reduce_only_pairs", []) or []:
+            if isinstance(item, dict):
+                add_symbol("recent_live_mismatch_cleanup", item.get("symbol", ""))
+            else:
+                add_symbol("recent_live_mismatch_cleanup", getattr(item, "symbol", ""))
+        return sources
+
     async def _recover_startup_live_positions(
         self,
         symbols: list[str],
@@ -2618,14 +2663,121 @@ class LiveRuntime:
                 adapter,
                 requested_symbols,
             )
+        truth_required_symbol_sources = (
+            self._truth_required_recovery_probe_symbol_sources(requested_symbols)
+        )
+        truth_required_sources = sorted(truth_required_symbol_sources)
+        truth_required_symbol_source_payload = {
+            source: list(truth_required_symbol_sources.get(source, []))
+            for source in truth_required_sources
+        }
+        truth_required_symbols = list(
+            dict.fromkeys(
+                symbol
+                for source in truth_required_sources
+                for symbol in truth_required_symbol_sources.get(source, [])
+            )
+        )
+        fallback_probe_symbol_cache: dict[Venue, list[str]] = {}
+
+        def truth_unavailable_core_decision(venue: Venue):
+            synthetic_work_items = ()
+            if truth_required_sources:
+                synthetic_work_items = (
+                    SimpleNamespace(
+                        kind="truth_required_position_probe",
+                        symbol="*",
+                        venues={venue.value},
+                        blocking=True,
+                        requires_truth=True,
+                    ),
+                )
+            return V1RecoveryDecisionCore().decide(
+                RecoveryEvidenceSnapshot(
+                    local_open_positions=tuple(
+                        self._recovery_state_collection("open_positions")
+                    ),
+                    pending_entries=tuple(
+                        self._recovery_state_collection("pending_entries")
+                    ),
+                    residual_repairs=tuple(
+                        self._recovery_state_collection("pending_residual_repairs")
+                    ),
+                    passive_closes=tuple(
+                        self._recovery_state_collection("pending_passive_closes")
+                    ),
+                    exchange_truth={
+                        "available": False,
+                        "missing_evidence": ("bulk_position_probe",),
+                        "venue": venue.value,
+                    },
+                    prior_recovery_block_reason=self.state.recovery_blocked_reason,
+                    operator_fail_closed=(
+                        self.state.operator.requested_mode
+                        == GlobalRiskMode.FAIL_CLOSED
+                    ),
+                    recovery_work_items=synthetic_work_items,
+                )
+            )
 
         async def fallback_symbols_for_venue(
             venue: Venue,
             adapter: VenueAdapter,
         ) -> list[str]:
+            if venue in fallback_probe_symbol_cache:
+                return fallback_probe_symbol_cache[venue]
             symbols_for_venue = probe_symbols_by_venue.get(venue, [])
             if symbols_for_venue:
+                fallback_probe_symbol_cache[venue] = symbols_for_venue
                 return symbols_for_venue
+            if truth_required_symbols:
+                bounded_symbols = await self._position_probe_symbols_for_venue(
+                    venue,
+                    adapter,
+                    truth_required_symbols,
+                )
+                max_bounded = self._MAX_BOUNDED_RECOVERY_FALLBACK_SYMBOLS
+                if len(bounded_symbols) > max_bounded:
+                    if getattr(self.journal, "_file", None) is not None:
+                        sample_symbols = bounded_symbols[:10]
+                        core_decision = truth_unavailable_core_decision(venue)
+                        self._append_runtime_diagnostic_event(
+                            "recovery.live_position_fallback_bounded_skipped",
+                            {
+                                "event_scope": "bounded_summary",
+                                "venue": venue.value,
+                                "fallback_symbol_count": len(bounded_symbols),
+                                "max_fallback_symbol_count": max_bounded,
+                                "fallback_symbols_sample": sample_symbols,
+                                "omitted_symbol_count": max(
+                                    len(bounded_symbols) - len(sample_symbols),
+                                    0,
+                                ),
+                                "truth_required_by": truth_required_sources,
+                                "truth_required_symbol_sources": (
+                                    truth_required_symbol_source_payload
+                                ),
+                                "reason": "truth_required_symbol_cap_exceeded",
+                                "decision": "truth_unavailable_for_required_recovery",
+                                "core_decision": core_decision.kind.value,
+                                "core_block_reason": core_decision.block_reason,
+                                "blocking": not core_decision.entry_allowed,
+                                "suppressed_count": 0,
+                                "ts_ms": global_probe_started_at_ms,
+                            },
+                            now_ms=global_probe_started_at_ms,
+                            key_parts=(
+                                venue.value,
+                                "truth_required_symbol_cap_exceeded",
+                            ),
+                            interval_ms=(
+                                self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS
+                            ),
+                        )
+                    fallback_probe_symbol_cache[venue] = []
+                    return []
+                fallback_probe_symbol_cache[venue] = bounded_symbols
+                return bounded_symbols
             static_symbols = [
                 str(symbol)
                 for symbol in getattr(self.config, "symbols", [])
@@ -2657,12 +2809,14 @@ class LiveRuntime:
                         key_parts=(venue.value, "static_universe_too_large"),
                         interval_ms=self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
                     )
+                fallback_probe_symbol_cache[venue] = []
                 return []
-            return await self._position_probe_symbols_for_venue(
+            fallback_probe_symbol_cache[venue] = await self._position_probe_symbols_for_venue(
                 venue,
                 adapter,
                 static_symbols,
             )
+            return fallback_probe_symbol_cache[venue]
 
         def canonical_position_symbol(
             venue: Venue,
@@ -2766,6 +2920,23 @@ class LiveRuntime:
                             payload,
                         )
                         return (venue, [])
+                    planned_fallback_symbols = await fallback_symbols_for_venue(
+                        venue,
+                        adapter,
+                    )
+                    core_decision = truth_unavailable_core_decision(venue)
+                    payload.update(
+                        {
+                            "fallback_symbol_count": len(planned_fallback_symbols),
+                            "fallback_symbols_sample": planned_fallback_symbols[:10],
+                            "truth_required_by": truth_required_sources,
+                            "truth_required_symbol_sources": (
+                                truth_required_symbol_source_payload
+                            ),
+                            "core_decision": core_decision.kind.value,
+                            "core_block_reason": core_decision.block_reason,
+                        }
+                    )
                     self.journal.append(
                         "recovery.live_position_bulk_probe_error",
                         payload,

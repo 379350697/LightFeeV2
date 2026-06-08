@@ -25,6 +25,8 @@ def order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
     if venue == Venue.BYBIT:
         return {
             "rest_order_status": "GET /v5/order/realtime",
+            "rest_order_history": "GET /v5/order/history",
+            "rest_execution_history": "GET /v5/execution/list",
             "open_order_truth": "GET /v5/order/realtime",
             "private_ws_order_topic": "order",
             "private_ws_execution_topic": "execution",
@@ -33,8 +35,11 @@ def order_truth_probe_paths(venue: Venue | None) -> dict[str, str]:
     if venue == Venue.OKX:
         return {
             "rest_order_status": "GET /api/v5/trade/order",
+            "rest_order_history": "GET /api/v5/trade/orders-history",
+            "rest_fills_history": "GET /api/v5/trade/fills-history",
             "open_order_truth": "GET /api/v5/trade/orders-pending",
             "private_ws_order_topic": "orders",
+            "private_ws_execution_topic": "orders",
             "live_position_probe": "GET /api/v5/account/positions",
         }
     if venue == Venue.BINANCE:
@@ -100,6 +105,9 @@ def build_order_submit_uncertainty_payload(
 
     if bool(getattr(error, "order_ack_only", False)):
         payload["order_ack_only"] = True
+    payload["accepted_order_truth_gap"] = True
+    payload["truth_required_by"] = "accepted_order_truth_gap"
+    payload["terminal_without_truth"] = False
     accepted_order_id = str(getattr(error, "accepted_order_id", "") or "")
     accepted_client_order_id = str(
         getattr(error, "accepted_client_order_id", "")

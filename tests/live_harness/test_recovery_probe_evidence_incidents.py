@@ -330,3 +330,155 @@ async def test_instrument_missing_probe_error_is_structured_and_non_empty():
     assert payload["classification"] == "instrument_missing"
     assert payload["exception_class"] == "TransportError"
     assert payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_bybit_bulk_timeout_falls_back_only_to_truth_required_symbols():
+    class BybitBulkTimeoutAdapter(_CatalogAdapter):
+        def __init__(self):
+            super().__init__(Venue.BYBIT)
+            self.fetch_position_symbols: list[str] = []
+            self._transport = SimpleNamespace(
+                _spec=SimpleNamespace(position_path="/v5/position/list"),
+                _venue_symbol=lambda symbol: symbol,
+            )
+
+        def supported_symbols(self) -> list[str]:
+            return ["OWNEDUSDT", "IRRELEVANTUSDT"]
+
+        async def fetch_all_positions(self):
+            raise asyncio.TimeoutError()
+
+        async def fetch_position(self, symbol: str) -> PositionSnapshot:
+            self.fetch_position_symbols.append(symbol)
+            return PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=1700000000000,
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td)
+        config.symbols = [f"SYM{i}USDT" for i in range(620)]
+        adapter = BybitBulkTimeoutAdapter()
+        runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: adapter})
+        runtime.state.pending_residual_repairs.append(
+            {
+                "position_id": "entry-owned",
+                "pair_id": "ownedusdt:binance->bybit",
+                "symbol": "OWNEDUSDT",
+                "origin": "entry_open",
+                "repair_venue": "bybit",
+                "repair_side": "buy",
+                "repair_quantity": 1.0,
+            }
+        )
+        runtime.journal.open()
+        try:
+            await runtime._fetch_startup_live_position_snapshots([])
+        finally:
+            runtime.journal.close()
+
+        records = _records(config)
+
+    assert adapter.fetch_position_symbols == ["OWNEDUSDT"]
+    bulk_error = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "recovery.live_position_bulk_probe_error"
+    )
+    assert bulk_error["venue"] == "bybit"
+    assert bulk_error["classification"] == "timeout"
+    assert bulk_error["fallback_symbol_count"] == 1
+    assert bulk_error["fallback_symbols_sample"] == ["OWNEDUSDT"]
+    assert bulk_error["truth_required_by"] == [
+        "pending_residual_repair",
+    ]
+    assert bulk_error["truth_required_symbol_sources"] == {
+        "pending_residual_repair": ["OWNEDUSDT"],
+    }
+    assert bulk_error["core_decision"] == "RISK_ONLY_WAIT_FOR_TRUTH"
+    assert not any(
+        record["kind"] == "recovery.live_position_static_config_probe_skipped"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_bybit_bulk_timeout_skips_truth_required_fallback_over_cap():
+    class BybitBulkTimeoutAdapter(_CatalogAdapter):
+        def __init__(self):
+            super().__init__(Venue.BYBIT)
+            self.fetch_position_symbols: list[str] = []
+            self._transport = SimpleNamespace(
+                _spec=SimpleNamespace(position_path="/v5/position/list"),
+                _venue_symbol=lambda symbol: symbol,
+            )
+
+        def supported_symbols(self) -> list[str]:
+            return [f"OWNED{i}USDT" for i in range(30)]
+
+        async def fetch_all_positions(self):
+            raise asyncio.TimeoutError()
+
+        async def fetch_position(self, symbol: str) -> PositionSnapshot:
+            self.fetch_position_symbols.append(symbol)
+            return PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=1700000000000,
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        config = _config(td)
+        config.symbols = [f"SYM{i}USDT" for i in range(620)]
+        adapter = BybitBulkTimeoutAdapter()
+        runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: adapter})
+        for index in range(30):
+            runtime.state.pending_residual_repairs.append(
+                {
+                    "position_id": f"entry-owned-{index}",
+                    "pair_id": f"owned{index}usdt:binance->bybit",
+                    "symbol": f"OWNED{index}USDT",
+                    "origin": "entry_open",
+                    "repair_venue": "bybit",
+                    "repair_side": "buy",
+                    "repair_quantity": 1.0,
+                }
+            )
+        runtime.journal.open()
+        try:
+            await runtime._fetch_startup_live_position_snapshots([])
+        finally:
+            runtime.journal.close()
+
+        records = _records(config)
+
+    assert adapter.fetch_position_symbols == []
+    skipped = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "recovery.live_position_fallback_bounded_skipped"
+    )
+    assert skipped["venue"] == "bybit"
+    assert skipped["fallback_symbol_count"] == 30
+    assert skipped["max_fallback_symbol_count"] == 25
+    assert skipped["truth_required_by"] == ["pending_residual_repair"]
+    assert skipped["core_decision"] == "RISK_ONLY_WAIT_FOR_TRUTH"
+    assert skipped["core_block_reason"] == "truth_unavailable_for_required_recovery"
+    assert skipped["blocking"] is True
+    bulk_error = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "recovery.live_position_bulk_probe_error"
+    )
+    assert bulk_error["fallback_symbol_count"] == 0
+    assert bulk_error["truth_required_symbol_sources"][
+        "pending_residual_repair"
+    ] == [f"OWNED{i}USDT" for i in range(30)]
