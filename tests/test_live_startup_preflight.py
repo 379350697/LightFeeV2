@@ -1708,6 +1708,9 @@ class TestRuntimePreflight:
             async def fetch_all_positions(self):
                 return []
 
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             bybit = FlatBulkPositionAdapter(Venue.BYBIT)
@@ -1717,6 +1720,7 @@ class TestRuntimePreflight:
             runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
             runtime.state.recovery_blocked_reason = "unpaired_live_position"
             runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
 
@@ -1728,6 +1732,185 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_unpaired_live_position_flat_truth_requires_open_order_truth(self):
+        """The unpaired-position release must not synthesize empty open orders."""
+
+        class OpenOrderAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                return [
+                    {
+                        "venue": self.venue.value,
+                        "symbol": symbol,
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "order_id": "still-live-order",
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = OpenOrderAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason
+            assert runtime.state.recovery_blocked_reason != "unpaired_live_position"
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.entry_allowed is False
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_unpaired_live_position_flat_truth_requires_available_order_truth(self):
+        """Flat positions cannot clear an unpaired block when order truth errors."""
+
+        class OpenOrderUnavailableAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                raise RuntimeError("open order truth unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = OpenOrderUnavailableAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == "unpaired_live_position"
+            assert runtime.state.recovery_blocked_at_ms == 1234
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_flat_truth_clears_stale_risk_only_lifecycle_without_block_reason(self):
+        """Production stale latch: core is clean but lifecycle stayed risk_only."""
+
+        class FlatTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            await runtime.start()
+
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.recovery_blocked_at_ms = 0
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+            runtime._last_private_position_probe_ms = 0
+
+            await runtime._post_tick_housekeeping(1700000005000)
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "recovery.lifecycle_clear"
+                and event["payload"].get("reason")
+                == "runtime_flat_truth_current_state_clean"
+                for event in events
+            )
+            await runtime.stop()
+
+    @pytest.mark.asyncio
+    async def test_runtime_stale_lifecycle_requires_open_order_truth_before_clear(self):
+        """Flat positions alone are not enough when live open-order truth exists."""
+
+        class OpenOrderTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                return [
+                    {
+                        "venue": self.venue.value,
+                        "symbol": symbol,
+                        "side": "buy",
+                        "quantity": 1.0,
+                        "order_id": "live-open-order",
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = OpenOrderTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            await runtime.start()
+
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+            runtime._last_private_position_probe_ms = 0
+
+            await runtime._post_tick_housekeeping(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.entry_allowed is False
+            await runtime.stop()
+
+    @pytest.mark.asyncio
+    async def test_runtime_stale_lifecycle_requires_exchange_truth_before_clear(self):
+        """The stale lifecycle release cannot run on unavailable truth."""
+
+        class TruthUnavailableAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                raise RuntimeError("open order truth unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = TruthUnavailableAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            await runtime.start()
+
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+            runtime._last_private_position_probe_ms = 0
+
+            await runtime._post_tick_housekeeping(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            await runtime.stop()
 
     @pytest.mark.asyncio
     async def test_runtime_position_flat_truth_does_not_clear_orphan_order_block(self):

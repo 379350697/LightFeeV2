@@ -344,6 +344,105 @@ def test_run_diagnose_acceptance_gate_blocks_required_position_truth_unavailable
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_downgrades_historical_required_truth_after_core_clean(
+    monkeypatch,
+):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "recovery.required_position_truth_unavailable",
+                "payload": {
+                    "venue": "bybit",
+                    "symbol": "*",
+                    "classification": "timeout",
+                    "truth_required_by": ["recovery_ledger_work"],
+                    "truth_required_symbol_sources": {
+                        "recovery_ledger_work": ["LAYERUSDT"],
+                    },
+                    "blocking": True,
+                    "decision": "truth_unavailable_for_required_recovery",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LAYERUSDT",
+            venues=["bybit", "okx", "hyperliquid"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["required_position_truth_unavailable_count"] == 1
+        assert gate["recovery_decision"]["kind"] == "RUNNING_CLEAN"
+        assert gate["recovery_decision"]["entry_allowed"] is True
+        assert gate["exception_conclusions"]["blocking_required_truth"] == (
+            "historical_required_truth_resolved_by_current_core"
+        )
+        assert "blocking_required_truth" not in gate["blocking_reasons"]
+        assert gate["gate_passed"] is True
+        assert "lifecycle_release_not_applied" in gate["fingerprints"]
+        assert "lifecycle_release_not_applied" in result["health"]["fingerprints"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_fingerprints_stale_lifecycle_release_after_core_clean(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LAYERUSDT",
+            venues=["bybit", "okx"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["recovery_decision"]["kind"] == "RUNNING_CLEAN"
+        assert "lifecycle_release_not_applied" in gate["fingerprints"]
+        assert "lifecycle_release_not_applied" in result["health"]["fingerprints"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_classifies_scoped_snapshot_fallback_as_v1_parity(monkeypatch):
     from scripts import diagnose_live as dl
 

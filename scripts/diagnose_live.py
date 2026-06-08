@@ -2015,6 +2015,30 @@ def _build_production_acceptance_gate(
         and pending_residual_repair_count == 0
     )
     exchange_recovery_clean = exchange_truth_flat and exchange_truth_no_open_orders
+    current_core_clean = (
+        local_recovery_clean
+        and exchange_recovery_clean
+        and str(local_state.get("risk_mode", "") or "").lower() == "running"
+        and recovery_decision.get("entry_allowed") is True
+        and not recovery_decision.get("block_reason")
+        and recovery_decision.get("kind")
+        in {"RUNNING_CLEAN", "RUNNING_WITH_EVIDENCE_GAP"}
+    )
+    fingerprints: list[str] = []
+    if (
+        current_core_clean
+        and str(local_state.get("lifecycle", "") or "").lower() == "risk_only"
+    ):
+        fingerprints.append("lifecycle_release_not_applied")
+    if (
+        required_position_truth_unavailable_count
+        and exception_conclusions.get("blocking_required_truth")
+        == "blocking_required_truth"
+        and current_core_clean
+    ):
+        exception_conclusions["blocking_required_truth"] = (
+            "historical_required_truth_resolved_by_current_core"
+        )
     residual_lifecycle_closed = (
         residual_count == 0
         or (
@@ -2119,6 +2143,7 @@ def _build_production_acceptance_gate(
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
         "recovery_decision": recovery_decision,
+        "fingerprints": fingerprints,
         "exception_conclusions": exception_conclusions,
         "unclassified_exceptions": unclassified_exceptions,
         "insufficient_evidence_exceptions": insufficient_evidence_exceptions,
@@ -2465,6 +2490,9 @@ def run_diagnose(
     production_acceptance_gate = _build_production_acceptance_gate(
         all_events, local_state, exchange_truth,
     )
+    for fingerprint in production_acceptance_gate.get("fingerprints", []) or []:
+        if fingerprint not in health.get("fingerprints", []):
+            health.setdefault("fingerprints", []).append(fingerprint)
     evidence_completeness = _build_evidence_completeness(
         order_errors, state_consistency, exchange_truth,
     )

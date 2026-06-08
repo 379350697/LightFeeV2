@@ -31,6 +31,7 @@ from lightfee.engine.state import (
     PendingEntryRemainderSlice,
     PendingPassiveOrder,
 )
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.hyperliquid import HyperliquidAdapter
 from lightfee.venues.symbol_rules import SymbolRule
 
@@ -2736,6 +2737,102 @@ class TestRealPathAbortCleanupDeadline:
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "pending_entry.maker_terminal_evidence_unavailable" not in kinds
         assert "pending_entry.maker_terminal_no_open_order" in kinds
+
+    @pytest.mark.asyncio
+    async def test_terminal_abandoned_flat_pending_entry_clears_recovery_core_block(
+        self, tmp_path
+    ):
+        """Terminal flat pending-entry cleanup must release stale recovery gate.
+
+        Production regression: the pending owner was correctly abandoned after
+        maker terminal evidence plus flat live truth, but the old recovery
+        decision/ledger work stayed latched and kept lifecycle risk_only.
+        """
+        runtime = _make_open_runtime(tmp_path, pending_entry_hard_ceiling_ms=1000)
+        runtime.config.runtime.mode = "live"
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+
+        maker = _FakeVenueAdapter(Venue.OKX)
+        maker.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="LAYERUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2000,
+        )
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="LAYERUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2000,
+        )
+        runtime._venue_adapters[Venue.OKX] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-layer-terminal-flat",
+            symbol="LAYERUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            uncertain_outcome=True,
+            outcome="maker_resting",
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+            passive_order=PendingPassiveOrder(
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+                target_quantity=10.0,
+                accepted_at_ms=1000,
+                timeout_at_ms=1500,
+                cancel_requested_at_ms=1600,
+                last_progress_state=PassiveOrderState.CANCELED,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+            },
+            now_ms=1700,
+        )
+
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.recovery_decision is not None
+        assert runtime.recovery_decision.entry_allowed is False
+        assert runtime._truth_required_recovery_probe_symbol_sources([])[
+            "recovery_ledger_work"
+        ] == ["LAYERUSDT"]
+
+        handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
+            pending, pending.pending_id, now_ms=3000
+        )
+
+        assert handled is True
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+        assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+        assert runtime.state.recovery_blocked_reason is None
+        assert runtime.recovery_decision is not None
+        assert runtime.recovery_decision.entry_allowed is True
+        assert runtime._truth_required_recovery_probe_symbol_sources([]).get(
+            "recovery_ledger_work", []
+        ) == []
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "reconciliation.entry_abandoned_flat" in kinds
+        assert "recovery.ledger_clear" in kinds
 
     @pytest.mark.asyncio
     async def test_try_abandon_stale_entry_requires_cancel_before_missing_progress_no_open_order_abandon(

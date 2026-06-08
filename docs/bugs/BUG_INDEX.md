@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest recovery current-state release latch closure, 2026-06-09: after the
+prior deploy, production exchange truth was high-confidence flat/no-open-orders
+and `V1RecoveryDecisionCore` evaluated `RUNNING_CLEAN`, but runtime
+`lifecycle=risk_only` remained latched while `risk_mode=running`. The root
+cause was a missing V1 current-state release loop after pending-entry/passive
+maker work had already terminalized, plus an older `unpaired_live_position`
+path that synthesized `open_orders=[]` from position-flat evidence. The local
+fix adds a narrow stale-lifecycle release helper that only clears on current
+`RUNNING_CLEAN` plus available flat position truth and empty open-order truth,
+routes pending-entry terminal removal/startup/tick recovery back through the
+recovery ledger/core, and makes `unpaired_live_position` use bounded symbol
+open-order truth instead of synthetic empties. `diagnose_live.py` now reports
+`lifecycle_release_not_applied` when current core/exchange truth is clean but
+runtime lifecycle remains `risk_only`. Local verification passed focused
+RED/GREEN and recovery/pending/residual regression scope (`311 passed`). Full
+evidence is recorded in
+[`daily/2026-06-09.md#cluster-cl-057-recovery-current-state-release-latch-and-open-order-truth-gap`](daily/2026-06-09.md#cluster-cl-057-recovery-current-state-release-latch-and-open-order-truth-gap).
+
 Latest production evidence contract split, 2026-06-08: CL-055 already closed
 the core trading risk for issue 2/3; this follow-up separates the diagnostic
 surface so healthy deploy windows are not misread as unclosed recovery risk.
