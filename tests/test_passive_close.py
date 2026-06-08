@@ -146,6 +146,7 @@ def _mock_adapter_with_tick(venue=Venue.BINANCE, tick=0.01):
     adapter.venue = venue
     adapter.price_tick_size = lambda symbol=None, _tick=tick: _tick
     adapter.normalize_quantity = AsyncMock(side_effect=lambda symbol, quantity: quantity)
+    adapter.query_passive_order_progress = AsyncMock(return_value=None)
     return adapter
 
 
@@ -260,6 +261,66 @@ class TestPassiveOrderContract:
         assert prog.cumulative_quantity == 0.005
         assert prog.average_price == 50100.0
         assert prog.state == PassiveOrderState.PARTIALLY_FILLED
+
+
+class TestMakerProgressTruthGate:
+    def test_maker_progress_query_timeout_does_not_consume_zero_fill_cycle(self):
+        """Order truth outage is retryable truth gap, not a no-fill maker cycle."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+                zero_fill_cycles_in_phase=0,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(
+            side_effect=TimeoutError("order query timeout")
+        )
+        maker_adapter.submit_passive_order = AsyncMock()
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state,
+                position.position_id,
+                wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        assert pending.phase_state.zero_fill_cycles_in_phase == 0
+        assert pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+        maker_adapter.submit_passive_order.assert_not_called()
+        events = journal.read_all()
+        truth_gap = [
+            e["payload"] for e in events
+            if e.get("kind") == "exit.passive_close_order_truth_unavailable"
+        ]
+        assert truth_gap
+        assert truth_gap[-1]["source"] == "poll_maker_progress"
+        assert truth_gap[-1]["next_action"] == "retry_progress_poll"
 
 
 class TestPassiveProgressAndHedge:
@@ -1521,14 +1582,10 @@ class TestPartialMakerFillGradualCatchUp:
             )
         )
 
-        assert result is False
-        hedge_adapter.place_order.assert_not_called()
-        dust = next(
-            e for e in journal.read_all()
-            if e.get("kind") == "exit.passive_close_hedge_dust_aborted"
-        )
-        assert dust["payload"]["reason"] == "price_unavailable_for_min_notional"
-        assert dust["payload"]["reason"] != "min_notional_rejected"
+        assert result is True
+        hedge_adapter.place_order.assert_awaited_once()
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_hedge_dust_aborted" not in kinds
 
     def test_delta_hedge_uses_bybit_instrument_min_notional_not_buffer(self):
         """Bybit hard min-notional comes from instruments-info, not local buffer."""
@@ -2065,6 +2122,193 @@ class TestFallbackResidualReal:
         assert terminals[-1]["terminal_reason"] == "passive_close_live_one_sided_force_close_problem"
         assert terminals[-1]["problem_reason"] == "normal_one_sided_flatten_failed_force_close"
         assert terminals[-1]["client_order_ids"]
+
+    def test_ack_only_live_one_sided_flatten_registers_truth_gap_without_clear(self):
+        """ACK-only one-sided flatten requires order/live truth before terminal clear."""
+        journal = _open_journal()
+
+        class AckOnlyAdapter(VenueAdapter):
+            def __init__(self, venue, *, quantity, side):
+                self._venue = venue
+                self._quantity = quantity
+                self._side = side
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                error = OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "order accepted but fill not confirmed",
+                )
+                error.order_ack_only = True
+                error.accepted_order_id = "ack-one-sided-oid"
+                error.accepted_client_order_id = request.client_order_id
+                error.fill_confirmation_missing_fields = ["fill", "order_state"]
+                raise error
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=self._quantity,
+                    entry_price=1.0211 if self._quantity else 0.0,
+                    observed_at_ms=2000,
+                )
+
+        class FlatAdapter(AckOnlyAdapter):
+            async def place_order(self, request):
+                raise AssertionError("flat leg should not be ordered")
+
+        okx = FlatAdapter(Venue.OKX, quantity=0.0, side=Side.BUY)
+        bybit = AckOnlyAdapter(Venue.BYBIT, quantity=20.0, side=Side.SELL)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-ack-one-sided",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is False
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        assert len(state.pending_close_reconciliations) == 1
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["kind"] == "accepted_order_truth_gap"
+        assert reconciliation["truth_required_by"] == "accepted_order_truth_gap"
+        assert reconciliation["short_legs"][0]["order_id"] == "ack-one-sided-oid"
+        assert reconciliation["short_legs"][0]["client_order_id"]
+
+        records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.accepted_order_truth_gap_registered" in kinds
+        assert "exit.passive_close_live_one_sided_force_close_problem" not in kinds
+        assert "runtime.position_lifecycle_terminal" not in kinds
+
+    def test_live_flat_clear_passes_real_exchange_truth_to_recovery_core(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-live-flat-truth",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3001,
+        ))
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+
+        captured_truth: list[dict] = []
+        original_decide = passive_close_module.V1RecoveryDecisionCore.decide
+
+        def capture_decide(core, snapshot):
+            captured_truth.append(snapshot.exchange_truth)
+            return original_decide(core, snapshot)
+
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        with patch.object(
+            passive_close_module.V1RecoveryDecisionCore,
+            "decide",
+            capture_decide,
+        ):
+            result = asyncio.run(
+                executor._clear_if_live_flat(
+                    state,
+                    pending,
+                    position,
+                    source="test_live_flat_truth",
+                )
+            )
+
+        assert result is True
+        assert captured_truth
+        truth = captured_truth[-1]
+        assert truth["truth_available"] is True
+        assert truth["positions"]
+        assert {item["venue"] for item in truth["positions"]} == {"okx", "bybit"}
+        assert all(item["quantity"] == 0.0 for item in truth["positions"])
+        assert truth["open_orders"] == []
+        assert truth["open_order_truth"]
+        assert all(item["open_orders_empty"] is True for item in truth["open_order_truth"])
 
     def test_live_flat_force_close_problem_does_not_enqueue_reconciliation_in_paper(self):
         """V1: pending-close reconciliation work is a live-runtime concern."""
@@ -3994,6 +4238,63 @@ class TestAmendCancelReplace:
         events = journal.read_all()
         blocked = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_blocked_double_order_risk"]
         assert len(blocked) == 1
+
+    def test_cancel_ack_old_order_alive_blocks_replacement_until_terminal_truth(self):
+        """Cancel ACK is not terminal truth; old order must be dead before replacement."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(order_id="old-oid"))
+        mock_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            state=PassiveOrderState.OPEN,
+            cumulative_quantity=0.0,
+            order_id="old-oid",
+            client_order_id="old-cid",
+        ))
+        mock_adapter.submit_passive_order = AsyncMock()
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        mock_adapter.query_passive_order_progress.assert_awaited_once()
+        mock_adapter.submit_passive_order.assert_not_called()
+        assert pending.phase_state.maker_order_id == "old-oid"
+        assert pending.phase_state.maker_client_order_id == "old-cid"
+        assert pending.next_retry_at_ms > 0
+
+        events = journal.read_all()
+        blocked = [
+            e["payload"] for e in events
+            if e.get("kind") == "exit.passive_close_cancel_replace_blocked_double_order_risk"
+        ]
+        assert len(blocked) == 1
+        assert blocked[-1]["reason"] == "cancel_ack_without_terminal_order_truth"
+        assert blocked[-1]["next_action"] == "retry_cancel_replace_after_order_truth"
 
     def test_cancel_fails_old_order_dead_proceeds(self):
         """When cancel fails but old order is dead → new order proceeds."""

@@ -211,11 +211,11 @@ async def test_jctusdt_terminal_maker_missing_price_compensates_in_real_drive_pa
 
     events = journal.read_all()
     kinds = [event["kind"] for event in events]
-    assert "exit.passive_close_hedge_dust_aborted" in kinds
-    assert "execution.min_notional_abort_and_flatten" in kinds
-    assert "exit.compensated" in kinds
-    assert "exit.passive_close_fallback_terminal_flat" in kinds
-    assert "recovery.flat" in kinds
+    assert "exit.passive_close_hedge_dust_aborted" not in kinds
+    assert "execution.min_notional_abort_and_flatten" not in kinds
+    assert "exit.compensated" not in kinds
+    assert "exit.passive_close_hedge_filled" in kinds
+    assert "exit.passive_close_resolved" in kinds
     assert pending.next_retry_at_ms == 0
 
 
@@ -290,8 +290,9 @@ async def test_jctusdt_live_one_sided_missing_price_compensates_instead_of_retry
 
     events = journal.read_all()
     kinds = [event["kind"] for event in events]
-    assert "exit.passive_close_hedge_dust_aborted" in kinds
-    assert "exit.compensated" in kinds
+    assert "exit.passive_close_hedge_dust_aborted" not in kinds
+    assert "exit.compensated" not in kinds
+    assert "exit.passive_close_live_one_sided_flatten" in kinds
     assert "exit.passive_close_fallback_terminal_flat" in kinds
     assert pending.next_retry_at_ms == 0
 

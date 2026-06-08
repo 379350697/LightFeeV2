@@ -281,6 +281,7 @@ class PassiveCloseExecutor:
         self._l2_quote_resolver: Optional[callable] = None
         # Inject aggressive close executor for fallback (set by runtime after construction)
         self._close_executor: Optional[object] = None
+        self._last_maker_progress_error: dict[str, Any] | None = None
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -773,6 +774,25 @@ class PassiveCloseExecutor:
                 adapter, position.symbol, maker_order_id, maker_client_id,
                 side=maker_side,
             )
+            if progress is None and self._last_maker_progress_error:
+                error_payload = dict(self._last_maker_progress_error)
+                self._journal.append(
+                    "exit.passive_close_order_truth_unavailable",
+                    {
+                        "position_id": position_id,
+                        "symbol": position.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
+                        "phase": pending.phase_state.phase.value,
+                        "zero_fill_cycles": pending.phase_state.zero_fill_cycles_in_phase,
+                        "source": "poll_maker_progress",
+                        "decision": "retain_pending",
+                        "next_action": "retry_progress_poll",
+                        **error_payload,
+                    },
+                )
+                pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                return False
 
             # Apply progress to pending state
             if progress is not None:
@@ -1567,6 +1587,7 @@ class PassiveCloseExecutor:
         side: Side = Side.BUY,
     ) -> Optional[PassiveOrderProgress]:
         """Query cumulative progress for a resting passive order."""
+        self._last_maker_progress_error = None
         try:
             return await adapter.query_passive_order_progress(
                 symbol=symbol,
@@ -1577,7 +1598,15 @@ class PassiveCloseExecutor:
         except NotImplementedError:
             # Fallback: adapter doesn't support passive progress query
             return None
-        except Exception:
+        except Exception as error:
+            self._last_maker_progress_error = {
+                "symbol": symbol,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "side": side.value,
+                "error": str(error),
+                "error_type": type(error).__name__,
+            }
             return None
 
     def _apply_maker_progress(
@@ -2155,6 +2184,18 @@ class PassiveCloseExecutor:
             }
             hedge_error_payload.update(uncertainty_payload)
             if is_order_truth_gap(e):
+                self._register_accepted_order_truth_gap(
+                    state,
+                    pending,
+                    position,
+                    venue=hedge_venue,
+                    leg_label=hedge_leg_label,
+                    operation="place_order",
+                    source="passive_close_hedge_order_truth_gap",
+                    payload=hedge_error_payload,
+                    request=request,
+                    quantity=normalized_delta,
+                )
                 hedge_error_payload["fill_reconciliation_attempted"] = (
                     fill_reconciliation_attempted
                 )
@@ -2513,20 +2554,32 @@ class PassiveCloseExecutor:
                 {"position_id": position.position_id, "error": str(e)},
             )
 
-        if not cancel_ok:
-            # Cancel failed — query old order status to avoid double-order risk.
-            # Only submit the new order if old order is confirmed dead.
+        if old_order_id or old_client_id:
+            # Exchange cancel ACKs are asynchronous.  Whether cancel failed or
+            # was accepted, only replace after old order is confirmed dead.
             old_dead = await self._probe_order_dead(
                 adapter, position.symbol, old_order_id, old_client_id,
                 side=maker_side,
             )
             if not old_dead:
+                reason = (
+                    "cancel_ack_without_terminal_order_truth"
+                    if cancel_ok
+                    else "cancel_failed_old_order_may_still_be_alive"
+                )
                 self._journal.append(
                     "exit.passive_close_cancel_replace_blocked_double_order_risk",
                     {
                         "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
                         "old_order_id": old_order_id,
-                        "reason": "cancel failed and old order may still be alive — refusing to submit new",
+                        "old_client_order_id": old_client_id,
+                        "cancel_ack_received": cancel_ok,
+                        "reason": reason,
+                        "decision": "retain_old_order_identity",
+                        "next_action": "retry_cancel_replace_after_order_truth",
                     },
                 )
                 pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
@@ -2928,6 +2981,32 @@ class PassiveCloseExecutor:
 
         actual_long_size = abs(float(getattr(long_snap, "quantity", 0.0)))
         actual_short_size = abs(float(getattr(short_snap, "quantity", 0.0)))
+        long_open_orders_flat, long_open_orders_evidence = await self._probe_venue_open_orders_flat(
+            position.long_venue,
+            position.symbol,
+            adapters or self._adapters,
+        )
+        short_open_orders_flat, short_open_orders_evidence = await self._probe_venue_open_orders_flat(
+            position.short_venue,
+            position.symbol,
+            adapters or self._adapters,
+        )
+        if long_open_orders_flat is not True or short_open_orders_flat is not True:
+            self._journal.append(
+                "exit.passive_close_clear_flat_untrusted",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "long_open_orders": long_open_orders_evidence,
+                    "short_open_orders": short_open_orders_evidence,
+                    "live_truth_trusted": False,
+                    "decision": "retain_pending",
+                    "source": source,
+                },
+            )
+            return False
 
         self._clear_live_flat_state(
             state,
@@ -2937,6 +3016,13 @@ class PassiveCloseExecutor:
             actual_long_size=actual_long_size,
             actual_short_size=actual_short_size,
             extra=extra,
+            exchange_truth=self._live_flat_exchange_truth(
+                position,
+                long_snap=long_snap,
+                short_snap=short_snap,
+                long_open_orders_evidence=long_open_orders_evidence,
+                short_open_orders_evidence=short_open_orders_evidence,
+            ),
         )
         return True
 
@@ -2957,6 +3043,56 @@ class PassiveCloseExecutor:
             "total_entry_fee_quote": position.total_entry_fee_quote,
             "captured_funding_quote": position.captured_funding_quote,
             "opened_at_ms": position.opened_at_ms,
+        }
+
+    @staticmethod
+    def _position_truth_record(snapshot: Any, venue: Venue, symbol: str) -> dict[str, Any]:
+        quantity = getattr(snapshot, "quantity", 0.0)
+        try:
+            quantity_value = float(quantity or 0.0)
+        except (TypeError, ValueError):
+            quantity_value = 0.0
+        side = getattr(snapshot, "side", None)
+        return {
+            "venue": venue.value,
+            "symbol": symbol,
+            "side": side.value if isinstance(side, Side) else str(side or ""),
+            "quantity": abs(quantity_value),
+            "entry_price": float(getattr(snapshot, "entry_price", 0.0) or 0.0),
+            "observed_at_ms": int(getattr(snapshot, "observed_at_ms", 0) or 0),
+        }
+
+    def _live_flat_exchange_truth(
+        self,
+        position: OpenPosition,
+        *,
+        long_snap: Any,
+        short_snap: Any,
+        long_open_orders_evidence: str | None,
+        short_open_orders_evidence: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "truth_available": True,
+            "positions": [
+                self._position_truth_record(long_snap, position.long_venue, position.symbol),
+                self._position_truth_record(short_snap, position.short_venue, position.symbol),
+            ],
+            "open_orders": [],
+            "open_order_truth": [
+                {
+                    "venue": position.long_venue.value,
+                    "symbol": position.symbol,
+                    "open_orders_empty": True,
+                    "evidence": long_open_orders_evidence,
+                },
+                {
+                    "venue": position.short_venue.value,
+                    "symbol": position.symbol,
+                    "open_orders_empty": True,
+                    "evidence": short_open_orders_evidence,
+                },
+            ],
+            "source": "passive_close_live_flat_truth",
         }
 
     @staticmethod
@@ -3168,6 +3304,92 @@ class PassiveCloseExecutor:
             },
         )
 
+    def _register_accepted_order_truth_gap(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        venue: Venue,
+        leg_label: str,
+        operation: str,
+        source: str,
+        payload: dict[str, Any],
+        request: OrderRequest | None = None,
+        quantity: float = 0.0,
+    ) -> None:
+        if self._runtime_mode != "live":
+            return
+        accepted_order_id = str(payload.get("accepted_order_id") or "")
+        accepted_client_order_id = str(
+            payload.get("accepted_client_order_id")
+            or getattr(request, "client_order_id", "")
+            or ""
+        )
+        if not accepted_order_id and not accepted_client_order_id:
+            return
+
+        record = self._close_reconciliation_record(
+            venue=venue,
+            order_id=accepted_order_id,
+            client_order_id=accepted_client_order_id,
+            quantity=0.0,
+        )
+        long_legs: list[dict[str, Any]] = []
+        short_legs: list[dict[str, Any]] = []
+        if venue == position.long_venue or leg_label == "long":
+            long_legs.append(record)
+        elif venue == position.short_venue or leg_label == "short":
+            short_legs.append(record)
+        else:
+            return
+
+        now_ms = self._now_ms()
+        reconciliation = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "kind": "accepted_order_truth_gap",
+            "reason": pending.reason,
+            "source": source,
+            "operation": operation,
+            "venue": venue.value,
+            "leg": leg_label,
+            "closed_at_ms": now_ms,
+            "created_cycle": int(getattr(state, "tick_count", 0) or 0),
+            "position_snapshot": self._position_snapshot_for_close_reconciliation(position),
+            "original_payload": dict(payload),
+            "long_legs": long_legs,
+            "short_legs": short_legs,
+            "attempt_count": 0,
+            "next_attempt_ms": now_ms,
+            "accepted_order_truth_gap": True,
+            "truth_required_by": "accepted_order_truth_gap",
+            "terminal_without_truth": False,
+            "requested_quantity": float(quantity or 0.0),
+            "next_action": payload.get(
+                "next_action",
+                "reconcile_accepted_order_or_probe_live_position",
+            ),
+            "probe_paths": dict(payload.get("order_truth_probe_paths") or {}),
+        }
+        state.enqueue_pending_close_reconciliation(reconciliation)
+        self._journal.append(
+            "exit.accepted_order_truth_gap_registered",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value,
+                "leg": leg_label,
+                "operation": operation,
+                "source": source,
+                "order_id": accepted_order_id,
+                "client_order_id": accepted_client_order_id,
+                "truth_required_by": "accepted_order_truth_gap",
+                "next_action": reconciliation["next_action"],
+                "probe_paths": reconciliation["probe_paths"],
+            },
+        )
+
     def _clear_live_flat_state(
         self,
         state: EngineState,
@@ -3178,6 +3400,7 @@ class PassiveCloseExecutor:
         actual_long_size: float,
         actual_short_size: float,
         extra: dict[str, Any] | None = None,
+        exchange_truth: dict[str, Any] | None = None,
     ) -> None:
         """Clear local passive/open state after live exchange truth is flat."""
 
@@ -3271,10 +3494,9 @@ class PassiveCloseExecutor:
                         getattr(state, "pending_residual_repairs", ()) or ()
                     ),
                     passive_closes=tuple(state.pending_passive_closes.values()),
-                    exchange_truth={
-                        "truth_available": True,
-                        "positions": [],
-                        "open_orders": [],
+                    exchange_truth=exchange_truth or {
+                        "truth_available": False,
+                        "missing_evidence": ["live_flat_exchange_truth"],
                     },
                     prior_recovery_block_reason=state.recovery_blocked_reason,
                     operator_fail_closed=(
@@ -3746,18 +3968,44 @@ class PassiveCloseExecutor:
         try:
             fill = await adapter.place_order(request)
         except Exception as exc:
+            uncertainty_payload: dict[str, Any] = {}
+            if isinstance(exc, OrderSubmitError):
+                uncertainty_payload = build_order_submit_uncertainty_payload(
+                    exc,
+                    venue=venue,
+                    operation="place_order",
+                    request=request,
+                    default_client_order_id=client_order_id,
+                )
+            error_payload = {
+                "position_id": position.position_id,
+                "venue": venue.value,
+                "leg": leg_label,
+                "live_quantity": live_qty,
+                "normalized_quantity": normalized_qty,
+                "side": close_side.value,
+                "error": str(exc),
+            }
+            error_payload.update(uncertainty_payload)
             self._journal.append(
                 "exit.passive_close_live_one_sided_error",
-                {
-                    "position_id": position.position_id,
-                    "venue": venue.value,
-                    "leg": leg_label,
-                    "live_quantity": live_qty,
-                    "normalized_quantity": normalized_qty,
-                    "side": close_side.value,
-                    "error": str(exc),
-                },
+                error_payload,
             )
+            if is_order_truth_gap(exc):
+                self._register_accepted_order_truth_gap(
+                    state,
+                    pending,
+                    position,
+                    venue=venue,
+                    leg_label=leg_label,
+                    operation="place_order",
+                    source="passive_close_live_one_sided_order_truth_gap",
+                    payload=error_payload,
+                    request=request,
+                    quantity=normalized_qty,
+                )
+                pending.next_retry_at_ms = self._now_ms() + 5_000
+                return False
             if self._close_executor is not None:
                 from lightfee.core.errors import SubmitFailureClass
 
@@ -4198,6 +4446,32 @@ class PassiveCloseExecutor:
         live_short_qty = self._live_position_quantity(live_short)
         if live_long_error is None and live_short_error is None:
             if live_long_qty <= 1e-9 and live_short_qty <= 1e-9:
+                long_open_orders_flat, long_open_orders_evidence = await self._probe_venue_open_orders_flat(
+                    position.long_venue,
+                    position.symbol,
+                    self._adapters,
+                )
+                short_open_orders_flat, short_open_orders_evidence = await self._probe_venue_open_orders_flat(
+                    position.short_venue,
+                    position.symbol,
+                    self._adapters,
+                )
+                if long_open_orders_flat is not True or short_open_orders_flat is not True:
+                    self._journal.append(
+                        "exit.passive_close_clear_flat_untrusted",
+                        {
+                            "position_id": pending.position_id,
+                            "symbol": position.symbol,
+                            "long_venue": position.long_venue.value,
+                            "short_venue": position.short_venue.value,
+                            "long_open_orders": long_open_orders_evidence,
+                            "short_open_orders": short_open_orders_evidence,
+                            "live_truth_trusted": False,
+                            "decision": "retain_pending",
+                            "source": "pending_passive_close_flat_probe",
+                        },
+                    )
+                    return False
                 self._clear_live_flat_state(
                     state,
                     pending,
@@ -4205,6 +4479,13 @@ class PassiveCloseExecutor:
                     source="pending_passive_close_flat_probe",
                     actual_long_size=live_long_qty,
                     actual_short_size=live_short_qty,
+                    exchange_truth=self._live_flat_exchange_truth(
+                        position,
+                        long_snap=live_long,
+                        short_snap=live_short,
+                        long_open_orders_evidence=long_open_orders_evidence,
+                        short_open_orders_evidence=short_open_orders_evidence,
+                    ),
                 )
                 return True
 
@@ -5200,16 +5481,7 @@ class PassiveCloseExecutor:
         if venue_reduce_only_close_exempts_min_notional(hedge_venue):
             return None
         if not (math.isfinite(price_hint) and price_hint > 0.0):
-            return {
-                "venue": hedge_venue,
-                "leg_notional": 0.0,
-                "min_notional": min_notional,
-                "quantity": quantity,
-                "price_hint": price_hint,
-                "reason": "price_unavailable_for_min_notional",
-                "price_source": price_source,
-                "min_notional_source": min_notional_source,
-            }
+            return None
         violation = close_leg_exchange_min_notional_violation(
             hedge_venue, symbol, side, quantity,
             reduce_only=True, price_hint=price_hint,

@@ -889,6 +889,25 @@ class TestM14PreSubmitMinNotional:
             "0.01 * 50000 = 500 notional, should be above default threshold"
         )
 
+    def test_price_unavailable_returns_none_not_dust(self):
+        """V1: missing order price evidence cannot prove a min-notional violation."""
+        from lightfee.core.domain import Side, Venue
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+
+        executor = PassiveCloseExecutor({}, None)
+        violation = executor._check_hedge_min_notional(
+            hedge_venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price_hint=0.0,
+            price_source="price_unavailable_for_min_notional",
+            min_notional_quote=5.0,
+            min_notional_source="venue_spec",
+        )
+
+        assert violation is None
+
     def test_zero_quantity_returns_violation(self):
         """Zero or near-zero quantity → violation."""
         from lightfee.core.domain import Side, Venue
