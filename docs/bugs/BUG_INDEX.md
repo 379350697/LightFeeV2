@@ -22,10 +22,15 @@ passed manifest/compileall and wrote `.deploy_version=e63d70e`, but
 `lightfee-live.service` entered `activating/auto-restart` because Aster V3
 startup attempted to derive a signer from the configured legacy secret and
 raised `ValueError: failed to derive aster signer from private key`. The root
-fix makes `credential_has_aster_v3_signer()` deterministic, allows Aster public
-live transport to start when private signing is invalid, and makes Aster private
-truth/order methods fail closed with explicit auth-failure evidence instead of
-crashing startup or returning false empty truth. Local RED/GREEN is recorded in
+fix in `9d037f5` makes `credential_has_aster_v3_signer()` deterministic,
+allows Aster public live transport to start when private signing is invalid,
+and makes Aster private truth/order methods fail closed with explicit
+auth-failure evidence instead of crashing startup or returning false empty
+truth. Cloud deploy of `9d037f5` passed manifest/compileall, restarted sidecar
+and live active/running with `NRestarts=0`, and settled
+`diagnose_live.py --json --since-deploy` reported `health.ok=true`,
+`lifecycle=running`, `risk_mode=running`, `version_mismatch=false`, and
+`production_acceptance_gate.gate_passed=true`. Full evidence is recorded in
 [`daily/2026-06-08.md#cluster-cl-053-aster-v3-invalid-signer-startup-crash`](daily/2026-06-08.md#cluster-cl-053-aster-v3-invalid-signer-startup-crash).
 
 Latest production issues 3-11 root-closure evidence hardening, 2026-06-08:
