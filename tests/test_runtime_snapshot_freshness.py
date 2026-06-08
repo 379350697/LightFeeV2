@@ -926,6 +926,13 @@ def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tm
     )
     assert structural["eligibility_class"] == "structural_ineligibility"
     assert structural["last_structural_probe_at_ms"] == 69500
+    assert structural["endpoint"] == "sidecar_perp_liquidity"
+    assert structural["source"] == "sidecar_perp_liquidity"
+    assert structural["floor"] == structural["min_open_interest_quote"]
+    assert structural["current_value"] == structural["observed_open_interest_quote"]
+    assert structural["fallback_source"] == "fresh_sidecar"
+    assert structural["targeted_revalidate_required"] is True
+    assert structural["targeted_revalidate_scope"] == "entry_candidate"
 
 
 @pytest.mark.asyncio

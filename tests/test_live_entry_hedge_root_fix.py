@@ -3968,6 +3968,70 @@ class TestRealPathAbortCleanupDeadline:
         assert pending.passive_order.last_progress_state == PassiveOrderState.CANCELED
 
     @pytest.mark.asyncio
+    async def test_pending_passive_rest_timeout_logs_ack_truth_gap_evidence(self, tmp_path):
+        """REST cancel ACK is not terminal; V1 keeps progress/order truth active."""
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_try_window_ms=0,
+            maker_entry_rest_timeout_ms=6000,
+            maker_venue_budget_window_ms=100,
+        )
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="USTCUSDT",
+            side=Side.BUY,
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.OPEN,
+            observed_at_ms=7000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+
+        pending = PendingEntry(
+            pending_id="entry-passive-timeout-evidence",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=3920.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_order_id="maker-oid",
+            maker_client_order_id="maker-cid",
+            passive_order=PendingPassiveOrder(
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+                limit_price=0.0012,
+                target_quantity=3920.0,
+                accepted_at_ms=1000,
+                timeout_at_ms=7000,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._maintain_pending_entry_passive_orders(7000)
+
+        payload = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"] == "passive_maintenance.cancel_rest_timeout"
+        ][-1]
+        assert payload["entry_id"] == pending.pending_id
+        assert payload["venue"] == "bybit"
+        assert payload["order_id"] == "maker-oid"
+        assert payload["client_order_id"] == "maker-cid"
+        assert payload["cancel_ack_terminal"] is False
+        assert payload["truth_required_by"] == "pending_entry_passive_reconciliation"
+        assert payload["next_truth_probe"] == "query_passive_order_progress"
+        assert payload["post_cancel_state"] == "pending_truth_confirmation"
+        assert pending.passive_order is not None
+        assert pending.passive_order.cancel_requested_at_ms == 7000
+
+    @pytest.mark.asyncio
     async def test_zero_fill_passive_repost_blocks_when_first_funding_too_close(self, tmp_path):
         """Zero-fill pending work must not repost normal maker risk inside horizon."""
 

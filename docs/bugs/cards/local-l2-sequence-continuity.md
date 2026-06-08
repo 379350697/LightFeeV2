@@ -51,6 +51,7 @@ Last-good / quote fallback rules:
 | 2026-05-30 | Post-`bbcd7b9` high rebuild/snapshot watch | deployed/probe verified | Current evidence remains official continuity/rebuild behavior; no Local-L2 readiness relaxation is allowed without new docs or V1 proof. |
 | 2026-06-07 | Post-`21e5d44` fallback/quote evidence closure | local implementation pending deploy | Added RED/GREEN contracts that `runtime.live_scan_revalidate_required` marks `fallback_source=last_good_sidecar` and `targeted_revalidate_required=true`; quote readiness evidence carries blocker families and quote ages; static recovery-probe skip evidence is bounded summary rather than noisy per-universe spam. No sequence continuity relaxation was made. |
 | 2026-06-07 | Entry admission prefilter and no-entry stage breakdown | local implementation pending deploy | `runtime.entry_admission_venue_degraded` now summarizes venue-scope admission pruning before Local-L2/quote tracking. `scan.no_entry_diagnostics` includes stage counts for candidate universe, unsupported symbol, entry-admission venue downgrade, snapshot/quote freshness, liquidity, and entry selection. |
+| 2026-06-08 | Structural open-interest degraded evidence | local RED/GREEN, deploy pending | CL-052 adds endpoint, source, floor/current value, fallback source, and targeted revalidate scope to `perp_open_interest_structural` payloads. This is diagnostic evidence only and does not relax Local-L2 sequence continuity or entry dispatch truth requirements. |
 
 ## Recurrences
 
@@ -60,6 +61,7 @@ Last-good / quote fallback rules:
 | 2026-05-29 | OKX `LABUSDT` evidence gap | `6987fc8` | closed for classification | [daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence](../daily/2026-05-29.md#cluster-cl-017-post-deploy-pending-hedge-admission-and-okx-l2-evidence) |
 | 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT`; post-fix `HEIUSDT` snapshot errors | `0fd9a74`; no Local-L2 code change selected | no dirty trading state; final affected-symbol probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
+| 2026-06-08 | production issue 11 snapshot/OI degraded evidence | working tree | local RED/GREEN and full pytest green; deploy pending | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 
 ## Regression Harness
 

@@ -1793,10 +1793,25 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
             events = runtime.journal.read_all()
-            assert any(
-                event["kind"] == "recovery.live_mismatch_flattened"
-                for event in events
+            flattened_events = [
+                event for event in events
+                if event["kind"] == "recovery.live_mismatch_flattened"
+            ]
+            assert flattened_events
+            flattened_payload = flattened_events[-1]["payload"]
+            assert flattened_payload["owner_resolution"] == "unowned_live_artifact"
+            assert flattened_payload["truth_required_by"] == "v1_recovery_decision_core"
+            assert flattened_payload["probe_family"] == "runtime_live_position_probe"
+            assert flattened_payload["post_cleanup_truth"]["truth_available"] is True
+            assert flattened_payload["post_cleanup_truth"]["positions"] == []
+            assert flattened_payload["positions"][0]["cleanup_intent_id"].startswith(
+                "live-recovery:runtime_live_position_probe:BTCUSDT:bybit:"
             )
+            assert flattened_payload["positions"][0]["post_cleanup_truth"] == {
+                "truth_available": True,
+                "position_qty": 0.0,
+                "side": "",
+            }
             clears = [
                 event for event in events
                 if event["kind"] == "recovery.ledger_clear"
@@ -1868,9 +1883,36 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_reason == (
                 "live_position_mismatch_flatten_failed"
             )
+            events = runtime.journal.read_all()
+            failed_events = [
+                event for event in events
+                if event["kind"] == "recovery.live_mismatch_flatten_failed"
+            ]
+            assert failed_events
+            failed_payload = failed_events[-1]["payload"]
+            assert failed_payload["owner_resolution"] == "unowned_live_artifact"
+            assert failed_payload["truth_required_by"] == "v1_recovery_decision_core"
+            assert failed_payload["probe_family"] == "runtime_live_position_probe"
+            assert failed_payload["post_cleanup_truth"]["truth_available"] is True
+            assert failed_payload["post_cleanup_truth"]["positions"] == [
+                {
+                    "venue": "bybit",
+                    "symbol": "BTCUSDT",
+                    "position_qty": 53.6,
+                    "side": "buy",
+                }
+            ]
+            assert failed_payload["failed_positions"][0]["cleanup_intent_id"].startswith(
+                "live-recovery:runtime_live_position_probe:BTCUSDT:bybit:"
+            )
+            assert failed_payload["failed_positions"][0]["post_cleanup_truth"] == {
+                "truth_available": True,
+                "position_qty": 53.6,
+                "side": "buy",
+            }
             assert not any(
                 event["kind"] == "recovery.legacy_block_cleared"
-                for event in runtime.journal.read_all()
+                for event in events
             )
             runtime.journal.close()
 
@@ -2399,6 +2441,23 @@ class TestRuntimePreflight:
                 event["kind"] == "recovery.live_mismatch_flattened"
                 for event in records
             )
+            flattened = [
+                event["payload"] for event in records
+                if event["kind"] == "recovery.live_mismatch_flattened"
+            ][-1]
+            assert flattened["owner_resolution"] == "unowned_live_artifact"
+            assert flattened["truth_required_by"] == "v1_recovery_decision_core"
+            assert flattened["probe_family"] == "startup_live_position_probe"
+            assert flattened["post_cleanup_truth"]["truth_available"] is True
+            assert flattened["post_cleanup_truth"]["positions"] == []
+            assert flattened["positions"][0]["cleanup_intent_id"].startswith(
+                "live-recovery:startup_live_position_probe:BTCUSDT:bybit:"
+            )
+            assert flattened["positions"][0]["post_cleanup_truth"] == {
+                "truth_available": True,
+                "position_qty": 0.0,
+                "side": "",
+            }
             assert any(
                 event["kind"] == "recovery.ledger_clear"
                 for event in records

@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest production issues 3-11 root-closure evidence hardening, 2026-06-08:
+issues 1-2 remain explicitly out of scope. The existing V1/exchange-semantics
+fixes for admission, pending hedge, recovery ledger, pending close, shared
+ACK-only order uncertainty, OKX amend fallback, and snapshot degraded handling
+were not duplicated. This pass only closed the remaining deterministic evidence
+gaps needed for deployment review: live mismatch flatten success/failure now
+records cleanup intent and post-cleanup read-only position truth; pending-entry
+passive maker rest-timeout cancel records order identity and that cancel ACK is
+not terminal; structural perp open-interest degraded events record endpoint,
+floor/current value, fallback source, and targeted revalidate scope. Local
+verification passed focused RED/GREEN, relevant suites, affected file suites,
+compileall, diff-check, full pytest (`3711 passed`, `9 skipped`, `1 warning`),
+and GitNexus detect-changes (`risk=low`, affected processes `0`). This is local
+green and code-review accepted for deployment only: no deploy, no production
+connection, no manual order/cancel, and no runtime-state mutation are claimed.
+Full evidence is recorded in
+[`daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening`](daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening).
+
 Latest post-deploy issue 1/4-9 closure, 2026-06-08: follow-up review excluded
 issue 3 and issue 11, kept existing entry admission coverage for Bybit `110007`
 and Hyperliquid venue-scope blockers, and closed the remaining health plus

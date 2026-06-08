@@ -1923,14 +1923,19 @@ class LiveRuntime:
         for requested_symbol, pos in snapshots:
             if abs(pos.quantity) <= 1e-9:
                 continue
+            cleanup_intent_id = (
+                f"live-recovery:{source}:{requested_symbol}:"
+                f"{pos.venue.value}:{now_ms}"
+            )
             ok = await self._cleanup_failed_leg_exposure(
                 pos.venue,
                 requested_symbol,
-                (
-                    f"live-recovery:{source}:{requested_symbol}:"
-                    f"{pos.venue.value}:{now_ms}"
-                ),
+                cleanup_intent_id,
                 "live_recovery_mismatch",
+            )
+            post_cleanup_truth = await self._post_cleanup_position_truth(
+                pos.venue,
+                requested_symbol,
             )
             payload = {
                 "requested_symbol": requested_symbol,
@@ -1939,6 +1944,8 @@ class LiveRuntime:
                 "side": pos.side.value,
                 "quantity": pos.quantity,
                 "entry_price": pos.entry_price,
+                "cleanup_intent_id": cleanup_intent_id,
+                "post_cleanup_truth": post_cleanup_truth,
             }
             if ok is True:
                 flattened.append(payload)
@@ -1959,6 +1966,12 @@ class LiveRuntime:
                         str(item.get("venue", "")) for item in flattened + failed
                         if item.get("venue")
                     }),
+                    "owner_resolution": "unowned_live_artifact",
+                    "truth_required_by": "v1_recovery_decision_core",
+                    "probe_family": source,
+                    "post_cleanup_truth": self._combined_post_cleanup_truth(
+                        flattened + failed
+                    ),
                     "ts_ms": now_ms,
                 },
             )
@@ -1975,10 +1988,75 @@ class LiveRuntime:
                     str(item.get("venue", "")) for item in flattened
                     if item.get("venue")
                 }),
+                "owner_resolution": "unowned_live_artifact",
+                "truth_required_by": "v1_recovery_decision_core",
+                "probe_family": source,
+                "post_cleanup_truth": self._combined_post_cleanup_truth(flattened),
                 "ts_ms": now_ms,
             },
         )
         return True
+
+    async def _post_cleanup_position_truth(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> dict[str, object]:
+        """Read-only position truth after recovery cleanup for diagnostics."""
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return {
+                "truth_available": False,
+                "position_qty": 0.0,
+                "side": "",
+                "error": "adapter_unavailable",
+            }
+        try:
+            pos = await adapter.fetch_position(symbol)
+        except Exception as exc:
+            return {
+                "truth_available": False,
+                "position_qty": 0.0,
+                "side": "",
+                "error": str(exc)[:500],
+            }
+        if pos is None:
+            return {
+                "truth_available": True,
+                "position_qty": 0.0,
+                "side": "",
+            }
+        qty = abs(float(getattr(pos, "quantity", 0.0) or 0.0))
+        side = str(getattr(getattr(pos, "side", ""), "value", "") or "")
+        return {
+            "truth_available": True,
+            "position_qty": qty,
+            "side": "" if qty <= 1e-9 else side,
+        }
+
+    @staticmethod
+    def _combined_post_cleanup_truth(items: list[dict[str, object]]) -> dict[str, object]:
+        positions: list[dict[str, object]] = []
+        truth_available = True
+        for item in items:
+            truth = item.get("post_cleanup_truth")
+            if not isinstance(truth, dict):
+                truth_available = False
+                continue
+            if not bool(truth.get("truth_available", False)):
+                truth_available = False
+            qty = float(truth.get("position_qty", 0.0) or 0.0)
+            if qty > 1e-9:
+                positions.append({
+                    "venue": item.get("venue", ""),
+                    "symbol": item.get("requested_symbol") or item.get("symbol", ""),
+                    "position_qty": qty,
+                    "side": truth.get("side", ""),
+                })
+        return {
+            "truth_available": truth_available,
+            "positions": positions,
+        }
 
     async def _maybe_recover_clean_live_positions(self, now_ms: int) -> None:
         """Probe private positions when the runtime would otherwise look clean."""
@@ -5728,9 +5806,16 @@ class LiveRuntime:
                         "passive_maintenance.cancel_rest_timeout",
                         {
                             "entry_id": entry_id, "symbol": pending.symbol,
+                            "venue": maker_venue.value,
+                            "order_id": po.order_id,
+                            "client_order_id": po.client_order_id,
                             "timeout_at_ms": po.timeout_at_ms,
                             "now_ms": now_ms,
                             "rest_timeout_ms": rest_timeout_ms,
+                            "cancel_ack_terminal": False,
+                            "truth_required_by": "pending_entry_passive_reconciliation",
+                            "next_truth_probe": "query_passive_order_progress",
+                            "post_cancel_state": "pending_truth_confirmation",
                         },
                     )
                     continue
@@ -13309,6 +13394,7 @@ class LiveRuntime:
             "domain": "liquidity",
             "source_domain": "perp_liquidity",
             "source": "sidecar_perp_liquidity",
+            "endpoint": "sidecar_perp_liquidity",
             "observed_at_ms": observed_at_ms,
             "age_ms": age_ms,
             "budget_ms": self._snapshot_domain_budget_ms("liquidity"),
@@ -13322,6 +13408,10 @@ class LiveRuntime:
             "observed_open_interest_quote": observed_open_interest_quote,
             "min_open_interest_quote": min_open_interest_quote,
             "eligibility_class": eligibility_class,
+            "floor": min_open_interest_quote,
+            "current_value": observed_open_interest_quote,
+            "targeted_revalidate_required": reason == "perp_open_interest_structural",
+            "targeted_revalidate_scope": "entry_candidate",
         }
         if state_record:
             payload.update({
