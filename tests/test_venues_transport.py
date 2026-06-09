@@ -8065,6 +8065,99 @@ class TestPassivePreflight:
         )
         transport._request.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_bybit_order_admission_precheck_uses_official_precheck_endpoint_and_classifies_terms(
+        self, monkeypatch
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BYBIT
+                assert venue_symbol == "CLUSDT"
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.01,
+                    min_qty=0.01,
+                    min_notional=1.0,
+                    rule_source="instruments-info",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._request = AsyncMock(
+            return_value={
+                "retCode": 110125,
+                "retMsg": (
+                    "You must agree to the Crude Oil Trading Terms before "
+                    "trading this contract."
+                ),
+            }
+        )
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="CLUSDT",
+            side=Side.SELL,
+            quantity=0.195,
+            price=None,
+            reduce_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="entry-1-h-bybit",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.precheck_order_admission(req)
+
+        assert exc.value.is_rejected
+        assert "110125" in str(exc.value)
+        transport._request.assert_awaited_once()
+        args, kwargs = transport._request.await_args
+        assert args[:2] == ("POST", "/v5/order/pre-check-order")
+        assert kwargs["private"] is True
+        body = kwargs["body"]
+        assert body["category"] == "linear"
+        assert body["symbol"] == "CLUSDT"
+        assert body["side"] == "Sell"
+        assert body["orderType"] == "Market"
+        assert body["qty"] == "0.19"
+        assert body["reduceOnly"] is False
+        assert body["positionIdx"] == 2
+        kinds = [event["kind"] for event in transport.drain_order_diagnostics()]
+        assert "order.precheck_attempt" in kinds
+        assert "order.precheck_result" in kinds
+
+    @pytest.mark.asyncio
+    async def test_bybit_order_admission_precheck_skips_reduce_only_without_http(self):
+        transport = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._request = AsyncMock(side_effect=AssertionError("precheck HTTP skipped"))
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="CLUSDT",
+            side=Side.BUY,
+            quantity=0.2,
+            price=None,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="close-1",
+        )
+
+        result = await transport.precheck_order_admission(req)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "reduce_only_exempt"
+        transport._request.assert_not_called()
+
 
 # ====================================================================# Root Fix: Journal Evidence Tests
 # ====================================================================

@@ -10,12 +10,31 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 | Card | Failure Family | Start Here When |
 |---|---|---|
 | [residual-repair-live-truth](cards/residual-repair-live-truth.md) | residual repair live truth, pair-gate release, open-order/dust terminality | `execution.residual_repair_paused`, `residual_repair_live_open_orders_present`, `residual_repair_live_position_nonzero`, or stale `pending_residual_repairs` appears. |
-| [pending-entry-hedge-admission](cards/pending-entry-hedge-admission.md) | pending hedge deterministic admission rejects | Bybit `110126`, Aster `-5018`, Hyperliquid `Insufficient margin`, or repeated `pending_entry.hedge_submit_result:error` appears. |
+| [pending-entry-hedge-admission](cards/pending-entry-hedge-admission.md) | pending hedge deterministic admission rejects | Bybit `110125`/`110126`, Aster `-5018`, Hyperliquid `Insufficient margin`, or repeated `pending_entry.hedge_submit_result:error` appears. |
 | [local-l2-sequence-continuity](cards/local-l2-sequence-continuity.md) | Local-L2 rebuilds and official sequence evidence | `runtime.local_l2_sequence_gap_rebuild`, `runtime.local_l2_snapshot_error`, or Local-L2 insufficient evidence recurs. |
 | [passive-close-terminal-flatness](cards/passive-close-terminal-flatness.md) | passive close terminal flatness / under-min / price unavailable | Pending passive close loops, terminal flat, under-min, or price-unavailable close branches recur. |
 | [pending-entry-terminality-live-truth](cards/pending-entry-terminality-live-truth.md) | pending entry false flat / live truth mismatch | Local state is flat but exchange truth has nonzero positions, or pending entries clear on stale/uncertain evidence. |
 
 ## Recent Closures
+
+Latest Bybit trading-terms pre-entry guard, 2026-06-09: production `CLUSDT`
+showed OKX maker / Bybit hedge failing on Bybit `110125` crude-oil trading
+terms. The same deploy window had healthy Bybit order-path behavior on other
+symbols, so the root is deterministic symbol/account trading-terms permission,
+not endpoint, timestamp, signature, or category drift. The local follow-up adds
+Bybit `/v5/order/pre-check-order` before non-reduce-only Bybit entry exposure
+when the live adapter supports it, classifies `110125/110126/110123` through the
+existing admission contract, emits
+`runtime.entry_admission_blocked source=pre_entry_bybit_precheck`, and prevents
+maker dispatch before a known terms-blocked hedge. Pending-hedge admission
+handling remains as defense in depth, and reduce-only close/cancel/passive/
+residual paths are unchanged. This deployment must be accepted as a full
+business-line gate, not a Bybit-only gate: entry admission, pending-entry
+terminality, passive-close ACK-only terminality, residual ACK-only closure,
+recovery lifecycle release, and Aster V3 private-truth startup safety must all
+stay green in local tests and post-deploy read-only production diagnostics.
+Full evidence is recorded in
+[`daily/2026-06-09.md#cluster-cl-058-bybit-trading-terms-pre-entry-admission-precheck`](daily/2026-06-09.md#cluster-cl-058-bybit-trading-terms-pre-entry-admission-precheck).
 
 Latest recovery current-state release latch closure, 2026-06-09: after the
 prior deploy, production exchange truth was high-confidence flat/no-open-orders
@@ -23,16 +42,18 @@ and `V1RecoveryDecisionCore` evaluated `RUNNING_CLEAN`, but runtime
 `lifecycle=risk_only` remained latched while `risk_mode=running`. The root
 cause was a missing V1 current-state release loop after pending-entry/passive
 maker work had already terminalized, plus an older `unpaired_live_position`
-path that synthesized `open_orders=[]` from position-flat evidence. The local
-fix adds a narrow stale-lifecycle release helper that only clears on current
+path that synthesized `open_orders=[]` from position-flat evidence. The fix in
+`62dee61`, deployed through the latest main manifest line, adds a narrow
+stale-lifecycle release helper that only clears on current
 `RUNNING_CLEAN` plus available flat position truth and empty open-order truth,
 routes pending-entry terminal removal/startup/tick recovery back through the
 recovery ledger/core, and makes `unpaired_live_position` use bounded symbol
 open-order truth instead of synthetic empties. `diagnose_live.py` now reports
 `lifecycle_release_not_applied` when current core/exchange truth is clean but
 runtime lifecycle remains `risk_only`. Local verification passed focused
-RED/GREEN and recovery/pending/residual regression scope (`311 passed`). Full
-evidence is recorded in
+RED/GREEN and recovery/pending/residual regression scope (`311 passed`), and
+the deployed main line reached running/flat/no-open-orders acceptance before
+the Bybit precheck follow-up. Full evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-057-recovery-current-state-release-latch-and-open-order-truth-gap`](daily/2026-06-09.md#cluster-cl-057-recovery-current-state-release-latch-and-open-order-truth-gap).
 
 Latest production evidence contract split, 2026-06-08: CL-055 already closed

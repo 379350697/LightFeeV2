@@ -16,6 +16,7 @@ import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import PositionSnapshot, Side, Venue
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
     active_position_poll_interval_ms,
@@ -224,6 +225,127 @@ class TestRuntimePreflight:
             assert runtime.state.venue_entry_cooldowns[key]["reason"] == "bybit_trading_terms_required"
             kinds = [e["kind"] for e in runtime.journal.read_all()]
             assert "runtime.entry_admission_blocked" in kinds
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bybit_precheck_terms_reject_blocks_before_maker_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class PrecheckRejectingBybit(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BYBIT)
+                    self.precheck_requests = []
+
+                async def precheck_order_admission(self, request):
+                    self.precheck_requests.append(request)
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "bybit order precheck failed: bybit retCode=110125 "
+                        "retMsg=You must agree to the Crude Oil Trading Terms "
+                        "before trading this contract.",
+                    )
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("maker dispatch must be blocked by Bybit precheck")
+
+            bybit = PrecheckRejectingBybit()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="CLUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert executor.calls == 0
+            assert len(bybit.precheck_requests) == 1
+            precheck_req = bybit.precheck_requests[0]
+            assert precheck_req.venue == Venue.BYBIT
+            assert precheck_req.symbol == "CLUSDT"
+            assert precheck_req.side == Side.SELL
+            assert precheck_req.reduce_only is False
+            key = "bybit:CLUSDT"
+            cooldown = runtime.state.venue_entry_cooldowns[key]
+            assert cooldown["reason"] == "bybit_trading_terms_required"
+            assert cooldown["source"] == "pre_entry_bybit_precheck"
+            assert cooldown["block_scope"] == "symbol"
+            assert cooldown["evidence_gap"] is False
+            events = runtime.journal.read_all()
+            blocked = [
+                event["payload"]
+                for event in events
+                if event["kind"] == "runtime.entry_admission_blocked"
+            ]
+            assert blocked
+            assert blocked[-1]["source"] == "pre_entry_bybit_precheck"
+            assert blocked[-1]["candidate_pair_id"] == "clusdt:binance->bybit"
+            assert not any(
+                event["kind"] == "execution.entry_selected"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bybit_precheck_ok_allows_entry_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class PrecheckOkBybit(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BYBIT)
+                    self.precheck_requests = []
+
+                async def precheck_order_admission(self, request):
+                    self.precheck_requests.append(request)
+                    return {"status": "ok"}
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason="planner test terminal",
+                    )
+
+            bybit = PrecheckOkBybit()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="CLUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is True
+            assert executor.calls == 1
+            assert len(bybit.precheck_requests) == 1
+            assert bybit.precheck_requests[0].side == Side.SELL
+            assert "bybit:CLUSDT" not in runtime.state.venue_entry_cooldowns
             runtime.journal.close()
 
     @pytest.mark.asyncio

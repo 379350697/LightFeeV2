@@ -15,6 +15,7 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
+    OrderRequest,
     PassiveOrderState,
     PositionSnapshot,
     Side,
@@ -762,6 +763,103 @@ class LiveRuntime:
                     source="initial_entry",
                     candidate_pair_id=candidate_pair_id,
                 )
+
+    async def _precheck_bybit_entry_admission(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+        quantity: float,
+        long_order_price_hint: float,
+        short_order_price_hint: float,
+        maker_venue: Venue,
+        entry_type,
+        maker_client_order_id: str,
+        hedge_client_order_id: str,
+    ) -> bool:
+        if Venue.BYBIT not in (long_venue, short_venue):
+            return True
+        adapter = self._venue_adapters.get(Venue.BYBIT)
+        precheck = getattr(adapter, "precheck_order_admission", None)
+        if adapter is None or not callable(precheck):
+            return True
+
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        pair_id = self._candidate_pair_id(candidate)
+        entry_type_value = str(getattr(entry_type, "value", entry_type) or "")
+        bybit_is_maker = maker_venue == Venue.BYBIT
+        passive = bybit_is_maker and "passive" in entry_type_value
+        side = Side.BUY if long_venue == Venue.BYBIT else Side.SELL
+        price_hint = (
+            long_order_price_hint if long_venue == Venue.BYBIT else short_order_price_hint
+        )
+        client_order_id = (
+            maker_client_order_id if bybit_is_maker else hedge_client_order_id
+        )
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price_hint if passive and price_hint > 0 else None,
+            reduce_only=False,
+            client_order_id=client_order_id,
+            post_only=passive,
+            time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
+            price_hint=price_hint if price_hint > 0 else None,
+            observed_at_ms=now_ms,
+        )
+
+        try:
+            await precheck(request)
+            return True
+        except OrderSubmitError as exc:
+            error_text = str(exc)
+            metadata = self._entry_admission_reject_metadata(Venue.BYBIT, error_text)
+            if metadata:
+                reason = str(metadata["reason"])
+                self._record_symbol_admission_block(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    reason=reason,
+                    raw_error=error_text,
+                    now_ms=now_ms,
+                    evidence=metadata,
+                    source="pre_entry_bybit_precheck",
+                    candidate_pair_id=pair_id,
+                )
+                return False
+            self.journal.append(
+                "runtime.entry_admission_precheck_rejected",
+                {
+                    "venue": Venue.BYBIT.value,
+                    "symbol": symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "raw_error": error_text[:500],
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+        except Exception as exc:
+            self.journal.append(
+                "runtime.entry_admission_precheck_uncertain",
+                {
+                    "venue": Venue.BYBIT.value,
+                    "symbol": symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "raw_error": str(exc)[:500],
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
 
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._venue_adapters.get(venue)
@@ -17354,6 +17452,21 @@ class LiveRuntime:
                     "reason": "pending entry already exists for this symbol pair",
                 },
             )
+            return False
+
+        if not await self._precheck_bybit_entry_admission(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            quantity=effective_quantity,
+            long_order_price_hint=long_order_price_hint,
+            short_order_price_hint=short_order_price_hint,
+            maker_venue=maker_venue,
+            entry_type=entry_type,
+            maker_client_order_id=maker_cid,
+            hedge_client_order_id=hedge_cid,
+        ):
             return False
 
         maker_bbo_evidence: dict = {}

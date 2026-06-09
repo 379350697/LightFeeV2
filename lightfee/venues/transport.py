@@ -1859,6 +1859,124 @@ class VenueTransport(MarketDataClient):
         payload["response_classification"] = "attempt"
         return payload
 
+    async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
+        """Validate a Bybit order through the official non-mutating pre-check API."""
+        spec = self._spec
+        venue_sym = self._venue_symbol(request.symbol)
+        if spec.venue_id != Venue.BYBIT:
+            return {
+                "venue": spec.venue_id.value,
+                "symbol": venue_sym,
+                "status": "skipped",
+                "reason": "precheck_not_supported_for_venue",
+            }
+        if self.mode == "paper":
+            return {
+                "venue": spec.venue_id.value,
+                "symbol": venue_sym,
+                "status": "skipped",
+                "reason": "paper_mode",
+            }
+        if request.reduce_only:
+            return {
+                "venue": spec.venue_id.value,
+                "symbol": venue_sym,
+                "status": "skipped",
+                "reason": "reduce_only_exempt",
+            }
+
+        symbol_rule = None
+        try:
+            symbol_rule = await get_symbol_rules_cache().get(
+                self,
+                spec.venue_id,
+                venue_sym,
+            )
+        except Exception:
+            symbol_rule = None
+        preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
+        request = replace(
+            request,
+            quantity=float(preflight["quantized_qty"]),
+            price=(
+                None
+                if preflight["quantized_price"] is None
+                else float(preflight["quantized_price"])
+            ),
+        )
+        passive = bool(
+            request.post_only or request.time_in_force == TimeInForce.POST_ONLY
+        )
+        body = _build_bybit_order_body(
+            request,
+            venue_sym,
+            passive=passive,
+            hedge_mode=self._hedge_mode,
+        )
+        if "qty" in body:
+            body["qty"] = _format_decimal(request.quantity)
+        if request.price is not None and (
+            passive or request.time_in_force != TimeInForce.IOC
+        ):
+            body["price"] = _format_decimal(request.price)
+        preflight["body_field_names"] = sorted(body.keys())
+        preflight["body_sanitized"] = {
+            k: v for k, v in body.items() if k not in ("orderLinkId",)
+        }
+        preflight["precheck_endpoint"] = "/v5/order/pre-check-order"
+        self._record_order_diagnostic("order.precheck_attempt", preflight)
+
+        try:
+            raw = await self._request(
+                "POST",
+                "/v5/order/pre-check-order",
+                body=body,
+                private=True,
+            )
+            _require_bybit_success(raw, "bybit order precheck failed")
+        except TransportError as e:
+            result_payload = dict(preflight)
+            result_payload["response_code"] = e.status_code
+            result_payload["response_msg"] = str(e)[:500]
+            result_payload["response_body"] = e.body[:1000]
+            result_payload["response_classification"] = (
+                "rejected"
+                if e.category in (
+                    TransportErrorCategory.AUTH_FAILURE,
+                    TransportErrorCategory.AUTHORIZATION_FAILURE,
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                    TransportErrorCategory.NORMALIZATION_FAILURE,
+                )
+                else "uncertain"
+            )
+            self._record_order_diagnostic("order.precheck_result", result_payload)
+            raise _map_to_submit_error(e.category, str(e), transport_error=e)
+        except OrderSubmitError as e:
+            result_payload = dict(preflight)
+            result_payload["response_classification"] = e.class_.value
+            result_payload["response_msg"] = str(e)[:500]
+            self._record_order_diagnostic("order.precheck_result", result_payload)
+            raise
+        except Exception as e:
+            result_payload = dict(preflight)
+            result_payload["response_classification"] = "uncertain"
+            result_payload["response_msg"] = str(e)[:500]
+            self._record_order_diagnostic("order.precheck_result", result_payload)
+            raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e)) from e
+
+        result_payload = dict(preflight)
+        result_payload["response_classification"] = "accepted"
+        if isinstance(raw, dict):
+            result_payload["response_msg"] = str(raw.get("retMsg", ""))[:500]
+        self._record_order_diagnostic("order.precheck_result", result_payload)
+        return {
+            "venue": spec.venue_id.value,
+            "symbol": venue_sym,
+            "status": "ok",
+            "response_classification": "accepted",
+        }
+
     # ------------------------------------------------------------------
     # Server-time offset (V1 parity)
     # ------------------------------------------------------------------
