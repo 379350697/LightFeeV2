@@ -66,6 +66,19 @@ def _inc_symbol_pair(
         top_symbols[symbol] += 1
 
 
+def _is_entry_admission_selection(reason: str, payload: dict[str, Any]) -> bool:
+    source = str(payload.get("source") or "")
+    domain = str(payload.get("domain") or "")
+    blocker_family = str(payload.get("blocker_family") or "")
+    return (
+        reason.endswith("_admission_blocked")
+        or reason == "bybit_trading_terms_required"
+        or source == "entry_admission"
+        or domain == "entry_admission"
+        or blocker_family == "exchange_admission"
+    )
+
+
 def _snapshot_fallback_blocked(payload: dict[str, Any]) -> bool:
     if _snapshot_fallback_blocking_scope(payload):
         return True
@@ -247,6 +260,7 @@ def analyze_event_file(
         event_counts: Counter[str] = Counter()
         entry_l2_blocker_counts: Counter[str] = Counter()
         entry_ws_bbo_blocker_counts: Counter[str] = Counter()
+        entry_admission_blocker_counts: Counter[str] = Counter()
         top_pairs: Counter[str] = Counter()
         top_symbols: Counter[str] = Counter()
         entry_l2_not_ready_reason_counts: Counter[str] = Counter()
@@ -280,9 +294,12 @@ def analyze_event_file(
             if kind in {
                 "runtime.entry_blocked_local_l2_selection",
                 "runtime.entry_blocked_ws_bbo_selection",
+                "runtime.entry_blocked_admission_selection",
             }:
                 reason = str(payload.get("reason", "unknown") or "unknown")
-                if (
+                if kind == "runtime.entry_blocked_admission_selection" or _is_entry_admission_selection(reason, payload):
+                    entry_admission_blocker_counts[reason] += 1
+                elif (
                     kind == "runtime.entry_blocked_ws_bbo_selection"
                     or provider == "ws_bbo_quote_lease"
                     or reason.startswith("entry_ws_bbo_quote_lease_")
@@ -308,6 +325,12 @@ def analyze_event_file(
                 totals = payload.get("entry_local_l2_primary_not_ready_reason_totals", {}) or {}
                 for reason, count in totals.items():
                     entry_l2_not_ready_reason_counts[str(reason)] += int(count or 0)
+                ws_bbo_totals = payload.get("entry_ws_bbo_blocker_counts", {}) or {}
+                for reason, count in ws_bbo_totals.items():
+                    entry_ws_bbo_blocker_counts[str(reason)] += int(count or 0)
+                admission_totals = payload.get("entry_admission_blocker_counts", {}) or {}
+                for reason, count in admission_totals.items():
+                    entry_admission_blocker_counts[str(reason)] += int(count or 0)
                 for item in payload.get("entry_local_l2_primary_not_ready_detail_samples", []) or []:
                     if isinstance(item, dict):
                         _inc_symbol_pair(item, top_pairs, top_symbols)
@@ -390,6 +413,8 @@ def analyze_event_file(
         blocker_reason_counts: dict[str, int] = dict(sorted(entry_l2_blocker_counts.items()))
         for reason, count in entry_ws_bbo_blocker_counts.items():
             blocker_reason_counts[reason] = blocker_reason_counts.get(reason, 0) + count
+        for reason, count in entry_admission_blocker_counts.items():
+            blocker_reason_counts[reason] = blocker_reason_counts.get(reason, 0) + count
         for reason, count in entry_l2_not_ready_reason_counts.items():
             blocker_reason_counts[reason] = blocker_reason_counts.get(reason, 0) + count
         # Merge pending_entry reason-suffixed counts into classification
@@ -400,6 +425,7 @@ def analyze_event_file(
             "event_counts": dict(sorted(event_counts.items())),
             "entry_l2_blocker_counts": dict(sorted(entry_l2_blocker_counts.items())),
             "entry_ws_bbo_blocker_counts": dict(sorted(entry_ws_bbo_blocker_counts.items())),
+            "entry_admission_blocker_counts": dict(sorted(entry_admission_blocker_counts.items())),
             "top_pairs": [
                 {"pair_id": pair_id, "count": count}
                 for pair_id, count in top_pairs.most_common(20)
@@ -521,6 +547,8 @@ def analyze(path: Path, since_ms: int = 0) -> dict[str, Any]:
     return {
         "event_counts": win.get("event_counts", {}),
         "entry_l2_blocker_counts": win.get("entry_l2_blocker_counts", {}),
+        "entry_ws_bbo_blocker_counts": win.get("entry_ws_bbo_blocker_counts", {}),
+        "entry_admission_blocker_counts": win.get("entry_admission_blocker_counts", {}),
         "top_pairs": win.get("top_pairs", []),
         "top_symbols": win.get("top_symbols", []),
         "entry_l2_not_ready_reason_counts": win.get("entry_l2_not_ready_reason_counts", {}),

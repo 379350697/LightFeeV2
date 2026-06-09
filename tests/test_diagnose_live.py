@@ -635,6 +635,179 @@ def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_closes_symbol_position_id_lifecycle(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "entry.opened",
+                "payload": {"symbol": "BULLAUSDT"},
+            },
+            {
+                "ts_ms": 1779816049100,
+                "kind": "runtime.position_opened",
+                "payload": {
+                    "position_id": "pos-bull-1",
+                    "symbol": "BULLAUSDT",
+                },
+            },
+            {
+                "ts_ms": 1779816049500,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "pos-bull-1",
+                    "symbol": "BULLAUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "exchange_truth_flat",
+                },
+            },
+            {
+                "ts_ms": 1779816049600,
+                "kind": "recovery.ledger_clear",
+                "payload": {
+                    "position_id": "pos-bull-1",
+                    "symbol": "BULLAUSDT",
+                    "reason": "flat_no_open_orders",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["aster", "binance"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["entry_opened_count"] == 1
+        assert gate["position_opened_count"] == 1
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["exception_conclusions"]["entry_opened"] == "closed_by_current_exchange_truth"
+        assert gate["exception_conclusions"]["position_opened"] == "closed_by_current_exchange_truth"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_truth(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1780657210000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1780657201000,
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "pos-btc-ack",
+                    "symbol": "BTCUSDT",
+                    "venue": "bybit",
+                    "accepted_order_id": "bybit-order-1",
+                    "accepted_client_order_id": "lf-close-1",
+                    "truth_required_by": "accepted_order_truth_gap",
+                },
+            },
+            {
+                "ts_ms": 1780657201100,
+                "kind": "exit.passive_close_hedge_error",
+                "payload": {
+                    "position_id": "pos-btc-ack",
+                    "symbol": "BTCUSDT",
+                    "hedge_venue": "bybit",
+                    "error": "accepted order lacks fill confirmation",
+                    "exchange_error": {
+                        "http_status": 200,
+                        "exchange_code": "0",
+                        "exchange_msg": "OK",
+                        "evidence_completeness": "complete",
+                        "confidence": "medium",
+                        "raw_body": "{\"retCode\":0,\"result\":{\"orderId\":\"bybit-order-1\"}}",
+                    },
+                    "accepted_order_truth_gap": True,
+                    "accepted_order_id": "bybit-order-1",
+                    "accepted_client_order_id": "lf-close-1",
+                },
+            },
+            {
+                "ts_ms": 1780657202000,
+                "kind": "exit.passive_close_hedge_reconciled_after_error",
+                "payload": {
+                    "position_id": "pos-btc-ack",
+                    "symbol": "BTCUSDT",
+                    "hedge_venue": "bybit",
+                    "order_id": "bybit-order-1",
+                    "client_order_id": "lf-close-1",
+                    "filled": 0.01,
+                    "residual": 0.0,
+                },
+            },
+            {
+                "ts_ms": 1780657203000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "pos-btc-ack",
+                    "symbol": "BTCUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "pending_passive_close_flat_probe",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BTCUSDT",
+            venues=["bybit"],
+            now_ms=1780657215000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["resolved_order_truth_gap_count"] == 1
+        assert gate["exception_conclusions"]["resolved_order_truth_gap"] == "closed_by_current_exchange_truth"
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        assert result["conclusion"]["status"] == "healthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_accepts_completed_residual_lifecycle(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -1983,6 +2156,101 @@ def test_run_diagnose_allows_explicit_exchange_truth_venues(monkeypatch):
 
         assert seen["symbols"] == ["OPGUSDT"]
         assert seen["venues"] == ["binance", "okx"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781011420000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781011300000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1781005938000-BSBUSDT",
+                    "symbol": "BSBUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781011300100,
+                "kind": "runtime.position_opened",
+                "payload": {
+                    "position_id": "entry-1781005938000-BSBUSDT",
+                    "symbol": "BSBUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781011300200,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1781006136786-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781011300300,
+                "kind": "runtime.position_opened",
+                "payload": {
+                    "position_id": "entry-1781006136786-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781011301000,
+                "kind": "execution.residual_repair_completed",
+                "payload": {"symbol": "BSBUSDT"},
+            },
+            {
+                "ts_ms": 1781011301100,
+                "kind": "execution.residual_repair_completed",
+                "payload": {"symbol": "MOVEUSDT"},
+            },
+            {
+                "ts_ms": 1781011301200,
+                "kind": "recovery.residual_repairs_complete",
+                "payload": {"reason": "all_residual_repairs_complete"},
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="",
+            venues=["bybit", "hyperliquid"],
+            now_ms=1781011430000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["exchange_truth_flat"] is True
+        assert gate["exchange_truth_no_open_orders"] is True
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["recovery_lifecycle"]["unclosed_open_keys"] == []
+        assert gate["recovery_lifecycle"]["exchange_truth_closed_open_keys"] == [
+            "entry-1781005938000-BSBUSDT",
+            "entry-1781006136786-MOVEUSDT",
+        ]
+        assert gate["exception_conclusions"]["entry_opened"] == "closed_by_current_exchange_truth"
+        assert gate["exception_conclusions"]["position_opened"] == "closed_by_current_exchange_truth"
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

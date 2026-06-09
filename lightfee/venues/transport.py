@@ -1923,13 +1923,13 @@ class VenueTransport(MarketDataClient):
         preflight["body_sanitized"] = {
             k: v for k, v in body.items() if k not in ("orderLinkId",)
         }
-        preflight["precheck_endpoint"] = "/v5/order/pre-check-order"
+        preflight["precheck_endpoint"] = "/v5/order/pre-check"
         self._record_order_diagnostic("order.precheck_attempt", preflight)
 
         try:
             raw = await self._request(
                 "POST",
-                "/v5/order/pre-check-order",
+                "/v5/order/pre-check",
                 body=body,
                 private=True,
             )

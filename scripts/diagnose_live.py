@@ -1415,8 +1415,141 @@ def _build_state_consistency(
 # order error evidence
 # ---------------------------------------------------------------------------
 
+_ORDER_TRUTH_GAP_REGISTERED_KINDS = frozenset({
+    "exit.accepted_order_truth_gap_registered",
+})
+_ORDER_TRUTH_GAP_RESOLUTION_KINDS = frozenset({
+    "exit.passive_close_hedge_reconciled_after_error",
+    "exit.passive_close_hedge_duplicate_client_order_reconciled",
+    "exit.passive_close_fallback_terminal_flat",
+    "exit.passive_close_recovery_probe_flat",
+    "runtime.position_lifecycle_terminal",
+    "recovery.flat",
+})
+
+
+def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in (
+        "position_id",
+        "entry_id",
+        "pending_id",
+        "source_entry_id",
+        "internal_entry_id",
+        "accepted_order_id",
+        "accepted_client_order_id",
+        "order_id",
+        "client_order_id",
+    ):
+        value = payload.get(key)
+        if value:
+            normalized = str(value).lower()
+            values.add(f"{key}:{normalized}")
+            if key in {"accepted_order_id", "order_id"}:
+                values.add(f"order_ref:{normalized}")
+            elif key in {"accepted_client_order_id", "client_order_id"}:
+                values.add(f"client_ref:{normalized}")
+    symbol = str(payload.get("symbol") or "").upper()
+    if symbol:
+        values.add(f"symbol:{symbol}")
+    venue = str(payload.get("venue") or payload.get("hedge_venue") or "").lower()
+    if venue and symbol:
+        values.add(f"venue_symbol:{venue}:{symbol}")
+    return values
+
+
+def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
+    if kind in {
+        "exit.passive_close_hedge_reconciled_after_error",
+        "exit.passive_close_hedge_duplicate_client_order_reconciled",
+    }:
+        try:
+            residual = float(payload.get("residual", 0) or 0)
+        except (TypeError, ValueError):
+            residual = 0.0
+        return residual <= 1e-9
+    if kind == "runtime.position_lifecycle_terminal":
+        return str(payload.get("terminal_state", "") or "").lower() == "flat"
+    return True
+
+
+def _build_resolved_order_truth_gap_summary(
+    events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any],
+    symbol: str = "",
+) -> dict[str, Any]:
+    if not (_exchange_truth_flat(exchange_truth) and _exchange_truth_no_open_orders(exchange_truth)):
+        return {
+            "count": 0,
+            "resolved_identities": [],
+            "current_exchange_truth_clean": False,
+        }
+
+    registered: list[set[str]] = []
+    resolved_identity_sets: list[set[str]] = []
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol", "") or "").upper()
+        if symbol and event_symbol and event_symbol != symbol.upper():
+            continue
+        identities = _truth_gap_identity_values(payload)
+        if not identities:
+            continue
+        if kind in _ORDER_TRUTH_GAP_REGISTERED_KINDS:
+            registered.append(identities)
+        elif (
+            kind in _ORDER_TRUTH_GAP_RESOLUTION_KINDS
+            and _truth_gap_resolution_complete(kind, payload)
+        ):
+            resolved_identity_sets.append(identities)
+
+    resolved: set[str] = set()
+    matched_count = 0
+    for registered_identities in registered:
+        matched_resolution = next(
+            (
+                identities for identities in resolved_identity_sets
+                if registered_identities & identities
+            ),
+            None,
+        )
+        if matched_resolution is None:
+            continue
+        matched_count += 1
+        resolved.update(registered_identities)
+        resolved.update(matched_resolution)
+
+    return {
+        "count": matched_count,
+        "resolved_identities": sorted(resolved),
+        "current_exchange_truth_clean": True,
+    }
+
+
+def _order_error_resolved_by_truth_gap(
+    payload: dict[str, Any],
+    resolved_truth_gap_summary: dict[str, Any] | None,
+) -> bool:
+    if not resolved_truth_gap_summary:
+        return False
+    if int(resolved_truth_gap_summary.get("count", 0) or 0) <= 0:
+        return False
+    if (
+        payload.get("accepted_order_truth_gap") is not True
+        and payload.get("truth_required_by") != "accepted_order_truth_gap"
+    ):
+        return False
+    resolved = set(resolved_truth_gap_summary.get("resolved_identities", []) or [])
+    return bool(_truth_gap_identity_values(payload) & resolved)
+
+
 def _build_order_error_evidence(
-    events: list[dict[str, Any]], symbol: str = "",
+    events: list[dict[str, Any]],
+    symbol: str = "",
+    resolved_truth_gap_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
 
@@ -1434,6 +1567,8 @@ def _build_order_error_evidence(
         error_msg = str(payload.get("error", payload.get("reason", "")))
 
         if symbol and event_symbol and event_symbol != symbol:
+            continue
+        if _order_error_resolved_by_truth_gap(payload, resolved_truth_gap_summary):
             continue
 
         exchange_error = payload.get("exchange_error", {})
@@ -1806,7 +1941,9 @@ def _is_residual_completion(kind: str, payload: dict[str, Any]) -> bool:
 
 def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     opened_keys: set[str] = set()
+    opened_key_symbols: dict[str, str] = {}
     terminal_keys: set[str] = set()
+    terminal_symbols: set[str] = set()
     residual_keys: set[str] = set()
     residual_completed_keys: set[str] = set()
     all_residuals_completed = False
@@ -1820,9 +1957,13 @@ def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str,
 
         if kind in {"entry.opened", "runtime.position_opened"} and key:
             opened_keys.add(key)
+            if symbol:
+                opened_key_symbols[key] = symbol
 
         if key and _is_flat_lifecycle_terminal(kind, payload):
             terminal_keys.add(key)
+            if symbol:
+                terminal_symbols.add(symbol)
 
         if "residual" in kind or "residual" in reason:
             residual_key = symbol or key
@@ -1838,8 +1979,13 @@ def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str,
             else:
                 all_residuals_completed = True
 
-    closed_open_keys = opened_keys & terminal_keys
-    unclosed_open_keys = opened_keys - terminal_keys
+    symbol_closed_open_keys = {
+        key for key in opened_keys
+        if opened_key_symbols.get(key)
+        and opened_key_symbols[key] in terminal_symbols
+    }
+    closed_open_keys = (opened_keys & terminal_keys) | symbol_closed_open_keys
+    unclosed_open_keys = opened_keys - closed_open_keys
     if all_residuals_completed:
         unclosed_residual_keys: set[str] = set()
     else:
@@ -2054,13 +2200,44 @@ def _build_production_acceptance_gate(
         exception_conclusions["blocking_required_truth"] = (
             "historical_required_truth_resolved_by_current_core"
         )
+    resolved_order_truth_gap_summary = _build_resolved_order_truth_gap_summary(
+        events,
+        exchange_truth,
+    )
+    resolved_order_truth_gap_count = int(
+        resolved_order_truth_gap_summary.get("count", 0) or 0
+    )
+    if resolved_order_truth_gap_count and current_core_clean:
+        exception_conclusions["resolved_order_truth_gap"] = (
+            "closed_by_current_exchange_truth"
+        )
+    residual_lifecycle_closed_by_recovery = (
+        residual_count > 0
+        and local_recovery_clean
+        and exchange_recovery_clean
+        and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
+    )
+    if (
+        (entry_opened_count or position_opened_count)
+        and current_core_clean
+        and residual_lifecycle_closed_by_recovery
+    ):
+        opened_keys = set(recovery_lifecycle.get("opened_keys", []) or [])
+        closed_keys = set(recovery_lifecycle.get("closed_open_keys", []) or [])
+        exchange_truth_closed_open_keys = opened_keys - closed_keys
+        if exchange_truth_closed_open_keys:
+            closed_keys |= exchange_truth_closed_open_keys
+            recovery_lifecycle = dict(recovery_lifecycle)
+            recovery_lifecycle["closed_open_keys"] = sorted(closed_keys)
+            recovery_lifecycle["unclosed_open_keys"] = []
+            recovery_lifecycle["exchange_truth_closed_open_keys"] = sorted(
+                exchange_truth_closed_open_keys
+            )
+            recovery_lifecycle["closed_trade_lifecycle_count"] = len(closed_keys)
+            recovery_lifecycle["unclosed_trade_lifecycle_count"] = 0
     residual_lifecycle_closed = (
         residual_count == 0
-        or (
-            local_recovery_clean
-            and exchange_recovery_clean
-            and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
-        )
+        or residual_lifecycle_closed_by_recovery
     )
     trade_lifecycle_closed = (
         not (entry_opened_count or position_opened_count)
@@ -2070,6 +2247,16 @@ def _build_production_acceptance_gate(
             and recovery_lifecycle["unclosed_trade_lifecycle_count"] == 0
         )
     )
+    if (entry_opened_count or position_opened_count) and trade_lifecycle_closed:
+        if current_core_clean:
+            if entry_opened_count:
+                exception_conclusions["entry_opened"] = (
+                    "closed_by_current_exchange_truth"
+                )
+            if position_opened_count:
+                exception_conclusions["position_opened"] = (
+                    "closed_by_current_exchange_truth"
+                )
 
     blocking_reasons: list[str] = []
     if open_position_count:
@@ -2105,6 +2292,7 @@ def _build_production_acceptance_gate(
         "snapshot_fallback_blocking": snapshot_fallback_blocking_count,
         "nonblocking_health_diagnostic": bulk_health_diagnostic_count,
         "contained_admission": contained_admission_count,
+        "resolved_order_truth_gap": resolved_order_truth_gap_count,
         "blocking_required_truth": (
             required_position_truth_unavailable_count
             if exception_conclusions.get("blocking_required_truth")
@@ -2136,6 +2324,8 @@ def _build_production_acceptance_gate(
         "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,
+        "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
+        "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "required_position_truth_unavailable_count": (
             required_position_truth_unavailable_count
         ),
@@ -2498,7 +2688,16 @@ def run_diagnose(
     )
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
-    order_errors = _build_order_error_evidence(all_events, symbol)
+    resolved_order_truth_gap_summary = _build_resolved_order_truth_gap_summary(
+        all_events,
+        exchange_truth,
+        symbol,
+    )
+    order_errors = _build_order_error_evidence(
+        all_events,
+        symbol,
+        resolved_order_truth_gap_summary,
+    )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
@@ -2545,6 +2744,7 @@ def run_diagnose(
         "exchange_truth": exchange_truth,
         "exchange_truth_env_files_loaded": exchange_truth_env_files_loaded,
         "state_consistency": state_consistency,
+        "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,

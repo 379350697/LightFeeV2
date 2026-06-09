@@ -2989,6 +2989,107 @@ class TestEntryReadinessProviderFactory:
             for r in records
         )
 
+    def test_ws_bbo_provider_admission_block_uses_admission_event_not_local_l2(
+        self,
+        tmp_path,
+    ):
+        from collections import Counter
+        import json
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = 1778985600000
+        config = TestPrimaryTrackingAdmission._make_config(
+            mode="live",
+            journal_path=str(tmp_path / "events.jsonl"),
+        )
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        rt = LiveRuntime(config)
+        rt.state.venue_entry_cooldowns["hyperliquid:*"] = {
+            "venue": "hyperliquid",
+            "symbol": "*",
+            "blocked_symbol": "BANANAUSDT",
+            "reason": "insufficient_margin_admission_blocked",
+            "source": "pending_hedge",
+            "block_scope": "venue",
+            "blocked_until_ms": now_ms + 120_000,
+            "official_doc_url": (
+                "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+            ),
+            "evidence_gap": False,
+        }
+        candidate = TestPrimaryTrackingAdmission._make_candidate(
+            "BANANAUSDT",
+            "bybit",
+            "hyperliquid",
+            "bananausdt:bybit->hyperliquid",
+            first_funding_timestamp_ms=now_ms + 300_000,
+        )
+        selection: Counter = Counter()
+        admission: Counter = Counter()
+        blockers: dict[str, str] = {}
+
+        rt.journal.open()
+        try:
+            selected = rt._select_entry_candidates(
+                [candidate],
+                now_ms=now_ms,
+                remaining_slots=1,
+                selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+                admission_blocker_counts=admission,
+            )
+            rt._emit_scan_no_entry_diagnostics(
+                reason=rt._v1_tradeable_no_entry_reason(selection, admission)
+                or "no_entry_dispatched",
+                snapshot=type("Snapshot", (), {"candidates": [candidate]})(),
+                tradeable=[candidate],
+                selected_candidate_count=len(selected),
+                dispatched_candidate_count=0,
+                remaining_slots=1,
+                tradeable_selection_blocker_counts=selection,
+                candidate_blockers=blockers,
+                now_ms=now_ms,
+                admission_blocker_counts=admission,
+            )
+        finally:
+            rt.journal.close()
+
+        assert selected == []
+        assert selection == Counter()
+        assert admission == Counter({"insufficient_margin_admission_blocked": 1})
+        assert blockers == {
+            "bananausdt:bybit->hyperliquid": "insufficient_margin_admission_blocked",
+        }
+        records = [
+            json.loads(line)
+            for line in rt.journal.path.read_text().splitlines()
+            if line.strip()
+        ]
+        admission_events = [
+            r for r in records
+            if r["kind"] == "runtime.entry_blocked_admission_selection"
+        ]
+        assert admission_events
+        payload = admission_events[-1]["payload"]
+        assert payload["reason"] == "insufficient_margin_admission_blocked"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["source"] == "entry_admission"
+        assert payload["domain"] == "entry_admission"
+        assert payload["blocker_family"] == "exchange_admission"
+        assert not any(
+            r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            for r in records
+        )
+        no_entry = [
+            r for r in records
+            if r["kind"] == "scan.no_entry_diagnostics"
+        ][-1]["payload"]
+        assert no_entry["reason"] == "tradeable_candidates_blocked_by_entry_admission"
+        assert no_entry["entry_admission_blocker_counts"] == {
+            "insufficient_margin_admission_blocked": 1,
+        }
+        assert no_entry["candidate_stage_blocked_counts"]["entry_admission"] == 1
+
     def test_ws_bbo_quote_lease_refreshes_stale_tracked_quote_from_rest_top_book(
         self,
         tmp_path,

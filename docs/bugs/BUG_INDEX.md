@@ -17,6 +17,46 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest post-deploy WS BBO admission, ACK-only diagnose, and active probe
+follow-up, 2026-06-09: deployment-window events were not a service crash, not a
+WS BBO quote-path trading failure, and not a fresh Local L2 recurrence. The
+root was diagnostic/event ownership drift after the WS BBO mainline switch:
+admission blockers such as Hyperliquid insufficient margin could still be
+represented by or rebucketed through the old Local L2 / WS BBO selection
+surfaces, and `diagnose_live.py` did not consume already-closed Bybit ACK-only
+passive-close truth gaps when `accepted_order_truth_gap` registration,
+reconciliation or terminal-flat evidence, and current exchange
+flat/no-open-orders truth were all present. The original Bybit trading-terms
+incident remains an account/symbol permission problem, but the new admission
+precheck implementation also had an endpoint follow-up: cloud dry-run
+reproduced HTTP 404 on the older `/v5/order/pre-check-order` path, and the
+local fix uses current Bybit V5 `/v5/order/pre-check`. The local follow-up adds
+`runtime.entry_blocked_admission_selection`,
+`entry_admission_blocker_counts`, admission-first analyzer/audit rebucketing,
+`resolved_order_truth_gap_summary`, resolved ACK-only filtering from active
+`top_exchange_errors`, and lifecycle closure for mixed `entry.opened` /
+`runtime.position_opened` evidence by exact key, symbol terminal evidence, or
+high-confidence exchange flat/no-open-orders truth after residual/recovery
+completion. Opened evidence without terminal/recovery proof still fails the
+gate. Local verification passed focused RED/GREEN plus entry/WS-BBO,
+diagnose/offline (`103 passed`), snapshot/passive-close, venues/startup,
+active Bybit probe harness (`7 passed`), Bybit precheck/ACK-only focused
+transport tests (`3 passed`), live-harness business-line, compile, and
+GitNexus change-scope gates. Cloud read-only probes on the current deployed
+`af40809` reproduced the old unhealthy diagnose interpretation, while the
+patched `/tmp` diagnose replay against the same production event/state files
+cleared `top_exchange_errors`, resolved the ACK-only truth gap, closed legacy
+opened lifecycle keys by current exchange truth, and returned
+`gate_passed=true` / `conclusion.status=healthy` without deploying or
+restarting services. An independent DOGEUSDT active probe capped at 10 USDT
+then reproduced Bybit ACK-only open and passive-close terminal flatness:
+precheck accepted, open IOC returned ACK-only with accepted id and no fill
+fields, live position truth proved the temporary long, passive reduce-only
+close resolved to final flat, and post-probe production verification showed all
+venues flat/no-open-orders with no pending-entry/passive-close/residual work.
+Deployment is pending. Full evidence is recorded in
+[`daily/2026-06-09.md#cluster-cl-062-post-deploy-ws-bbo-admission-and-ack-only-truth-consumption`](daily/2026-06-09.md#cluster-cl-062-post-deploy-ws-bbo-admission-and-ack-only-truth-consumption).
+
 Latest WS BBO mainline / Local L2 isolation closure, 2026-06-09: production
 configuration already used `entry_readiness_provider="ws_bbo_quote_lease"`,
 but WS BBO selection blockers still reused the historical
@@ -72,10 +112,12 @@ Latest Bybit trading-terms pre-entry guard, 2026-06-09: production `CLUSDT`
 showed OKX maker / Bybit hedge failing on Bybit `110125` crude-oil trading
 terms. The same deploy window had healthy Bybit order-path behavior on other
 symbols, so the root is deterministic symbol/account trading-terms permission,
-not endpoint, timestamp, signature, or category drift. The local follow-up adds
-Bybit `/v5/order/pre-check-order` before non-reduce-only Bybit entry exposure
-when the live adapter supports it, classifies `110125/110126/110123` through the
-existing admission contract, emits
+not main order endpoint, timestamp, signature, or category drift. A later active
+probe dry-run found the new admission guard's endpoint path was stale:
+`/v5/order/pre-check-order` returned HTTP 404, while current Bybit V5 precheck
+uses `/v5/order/pre-check`. The local follow-up corrects that endpoint before
+non-reduce-only Bybit entry exposure when the live adapter supports it,
+classifies `110125/110126/110123` through the existing admission contract, emits
 `runtime.entry_admission_blocked source=pre_entry_bybit_precheck`, and prevents
 maker dispatch before a known terms-blocked hedge. Pending-hedge admission
 handling remains as defense in depth, and reduce-only close/cancel/passive/

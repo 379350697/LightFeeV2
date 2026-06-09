@@ -16179,6 +16179,7 @@ class LiveRuntime:
             "entry_final_gate_blocked_counts",
             "tradeable_selection_blocker_counts",
             "entry_ws_bbo_blocker_counts",
+            "entry_admission_blocker_counts",
             "selection_bucket_counts",
             "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
@@ -16292,6 +16293,13 @@ class LiveRuntime:
             int(v) for k, v in tradeable_selection_blocker_counts.items()
             if str(k).startswith("entry_ws_bbo_quote_lease_")
         )
+        entry_admission_blocked = sum(
+            int(v) for k, v in admission_counts.items()
+            if (
+                str(k).endswith("_admission_blocked")
+                or str(k) in {"bybit_trading_terms_required"}
+            )
+        )
         primary_tracked_not_ready = sum(
             int(v) for k, v in tradeable_selection_blocker_counts.items()
             if (
@@ -16310,11 +16318,24 @@ class LiveRuntime:
             ] = lifecycle_selection_blocked
         if ws_bbo_selection_blocked > 0:
             selection_bucket_counts["ws_bbo_not_ready"] = ws_bbo_selection_blocked
+        if entry_admission_blocked > 0:
+            selection_bucket_counts["entry_admission_blocked"] = entry_admission_blocked
 
         entry_ws_bbo_blocker_counts = {
             str(k): int(v)
             for k, v in tradeable_selection_blocker_counts.items()
             if str(k).startswith("entry_ws_bbo_quote_lease_") and int(v) > 0
+        }
+        entry_admission_blocker_counts = {
+            str(k): int(v)
+            for k, v in admission_counts.items()
+            if (
+                int(v) > 0
+                and (
+                    str(k).endswith("_admission_blocked")
+                    or str(k) in {"bybit_trading_terms_required"}
+                )
+            )
         }
         entry_ws_bbo_blocker_samples = [
             sample
@@ -16332,6 +16353,7 @@ class LiveRuntime:
             "entry_admission_venue_degraded": sum(
                 int(v) for v in entry_admission_filter_blockers.values()
             ),
+            "entry_admission": entry_admission_blocked,
             "snapshot_quote_or_freshness": sum(
                 int(v) for v in snapshot_freshness_blockers.values()
             ),
@@ -16391,6 +16413,9 @@ class LiveRuntime:
             "entry_ws_bbo_blocker_counts": dict(
                 sorted(entry_ws_bbo_blocker_counts.items())
             ),
+            "entry_admission_blocker_counts": dict(
+                sorted(entry_admission_blocker_counts.items())
+            ),
             "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
             "selection_bucket_counts": selection_bucket_counts,
             "candidate_stage_blocked_counts": {
@@ -16426,6 +16451,9 @@ class LiveRuntime:
             "entry_ws_bbo_blocker_counts": payload.get(
                 "entry_ws_bbo_blocker_counts", {},
             ),
+            "entry_admission_blocker_counts": payload.get(
+                "entry_admission_blocker_counts", {},
+            ),
             "candidates": [
                 {
                     "pair_id": c["pair_id"],
@@ -16455,6 +16483,9 @@ class LiveRuntime:
             ),
             "entry_ws_bbo_blocker_keys": sorted(
                 payload.get("entry_ws_bbo_blocker_counts", {}).keys()
+            ),
+            "entry_admission_blocker_keys": sorted(
+                payload.get("entry_admission_blocker_counts", {}).keys()
             ),
         })
         full_due = (
@@ -16795,6 +16826,9 @@ class LiveRuntime:
             "leverage_admission_blocked",
             "max_notional_admission_blocked",
         }
+        exchange_admission_reasons = admission_reasons - {
+            "entry_local_l2_waiting_for_primary_tracking",
+        }
 
         active_symbols = {
             str(getattr(position, "symbol", ""))
@@ -16870,6 +16904,7 @@ class LiveRuntime:
             if blocker:
                 blocker_str = str(blocker)
                 ws_bbo_blocker = blocker_str.startswith("entry_ws_bbo_quote_lease_")
+                admission_selection_blocker = blocker_str in exchange_admission_reasons
                 # Admission buckets (not primary tracked) vs readiness failures
                 if blocker_str in admission_reasons:
                     if admission_blocker_counts is not None:
@@ -16890,7 +16925,22 @@ class LiveRuntime:
                     if lifecycle_evidence:
                         diagnostic_payload["lifecycle_evidence"] = lifecycle_evidence
                     if readiness_evidence:
-                        if ws_bbo_blocker:
+                        if admission_selection_blocker:
+                            provider_name = self._entry_readiness_provider_name()
+                            readiness_evidence.setdefault("provider", provider_name)
+                            readiness_evidence.setdefault("source", "entry_admission")
+                            readiness_evidence.setdefault("domain", "entry_admission")
+                            readiness_evidence.setdefault(
+                                "blocker_family",
+                                "exchange_admission",
+                            )
+                            diagnostic_payload.update({
+                                "provider": provider_name,
+                                "source": "entry_admission",
+                                "domain": "entry_admission",
+                                "blocker_family": "exchange_admission",
+                            })
+                        elif ws_bbo_blocker:
                             readiness_evidence.setdefault("provider", "ws_bbo_quote_lease")
                             readiness_evidence.setdefault("source", "ws_bbo_quote_lease")
                             domain = (
@@ -16915,10 +16965,14 @@ class LiveRuntime:
                         diagnostic_payload["readiness_evidence"] = readiness_evidence
                     if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS:
                         event_kind = "runtime.entry_blocked_lifecycle_selection"
+                    elif admission_selection_blocker:
+                        event_kind = "runtime.entry_blocked_admission_selection"
                     elif ws_bbo_blocker:
                         event_kind = "runtime.entry_blocked_ws_bbo_selection"
-                    else:
+                    elif self._entry_readiness_provider_uses_local_l2():
                         event_kind = "runtime.entry_blocked_local_l2_selection"
+                    else:
+                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
                     self._append_runtime_diagnostic_event(
                         event_kind,
                         diagnostic_payload,

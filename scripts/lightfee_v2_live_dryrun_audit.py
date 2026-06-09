@@ -14,6 +14,16 @@ import sys
 from collections import defaultdict
 
 
+def _is_entry_admission_selection(reason: str, payload: dict) -> bool:
+    return (
+        str(reason).endswith("_admission_blocked")
+        or str(reason) == "bybit_trading_terms_required"
+        or str(payload.get("source") or "") == "entry_admission"
+        or str(payload.get("domain") or "") == "entry_admission"
+        or str(payload.get("blocker_family") or "") == "exchange_admission"
+    )
+
+
 def audit(journal_path: str, minutes: int) -> dict:
     """Parse journal lines, count key events."""
     import time
@@ -21,6 +31,7 @@ def audit(journal_path: str, minutes: int) -> dict:
     venue_reasons: dict[str, int] = defaultdict(int)
     l2_selection_reasons: dict[str, int] = defaultdict(int)
     ws_bbo_selection_reasons: dict[str, int] = defaultdict(int)
+    admission_selection_reasons: dict[str, int] = defaultdict(int)
     l2_not_ready_reasons: dict[str, int] = defaultdict(int)
 
     if not os.path.exists(journal_path):
@@ -69,9 +80,13 @@ def audit(journal_path: str, minutes: int) -> dict:
             elif event in {
                 "runtime.entry_blocked_local_l2_selection",
                 "runtime.entry_blocked_ws_bbo_selection",
+                "runtime.entry_blocked_admission_selection",
             }:
                 reason = payload.get("reason", "unknown")
-                if (
+                if event == "runtime.entry_blocked_admission_selection" or _is_entry_admission_selection(str(reason), payload):
+                    counts["entry_blocked_admission_selection"] += 1
+                    admission_selection_reasons[reason] += 1
+                elif (
                     event == "runtime.entry_blocked_ws_bbo_selection"
                     or provider == "ws_bbo_quote_lease"
                     or str(reason).startswith("entry_ws_bbo_quote_lease_")
@@ -107,6 +122,7 @@ def audit(journal_path: str, minutes: int) -> dict:
         "venue_reasons": dict(venue_reasons),
         "l2_selection_reasons": dict(l2_selection_reasons),
         "ws_bbo_selection_reasons": dict(ws_bbo_selection_reasons),
+        "admission_selection_reasons": dict(admission_selection_reasons),
         "l2_not_ready_reasons": dict(l2_not_ready_reasons),
     }
 
@@ -145,6 +161,11 @@ def main():
                                      key=lambda x: -x[1])[:10]:
             print(f"  {reason}: {count}")
         print()
+        print("Top Admission Selection Blockers:")
+        for reason, count in sorted(result.get("admission_selection_reasons", {}).items(),
+                                     key=lambda x: -x[1])[:10]:
+            print(f"  {reason}: {count}")
+        print()
         print("Top Not-Ready Reasons:")
         for reason, count in sorted(result.get("l2_not_ready_reasons", {}).items(),
                                      key=lambda x: -x[1])[:10]:
@@ -160,6 +181,10 @@ def main():
         ws_bbo_selection = counts.get("entry_blocked_ws_bbo_selection", 0)
         if ws_bbo_selection:
             print(f"  NOTE: entry_blocked_ws_bbo_selection ({ws_bbo_selection})")
+
+        admission_selection = counts.get("entry_blocked_admission_selection", 0)
+        if admission_selection:
+            print(f"  NOTE: entry_blocked_admission_selection ({admission_selection})")
 
         l2_selection = counts.get("entry_blocked_local_l2_selection", 0)
         l2_not_ready = counts.get("entry_blocked_local_l2_not_ready", 0)

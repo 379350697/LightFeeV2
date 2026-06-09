@@ -8119,7 +8119,7 @@ class TestPassivePreflight:
         assert "110125" in str(exc.value)
         transport._request.assert_awaited_once()
         args, kwargs = transport._request.await_args
-        assert args[:2] == ("POST", "/v5/order/pre-check-order")
+        assert args[:2] == ("POST", "/v5/order/pre-check")
         assert kwargs["private"] is True
         body = kwargs["body"]
         assert body["category"] == "linear"

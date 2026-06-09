@@ -1305,6 +1305,86 @@ class TestProductionBlockerAnalyzer:
             "entry_local_l2_waiting_for_dual_ready": 1,
         }
 
+    def test_analyzer_rebuckets_legacy_ws_bbo_and_admission_events(
+        self,
+        tmp_path,
+    ):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        journal = tmp_path / "ws_bbo_admission_legacy.jsonl"
+        records = [
+            {
+                "ts_ms": 1778985600000,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "entry_ws_bbo_quote_lease_stale_quote",
+                    "provider": "ws_bbo_quote_lease",
+                    "symbol": "SEIUSDT",
+                    "pair_id": "seiusdt:bybit->hyperliquid",
+                },
+            },
+            {
+                "ts_ms": 1778985600100,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "insufficient_margin_admission_blocked",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "entry_admission",
+                    "symbol": "SEIUSDT",
+                    "pair_id": "seiusdt:bybit->hyperliquid",
+                },
+            },
+            {
+                "ts_ms": 1778985600200,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "entry_local_l2_waiting_for_dual_ready",
+                    "provider": "local_l2",
+                    "symbol": "POLYXUSDT",
+                    "pair_id": "polyxusdt:binance->bybit",
+                },
+            },
+            {
+                "ts_ms": 1778985600300,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {
+                    "entry_ws_bbo_blocker_counts": {
+                        "entry_ws_bbo_quote_lease_stale_quote": 1,
+                    },
+                    "entry_admission_blocker_counts": {
+                        "insufficient_margin_admission_blocked": 1,
+                    },
+                    "entry_local_l2_primary_not_ready_reason_totals": {
+                        "entry_local_l2_waiting_for_dual_ready": 1,
+                    },
+                },
+            },
+        ]
+        journal.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+
+        result = analyze_event_file(
+            journal,
+            now_ms=1778985601000,
+            windows=["run_window"],
+        )
+        window = result["windows"]["run_window"]
+
+        assert window["entry_l2_blocker_counts"] == {
+            "entry_local_l2_waiting_for_dual_ready": 1,
+        }
+        assert window["entry_ws_bbo_blocker_counts"] == {
+            "entry_ws_bbo_quote_lease_stale_quote": 2,
+        }
+        assert window["entry_admission_blocker_counts"] == {
+            "insufficient_margin_admission_blocked": 2,
+        }
+        assert (
+            window["blocker_reason_counts"]["insufficient_margin_admission_blocked"]
+            == 2
+        )
+
     def test_analyzer_detects_min_notional_residual(self):
         from scripts.analyze_production_blockers import analyze_event_file
 
