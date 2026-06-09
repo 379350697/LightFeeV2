@@ -445,6 +445,76 @@ class TestPassiveRepricing:
         mid = executor._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT")
         assert mid == 0.0
 
+    def test_source_aware_ws_bbo_quote_labels_hedge_reference_price(self):
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        executor.set_l2_quote_resolver(
+            lambda venue, symbol: (99.0, 101.0, "ws_bbo_quote_lease")
+        )
+
+        buy_price, buy_source = asyncio.run(
+            executor._resolve_hedge_reference_price(
+                Venue.BINANCE, "BTCUSDT", Side.BUY, 0.0,
+            )
+        )
+        sell_price, sell_source = asyncio.run(
+            executor._resolve_hedge_reference_price(
+                Venue.BINANCE, "BTCUSDT", Side.SELL, 0.0,
+            )
+        )
+
+        assert buy_price == 101.0
+        assert buy_source == "ws_bbo_quote_lease_best_ask"
+        assert sell_price == 99.0
+        assert sell_source == "ws_bbo_quote_lease_best_bid"
+
+    def test_source_aware_ws_bbo_mid_labels_hedge_reference_price(self):
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        executor.set_l2_quote_resolver(lambda venue, symbol: None)
+        executor.set_l2_mid_resolver(lambda venue, symbol: (100.5, "ws_bbo_quote_lease"))
+
+        price, source = asyncio.run(
+            executor._resolve_hedge_reference_price(
+                Venue.BINANCE, "BTCUSDT", Side.BUY, 0.0,
+            )
+        )
+
+        assert price == 100.5
+        assert source == "ws_bbo_quote_lease_mid"
+
+    def test_ws_bbo_maker_leg_gap_journal_uses_quote_source_not_local_l2(self):
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        executor.set_l2_mid_resolver(
+            lambda venue, symbol: (
+                50000.0 if venue == Venue.BINANCE else 0.0,
+                "ws_bbo_quote_lease",
+            )
+        )
+        executor._estimate_venue_taker_cost_bps = lambda venue, symbol, l2_mid=0.0: 5.0
+
+        position = _make_position(long_venue=Venue.BINANCE, short_venue=Venue.OKX)
+        leg = executor._select_preferred_maker_leg(position)
+
+        assert leg == ActiveMakerLeg.LONG
+        events = journal.read_all()
+        ws_bbo_missing = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_leg_quote_evidence_missing"
+        ]
+        assert len(ws_bbo_missing) == 1
+        payload = ws_bbo_missing[0]["payload"]
+        assert payload["long_price_source"] == "ws_bbo_quote_lease"
+        assert payload["short_price_source"] == "ws_bbo_quote_lease"
+        selected = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_leg_selected"
+        ][-1]["payload"]
+        assert selected["long_price_evidence_available"] is True
+        assert selected["short_price_evidence_available"] is False
+        assert selected["long_price_source"] == "ws_bbo_quote_lease"
+
     def test_tick_size_from_spec(self):
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)

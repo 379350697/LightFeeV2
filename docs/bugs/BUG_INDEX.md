@@ -17,6 +17,26 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest WS BBO mainline / Local L2 isolation closure, 2026-06-09: production
+configuration already used `entry_readiness_provider="ws_bbo_quote_lease"`,
+but WS BBO selection blockers still reused the historical
+`runtime.entry_blocked_local_l2_selection` event name, and close/passive price
+hints could still prefer Local L2 before WS BBO. The local fix keeps Local L2
+runtime/data-plane/session code intact for explicit `local_l2` / `ws_top_book`
+legacy modes and diagnostics, while moving the active WS BBO business chain to
+`runtime.entry_blocked_ws_bbo_selection`, WS BBO-first close price evidence,
+source-aware passive close labels, WS BBO-specific passive maker-leg
+quote-evidence gap logs, non-blocking WS BBO quote-resolver missing/stale
+evidence, and separate `entry_ws_bbo_*` no-entry diagnostics. Historical
+old-name records carrying
+`provider=ws_bbo_quote_lease` are now classified as WS BBO, not Local L2
+recurrence, and dry-run audit text output prints WS BBO selection blockers
+separately from Local L2. Local verification passed entry/WS BBO,
+close/passive, diagnose/offline, entry execution gate, and live-harness
+business-line slices.
+Deployment is pending. Full evidence is recorded in
+[`daily/2026-06-09.md#cluster-cl-061-ws-bbo-mainline-separates-from-local-l2-legacy-diagnostics`](daily/2026-06-09.md#cluster-cl-061-ws-bbo-mainline-separates-from-local-l2-legacy-diagnostics).
+
 Latest live-artifact account-truth recovery release, 2026-06-09: post-`b2d0706`
 deploy proved the previous fail-closed guard fix was still not enough. Current
 production account truth was flat/no-open-orders on every venue, but exported

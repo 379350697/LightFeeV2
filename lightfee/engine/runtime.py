@@ -916,6 +916,20 @@ class LiveRuntime:
             return "invalid_quote"
         return "unknown"
 
+    @staticmethod
+    def _ws_bbo_selection_blocker_family(reason: str) -> str:
+        if reason == "entry_ws_bbo_quote_lease_waiting_for_subscription":
+            return "subscription"
+        if reason == "entry_ws_bbo_quote_lease_budget_exhausted":
+            return "subscription_budget"
+        if reason == "entry_ws_bbo_quote_lease_missing_quote":
+            return "missing_quote"
+        if reason == "entry_ws_bbo_quote_lease_stale_quote":
+            return "stale_quote"
+        if reason == "entry_ws_bbo_quote_lease_invalid_quote":
+            return "invalid_quote"
+        return "unknown"
+
     def _entry_ws_bbo_subscription_blocker(
         self,
         candidate: Any,
@@ -990,11 +1004,12 @@ class LiveRuntime:
 
         return reason, {
             "provider": "ws_bbo_quote_lease",
-            "source": "ws_bbo_subscription",
+            "source": "ws_bbo_quote_lease",
+            "domain": "ws_bbo_subscription",
             "blocker_family": (
-                "budget_exhausted"
+                "subscription_budget"
                 if budget_exhausted
-                else "waiting_for_subscription"
+                else "subscription"
             ),
             "coverage_reason": coverage_reason,
             "symbol": symbol,
@@ -1449,9 +1464,14 @@ class LiveRuntime:
                     "maker_hedge_deadline_ms": self.config.strategy.maker_hedge_deadline_ms,
                 },
             )
-            # Inject the L2 mid resolver so repricing has live book data
-            self.passive_close_executor.set_l2_mid_resolver(self._resolve_local_l2_mid)
-            self.passive_close_executor.set_l2_quote_resolver(self._resolve_local_l2_quote)
+            # Inject provider-aware price evidence; legacy method names remain
+            # on PassiveCloseExecutor for compatibility with existing callers.
+            self.passive_close_executor.set_l2_mid_resolver(
+                self._resolve_close_price_hint_mid_with_source
+            )
+            self.passive_close_executor.set_l2_quote_resolver(
+                self._resolve_close_price_hint_quote_with_source
+            )
             # Inject close executor for DUAL_TAKER fallback
             if self.close_executor is not None:
                 self.passive_close_executor.set_close_executor(self.close_executor)
@@ -6836,17 +6856,14 @@ class LiveRuntime:
         return fallback_price if fallback_price and fallback_price > 0 else None
 
     def _pending_entry_passive_best_quote(self, pending) -> tuple[float, float] | None:
-        quote = self._resolve_local_l2_quote(pending.maker_venue(), pending.symbol)
-        if quote is not None:
-            return quote
         if self._entry_readiness_provider_uses_ws_bbo():
-            venue_value = pending.maker_venue().value
-            quote_obj = self.ws_bbo_cache.get_quote(venue_value, pending.symbol)
-            if quote_obj is not None:
-                bid = float(getattr(quote_obj, "bid", 0.0) or 0.0)
-                ask = float(getattr(quote_obj, "ask", 0.0) or 0.0)
-                if bid > 0.0 and ask >= bid:
-                    return bid, ask
+            return self._resolve_ws_bbo_close_quote(
+                pending.maker_venue(), pending.symbol,
+            )
+        if self._entry_readiness_provider_uses_local_l2():
+            quote = self._resolve_local_l2_quote(pending.maker_venue(), pending.symbol)
+            if quote is not None:
+                return quote
         return None
 
     def _pending_entry_passive_ladder_profile(self, venue: Venue) -> tuple[bool, bool]:
@@ -14333,10 +14350,15 @@ class LiveRuntime:
             "freshness": "not_checked_local_l2_disabled",
             "would_cross": False,
             "source": "local_l2",
+            "provider": self._entry_readiness_provider_name(),
+            "domain": "local_l2_book",
+            "blocker_family": "post_only_bbo",
         }
         if self._entry_readiness_provider_uses_ws_bbo():
             stale_after_ms = self._entry_quote_lease_max_age_ms()
             payload["source"] = "ws_bbo_quote_lease"
+            payload["provider"] = "ws_bbo_quote_lease"
+            payload["domain"] = "ws_bbo_cache"
             payload["stale_after_ms"] = stale_after_ms
             quote = self.ws_bbo_cache.get_quote(venue_str, symbol)
             if quote is None:
@@ -16086,6 +16108,12 @@ class LiveRuntime:
             return "tradeable_candidates_waiting_for_entry_local_l2_prewarm_window"
         if blockers == {"entry_local_l2_waiting_for_dual_ready"}:
             return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
+        ws_bbo_blockers = {
+            key for key in blockers
+            if key.startswith("entry_ws_bbo_quote_lease_")
+        }
+        if ws_bbo_blockers and blockers <= ws_bbo_blockers:
+            return "tradeable_candidates_blocked_by_entry_ws_bbo_readiness"
         admission_blockers = {
             key for key in blockers
             if key.endswith("_admission_blocked")
@@ -16150,6 +16178,7 @@ class LiveRuntime:
             "execution_liquidity_blocked_counts",
             "entry_final_gate_blocked_counts",
             "tradeable_selection_blocker_counts",
+            "entry_ws_bbo_blocker_counts",
             "selection_bucket_counts",
             "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
@@ -16221,6 +16250,8 @@ class LiveRuntime:
                 )
 
         readiness = self._entry_l2_readiness_diagnostics_payload()
+        local_l2_provider_active = self._entry_readiness_provider_uses_local_l2()
+        ws_bbo_provider_active = self._entry_readiness_provider_uses_ws_bbo()
         candidate_samples = []
         for rank, candidate in enumerate(list(tradeable)[:24], start=1):
             pair_id = getattr(candidate, "pair_id", "")
@@ -16257,11 +16288,16 @@ class LiveRuntime:
             int(v) for k, v in tradeable_selection_blocker_counts.items()
             if str(k) in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
         )
+        ws_bbo_selection_blocked = sum(
+            int(v) for k, v in tradeable_selection_blocker_counts.items()
+            if str(k).startswith("entry_ws_bbo_quote_lease_")
+        )
         primary_tracked_not_ready = sum(
             int(v) for k, v in tradeable_selection_blocker_counts.items()
             if (
                 k not in {"entry_local_l2_waiting_for_primary_tracking"}
                 and str(k) not in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
+                and not str(k).startswith("entry_ws_bbo_quote_lease_")
             )
         )
         selection_bucket_counts = {
@@ -16272,6 +16308,21 @@ class LiveRuntime:
             selection_bucket_counts[
                 "lifecycle_selection_blocked"
             ] = lifecycle_selection_blocked
+        if ws_bbo_selection_blocked > 0:
+            selection_bucket_counts["ws_bbo_not_ready"] = ws_bbo_selection_blocked
+
+        entry_ws_bbo_blocker_counts = {
+            str(k): int(v)
+            for k, v in tradeable_selection_blocker_counts.items()
+            if str(k).startswith("entry_ws_bbo_quote_lease_") and int(v) > 0
+        }
+        entry_ws_bbo_blocker_samples = [
+            sample
+            for sample in candidate_samples
+            if str(sample.get("selection_blocker", "")).startswith(
+                "entry_ws_bbo_quote_lease_"
+            )
+        ][:24]
 
         candidate_stage_blocked_counts = {
             "candidate_universe": sum(int(v) for v in blocked_reason_counts.values()),
@@ -16337,21 +16388,31 @@ class LiveRuntime:
             "tradeable_selection_blocker_counts": dict(
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
             ),
+            "entry_ws_bbo_blocker_counts": dict(
+                sorted(entry_ws_bbo_blocker_counts.items())
+            ),
+            "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
             "selection_bucket_counts": selection_bucket_counts,
             "candidate_stage_blocked_counts": {
                 key: value
                 for key, value in candidate_stage_blocked_counts.items()
                 if value > 0
             },
-            "entry_local_l2_primary_ready_filter_active": bool(
-                self.config.strategy.local_l2_enabled and self._tracked_primary_pair_ids
-            ),
-            "entry_local_l2_primary_not_ready_reason_counts": readiness["reason_counts"],
-            "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
-            "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
             "candidates": candidate_samples,
             "ts_ms": now_ms,
         }
+        if local_l2_provider_active:
+            payload.update({
+                "entry_local_l2_primary_ready_filter_active": bool(
+                    self.config.strategy.local_l2_enabled
+                    and self._tracked_primary_pair_ids
+                ),
+                "entry_local_l2_primary_not_ready_reason_counts": readiness["reason_counts"],
+                "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
+                "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
+            })
+        elif ws_bbo_provider_active:
+            payload["entry_readiness_provider"] = "ws_bbo_quote_lease"
         fingerprint = self._payload_fingerprint({
             "reason": payload["reason"],
             "candidate_count": payload["candidate_count"],
@@ -16359,9 +16420,12 @@ class LiveRuntime:
             "selected_candidate_count": payload["selected_candidate_count"],
             "dispatched_candidate_count": payload["dispatched_candidate_count"],
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
-            "entry_local_l2_primary_not_ready_reason_totals": payload[
-                "entry_local_l2_primary_not_ready_reason_totals"
-            ],
+            "entry_local_l2_primary_not_ready_reason_totals": payload.get(
+                "entry_local_l2_primary_not_ready_reason_totals", {},
+            ),
+            "entry_ws_bbo_blocker_counts": payload.get(
+                "entry_ws_bbo_blocker_counts", {},
+            ),
             "candidates": [
                 {
                     "pair_id": c["pair_id"],
@@ -16387,7 +16451,10 @@ class LiveRuntime:
                 payload["tradeable_selection_blocker_counts"].keys()
             ),
             "entry_local_l2_primary_not_ready_reason_keys": sorted(
-                payload["entry_local_l2_primary_not_ready_reason_totals"].keys()
+                payload.get("entry_local_l2_primary_not_ready_reason_totals", {}).keys()
+            ),
+            "entry_ws_bbo_blocker_keys": sorted(
+                payload.get("entry_ws_bbo_blocker_counts", {}).keys()
             ),
         })
         full_due = (
@@ -16802,6 +16869,7 @@ class LiveRuntime:
                     )
             if blocker:
                 blocker_str = str(blocker)
+                ws_bbo_blocker = blocker_str.startswith("entry_ws_bbo_quote_lease_")
                 # Admission buckets (not primary tracked) vs readiness failures
                 if blocker_str in admission_reasons:
                     if admission_blocker_counts is not None:
@@ -16822,12 +16890,35 @@ class LiveRuntime:
                     if lifecycle_evidence:
                         diagnostic_payload["lifecycle_evidence"] = lifecycle_evidence
                     if readiness_evidence:
+                        if ws_bbo_blocker:
+                            readiness_evidence.setdefault("provider", "ws_bbo_quote_lease")
+                            readiness_evidence.setdefault("source", "ws_bbo_quote_lease")
+                            domain = (
+                                "ws_bbo_subscription"
+                                if blocker_str in {
+                                    "entry_ws_bbo_quote_lease_waiting_for_subscription",
+                                    "entry_ws_bbo_quote_lease_budget_exhausted",
+                                }
+                                else "ws_bbo_cache"
+                            )
+                            readiness_evidence.setdefault("domain", domain)
+                            readiness_evidence.setdefault(
+                                "blocker_family",
+                                self._ws_bbo_selection_blocker_family(blocker_str),
+                            )
+                            diagnostic_payload.update({
+                                "provider": "ws_bbo_quote_lease",
+                                "source": "ws_bbo_quote_lease",
+                                "domain": readiness_evidence["domain"],
+                                "blocker_family": readiness_evidence["blocker_family"],
+                            })
                         diagnostic_payload["readiness_evidence"] = readiness_evidence
-                    event_kind = (
-                        "runtime.entry_blocked_lifecycle_selection"
-                        if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
-                        else "runtime.entry_blocked_local_l2_selection"
-                    )
+                    if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS:
+                        event_kind = "runtime.entry_blocked_lifecycle_selection"
+                    elif ws_bbo_blocker:
+                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
+                    else:
+                        event_kind = "runtime.entry_blocked_local_l2_selection"
                     self._append_runtime_diagnostic_event(
                         event_kind,
                         diagnostic_payload,
@@ -17046,6 +17137,8 @@ class LiveRuntime:
         provider_name = self._entry_readiness_provider_name()
         evidence = {
             "provider": provider_name,
+            "source": provider_name,
+            "domain": "quote_lease_execution_gate",
             "pair_id": self._candidate_pair_id(candidate),
             "symbol": str(getattr(candidate, "symbol", "")),
             "long_venue": str(getattr(candidate, "long_venue", "")),
@@ -18487,6 +18580,8 @@ class LiveRuntime:
         if now_ms is None:
             now_ms = wall_clock_now_ms()
         venue_value = venue.value if hasattr(venue, 'value') else str(venue)
+        if self._entry_readiness_provider_uses_ws_bbo():
+            return self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
         budget_ms = int(self.config.strategy.max_liquidity_snapshot_age_ms or 0)
         try:
             book = self.local_l2_runtime.get_book(venue_value, symbol)
@@ -18506,16 +18601,20 @@ class LiveRuntime:
                             "ts_ms": now_ms,
                         },
                     )
-                    return self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
+                    return 0.0
                 mid = book.mid_price()
                 if mid and mid > 0:
                     return mid
         except Exception:
             pass
-        return self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
+        return 0.0
 
     def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
         """Get best bid/ask from the local L2 book for passive tick inference."""
+        if self._entry_readiness_provider_uses_ws_bbo():
+            return self._resolve_ws_bbo_close_quote(venue, symbol)
+        if not self._entry_readiness_provider_uses_local_l2():
+            return None
         try:
             book = self.local_l2_runtime.get_book(
                 venue.value if hasattr(venue, "value") else str(venue),
@@ -18529,6 +18628,148 @@ class LiveRuntime:
         except Exception:
             pass
         return None
+
+    def _resolve_ws_bbo_close_quote(
+        self,
+        venue,
+        symbol: str,
+        now_ms: int | None = None,
+    ) -> tuple[float, float] | None:
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return None
+        if now_ms is None:
+            now_ms = wall_clock_now_ms()
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_lease_budget_unavailable",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        try:
+            quote = self.ws_bbo_cache.get_quote(venue_value, symbol)
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "fallback_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        if quote is None:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "missing_quote",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        try:
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_parse_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        if (
+            observed_at_ms > 0
+            and age_ms is not None
+            and budget_ms > 0
+            and age_ms <= budget_ms
+            and bid > 0.0
+            and ask > bid
+        ):
+            return bid, ask
+        self.journal.append(
+            "runtime.close_price_evidence_stale",
+            {
+                "venue": venue_value,
+                "symbol": symbol,
+                "domain": "ws_bbo_cache",
+                "reason": (
+                    "quote_stale"
+                    if age_ms is not None and age_ms > budget_ms
+                    else "invalid_quote"
+                ),
+                "observed_at_ms": observed_at_ms,
+                "age_ms": age_ms,
+                "budget_ms": budget_ms,
+                "decision": "reject_price_hint",
+                "fallback_source": "none",
+                "provider": "ws_bbo_quote_lease",
+                "source": "ws_bbo_quote_lease",
+                "ts_ms": now_ms,
+            },
+        )
+        return None
+
+    def _resolve_close_price_hint_mid_with_source(self, venue, symbol: str):
+        if self._entry_readiness_provider_uses_ws_bbo():
+            now_ms = wall_clock_now_ms()
+            venue_value = venue.value if hasattr(venue, "value") else str(venue)
+            return (
+                self._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms),
+                "ws_bbo_quote_lease",
+            )
+        return self._resolve_local_l2_mid(venue, symbol), "local_l2"
+
+    def _resolve_close_price_hint_quote_with_source(self, venue, symbol: str):
+        if self._entry_readiness_provider_uses_ws_bbo():
+            quote = self._resolve_ws_bbo_close_quote(venue, symbol)
+            if quote is None:
+                return None
+            return quote[0], quote[1], "ws_bbo_quote_lease"
+        quote = self._resolve_local_l2_quote(venue, symbol)
+        if quote is None:
+            return None
+        return quote[0], quote[1], "local_l2"
 
     def _apply_tick_backoff(self, is_active: bool = False, is_maker: bool = False) -> None:
         """Apply incremental tick-failure backoff from config floors / caps.

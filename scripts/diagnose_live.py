@@ -1504,6 +1504,19 @@ def _build_order_error_evidence(
 # L2 evidence
 # ---------------------------------------------------------------------------
 
+def _is_ws_bbo_entry_selection_event(kind: str, payload: dict[str, Any]) -> bool:
+    readiness = payload.get("readiness_evidence", {})
+    if not isinstance(readiness, dict):
+        readiness = {}
+    provider = str(payload.get("provider") or readiness.get("provider") or "")
+    reason = str(payload.get("reason") or "")
+    return (
+        kind == "runtime.entry_blocked_ws_bbo_selection"
+        or provider == "ws_bbo_quote_lease"
+        or reason.startswith("entry_ws_bbo_quote_lease_")
+    )
+
+
 def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
     missing_l2_count = 0
     stale_rebuild_count = 0
@@ -1516,6 +1529,8 @@ def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         payload = rec.get("payload", {})
         if not isinstance(payload, dict):
+            continue
+        if _is_ws_bbo_entry_selection_event(kind, payload):
             continue
         if kind == "runtime.local_l2_sequence_gap":
             sequence_gap_count += 1

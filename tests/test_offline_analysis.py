@@ -1080,6 +1080,92 @@ class TestDryRunAuditRedLight:
             f"audit should extract reason from 'payload', got: {l2_reasons}"
         )
 
+    def test_audit_classifies_legacy_ws_bbo_event_as_ws_bbo_not_local_l2(self, tmp_path):
+        import time
+        audit = self._import_audit()
+        now_ms = int(time.time() * 1000)
+
+        journal = tmp_path / "legacy_ws_bbo.jsonl"
+        self._write_journal(str(journal), [
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "entry_ws_bbo_quote_lease_stale_quote",
+                    "provider": "ws_bbo_quote_lease",
+                    "readiness_evidence": {
+                        "provider": "ws_bbo_quote_lease",
+                        "source": "ws_bbo_quote_lease",
+                    },
+                },
+            },
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_ws_bbo_selection",
+                "payload": {
+                    "reason": "entry_ws_bbo_quote_lease_missing_quote",
+                    "provider": "ws_bbo_quote_lease",
+                },
+            },
+        ])
+
+        result = audit(str(journal), minutes=52560000)
+
+        assert result.get("l2_selection_reasons", {}) == {}
+        assert result.get("ws_bbo_selection_reasons", {}) == {
+            "entry_ws_bbo_quote_lease_missing_quote": 1,
+            "entry_ws_bbo_quote_lease_stale_quote": 1,
+        }
+        assert result.get("counts", {}).get("entry_blocked_local_l2_selection", 0) == 0
+        assert result.get("counts", {}).get("entry_blocked_ws_bbo_selection", 0) == 2
+
+    def test_dry_run_text_output_prints_ws_bbo_selection_summary(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        import importlib
+        import sys
+        import time
+        from pathlib import Path as _Path
+
+        scripts_dir = str(_Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        mod_name = "lightfee_v2_live_dryrun_audit"
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+        mod = importlib.import_module(mod_name)
+
+        now_ms = int(time.time() * 1000)
+        journal = tmp_path / "ws_bbo_text.jsonl"
+        self._write_journal(str(journal), [
+            {
+                "ts_ms": now_ms,
+                "kind": "runtime.entry_blocked_ws_bbo_selection",
+                "payload": {
+                    "reason": "entry_ws_bbo_quote_lease_missing_quote",
+                    "provider": "ws_bbo_quote_lease",
+                },
+            },
+        ])
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lightfee_v2_live_dryrun_audit.py",
+                "--minutes",
+                "52560000",
+                "--log",
+                str(journal),
+            ],
+        )
+        mod.main()
+
+        output = capsys.readouterr().out
+        assert "Top WS BBO Selection Blockers:" in output
+        assert "entry_ws_bbo_quote_lease_missing_quote: 1" in output
+        assert "entry_blocked_ws_bbo_selection (1)" in output
+
     def test_audit_ts_ms_window_filtering(self, tmp_path):
         """WAS RED-LIGHT, NOW GREEN: ts_ms window filtering excludes old events."""
         import time
@@ -1173,6 +1259,51 @@ class TestProductionBlockerAnalyzer:
         classification = result["classification"]
         assert classification["entry_local_l2_waiting_for_primary_tracking"] == "current_new_high_frequency"
         assert classification["entry_local_l2_waiting_for_dual_ready"] == "current_new_high_frequency"
+
+    def test_analyzer_classifies_legacy_ws_bbo_events_separately(self, tmp_path):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        journal = tmp_path / "ws_bbo_legacy.jsonl"
+        records = [
+            {
+                "ts_ms": 1778985600000,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "entry_ws_bbo_quote_lease_stale_quote",
+                    "pair_id": "btcusdt:binance->bybit",
+                    "symbol": "BTCUSDT",
+                    "provider": "ws_bbo_quote_lease",
+                    "readiness_evidence": {"provider": "ws_bbo_quote_lease"},
+                },
+            },
+            {
+                "ts_ms": 1778985601000,
+                "kind": "runtime.entry_blocked_local_l2_selection",
+                "payload": {
+                    "reason": "entry_local_l2_waiting_for_dual_ready",
+                    "pair_id": "ethusdt:binance->okx",
+                    "symbol": "ETHUSDT",
+                    "provider": "local_l2",
+                },
+            },
+        ]
+        journal.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+
+        result = analyze_event_file(
+            journal,
+            now_ms=1778989200000,
+            windows=["last_2h"],
+        )
+        win_2h = result["windows"]["last_2h"]
+
+        assert win_2h["entry_ws_bbo_blocker_counts"] == {
+            "entry_ws_bbo_quote_lease_stale_quote": 1,
+        }
+        assert win_2h["entry_l2_blocker_counts"] == {
+            "entry_local_l2_waiting_for_dual_ready": 1,
+        }
 
     def test_analyzer_detects_min_notional_residual(self):
         from scripts.analyze_production_blockers import analyze_event_file

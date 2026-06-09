@@ -246,6 +246,7 @@ def analyze_event_file(
     def _analyze_records(records: list[dict[str, Any]], since_ms: int) -> dict[str, Any]:
         event_counts: Counter[str] = Counter()
         entry_l2_blocker_counts: Counter[str] = Counter()
+        entry_ws_bbo_blocker_counts: Counter[str] = Counter()
         top_pairs: Counter[str] = Counter()
         top_symbols: Counter[str] = Counter()
         entry_l2_not_ready_reason_counts: Counter[str] = Counter()
@@ -271,9 +272,24 @@ def analyze_event_file(
             if ts_ms > w_last:
                 w_last = ts_ms
 
-            if kind == "runtime.entry_blocked_local_l2_selection":
+            readiness = payload.get("readiness_evidence", {})
+            if not isinstance(readiness, dict):
+                readiness = {}
+            provider = str(payload.get("provider") or readiness.get("provider") or "")
+
+            if kind in {
+                "runtime.entry_blocked_local_l2_selection",
+                "runtime.entry_blocked_ws_bbo_selection",
+            }:
                 reason = str(payload.get("reason", "unknown") or "unknown")
-                entry_l2_blocker_counts[reason] += 1
+                if (
+                    kind == "runtime.entry_blocked_ws_bbo_selection"
+                    or provider == "ws_bbo_quote_lease"
+                    or reason.startswith("entry_ws_bbo_quote_lease_")
+                ):
+                    entry_ws_bbo_blocker_counts[reason] += 1
+                else:
+                    entry_l2_blocker_counts[reason] += 1
                 _inc_symbol_pair(payload, top_pairs, top_symbols)
             elif kind == "runtime.entry_local_l2_readiness_diagnostics":
                 saw_not_ready = False
@@ -372,6 +388,8 @@ def analyze_event_file(
 
         # Build a flat key-value map for blocker reasons vs just event kinds
         blocker_reason_counts: dict[str, int] = dict(sorted(entry_l2_blocker_counts.items()))
+        for reason, count in entry_ws_bbo_blocker_counts.items():
+            blocker_reason_counts[reason] = blocker_reason_counts.get(reason, 0) + count
         for reason, count in entry_l2_not_ready_reason_counts.items():
             blocker_reason_counts[reason] = blocker_reason_counts.get(reason, 0) + count
         # Merge pending_entry reason-suffixed counts into classification
@@ -381,6 +399,7 @@ def analyze_event_file(
         return {
             "event_counts": dict(sorted(event_counts.items())),
             "entry_l2_blocker_counts": dict(sorted(entry_l2_blocker_counts.items())),
+            "entry_ws_bbo_blocker_counts": dict(sorted(entry_ws_bbo_blocker_counts.items())),
             "top_pairs": [
                 {"pair_id": pair_id, "count": count}
                 for pair_id, count in top_pairs.most_common(20)

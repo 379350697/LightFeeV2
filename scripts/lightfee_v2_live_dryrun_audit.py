@@ -20,6 +20,7 @@ def audit(journal_path: str, minutes: int) -> dict:
     counts: dict[str, int] = defaultdict(int)
     venue_reasons: dict[str, int] = defaultdict(int)
     l2_selection_reasons: dict[str, int] = defaultdict(int)
+    ws_bbo_selection_reasons: dict[str, int] = defaultdict(int)
     l2_not_ready_reasons: dict[str, int] = defaultdict(int)
 
     if not os.path.exists(journal_path):
@@ -48,6 +49,15 @@ def audit(journal_path: str, minutes: int) -> dict:
             # V2 journal uses 'payload'; V1 uses 'data'. Support both.
             payload = entry.get("payload", entry.get("data", {}))
 
+            readiness = payload.get("readiness_evidence", {})
+            if not isinstance(readiness, dict):
+                readiness = {}
+            provider = str(
+                payload.get("provider")
+                or readiness.get("provider")
+                or ""
+            )
+
             if event == "entry.opened":
                 counts["open_position_count"] += 1
             elif event == "order.passive_submitted":
@@ -56,10 +66,21 @@ def audit(journal_path: str, minutes: int) -> dict:
                 counts["order.uncertain"] += 1
                 venue = payload.get("venue", "unknown")
                 venue_reasons[f"uncertain:{venue}"] += 1
-            elif event == "runtime.entry_blocked_local_l2_selection":
-                counts["entry_blocked_local_l2_selection"] += 1
+            elif event in {
+                "runtime.entry_blocked_local_l2_selection",
+                "runtime.entry_blocked_ws_bbo_selection",
+            }:
                 reason = payload.get("reason", "unknown")
-                l2_selection_reasons[reason] += 1
+                if (
+                    event == "runtime.entry_blocked_ws_bbo_selection"
+                    or provider == "ws_bbo_quote_lease"
+                    or str(reason).startswith("entry_ws_bbo_quote_lease_")
+                ):
+                    counts["entry_blocked_ws_bbo_selection"] += 1
+                    ws_bbo_selection_reasons[reason] += 1
+                else:
+                    counts["entry_blocked_local_l2_selection"] += 1
+                    l2_selection_reasons[reason] += 1
             elif event == "runtime.entry_blocked_local_l2_not_ready":
                 counts["entry_blocked_local_l2_not_ready"] += 1
                 reasons = payload.get("reasons", [])
@@ -85,6 +106,7 @@ def audit(journal_path: str, minutes: int) -> dict:
         "counts": dict(counts),
         "venue_reasons": dict(venue_reasons),
         "l2_selection_reasons": dict(l2_selection_reasons),
+        "ws_bbo_selection_reasons": dict(ws_bbo_selection_reasons),
         "l2_not_ready_reasons": dict(l2_not_ready_reasons),
     }
 
@@ -113,8 +135,13 @@ def main():
         for key in sorted(counts):
             print(f"  {key}: {counts[key]}")
         print()
-        print("Top Selection Blockers:")
+        print("Top Local L2 Selection Blockers:")
         for reason, count in sorted(result.get("l2_selection_reasons", {}).items(),
+                                     key=lambda x: -x[1])[:10]:
+            print(f"  {reason}: {count}")
+        print()
+        print("Top WS BBO Selection Blockers:")
+        for reason, count in sorted(result.get("ws_bbo_selection_reasons", {}).items(),
                                      key=lambda x: -x[1])[:10]:
             print(f"  {reason}: {count}")
         print()
@@ -129,6 +156,10 @@ def main():
             print("  PASS: order.uncertain caused by ACK-only maker responses is zero")
         else:
             print(f"  WARN: order.uncertain count = {uncertain}")
+
+        ws_bbo_selection = counts.get("entry_blocked_ws_bbo_selection", 0)
+        if ws_bbo_selection:
+            print(f"  NOTE: entry_blocked_ws_bbo_selection ({ws_bbo_selection})")
 
         l2_selection = counts.get("entry_blocked_local_l2_selection", 0)
         l2_not_ready = counts.get("entry_blocked_local_l2_not_ready", 0)

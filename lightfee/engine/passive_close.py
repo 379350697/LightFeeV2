@@ -5208,39 +5208,66 @@ class PassiveCloseExecutor:
         The runtime injects a resolver backed by the local L2 book; when that
         resolver returns 0.0 the caller must treat the price hint as unavailable.
         """
+        mid, _source = self._resolve_local_l2_mid_with_source(venue, symbol)
+        return mid
+
+    def _resolve_local_l2_mid_with_source(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[float, str]:
+        source = "local_l2"
         if self._l2_mid_resolver is not None:
             try:
-                mid = self._l2_mid_resolver(venue, symbol)
+                raw = self._l2_mid_resolver(venue, symbol)
+                if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+                    mid = raw[0]
+                    source = str(raw[1] or source)
+                else:
+                    mid = raw
                 if mid and mid > 0:
-                    return mid
+                    return float(mid), source
             except Exception:
                 pass
-        return 0.0
+        return 0.0, source
 
     def _resolve_local_l2_quote(self, venue: Venue, symbol: str) -> tuple[float, float] | None:
         """Resolve best bid/ask from injected local-L2 resolver."""
+        quote, _source = self._resolve_local_l2_quote_with_source(venue, symbol)
+        return quote
+
+    def _resolve_local_l2_quote_with_source(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[tuple[float, float] | None, str]:
         if self._l2_quote_resolver is None:
-            return None
+            return None, "local_l2"
         try:
             quote = self._l2_quote_resolver(venue, symbol)
         except Exception:
-            return None
+            return None, "local_l2"
         if quote is None:
-            return None
+            return None, "local_l2"
         try:
-            best_bid, best_ask = quote
+            source = "local_l2"
+            if isinstance(quote, (tuple, list)) and len(quote) >= 3:
+                best_bid, best_ask, raw_source = quote[0], quote[1], quote[2]
+                source = str(raw_source or source)
+            else:
+                best_bid, best_ask = quote
             best_bid = float(best_bid)
             best_ask = float(best_ask)
         except Exception:
-            return None
+            return None, "local_l2"
         if (
             math.isfinite(best_bid)
             and math.isfinite(best_ask)
             and best_bid > 0.0
             and best_ask > best_bid
         ):
-            return best_bid, best_ask
-        return None
+            return (best_bid, best_ask), source
+        return None, "local_l2"
 
     async def _resolve_hedge_reference_price(
         self,
@@ -5256,16 +5283,20 @@ class PassiveCloseExecutor:
         if math.isfinite(candidate) and candidate > 0.0:
             return candidate, "price_hint"
 
-        quote = self._resolve_local_l2_quote(venue, symbol)
+        quote, quote_source = self._resolve_local_l2_quote_with_source(venue, symbol)
         if quote is not None:
             price = quote[1] if side == Side.BUY else quote[0]
             if math.isfinite(price) and price > 0.0:
-                source = "local_l2_best_ask" if side == Side.BUY else "local_l2_best_bid"
+                source = (
+                    f"{quote_source}_best_ask"
+                    if side == Side.BUY
+                    else f"{quote_source}_best_bid"
+                )
                 return price, source
 
-        local_mid = self._resolve_local_l2_mid(venue, symbol)
+        local_mid, mid_source = self._resolve_local_l2_mid_with_source(venue, symbol)
         if math.isfinite(local_mid) and local_mid > 0.0:
-            return local_mid, "local_l2_mid"
+            return local_mid, f"{mid_source}_mid"
 
         adapter = self._adapter(venue)
         if adapter is None:
@@ -5553,19 +5584,21 @@ class PassiveCloseExecutor:
         estimated slippage/bps on each venue. The leg with higher estimated
         taker cost should be the maker leg to save on fees/slippage.
 
-        Uses runtime-injected local L2 resolver for mid + quote resolver for
-        spread. Falls back to venue taker fee comparison if L2 is unavailable.
-        If L2 data is missing for either venue, journals the gap and uses a
+        Uses runtime-injected quote resolver for mid + spread. Falls back to
+        venue taker fee comparison if quote evidence is unavailable.
+        If quote evidence is missing for either venue, journals the gap and uses a
         deterministic fallback chain. Tie-break defaults to LONG (V1 behavior).
         """
         symbol = position.symbol
         pid = position.position_id
 
-        # Resolve local L2 mid for both venues via injected resolver
-        long_mid = self._resolve_local_l2_mid(position.long_venue, symbol)
-        short_mid = self._resolve_local_l2_mid(position.short_venue, symbol)
+        long_mid, long_price_source = self._resolve_local_l2_mid_with_source(
+            position.long_venue, symbol,
+        )
+        short_mid, short_price_source = self._resolve_local_l2_mid_with_source(
+            position.short_venue, symbol,
+        )
 
-        # Compute L2-based cost estimates
         long_cost_bps = self._estimate_venue_taker_cost_bps(
             position.long_venue, symbol, l2_mid=long_mid,
         )
@@ -5573,19 +5606,30 @@ class PassiveCloseExecutor:
             position.short_venue, symbol, l2_mid=short_mid,
         )
 
-        # Track data quality for journal
-        long_has_l2 = long_mid > 0.0
-        short_has_l2 = short_mid > 0.0
+        long_has_price_evidence = long_mid > 0.0
+        short_has_price_evidence = short_mid > 0.0
+        uses_local_l2_sources = (
+            long_price_source == "local_l2"
+            and short_price_source == "local_l2"
+        )
 
-        if not long_has_l2 or not short_has_l2:
+        if not long_has_price_evidence or not short_has_price_evidence:
             self._journal.append(
-                "exit.passive_close_maker_leg_l2_missing",
+                (
+                    "exit.passive_close_maker_leg_l2_missing"
+                    if uses_local_l2_sources
+                    else "exit.passive_close_maker_leg_quote_evidence_missing"
+                ),
                 {
                     "position_id": pid,
                     "long_venue": position.long_venue.value,
                     "short_venue": position.short_venue.value,
-                    "long_mid_available": long_has_l2,
-                    "short_mid_available": short_has_l2,
+                    "long_mid_available": long_has_price_evidence,
+                    "short_mid_available": short_has_price_evidence,
+                    "long_price_evidence_available": long_has_price_evidence,
+                    "short_price_evidence_available": short_has_price_evidence,
+                    "long_price_source": long_price_source,
+                    "short_price_source": short_price_source,
                     "long_cost_bps": long_cost_bps,
                     "short_cost_bps": short_cost_bps,
                 },
@@ -5599,8 +5643,12 @@ class PassiveCloseExecutor:
                     "selected_leg": "long",
                     "long_taker_cost_bps": long_cost_bps,
                     "short_taker_cost_bps": short_cost_bps,
-                    "long_l2_available": long_has_l2,
-                    "short_l2_available": short_has_l2,
+                    "long_l2_available": long_has_price_evidence,
+                    "short_l2_available": short_has_price_evidence,
+                    "long_price_evidence_available": long_has_price_evidence,
+                    "short_price_evidence_available": short_has_price_evidence,
+                    "long_price_source": long_price_source,
+                    "short_price_source": short_price_source,
                     "reason": "long_taker_cost_higher",
                 },
             )
@@ -5613,8 +5661,12 @@ class PassiveCloseExecutor:
                     "selected_leg": "short",
                     "long_taker_cost_bps": long_cost_bps,
                     "short_taker_cost_bps": short_cost_bps,
-                    "long_l2_available": long_has_l2,
-                    "short_l2_available": short_has_l2,
+                    "long_l2_available": long_has_price_evidence,
+                    "short_l2_available": short_has_price_evidence,
+                    "long_price_evidence_available": long_has_price_evidence,
+                    "short_price_evidence_available": short_has_price_evidence,
+                    "long_price_source": long_price_source,
+                    "short_price_source": short_price_source,
                     "reason": "short_taker_cost_higher",
                 },
             )
@@ -5627,8 +5679,12 @@ class PassiveCloseExecutor:
                     "selected_leg": "long",
                     "long_taker_cost_bps": long_cost_bps,
                     "short_taker_cost_bps": short_cost_bps,
-                    "long_l2_available": long_has_l2,
-                    "short_l2_available": short_has_l2,
+                    "long_l2_available": long_has_price_evidence,
+                    "short_l2_available": short_has_price_evidence,
+                    "long_price_evidence_available": long_has_price_evidence,
+                    "short_price_evidence_available": short_has_price_evidence,
+                    "long_price_source": long_price_source,
+                    "short_price_source": short_price_source,
                     "reason": "tie_or_equal_cost_default_long",
                 },
             )
@@ -5639,12 +5695,11 @@ class PassiveCloseExecutor:
     ) -> float:
         """Estimate the effective taker cost in bps for a venue.
 
-        Uses injected L2 quote resolver for spread + venue taker fee.
-        Fallback: taker fee only if L2 spread unavailable.
+        Uses injected quote resolver for spread + venue taker fee.
+        Fallback: taker fee only if spread evidence is unavailable.
         """
         cost_bps = 0.0
 
-        # Spread-based slippage from injected L2 quote resolver
         quote = self._resolve_local_l2_quote(venue, symbol)
         if quote is not None and l2_mid > 0.0:
             best_bid, best_ask = quote

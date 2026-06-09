@@ -33,6 +33,53 @@ def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
 
 
+def test_l2_evidence_excludes_legacy_ws_bbo_selection_events():
+    from scripts.diagnose_live import _build_l2_evidence
+
+    evidence = _build_l2_evidence([
+        {
+            "ts_ms": 1779810000000,
+            "kind": "runtime.entry_blocked_local_l2_selection",
+            "payload": {
+                "reason": "entry_ws_bbo_quote_lease_stale_quote",
+                "provider": "ws_bbo_quote_lease",
+                "readiness_evidence": {
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                },
+            },
+        },
+        {
+            "ts_ms": 1779810001000,
+            "kind": "runtime.entry_local_l2_readiness_diagnostics",
+            "payload": {
+                "provider": "local_l2",
+                "reason_totals": {"book_missing": 2},
+                "not_ready": [
+                    {
+                        "pair_id": "btcusdt:binance->bybit",
+                        "venue": "binance",
+                        "symbol": "BTCUSDT",
+                        "reason": "book_missing",
+                    }
+                ],
+            },
+        },
+    ])
+
+    assert evidence["missing_l2_or_tick_count"] == 2
+    assert evidence["details"] == [
+        {
+            "kind": "runtime.entry_local_l2_readiness_diagnostics",
+            "pair_id": "btcusdt:binance->bybit",
+            "venue": "binance",
+            "symbol": "BTCUSDT",
+            "reason": "book_missing",
+            "ts_ms": 1779810001000,
+        }
+    ]
+
+
 def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     venues = venues or []
     return {

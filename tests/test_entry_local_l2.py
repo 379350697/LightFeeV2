@@ -2974,12 +2974,20 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         evidence = payload["readiness_evidence"]
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_cache"
         assert evidence["blocker_family"] == "stale_quote"
         assert evidence["quote_age_ms"]["long"] == 100
         assert evidence["quote_age_ms"]["short"] == 5000
+        assert not any(
+            r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            and r.get("payload", {}).get("provider") == "ws_bbo_quote_lease"
+            for r in records
+        )
 
     def test_ws_bbo_quote_lease_refreshes_stale_tracked_quote_from_rest_top_book(
         self,
@@ -3327,9 +3335,12 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         evidence = payload["readiness_evidence"]
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_cache"
         assert evidence["rest_refresh"]["long"]["attempted"] is True
         assert evidence["rest_refresh"]["long"]["outcome"] == "no_quote"
 
@@ -3400,9 +3411,12 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         evidence = payload["readiness_evidence"]
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_cache"
         assert evidence["rest_refresh"]["short"]["attempted"] is True
         assert evidence["rest_refresh"]["short"]["outcome"] == "no_quote"
 
@@ -3526,10 +3540,15 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         evidence = payload["readiness_evidence"]
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_subscription"
         assert evidence["provider"] == "ws_bbo_quote_lease"
+        assert evidence["source"] == "ws_bbo_quote_lease"
+        assert evidence["domain"] == "ws_bbo_subscription"
         assert evidence["long_stream_state"]["last_error"] == "ConnectionError: test-stream-down"
 
     def test_ws_bbo_quote_lease_blocks_untracked_candidate_before_provider_missing_quote(
@@ -3594,11 +3613,17 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         assert payload["reason"] == "entry_ws_bbo_quote_lease_waiting_for_subscription"
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_subscription"
         evidence = payload["readiness_evidence"]
         assert evidence["provider"] == "ws_bbo_quote_lease"
+        assert evidence["source"] == "ws_bbo_quote_lease"
+        assert evidence["domain"] == "ws_bbo_subscription"
+        assert evidence["blocker_family"] == "subscription"
         assert evidence["missing_long_subscription"] is True
         assert evidence["missing_short_subscription"] is True
         assert evidence["long_stream_state"]["tracked"] is False
@@ -3829,10 +3854,14 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
+            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
         ][-1]
         evidence = payload["readiness_evidence"]
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_subscription"
         assert evidence["coverage_reason"] == "subscription_budget_exhausted"
+        assert evidence["blocker_family"] == "subscription_budget"
         assert evidence["per_venue_budget"] == 1
         assert evidence["long_subscription_budget"]["excluded"] is True
         assert evidence["short_subscription_budget"]["excluded"] is True
