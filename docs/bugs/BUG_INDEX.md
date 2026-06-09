@@ -23,11 +23,14 @@ production account truth was flat/no-open-orders on every venue, but exported
 state still carried the old `recovery_blocked_reason=unpaired_live_position`.
 Runtime was attempting to release that live-artifact blocker through a dirty
 candidate-symbol sweep, so historical unsupported symbols created evidence gaps
-even though diagnose had already proved account-level truth clean. The local
-follow-up adds account-truth recovery ledger refresh using `fetch_all_positions`
-plus unfiltered open-order truth, and routes old `unpaired_live_position`
-cleanup through that evidence source. Live open orders and open-order truth
-errors still block release. Full evidence is recorded in
+even though diagnose had already proved account-level truth clean. The deployed
+follow-up in `78a0feb` adds account-truth recovery ledger refresh using
+`fetch_all_positions` plus unfiltered open-order truth, and routes old
+`unpaired_live_position` cleanup through that evidence source. Live open orders
+and open-order truth errors still block release. Cloud acceptance on `78a0feb`
+passed verifier and diagnose with `lifecycle=running`, `risk_mode=running`,
+`recovery_blocked_reason=null`, all venues flat/no-open-orders, and
+`production_acceptance_gate.gate_passed=true`. Full evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-060-live-artifact-recovery-release-uses-account-truth`](daily/2026-06-09.md#cluster-cl-060-live-artifact-recovery-release-uses-account-truth).
 
 Latest recovery fail-closed release latch follow-up, 2026-06-09: post-`3a59a53`
@@ -36,12 +39,13 @@ deploy verification showed the business exchange-truth gate clean
 failed with `lifecycle=risk_only`, `risk_mode=fail_closed` while
 `V1RecoveryDecisionCore=RUNNING_CLEAN`. This is distinct from the prior CL-057
 `risk_only/running` stale lifecycle case: the fail-closed risk latch itself was
-still present after the recovery block reason had gone. The local follow-up
+still present after the recovery block reason had gone. The deployed follow-up
 extends the same core-clean + flat-position + empty-open-order release helper to
 allow stale `fail_closed` through `clear_risk_mode_for_recovery()`, while still
 preserving operator fail-closed, reduce-only/entry-paused risk modes, local
-recovery work, live position truth, and live open-order blockers. Full evidence
-is recorded in
+recovery work, live position truth, and live open-order blockers. Cloud
+acceptance on `78a0feb` proved the stale fail-closed latch cleared. Full
+evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-059-recovery-fail-closed-release-latch-after-core-clean-truth`](daily/2026-06-09.md#cluster-cl-059-recovery-fail-closed-release-latch-after-core-clean-truth).
 
 Latest Bybit trading-terms pre-entry guard, 2026-06-09: production `CLUSDT`
@@ -55,11 +59,11 @@ existing admission contract, emits
 `runtime.entry_admission_blocked source=pre_entry_bybit_precheck`, and prevents
 maker dispatch before a known terms-blocked hedge. Pending-hedge admission
 handling remains as defense in depth, and reduce-only close/cancel/passive/
-residual paths are unchanged. This deployment must be accepted as a full
+residual paths are unchanged. This deployment was accepted as a full
 business-line gate, not a Bybit-only gate: entry admission, pending-entry
 terminality, passive-close ACK-only terminality, residual ACK-only closure,
-recovery lifecycle release, and Aster V3 private-truth startup safety must all
-stay green in local tests and post-deploy read-only production diagnostics.
+recovery lifecycle release, and Aster V3 private-truth startup safety stayed
+green in local tests and post-deploy read-only production diagnostics.
 Full evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-058-bybit-trading-terms-pre-entry-admission-precheck`](daily/2026-06-09.md#cluster-cl-058-bybit-trading-terms-pre-entry-admission-precheck).
 
