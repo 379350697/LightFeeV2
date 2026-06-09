@@ -17,6 +17,20 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest recovery fail-closed release latch follow-up, 2026-06-09: post-`3a59a53`
+deploy verification showed the business exchange-truth gate clean
+(`gate_passed=true`, all venues flat/no-open-orders), but top-level health still
+failed with `lifecycle=risk_only`, `risk_mode=fail_closed` while
+`V1RecoveryDecisionCore=RUNNING_CLEAN`. This is distinct from the prior CL-057
+`risk_only/running` stale lifecycle case: the fail-closed risk latch itself was
+still present after the recovery block reason had gone. The local follow-up
+extends the same core-clean + flat-position + empty-open-order release helper to
+allow stale `fail_closed` through `clear_risk_mode_for_recovery()`, while still
+preserving operator fail-closed, reduce-only/entry-paused risk modes, local
+recovery work, live position truth, and live open-order blockers. Full evidence
+is recorded in
+[`daily/2026-06-09.md#cluster-cl-059-recovery-fail-closed-release-latch-after-core-clean-truth`](daily/2026-06-09.md#cluster-cl-059-recovery-fail-closed-release-latch-after-core-clean-truth).
+
 Latest Bybit trading-terms pre-entry guard, 2026-06-09: production `CLUSDT`
 showed OKX maker / Bybit hedge failing on Bybit `110125` crude-oil trading
 terms. The same deploy window had healthy Bybit order-path behavior on other

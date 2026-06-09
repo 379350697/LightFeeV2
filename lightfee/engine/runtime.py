@@ -1576,7 +1576,10 @@ class LiveRuntime:
         """
         if self.state.lifecycle != EngineLifecycle.RISK_ONLY:
             return False
-        if self.state.risk_mode != GlobalRiskMode.RUNNING:
+        if self.state.risk_mode not in {
+            GlobalRiskMode.RUNNING,
+            GlobalRiskMode.FAIL_CLOSED,
+        }:
             return False
         if self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
             return False

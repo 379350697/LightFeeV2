@@ -1967,6 +1967,45 @@ class TestRuntimePreflight:
             await runtime.stop()
 
     @pytest.mark.asyncio
+    async def test_runtime_flat_truth_clears_stale_fail_closed_lifecycle_without_block_reason(self):
+        """Production stale latch: core clean but lifecycle and fail_closed stayed latched."""
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.recovery_blocked_at_ms = 0
+
+            runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [],
+                    "errors": [],
+                },
+                now_ms=1700000005000,
+                lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
+            )
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "recovery.lifecycle_clear"
+                and event["payload"].get("reason")
+                == "runtime_flat_truth_current_state_clean"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_stale_lifecycle_requires_open_order_truth_before_clear(self):
         """Flat positions alone are not enough when live open-order truth exists."""
 
