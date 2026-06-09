@@ -54,7 +54,12 @@ precheck accepted, open IOC returned ACK-only with accepted id and no fill
 fields, live position truth proved the temporary long, passive reduce-only
 close resolved to final flat, and post-probe production verification showed all
 venues flat/no-open-orders with no pending-entry/passive-close/residual work.
-Deployment is pending. Full evidence is recorded in
+Deployment accepted on `1894412`: remote `git_head` and `.deploy_version`
+matched, `verify_production_services.py --json` returned `ok=true` with zero
+critical/warning reports, and `diagnose_live.py --json --since-deploy` returned
+`health.ok=true`, `top_exchange_errors=[]`, `gate_passed=true`,
+`conclusion.status=healthy`, and all venue positions/open orders empty. Full
+evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-062-post-deploy-ws-bbo-admission-and-ack-only-truth-consumption`](daily/2026-06-09.md#cluster-cl-062-post-deploy-ws-bbo-admission-and-ack-only-truth-consumption).
 
 Latest WS BBO mainline / Local L2 isolation closure, 2026-06-09: production
@@ -74,7 +79,10 @@ recurrence, and dry-run audit text output prints WS BBO selection blockers
 separately from Local L2. Local verification passed entry/WS BBO,
 close/passive, diagnose/offline, entry execution gate, and live-harness
 business-line slices.
-Deployment is pending. Full evidence is recorded in
+Deployment accepted on `1894412`; the post-deploy diagnose window showed
+admission blockers under `runtime.entry_blocked_admission_selection`, no
+current Local L2 recurrence, a passing production acceptance gate, and all
+venues flat/no-open-orders. Full evidence is recorded in
 [`daily/2026-06-09.md#cluster-cl-061-ws-bbo-mainline-separates-from-local-l2-legacy-diagnostics`](daily/2026-06-09.md#cluster-cl-061-ws-bbo-mainline-separates-from-local-l2-legacy-diagnostics).
 
 Latest live-artifact account-truth recovery release, 2026-06-09: post-`b2d0706`
