@@ -17,6 +17,19 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest live-artifact account-truth recovery release, 2026-06-09: post-`b2d0706`
+deploy proved the previous fail-closed guard fix was still not enough. Current
+production account truth was flat/no-open-orders on every venue, but exported
+state still carried the old `recovery_blocked_reason=unpaired_live_position`.
+Runtime was attempting to release that live-artifact blocker through a dirty
+candidate-symbol sweep, so historical unsupported symbols created evidence gaps
+even though diagnose had already proved account-level truth clean. The local
+follow-up adds account-truth recovery ledger refresh using `fetch_all_positions`
+plus unfiltered open-order truth, and routes old `unpaired_live_position`
+cleanup through that evidence source. Live open orders and open-order truth
+errors still block release. Full evidence is recorded in
+[`daily/2026-06-09.md#cluster-cl-060-live-artifact-recovery-release-uses-account-truth`](daily/2026-06-09.md#cluster-cl-060-live-artifact-recovery-release-uses-account-truth).
+
 Latest recovery fail-closed release latch follow-up, 2026-06-09: post-`3a59a53`
 deploy verification showed the business exchange-truth gate clean
 (`gate_passed=true`, all venues flat/no-open-orders), but top-level health still

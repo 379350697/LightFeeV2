@@ -1682,6 +1682,218 @@ class LiveRuntime:
             lifecycle_clear_reason=lifecycle_clear_reason,
         )
 
+    async def _refresh_recovery_ledger_from_account_truth(
+        self,
+        now_ms: int,
+        *,
+        lifecycle_clear_reason: str = "current_account_truth_core_clean",
+    ) -> RecoveryLedger | None:
+        if not self._venue_adapters:
+            return None
+        exchange_truth = await self._collect_recovery_ledger_account_truth(now_ms)
+        if not exchange_truth.get("truth_supported", True):
+            return None
+        return self._refresh_recovery_ledger_from_exchange_truth(
+            exchange_truth,
+            now_ms=now_ms,
+            lifecycle_clear_reason=lifecycle_clear_reason,
+        )
+
+    async def _collect_recovery_ledger_account_truth(
+        self,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        positions: list[dict[str, Any]] = []
+        open_orders: list[dict[str, Any]] = []
+        probe_evidence: list[dict[str, Any]] = []
+        errors: list[str] = []
+        truth_probe_count = 0
+
+        for venue, adapter in self._venue_adapters.items():
+            venue_name = venue.value if hasattr(venue, "value") else str(venue)
+            fetch_all_positions = getattr(adapter, "fetch_all_positions", None)
+            if not callable(fetch_all_positions):
+                transport = getattr(adapter, "_transport", None)
+                fetch_all_positions = getattr(transport, "fetch_all_positions", None)
+            if not callable(fetch_all_positions):
+                errors.append(f"{venue_name}:*:positions:fetch_all_positions_unavailable")
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": "*",
+                        "endpoint": "fetch_all_positions",
+                        "method": "fetch_all_positions",
+                        "finished_at_ms": now_ms,
+                        "classification": "position_probe_unfiltered_failed",
+                        "error": "fetch_all_positions_unavailable",
+                    }
+                )
+            else:
+                try:
+                    rows = await fetch_all_positions()
+                    truth_probe_count += 1
+                    if isinstance(rows, (list, tuple, set)):
+                        for position in rows:
+                            positions.append(
+                                self._recovery_ledger_position_payload(
+                                    position,
+                                    venue_name=venue_name,
+                                    symbol="*",
+                                )
+                            )
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": "*",
+                            "endpoint": "fetch_all_positions",
+                            "method": "fetch_all_positions",
+                            "finished_at_ms": now_ms,
+                            "classification": "position_probe_unfiltered_succeeded",
+                            "position_count": len(rows)
+                            if isinstance(rows, (list, tuple, set))
+                            else 0,
+                        }
+                    )
+                except Exception as exc:
+                    truth_probe_count += 1
+                    errors.append(f"{venue_name}:*:positions:{exc}")
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": "*",
+                            "endpoint": "fetch_all_positions",
+                            "method": "fetch_all_positions",
+                            "finished_at_ms": now_ms,
+                            "classification": "position_probe_unfiltered_failed",
+                            "error": str(exc),
+                        }
+                    )
+
+            try:
+                rows, endpoint = await self._fetch_recovery_ledger_account_open_orders(
+                    venue,
+                    adapter,
+                )
+                truth_probe_count += 1
+                for row in self._recovery_ledger_open_order_payloads(
+                    rows,
+                    venue_name=venue_name,
+                    symbol="*",
+                ):
+                    open_orders.append(row)
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": "*",
+                        "endpoint": endpoint,
+                        "method": "fetch_open_orders",
+                        "finished_at_ms": now_ms,
+                        "classification": "open_order_probe_unfiltered_succeeded",
+                        "open_order_count": len(rows)
+                        if isinstance(rows, (list, tuple, set))
+                        else 0,
+                    }
+                )
+            except Exception as exc:
+                truth_probe_count += 1
+                errors.append(f"{venue_name}:*:open_orders:{exc}")
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": "*",
+                        "endpoint": "fetch_open_orders",
+                        "method": "fetch_open_orders",
+                        "finished_at_ms": now_ms,
+                        "classification": "open_order_probe_unfiltered_failed",
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "truth_supported": truth_probe_count > 0,
+            "truth_available": not errors,
+            "positions": positions,
+            "open_orders": open_orders,
+            "probe_evidence": probe_evidence,
+            "errors": errors,
+        }
+
+    async def _fetch_recovery_ledger_account_open_orders(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+    ) -> tuple[list[Any], str]:
+        transport = getattr(adapter, "_transport", None)
+        request = getattr(transport, "_request", None)
+
+        if venue == Venue.ASTER:
+            fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+            if callable(fetch_open_orders):
+                rows = await fetch_open_orders(None)
+                if isinstance(rows, dict) and rows.get("error"):
+                    raise RuntimeError(str(rows.get("error")))
+                return self._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
+            if callable(request):
+                raw = await request("GET", "/fapi/v3/openOrders", params={}, private=True)
+                return self._recovery_ledger_order_rows(raw), "/fapi/v3/openOrders"
+
+        if venue == Venue.BINANCE and callable(request):
+            raw = await request("GET", "/fapi/v1/openOrders", params={}, private=True)
+            return self._recovery_ledger_order_rows(raw), "/fapi/v1/openOrders"
+        if venue == Venue.BYBIT and callable(request):
+            raw = await request(
+                "GET",
+                "/v5/order/realtime",
+                params={"category": "linear", "settleCoin": "USDT"},
+                private=True,
+            )
+            return self._recovery_ledger_order_rows(raw), "/v5/order/realtime"
+        if venue == Venue.OKX and callable(request):
+            raw = await request(
+                "GET",
+                "/api/v5/trade/orders-pending",
+                params={"instType": "SWAP"},
+                private=True,
+            )
+            return self._recovery_ledger_order_rows(raw), "/api/v5/trade/orders-pending"
+        if venue == Venue.BITGET and callable(request):
+            raw = await request(
+                "GET",
+                "/api/v2/mix/order/orders-pending",
+                params={"productType": "USDT-FUTURES"},
+                private=True,
+            )
+            return (
+                self._recovery_ledger_order_rows(raw),
+                "/api/v2/mix/order/orders-pending",
+            )
+        if venue == Venue.GATE and callable(request):
+            raw = await request(
+                "GET",
+                "/api/v4/futures/usdt/orders",
+                params={"status": "open"},
+                private=True,
+            )
+            return self._recovery_ledger_order_rows(raw), "/api/v4/futures/usdt/orders"
+        if venue == Venue.HYPERLIQUID and callable(request):
+            credential = getattr(transport, "_credential", None)
+            account = str(getattr(credential, "account_address", "") or "")
+            raw = await request(
+                "POST",
+                "/info",
+                body={"type": "openOrders", "user": account},
+                private=False,
+            )
+            return self._recovery_ledger_order_rows(raw), "/info openOrders"
+
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if not callable(fetch_open_orders):
+            raise RuntimeError("fetch_open_orders_unavailable")
+        rows = await fetch_open_orders(None)
+        if isinstance(rows, dict) and rows.get("error"):
+            raise RuntimeError(str(rows.get("error")))
+        return self._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
+
     async def _collect_recovery_ledger_exchange_truth(
         self,
         symbols: list[str],
@@ -1865,23 +2077,89 @@ class LiveRuntime:
                 result.append(
                     {
                         "venue": str(row.get("venue") or venue_name).lower(),
-                        "symbol": str(row.get("symbol") or symbol).upper(),
+                        "symbol": str(
+                            row.get("symbol")
+                            or row.get("instId")
+                            or row.get("contract")
+                            or row.get("coin")
+                            or symbol
+                        ).upper(),
                         "side": str(row.get("side") or "").lower(),
                         "quantity": float(
-                            row.get("quantity", row.get("qty", 0.0)) or 0.0
+                            row.get(
+                                "quantity",
+                                row.get(
+                                    "origQty",
+                                    row.get(
+                                        "qty",
+                                        row.get(
+                                            "size",
+                                            row.get("sz", row.get("amount", 0.0)),
+                                        ),
+                                    ),
+                                ),
+                            )
+                            or 0.0
                         ),
-                        "price": float(row.get("price", 0.0) or 0.0),
-                        "reduce_only": bool(row.get("reduce_only", False)),
-                        "order_id": str(row.get("order_id") or row.get("id") or ""),
+                        "price": float(row.get("price", row.get("px", 0.0)) or 0.0),
+                        "reduce_only": LiveRuntime._truthy_recovery_order_field(
+                            row.get("reduce_only", row.get("reduceOnly", False))
+                        ),
+                        "order_id": str(
+                            row.get("order_id")
+                            or row.get("orderId")
+                            or row.get("ordId")
+                            or row.get("id")
+                            or row.get("orderLinkId")
+                            or row.get("clientOid")
+                            or row.get("clOrdId")
+                            or ""
+                        ),
                         "client_order_id": str(
                             row.get("client_order_id")
                             or row.get("clientOrderId")
                             or row.get("order_link_id")
+                            or row.get("orderLinkId")
+                            or row.get("clientOid")
+                            or row.get("clOrdId")
                             or ""
                         ),
                     }
                 )
         return result
+
+    @staticmethod
+    def _truthy_recovery_order_field(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").lower() in {"true", "1", "yes"}
+
+    @staticmethod
+    def _recovery_ledger_order_rows(raw: Any) -> list[Any]:
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return raw
+        if not isinstance(raw, dict):
+            return [raw]
+        if raw.get("error"):
+            raise RuntimeError(str(raw.get("error")))
+        result = raw.get("result")
+        if isinstance(result, dict) and isinstance(result.get("list"), list):
+            return result["list"]
+        data = raw.get("data")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("entrustedList", "orderList", "list", "orders"):
+                rows = data.get(key)
+                if isinstance(rows, list):
+                    return rows
+        for key in ("list", "orders", "openOrders"):
+            rows = raw.get(key)
+            if isinstance(rows, list):
+                return rows
+        return []
 
     def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
         symbols = set(self._startup_position_probe_symbols(symbol_info))
@@ -2333,8 +2611,7 @@ class LiveRuntime:
             and not self._has_local_recovery_work()
             and self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
         ):
-            await self._refresh_recovery_ledger_for_symbols(
-                self._startup_recovery_ledger_symbols({}),
+            await self._refresh_recovery_ledger_from_account_truth(
                 now_ms,
                 lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
             )

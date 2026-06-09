@@ -1856,10 +1856,92 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_unpaired_live_position_uses_account_truth_not_symbol_sweep(self):
+        """Old live-artifact blockers clear from unfiltered account truth, not dirty symbols."""
+
+        class AccountFlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.account_open_order_calls = 0
+                self.symbol_open_order_calls: list[str] = []
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                if symbol is None:
+                    self.account_open_order_calls += 1
+                    return []
+                self.symbol_open_order_calls.append(symbol)
+                raise RuntimeError(f"unsupported symbol: {symbol}")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = AccountFlatTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {
+                "recent_touched_symbols": ["CL-USDT-SWAP", "CLUSDT"]
+            }
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert bybit.account_open_order_calls == 1
+            assert bybit.symbol_open_order_calls == []
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_truth_prefers_aster_v3_adapter_open_orders(self):
+        """Aster private truth is V3 adapter-owned, not the public FAPI transport."""
+
+        class PublicTransport:
+            async def _request(self, *args, **kwargs):
+                raise AssertionError("runtime must not use Aster public transport")
+
+        class AsterAccountTruthAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.ASTER)
+                self._transport = PublicTransport()
+                self.open_order_symbol = "not-called"
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                self.open_order_symbol = symbol
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={Venue.ASTER: AsterAccountTruthAdapter()},
+            )
+
+            truth = await runtime._collect_recovery_ledger_account_truth(1700000005000)
+
+            assert truth["truth_available"] is True
+            assert truth["open_orders"] == []
+            adapter = runtime._venue_adapters[Venue.ASTER]
+            assert adapter.open_order_symbol is None
+
+    @pytest.mark.asyncio
     async def test_runtime_unpaired_live_position_flat_truth_requires_open_order_truth(self):
         """The unpaired-position release must not synthesize empty open orders."""
 
         class OpenOrderAdapter(FakeVenueAdapter):
+            def supported_symbols(self) -> list[str]:
+                return ["BTCUSDT"]
+
             async def fetch_all_positions(self):
                 return []
 
@@ -1867,7 +1949,7 @@ class TestRuntimePreflight:
                 return [
                     {
                         "venue": self.venue.value,
-                        "symbol": symbol,
+                        "symbol": "BTCUSDT",
                         "side": "sell",
                         "quantity": 1.0,
                         "order_id": "still-live-order",
@@ -1900,6 +1982,9 @@ class TestRuntimePreflight:
         """Flat positions cannot clear an unpaired block when order truth errors."""
 
         class OpenOrderUnavailableAdapter(FakeVenueAdapter):
+            def supported_symbols(self) -> list[str]:
+                return ["BTCUSDT"]
+
             async def fetch_all_positions(self):
                 return []
 
