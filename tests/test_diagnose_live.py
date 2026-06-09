@@ -6,6 +6,7 @@ Tests that diagnose_live.py correctly:
 - Detects local open position when exchange flat -> state_mismatch=true
 - Detects RuntimeWarning was never awaited -> runtime_warnings entry
 - Tracks L2 missing/tick stats -> l2_evidence populated
+- Separates snapshot stale/degraded diagnostics from Local L2 evidence
 """
 
 from __future__ import annotations
@@ -78,6 +79,42 @@ def test_l2_evidence_excludes_legacy_ws_bbo_selection_events():
             "ts_ms": 1779810001000,
         }
     ]
+
+
+def test_snapshot_stale_and_degraded_are_reported_outside_l2_evidence():
+    from scripts.diagnose_live import _build_l2_evidence, _build_snapshot_evidence
+
+    events = [
+        {
+            "ts_ms": 1779810000000,
+            "kind": "runtime.snapshot_stale",
+            "payload": {"stale_degraded_domains": ["quote"]},
+        },
+        {
+            "ts_ms": 1779810001000,
+            "kind": "runtime.snapshot_degraded",
+            "payload": {
+                "degraded_domains": ["liquidity"],
+                "candidate_freshness_scope": [
+                    {
+                        "candidate_symbol": "BTCUSDT",
+                        "domain": "quote",
+                        "blocked": True,
+                        "block_reason": "quote_stale",
+                    }
+                ],
+            },
+        },
+    ]
+
+    l2 = _build_l2_evidence(events)
+    snapshot = _build_snapshot_evidence(events)
+
+    assert l2["stale_rebuild_count"] == 0
+    assert l2["missing_l2_or_tick_count"] == 0
+    assert snapshot["stale_or_degraded_count"] == 2
+    assert snapshot["domain_counts"] == {"liquidity": 1, "quote": 2}
+    assert snapshot["blocking_scope_count"] == 1
 
 
 def _flat_exchange_truth(runtime_dir, symbols, venues=None):
@@ -2565,9 +2602,12 @@ def test_l2_missing_tick_stats_tracked():
         )
 
         l2 = result["l2_evidence"]
+        snapshot = result["snapshot_evidence"]
         assert l2["sequence_gap_count"] >= 1
-        assert l2["stale_rebuild_count"] >= 1
+        assert l2["stale_rebuild_count"] == 0
         assert l2["missing_l2_or_tick_count"] >= 1
+        assert snapshot["stale_or_degraded_count"] == 1
+        assert snapshot["domain_counts"] == {"liquidity": 1}
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

@@ -14353,6 +14353,7 @@ class LiveRuntime:
             "provider": self._entry_readiness_provider_name(),
             "domain": "local_l2_book",
             "blocker_family": "post_only_bbo",
+            "repriced_attempted": False,
         }
         if self._entry_readiness_provider_uses_ws_bbo():
             stale_after_ms = self._entry_quote_lease_max_age_ms()
@@ -14394,6 +14395,26 @@ class LiveRuntime:
             if not fresh:
                 return False, "stale_bbo", payload
             if would_cross:
+                repriced_price = best_bid if side == Side.BUY else best_ask
+                repriced_would_cross = (
+                    repriced_price > 0.0
+                    and (
+                        (side == Side.BUY and repriced_price >= best_ask)
+                        or (side == Side.SELL and repriced_price <= best_bid)
+                    )
+                )
+                payload.update(
+                    {
+                        "repriced_attempted": True,
+                        "original_price": price,
+                        "repriced_price": repriced_price,
+                        "repriced_would_cross": repriced_would_cross,
+                    }
+                )
+                if repriced_price > 0.0 and not repriced_would_cross:
+                    payload["price"] = repriced_price
+                    payload["would_cross"] = False
+                    return True, "", payload
                 return False, "would_cross_bbo", payload
             return True, "", payload
 
@@ -15322,6 +15343,21 @@ class LiveRuntime:
                     or ask <= 0.0
                 ):
                     reason = "quote_stale" if age_ms > quote_budget_ms else "invalid_quote"
+                    if reason == "quote_stale":
+                        resolved = self._ws_bbo_entry_quote_resolution(
+                            venue=venue,
+                            symbol=symbol,
+                            now_ms=now_ms,
+                            sidecar_reason=reason,
+                            sidecar_source=source,
+                            sidecar_observed_at_ms=observed_at_ms,
+                            sidecar_age_ms=age_ms,
+                            sidecar_budget_ms=quote_budget_ms,
+                            fallback_source=fallback_source,
+                        )
+                        if resolved is not None:
+                            decisions.append(resolved)
+                            continue
                     payload = {
                         "venue": venue,
                         "symbol": symbol,
@@ -15444,6 +15480,72 @@ class LiveRuntime:
                 getattr(quote, "funding_timestamp_ms", 0) or 0
             ),
             "invalid_quote_fields": invalid_fields,
+        }
+
+    def _ws_bbo_entry_quote_resolution(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        now_ms: int,
+        sidecar_reason: str,
+        sidecar_source: str,
+        sidecar_observed_at_ms: int,
+        sidecar_age_ms: int,
+        sidecar_budget_ms: int,
+        fallback_source: str,
+    ) -> dict | None:
+        if sidecar_reason != "quote_stale":
+            return None
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return None
+        cache = getattr(self, "ws_bbo_cache", None)
+        if cache is None:
+            return None
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            return None
+        quote = cache.fresh_quote(
+            venue,
+            symbol,
+            now_ms=now_ms,
+            max_age_ms=budget_ms,
+        )
+        if quote is None:
+            return None
+        observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        if observed_at_ms <= 0 or age_ms > budget_ms or bid <= 0.0 or ask <= bid:
+            return None
+        return {
+            "venue": str(venue or "").lower(),
+            "symbol": str(symbol or "").upper(),
+            "domain": "quote",
+            "source": "ws_bbo_quote_lease",
+            "provider": "ws_bbo_quote_lease",
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+            "budget_ms": budget_ms,
+            "decision": "continue",
+            "fallback_source": fallback_source,
+            "reason": f"{sidecar_reason}_resolved_by_ws_bbo",
+            "blocking": False,
+            "event_kind": "runtime.entry_quote_evidence_resolved_by_ws_bbo",
+            "sidecar_reason": str(sidecar_reason or ""),
+            "sidecar_source": str(sidecar_source or ""),
+            "sidecar_observed_at_ms": int(sidecar_observed_at_ms or 0),
+            "sidecar_age_ms": int(sidecar_age_ms or 0),
+            "sidecar_budget_ms": int(sidecar_budget_ms or 0),
+            "ws_bbo_source": str(getattr(quote, "source", "") or ""),
+            "quote_bid": bid,
+            "quote_ask": ask,
+            "quote_bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
+            "quote_ask_size": float(getattr(quote, "ask_size", 0.0) or 0.0),
+            "invalid_quote_fields": [],
+            "blocker_family": "quote_evidence_resolved",
+            "metric_fresh": True,
         }
 
     @staticmethod
@@ -15788,7 +15890,11 @@ class LiveRuntime:
                     failure["domain"],
                 )
                 if key not in metrics:
-                    self._record_snapshot_metric(metrics, key, False)
+                    self._record_snapshot_metric(
+                        metrics,
+                        key,
+                        bool(failure.get("metric_fresh", False)),
+                    )
                 ages[key] = int(failure.get("age_ms", 0) or 0)
                 if budgets is not None:
                     budgets[key] = int(failure.get("budget_ms", 0) or 0)
@@ -17932,6 +18038,25 @@ class LiveRuntime:
                     },
                 )
                 return False
+            repriced_price = float(
+                maker_bbo_evidence.get("repriced_price", 0.0) or 0.0
+            )
+            if repriced_price > 0.0:
+                maker_order_price_hint = repriced_price
+                if maker_leg == Side.BUY:
+                    long_order_price_hint = repriced_price
+                else:
+                    short_order_price_hint = repriced_price
+                self.journal.append(
+                    "runtime.entry_post_only_bbo_repriced",
+                    {
+                        **maker_bbo_evidence,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "reason": "post_only_would_cross_repriced",
+                        "ts_ms": now_ms,
+                    },
+                )
 
         def _positive_ms(value) -> int:
             try:

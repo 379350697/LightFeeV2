@@ -1389,6 +1389,70 @@ class TestPlannerDispatchIntegration:
         assert binance.last_request.price == 50000.0
 
     @pytest.mark.asyncio
+    async def test_ws_bbo_post_only_guard_reprices_crossing_maker_quote_once(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        candidate = self._candidate()
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
+        assert readiness.allowed
+
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=49980.0,
+                ask=49990.0,
+                observed_at_ms=5100,
+                received_at_ms=5100,
+                source="binance_bbo_ws",
+            )
+        )
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5100,
+            price_hint=12345.0,
+        )
+
+        assert dispatched is True
+        assert binance.last_request is not None
+        assert binance.last_request.post_only is True
+        assert binance.last_request.price == 49980.0
+        assert not [
+            record for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_post_only_bbo"
+        ]
+
+    @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_refreshes_expired_quote_lease(
         self,
         config,

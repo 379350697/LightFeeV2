@@ -149,6 +149,240 @@ def test_runtime_no_tradeable_diagnostics_classifies_edge_window_and_domain():
     ) == "candidate_snapshot_domain_stale"
 
 
+def test_ws_bbo_provider_resolves_stale_sidecar_quote_for_entry_freshness(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
+            local_l2_enabled=False,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.pair_id = "btcusdt:okx->bybit"
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 31_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 31_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+    for venue, bid, ask in (
+        ("okx", 100.0, 101.0),
+        ("bybit", 100.2, 101.2),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                bid_size=50.0,
+                ask_size=60.0,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source=f"{venue}_bbo_ws",
+            )
+        )
+
+    metrics = {}
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+            metrics=metrics,
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == [candidate]
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    kinds = [record["kind"] for record in records]
+    assert "runtime.quote_stale" not in kinds
+    resolved = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
+    ]
+    assert len(resolved) == 2
+    assert {payload["venue"] for payload in resolved} == {"okx", "bybit"}
+    assert all(payload["source"] == "ws_bbo_quote_lease" for payload in resolved)
+    assert all(payload["sidecar_reason"] == "quote_stale" for payload in resolved)
+    assert runtime._last_snapshot_freshness_filter_blockers["quote_stale"] == 0
+    assert metrics["okx|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
+    assert metrics["bybit|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
+
+
+def test_ws_bbo_provider_does_not_resolve_missing_or_invalid_sidecar_quote(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
+            local_l2_enabled=False,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=0.0,
+                ask=101.0,
+                bid_size=100.0,
+                ask_size=100.0,
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms,
+                source="sidecar_quote",
+            ),
+        },
+        candidates=[candidate],
+    )
+    for venue, bid, ask in (
+        ("okx", 100.0, 101.0),
+        ("bybit", 100.2, 101.2),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                bid_size=50.0,
+                ask_size=60.0,
+                observed_at_ms=now_ms - 100,
+                received_at_ms=now_ms - 100,
+                source=f"{venue}_bbo_ws",
+            )
+        )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == []
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    resolved = [
+        record for record in records
+        if record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
+    ]
+    reasons = {
+        record["payload"]["reason"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"].get("domain") == "quote"
+    }
+    assert resolved == []
+    assert reasons == {"invalid_quote", "missing_quote"}
+
+
+def test_ws_bbo_provider_keeps_entry_fail_closed_when_bbo_cannot_resolve_stale_sidecar_quote(tmp_path):
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
+            local_l2_enabled=False,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 31_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 31_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == []
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert any(record["kind"] == "runtime.quote_stale" for record in records)
+    assert not any(
+        record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
+        for record in records
+    )
+
+
 def test_snapshot_freshness_decisions_are_rate_limited_by_source_domain(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(

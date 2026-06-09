@@ -1671,8 +1671,6 @@ def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
             sequence_gap_count += 1
         elif kind == "runtime.local_l2_sync_failed":
             stale_rebuild_count += 1
-        elif kind in ("runtime.snapshot_stale", "runtime.snapshot_degraded"):
-            stale_rebuild_count += 1
         elif kind in ("runtime.entry_blocked_local_l2_selection", "runtime.entry_local_l2_readiness_diagnostics"):
             not_ready = payload.get("not_ready", []) or []
             reason_totals = payload.get("reason_totals", {})
@@ -1705,6 +1703,63 @@ def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
         "stale_rebuild_count": stale_rebuild_count,
         "sequence_gap_count": sequence_gap_count,
         "details": details[:20],
+    }
+
+
+def _snapshot_domains_from_payload(payload: dict[str, Any]) -> set[str]:
+    domains: set[str] = set()
+    for key in ("stale_degraded_domains", "degraded_domains"):
+        values = payload.get(key, []) or []
+        if isinstance(values, str):
+            values = [values]
+        for value in values:
+            domain = str(value or "").strip()
+            if domain:
+                domains.add(domain)
+    for item in payload.get("candidate_freshness_scope", []) or []:
+        if not isinstance(item, dict):
+            continue
+        domain = str(item.get("domain", "") or "").strip()
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+def _build_snapshot_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
+    stale_or_degraded_count = 0
+    domain_counts: dict[str, int] = {}
+    blocking_scope_count = 0
+    details: list[dict[str, Any]] = []
+
+    for rec in events:
+        kind = str(rec.get("kind", ""))
+        if kind not in ("runtime.snapshot_stale", "runtime.snapshot_degraded"):
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        stale_or_degraded_count += 1
+        domains = _snapshot_domains_from_payload(payload) or {"unknown"}
+        for domain in domains:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        scoped_blockers = [
+            item for item in payload.get("candidate_freshness_scope", []) or []
+            if isinstance(item, dict) and bool(item.get("blocked", False))
+        ]
+        blocking_scope_count += len(scoped_blockers)
+        if len(details) < 20:
+            details.append({
+                "kind": kind,
+                "ts_ms": rec.get("ts_ms", 0),
+                "domains": sorted(domains),
+                "blocking_scope_count": len(scoped_blockers),
+            })
+
+    return {
+        "stale_or_degraded_count": stale_or_degraded_count,
+        "domain_counts": dict(sorted(domain_counts.items())),
+        "blocking_scope_count": blocking_scope_count,
+        "details": details,
     }
 
 
@@ -2496,6 +2551,7 @@ def _build_conclusion(
     evidence_completeness: dict[str, Any],
     order_errors: list[dict[str, Any]],
     l2_evidence: dict[str, Any],
+    snapshot_evidence: dict[str, Any],
     exchange_truth: dict[str, Any],
     production_acceptance_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -2596,6 +2652,11 @@ def _build_conclusion(
         next_actions.append("investigate L2 stale/rebuild ({} rebuilds, {} gaps)".format(
             l2_evidence["stale_rebuild_count"], l2_evidence["sequence_gap_count"],
         ))
+    if (
+        snapshot_evidence.get("stale_or_degraded_count", 0) > 0
+        and l2_evidence["stale_rebuild_count"] <= 0
+    ):
+        next_actions.append("review snapshot stale/degraded evidence; not classified as Local L2")
     if gate_failed:
         next_actions.append(
             "resolve production acceptance gate blockers: {}".format(
@@ -2700,6 +2761,7 @@ def run_diagnose(
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
+    snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
     production_acceptance_gate = _build_production_acceptance_gate(
         all_events, local_state, exchange_truth,
@@ -2712,7 +2774,7 @@ def run_diagnose(
     )
     conclusion = _build_conclusion(
         health, state_consistency, evidence_completeness, order_errors,
-        l2_evidence, exchange_truth, production_acceptance_gate,
+        l2_evidence, snapshot_evidence, exchange_truth, production_acceptance_gate,
     )
 
     event_counts: dict[str, int] = {}
@@ -2750,6 +2812,7 @@ def run_diagnose(
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
         "l2_evidence": l2_evidence,
+        "snapshot_evidence": snapshot_evidence,
         "runtime_warnings": runtime_warnings,
         "production_acceptance_gate": production_acceptance_gate,
         "evidence_quality": evidence_completeness,
