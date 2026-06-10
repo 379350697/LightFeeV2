@@ -25,6 +25,7 @@ from typing import Any, Optional
 import httpx
 
 from lightfee.core.domain import (
+    AccountBalanceSnapshot,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -3307,6 +3308,59 @@ class VenueTransport(MarketDataClient):
             entry_price=0.0,
             observed_at_ms=now_ms,
         )
+
+    # ------------------------------------------------------------------
+    # Account balance snapshot (entry admission)
+    # ------------------------------------------------------------------
+
+    async def fetch_account_balance_snapshot(self) -> Optional[AccountBalanceSnapshot]:
+        """Fetch available account balance for entry admission checks."""
+        spec = self._spec
+        if self.mode != "live":
+            return None
+
+        now_ms = int(time.time() * 1000)
+        try:
+            if spec.venue_id == Venue.HYPERLIQUID:
+                account_address = self._credential.account_address if self._credential else ""
+                if not account_address:
+                    return None
+                raw = await self._request(
+                    "POST",
+                    "/info",
+                    body={"type": "clearinghouseState", "user": account_address},
+                    private=True,
+                )
+                if not isinstance(raw, dict):
+                    return None
+                withdrawable = _parse_optional_float(raw.get("withdrawable"))
+                if withdrawable is None:
+                    return None
+                cross = raw.get("crossMarginSummary")
+                margin = raw.get("marginSummary")
+                account_value = None
+                if isinstance(cross, dict):
+                    account_value = _parse_optional_float(cross.get("accountValue"))
+                if account_value is None and isinstance(margin, dict):
+                    account_value = _parse_optional_float(margin.get("accountValue"))
+                locked = 0.0
+                if account_value is not None:
+                    locked = max(account_value - withdrawable, 0.0)
+                return AccountBalanceSnapshot(
+                    venue=Venue.HYPERLIQUID,
+                    asset="USDC",
+                    free=max(withdrawable, 0.0),
+                    locked=locked,
+                    observed_at_ms=now_ms,
+                )
+            return None
+        except TransportError:
+            raise
+        except Exception as e:
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                f"account balance snapshot failed: {e}",
+            )
 
     # ------------------------------------------------------------------
     # Account risk snapshot (V1: per-venue account risk polling)

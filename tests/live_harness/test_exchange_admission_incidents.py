@@ -10,7 +10,7 @@ from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
-from lightfee.core.domain import PositionSnapshot, Side, Venue
+from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from tests.test_live_startup_preflight import make_test_config
 
@@ -201,6 +201,19 @@ class FlatAdapter:
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
+
+
+class BalanceAdapter(FlatAdapter):
+    def __init__(self, balance: AccountBalanceSnapshot | None = None, error: Exception | None = None):
+        self.balance = balance
+        self.error = error
+        self.balance_calls = 0
+
+    async def fetch_account_balance_snapshot(self):
+        self.balance_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.balance
 
 
 class RejectingHedgeAdapter(FlatAdapter):
@@ -486,6 +499,132 @@ def test_hyperliquid_venue_cooldown_prunes_new_entry_candidates_before_shortlist
         assert payload["allowed_count"] == 1
         assert payload["suppressed_count"] == 0
         assert payload["samples"][0]["candidate_pair_id"] == "wldusdt:bybit->hyperliquid"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_scan_start_balance_prefilter_arms_venue_cooldown():
+    with tempfile.TemporaryDirectory() as td:
+        now_ms = 1778787002000
+        hyperliquid = BalanceAdapter(
+            AccountBalanceSnapshot(
+                venue=Venue.HYPERLIQUID,
+                asset="USDC",
+                free=5.0,
+                locked=0.0,
+                observed_at_ms=now_ms,
+            )
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal.open()
+
+        allowed = await runtime._refresh_hyperliquid_entry_balance_admission(now_ms)
+
+        assert allowed is False
+        assert hyperliquid.balance_calls == 1
+        cooldown = runtime.state.venue_entry_cooldowns["hyperliquid:*"]
+        assert cooldown["reason"] == "insufficient_margin_admission_prefiltered"
+        assert cooldown["source"] == "scan_start_balance_prefilter"
+        assert cooldown["block_scope"] == "venue"
+        assert cooldown["available_balance_quote"] == pytest.approx(5.0)
+        assert cooldown["required_initial_margin_quote"] > 5.0
+        assert cooldown["live_target_leverage"] == runtime.config.strategy.live_target_leverage
+        records = runtime.journal.read_all()
+        event = [
+            record["payload"] for record in records
+            if record["kind"] == "runtime.entry_admission_blocked"
+        ][-1]
+        assert event["reason"] == "insufficient_margin_admission_prefiltered"
+        assert event["source"] == "scan_start_balance_prefilter"
+        assert event["evidence_gap"] is False
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_candidate_balance_prefilter_prunes_only_underfunded_candidates():
+    with tempfile.TemporaryDirectory() as td:
+        now_ms = 1778787002000
+        hyperliquid = BalanceAdapter(
+            AccountBalanceSnapshot(
+                venue=Venue.HYPERLIQUID,
+                asset="USDC",
+                free=20.0,
+                locked=0.0,
+                observed_at_ms=now_ms,
+            )
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal.open()
+        small = _candidate("SMALLUSDT", "bybit", "hyperliquid")
+        small.entry_notional_quote = 50.0
+        large = _candidate("LARGEUSDT", "bybit", "hyperliquid")
+        large.entry_notional_quote = 100.0
+        bybit_only = _candidate("BTCUSDT", "bybit", "binance")
+        bybit_only.entry_notional_quote = 100.0
+
+        filtered = await runtime._filter_candidates_by_entry_balance_admission(
+            [small, large, bybit_only],
+            now_ms=now_ms,
+            stage="shortlist",
+        )
+
+        assert [candidate.symbol for candidate in filtered] == ["SMALLUSDT", "BTCUSDT"]
+        assert runtime._last_entry_admission_filter_blockers == {
+            "insufficient_margin_admission_prefiltered": 1
+        }
+        sample = runtime._last_entry_admission_filter_samples[0]
+        assert sample["candidate_pair_id"] == "largeusdt:bybit->hyperliquid"
+        assert sample["available_balance_quote"] == pytest.approx(20.0)
+        assert sample["entry_notional_quote"] == pytest.approx(100.0)
+        assert sample["required_initial_margin_quote"] > 20.0
+        payload = [
+            record["payload"] for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_degraded"
+        ][-1]
+        assert payload["reason"] == "insufficient_margin_admission_prefiltered"
+        assert payload["source"] == "candidate_balance_prefilter"
+        assert payload["blocked_count"] == 1
+        assert payload["allowed_count"] == 2
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_balance_unavailable_blocks_entry_with_evidence_gap():
+    with tempfile.TemporaryDirectory() as td:
+        now_ms = 1778787002000
+        hyperliquid = BalanceAdapter(error=RuntimeError("clearinghouse unavailable"))
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal.open()
+        candidate = _candidate("MOVEUSDT", "bybit", "hyperliquid")
+
+        filtered = await runtime._filter_candidates_by_entry_balance_admission(
+            [candidate],
+            now_ms=now_ms,
+            stage="shortlist",
+        )
+
+        assert filtered == []
+        assert runtime._last_entry_admission_filter_blockers == {
+            "hyperliquid_account_balance_unavailable": 1
+        }
+        sample = runtime._last_entry_admission_filter_samples[0]
+        assert sample["reason"] == "hyperliquid_account_balance_unavailable"
+        assert sample["evidence_gap"] is True
+        payload = [
+            record["payload"] for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_degraded"
+        ][-1]
+        assert payload["reason"] == "hyperliquid_account_balance_unavailable"
+        assert payload["evidence_gap"] is True
         runtime.journal.close()
 
 

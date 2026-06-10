@@ -387,6 +387,51 @@ class TestBinanceAsterPostSigning:
         assert snapshot.available_balance_quote == pytest.approx(74.25)
         assert snapshot.source == "aster_v3_account_with_join_margin"
 
+    @pytest.mark.asyncio
+    async def test_hyperliquid_account_balance_uses_clearinghouse_withdrawable(self):
+        credential = LiveCredential(
+            wallet_private_key="0x" + "1" * 64,
+            account_address="0x" + "2" * 40,
+        )
+        transport = VenueTransport(
+            spec=hyperliquid_spec(),
+            mode="live",
+            credential=credential,
+        )
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            assert method == "POST"
+            assert path == "/info"
+            assert body == {
+                "type": "clearinghouseState",
+                "user": transport._credential.account_address,
+            }
+            assert private is True
+            return {
+                "marginSummary": {
+                    "accountValue": "29.78001",
+                    "totalMarginUsed": "3.25",
+                },
+                "crossMarginSummary": {
+                    "accountValue": "29.78001",
+                    "totalMarginUsed": "3.25",
+                },
+                "withdrawable": "24.5",
+                "time": 1778787002000,
+                "assetPositions": [],
+            }
+
+        transport._request = mock_request
+
+        snapshot = await transport.fetch_account_balance_snapshot()
+
+        assert snapshot is not None
+        assert snapshot.venue == Venue.HYPERLIQUID
+        assert snapshot.asset == "USDC"
+        assert snapshot.free == pytest.approx(24.5)
+        assert snapshot.locked == pytest.approx(29.78001 - 24.5)
+        assert snapshot.observed_at_ms > 0
+
     def test_binance_post_signature_matches_signed_payload(self):
         """The signature must be HMAC-SHA256 of the URL-encoded query params (V1 order, with recvWindow)."""
         spec = binance_spec()

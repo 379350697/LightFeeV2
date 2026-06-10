@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountBalanceSnapshot,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -78,6 +79,9 @@ class HyperliquidAdapter(VenueAdapter):
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         return await self._transport.fetch_position(symbol)
+
+    async def fetch_account_balance_snapshot(self) -> Optional[AccountBalanceSnapshot]:
+        return await self._transport.fetch_account_balance_snapshot()
 
     async def fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         """Fetch Hyperliquid open orders for the configured account."""

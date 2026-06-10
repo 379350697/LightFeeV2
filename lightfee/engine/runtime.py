@@ -14,6 +14,7 @@ from typing import Any, Optional
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountBalanceSnapshot,
     OrderFill,
     OrderRequest,
     PassiveOrderState,
@@ -185,6 +186,7 @@ class LiveRuntime:
         # V1 per-venue risk snapshot runtime cache
         #   key: venue → {fetched_at_ms, result: OK(Optional[ARS]) | Err(str)}
         self._risk_snapshot_cache: dict[Venue, dict] = {}
+        self._entry_balance_snapshot_cache: dict[Venue, dict] = {}
 
         # V1 maker-event lane state
         #   Tracks pending passive maker entries with last known price for repricing.
@@ -293,6 +295,9 @@ class LiveRuntime:
     _HYPERLIQUID_ERROR_DOC_URL = (
         "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
     )
+    _HYPERLIQUID_INFO_DOC_URL = (
+        "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint"
+    )
     _ASTER_API_DOC_URL = "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation"
     _ASTER_OPENABLE_NOTIONAL_DOC_URL = (
         "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
@@ -395,6 +400,18 @@ class LiveRuntime:
                 "official_doc_url": LiveRuntime._BINANCE_USDM_ERROR_DOC_URL,
                 "evidence_gap": False,
             }
+        if reason == "insufficient_margin_admission_prefiltered":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._HYPERLIQUID_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason == "hyperliquid_account_balance_unavailable":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._HYPERLIQUID_INFO_DOC_URL,
+                "evidence_gap": True,
+            }
         if reason == "leverage_admission_blocked":
             return {
                 "reason": reason,
@@ -414,9 +431,414 @@ class LiveRuntime:
         keys = [f"{venue.value}:{symbol}"]
         if venue == Venue.ASTER and reason == "max_notional_admission_blocked":
             keys.append(f"{venue.value}:*")
-        if venue == Venue.HYPERLIQUID and reason == "insufficient_margin_admission_blocked":
+        if venue == Venue.HYPERLIQUID and reason in {
+            "insufficient_margin_admission_blocked",
+            "insufficient_margin_admission_prefiltered",
+        }:
+            if symbol == "*":
+                return [f"{venue.value}:*"]
             keys.append(f"{venue.value}:*")
         return keys
+
+    @staticmethod
+    def _candidate_uses_venue(candidate: Any, venue: Venue) -> bool:
+        target = venue.value
+        return (
+            str(getattr(candidate, "long_venue", "") or "").lower() == target
+            or str(getattr(candidate, "short_venue", "") or "").lower() == target
+        )
+
+    def _entry_admission_margin_buffer_bps(self) -> float:
+        strategy = self.config.strategy
+        buffer_bps = 0.0
+        for attr in (
+            "execution_buffer_bps",
+            "capital_buffer_bps",
+            "entry_exit_reserve_bps",
+        ):
+            try:
+                buffer_bps += float(getattr(strategy, attr, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return max(buffer_bps, 0.0)
+
+    def _hyperliquid_entry_required_initial_margin_quote(
+        self,
+        entry_notional_quote: float,
+    ) -> float:
+        try:
+            leverage = float(
+                getattr(self.config.strategy, "live_target_leverage", 1.0) or 1.0
+            )
+        except (TypeError, ValueError):
+            leverage = 1.0
+        leverage = max(leverage, 1.0)
+        try:
+            notional = float(entry_notional_quote or 0.0)
+        except (TypeError, ValueError):
+            notional = 0.0
+        if not math.isfinite(notional) or notional <= 0.0:
+            return 0.0
+        buffer_multiplier = 1.0 + (self._entry_admission_margin_buffer_bps() / 10_000.0)
+        return max(notional / leverage, 0.0) * buffer_multiplier
+
+    def _cached_entry_balance_snapshot(self, venue: Venue, now_ms: int):
+        entry = self._entry_balance_snapshot_cache.get(venue)
+        if entry is None:
+            return None, False
+        fetched_at = int(entry.get("fetched_at_ms", 0) or 0)
+        ttl = self._RISK_SNAPSHOT_TTL_MS_DEFAULT
+        if ttl <= 0 or (now_ms - fetched_at) > ttl:
+            return None, False
+        return entry.get("result"), True
+
+    def _store_entry_balance_snapshot(self, venue: Venue, now_ms: int, result) -> None:
+        self._entry_balance_snapshot_cache[venue] = {
+            "fetched_at_ms": now_ms,
+            "result": result,
+        }
+
+    async def _fetch_hyperliquid_entry_balance_snapshot(
+        self,
+        now_ms: int,
+    ) -> tuple[AccountBalanceSnapshot | None, str | None]:
+        adapter = self.get_venue_adapter(Venue.HYPERLIQUID)
+        if adapter is None:
+            return None, "hyperliquid_adapter_unavailable"
+
+        cached_result, was_cached = self._cached_entry_balance_snapshot(
+            Venue.HYPERLIQUID,
+            now_ms,
+        )
+        if was_cached:
+            ok, value = cached_result
+            if ok:
+                return value, None
+            return None, str(value or "hyperliquid_account_balance_unavailable")
+
+        try:
+            snapshot = await adapter.fetch_account_balance_snapshot()
+            self._store_entry_balance_snapshot(
+                Venue.HYPERLIQUID,
+                now_ms,
+                (True, snapshot),
+            )
+            if snapshot is None:
+                return None, "hyperliquid_account_balance_unavailable"
+            return snapshot, None
+        except Exception as e:
+            error = str(e) or e.__class__.__name__
+            self._store_entry_balance_snapshot(
+                Venue.HYPERLIQUID,
+                now_ms,
+                (False, error),
+            )
+            return None, error
+
+    def _hyperliquid_balance_block_sample(
+        self,
+        *,
+        candidate: Any | None,
+        reason: str,
+        now_ms: int,
+        stage: str,
+        source: str,
+        available_balance_quote: float | None,
+        required_initial_margin_quote: float,
+        entry_notional_quote: float,
+        raw_error: str = "",
+    ) -> dict:
+        evidence = self._entry_admission_evidence(reason)
+        try:
+            live_target_leverage = float(
+                getattr(self.config.strategy, "live_target_leverage", 1.0) or 1.0
+            )
+        except (TypeError, ValueError):
+            live_target_leverage = 1.0
+        candidate_pair_id = (
+            self._candidate_pair_id(candidate)
+            if candidate is not None
+            else "hyperliquid:*"
+        )
+        symbol = "*"
+        long_venue = ""
+        short_venue = ""
+        if candidate is not None:
+            symbol = str(getattr(candidate, "symbol", "*") or "*")
+            long_venue = str(getattr(candidate, "long_venue", "") or "")
+            short_venue = str(getattr(candidate, "short_venue", "") or "")
+        payload = {
+            "candidate_pair_id": candidate_pair_id,
+            "pair_id": candidate_pair_id,
+            "symbol": symbol,
+            "long_venue": long_venue,
+            "short_venue": short_venue,
+            "venue": Venue.HYPERLIQUID.value,
+            "reason": reason,
+            "block_scope": "venue",
+            "source": source,
+            "official_doc_url": str(evidence.get("official_doc_url") or ""),
+            "evidence_gap": bool(evidence.get("evidence_gap", True)),
+            "stage": stage,
+            "available_balance_quote": available_balance_quote,
+            "required_initial_margin_quote": required_initial_margin_quote,
+            "entry_notional_quote": entry_notional_quote,
+            "live_target_leverage": live_target_leverage,
+            "margin_buffer_bps": self._entry_admission_margin_buffer_bps(),
+            "ts_ms": now_ms,
+        }
+        if raw_error:
+            payload["raw_error"] = raw_error[:500]
+        return payload
+
+    def _append_hyperliquid_balance_unavailable_event(
+        self,
+        *,
+        now_ms: int,
+        stage: str,
+        source: str,
+        raw_error: str,
+        candidate_count: int,
+        blocked_count: int,
+        allowed_count: int,
+        samples: list[dict],
+    ) -> None:
+        reason = "hyperliquid_account_balance_unavailable"
+        evidence = self._entry_admission_evidence(reason)
+        self._append_runtime_diagnostic_event(
+            "runtime.entry_admission_venue_degraded",
+            {
+                "venue": Venue.HYPERLIQUID.value,
+                "reason": reason,
+                "block_scope": "venue",
+                "source": source,
+                "official_doc_url": evidence["official_doc_url"],
+                "evidence_gap": True,
+                "stage": stage,
+                "candidate_count": candidate_count,
+                "blocked_count": blocked_count,
+                "allowed_count": allowed_count,
+                "blocked_reason_counts": {reason: blocked_count},
+                "samples": samples[:10],
+                "suppressed_count": max(blocked_count - len(samples), 0),
+                "raw_error": raw_error[:500],
+                "ts_ms": now_ms,
+            },
+            now_ms=now_ms,
+            key_parts=(stage, Venue.HYPERLIQUID.value, reason, source),
+            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+        )
+
+    async def _refresh_hyperliquid_entry_balance_admission(self, now_ms: int) -> bool:
+        adapter = self.get_venue_adapter(Venue.HYPERLIQUID)
+        if adapter is None:
+            return True
+
+        try:
+            entry_notional = float(
+                getattr(
+                    self.config.strategy,
+                    "fixed_live_entry_notional_quote",
+                    0.0,
+                ) or 0.0
+            )
+        except (TypeError, ValueError):
+            entry_notional = 0.0
+        required_margin = self._hyperliquid_entry_required_initial_margin_quote(
+            entry_notional
+        )
+        snapshot, error = await self._fetch_hyperliquid_entry_balance_snapshot(now_ms)
+        if snapshot is None:
+            reason = "hyperliquid_account_balance_unavailable"
+            sample = self._hyperliquid_balance_block_sample(
+                candidate=None,
+                reason=reason,
+                now_ms=now_ms,
+                stage="scan_start",
+                source="scan_start_balance_prefilter",
+                available_balance_quote=None,
+                required_initial_margin_quote=required_margin,
+                entry_notional_quote=entry_notional,
+                raw_error=error or reason,
+            )
+            self._append_hyperliquid_balance_unavailable_event(
+                now_ms=now_ms,
+                stage="scan_start",
+                source="scan_start_balance_prefilter",
+                raw_error=error or reason,
+                candidate_count=1,
+                blocked_count=1,
+                allowed_count=0,
+                samples=[sample],
+            )
+            return False
+
+        available = max(float(snapshot.free or 0.0), 0.0)
+        if available + 1e-9 >= required_margin:
+            return True
+
+        reason = "insufficient_margin_admission_prefiltered"
+        evidence = self._entry_admission_evidence(reason)
+        extra = self._hyperliquid_balance_block_sample(
+            candidate=None,
+            reason=reason,
+            now_ms=now_ms,
+            stage="scan_start",
+            source="scan_start_balance_prefilter",
+            available_balance_quote=available,
+            required_initial_margin_quote=required_margin,
+            entry_notional_quote=entry_notional,
+        )
+        self._record_symbol_admission_block(
+            venue=Venue.HYPERLIQUID,
+            symbol="*",
+            reason=reason,
+            raw_error="hyperliquid available balance below entry initial margin",
+            now_ms=now_ms,
+            evidence=evidence,
+            source="scan_start_balance_prefilter",
+            candidate_pair_id="hyperliquid:*",
+            extra_payload=extra,
+        )
+        return False
+
+    async def _filter_candidates_by_entry_balance_admission(
+        self,
+        candidates: list,
+        *,
+        now_ms: int,
+        stage: str,
+    ) -> list:
+        if not candidates:
+            return []
+        if not any(
+            self._candidate_uses_venue(candidate, Venue.HYPERLIQUID)
+            for candidate in candidates
+        ):
+            return candidates
+        if self.get_venue_adapter(Venue.HYPERLIQUID) is None:
+            return candidates
+
+        snapshot, error = await self._fetch_hyperliquid_entry_balance_snapshot(now_ms)
+        allowed: list = []
+        blocked_samples: list[dict] = []
+        blocked_reason_counts: Counter[str] = Counter()
+        source = "candidate_balance_prefilter"
+
+        if snapshot is None:
+            reason = "hyperliquid_account_balance_unavailable"
+            for candidate in candidates:
+                if not self._candidate_uses_venue(candidate, Venue.HYPERLIQUID):
+                    allowed.append(candidate)
+                    continue
+                try:
+                    entry_notional = float(
+                        getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    entry_notional = 0.0
+                required_margin = self._hyperliquid_entry_required_initial_margin_quote(
+                    entry_notional
+                )
+                blocked_reason_counts[reason] += 1
+                if len(blocked_samples) < 24:
+                    blocked_samples.append(
+                        self._hyperliquid_balance_block_sample(
+                            candidate=candidate,
+                            reason=reason,
+                            now_ms=now_ms,
+                            stage=stage,
+                            source=source,
+                            available_balance_quote=None,
+                            required_initial_margin_quote=required_margin,
+                            entry_notional_quote=entry_notional,
+                            raw_error=error or reason,
+                        )
+                    )
+            self._last_entry_admission_filter_blockers.update(blocked_reason_counts)
+            self._last_entry_admission_filter_samples.extend(blocked_samples)
+            self._append_hyperliquid_balance_unavailable_event(
+                now_ms=now_ms,
+                stage=stage,
+                source=source,
+                raw_error=error or reason,
+                candidate_count=len(candidates),
+                blocked_count=sum(blocked_reason_counts.values()),
+                allowed_count=len(allowed),
+                samples=blocked_samples,
+            )
+            return allowed
+
+        available = max(float(snapshot.free or 0.0), 0.0)
+        for candidate in candidates:
+            if not self._candidate_uses_venue(candidate, Venue.HYPERLIQUID):
+                allowed.append(candidate)
+                continue
+            try:
+                entry_notional = float(
+                    getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                entry_notional = 0.0
+            required_margin = self._hyperliquid_entry_required_initial_margin_quote(
+                entry_notional
+            )
+            if available + 1e-9 >= required_margin:
+                allowed.append(candidate)
+                continue
+
+            reason = "insufficient_margin_admission_prefiltered"
+            blocked_reason_counts[reason] += 1
+            if len(blocked_samples) < 24:
+                blocked_samples.append(
+                    self._hyperliquid_balance_block_sample(
+                        candidate=candidate,
+                        reason=reason,
+                        now_ms=now_ms,
+                        stage=stage,
+                        source=source,
+                        available_balance_quote=available,
+                        required_initial_margin_quote=required_margin,
+                        entry_notional_quote=entry_notional,
+                    )
+                )
+
+        blocked_count = sum(blocked_reason_counts.values())
+        if blocked_count <= 0:
+            return allowed
+
+        self._last_entry_admission_filter_blockers.update(blocked_reason_counts)
+        self._last_entry_admission_filter_samples.extend(blocked_samples)
+        sorted_reasons = sorted(blocked_reason_counts)
+        reason = (
+            sorted_reasons[0]
+            if len(sorted_reasons) == 1
+            else "multiple_entry_balance_admission_blocks"
+        )
+        evidence = self._entry_admission_evidence(reason)
+        self._append_runtime_diagnostic_event(
+            "runtime.entry_admission_venue_degraded",
+            {
+                "venue": Venue.HYPERLIQUID.value,
+                "reason": reason,
+                "block_scope": "venue",
+                "source": source,
+                "official_doc_url": evidence.get("official_doc_url", ""),
+                "evidence_gap": bool(evidence.get("evidence_gap", True)),
+                "stage": stage,
+                "candidate_count": len(candidates),
+                "blocked_count": blocked_count,
+                "allowed_count": len(allowed),
+                "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
+                "samples": blocked_samples[:10],
+                "suppressed_count": max(blocked_count - len(blocked_samples), 0),
+                "ts_ms": now_ms,
+            },
+            now_ms=now_ms,
+            key_parts=(stage, Venue.HYPERLIQUID.value, reason, source),
+            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+        )
+        return allowed
 
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
         symbol = str(getattr(candidate, "symbol", "") or "")
@@ -607,10 +1029,12 @@ class LiveRuntime:
         evidence: dict | None = None,
         source: str = "initial_entry",
         candidate_pair_id: str = "",
+        extra_payload: dict | None = None,
     ) -> None:
         until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         key = (venue.value, symbol)
         evidence = dict(evidence or self._entry_admission_evidence(reason))
+        extra_payload = dict(extra_payload or {})
         self._symbol_admission_blocked_until_ms[key] = until_ms
         base_payload = {
             "venue": venue.value,
@@ -626,6 +1050,7 @@ class LiveRuntime:
         if candidate_pair_id:
             base_payload["candidate_pair_id"] = candidate_pair_id
             base_payload["pair_id"] = candidate_pair_id
+        base_payload.update(extra_payload)
         for state_key in self._entry_admission_block_state_keys(venue, symbol, reason):
             payload = dict(base_payload)
             if state_key.endswith(":*"):
@@ -666,6 +1091,7 @@ class LiveRuntime:
                     "symbol": symbol,
                     "candidate_pair_id": candidate_pair_id,
                     "pair_id": candidate_pair_id,
+                    **extra_payload,
                     "ts_ms": now_ms,
                 },
             )
@@ -5261,6 +5687,7 @@ class LiveRuntime:
             return
 
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
+            await self._refresh_hyperliquid_entry_balance_admission(now_ms)
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
             )
@@ -5268,6 +5695,11 @@ class LiveRuntime:
                 tradeable,
             )
             tradeable = self._filter_candidates_by_entry_admission(
+                tradeable,
+                now_ms=now_ms,
+                stage="shortlist",
+            )
+            tradeable = await self._filter_candidates_by_entry_balance_admission(
                 tradeable,
                 now_ms=now_ms,
                 stage="shortlist",
@@ -16276,7 +16708,11 @@ class LiveRuntime:
         admission_blockers = {
             key for key in blockers
             if key.endswith("_admission_blocked")
-            or key in {"bybit_trading_terms_required"}
+            or key in {
+                "bybit_trading_terms_required",
+                "insufficient_margin_admission_prefiltered",
+                "hyperliquid_account_balance_unavailable",
+            }
         }
         if admission_blockers and blockers <= admission_blockers:
             return "tradeable_candidates_blocked_by_entry_admission"
@@ -16456,7 +16892,11 @@ class LiveRuntime:
             int(v) for k, v in admission_counts.items()
             if (
                 str(k).endswith("_admission_blocked")
-                or str(k) in {"bybit_trading_terms_required"}
+                or str(k) in {
+                    "bybit_trading_terms_required",
+                    "insufficient_margin_admission_prefiltered",
+                    "hyperliquid_account_balance_unavailable",
+                }
             )
         )
         primary_tracked_not_ready = sum(
@@ -16492,7 +16932,11 @@ class LiveRuntime:
                 int(v) > 0
                 and (
                     str(k).endswith("_admission_blocked")
-                    or str(k) in {"bybit_trading_terms_required"}
+                    or str(k) in {
+                        "bybit_trading_terms_required",
+                        "insufficient_margin_admission_prefiltered",
+                        "hyperliquid_account_balance_unavailable",
+                    }
                 )
             )
         }
