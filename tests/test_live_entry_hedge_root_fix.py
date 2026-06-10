@@ -26,6 +26,7 @@ from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.reconciliation import PositionReconciliationResult
 from lightfee.engine.state import (
     HedgeInflight,
+    OpenPosition,
     PendingEntry,
     PendingEntryPassivePhaseState,
     PendingEntryRemainderSlice,
@@ -2151,6 +2152,64 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         assert pending.phase_state.small_fill_min_notional_attempts == 0
 
     @pytest.mark.asyncio
+    async def test_live_drive_missing_hedge_submits_full_missing_quantity_when_exchange_accepts_it(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_hedge_deadline_ms=2_500,
+            maker_hedge_soft_deadline_ms=800,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.min_notional_quote = 230.0
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="HOMEUSDT",
+            side=Side.SELL,
+            quantity=700.0,
+            price=1.0,
+            order_id="hedge-home-700",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-home-full-missing",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            target_quantity=700.0,
+            maker_leg="long",
+            maker_leg_filled=700.0,
+            hedge_leg_filled=0.0,
+            maker_price=1.0,
+            maker_fill_price=1.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=700.0,
+                    notional_quote=700.0,
+                    fill_at_ms=1_100,
+                ),
+            ],
+        )
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            2_000,
+        )
+
+        assert driven is True
+        assert hedge_adapter.normalize_quantity_calls[0][1] == pytest.approx(700.0)
+        assert len(hedge_adapter._place_order_calls) == 1
+        assert hedge_adapter._place_order_calls[0].quantity == pytest.approx(700.0)
+        assert pending.missing_hedge_quantity() == pytest.approx(0.0)
+        assert not [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "pending_entry.hedge_quantity_undercut"
+        ]
+
+    @pytest.mark.asyncio
     async def test_startup_recovery_and_normal_tick_share_small_fill_decision(
         self,
         tmp_path,
@@ -2194,6 +2253,63 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         assert [event["payload"]["entry_id"] for event in events] == [
             "entry-normal-small-fill",
             "entry-recovery-small-fill",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_recovery_drive_missing_hedge_submits_full_missing_quantity_when_exchange_accepts_it(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_hedge_deadline_ms=2_500,
+            maker_hedge_soft_deadline_ms=800,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.min_notional_quote = 230.0
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="HOMEUSDT",
+            side=Side.SELL,
+            quantity=700.0,
+            price=1.0,
+            order_id="recovery-hedge-home-700",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-home-recovery-full-missing",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            target_quantity=700.0,
+            maker_leg="long",
+            maker_leg_filled=700.0,
+            hedge_leg_filled=0.0,
+            maker_price=1.0,
+            maker_fill_price=1.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=700.0,
+                    notional_quote=700.0,
+                    fill_at_ms=1_100,
+                ),
+            ],
+        )
+
+        driven = await runtime._recover_drive_missing_hedge(
+            pending,
+            "startup_recovery",
+        )
+
+        assert driven is True
+        assert hedge_adapter.normalize_quantity_calls[0][1] == pytest.approx(700.0)
+        assert len(hedge_adapter._place_order_calls) == 1
+        assert hedge_adapter._place_order_calls[0].quantity == pytest.approx(700.0)
+        assert pending.missing_hedge_quantity() == pytest.approx(0.0)
+        assert not [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "pending_entry.hedge_quantity_undercut"
         ]
 
     @pytest.mark.asyncio
@@ -6991,6 +7107,176 @@ class TestResidualRepairExecutionV1Parity:
         assert terminal
         assert terminal[-1]["payload"]["terminal_reason"] == "exchange_min_quantity_dust"
         assert terminal[-1]["payload"]["repair_quantity"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_entry_open_unrepairable_contract_dust_is_marked_tolerated(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-home-dust"] = OpenPosition(
+            position_id="entry-home-dust",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=690.0,
+            short_quantity=690.0,
+            long_entry_price=0.033,
+            short_entry_price=0.033,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=690.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-home-dust",
+            "pair_id": "home:okx->bybit",
+            "symbol": "HOMEUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 10.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 0.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=700.0,
+            entry_price=0.033,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        events = runtime.journal.read_all()
+        tolerated = [
+            event for event in events
+            if event["kind"] == "execution.entry_residual_dust_tolerated"
+        ]
+        assert tolerated
+        payload = tolerated[-1]["payload"]
+        assert payload["position_id"] == "entry-home-dust"
+        assert payload["repair_quantity"] == pytest.approx(10.0)
+        assert payload["matched_quantity"] == pytest.approx(690.0)
+        assert payload["residual_ratio"] < 0.05
+
+    @pytest.mark.asyncio
+    async def test_entry_open_contract_dust_over_five_percent_is_not_marked_tolerated(
+        self, tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-home-dust-large"] = OpenPosition(
+            position_id="entry-home-dust-large",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=690.0,
+            short_quantity=690.0,
+            long_entry_price=0.033,
+            short_entry_price=0.033,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=690.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-home-dust-large",
+            "pair_id": "home:okx->bybit",
+            "symbol": "HOMEUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 40.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 0.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=730.0,
+            entry_price=0.033,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        tolerated = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.entry_residual_dust_tolerated"
+        ]
+        assert tolerated == []
+
+    @pytest.mark.asyncio
+    async def test_entry_open_repairable_residual_is_not_marked_tolerated(
+        self, tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-home-repairable"] = OpenPosition(
+            position_id="entry-home-repairable",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=690.0,
+            short_quantity=690.0,
+            long_entry_price=0.033,
+            short_entry_price=0.033,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=690.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-home-repairable",
+            "pair_id": "home:okx->bybit",
+            "symbol": "HOMEUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 10.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+            "next_attempt_ms": now_ms,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 10.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=700.0,
+            entry_price=1.0,
+            observed_at_ms=now_ms,
+        )
+        okx.place_order_fill = OrderFill(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.SELL,
+            quantity=10.0,
+            price=1.0,
+            order_id="repair-fill",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert okx._place_order_calls
+        tolerated = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.entry_residual_dust_tolerated"
+        ]
+        assert tolerated == []
 
     @pytest.mark.asyncio
     async def test_okx_residual_contract_dust_uses_transport_symbol_rules_cache(

@@ -522,6 +522,12 @@ def test_run_diagnose_fingerprints_stale_lifecycle_release_after_core_clean(monk
         assert gate["recovery_decision"]["kind"] == "RUNNING_CLEAN"
         assert "lifecycle_release_not_applied" in gate["fingerprints"]
         assert "lifecycle_release_not_applied" in result["health"]["fingerprints"]
+        assert (
+            result["entry_quantity_terminal_summary"][
+                "lifecycle_release_not_applied_count"
+            ]
+            == 1
+        )
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -2494,6 +2500,53 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
                     "reason": "startup_clean_stale_fail_closed_cleared",
                 },
             },
+            {
+                "ts_ms": 1781096100400,
+                "kind": "execution.entry_residual_dust_tolerated",
+                "payload": {
+                    "position_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "repair_quantity": 10.0,
+                    "matched_quantity": 690.0,
+                    "residual_ratio": 0.01449,
+                },
+            },
+            {
+                "ts_ms": 1781096100500,
+                "kind": "pending_entry.hedge_quantity_undercut",
+                "payload": {
+                    "entry_id": "entry-undercut",
+                    "symbol": "HOMEUSDT",
+                    "missing_hedge_quantity": 700.0,
+                    "normalized_quantity": 690.0,
+                },
+            },
+            {
+                "ts_ms": 1781096100600,
+                "kind": "execution.entry_quantity_plan",
+                "payload": {
+                    "entry_id": "entry-legit-split",
+                    "symbol": "BTCUSDT",
+                    "common_quantity": 1.0,
+                    "full_target_quantity": 1.0,
+                    "initial_maker_target_quantity": 0.5,
+                    "route": "passive_incremental",
+                    "okx_base_quantity_step": 0.0,
+                },
+            },
+            {
+                "ts_ms": 1781096100700,
+                "kind": "execution.entry_quantity_plan",
+                "payload": {
+                    "entry_id": "entry-mismatch",
+                    "symbol": "HOMEUSDT",
+                    "common_quantity": 700.0,
+                    "full_target_quantity": 690.0,
+                    "initial_maker_target_quantity": 690.0,
+                    "route": "passive_incremental",
+                    "okx_base_quantity_step": 100.0,
+                },
+            },
         ])
 
         monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
@@ -2519,6 +2572,11 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
         assert summary["single_leg_fast_flatten_count"] == 1
         assert summary["passive_owned_drift_blocked_count"] == 1
         assert summary["stale_fail_closed_after_flat_count"] == 1
+        entry_summary = result["entry_quantity_terminal_summary"]
+        assert entry_summary["entry_residual_dust_tolerated_count"] == 1
+        assert entry_summary["hedge_quantity_undercut_count"] == 1
+        assert entry_summary["common_quantity_mismatch_count"] == 1
+        assert entry_summary["common_quantity_mismatch_entry_ids"] == ["entry-mismatch"]
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

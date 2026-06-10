@@ -2950,6 +2950,10 @@ def run_diagnose(
         event_counts[kind] = event_counts.get(kind, 0) + 1
     quick_flat_summary = summarize_quick_flat_events(all_events)
     passive_close_terminal_summary = _build_passive_close_terminal_summary(all_events)
+    entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
+        all_events,
+        production_acceptance_gate,
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2980,12 +2984,71 @@ def run_diagnose(
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
+        "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,
         "runtime_warnings": runtime_warnings,
         "production_acceptance_gate": production_acceptance_gate,
         "evidence_quality": evidence_completeness,
         "conclusion": conclusion,
+    }
+
+
+def _build_entry_quantity_terminal_summary(
+    events: list[dict[str, Any]],
+    production_acceptance_gate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry_residual_dust_tolerated_count = 0
+    hedge_quantity_undercut_count = 0
+    common_quantity_mismatch_count = 0
+    dust_tolerated_positions: set[str] = set()
+    hedge_undercut_entries: set[str] = set()
+    quantity_mismatch_entries: set[str] = set()
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if kind == "execution.entry_residual_dust_tolerated":
+            entry_residual_dust_tolerated_count += 1
+            position_id = str(payload.get("position_id") or payload.get("entry_id") or "")
+            if position_id:
+                dust_tolerated_positions.add(position_id)
+        elif kind == "pending_entry.hedge_quantity_undercut":
+            hedge_quantity_undercut_count += 1
+            entry_id = str(payload.get("entry_id") or payload.get("position_id") or "")
+            if entry_id:
+                hedge_undercut_entries.add(entry_id)
+        elif kind == "execution.entry_quantity_plan":
+            try:
+                common_quantity = float(payload.get("common_quantity", 0.0) or 0.0)
+                full_target_quantity = float(
+                    payload.get("full_target_quantity", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                continue
+            if abs(common_quantity - full_target_quantity) > 1e-9:
+                common_quantity_mismatch_count += 1
+                entry_id = str(payload.get("entry_id") or "")
+                if entry_id:
+                    quantity_mismatch_entries.add(entry_id)
+
+    fingerprints = []
+    if production_acceptance_gate:
+        fingerprints = list(production_acceptance_gate.get("fingerprints", []) or [])
+    lifecycle_release_not_applied_count = (
+        1 if "lifecycle_release_not_applied" in fingerprints else 0
+    )
+
+    return {
+        "entry_residual_dust_tolerated_count": entry_residual_dust_tolerated_count,
+        "hedge_quantity_undercut_count": hedge_quantity_undercut_count,
+        "common_quantity_mismatch_count": common_quantity_mismatch_count,
+        "lifecycle_release_not_applied_count": lifecycle_release_not_applied_count,
+        "dust_tolerated_position_ids": sorted(dust_tolerated_positions),
+        "hedge_undercut_entry_ids": sorted(hedge_undercut_entries),
+        "common_quantity_mismatch_entry_ids": sorted(quantity_mismatch_entries),
     }
 
 

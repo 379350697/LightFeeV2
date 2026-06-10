@@ -60,6 +60,7 @@ class FakeVenueAdapter(VenueAdapter):
     default_position_side: Side = Side.BUY
     default_position_qty: float = 0.0
     okx_base_quantity_step: float = 0.0
+    passive_metadata_payload: Optional[dict] = None
     last_request: Optional[OrderRequest] = None
     place_order_call_count: int = 0
     fetch_position_call_count: int = 0
@@ -102,6 +103,15 @@ class FakeVenueAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol, quantity):
         return quantity
+
+    def passive_metadata(self, symbol: str) -> dict:
+        if self.passive_metadata_payload is not None:
+            return dict(self.passive_metadata_payload)
+        return {
+            "min_notional": self._min_notional_quote,
+            "min_quantity": 0.001,
+            "quantity_step": 0.001,
+        }
 
 
 def make_fake_fill(
@@ -1745,6 +1755,245 @@ class TestPlannerDispatchIntegration:
             if r["kind"] == "execution.entry_selected"
         ][-1]
         assert selected["payload"]["quantity"] == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_uses_single_common_quantity_plan_for_home_okx_bybit(
+        self, config, tmp_journal,
+    ):
+        config.strategy.maker_initial_slice_ratio = 1.0
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=720.5692497072687,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(700.0)
+        assert executor.ctx.short_quantity == pytest.approx(700.0)
+        records = runtime.journal.read_all()
+        selected = [
+            r for r in records
+            if r["kind"] == "execution.entry_selected"
+        ][-1]
+        assert selected["payload"]["quantity"] == pytest.approx(700.0)
+        quantity_plan = [
+            r for r in records
+            if r["kind"] == "execution.entry_quantity_plan"
+        ][-1]
+        payload = quantity_plan["payload"]
+        assert payload["symbol"] == "HOMEUSDT"
+        assert payload["raw_quantity"] == pytest.approx(720.5692497072687)
+        assert payload["common_quantity"] == pytest.approx(700.0)
+        assert payload["full_target_quantity"] == pytest.approx(700.0)
+        assert payload["initial_maker_target_quantity"] == pytest.approx(700.0)
+        assert payload["venue_quantity_steps"]["okx"] == pytest.approx(100.0)
+        assert payload["venue_quantity_steps"]["bybit"] == pytest.approx(0.001)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_skips_when_non_okx_quantity_metadata_missing(
+        self, config, tmp_journal,
+    ):
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT, passive_metadata_payload={})
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=720.5692497072687,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is False
+        assert executor.called is False
+        skipped = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "runtime.entry_skipped_quantity_metadata_missing"
+        ][-1]
+        assert skipped["payload"]["symbol"] == "HOMEUSDT"
+        assert skipped["payload"]["missing_venues"] == ["bybit"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_skips_when_non_okx_min_notional_metadata_missing(
+        self, config, tmp_journal,
+    ):
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        bybit = FakeVenueAdapter(
+            Venue.BYBIT,
+            passive_metadata_payload={"quantity_step": 0.001, "min_quantity": 0.001},
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=720.5692497072687,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is False
+        assert executor.called is False
+        skipped = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "runtime.entry_skipped_quantity_metadata_missing"
+        ][-1]
+        assert skipped["payload"]["symbol"] == "HOMEUSDT"
+        assert skipped["payload"]["missing_venues"] == ["bybit"]
+        assert skipped["payload"]["missing_fields"]["bybit"] == ["min_notional"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_skips_when_non_okx_min_quantity_metadata_zero(
+        self, config, tmp_journal,
+    ):
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        bybit = FakeVenueAdapter(
+            Venue.BYBIT,
+            passive_metadata_payload={
+                "quantity_step": 0.001,
+                "min_quantity": 0.0,
+                "min_notional": 5.0,
+            },
+        )
+        adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=720.5692497072687,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is False
+        assert executor.called is False
+        skipped = [
+            r for r in runtime.journal.read_all()
+            if r["kind"] == "runtime.entry_skipped_quantity_metadata_missing"
+        ][-1]
+        assert skipped["payload"]["symbol"] == "HOMEUSDT"
+        assert skipped["payload"]["missing_venues"] == ["bybit"]
+        assert skipped["payload"]["missing_fields"]["bybit"] == ["min_quantity"]
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_preserves_candidate_funding_semantics(self, config, tmp_journal):

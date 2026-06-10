@@ -238,11 +238,12 @@ class VenueAdapter(ABC):
     def passive_metadata(self, symbol: str) -> dict:
         """V1: metadata for passive orders on this venue.
 
-        Returns: {min_notional, price_tick, quantity_step, max_quantity}.
+        Returns: {min_notional, min_quantity, price_tick, quantity_step, max_quantity}.
         """
         spec = self._get_spec()
         return {
             "min_notional": spec.min_notional if spec else 5.0,
+            "min_quantity": spec.min_quantity if spec else 0.001,
             "price_tick": spec.price_tick if spec else 0.01,
             "quantity_step": spec.quantity_step if spec else 0.001,
             "max_quantity": 0.0,

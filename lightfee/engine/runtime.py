@@ -1551,6 +1551,92 @@ class LiveRuntime:
             return (leg_notional, min_notional)
         return None
 
+    async def _normalize_pending_entry_hedge_quantity(
+        self,
+        *,
+        pending,
+        hedge_venue: Venue,
+        adapter,
+        missing: float,
+        hedge_price: float,
+        hedgeability_plan: PendingEntryHedgeabilityPlan,
+    ) -> tuple[float, tuple[float, float] | None, dict]:
+        releasable = releasable_hedge_quantity(
+            missing,
+            hedgeability_plan.min_hedgeable_chunk,
+        )
+        full_normalized = missing
+        if hasattr(adapter, "normalize_quantity"):
+            full_normalized = await adapter.normalize_quantity(pending.symbol, missing)
+        full_normalized = float(full_normalized or 0.0)
+        full_min_notional_violation = self._pending_entry_min_notional_violation(
+            pending,
+            hedge_venue,
+            full_normalized,
+            hedge_price,
+        )
+        evidence = {
+            "missing_hedge_quantity": missing,
+            "releasable_quantity": releasable,
+            "full_missing_normalized_quantity": full_normalized,
+            "min_hedgeable_chunk": hedgeability_plan.min_hedgeable_chunk,
+            "hedgeability": dict(hedgeability_plan.diagnostics),
+        }
+        if (
+            full_normalized > 1e-9
+            and full_min_notional_violation is None
+            and full_normalized + 1e-9 >= missing
+        ):
+            evidence["quantity_source"] = "full_missing_exchange_normalized"
+            return full_normalized, None, evidence
+
+        normalized = releasable
+        if hasattr(adapter, "normalize_quantity"):
+            normalized = await adapter.normalize_quantity(pending.symbol, releasable)
+        normalized = float(normalized or 0.0)
+        min_notional_violation = self._pending_entry_min_notional_violation(
+            pending,
+            hedge_venue,
+            normalized,
+            hedge_price,
+        )
+        evidence["quantity_source"] = "releasable_chunk_normalized"
+        evidence["normalized_quantity"] = normalized
+        evidence["full_missing_min_notional_violation"] = (
+            {
+                "leg_notional_quote": full_min_notional_violation[0],
+                "venue_min_notional_quote": full_min_notional_violation[1],
+            }
+            if full_min_notional_violation is not None
+            else None
+        )
+        return normalized, min_notional_violation, evidence
+
+    def _append_pending_entry_hedge_quantity_undercut(
+        self,
+        *,
+        entry_id: str,
+        pending,
+        hedge_venue: Venue,
+        normalized_quantity: float,
+        quantity_evidence: dict,
+    ) -> None:
+        missing = float(quantity_evidence.get("missing_hedge_quantity", 0.0) or 0.0)
+        if normalized_quantity + 1e-9 >= missing:
+            return
+        self.journal.append(
+            "pending_entry.hedge_quantity_undercut",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "hedge_venue": hedge_venue.value,
+                "missing_hedge_quantity": missing,
+                "normalized_quantity": normalized_quantity,
+                "undercut_quantity": max(missing - normalized_quantity, 0.0),
+                **dict(quantity_evidence),
+            },
+        )
+
     def _append_pending_entry_hedge_decision_event(
         self,
         decision: PendingEntryHedgeDeltaDecision,
@@ -11392,32 +11478,28 @@ class LiveRuntime:
                 missing,
                 hedge_price,
             )
-            releasable = releasable_hedge_quantity(
-                missing,
-                hedgeability_plan.min_hedgeable_chunk,
-            )
-            early_decision = decide_pending_entry_hedge_delta_pre_submit(
-                pending,
-                strategy=self.config.strategy,
-                hedgeability_plan=hedgeability_plan,
-                normalized_quantity=None,
-                min_notional_violation=None,
-                now_ms=now_ms,
-                maker_progress_updated=False,
-            )
-            if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
-                self._append_pending_entry_hedge_decision_event(early_decision)
-                return False
-
-            # V1: normalize to exchange lot size after releasable chunk planning.
-            normalized = releasable
-            if hasattr(adapter, "normalize_quantity"):
-                normalized = await adapter.normalize_quantity(pending.symbol, releasable)
-            min_notional_violation = self._pending_entry_min_notional_violation(
-                pending,
-                hedge_venue,
-                normalized,
-                hedge_price,
+            if hedgeability_plan.aligned_target_quantity <= 1e-9:
+                early_decision = decide_pending_entry_hedge_delta_pre_submit(
+                    pending,
+                    strategy=self.config.strategy,
+                    hedgeability_plan=hedgeability_plan,
+                    normalized_quantity=None,
+                    min_notional_violation=None,
+                    now_ms=now_ms,
+                    maker_progress_updated=False,
+                )
+                if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
+                    self._append_pending_entry_hedge_decision_event(early_decision)
+                    return False
+            normalized, min_notional_violation, quantity_evidence = (
+                await self._normalize_pending_entry_hedge_quantity(
+                    pending=pending,
+                    hedge_venue=hedge_venue,
+                    adapter=adapter,
+                    missing=missing,
+                    hedge_price=hedge_price,
+                    hedgeability_plan=hedgeability_plan,
+                )
             )
             decision = decide_pending_entry_hedge_delta_pre_submit(
                 pending,
@@ -11444,6 +11526,13 @@ class LiveRuntime:
                 )
                 return False
             normalized = decision.normalized_quantity
+            self._append_pending_entry_hedge_quantity_undercut(
+                entry_id=pending.pending_id,
+                pending=pending,
+                hedge_venue=hedge_venue,
+                normalized_quantity=normalized,
+                quantity_evidence=quantity_evidence,
+            )
 
             if normalized <= 1e-9:
                 self.journal.append(
@@ -11612,31 +11701,29 @@ class LiveRuntime:
                 missing,
                 hedge_price,
             )
-            releasable = releasable_hedge_quantity(
-                missing,
-                hedgeability_plan.min_hedgeable_chunk,
-            )
-            early_decision = decide_pending_entry_hedge_delta_pre_submit(
-                pending,
-                strategy=self.config.strategy,
-                hedgeability_plan=hedgeability_plan,
-                normalized_quantity=None,
-                min_notional_violation=None,
-                now_ms=now_ms,
-                maker_progress_updated=True,
-            )
-            if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
-                self._append_pending_entry_hedge_decision_event(early_decision)
-                return False
+            if hedgeability_plan.aligned_target_quantity <= 1e-9:
+                early_decision = decide_pending_entry_hedge_delta_pre_submit(
+                    pending,
+                    strategy=self.config.strategy,
+                    hedgeability_plan=hedgeability_plan,
+                    normalized_quantity=None,
+                    min_notional_violation=None,
+                    now_ms=now_ms,
+                    maker_progress_updated=True,
+                )
+                if early_decision.kind in {"buffer_small_fill", "keep_pending"}:
+                    self._append_pending_entry_hedge_decision_event(early_decision)
+                    return False
 
-            normalized = releasable
-            if hasattr(adapter, "normalize_quantity"):
-                normalized = await adapter.normalize_quantity(pending.symbol, releasable)
-            min_notional_violation = self._pending_entry_min_notional_violation(
-                pending,
-                hedge_venue,
-                normalized,
-                hedge_price,
+            normalized, min_notional_violation, quantity_evidence = (
+                await self._normalize_pending_entry_hedge_quantity(
+                    pending=pending,
+                    hedge_venue=hedge_venue,
+                    adapter=adapter,
+                    missing=missing,
+                    hedge_price=hedge_price,
+                    hedgeability_plan=hedgeability_plan,
+                )
             )
             decision = decide_pending_entry_hedge_delta_pre_submit(
                 pending,
@@ -11663,6 +11750,13 @@ class LiveRuntime:
                 )
                 return False
             normalized = decision.normalized_quantity
+            self._append_pending_entry_hedge_quantity_undercut(
+                entry_id=entry_id,
+                pending=pending,
+                hedge_venue=hedge_venue,
+                normalized_quantity=normalized,
+                quantity_evidence=quantity_evidence,
+            )
 
             if normalized <= 1e-9:
                 self.journal.append(
@@ -14400,6 +14494,41 @@ class LiveRuntime:
                 "ts_ms": now_ms,
             },
         )
+        position_id = str(task.get("position_id", "") or "")
+        position = self.state.open_positions.get(position_id)
+        matched_quantity = float(
+            getattr(position, "matched_quantity", 0.0) or 0.0
+        ) if position is not None else 0.0
+        residual_ratio = (
+            abs(float(repair_quantity or 0.0)) / matched_quantity
+            if matched_quantity > 1e-9
+            else 0.0
+        )
+        if (
+            str(task.get("origin", "") or "") == "entry_open"
+            and terminal_reason in {
+                "exchange_min_quantity_dust",
+                "exchange_min_notional_dust",
+            }
+            and matched_quantity > 1e-9
+            and residual_ratio <= 0.05 + 1e-12
+        ):
+            self.journal.append(
+                "execution.entry_residual_dust_tolerated",
+                {
+                    "position_id": position_id,
+                    "pair_id": pair_id,
+                    "symbol": symbol,
+                    "repair_venue": repair_venue.value,
+                    "repair_side": repair_side.value,
+                    "repair_quantity": repair_quantity,
+                    "matched_quantity": matched_quantity,
+                    "residual_ratio": residual_ratio,
+                    "terminal_reason": terminal_reason,
+                    "reason": "unrepairable_entry_residual_dust_within_tolerance",
+                    "ts_ms": now_ms,
+                },
+            )
 
     def _reschedule_pending_residual_repair_task(
         self, task: dict, now_ms: int, error: str
@@ -17796,6 +17925,78 @@ class LiveRuntime:
             return 0.0, step
         return aligned, step
 
+    async def _entry_venue_quantity_step(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> float | None:
+        quantity_step, missing_fields = await self._entry_venue_quantity_metadata(
+            venue,
+            symbol,
+        )
+        if missing_fields:
+            return None
+        return quantity_step
+
+    async def _entry_venue_quantity_metadata(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[float | None, list[str]]:
+        okx_step = await self._okx_entry_base_quantity_step(venue, symbol)
+        if okx_step is None:
+            return None, ["okx_contract_step"]
+        if okx_step > 0:
+            return okx_step, []
+
+        adapter = self.get_venue_adapter(venue)
+        passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
+        if callable(passive_metadata):
+            try:
+                metadata = passive_metadata(symbol) or {}
+                if not metadata:
+                    return None, ["metadata"]
+                quantity_step = self._safe_positive_float(
+                    metadata.get("quantity_step")
+                    or metadata.get("step_size")
+                    or metadata.get("qtyStep")
+                )
+                missing_fields: list[str] = []
+                if quantity_step > 0:
+                    for field_name, aliases in {
+                        "min_quantity": ("min_quantity", "min_qty", "minOrderQty"),
+                        "min_notional": (
+                            "min_notional",
+                            "min_notional_quote",
+                            "minNotionalValue",
+                        ),
+                    }.items():
+                        values = [
+                            metadata.get(alias)
+                            for alias in aliases
+                            if alias in metadata
+                        ]
+                        if not values:
+                            missing_fields.append(field_name)
+                            continue
+                        if field_name == "min_quantity":
+                            min_quantity = self._safe_positive_float(values[0])
+                            if min_quantity <= 0:
+                                missing_fields.append(field_name)
+                        else:
+                            try:
+                                min_notional = float(values[0] or 0.0)
+                            except (TypeError, ValueError):
+                                min_notional = -1.0
+                            if not math.isfinite(min_notional) or min_notional < 0:
+                                missing_fields.append(field_name)
+                    return quantity_step, missing_fields
+                missing_fields.append("quantity_step")
+                return None, missing_fields
+            except Exception:
+                return None, ["metadata"]
+        return None, ["metadata"]
+
     def _entry_quote_lease_execution_check(
         self,
         candidate,
@@ -18165,7 +18366,8 @@ class LiveRuntime:
         # Resolve venue enums from candidate string fields
         long_venue = Venue.from_str(candidate.long_venue)
         short_venue = Venue.from_str(candidate.short_venue)
-        quantity = candidate.entry_notional_quote / price_hint
+        raw_quantity = candidate.entry_notional_quote / price_hint
+        quantity = raw_quantity
         quantity, okx_base_step = await self._okx_aligned_entry_quantity(
             long_venue=long_venue,
             short_venue=short_venue,
@@ -18180,7 +18382,7 @@ class LiveRuntime:
                     "symbol": candidate.symbol,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "raw_quantity": candidate.entry_notional_quote / price_hint,
+                    "raw_quantity": raw_quantity,
                     "reason": "okx_ct_val_lot_sz_unconfirmed",
                     "ts_ms": now_ms,
                 },
@@ -18194,8 +18396,56 @@ class LiveRuntime:
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
                     "okx_base_quantity_step": okx_base_step,
-                    "raw_quantity": candidate.entry_notional_quote / price_hint,
+                    "raw_quantity": raw_quantity,
                     "reason": "quantity_below_okx_contract_step",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
+        long_quantity_step, long_missing_quantity_fields = await self._entry_venue_quantity_metadata(
+            long_venue,
+            candidate.symbol,
+        )
+        short_quantity_step, short_missing_quantity_fields = await self._entry_venue_quantity_metadata(
+            short_venue,
+            candidate.symbol,
+        )
+        if (
+            long_quantity_step is None
+            or short_quantity_step is None
+            or long_missing_quantity_fields
+            or short_missing_quantity_fields
+        ):
+            missing_venues = []
+            missing_fields = {}
+            if long_quantity_step is None:
+                missing_venues.append(long_venue.value)
+            elif long_missing_quantity_fields:
+                missing_venues.append(long_venue.value)
+            if short_quantity_step is None:
+                missing_venues.append(short_venue.value)
+            elif short_missing_quantity_fields:
+                missing_venues.append(short_venue.value)
+            if long_quantity_step is None or long_missing_quantity_fields:
+                missing_fields[long_venue.value] = (
+                    long_missing_quantity_fields or ["quantity_step"]
+                )
+            if short_quantity_step is None or short_missing_quantity_fields:
+                missing_fields[short_venue.value] = (
+                    short_missing_quantity_fields or ["quantity_step"]
+                )
+            self.journal.append(
+                "runtime.entry_skipped_quantity_metadata_missing",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "missing_venues": missing_venues,
+                    "missing_fields": missing_fields,
+                    "raw_quantity": raw_quantity,
+                    "common_quantity": quantity,
+                    "reason": "quantity_metadata_missing",
                     "ts_ms": now_ms,
                 },
             )
@@ -18426,6 +18676,14 @@ class LiveRuntime:
             )
             return False
 
+        if (
+            okx_base_step is not None
+            and okx_base_step > 0
+            and route == ExecutionRoute.PASSIVE_INCREMENTAL
+            and plan.full_target_quantity > 0
+        ):
+            plan.initial_maker_target_quantity = plan.full_target_quantity
+
         # Map planner route to EntryType
         if route == ExecutionRoute.PASSIVE_INCREMENTAL:
             entry_type = EntryType.PASSIVE_INCREMENTAL
@@ -18455,6 +18713,29 @@ class LiveRuntime:
         hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
         maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
         hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
+        self.journal.append(
+            "execution.entry_quantity_plan",
+            {
+                "entry_id": entry_id,
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "raw_quantity": raw_quantity,
+                "common_quantity": quantity,
+                "full_target_quantity": plan.full_target_quantity,
+                "initial_maker_target_quantity": plan.initial_maker_target_quantity,
+                "effective_quantity": effective_quantity,
+                "route": route.value,
+                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
+                "min_hedgeable_chunk": min_hedgeable_chunk,
+                "okx_base_quantity_step": okx_base_step,
+                "venue_quantity_steps": {
+                    long_venue.value: long_quantity_step or 0.0,
+                    short_venue.value: short_quantity_step or 0.0,
+                },
+                "ts_ms": now_ms,
+            },
+        )
 
         if is_client_order_id_duplicate(maker_cid, self._recovery_dedup_index):
             self.journal.append(
