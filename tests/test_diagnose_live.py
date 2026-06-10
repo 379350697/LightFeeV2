@@ -845,6 +845,171 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_resolves_moveusdt_ack_only_duplicate_after_terminal_flat(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781078435000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781078427209,
+                "kind": "order.uncertain",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "reason": "order accepted (id=a29a75c3-9db5-464b-88ed-ef5cb0aa9aa9) but fill not confirmed",
+                    "exchange_error": {
+                        "venue": "bybit",
+                        "operation": "place_order",
+                        "exchange_code": "0",
+                        "exchange_msg": "OK",
+                        "evidence_completeness": "partial",
+                        "missing_evidence": ["fill_confirmation"],
+                        "extra": {
+                            "order_ack_only": True,
+                            "accepted_order_id": "a29a75c3-9db5-464b-88ed-ef5cb0aa9aa9",
+                            "accepted_client_order_id": "lfxlbf3cf3338c41e406",
+                        },
+                        "request_context": {
+                            "symbol": "MOVEUSDT",
+                            "side": "sell",
+                            "quantity": 1840.0,
+                            "reduce_only": True,
+                            "client_order_id": "lfxlbf3cf3338c41e406",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "MOVEUSDT",
+                        "side": "sell",
+                        "quantity": 1840.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfxlbf3cf3338c41e406",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781078428249,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "reason": "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate",
+                    "exchange_error": {
+                        "venue": "bybit",
+                        "operation": "place_order",
+                        "exchange_code": "110072",
+                        "exchange_msg": "orderlinkedid is duplicate",
+                        "evidence_completeness": "missing_exchange_body",
+                        "missing_evidence": ["exchange_response_body"],
+                        "request_context": {
+                            "symbol": "MOVEUSDT",
+                            "side": "sell",
+                            "quantity": 1840.0,
+                            "reduce_only": True,
+                            "client_order_id": "lfxlbf3cf3338c41e406",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "MOVEUSDT",
+                        "side": "sell",
+                        "quantity": 1840.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfxlbf3cf3338c41e406",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781078428474,
+                "kind": "order.reconcile_result",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "venue": "bybit",
+                    "symbol": "MOVEUSDT",
+                    "client_order_id": "lfxlbf3cf3338c41e406",
+                    "status": "none",
+                    "reason": "duplicate_client_id",
+                    "uncertain_subtype": "duplicate_client_id",
+                    "target_qty": 1840.0,
+                    "reconciled_qty": 0.0,
+                    "live_qty": 0.0,
+                    "remaining_qty": 1840.0,
+                    "next_action": "clear_live_flat",
+                },
+            },
+            {
+                "ts_ms": 1781078428728,
+                "kind": "exit.passive_close_recovery_probe_flat",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                    "client_order_id": "lfxlbf3cf3338c41e406",
+                },
+            },
+            {
+                "ts_ms": 1781078428977,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "pending_passive_close_flat_probe",
+                    "client_order_id": "lfxlbf3cf3338c41e406",
+                },
+            },
+            {
+                "ts_ms": 1781078428977,
+                "kind": "recovery.flat",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                    "client_order_id": "lfxlbf3cf3338c41e406",
+                },
+            },
+            {
+                "ts_ms": 1781078429188,
+                "kind": "execution.residual_repair_completed",
+                "payload": {
+                    "position_id": "entry-1781077922981-MOVEUSDT",
+                    "symbol": "MOVEUSDT",
+                    "result": "already_flat",
+                    "client_order_id": "lfxlbf3cf3338c41e406",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="MOVEUSDT",
+            venues=["bybit"],
+            now_ms=1781078436000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["resolved_order_truth_gap_count"] == 1
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        assert result["conclusion"]["status"] == "healthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_accepts_completed_residual_lifecycle(monkeypatch):
     from scripts import diagnose_live as dl
 

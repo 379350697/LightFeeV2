@@ -688,6 +688,8 @@ class CloseExecutor:
                     submit_started_at_ms=chunk_start_ms,
                 ))
                 chunk_short_order_ids.append(short_result["fill"].order_id)
+            elif short_result["outcome"] == "terminal_flat":
+                chunk_short_order_ids.append(short_result.get("order_id", ""))
             elif short_result["outcome"] == "uncertain":
                 any_short_uncertain = True
                 chunk_short_order_ids.append(short_result.get("order_id", ""))
@@ -769,6 +771,8 @@ class CloseExecutor:
                     submit_started_at_ms=chunk_start_ms,
                 ))
                 chunk_long_order_ids.append(long_result["fill"].order_id)
+            elif long_result["outcome"] == "terminal_flat":
+                chunk_long_order_ids.append(long_result.get("order_id", ""))
             elif long_result["outcome"] == "uncertain":
                 any_long_uncertain = True
                 chunk_long_order_ids.append(long_result.get("order_id", ""))
@@ -1341,6 +1345,34 @@ class CloseExecutor:
                         duplicate_reconcile is not None
                         and duplicate_reconcile.clear_state
                     ):
+                        if recon_qty <= 1e-12:
+                            self.journal.append(
+                                "exit.close_duplicate_client_order_resolved_live_flat",
+                                {
+                                    "position_id": position_id,
+                                    "leg": leg,
+                                    "venue": request.venue.value,
+                                    "symbol": request.symbol,
+                                    "side": request.side.value,
+                                    "order_id": duplicate_reconcile.order_id,
+                                    "client_order_id": (
+                                        duplicate_reconcile.client_order_id
+                                        or request.client_order_id
+                                    ),
+                                    "requested": request.quantity,
+                                    "reconciled_qty": duplicate_reconcile.reconciled_qty,
+                                    "live_qty": duplicate_reconcile.live_qty,
+                                    "remaining_qty": duplicate_reconcile.remaining_qty,
+                                    "classification": duplicate_reconcile.classification,
+                                    "reason": "duplicate_client_order_live_flat",
+                                },
+                            )
+                            return {
+                                "outcome": "terminal_flat",
+                                "fill": None,
+                                "order_id": duplicate_reconcile.order_id,
+                                "reason": "duplicate_client_order_live_flat",
+                            }
                         fill = OrderFill(
                             venue=request.venue,
                             symbol=request.symbol,

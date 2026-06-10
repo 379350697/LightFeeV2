@@ -889,6 +889,76 @@ class TestCloseChunkExecutor:
         assert "exit.close_residual_detected" in kinds
 
     @pytest.mark.asyncio
+    async def test_bybit_duplicate_live_flat_does_not_emit_zero_quantity_fill(self):
+        """Live-flat duplicate reconciliation is terminal truth, not a zero fill."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class DuplicateLiveFlatBybitAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT, default_fill_price=0.2911)
+                self.reconciliation_lookups = []
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return None
+
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+        adapter = DuplicateLiveFlatBybitAdapter()
+        adapter.place_order_outcomes = [
+            _make_rejected_error(
+                "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate"
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        client_order_id = compact_client_order_id("p001", "exit_short")
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="MOVEUSDT",
+            side=Side.BUY,
+            quantity=1840.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "terminal_flat"
+        assert result["reason"] == "duplicate_client_order_live_flat"
+        assert adapter.reconciliation_lookups == [
+            ("MOVEUSDT", "", client_order_id)
+        ]
+        events = journal.read_all()
+        filled_events = [event for event in events if event["kind"] == "order.filled"]
+        assert filled_events == []
+        resolution_payload = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.close_duplicate_client_order_resolved_live_flat"
+        ][-1]
+        assert resolution_payload["client_order_id"] == client_order_id
+        assert resolution_payload["reconciled_qty"] == 0.0
+        assert resolution_payload["live_qty"] == 0.0
+
+    @pytest.mark.asyncio
     async def test_bybit_duplicate_close_partial_returns_reconciled_fill_at_retry_ceiling(self):
         """Duplicate partial evidence must not be dropped when no retry budget remains."""
         from lightfee.engine.close_executor import CloseExecutor

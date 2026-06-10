@@ -1514,6 +1514,20 @@ _ORDER_TRUTH_GAP_RESOLUTION_KINDS = frozenset({
 
 def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
     values: set[str] = set()
+    nested_payloads: list[dict[str, Any]] = [payload]
+    exchange_error = payload.get("exchange_error")
+    if isinstance(exchange_error, dict):
+        nested_payloads.append(exchange_error)
+        extra = exchange_error.get("extra")
+        if isinstance(extra, dict):
+            nested_payloads.append(extra)
+        request_context = exchange_error.get("request_context")
+        if isinstance(request_context, dict):
+            nested_payloads.append(request_context)
+    request_context = payload.get("request_context")
+    if isinstance(request_context, dict):
+        nested_payloads.append(request_context)
+
     for key in (
         "position_id",
         "entry_id",
@@ -1525,21 +1539,78 @@ def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
         "order_id",
         "client_order_id",
     ):
-        value = payload.get(key)
-        if value:
-            normalized = str(value).lower()
-            values.add(f"{key}:{normalized}")
-            if key in {"accepted_order_id", "order_id"}:
-                values.add(f"order_ref:{normalized}")
-            elif key in {"accepted_client_order_id", "client_order_id"}:
-                values.add(f"client_ref:{normalized}")
+        for nested in nested_payloads:
+            value = nested.get(key)
+            if value:
+                normalized = str(value).lower()
+                values.add(f"{key}:{normalized}")
+                if key in {"accepted_order_id", "order_id"}:
+                    values.add(f"order_ref:{normalized}")
+                elif key in {"accepted_client_order_id", "client_order_id"}:
+                    values.add(f"client_ref:{normalized}")
     symbol = str(payload.get("symbol") or "").upper()
+    if not symbol:
+        for nested in nested_payloads:
+            symbol = str(nested.get("symbol") or "").upper()
+            if symbol:
+                break
     if symbol:
         values.add(f"symbol:{symbol}")
     venue = str(payload.get("venue") or payload.get("hedge_venue") or "").lower()
+    if not venue:
+        for nested in nested_payloads:
+            venue = str(nested.get("venue") or nested.get("hedge_venue") or "").lower()
+            if venue:
+                break
     if venue and symbol:
         values.add(f"venue_symbol:{venue}:{symbol}")
     return values
+
+
+def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    exchange_error = payload.get("exchange_error")
+    return exchange_error if isinstance(exchange_error, dict) else {}
+
+
+def _payload_is_ack_only_order_truth_gap(payload: dict[str, Any]) -> bool:
+    exchange_error = _exchange_error_dict(payload)
+    extra = exchange_error.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    missing_evidence = payload.get("missing_evidence") or exchange_error.get("missing_evidence") or []
+    if not isinstance(missing_evidence, list):
+        missing_evidence = [missing_evidence]
+    reason = str(payload.get("reason") or payload.get("error") or "").lower()
+    exchange_code = str(
+        payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
+    )
+    return (
+        payload.get("accepted_order_truth_gap") is True
+        or payload.get("truth_required_by") == "accepted_order_truth_gap"
+        or extra.get("order_ack_only") is True
+        or (
+            exchange_code == "0"
+            and any(str(item) == "fill_confirmation" for item in missing_evidence)
+        )
+        or ("accepted" in reason and "fill" in reason and "confirm" in reason)
+    )
+
+
+def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
+    exchange_error = _exchange_error_dict(payload)
+    exchange_code = str(
+        payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
+    )
+    exchange_msg = str(
+        payload.get("exchange_msg") or exchange_error.get("exchange_msg") or ""
+    ).lower()
+    reason = str(payload.get("reason") or payload.get("error") or "").lower()
+    return (
+        exchange_code == "110072"
+        or ("110072" in reason)
+        or ("orderlinkedid" in exchange_msg and "duplicate" in exchange_msg)
+        or ("orderlinkedid" in reason and "duplicate" in reason)
+    )
 
 
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
@@ -1554,6 +1625,16 @@ def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
         return residual <= 1e-9
     if kind == "runtime.position_lifecycle_terminal":
         return str(payload.get("terminal_state", "") or "").lower() == "flat"
+    if kind == "order.reconcile_result":
+        try:
+            live_qty = float(payload.get("live_qty") or 0.0)
+        except (TypeError, ValueError):
+            live_qty = 0.0
+        return (
+            str(payload.get("reason", "") or "").lower() == "duplicate_client_id"
+            and str(payload.get("next_action", "") or "").lower() == "clear_live_flat"
+            and abs(live_qty) <= 1e-9
+        )
     return True
 
 
@@ -1582,10 +1663,12 @@ def _build_resolved_order_truth_gap_summary(
         identities = _truth_gap_identity_values(payload)
         if not identities:
             continue
-        if kind in _ORDER_TRUTH_GAP_REGISTERED_KINDS:
+        if kind in _ORDER_TRUTH_GAP_REGISTERED_KINDS or (
+            kind == "order.uncertain" and _payload_is_ack_only_order_truth_gap(payload)
+        ):
             registered.append(identities)
         elif (
-            kind in _ORDER_TRUTH_GAP_RESOLUTION_KINDS
+            (kind in _ORDER_TRUTH_GAP_RESOLUTION_KINDS or kind == "order.reconcile_result")
             and _truth_gap_resolution_complete(kind, payload)
         ):
             resolved_identity_sets.append(identities)
@@ -1621,9 +1704,9 @@ def _order_error_resolved_by_truth_gap(
         return False
     if int(resolved_truth_gap_summary.get("count", 0) or 0) <= 0:
         return False
-    if (
-        payload.get("accepted_order_truth_gap") is not True
-        and payload.get("truth_required_by") != "accepted_order_truth_gap"
+    if not (
+        _payload_is_ack_only_order_truth_gap(payload)
+        or _payload_is_bybit_duplicate_client_id(payload)
     ):
         return False
     resolved = set(resolved_truth_gap_summary.get("resolved_identities", []) or [])
