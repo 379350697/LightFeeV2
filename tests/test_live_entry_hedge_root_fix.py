@@ -2672,6 +2672,163 @@ class TestRealPathAbortCleanupDeadline:
         assert abandoned is True
 
     @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_retains_terminal_no_fill_when_open_order_matches(
+        self, tmp_path
+    ):
+        """Execution-history terminal/no-fill evidence is not enough while
+        realtime open-order truth still shows the maker order."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        maker.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="SUSHIUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="SUSHIUSDT",
+            side=Side.BUY,
+            order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+            client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=1781052741000,
+        )
+        maker.open_orders = [
+            {
+                "orderId": "f37adbb4-caa1-4044-9e36-ba897bbba795",
+                "orderLinkId": "62c273802b05ae03599e8b42ac67df94b56a",
+                "symbol": "SUSHIUSDT",
+                "side": "Buy",
+                "qty": "144.2",
+                "price": "0.1664",
+                "reduceOnly": False,
+            }
+        ]
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUSHIUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+        pending = PendingEntry(
+            pending_id="entry-1781052726614-SUSHIUSDT",
+            symbol="SUSHIUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=144.2,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1781052726614,
+            maker_leg="long",
+            uncertain_outcome=False,
+            outcome="canceled",
+            maker_order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+            maker_client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+            passive_order=PendingPassiveOrder(
+                order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+                client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+                target_quantity=144.2,
+                accepted_at_ms=1781052726614,
+                last_progress_state=PassiveOrderState.CANCELED,
+            ),
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_open_order_retained" in kinds
+        assert "reconciliation.entry_abandoned_flat" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_retains_terminal_no_fill_when_open_order_truth_unavailable(
+        self, tmp_path
+    ):
+        """Terminal no-fill progress still needs realtime open-order truth; a
+        truth timeout cannot prove the maker owner is gone."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        maker.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="SUSHIUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="SUSHIUSDT",
+            side=Side.BUY,
+            order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+            client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=1781052741000,
+        )
+        maker.fetch_open_orders_raises = TimeoutError("open order truth timeout")
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUSHIUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+        pending = PendingEntry(
+            pending_id="entry-terminal-open-order-unavailable",
+            symbol="SUSHIUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=144.2,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1781052726614,
+            maker_leg="long",
+            uncertain_outcome=False,
+            outcome="canceled",
+            maker_order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+            maker_client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+            passive_order=PendingPassiveOrder(
+                order_id="f37adbb4-caa1-4044-9e36-ba897bbba795",
+                client_order_id="62c273802b05ae03599e8b42ac67df94b56a",
+                target_quantity=144.2,
+                accepted_at_ms=1781052726614,
+                last_progress_state=PassiveOrderState.CANCELED,
+            ),
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is False
+        events = runtime.journal.read_all()
+        assert any(
+            event["kind"] == "pending_entry.maker_terminal_evidence_unavailable"
+            and event["payload"].get("open_order_error") == "open order truth timeout"
+            for event in events
+        )
+        assert not any(
+            event["kind"] == "reconciliation.entry_abandoned_flat"
+            for event in events
+        )
+
+    @pytest.mark.asyncio
     async def test_try_abandon_stale_entry_allows_missing_progress_when_open_order_absent(
         self, tmp_path
     ):
@@ -2833,6 +2990,98 @@ class TestRealPathAbortCleanupDeadline:
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "reconciliation.entry_abandoned_flat" in kinds
         assert "recovery.ledger_clear" in kinds
+
+    @pytest.mark.asyncio
+    async def test_terminal_pending_entry_open_order_match_does_not_clear_recovery_core(
+        self, tmp_path
+    ):
+        """A matching live maker order keeps the pending owner and blocks the
+        release path that would otherwise clear risk_only as evidence-gap."""
+        runtime = _make_open_runtime(tmp_path, pending_entry_hard_ceiling_ms=1000)
+        runtime.config.runtime.mode = "live"
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.recovery_blocked_reason = "owned_pending_entry"
+
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        maker.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="MEUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="MEUSDT",
+            side=Side.BUY,
+            order_id="57a9c1b4-0b73-4a73-ad24-080a424f2ed5",
+            client_order_id="f9fc9e90a9e2f3bbb44aee84ddb2d3e6fc56",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=1781052741000,
+        )
+        maker.open_orders = [
+            {
+                "orderId": "57a9c1b4-0b73-4a73-ad24-080a424f2ed5",
+                "orderLinkId": "f9fc9e90a9e2f3bbb44aee84ddb2d3e6fc56",
+                "symbol": "MEUSDT",
+                "side": "Buy",
+                "qty": "408.0",
+                "price": "0.0588",
+                "reduceOnly": False,
+            }
+        ]
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="MEUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1781052740000,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-1781052726614-MEUSDT",
+            symbol="MEUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=408.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1781052726614,
+            maker_leg="long",
+            uncertain_outcome=False,
+            outcome="canceled",
+            maker_order_id="57a9c1b4-0b73-4a73-ad24-080a424f2ed5",
+            maker_client_order_id="f9fc9e90a9e2f3bbb44aee84ddb2d3e6fc56",
+            passive_order=PendingPassiveOrder(
+                order_id="57a9c1b4-0b73-4a73-ad24-080a424f2ed5",
+                client_order_id="f9fc9e90a9e2f3bbb44aee84ddb2d3e6fc56",
+                target_quantity=408.0,
+                accepted_at_ms=1781052726614,
+                cancel_requested_at_ms=1781052730000,
+                last_progress_state=PassiveOrderState.CANCELED,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
+            pending, pending.pending_id, now_ms=1781052846614
+        )
+
+        assert handled is True
+        assert pending.pending_id in runtime.state.pending_entries
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.recovery_blocked_reason == "owned_pending_entry"
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_open_order_retained" in kinds
+        assert "reconciliation.entry_abandoned_flat" not in kinds
+        assert "recovery.ledger_clear" not in kinds
 
     @pytest.mark.asyncio
     async def test_try_abandon_stale_entry_requires_cancel_before_missing_progress_no_open_order_abandon(

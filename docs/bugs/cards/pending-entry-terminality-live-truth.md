@@ -39,6 +39,12 @@ evidence must map to the matrix before runtime code changes.
 - `ambiguous_exchange_truth`
 - local state is flat while exchange truth has a non-reduce-only open maker
   order.
+- Passive progress is terminal/no-fill, such as Bybit execution history
+  `execution_not_found` represented as `canceled`, while realtime open-order
+  truth still has a matching non-reduce-only maker order.
+- `reconciliation.entry_abandoned_flat(reason=both_venues_zero)` appears after
+  `pending_entry.finalize_deferred_maker_open_order` or other retained
+  maker-open-order evidence for the same pending entry.
 - `pending_close_reconciliations_active` remains after both close venues are
   terminal flat and no managed open position exists.
 - final close fill/PnL reconciliation is unavailable, but terminal live
@@ -153,6 +159,11 @@ owner becomes blocking `unpaired_live_position`.
   close, and residual repair. Accepted ACK-only/no-fill responses must preserve
   missing fill evidence and probe paths; they are not standalone terminal
   success or failure.
+- Terminal no-fill passive progress is not sufficient to remove a pending
+  maker owner while realtime open-order truth is unavailable or still matches
+  the maker order id/client id. Position-flat truth can clear
+  `unpaired_live_position`, but it cannot clear an order-artifact blocker or
+  pending owner without open-order truth.
 - Aster accepted-order uncertainty must not reuse Binance `/fapi/v1|v2` private
   paths. Aster Pro API V3 truth probes are `GET /fapi/v3/order`,
   `GET /fapi/v3/openOrders`, and `GET /fapi/v3/positionRisk`; there is no
@@ -185,6 +196,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-09 | Current-state recovery lifecycle release latch | fixed, deployed/cloud verified | CL-057 closes the post-terminal pending-entry/runtime latch where current exchange truth and `V1RecoveryDecisionCore` are clean but `lifecycle=risk_only` remains. Terminal pending-entry removal, startup ledger refresh, and runtime clean-position housekeeping now return through recovery ledger/core before release. The old `unpaired_live_position` flat-position branch no longer synthesizes `open_orders=[]`; it must query bounded symbol open-order truth, and evidence-gap or live open order keeps the blocker. Merged as `62dee61` and included in the latest deployed main line. |
 | 2026-06-09 | Current-state recovery fail-closed release latch | deployed/cloud verified | CL-059 closes the post-`3a59a53` production follow-up where exchange truth and `V1RecoveryDecisionCore` are clean but exported state remains `lifecycle=risk_only`, `risk_mode=fail_closed`. This differs from CL-057's `risk_only/running` latch: the risk-mode latch itself must be released through the same core-clean plus flat/no-open-orders truth gate. Operator fail-closed, reduce-only/entry-paused risk, local recovery work, live position truth, and live open-order truth still block release. Final cloud acceptance on `78a0feb` proved `lifecycle=running`, `risk_mode=running`, and no recovery blocker. |
 | 2026-06-09 | Live-artifact recovery account-truth release | deployed/cloud verified | CL-060 closes the post-`b2d0706` production follow-up where the old `unpaired_live_position` blocker remained despite all-account diagnose truth proving flat/no-open-orders. Runtime now uses account-level position and open-order truth to release historical live-artifact blockers after local work is gone, instead of relying on dirty candidate-symbol sweeps that can create unsupported-symbol evidence gaps. Cloud acceptance on `78a0feb` passed verifier and diagnose with all venues flat/no-open-orders. |
+| 2026-06-10 | Terminal no-fill maker open-order owner retention | local fixed; deploy pending | CL-064 closes the `SUSHIUSDT` / `MEUSDT` recurrence where Bybit execution history/no-fill evidence and flat positions were treated as terminal while realtime open-order truth still showed matching maker orders. `_pending_entry_has_unresolved_maker_order()` and abort cleanup now require actual maker fill for the maker-completed fast path, query realtime open-order truth for terminal no-fill progress, retain pending when a matching open order exists or truth is unavailable, and allow flat abandon only when open-order truth explicitly has no match. Local verification passed focused terminal no-fill branches (`6 passed`), recovery core/ledger (`34 passed`), target regression (`609 passed`), compileall, and full pytest `3778 passed`, `9 skipped`, `1 warning`. No order/cancel/runtime-state mutation or cloud deploy occurred in this pass. |
 
 ## Recurrences
 
@@ -208,6 +220,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-07 | post-`21e5d44` no-entry deployment evidence loop | local implementation pending deploy | Cloud was flat and had no entry lifecycle, but four evidence-chain holes remained: bare `diagnose_live.py` missed systemd env credentials, `verify_production_services.py` could mark `live_tick_stale` critical despite high-confidence flat exchange truth plus recent scan progress, Hyperliquid insufficient-margin admission lacked unified `source`/scope/pair evidence across pending hedge and initial entry, and last-good/quote/recovery probe noise needed bounded V1-style classification. Local RED/GREEN now covers diagnose env loading, tick-stale false critical suppression, Hyperliquid `PE-11` evidence fields, quote blocker families, last-good targeted revalidate evidence, and bounded static recovery-probe skip summaries. | [daily/2026-06-07.md#post-21e5d44-evidence-chain-closure](../daily/2026-06-07.md#post-21e5d44-evidence-chain-closure) |
 | 2026-06-08 | Aster private truth signature failures with V3 API-wallet credentials | fixed, deployed through main | User-provided Aster screenshots showed an authorized Pro API V3 wallet with `Read, Perp Trade, Spot Trade` permission and prior fills, while cloud private truth failed on old Binance-HMAC `/fapi/v1|v2|v4` paths with invalid signature. Root cause is integration drift: Aster private truth/order surfaces must use dedicated V3 Web3 signing (`fapi3`, `nonce`, `signer`, EIP-712 `signature`). V2 now isolates Aster private transport from Binance HMAC while leaving public Local-L2/FAPI market data unchanged. Review closure pins `accountWithJoinMargin`, capability truth without private WS health, and Aster V3 order truth paths. Follow-up startup safety and host fixes are in main (`9d037f5`, `6054c47`) and the deployed manifest line. | |
 | 2026-06-08 | production issues 8-9 live mismatch post-cleanup truth | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
+| 2026-06-10 | `SUSHIUSDT`, `MEUSDT` Bybit terminal no-fill maker open orders | this main closure | local fixed; deploy pending | [daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention](../daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention) |
 
 ## Regression Harness
 

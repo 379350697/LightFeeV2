@@ -8945,7 +8945,9 @@ class LiveRuntime:
     ) -> bool:
         if not self._pending_entry_has_maker_order_reference(pending):
             return True
-        if pending.maker_completed():
+        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
+        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
+        if pending.maker_completed() and maker_filled >= target_quantity - 1e-9:
             return True
 
         maker_venue = pending.maker_venue()
@@ -9061,7 +9063,9 @@ class LiveRuntime:
                 )
                 return True
             return False
-        if pending.maker_completed():
+        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
+        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
+        if pending.maker_completed() and maker_filled >= target_quantity - 1e-9:
             return False
 
         maker_venue = pending.maker_venue()
@@ -9156,9 +9160,57 @@ class LiveRuntime:
             return True
         state = getattr(progress, "state", None)
         if state is not None and hasattr(state, "is_terminal"):
-            if getattr(state, "value", "") == "filled":
+            state_value = str(getattr(state, "value", str(state or "")) or "").lower()
+            if state_value == "filled":
                 return True
-            return not state.is_terminal()
+            if state.is_terminal():
+                matches, open_order_error = await self._pending_entry_maker_open_order_matches(
+                    pending,
+                    adapter,
+                    maker_venue,
+                )
+                if matches is not None:
+                    if matches:
+                        self.journal.append(
+                            "pending_entry.maker_open_order_retained",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_order_id": order_id,
+                                "maker_client_order_id": client_order_id,
+                                "open_order_count": len(matches),
+                                "reason": "passive_order_terminal_no_fill_open_order_present",
+                                "progress_state": state_value,
+                            },
+                        )
+                        return True
+                    self.journal.append(
+                        "pending_entry.maker_terminal_no_open_order",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "maker_venue": maker_venue.value,
+                            "maker_order_id": order_id,
+                            "maker_client_order_id": client_order_id,
+                            "reason": "passive_order_terminal_no_fill_open_order_absent",
+                            "progress_state": state_value,
+                        },
+                    )
+                    return False
+                self.journal.append(
+                    "pending_entry.maker_terminal_evidence_unavailable",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": maker_venue.value,
+                        "reason": "passive_order_terminal_no_fill",
+                        "progress_state": state_value,
+                        "open_order_error": open_order_error,
+                    },
+                )
+                return True
+            return True
         return True
 
     def _try_clear_stale_hedge_inflight(self, pending, entry_id: str, result, now_ms: int) -> None:
@@ -9562,6 +9614,7 @@ class LiveRuntime:
         Returns True if pending was removed, False if retained (cleanup failed).
         """
         enter_fail_closed(self.state)
+        self.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
         return await self._abort_pending_entry(pending, entry_id, reason)
 
     async def _abort_pending_entry(
