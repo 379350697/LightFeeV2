@@ -2439,6 +2439,91 @@ def test_run_diagnose_allows_explicit_exchange_truth_venues(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781097000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781096100000,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-normal",
+                    "symbol": "HOMEUSDT",
+                    "problem": False,
+                    "single_leg_fast_flatten": False,
+                },
+            },
+            {
+                "ts_ms": 1781096100100,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-problem",
+                    "symbol": "SAHARAUSDT",
+                    "problem": True,
+                    "single_leg_fast_flatten": True,
+                },
+            },
+            {
+                "ts_ms": 1781096100200,
+                "kind": "runtime.position_drift_skipped_passive_close_owner",
+                "payload": {
+                    "position_id": "entry-owner",
+                    "symbol": "MOVEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781096100300,
+                "kind": "runtime.stale_fail_closed_cleared",
+                "payload": {
+                    "reason": "startup_clean_stale_fail_closed_cleared",
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1781097000000,
+        )
+
+        summary = result["passive_close_terminal_summary"]
+        assert summary["passive_close_resolved_count"] == 2
+        assert summary["problem_resolved_count"] == 1
+        assert summary["single_leg_fast_flatten_count"] == 1
+        assert summary["passive_owned_drift_blocked_count"] == 1
+        assert summary["stale_fail_closed_after_flat_count"] == 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
     from scripts import diagnose_live as dl
 

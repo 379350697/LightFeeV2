@@ -2300,6 +2300,70 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_force_close_problem" not in kinds
         assert "runtime.position_lifecycle_terminal" not in kinds
 
+    def test_one_sided_flatten_requires_open_order_flat_proof(self):
+        """Do not submit one-sided reduce-only while an exchange order may still manage it."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-open-order",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_open_orders = AsyncMock(return_value=[{
+            "order_id": "still-live-maker",
+            "client_order_id": "maker-cid",
+            "status": "open",
+        }])
+        bybit.place_order = AsyncMock(side_effect=AssertionError("must not flatten with open order"))
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is False
+        bybit.fetch_open_orders.assert_awaited_once()
+        bybit.place_order.assert_not_called()
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_one_sided_truth_gap" in kinds
+        assert "exit.passive_close_live_one_sided_flatten" not in kinds
+
     def test_live_flat_clear_passes_real_exchange_truth_to_recovery_core(self):
         journal = _open_journal()
         state = EngineState()
@@ -2435,6 +2499,73 @@ class TestFallbackResidualReal:
         assert "exit.pending_close_reconciliation_registered" not in [
             record["kind"] for record in journal.read_all()
         ]
+
+    def test_live_flat_cleanup_resolves_passive_close_terminal(self):
+        """V1 parity: live-flat passive cleanup is still a close resolution."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-live-flat-resolved",
+            symbol="SAHARAUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=1330.0,
+            short_quantity=1330.0,
+            matched_quantity=1330.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1330.0,
+            chunk_quantities=[1330.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        executor._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source="passive_close_live_one_sided_flattened",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+            extra={
+                "flattened_venue": Venue.BYBIT.value,
+                "flattened_quantity": 1330.0,
+                "single_leg_fast_flatten": True,
+            },
+            exchange_truth={
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+            },
+        )
+
+        records = journal.read_all()
+        resolved = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.passive_close_resolved"
+        ]
+        assert resolved
+        assert resolved[-1]["position_id"] == position.position_id
+        assert resolved[-1]["resolution_source"] == "passive_close_live_one_sided_flattened"
+        assert resolved[-1]["problem"] is False
+        assert resolved[-1]["single_leg_fast_flatten"] is True
+        assert resolved[-1]["exchange_truth"]["positions_flat"] is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
 
     def test_live_flat_force_close_problem_keeps_close_reconciliation_work(self):
         """V1: lifecycle can clear flat while fill/PnL reconciliation continues."""
@@ -4259,6 +4390,81 @@ class TestAmendCancelReplace:
         assert fallback["reason"] == "okx_amend_invalid_request_type"
         assert fallback["exchange_code"] == "50115"
         assert "exit.passive_close_amend_failed" not in [event["kind"] for event in events]
+
+    def test_okx_amend_failure_reconciles_and_retains_live_order_identity(self):
+        """OKX amend failures leave the old order alive by default; query before acting."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-okx-amend-open",
+            symbol="SAHARAUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1330.0,
+            chunk_quantities=[1330.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-okx-oid",
+                maker_client_order_id="old-okx-cid",
+                maker_resting_limit_price=0.043,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        amend_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "OKX amend-order timeout",
+        )
+        amend_error.endpoint = "POST /api/v5/trade/amend-order"
+
+        mock_adapter = _mock_adapter_with_tick(Venue.OKX)
+        mock_adapter.amend_passive_order = AsyncMock(side_effect=amend_error)
+        mock_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.OKX,
+            symbol="SAHARAUSDT",
+            side=Side.SELL,
+            order_id="old-okx-oid",
+            client_order_id="old-okx-cid",
+            cumulative_quantity=120.0,
+            average_price=0.043,
+            state=PassiveOrderState.PARTIALLY_FILLED,
+        ))
+        mock_adapter.cancel_passive_order = AsyncMock()
+        mock_adapter.submit_passive_order = AsyncMock()
+
+        executor = PassiveCloseExecutor({Venue.OKX: mock_adapter}, journal)
+
+        asyncio.run(
+            executor._amend_maker_order(
+                state,
+                pending,
+                position,
+                Venue.OKX,
+                Side.SELL,
+                "long",
+                0.044,
+                1210.0,
+                0.001,
+                0.044,
+            )
+        )
+
+        mock_adapter.query_passive_order_progress.assert_awaited_once()
+        mock_adapter.cancel_passive_order.assert_not_called()
+        mock_adapter.submit_passive_order.assert_not_called()
+        assert pending.phase_state.maker_order_id == "old-okx-oid"
+        assert pending.phase_state.maker_client_order_id == "old-okx-cid"
+        assert pending.maker_fill.quantity == pytest.approx(120.0)
+        records = journal.read_all()
+        kinds = [event["kind"] for event in records]
+        assert "exit.passive_close_amend_order_truth_retained" in kinds
+        assert "exit.passive_close_amend_failed" not in kinds
 
     def test_cancel_fails_old_order_alive_blocks_new_order(self):
         """When cancel fails and old order is still alive → refuse new order (double-order guard)."""

@@ -3262,6 +3262,77 @@ class TestRuntimePreflight:
             assert runtime.state.open_positions[position.position_id].matched_quantity == pytest.approx(0.05)
 
     @pytest.mark.asyncio
+    async def test_active_position_drift_skips_passive_close_owner_without_maker_order(self):
+        """Passive close ownership blocks drift even after maker id is cleared."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = FakeVenueAdapter(Venue.BINANCE)
+            okx = FakeVenueAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+            )
+            await runtime.start()
+            binance.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="BTCUSDT",
+                    side=Side.BUY,
+                    quantity=0.05,
+                    entry_price=65000.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            okx.position_snapshots = [
+                PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol="BTCUSDT",
+                    side=Side.SELL,
+                    quantity=0.03,
+                    entry_price=65010.0,
+                    observed_at_ms=1700000010000,
+                )
+            ]
+            position = OpenPosition(
+                position_id="pos-passive-owner-no-maker",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.05,
+                short_quantity=0.05,
+                long_entry_price=65000.0,
+                short_entry_price=65010.0,
+                opened_at_ms=1700000000000,
+                matched_quantity=0.05,
+            )
+            runtime.state.open_positions[position.position_id] = position
+            runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+                position_id=position.position_id,
+                reason="funding_capture",
+                position_snapshot=position,
+                target_quantity=0.05,
+                chunk_quantities=[0.05],
+                phase_state=PassivePhaseState(
+                    phase=PassiveExecutionPhase.DUAL_TAKER,
+                    active_maker_leg=ActiveMakerLeg.SHORT,
+                    maker_order_id="",
+                    maker_client_order_id="",
+                ),
+                next_retry_at_ms=wall_clock_now_ms() + 5_000,
+            )
+
+            await runtime.tick_active_positions()
+            await runtime.stop()
+
+            assert binance.place_order_call_count == 0
+            assert okx.place_order_call_count == 0
+            assert position.position_id in runtime.state.pending_passive_closes
+            assert runtime.state.open_positions[position.position_id].matched_quantity == pytest.approx(0.05)
+            kinds = [event["kind"] for event in runtime.journal.read_all()]
+            assert "runtime.position_drift_skipped_passive_close_owner" in kinds
+            assert "runtime.position_drift_correction_failed" not in kinds
+
+    @pytest.mark.asyncio
     async def test_active_position_drift_removes_position_when_exchange_flat(self):
         """If both live legs are flat, V2 must not keep showing an open position."""
         with tempfile.TemporaryDirectory() as td:

@@ -2949,6 +2949,7 @@ def run_diagnose(
         kind = str(rec.get("kind", ""))
         event_counts[kind] = event_counts.get(kind, 0) + 1
     quick_flat_summary = summarize_quick_flat_events(all_events)
+    passive_close_terminal_summary = _build_passive_close_terminal_summary(all_events)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2978,6 +2979,7 @@ def run_diagnose(
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
+        "passive_close_terminal_summary": passive_close_terminal_summary,
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,
         "runtime_warnings": runtime_warnings,
@@ -2996,6 +2998,51 @@ def _event_matches_symbol(event: dict[str, Any], symbol: str) -> bool:
     if event_symbol == target:
         return True
     return target in json.dumps(payload, sort_keys=True).upper()
+
+
+def _build_passive_close_terminal_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    resolved_count = 0
+    problem_resolved_count = 0
+    single_leg_fast_flatten_count = 0
+    passive_owned_drift_blocked_count = 0
+    stale_fail_closed_after_flat_count = 0
+    resolved_positions: set[str] = set()
+    problem_positions: set[str] = set()
+    single_leg_fast_positions: set[str] = set()
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        position_id = str(payload.get("position_id") or "")
+        if kind == "exit.passive_close_resolved":
+            resolved_count += 1
+            if position_id:
+                resolved_positions.add(position_id)
+            if bool(payload.get("problem", False)):
+                problem_resolved_count += 1
+                if position_id:
+                    problem_positions.add(position_id)
+            if bool(payload.get("single_leg_fast_flatten", False)):
+                single_leg_fast_flatten_count += 1
+                if position_id:
+                    single_leg_fast_positions.add(position_id)
+        elif kind == "runtime.position_drift_skipped_passive_close_owner":
+            passive_owned_drift_blocked_count += 1
+        elif kind == "runtime.stale_fail_closed_cleared":
+            stale_fail_closed_after_flat_count += 1
+
+    return {
+        "passive_close_resolved_count": resolved_count,
+        "problem_resolved_count": problem_resolved_count,
+        "single_leg_fast_flatten_count": single_leg_fast_flatten_count,
+        "passive_owned_drift_blocked_count": passive_owned_drift_blocked_count,
+        "stale_fail_closed_after_flat_count": stale_fail_closed_after_flat_count,
+        "resolved_position_ids": sorted(resolved_positions),
+        "problem_position_ids": sorted(problem_positions),
+        "single_leg_fast_flatten_position_ids": sorted(single_leg_fast_positions),
+    }
 
 
 def _event_scope_venues(payload: dict[str, Any]) -> set[str]:

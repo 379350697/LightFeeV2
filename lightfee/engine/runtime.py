@@ -4167,23 +4167,33 @@ class LiveRuntime:
         for position in list(self.state.open_positions.values()):
             if position.position_id in self.state.pending_passive_closes:
                 ppc = self.state.pending_passive_closes[position.position_id]
-                # Only skip drift check if maker order is still actively managed.
-                # When maker is terminal (order ID empty), allow drift check to
-                # detect exchange-flat and break stuck passive close states.
-                if getattr(ppc.phase_state, "maker_order_id", ""):
-                    continue
-                # V1 ownership: once passive close has submitted live close work,
-                # let that pending close settle before drift correction can submit
-                # another reduce-only leg for the same position.
-                passive_close_action_settling = (
-                    (
-                        bool(getattr(ppc, "short_legs", None))
-                        or bool(getattr(ppc, "long_legs", None))
-                    )
-                    and int(getattr(ppc, "next_retry_at_ms", 0) or 0) > now_ms
+                phase_state = getattr(ppc, "phase_state", None)
+                reason = "pending_passive_close_owner"
+                if getattr(phase_state, "maker_order_id", ""):
+                    reason = "maker_order_active"
+                elif getattr(phase_state, "maker_client_order_id", ""):
+                    reason = "maker_client_order_active"
+                elif (
+                    bool(getattr(ppc, "short_legs", None))
+                    or bool(getattr(ppc, "long_legs", None))
+                ):
+                    reason = "passive_close_live_action_settling"
+                elif int(getattr(ppc, "next_retry_at_ms", 0) or 0) > now_ms:
+                    reason = "passive_close_retry_scheduled"
+                self.journal.append(
+                    "runtime.position_drift_skipped_passive_close_owner",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "reason": reason,
+                        "phase": str(getattr(phase_state, "phase", "") or ""),
+                        "next_retry_at_ms": int(
+                            getattr(ppc, "next_retry_at_ms", 0) or 0
+                        ),
+                        "ts_ms": now_ms,
+                    },
                 )
-                if passive_close_action_settling:
-                    continue
+                continue
             if any(
                 pending.position_id == position.position_id
                 for pending in self.state.pending_closes.values()

@@ -2489,6 +2489,60 @@ class PassiveCloseExecutor:
                     reference_mid,
                 )
                 return
+            if maker_venue == Venue.OKX:
+                progress = await self._poll_maker_progress(
+                    adapter,
+                    position.symbol,
+                    pending.phase_state.maker_order_id,
+                    pending.phase_state.maker_client_order_id,
+                    side=maker_side,
+                )
+                if progress is not None:
+                    pending.phase_state.maker_order_id = (
+                        progress.order_id or pending.phase_state.maker_order_id
+                    )
+                    pending.phase_state.maker_client_order_id = (
+                        progress.client_order_id
+                        or pending.phase_state.maker_client_order_id
+                    )
+                    if progress.cumulative_quantity > pending.maker_fill.quantity + 1e-9:
+                        self._apply_maker_progress(pending, progress, now_ms)
+                    if progress.state in (
+                        PassiveOrderState.OPEN,
+                        PassiveOrderState.PARTIALLY_FILLED,
+                    ):
+                        self._journal.append(
+                            "exit.passive_close_amend_order_truth_retained",
+                            {
+                                "position_id": position.position_id,
+                                "venue": maker_venue.value,
+                                "maker_leg": maker_leg_label,
+                                "order_id": pending.phase_state.maker_order_id,
+                                "client_order_id": pending.phase_state.maker_client_order_id,
+                                "state": progress.state.value,
+                                "cumulative_quantity": progress.cumulative_quantity,
+                                "average_price": progress.average_price,
+                                "reason": "okx_amend_failed_original_order_still_live",
+                                "official_doc_rule": "okx_amend_cxlOnFail_default_false",
+                            },
+                        )
+                        pending.next_retry_at_ms = (
+                            self._now_ms() + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                        )
+                        return
+                    self._journal.append(
+                        "exit.passive_close_amend_order_truth_terminal",
+                        {
+                            "position_id": position.position_id,
+                            "venue": maker_venue.value,
+                            "maker_leg": maker_leg_label,
+                            "order_id": progress.order_id,
+                            "client_order_id": progress.client_order_id,
+                            "state": progress.state.value,
+                            "cumulative_quantity": progress.cumulative_quantity,
+                            "reason": "okx_amend_failed_original_order_terminal",
+                        },
+                    )
             # Transport/auth/rate-limit failure — journal, set retry, let drive loop escalate
             self._journal.append(
                 "exit.passive_close_amend_failed",
@@ -3390,6 +3444,95 @@ class PassiveCloseExecutor:
             },
         )
 
+    def _emit_passive_close_terminal_resolution(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        actual_long_size: float,
+        actual_short_size: float,
+        extra: dict[str, Any] | None,
+        exchange_truth: dict[str, Any] | None,
+    ) -> None:
+        """Project live-flat passive cleanup as a V1 close terminal event."""
+        short_legs, long_legs = self._pending_runtime_close_legs(pending)
+        long_closed = sum(leg.fill.quantity for leg in long_legs if leg.fill)
+        short_closed = sum(leg.fill.quantity for leg in short_legs if leg.fill)
+        if actual_long_size <= 1e-9:
+            long_closed = max(
+                long_closed,
+                float(position.long_quantity or position.matched_quantity or 0.0),
+            )
+        if actual_short_size <= 1e-9:
+            short_closed = max(
+                short_closed,
+                float(position.short_quantity or position.matched_quantity or 0.0),
+            )
+
+        now_ms = self._now_ms()
+        progress_times: list[int] = []
+        for fill_state in (
+            getattr(pending, "maker_fill", None),
+            getattr(pending, "hedge_fill", None),
+        ):
+            ts = int(getattr(fill_state, "last_fill_time_ms", 0) or 0)
+            if ts > 0:
+                progress_times.append(ts)
+        for leg in [
+            *getattr(pending, "short_legs", []),
+            *getattr(pending, "long_legs", []),
+        ]:
+            fill = getattr(leg, "fill", None)
+            ts = int(getattr(fill, "filled_at_ms", 0) or 0)
+            if ts > 0:
+                progress_times.append(ts)
+        first_progress_ms = min(progress_times) if progress_times else 0
+        inferred_fast_flatten = (
+            "one_sided" in source
+            and first_progress_ms > 0
+            and now_ms - first_progress_ms <= 2_000
+        )
+
+        extra_payload = dict(extra or {})
+        truth_payload = exchange_truth or {
+            "truth_available": True,
+            "positions_flat": actual_long_size <= 1e-9 and actual_short_size <= 1e-9,
+            "open_orders_flat": None,
+            "source": source,
+        }
+        self._journal.append(
+            "exit.passive_close_resolved",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "reason": pending.reason,
+                "resolution_source": source,
+                "long_closed_qty": long_closed,
+                "short_closed_qty": short_closed,
+                "price_pnl": 0.0,
+                "net_quote": 0.0,
+                "chunk_count": pending.chunk_count(),
+                "total_legs": len(long_legs) + len(short_legs),
+                "terminal_close_execution": True,
+                "live_flat_terminal": True,
+                "problem": bool(extra_payload.get("problem", False)),
+                "problem_reason": str(
+                    extra_payload.get("problem_reason")
+                    or extra_payload.get("force_close_reason")
+                    or ""
+                ),
+                "single_leg_fast_flatten": bool(
+                    extra_payload.get("single_leg_fast_flatten", False)
+                    or inferred_fast_flatten
+                ),
+                "single_leg_fast_flatten_threshold_ms": 2_000,
+                "first_progress_ms": first_progress_ms,
+                "resolved_at_ms": now_ms,
+                "exchange_truth": truth_payload,
+            },
+        )
+
     def _clear_live_flat_state(
         self,
         state: EngineState,
@@ -3509,6 +3652,16 @@ class PassiveCloseExecutor:
                 state,
                 core_decision,
                 journal=self._journal,
+            )
+            failure_reason = "terminal_close_resolution_failed"
+            self._emit_passive_close_terminal_resolution(
+                pending,
+                position,
+                source=source,
+                actual_long_size=actual_long_size,
+                actual_short_size=actual_short_size,
+                extra=extra,
+                exchange_truth=exchange_truth,
             )
         except Exception as error:
             state.pending_close_reconciliations = original_reconciliations
@@ -3854,6 +4007,30 @@ class PassiveCloseExecutor:
         )
         adapter = self._adapter(venue)
         if adapter is None:
+            return False
+
+        open_orders_flat, open_orders_evidence = await self._probe_venue_open_orders_flat(
+            venue,
+            position.symbol,
+            self._adapters,
+        )
+        if open_orders_flat is not True:
+            self._journal.append(
+                "exit.passive_close_live_one_sided_truth_gap",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "live_quantity": live_qty,
+                    "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
+                    "open_orders_flat": open_orders_flat,
+                    "open_orders_evidence": open_orders_evidence,
+                    "decision": "retain_pending",
+                    "reason": "one_sided_flatten_requires_open_order_flat_proof",
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
 
         try:
