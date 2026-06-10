@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -530,16 +531,23 @@ def _load_venue_credential(venue: str) -> Optional[Any]:
         or os.environ.get(prefix + "PRIVATE_KEY", "")
     )
     account_address = os.environ.get(prefix + "ACCOUNT_ADDRESS", "")
+    wallet_mode = os.environ.get(prefix + "WALLET_MODE", "")
     if not ((api_key and api_secret) or wallet_private_key or account_address):
         return None
     try:
-        from lightfee.venues.transport import LiveCredential
+        from lightfee.venues.transport import (
+            LiveCredential,
+            _normalize_hyperliquid_wallet_mode,
+        )
+        if venue.lower() == "hyperliquid":
+            wallet_mode = _normalize_hyperliquid_wallet_mode(wallet_mode)
         return LiveCredential(
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=os.environ.get(prefix + "API_PASSPHRASE", ""),
             wallet_private_key=wallet_private_key,
             account_address=account_address,
+            wallet_mode=wallet_mode or "account_wallet",
         )
     except Exception:
         return None
@@ -571,6 +579,70 @@ def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
     except Exception:
         pass
     return None
+
+
+def _mask_address(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 12:
+        return text
+    return "{}...{}".format(text[:6], text[-4:])
+
+
+def _address_hash(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
+    try:
+        from lightfee.venues.transport import (
+            _derive_hyperliquid_account_address,
+            _normalize_hyperliquid_wallet_mode,
+        )
+    except Exception:
+        return {
+            "wallet_mode": str(getattr(credential, "wallet_mode", "") or ""),
+            "account_address_present": bool(
+                str(getattr(credential, "account_address", "") or "").strip()
+            ),
+            "signer_address_present": False,
+            "account_matches_signer": False,
+        }
+
+    wallet_mode = _normalize_hyperliquid_wallet_mode(
+        str(getattr(credential, "wallet_mode", "") or "account_wallet")
+    )
+    account_address = str(getattr(credential, "account_address", "") or "").strip()
+    wallet_private_key = str(getattr(credential, "wallet_private_key", "") or "").strip()
+    signer_address = ""
+    signer_error = ""
+    if wallet_private_key:
+        try:
+            signer_address = _derive_hyperliquid_account_address(wallet_private_key)
+        except Exception as exc:
+            signer_error = str(exc)[:160]
+    account_matches_signer = (
+        bool(account_address)
+        and bool(signer_address)
+        and account_address.lower() == signer_address.lower()
+    )
+    identity: dict[str, Any] = {
+        "wallet_mode": wallet_mode,
+        "account_address_present": bool(account_address),
+        "signer_address_present": bool(signer_address),
+        "account_matches_signer": account_matches_signer,
+        "account_address_masked": _mask_address(account_address),
+        "account_address_hash": _address_hash(account_address),
+        "signer_address_masked": _mask_address(signer_address),
+        "signer_address_hash": _address_hash(signer_address),
+    }
+    if signer_error:
+        identity["signer_address_error"] = signer_error
+    return identity
 
 
 def _probe_venue_symbol(adapter: Any, symbol: str) -> str:
@@ -940,6 +1012,7 @@ async def _build_exchange_truth_async(
     all_open_orders: dict[str, dict[str, Any]] = {}
     all_position_probe_evidence: dict[str, dict[str, Any]] = {}
     all_open_order_probe_evidence: dict[str, dict[str, Any]] = {}
+    credential_identity: dict[str, dict[str, Any]] = {}
     available_venues: list[str] = []
     fetch_status: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
@@ -954,6 +1027,13 @@ async def _build_exchange_truth_async(
             all_open_orders[venue] = {"error": "no credentials available"}
             all_position_probe_evidence[venue] = {}
             all_open_order_probe_evidence[venue] = {}
+            if venue.lower() == "hyperliquid":
+                credential_identity[venue] = {
+                    "wallet_mode": "",
+                    "account_address_present": False,
+                    "signer_address_present": False,
+                    "account_matches_signer": False,
+                }
             fetch_status[venue] = {
                 "status": "no_credentials",
                 "positions_succeeded": [],
@@ -963,6 +1043,9 @@ async def _build_exchange_truth_async(
             }
             missing.append("{}_credentials".format(venue))
             continue
+
+        if venue.lower() == "hyperliquid":
+            credential_identity[venue] = _hyperliquid_credential_identity(credential)
 
         adapter = _create_readonly_adapter(venue, credential)
         if adapter is None:
@@ -1078,6 +1161,7 @@ async def _build_exchange_truth_async(
         "confidence": confidence,
         "positions": all_positions,
         "open_orders": all_open_orders,
+        "credential_identity": credential_identity,
         "position_probe_evidence": all_position_probe_evidence,
         "open_order_probe_evidence": all_open_order_probe_evidence,
         "has_nonzero_position": has_any_position,

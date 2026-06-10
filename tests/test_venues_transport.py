@@ -772,14 +772,13 @@ class TestHyperliquidLiveOrderNowSupported:
         assert adapter._transport._credential.account_address == expected
         assert adapter._credential.account_address == expected
 
-    def test_registry_account_wallet_uses_v1_wallet_address_over_account_env(self, monkeypatch):
-        from eth_account import Account
+    def test_registry_preserves_explicit_hyperliquid_account_address_for_exchange_truth(self, monkeypatch):
         from lightfee.venues.registry import build_adapter
 
         wallet_key = "0x" + "1" * 64
-        stale_account = "0x000000000000000000000000000000000000beef"
+        account_address = "0x000000000000000000000000000000000000beef"
         monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
-        monkeypatch.setenv("LF_TEST_HL_ACCOUNT", stale_account)
+        monkeypatch.setenv("LF_TEST_HL_ACCOUNT", account_address)
         vc = VenueConfig(venue="hyperliquid")
         vc.live.trade_credentials = TradeCredentials(
             wallet_private_key_env="LF_TEST_HL_WALLET",
@@ -788,10 +787,8 @@ class TestHyperliquidLiveOrderNowSupported:
 
         adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
 
-        expected = Account.from_key(wallet_key).address
         assert adapter._transport._credential.wallet_mode == "account_wallet"
-        assert adapter._transport._credential.account_address == expected
-        assert adapter._transport._credential.account_address != stale_account
+        assert adapter._transport._credential.account_address == account_address
 
     def test_registry_preserves_hyperliquid_api_wallet_mode_without_deriving_account(self, monkeypatch):
         from lightfee.venues.registry import build_adapter
@@ -883,23 +880,21 @@ class TestHyperliquidLiveOrderNowSupported:
         assert result["reason"] == "api_wallet_authorization_unverified"
 
     @pytest.mark.asyncio
-    async def test_hyperliquid_account_wallet_preflight_uses_v1_signer_account(self):
+    async def test_hyperliquid_account_wallet_preflight_fails_closed_on_signer_account_mismatch(self):
         from eth_account import Account
 
         wallet_key = "0x" + "1" * 64
-        stale_account = "0x000000000000000000000000000000000000beef"
+        configured_account = "0x000000000000000000000000000000000000beef"
         signer_account = Account.from_key(wallet_key).address
         cred = LiveCredential(
             wallet_private_key=wallet_key,
-            account_address=stale_account,
+            account_address=configured_account,
             wallet_mode="account_wallet",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
 
         def handler(request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content.decode())
-            assert body == {"type": "clearinghouseState", "user": signer_account}
-            return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            raise AssertionError("mismatched account_wallet preflight must fail before HTTP")
 
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
@@ -907,14 +902,15 @@ class TestHyperliquidLiveOrderNowSupported:
         finally:
             await transport.close()
 
-        assert result["status"] == "ok"
+        assert result["status"] == "failed"
         assert result["authorization_mode"] == "account_wallet"
-        assert result["wallet_matches_account"] is True
-        assert result["signer_matches_account"] is True
+        assert result["wallet_matches_account"] is False
+        assert result["signer_matches_account"] is False
         assert result["api_wallet_authorization_verified"] is False
-        assert result["authorization_verified"] is True
-        assert result["trading_capability_trusted"] is True
-        assert result["configured_account_address"] == signer_account
+        assert result["authorization_verified"] is False
+        assert result["trading_capability_trusted"] is False
+        assert result["reason"] == "account_wallet_signer_mismatch"
+        assert result["configured_account_address"] == configured_account
         assert result["signer_address"] == signer_account
 
     @pytest.mark.asyncio

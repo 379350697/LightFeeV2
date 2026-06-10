@@ -1849,12 +1849,88 @@ def test_exchange_truth_loads_hyperliquid_private_key_alias(monkeypatch):
     account = "0x" + "2" * 40
     monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_PRIVATE_KEY", private_key)
     monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS", account)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_WALLET_MODE", "agent_wallet")
 
     credential = dl._load_venue_credential("hyperliquid")
 
     assert credential is not None
     assert credential.wallet_private_key == private_key
     assert credential.account_address == account
+    assert credential.wallet_mode == "api_wallet"
+
+
+def test_exchange_truth_hyperliquid_queries_configured_account_when_signer_differs(monkeypatch):
+    import asyncio
+    import httpx
+    from scripts import diagnose_live as dl
+
+    private_key = "0x" + "1" * 64
+    account = "0x" + "2" * 40
+    seen_users: list[str] = []
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_PRIVATE_KEY", private_key)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS", account)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_WALLET_MODE", "agent_wallet")
+
+    original_create = dl._create_readonly_adapter
+
+    def create_adapter(venue, credential):
+        adapter = original_create(venue, credential)
+        assert adapter is not None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info" and body.get("type") == "clearinghouseState":
+                seen_users.append(body["user"])
+                if body["user"].lower() == account.lower():
+                    return httpx.Response(
+                        200,
+                        json={
+                            "assetPositions": [
+                                {
+                                    "position": {
+                                        "coin": "OP",
+                                        "szi": "-397.9",
+                                        "entryPx": "0.10286",
+                                    }
+                                }
+                            ],
+                            "marginSummary": {},
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={"assetPositions": [], "marginSummary": {}},
+                )
+            if request.url.path == "/info" and body.get("type") == "openOrders":
+                seen_users.append(body["user"])
+                return httpx.Response(200, json=[])
+            raise AssertionError(f"unexpected request: {request.url.path} {body}")
+
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return adapter
+
+    monkeypatch.setattr(dl, "_create_readonly_adapter", create_adapter)
+
+    result = asyncio.run(dl._build_exchange_truth_async(
+        runtime_dir="/unused",
+        symbols=[],
+        venues=["hyperliquid"],
+    ))
+
+    assert seen_users
+    assert set(seen_users) == {account}
+    assert result["available"] is True
+    assert result["confidence"] == "high"
+    assert result["has_nonzero_position"] is True
+    assert result["credential_identity"]["hyperliquid"]["wallet_mode"] == "api_wallet"
+    assert result["credential_identity"]["hyperliquid"]["account_matches_signer"] is False
+    assert result["credential_identity"]["hyperliquid"]["account_address_masked"] == (
+        "0x2222...2222"
+    )
+    assert "account_address" not in result["credential_identity"]["hyperliquid"]
+    assert "wallet_private_key" not in result["credential_identity"]["hyperliquid"]
+    assert result["positions"]["hyperliquid"]["OPUSDT"]["quantity"] == 397.9
+    assert result["positions"]["hyperliquid"]["OPUSDT"]["side"].endswith("SELL")
 
 
 def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):

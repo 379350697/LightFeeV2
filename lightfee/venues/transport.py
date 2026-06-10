@@ -122,14 +122,7 @@ def _normalize_hyperliquid_credential(credential: LiveCredential) -> LiveCredent
     wallet_mode = _normalize_hyperliquid_wallet_mode(credential.wallet_mode)
     if wallet_mode != credential.wallet_mode:
         credential = replace(credential, wallet_mode=wallet_mode)
-    if wallet_mode == "account_wallet" and credential.wallet_private_key:
-        return replace(
-            credential,
-            account_address=_derive_hyperliquid_account_address(
-                credential.wallet_private_key
-            ),
-        )
-    if wallet_mode == "api_wallet" and not credential.account_address:
+    if wallet_mode == "api_wallet":
         return credential
     if credential.account_address or not credential.wallet_private_key:
         return credential

@@ -12,6 +12,11 @@ evidence must map to the matrix before runtime code changes.
 ## Stable Fingerprints
 
 - Local state shows no open/pending work while exchange truth has nonzero positions.
+- Hyperliquid configured account has nonzero positions, but
+  `clearinghouseState` queried with the signer/API-wallet address returns empty
+  `assetPositions`.
+- `exchange_truth.credential_identity.hyperliquid.account_matches_signer=false`
+  appears with a flat Hyperliquid position report.
 - `stale_accepted_order`
 - planned hedge client order id queried before submit.
 - `pending_entry` cleared from momentary flat position snapshots.
@@ -151,6 +156,10 @@ owner becomes blocking `unpaired_live_position`.
   proves account/venue capacity is exhausted, V2 must block new entries through
   that venue before maker submit, not discover the same condition after another
   maker exposure.
+- Hyperliquid API/agent wallets are signers, not proof of the account whose
+  positions must be read. Exchange-truth position probes must query the
+  configured master/sub-account address; signer-address `assetPositions=[]` is
+  not flat account truth when the signer differs from the account.
 - V1 pending-close reconciliation can continue as background accounting after
   lifecycle close when private position truth is confirmed. It must not force
   normal lifecycle risk-only solely because fill/PnL reconciliation is still
@@ -198,6 +207,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-09 | Live-artifact recovery account-truth release | deployed/cloud verified | CL-060 closes the post-`b2d0706` production follow-up where the old `unpaired_live_position` blocker remained despite all-account diagnose truth proving flat/no-open-orders. Runtime now uses account-level position and open-order truth to release historical live-artifact blockers after local work is gone, instead of relying on dirty candidate-symbol sweeps that can create unsupported-symbol evidence gaps. Cloud acceptance on `78a0feb` passed verifier and diagnose with all venues flat/no-open-orders. |
 | 2026-06-10 | Terminal no-fill maker open-order owner retention | fixed, deployed, cloud verified | CL-064 closes the `SUSHIUSDT` / `MEUSDT` recurrence where Bybit execution history/no-fill evidence and flat positions were treated as terminal while realtime open-order truth still showed matching maker orders. `_pending_entry_has_unresolved_maker_order()` and abort cleanup now require actual maker fill for the maker-completed fast path, query realtime open-order truth for terminal no-fill progress, retain pending when a matching open order exists or truth is unavailable, and allow flat abandon only when open-order truth explicitly has no match. Local verification passed focused terminal no-fill branches (`6 passed`), recovery core/ledger (`34 passed`), target regression (`609 passed`), compileall, and full pytest `3778 passed`, `9 skipped`, `1 warning`. Runtime commit `66a3688` was deployed and cloud verified: manifest critical files passed, services were active with `NRestarts=0`, verifier returned `ok=true` with no critical/warning issues, since-deploy diagnose returned `healthy` / `risk=low` / `gate_passed=true`, and all configured exchange truth was flat/no-open-orders. No manual order/cancel/runtime-state mutation was used. |
 | 2026-06-10 | PE-14 supervision stale-backlog terminality closure | fixed, deployed, cloud verified | Follow-up root closure for the same CL-064 risk window. The pending-entry terminalizer now owns the V1 supervision stale-clear decision: only zero-fill, no inflight hedge, no cancel requested, resting passive order, progress fetch absent, and live truth proving no open order/position may remove pending. Matching live open order, live position, unavailable truth, any fill, inflight hedge, cancel request, non-resting progress, or existing progress retains pending. RED/GREEN coverage is in `tests/engine/test_pending_entry_terminalizer.py -k supervision_stale_clear` (`4 passed`), the full terminalizer suite reports `11 passed`, final full pytest reports `3782 passed`, `9 skipped`, `1 warning`, and production acceptance for deployed runtime `66a3688` passed with all-account flat/no-open-orders truth. |
+| 2026-06-10 | Hyperliquid exchange-truth account identity false-green | fixed locally, deploy pending | CL-065 closes the root cause where diagnose queried the signer/API-wallet address instead of the configured Hyperliquid account and therefore reported empty `assetPositions` while the configured account had 18 nonzero positions. V2 now preserves explicit account addresses, loads wallet mode in diagnose, treats API/agent wallets as signers for the configured account, fails closed on account-wallet signer/account mismatch, and emits sanitized credential identity so future account/signer drift is visible. Local related diagnose/health gates report `104 passed`, full venue transport reports `401 passed`, and GitNexus detect-changes is low risk with no affected processes. |
 
 ## Recurrences
 
@@ -222,6 +232,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-08 | Aster private truth signature failures with V3 API-wallet credentials | fixed, deployed through main | User-provided Aster screenshots showed an authorized Pro API V3 wallet with `Read, Perp Trade, Spot Trade` permission and prior fills, while cloud private truth failed on old Binance-HMAC `/fapi/v1|v2|v4` paths with invalid signature. Root cause is integration drift: Aster private truth/order surfaces must use dedicated V3 Web3 signing (`fapi3`, `nonce`, `signer`, EIP-712 `signature`). V2 now isolates Aster private transport from Binance HMAC while leaving public Local-L2/FAPI market data unchanged. Review closure pins `accountWithJoinMargin`, capability truth without private WS health, and Aster V3 order truth paths. Follow-up startup safety and host fixes are in main (`9d037f5`, `6054c47`) and the deployed manifest line. | |
 | 2026-06-08 | production issues 8-9 live mismatch post-cleanup truth | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-10 | `SUSHIUSDT`, `MEUSDT` Bybit terminal no-fill maker open orders | `66a3688` | fixed, deployed, cloud verified | [daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention](../daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention) |
+| 2026-06-10 | Hyperliquid configured account 18 nonzero positions hidden by signer-address flat probe | working tree | fixed locally, deploy pending | [daily/2026-06-10.md#cluster-cl-065-hyperliquid-exchange-truth-account-identity-false-green](../daily/2026-06-10.md#cluster-cl-065-hyperliquid-exchange-truth-account-identity-false-green) |
 
 ## Regression Harness
 
@@ -288,7 +299,12 @@ owner becomes blocking `unpaired_live_position`.
     still reports nonzero size.
 22. Confirm supervisor risk snapshots include venues from pending-close
     reconciliation snapshots even after `open_positions` is empty.
-23. If production is flat/no-open-orders but `unpaired_live_position` remains
+23. For Hyperliquid, compare the configured account address against the signer
+    address before accepting flat account truth. If they differ, confirm
+    exchange truth queried the configured account and inspect sanitized
+    `credential_identity`; signer-address empty `assetPositions` is not proof
+    that the trading account is flat.
+24. If production is flat/no-open-orders but `unpaired_live_position` remains
     latched, verify runtime live-position housekeeping emitted a core
     `RUNNING_CLEAN` clear after `no_live_positions`. Do not use position-flat
     truth to clear `orphan_maker_order`; require open-order truth for that
