@@ -34,9 +34,15 @@ open-order truth explicitly has no match. It also latches operator
 fail-closed during abort fail-closed cleanup. Local verification passed
 focused terminal no-fill branches (`6 passed`), recovery core/ledger
 (`34 passed`), target regression (`609 passed`), compileall, and full pytest
-`3778 passed`, `9 skipped`, `1 warning`. No production order/cancel/runtime
-state mutation or cloud deployment happened in this pass, so production
-acceptance remains pending.
+`3778 passed`, `9 skipped`, `1 warning`. Follow-up PE-14 coverage now routes
+V1 supervision stale-backlog clear through `PendingEntryTerminalizer`: only
+zero-fill/resting/progress-absent/no-live-artifact may clear, while fills,
+inflight hedge, cancel requests, non-resting/progress evidence, live artifacts,
+or unavailable truth retain pending. Follow-up RED/GREEN reports
+`4 passed`, the terminalizer suite reports `11 passed`, and the final full
+suite reports `3782 passed`, `9 skipped`, `1 warning`. No production
+order/cancel/runtime state mutation or cloud deployment happened in this pass,
+so production acceptance remains pending.
 Full evidence is recorded in
 [`daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention`](daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention).
 
