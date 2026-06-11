@@ -683,11 +683,20 @@ def _hyperliquid_balance_view_payload(
     account_address: str,
     perp_raw: Any,
     spot_raw: Any,
+    user_abstraction: str = "",
 ) -> dict[str, Any]:
     perp = perp_raw if isinstance(perp_raw, dict) else {}
     spot_balances = _hyperliquid_spot_balances(spot_raw)
     usdc_total = sum(
         float(item.get("total") or 0.0)
+        for item in spot_balances
+        if str(item.get("coin", "") or "").upper() == "USDC"
+    )
+    usdc_available = sum(
+        max(
+            float(item.get("total") or 0.0) - float(item.get("hold") or 0.0),
+            0.0,
+        )
         for item in spot_balances
         if str(item.get("coin", "") or "").upper() == "USDC"
     )
@@ -712,7 +721,14 @@ def _hyperliquid_balance_view_payload(
         total_margin_used = _optional_float(margin.get("totalMarginUsed"))
     withdrawable = _optional_float(perp.get("withdrawable"))
 
-    if (withdrawable or 0.0) <= 1e-9 and usdc_total > 1e-9:
+    abstraction = str(user_abstraction or "")
+    if (
+        (withdrawable or 0.0) <= 1e-9
+        and abstraction == "unifiedAccount"
+        and usdc_available > 1e-9
+    ):
+        classification = "unified_collateral_available"
+    elif (withdrawable or 0.0) <= 1e-9 and usdc_total > 1e-9:
         classification = "usdc_present_margin_view_zero"
     elif (withdrawable or 0.0) <= 1e-9:
         classification = "margin_view_zero"
@@ -721,6 +737,7 @@ def _hyperliquid_balance_view_payload(
 
     return {
         "classification": classification,
+        "user_abstraction": abstraction,
         "account_address_masked": _mask_address(account_address),
         "account_address_hash": _address_hash(account_address),
         "perp": {
@@ -731,6 +748,7 @@ def _hyperliquid_balance_view_payload(
         },
         "spot": {
             "usdc_total": usdc_total,
+            "usdc_available": usdc_available,
             "balances": spot_balances[:20],
         },
     }
@@ -753,6 +771,17 @@ async def _fetch_hyperliquid_balance_view(
             body={"type": "clearinghouseState", "user": account_address},
             private=True,
         )
+        user_abstraction = ""
+        try:
+            raw_abstraction = await transport._request(
+                "POST",
+                "/info",
+                body={"type": "userAbstraction", "user": account_address},
+                private=True,
+            )
+            user_abstraction = str(raw_abstraction or "")
+        except Exception:
+            user_abstraction = "unavailable"
         spot_raw = await transport._request(
             "POST",
             "/info",
@@ -763,6 +792,7 @@ async def _fetch_hyperliquid_balance_view(
             account_address=account_address,
             perp_raw=perp_raw,
             spot_raw=spot_raw,
+            user_abstraction=user_abstraction,
         )
     except Exception as exc:
         return {
@@ -2412,6 +2442,7 @@ def _build_production_acceptance_gate(
     bulk_health_diagnostic_count = 0
     contained_admission_count = 0
     hyperliquid_margin_view_zero_count = 0
+    hyperliquid_unified_collateral_available_count = 0
     hyperliquid_balance_view_advice: list[str] = []
     hyperliquid_balance_view_details: list[dict[str, Any]] = []
     required_position_truth_unavailable_count = 0
@@ -2506,14 +2537,10 @@ def _build_production_acceptance_gate(
                             and (required_margin or 0.0) > 0.0
                         )
                     ):
-                        hyperliquid_margin_view_zero_count += 1
                         conclusion = (
                             balance_classification
                             or "margin_view_zero"
                         )
-                        exception_conclusions[
-                            "hyperliquid_margin_view_zero"
-                        ] = conclusion
                         spot = hyperliquid_balance.get("spot") or {}
                         perp = hyperliquid_balance.get("perp") or {}
                         detail = {
@@ -2532,6 +2559,12 @@ def _build_production_acceptance_gate(
                             "spot_usdc_total": _optional_float(
                                 spot.get("usdc_total")
                             ),
+                            "spot_usdc_available": _optional_float(
+                                spot.get("usdc_available")
+                            ),
+                            "user_abstraction": str(
+                                hyperliquid_balance.get("user_abstraction", "") or ""
+                            ),
                             "perp_withdrawable": _optional_float(
                                 perp.get("withdrawable")
                             ),
@@ -2540,19 +2573,35 @@ def _build_production_acceptance_gate(
                             ),
                         }
                         hyperliquid_balance_view_details.append(detail)
-                        if (
-                            conclusion == "usdc_present_margin_view_zero"
-                            and not hyperliquid_balance_view_advice
-                        ):
-                            hyperliquid_balance_view_advice.append(
-                                "Hyperliquid USDC is present, but the "
-                                "admission margin view reads zero available "
-                                "margin; do not assume a spot-to-perp "
-                                "transfer is possible. Check the configured "
-                                "account address, API wallet parent account, "
-                                "collateral eligibility, and the balance "
-                                "source used by the admission prefilter."
-                            )
+                        if conclusion == "unified_collateral_available":
+                            hyperliquid_unified_collateral_available_count += 1
+                            exception_conclusions[
+                                "hyperliquid_unified_collateral_available"
+                            ] = conclusion
+                            if not hyperliquid_balance_view_advice:
+                                hyperliquid_balance_view_advice.append(
+                                    "Hyperliquid unified collateral is available "
+                                    "from spot USDC. If entries are still "
+                                    "blocked, check trading preflight, candidate "
+                                    "freshness, and exchange reject truth."
+                                )
+                        else:
+                            hyperliquid_margin_view_zero_count += 1
+                            exception_conclusions[
+                                "hyperliquid_margin_view_zero"
+                            ] = conclusion
+                            if (
+                                conclusion == "usdc_present_margin_view_zero"
+                                and not hyperliquid_balance_view_advice
+                            ):
+                                hyperliquid_balance_view_advice.append(
+                                    "Hyperliquid USDC is present, but the "
+                                    "admission margin view reads zero available "
+                                    "margin. Check the configured account "
+                                    "address, API wallet parent account, "
+                                    "collateral eligibility, and the balance "
+                                    "source used by the admission prefilter."
+                                )
 
         if kind in ("runtime.local_l2_sequence_gap_rebuild", "runtime.local_l2_snapshot_error"):
             if _has_official_sequence_rebuild_evidence(payload):
@@ -2721,6 +2770,9 @@ def _build_production_acceptance_gate(
         "nonblocking_health_diagnostic": bulk_health_diagnostic_count,
         "contained_admission": contained_admission_count,
         "hyperliquid_margin_view_zero": hyperliquid_margin_view_zero_count,
+        "hyperliquid_unified_collateral_available": (
+            hyperliquid_unified_collateral_available_count
+        ),
         "resolved_order_truth_gap": resolved_order_truth_gap_count,
         "blocking_required_truth": (
             required_position_truth_unavailable_count
@@ -2754,6 +2806,9 @@ def _build_production_acceptance_gate(
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,
         "hyperliquid_margin_view_zero_count": hyperliquid_margin_view_zero_count,
+        "hyperliquid_unified_collateral_available_count": (
+            hyperliquid_unified_collateral_available_count
+        ),
         "hyperliquid_balance_view_details": hyperliquid_balance_view_details[:10],
         "hyperliquid_balance_view_advice": hyperliquid_balance_view_advice,
         "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
@@ -2994,7 +3049,23 @@ def _build_conclusion(
         if production_acceptance_gate is not None
         else []
     )
-    if balance_view_advice:
+    unified_collateral_count = (
+        int(
+            production_acceptance_gate.get(
+                "hyperliquid_unified_collateral_available_count",
+                0,
+            )
+            or 0
+        )
+        if production_acceptance_gate is not None
+        else 0
+    )
+    if unified_collateral_count > 0:
+        summary_parts.append(
+            "Hyperliquid unified collateral available; check trading preflight, "
+            "candidate freshness, and exchange reject truth"
+        )
+    elif balance_view_advice:
         summary_parts.append(
             "Hyperliquid USDC present but admission margin view reads zero"
         )

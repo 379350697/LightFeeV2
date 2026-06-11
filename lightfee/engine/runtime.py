@@ -348,7 +348,11 @@ class LiveRuntime:
             return LiveRuntime._entry_admission_evidence(
                 "insufficient_margin_admission_blocked"
             )
-        if venue == Venue.HYPERLIQUID and "insufficient margin" in text:
+        if venue == Venue.HYPERLIQUID and (
+            "insufficient margin" in text
+            or "perpmarginrejected" in text
+            or "insufficientspotbalancerejected" in text
+        ):
             return {
                 "reason": "insufficient_margin_admission_blocked",
                 "official_doc_url": LiveRuntime._HYPERLIQUID_ERROR_DOC_URL,
@@ -547,6 +551,9 @@ class LiveRuntime:
         required_initial_margin_quote: float,
         entry_notional_quote: float,
         raw_error: str = "",
+        balance_classification: str = "",
+        user_abstraction: str = "",
+        spot_usdc_available: float | None = None,
     ) -> dict:
         evidence = self._entry_admission_evidence(reason)
         try:
@@ -589,6 +596,12 @@ class LiveRuntime:
         }
         if raw_error:
             payload["raw_error"] = raw_error[:500]
+        if balance_classification:
+            payload["balance_classification"] = balance_classification
+        if user_abstraction:
+            payload["user_abstraction"] = user_abstraction
+        if spot_usdc_available is not None:
+            payload["spot_usdc_available"] = spot_usdc_available
         return payload
 
     def _append_hyperliquid_balance_unavailable_event(
@@ -688,6 +701,11 @@ class LiveRuntime:
             available_balance_quote=available,
             required_initial_margin_quote=required_margin,
             entry_notional_quote=entry_notional,
+            balance_classification=str(
+                getattr(snapshot, "balance_classification", "") or ""
+            ),
+            user_abstraction=str(getattr(snapshot, "user_abstraction", "") or ""),
+            spot_usdc_available=getattr(snapshot, "spot_usdc_available", None),
         )
         self._record_symbol_admission_block(
             venue=Venue.HYPERLIQUID,
@@ -800,6 +818,17 @@ class LiveRuntime:
                         available_balance_quote=available,
                         required_initial_margin_quote=required_margin,
                         entry_notional_quote=entry_notional,
+                        balance_classification=str(
+                            getattr(snapshot, "balance_classification", "") or ""
+                        ),
+                        user_abstraction=str(
+                            getattr(snapshot, "user_abstraction", "") or ""
+                        ),
+                        spot_usdc_available=getattr(
+                            snapshot,
+                            "spot_usdc_available",
+                            None,
+                        ),
                     )
                 )
 

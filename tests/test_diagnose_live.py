@@ -450,7 +450,7 @@ def test_run_diagnose_can_report_code_side_blockers_without_changing_gate(monkey
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
+def test_production_gate_classifies_hyperliquid_unified_collateral_as_available():
     from scripts import diagnose_live as dl
 
     events = [
@@ -487,14 +487,16 @@ def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
         "has_open_order": False,
         "balance_views": {
             "hyperliquid": {
-                "classification": "usdc_present_margin_view_zero",
+                "classification": "unified_collateral_available",
                 "perp": {
                     "withdrawable": 0.0,
                     "account_value": 0.0,
                 },
                 "spot": {
                     "usdc_total": 145.863168,
+                    "usdc_available": 145.863168,
                 },
+                "user_abstraction": "unifiedAccount",
             }
         },
     }
@@ -502,18 +504,17 @@ def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
     gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
 
     assert gate["contained_admission_count"] == 1
-    assert gate["hyperliquid_margin_view_zero_count"] == 1
+    assert gate["hyperliquid_margin_view_zero_count"] == 0
+    assert gate["hyperliquid_unified_collateral_available_count"] == 1
     assert gate["exception_conclusions"]["contained_admission"] == "contained_admission"
     assert (
-        gate["exception_conclusions"]["hyperliquid_margin_view_zero"]
-        == "usdc_present_margin_view_zero"
+        gate["exception_conclusions"]["hyperliquid_unified_collateral_available"]
+        == "unified_collateral_available"
     )
     expected_advice = (
-        "Hyperliquid USDC is present, but the admission margin view reads zero "
-        "available margin; do not assume a spot-to-perp transfer is possible. "
-        "Check the configured account address, API wallet parent account, "
-        "collateral eligibility, and the balance source used by the admission "
-        "prefilter."
+        "Hyperliquid unified collateral is available from spot USDC. If "
+        "entries are still blocked, check trading preflight, candidate "
+        "freshness, and exchange reject truth."
     )
     assert gate["hyperliquid_balance_view_advice"] == [expected_advice]
     assert gate["blocking_reasons"] == []
@@ -534,10 +535,64 @@ def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
         gate,
     )
     assert (
-        "Hyperliquid USDC present but admission margin view reads zero"
-        in conclusion["summary"]
-    )
+        "Hyperliquid unified collateral available; check trading preflight, "
+        "candidate freshness, and exchange reject truth"
+    ) in conclusion["summary"]
     assert expected_advice in conclusion["next_actions"]
+
+
+def test_hyperliquid_balance_view_keeps_non_unified_spot_usdc_fail_closed():
+    from scripts import diagnose_live as dl
+
+    payload = dl._hyperliquid_balance_view_payload(
+        account_address="0x" + "2" * 40,
+        perp_raw={
+            "withdrawable": "0",
+            "marginSummary": {"accountValue": "0", "totalMarginUsed": "0"},
+            "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"},
+        },
+        spot_raw={
+            "balances": [
+                {
+                    "coin": "USDC",
+                    "total": "145.863168",
+                    "hold": "0",
+                }
+            ]
+        },
+        user_abstraction="normalAccount",
+    )
+
+    assert payload["classification"] == "usdc_present_margin_view_zero"
+    assert payload["spot"]["usdc_available"] == pytest.approx(145.863168)
+    assert payload["user_abstraction"] == "normalAccount"
+
+
+def test_hyperliquid_balance_view_keeps_empty_unified_spot_fail_closed():
+    from scripts import diagnose_live as dl
+
+    payload = dl._hyperliquid_balance_view_payload(
+        account_address="0x" + "2" * 40,
+        perp_raw={
+            "withdrawable": "0",
+            "marginSummary": {"accountValue": "0", "totalMarginUsed": "0"},
+            "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"},
+        },
+        spot_raw={
+            "balances": [
+                {
+                    "coin": "USDC",
+                    "total": "0",
+                    "hold": "0",
+                }
+            ]
+        },
+        user_abstraction="unifiedAccount",
+    )
+
+    assert payload["classification"] == "margin_view_zero"
+    assert payload["spot"]["usdc_available"] == pytest.approx(0.0)
+    assert payload["user_abstraction"] == "unifiedAccount"
 
 
 def test_run_diagnose_acceptance_gate_blocks_required_position_truth_unavailable(monkeypatch):
@@ -2265,7 +2320,7 @@ def test_exchange_truth_hyperliquid_queries_configured_account_when_signer_diffe
     assert result["positions"]["hyperliquid"]["OPUSDT"]["side"].endswith("SELL")
 
 
-def test_exchange_truth_hyperliquid_reports_usdc_present_when_margin_view_zero(monkeypatch):
+def test_exchange_truth_hyperliquid_reports_unified_collateral_available(monkeypatch):
     import asyncio
     import httpx
     from scripts import diagnose_live as dl
@@ -2294,6 +2349,9 @@ def test_exchange_truth_hyperliquid_reports_usdc_present_when_margin_view_zero(m
                         "crossMarginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
                     },
                 )
+            if request.url.path == "/info" and body.get("type") == "userAbstraction":
+                assert body["user"] == account
+                return httpx.Response(200, json="unifiedAccount")
             if request.url.path == "/info" and body.get("type") == "spotClearinghouseState":
                 return httpx.Response(
                     200,
@@ -2324,10 +2382,12 @@ def test_exchange_truth_hyperliquid_reports_usdc_present_when_margin_view_zero(m
     ))
 
     balance = result["balance_views"]["hyperliquid"]
-    assert balance["classification"] == "usdc_present_margin_view_zero"
+    assert balance["classification"] == "unified_collateral_available"
+    assert balance["user_abstraction"] == "unifiedAccount"
     assert balance["perp"]["withdrawable"] == pytest.approx(0.0)
     assert balance["perp"]["account_value"] == pytest.approx(0.0)
     assert balance["spot"]["usdc_total"] == pytest.approx(145.863168)
+    assert balance["spot"]["usdc_available"] == pytest.approx(145.863168)
     assert balance["spot"]["balances"][0]["coin"] == "USDC"
     assert "account_address" not in balance
 

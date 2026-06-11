@@ -195,6 +195,26 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         runtime.journal.close()
 
 
+@pytest.mark.parametrize(
+    "reject_status",
+    ["perpMarginRejected", "insufficientSpotBalanceRejected"],
+)
+def test_hyperliquid_official_margin_reject_statuses_classify_as_admission_blocks(
+    reject_status: str,
+):
+    metadata = LiveRuntime._entry_admission_reject_metadata(
+        Venue.HYPERLIQUID,
+        reject_status,
+    )
+
+    assert metadata is not None
+    assert metadata["reason"] == "insufficient_margin_admission_blocked"
+    assert metadata["official_doc_url"] == (
+        "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses"
+    )
+    assert metadata["evidence_gap"] is False
+
+
 class FlatAdapter:
     async def fetch_position(self, symbol: str):
         return None
@@ -513,6 +533,9 @@ async def test_hyperliquid_scan_start_balance_prefilter_arms_venue_cooldown():
                 free=5.0,
                 locked=0.0,
                 observed_at_ms=now_ms,
+                balance_classification="unified_collateral_available",
+                user_abstraction="unifiedAccount",
+                spot_usdc_available=145.863168,
             )
         )
         runtime = LiveRuntime(
@@ -532,6 +555,9 @@ async def test_hyperliquid_scan_start_balance_prefilter_arms_venue_cooldown():
         assert cooldown["available_balance_quote"] == pytest.approx(5.0)
         assert cooldown["required_initial_margin_quote"] > 5.0
         assert cooldown["live_target_leverage"] == runtime.config.strategy.live_target_leverage
+        assert cooldown["balance_classification"] == "unified_collateral_available"
+        assert cooldown["user_abstraction"] == "unifiedAccount"
+        assert cooldown["spot_usdc_available"] == pytest.approx(145.863168)
         records = runtime.journal.read_all()
         event = [
             record["payload"] for record in records
@@ -540,6 +566,9 @@ async def test_hyperliquid_scan_start_balance_prefilter_arms_venue_cooldown():
         assert event["reason"] == "insufficient_margin_admission_prefiltered"
         assert event["source"] == "scan_start_balance_prefilter"
         assert event["evidence_gap"] is False
+        assert event["balance_classification"] == "unified_collateral_available"
+        assert event["user_abstraction"] == "unifiedAccount"
+        assert event["spot_usdc_available"] == pytest.approx(145.863168)
         runtime.journal.close()
 
 
@@ -583,6 +612,9 @@ async def test_hyperliquid_candidate_balance_prefilter_prunes_only_underfunded_c
         assert sample["available_balance_quote"] == pytest.approx(20.0)
         assert sample["entry_notional_quote"] == pytest.approx(100.0)
         assert sample["required_initial_margin_quote"] > 20.0
+        assert "balance_classification" not in sample
+        assert "user_abstraction" not in sample
+        assert "spot_usdc_available" not in sample
         payload = [
             record["payload"] for record in runtime.journal.read_all()
             if record["kind"] == "runtime.entry_admission_venue_degraded"

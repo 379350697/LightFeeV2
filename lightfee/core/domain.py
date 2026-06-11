@@ -193,6 +193,9 @@ class AccountBalanceSnapshot:
     free: float
     locked: float
     observed_at_ms: int
+    balance_classification: str = ""
+    user_abstraction: str = ""
+    spot_usdc_available: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

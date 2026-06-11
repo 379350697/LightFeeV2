@@ -17,6 +17,35 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Hyperliquid unified-collateral diagnostic closure, 2026-06-11:
+production blocker attribution could still report Hyperliquid
+`insufficient_margin_admission_prefiltered` as an account/admission blocker
+when the account was actually a unified account with available spot USDC
+collateral. The transport admission path already uses the configured
+Hyperliquid account address, checks `userAbstraction`, and only falls back to
+`spotClearinghouseState` for `unifiedAccount`; a new guard test freezes the
+non-unified fail-closed behavior and the snapshot now carries
+`balance_classification`, `user_abstraction`, and `spot_usdc_available` so
+runtime-generated prefilter samples can be analyzed with the same resolver
+truth. The local fix synchronizes
+`scripts/diagnose_live.py` and `scripts/analyze_production_blockers.py` with
+that resolver: diagnose now queries `userAbstraction`, classifies
+`withdrawable=0 + unifiedAccount + spot USDC available` as
+`unified_collateral_available`, removes the old transfer-advice direction for
+that case, and the exclude-strategy/exclude-liquidity offline view no
+longer counts those samples as `account/admission` blockers. Runtime admission
+reject classification now also recognizes official Hyperliquid final reject
+statuses `perpMarginRejected` and `insufficientSpotBalanceRejected`, recording
+them as exchange-truth insufficient-margin admission blocks instead of an
+unknown error. V1 comparison
+preserves the account-truth boundary: exchange/user state is queried with the
+configured actual account address, while signer/API wallet identity is not
+treated as account truth. Hyperliquid official docs confirm that info queries
+must use the actual master/sub-account address and that `orderStatus` exposes
+final reject truths such as `perpMarginRejected`.
+Full evidence is recorded in
+[`daily/2026-06-11.md#cluster-cl-069-hyperliquid-unified-collateral-diagnostic-closure`](daily/2026-06-11.md#cluster-cl-069-hyperliquid-unified-collateral-diagnostic-closure).
+
 Latest code-side no-entry blocker attribution closure, 2026-06-11: the
 previous deployment window had only one real open over roughly six to seven
 hours, but after filtering strategy plus OI/liquidity blockers the remaining

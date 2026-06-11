@@ -1449,7 +1449,6 @@ class TestProductionBlockerAnalyzer:
             "strategy": 85,
         }
         assert view["category_counts"] == {
-            "account/admission": 2,
             "code_data_freshness": 52,
             "exchange_truth_probe": 1,
             "order_truth_gap": 1,
@@ -1460,7 +1459,6 @@ class TestProductionBlockerAnalyzer:
             "bulk_position_probe_timeout": 1,
             "entry_ws_bbo_quote_lease_budget_exhausted": 8,
             "invalid_quote": 50,
-            "insufficient_margin_admission_prefiltered": 2,
             "last_good_sidecar_revalidate_required": 2,
         }
 
@@ -1584,6 +1582,26 @@ def _code_side_blocker_incident_records():
                     "entry_admission_blocker_counts": {
                         "insufficient_margin_admission_prefiltered": 2,
                     },
+                    "entry_admission_venue_degraded_samples": [
+                        {
+                            "venue": "hyperliquid",
+                            "reason": "insufficient_margin_admission_prefiltered",
+                            "available_balance_quote": 0.0,
+                            "required_initial_margin_quote": 12.5,
+                            "balance_classification": "unified_collateral_available",
+                            "spot_usdc_available": 145.863168,
+                            "user_abstraction": "unifiedAccount",
+                        },
+                        {
+                            "venue": "hyperliquid",
+                            "reason": "insufficient_margin_admission_prefiltered",
+                            "available_balance_quote": 0.0,
+                            "required_initial_margin_quote": 12.5,
+                            "balance_classification": "unified_collateral_available",
+                            "spot_usdc_available": 145.863168,
+                            "user_abstraction": "unifiedAccount",
+                        },
+                    ],
                 },
             },
             {

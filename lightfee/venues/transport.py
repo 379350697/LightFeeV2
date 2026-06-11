@@ -3357,6 +3357,13 @@ class VenueTransport(MarketDataClient):
                 locked = 0.0
                 if account_value is not None:
                     locked = max(account_value - withdrawable, 0.0)
+                balance_classification = (
+                    "margin_view_available"
+                    if withdrawable > 1e-9
+                    else "margin_view_zero"
+                )
+                user_abstraction = ""
+                spot_usdc_available = None
                 if withdrawable <= 1e-9:
                     abstraction = await self._request(
                         "POST",
@@ -3367,6 +3374,7 @@ class VenueTransport(MarketDataClient):
                         },
                         private=True,
                     )
+                    user_abstraction = str(abstraction or "")
                     if abstraction == "unifiedAccount":
                         spot_raw = await self._request(
                             "POST",
@@ -3380,15 +3388,20 @@ class VenueTransport(MarketDataClient):
                         spot_available = _hyperliquid_spot_usdc_available(spot_raw)
                         if spot_available is not None:
                             available, held = spot_available
+                            spot_usdc_available = available
                             if available > withdrawable:
                                 withdrawable = available
                                 locked = held
+                                balance_classification = "unified_collateral_available"
                 return AccountBalanceSnapshot(
                     venue=Venue.HYPERLIQUID,
                     asset="USDC",
                     free=max(withdrawable, 0.0),
                     locked=locked,
                     observed_at_ms=now_ms,
+                    balance_classification=balance_classification,
+                    user_abstraction=user_abstraction,
+                    spot_usdc_available=spot_usdc_available,
                 )
             return None
         except TransportError:

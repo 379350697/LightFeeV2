@@ -208,6 +208,54 @@ def _is_nonblocking_bulk_probe(payload: dict[str, Any]) -> bool:
     return not truth_required_by and payload.get("blocking") is not True
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_hyperliquid_unified_collateral_sample(sample: Any) -> bool:
+    if not isinstance(sample, dict):
+        return False
+    venue = str(sample.get("venue", "") or "").lower()
+    classification = str(
+        sample.get("balance_classification")
+        or sample.get("classification")
+        or sample.get("collateral_classification")
+        or ""
+    )
+    user_abstraction = str(sample.get("user_abstraction", "") or "")
+    spot_available = _float_or_none(
+        sample.get("spot_usdc_available")
+        if sample.get("spot_usdc_available") is not None
+        else sample.get("usdc_available")
+    )
+    return (
+        venue == "hyperliquid"
+        and classification == "unified_collateral_available"
+        and user_abstraction == "unifiedAccount"
+        and spot_available is not None
+        and spot_available > 1e-9
+    )
+
+
+def _unified_collateral_admission_counts(payload: dict[str, Any]) -> Counter[str]:
+    ignored: Counter[str] = Counter()
+    for sample_key in (
+        "entry_admission_venue_degraded_samples",
+        "entry_admission_blocker_samples",
+    ):
+        for sample in payload.get(sample_key, []) or []:
+            if not _is_hyperliquid_unified_collateral_sample(sample):
+                continue
+            reason = str(
+                sample.get("reason") or "insufficient_margin_admission_prefiltered"
+            )
+            ignored[reason] += 1
+    return ignored
+
+
 def _code_side_view(
     *,
     category_counts: Counter[str],
@@ -266,6 +314,7 @@ def _record_code_side_blocker(
             if reason_text in {"invalid_quote", "quote_stale", "missing_quote"}:
                 _add_count(category_counts, "code_data_freshness", count)
                 _add_count(reason_counts, reason_text, count)
+        unified_collateral_ignored = _unified_collateral_admission_counts(payload)
         for admission_key in (
             "entry_admission_blocker_counts",
             "entry_admission_venue_degraded_counts",
@@ -275,8 +324,19 @@ def _record_code_side_blocker(
                 continue
             for reason, count in admission_totals.items():
                 reason_text = str(reason or "entry_admission_blocked")
-                _add_count(category_counts, "account/admission", count)
-                _add_count(reason_counts, reason_text, count)
+                try:
+                    effective_count = int(count or 0)
+                except (TypeError, ValueError):
+                    effective_count = 0
+                ignored_count = min(
+                    effective_count,
+                    unified_collateral_ignored.get(reason_text, 0),
+                )
+                if ignored_count > 0:
+                    unified_collateral_ignored[reason_text] -= ignored_count
+                    effective_count -= ignored_count
+                _add_count(category_counts, "account/admission", effective_count)
+                _add_count(reason_counts, reason_text, effective_count)
         if exclude_strategy:
             strategy_counts = payload.get("strategy_blocker_counts", {}) or {}
             strategy_total = payload.get("strategy_blocked_count")
