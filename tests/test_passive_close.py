@@ -3196,10 +3196,14 @@ class TestFallbackResidualReal:
         )
 
         assert result.success is False
+        assert result.truth_gap is True
         assert result.residual == pytest.approx(10.0)
+        assert result.accepted_order_id == "ack-oid"
+        assert result.accepted_client_order_id == "ack-cid"
+        records = journal.read_all()
         payload = [
-            record["payload"] for record in journal.read_all()
-            if record["kind"] == "exit.passive_close_hedge_error"
+            record["payload"] for record in records
+            if record["kind"] == "exit.passive_close_hedge_ack_pending_reconcile"
         ][-1]
         assert payload["order_ack_only"] is True
         assert payload["accepted_order_id"] == "ack-oid"
@@ -3210,6 +3214,219 @@ class TestFallbackResidualReal:
         assert payload["next_action"] == "reconcile_accepted_order_or_probe_live_position"
         assert payload["fill_reconciliation_attempted"] is True
         assert payload["fill_reconciliation_result"] == "missing_or_zero_fill"
+        kinds = [record["kind"] for record in records]
+        assert "exit.accepted_order_truth_gap_registered" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
+        assert len(state.pending_close_reconciliations) == 1
+        assert state.pending_close_reconciliations[0]["kind"] == "accepted_order_truth_gap"
+
+    def test_ack_only_terminal_hedge_live_flat_resolves_without_deadline_fail_closed(self):
+        """Bybit ACK-only close is resolved by live-flat truth, not by fail-closed compensation."""
+        journal = _open_journal()
+
+        ack_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-oid) but fill not confirmed",
+        )
+        ack_error.order_ack_only = True
+        ack_error.accepted_order_id = "ack-oid"
+        ack_error.accepted_client_order_id = "ack-cid"
+        ack_error.fill_confirmation_missing_fields = ["executedQty", "cumQty"]
+        ack_error.exchange_response_body = (
+            '{"retCode":0,"result":{"orderId":"ack-oid","orderLinkId":"ack-cid"}}'
+        )
+
+        maker = _mock_adapter_passive_ok(Venue.OKX)
+        maker.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.OKX,
+            symbol="KATUSDT",
+            side=Side.SELL,
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            cumulative_quantity=7000.0,
+            average_price=0.00679,
+            state=PassiveOrderState.FILLED,
+        ))
+        maker.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="KATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        maker.fetch_open_orders = AsyncMock(return_value=[])
+
+        hedge = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge.place_order = AsyncMock(side_effect=ack_error)
+        hedge.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        hedge.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="KATUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3001,
+        ))
+        hedge.fetch_open_orders = AsyncMock(return_value=[])
+
+        executor = PassiveCloseExecutor({Venue.OKX: maker, Venue.BYBIT: hedge}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.00679)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.00678, 0.0068))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-katusdt-ack-flat",
+            symbol="KATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=7000.0,
+            short_quantity=7000.0,
+            matched_quantity=7000.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=7000.0,
+            chunk_quantities=[7000.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_hedge_ack_pending_reconcile" in kinds
+        assert "exit.accepted_order_truth_gap_registered" in kinds
+        assert "exit.passive_close_resolved" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
+        assert "exit.passive_close_hedge_deadline_fail_closed" not in kinds
+        assert "exit.compensated" not in kinds
+
+    def test_ack_only_terminal_hedge_not_flat_retains_pending_without_fake_green(self):
+        """ACK-only truth gap remains pending when live position truth is not flat."""
+        journal = _open_journal()
+
+        ack_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-oid) but fill not confirmed",
+        )
+        ack_error.order_ack_only = True
+        ack_error.accepted_order_id = "ack-oid"
+        ack_error.accepted_client_order_id = "ack-cid"
+
+        maker = _mock_adapter_passive_ok(Venue.OKX)
+        maker.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.OKX,
+            symbol="KATUSDT",
+            side=Side.SELL,
+            order_id="maker-oid",
+            client_order_id="maker-cid",
+            cumulative_quantity=7000.0,
+            average_price=0.00679,
+            state=PassiveOrderState.FILLED,
+        ))
+        maker.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="KATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        maker.fetch_open_orders = AsyncMock(return_value=[])
+
+        hedge = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge.place_order = AsyncMock(side_effect=ack_error)
+        hedge.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        hedge.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="KATUSDT",
+            side=Side.SELL,
+            quantity=7000.0,
+            entry_price=0.00679,
+            observed_at_ms=3001,
+        ))
+        hedge.fetch_open_orders = AsyncMock(return_value=[])
+
+        executor = PassiveCloseExecutor({Venue.OKX: maker, Venue.BYBIT: hedge}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.00679)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.00678, 0.0068))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-katusdt-ack-not-flat",
+            symbol="KATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=7000.0,
+            short_quantity=7000.0,
+            matched_quantity=7000.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=7000.0,
+            chunk_quantities=[7000.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        assert pending.next_retry_at_ms > 0
+        assert pending.hedge_fill.quantity == 0.0
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_hedge_ack_pending_reconcile" in kinds
+        assert "exit.passive_close_hedge_ack_live_truth_pending" in kinds
+        assert "exit.passive_close_resolved" not in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
+        assert "exit.passive_close_hedge_deadline_fail_closed" not in kinds
+
+        pending.next_retry_at_ms = 0
+        second_result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert second_result is False
+        assert hedge.place_order.await_count == 1
+        assert hedge.fetch_order_fill_reconciliation.await_count == 2
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_hedge_ack_reconcile_in_progress" in kinds
 
     def test_ubusdt_bybit_duplicate_partial_retries_remaining_with_new_cid(self):
         """UBUSDT regression: partial duplicate evidence retries remaining reduce-only."""

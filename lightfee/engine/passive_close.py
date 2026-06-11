@@ -207,6 +207,9 @@ class HedgeDeltaResult:
     success: bool
     error: Optional[str] = None
     order_id: str = ""
+    truth_gap: bool = False
+    accepted_order_id: str = ""
+    accepted_client_order_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +544,130 @@ class PassiveCloseExecutor:
         )
         return False
 
+    def _hedge_truth_gap_extra(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        result: HedgeDeltaResult,
+    ) -> dict[str, Any]:
+        if pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG:
+            hedge_venue = position.short_venue
+            hedge_leg = "short"
+        else:
+            hedge_venue = position.long_venue
+            hedge_leg = "long"
+
+        extra: dict[str, Any] = {
+            "accepted_order_truth_gap": True,
+            "hedge_venue": hedge_venue.value,
+            "hedge_leg": hedge_leg,
+            "flattened_venue": hedge_venue.value,
+            "flattened_quantity": result.requested,
+        }
+        if result.accepted_order_id:
+            extra["accepted_order_id"] = result.accepted_order_id
+            extra["accepted_order_ids"] = [result.accepted_order_id]
+        if result.accepted_client_order_id:
+            extra["accepted_client_order_id"] = result.accepted_client_order_id
+            extra["accepted_client_order_ids"] = [result.accepted_client_order_id]
+        return extra
+
+    def _active_hedge_truth_gap_reconciliation(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        *,
+        hedge_venue: Venue,
+        hedge_leg: str,
+    ) -> dict[str, Any] | None:
+        for reconciliation in getattr(state, "pending_close_reconciliations", []):
+            if not isinstance(reconciliation, dict):
+                continue
+            if str(reconciliation.get("kind") or "") != "accepted_order_truth_gap":
+                continue
+            if str(reconciliation.get("position_id") or "") != pending.position_id:
+                continue
+            venue_match = str(reconciliation.get("venue") or "") == hedge_venue.value
+            leg_match = str(reconciliation.get("leg") or "") == hedge_leg
+            if venue_match and leg_match:
+                return reconciliation
+
+            leg_records = (
+                reconciliation.get("long_legs", [])
+                if hedge_leg == "long"
+                else reconciliation.get("short_legs", [])
+            )
+            if any(
+                isinstance(record, dict)
+                and str(record.get("venue") or "") == hedge_venue.value
+                for record in leg_records
+            ):
+                return reconciliation
+        return None
+
+    @staticmethod
+    def _accepted_order_truth_gap_identity(
+        reconciliation: dict[str, Any],
+        *,
+        hedge_venue: Venue,
+        hedge_leg: str,
+    ) -> tuple[str, str]:
+        payload = reconciliation.get("original_payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        order_id = str(payload.get("accepted_order_id") or "")
+        client_order_id = str(payload.get("accepted_client_order_id") or "")
+        leg_records = (
+            reconciliation.get("long_legs", [])
+            if hedge_leg == "long"
+            else reconciliation.get("short_legs", [])
+        )
+        for record in leg_records:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("venue") or "") != hedge_venue.value:
+                continue
+            order_id = order_id or str(record.get("order_id") or "")
+            client_order_id = client_order_id or str(record.get("client_order_id") or "")
+        return order_id, client_order_id
+
+    async def _handle_hedge_truth_gap_result(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        result: HedgeDeltaResult,
+        *,
+        source: str,
+    ) -> bool:
+        extra = self._hedge_truth_gap_extra(pending, position, result)
+        if await self._clear_if_live_flat(
+            state,
+            pending,
+            position,
+            source=f"{source}_live_flat",
+            extra=extra,
+        ):
+            return True
+
+        pending.next_retry_at_ms = self._now_ms() + 1_000
+        self._journal.append(
+            "exit.passive_close_hedge_ack_live_truth_pending",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "requested": result.requested,
+                "residual": result.residual,
+                "accepted_order_id": result.accepted_order_id,
+                "accepted_client_order_id": result.accepted_client_order_id,
+                "decision": "retain_pending",
+                "next_action": "retry_order_position_open_order_reconciliation",
+                "next_retry_ms": 1_000,
+                "source": source,
+            },
+        )
+        return False
+
     def _enter_passive_close_execution_fail_closed(
         self,
         state: EngineState,
@@ -827,6 +954,14 @@ class PassiveCloseExecutor:
                         pending = state.pending_passive_closes.get(position_id)
                         if pending is None:
                             return True
+                        if result.truth_gap:
+                            return await self._handle_hedge_truth_gap_result(
+                                state,
+                                pending,
+                                position,
+                                result,
+                                source="terminal_maker_filled_hedge_ack",
+                            )
                         # Non-retryable hedge error → escalate to aggressive close
                         if not result.success and self._is_non_retryable_hedge_error(result.error or ""):
                             self._journal.append(
@@ -1089,6 +1224,14 @@ class PassiveCloseExecutor:
                     pending = state.pending_passive_closes.get(position_id)
                     if pending is None:
                         return True
+                    if result.truth_gap:
+                        return await self._handle_hedge_truth_gap_result(
+                            state,
+                            pending,
+                            position,
+                            result,
+                            source="passive_close_delta_hedge_ack",
+                        )
 
                     # Non-retryable hedge error → escalate regardless of maker state
                     if self._is_non_retryable_hedge_error(result.error or ""):
@@ -1885,6 +2028,130 @@ class PassiveCloseExecutor:
                 },
             )
 
+        active_truth_gap = self._active_hedge_truth_gap_reconciliation(
+            state,
+            pending,
+            hedge_venue=hedge_venue,
+            hedge_leg=hedge_leg_label,
+        )
+        if active_truth_gap is not None:
+            accepted_order_id, accepted_client_order_id = self._accepted_order_truth_gap_identity(
+                active_truth_gap,
+                hedge_venue=hedge_venue,
+                hedge_leg=hedge_leg_label,
+            )
+            accepted_client_order_id = accepted_client_order_id or hedge_cid
+            fill_reconciliation_attempted = False
+            fill_reconciliation_result = "not_available"
+            fill_reconciliation_error = ""
+            reconciliation = None
+            fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
+            if callable(fetch_reconciliation) and (accepted_order_id or accepted_client_order_id):
+                fill_reconciliation_attempted = True
+                try:
+                    reconciliation = await fetch_reconciliation(
+                        position.symbol,
+                        accepted_order_id,
+                        accepted_client_order_id or None,
+                    )
+                except Exception as reconcile_error:
+                    fill_reconciliation_result = "error"
+                    fill_reconciliation_error = str(reconcile_error)
+
+            recon_qty_raw = (
+                getattr(reconciliation, "quantity", 0.0)
+                if reconciliation is not None
+                else 0.0
+            )
+            recon_qty = (
+                float(recon_qty_raw)
+                if isinstance(recon_qty_raw, (int, float))
+                else 0.0
+            )
+            if recon_qty > 1e-12:
+                fill_reconciliation_result = "filled"
+                recon_price_raw = getattr(
+                    reconciliation, "average_price", hedge_price or 0.0,
+                )
+                recon_price = (
+                    float(recon_price_raw)
+                    if isinstance(recon_price_raw, (int, float))
+                    else (hedge_price or 0.0)
+                )
+                fill = OrderFill(
+                    venue=hedge_venue,
+                    symbol=position.symbol,
+                    side=getattr(reconciliation, "side", hedge_side) or hedge_side,
+                    quantity=recon_qty,
+                    price=recon_price,
+                    order_id=(
+                        str(getattr(reconciliation, "order_id", "") or "")
+                        or accepted_order_id
+                    ),
+                    client_order_id=(
+                        str(getattr(reconciliation, "client_order_id", "") or "")
+                        or accepted_client_order_id
+                        or hedge_cid
+                    ),
+                    fee_quote=getattr(reconciliation, "fee_quote", None),
+                    filled_at_ms=getattr(reconciliation, "filled_at_ms", 0)
+                    or self._now_ms(),
+                )
+                record_hedge_fill(fill)
+                state.remove_pending_close_reconciliation(active_truth_gap)
+                residual = max(delta - fill.quantity, 0.0)
+                success = residual < 1e-12
+                self._journal.append(
+                    "exit.passive_close_hedge_ack_reconciled",
+                    {
+                        "position_id": position.position_id,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_leg": hedge_leg_label,
+                        "accepted_order_id": accepted_order_id,
+                        "accepted_client_order_id": accepted_client_order_id,
+                        "requested": delta,
+                        "filled": fill.quantity,
+                        "residual": residual,
+                    },
+                )
+                return HedgeDeltaResult(
+                    requested=delta,
+                    filled=fill.quantity,
+                    residual=residual,
+                    success=success,
+                    error=None if success else "partial_fill",
+                    order_id=fill.order_id,
+                )
+
+            if fill_reconciliation_attempted and fill_reconciliation_result == "not_available":
+                fill_reconciliation_result = "missing_or_zero_fill"
+            self._journal.append(
+                "exit.passive_close_hedge_ack_reconcile_in_progress",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg_label,
+                    "accepted_order_id": accepted_order_id,
+                    "accepted_client_order_id": accepted_client_order_id,
+                    "requested": delta,
+                    "fill_reconciliation_attempted": fill_reconciliation_attempted,
+                    "fill_reconciliation_result": fill_reconciliation_result,
+                    "fill_reconciliation_error": fill_reconciliation_error,
+                    "decision": "retain_pending_without_resubmit",
+                    "next_action": "retry_order_position_open_order_reconciliation",
+                },
+            )
+            return HedgeDeltaResult(
+                requested=delta,
+                filled=0.0,
+                residual=delta,
+                success=False,
+                error="accepted_order_truth_gap_pending",
+                truth_gap=True,
+                accepted_order_id=accepted_order_id,
+                accepted_client_order_id=accepted_client_order_id,
+            )
+
         try:
             fill = await adapter.place_order(request)
         except Exception as e:
@@ -2184,6 +2451,26 @@ class PassiveCloseExecutor:
             }
             hedge_error_payload.update(uncertainty_payload)
             if is_order_truth_gap(e):
+                accepted_order_id = str(
+                    hedge_error_payload.get("accepted_order_id")
+                    or getattr(e, "accepted_order_id", "")
+                    or ""
+                )
+                accepted_client_order_id = str(
+                    hedge_error_payload.get("accepted_client_order_id")
+                    or getattr(e, "accepted_client_order_id", "")
+                    or hedge_cid
+                    or ""
+                )
+                hedge_error_payload["accepted_order_id"] = accepted_order_id
+                hedge_error_payload["accepted_client_order_id"] = accepted_client_order_id
+                hedge_error_payload["fill_reconciliation_attempted"] = (
+                    fill_reconciliation_attempted
+                )
+                hedge_error_payload["fill_reconciliation_result"] = (
+                    fill_reconciliation_result or "not_attempted"
+                )
+                hedge_error_payload["fill_reconciliation_client_order_id"] = hedge_cid
                 self._register_accepted_order_truth_gap(
                     state,
                     pending,
@@ -2196,13 +2483,20 @@ class PassiveCloseExecutor:
                     request=request,
                     quantity=normalized_delta,
                 )
-                hedge_error_payload["fill_reconciliation_attempted"] = (
-                    fill_reconciliation_attempted
+                self._journal.append(
+                    "exit.passive_close_hedge_ack_pending_reconcile",
+                    hedge_error_payload,
                 )
-                hedge_error_payload["fill_reconciliation_result"] = (
-                    fill_reconciliation_result or "not_attempted"
+                return HedgeDeltaResult(
+                    requested=delta,
+                    filled=0.0,
+                    residual=delta,
+                    success=False,
+                    error=str(e),
+                    truth_gap=True,
+                    accepted_order_id=accepted_order_id,
+                    accepted_client_order_id=accepted_client_order_id,
                 )
-                hedge_error_payload["fill_reconciliation_client_order_id"] = hedge_cid
             self._journal.append(
                 "exit.passive_close_hedge_error",
                 hedge_error_payload,
@@ -3265,8 +3559,22 @@ class PassiveCloseExecutor:
                     else None
                 )
                 if target is not None:
-                    client_ids = [str(v) for v in extra.get("force_close_client_order_ids", []) if v]
-                    order_ids = [str(v) for v in extra.get("force_close_order_ids", []) if v]
+                    client_ids = [
+                        str(v)
+                        for v in [
+                            *extra.get("force_close_client_order_ids", []),
+                            *extra.get("accepted_client_order_ids", []),
+                        ]
+                        if v
+                    ]
+                    order_ids = [
+                        str(v)
+                        for v in [
+                            *extra.get("force_close_order_ids", []),
+                            *extra.get("accepted_order_ids", []),
+                        ]
+                        if v
+                    ]
                     count = max(len(client_ids), len(order_ids))
                     for idx in range(count):
                         add_record(
@@ -4770,6 +5078,14 @@ class PassiveCloseExecutor:
             if pending is None:
                 return True
             if not result.success:
+                if result.truth_gap:
+                    return await self._handle_hedge_truth_gap_result(
+                        state,
+                        pending,
+                        position,
+                        result,
+                        source="fallback_unhedged_hedge_ack",
+                    )
                 self._journal.append(
                     "exit.passive_close_fallback_unhedged_failed",
                     {
