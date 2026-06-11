@@ -1449,7 +1449,7 @@ class TestProductionBlockerAnalyzer:
             "strategy": 85,
         }
         assert view["category_counts"] == {
-            "code_data_freshness": 53,
+            "code_data_freshness": 56,
             "exchange_truth_probe": 1,
             "order_truth_gap": 1,
             "ws_bbo_budget": 8,
@@ -1461,9 +1461,15 @@ class TestProductionBlockerAnalyzer:
             "invalid_quote": 50,
             "last_good_sidecar_revalidate_required": 2,
             "quote_revalidate_unavailable": 1,
+            "rest_invalid_quote": 3,
         }
         assert view["resolution_counts"] == {
             "last_good_revalidated": 1,
+            "quote_truth_failed": 3,
+            "quote_truth_must_resolve": 10,
+            "quote_truth_resolved": 7,
+            "quote_truth_rest_resolved": 5,
+            "quote_truth_ws_resolved": 2,
             "quote_revalidate_failed": 1,
             "quote_revalidate_resolved": 1,
             "quote_revalidate_source:bybit_bbo_ws": 1,
@@ -1495,8 +1501,9 @@ class TestProductionBlockerAnalyzer:
 
         view = report["windows"]["run_window"]["code_side_blocker_view"]
         assert view["excluded_filters"] == ["strategy", "liquidity", "open_interest"]
-        assert view["category_counts"]["code_data_freshness"] == 53
+        assert view["category_counts"]["code_data_freshness"] == 56
         assert view["resolution_counts"]["quote_revalidate_resolved"] == 1
+        assert view["resolution_counts"]["quote_truth_rest_resolved"] == 5
         assert view["filtered_out_counts"] == {
             "liquidity": 68,
             "open_interest": 76,
@@ -1578,6 +1585,15 @@ def _code_side_blocker_incident_records():
                     "snapshot_freshness_blocked_counts": {"invalid_quote": 49},
                     "entry_ws_bbo_blocker_counts": {
                         "entry_ws_bbo_quote_lease_budget_exhausted": 8,
+                    },
+                    "quote_truth_must_resolve_count": 10,
+                    "quote_truth_resolved_count": 7,
+                    "quote_truth_failed_count": 3,
+                    "quote_truth_ws_resolved_count": 2,
+                    "quote_truth_rest_resolved_count": 5,
+                    "budget_excluded_without_rest_count": 0,
+                    "top_quote_blocker_buckets": {
+                        "rest_invalid_quote": 3,
                     },
                     "strategy_blocker_counts": {
                         "funding_edge_below_floor": 80,

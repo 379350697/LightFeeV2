@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest quote-truth budget-excluded REST closure, 2026-06-11: post-deploy
+evidence showed the quote stale/last-good pre-filter revalidation path was active
+but incomplete. `runtime.entry_quote_revalidate_resolved` and
+`runtime.last_good_revalidated_by_entry_quote_truth` increased, while
+`runtime.entry_quote_revalidate_failed` and
+`runtime.entry_ws_bbo_top_candidate_rewarm_budget_exhausted` remained high.
+The deterministic gap was that must-resolve top candidate legs excluded from
+the WS-BBO subscription budget were treated as final failures and never reached
+REST/top-book truth. The follow-up fix keeps WS-BBO budget and quote TTL
+unchanged, but reclassifies budget exhaustion as a WS prewarm outcome only:
+budget-excluded must-resolve legs now continue into bounded REST/top-book
+fallback, successful REST quotes update the entry quote overlay/cache, and
+`budget_excluded_without_rest_count` is exposed as the hard code-side closure
+metric. Invalid, zero, crossed, and missing-observed quotes still fail closed,
+and no strategy, OI, liquidity, margin/admission, order submit, close, or
+production config semantics changed. Full evidence is recorded in
+[`daily/2026-06-11.md#cluster-cl-071-quote-stale--last-good-entry-truth-revalidate-closure`](daily/2026-06-11.md#cluster-cl-071-quote-stale--last-good-entry-truth-revalidate-closure).
+
 Latest 8-concurrent-position capacity closure, 2026-06-11:
 production concurrency target is 8, and a normal balanced active position must
 consume one slot rather than turning diagnose or entry admission into global

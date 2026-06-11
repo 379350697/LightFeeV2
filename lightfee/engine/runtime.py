@@ -5221,11 +5221,14 @@ class LiveRuntime:
         return {
             "target_count": 0,
             "all_target_count": 0,
+            "must_resolve_count": 0,
             "budgeted_target_count": 0,
             "budget_exhausted_count": 0,
+            "budget_excluded_without_rest_count": 0,
             "skipped_unbudgeted_count": 0,
             "cache_initial_hit_count": 0,
             "cache_wait_hit_count": 0,
+            "ws_resolved_count": 0,
             "rest_attempt_count": 0,
             "rest_resolved_count": 0,
             "rest_failed_count": 0,
@@ -5246,6 +5249,24 @@ class LiveRuntime:
         )
         self.state.last_scan["quote_revalidate_failed_count"] = int(
             stats.get("failed_count", 0) or 0
+        )
+        self.state.last_scan["quote_truth_must_resolve_count"] = int(
+            stats.get("must_resolve_count", stats.get("target_count", 0)) or 0
+        )
+        self.state.last_scan["quote_truth_resolved_count"] = int(
+            stats.get("resolved_count", 0) or 0
+        )
+        self.state.last_scan["quote_truth_failed_count"] = int(
+            stats.get("failed_count", 0) or 0
+        )
+        self.state.last_scan["quote_truth_ws_resolved_count"] = int(
+            stats.get("ws_resolved_count", 0) or 0
+        )
+        self.state.last_scan["quote_truth_rest_resolved_count"] = int(
+            stats.get("rest_resolved_count", 0) or 0
+        )
+        self.state.last_scan["budget_excluded_without_rest_count"] = int(
+            stats.get("budget_excluded_without_rest_count", 0) or 0
         )
         sources = stats.get("sources", Counter())
         self.state.last_scan["quote_revalidate_sources"] = dict(
@@ -5279,11 +5300,16 @@ class LiveRuntime:
             "candidate_count": int(candidate_count or 0),
             "all_target_count": int(stats.get("all_target_count", 0) or 0),
             "target_count": int(stats.get("target_count", 0) or 0),
+            "must_resolve_count": int(stats.get("must_resolve_count", 0) or 0),
             "budgeted_target_count": int(stats.get("budgeted_target_count", 0) or 0),
             "budget_exhausted_count": int(stats.get("budget_exhausted_count", 0) or 0),
+            "budget_excluded_without_rest_count": int(
+                stats.get("budget_excluded_without_rest_count", 0) or 0
+            ),
             "skipped_unbudgeted_count": int(stats.get("skipped_unbudgeted_count", 0) or 0),
             "cache_initial_hit_count": int(stats.get("cache_initial_hit_count", 0) or 0),
             "cache_wait_hit_count": int(stats.get("cache_wait_hit_count", 0) or 0),
+            "ws_resolved_count": int(stats.get("ws_resolved_count", 0) or 0),
             "rest_attempt_count": int(stats.get("rest_attempt_count", 0) or 0),
             "rest_resolved_count": int(stats.get("rest_resolved_count", 0) or 0),
             "rest_failed_count": int(stats.get("rest_failed_count", 0) or 0),
@@ -5515,30 +5541,31 @@ class LiveRuntime:
         for target in all_targets:
             key = (target["venue"], target["symbol"])
             if key in budget_excluded_keys:
-                stats["failed_count"] += 1
                 stats["budget_exhausted_count"] += 1
-                stats["top_quote_blocker_buckets"]["ws_bbo_rewarm_budget_exhausted"] += 1
+                target["ws_budget_excluded"] = True
+                target["rest_fallback_planned"] = True
                 self.journal.append(
                     "runtime.entry_ws_bbo_top_candidate_rewarm_budget_exhausted",
-                    {**target, "ts_ms": now_ms},
-                )
-                self.journal.append(
-                    "runtime.entry_quote_revalidate_failed",
                     {
                         **target,
-                        "outcome": "budget_exhausted",
-                        "source": "ws_bbo_quote_lease",
+                        "outcome": "rest_fallback_planned",
                         "ts_ms": now_ms,
                     },
                 )
-                continue
-            if budgeted_keys and key not in budgeted_keys:
+            if (
+                budgeted_keys
+                and key not in budgeted_keys
+                and not bool(target.get("ws_budget_excluded"))
+            ):
                 stats["skipped_unbudgeted_count"] += 1
                 continue
             targets.append(target)
 
         stats["target_count"] = len(targets)
-        stats["budgeted_target_count"] = len(targets)
+        stats["must_resolve_count"] = len(targets)
+        stats["budgeted_target_count"] = sum(
+            1 for target in targets if not bool(target.get("ws_budget_excluded"))
+        )
         if targets:
             self.journal.append(
                 "runtime.entry_quote_revalidate_targeted",
@@ -5578,6 +5605,7 @@ class LiveRuntime:
                     stats["cache_initial_hit_count"] += 1
                 else:
                     stats["cache_wait_hit_count"] += 1
+                stats["ws_resolved_count"] += 1
 
         collect_fresh_from_cache("initial")
         wait_budget_ms = min(self._entry_quote_lease_max_age_ms(), 750)
@@ -5612,6 +5640,10 @@ class LiveRuntime:
                 overlay[key] = refreshed
                 unresolved.pop(key, None)
                 stats["rest_resolved_count"] += 1
+        else:
+            for target in unresolved.values():
+                if bool(target.get("ws_budget_excluded")):
+                    stats["budget_excluded_without_rest_count"] += 1
 
         for key, quote in overlay.items():
             source = str(getattr(quote, "source", "") or "entry_quote_truth")
@@ -5642,10 +5674,22 @@ class LiveRuntime:
 
         for target in unresolved.values():
             stats["failed_count"] += 1
-            stats["top_quote_blocker_buckets"]["quote_revalidate_unavailable"] += 1
+            if bool(target.get("ws_budget_excluded")) and not callable(refresh_quote):
+                outcome = "budget_excluded_rest_unavailable"
+                bucket = "budget_excluded_without_rest"
+            elif target.get("rest_error"):
+                outcome = "rest_timeout"
+                bucket = "rest_topbook_revalidate_failed"
+            elif stats.get("rest_attempt_count", 0):
+                outcome = "rest_invalid_quote"
+                bucket = "rest_topbook_revalidate_failed"
+            else:
+                outcome = "ws_timeout"
+                bucket = "quote_revalidate_unavailable"
+            stats["top_quote_blocker_buckets"][bucket] += 1
             payload = {
                 **target,
-                "outcome": "quote_revalidate_unavailable",
+                "outcome": outcome,
                 "source": "entry_quote_truth",
                 "ts_ms": now_ms,
             }
@@ -17560,6 +17604,14 @@ class LiveRuntime:
             "tradeable_selection_blocker_counts",
             "entry_ws_bbo_blocker_counts",
             "entry_admission_blocker_counts",
+            "quote_truth_must_resolve_count",
+            "quote_truth_resolved_count",
+            "quote_truth_failed_count",
+            "quote_truth_ws_resolved_count",
+            "quote_truth_rest_resolved_count",
+            "budget_excluded_without_rest_count",
+            "quote_revalidate_sources",
+            "top_quote_blocker_buckets",
             "selection_bucket_counts",
             "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
@@ -17758,6 +17810,33 @@ class LiveRuntime:
         )
         open_position_count = len(self.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
+        last_scan = self.state.last_scan if isinstance(self.state.last_scan, dict) else {}
+        quote_truth_payload = {
+            "quote_truth_must_resolve_count": int(
+                last_scan.get("quote_truth_must_resolve_count", 0) or 0
+            ),
+            "quote_truth_resolved_count": int(
+                last_scan.get("quote_truth_resolved_count", 0) or 0
+            ),
+            "quote_truth_failed_count": int(
+                last_scan.get("quote_truth_failed_count", 0) or 0
+            ),
+            "quote_truth_ws_resolved_count": int(
+                last_scan.get("quote_truth_ws_resolved_count", 0) or 0
+            ),
+            "quote_truth_rest_resolved_count": int(
+                last_scan.get("quote_truth_rest_resolved_count", 0) or 0
+            ),
+            "budget_excluded_without_rest_count": int(
+                last_scan.get("budget_excluded_without_rest_count", 0) or 0
+            ),
+            "quote_revalidate_sources": dict(
+                last_scan.get("quote_revalidate_sources", {}) or {}
+            ),
+            "top_quote_blocker_buckets": dict(
+                last_scan.get("top_quote_blocker_buckets", {}) or {}
+            ),
+        }
 
         payload = {
             "reason": reason,
@@ -17815,6 +17894,7 @@ class LiveRuntime:
                 sorted(entry_admission_blocker_counts.items())
             ),
             "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
+            **quote_truth_payload,
             "selection_bucket_counts": selection_bucket_counts,
             "candidate_stage_blocked_counts": {
                 key: value

@@ -310,6 +310,11 @@ def _record_code_side_blocker(
         for key in (
             "quote_revalidate_resolved_count",
             "quote_revalidate_failed_count",
+            "quote_truth_must_resolve_count",
+            "quote_truth_resolved_count",
+            "quote_truth_failed_count",
+            "quote_truth_ws_resolved_count",
+            "quote_truth_rest_resolved_count",
         ):
             try:
                 count = int(payload.get(key, 0) or 0)
@@ -321,6 +326,21 @@ def _record_code_side_blocker(
                     key.replace("_count", ""),
                     count,
                 )
+        try:
+            budget_without_rest = int(
+                payload.get("budget_excluded_without_rest_count", 0) or 0
+            )
+        except (TypeError, ValueError):
+            budget_without_rest = 0
+        if budget_without_rest > 0:
+            _add_count(category_counts, "ws_bbo_budget", budget_without_rest)
+            _add_count(reason_counts, "budget_excluded_without_rest", budget_without_rest)
+        top_quote_blockers = payload.get("top_quote_blocker_buckets", {}) or {}
+        if isinstance(top_quote_blockers, dict):
+            for reason, count in top_quote_blockers.items():
+                reason_text = str(reason or "quote_revalidate_failed")
+                _add_count(category_counts, "code_data_freshness", count)
+                _add_count(reason_counts, reason_text, count)
         ws_bbo_totals = payload.get("entry_ws_bbo_blocker_counts", {}) or {}
         for reason, count in ws_bbo_totals.items():
             reason_text = str(reason)

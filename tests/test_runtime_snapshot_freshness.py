@@ -755,6 +755,250 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
 
 
 @pytest.mark.asyncio
+async def test_runtime_entry_quote_revalidate_budget_excluded_top_candidate_uses_rest(
+    tmp_path,
+    monkeypatch,
+):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5_000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=100,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    async def prewarm_budget_excludes_top_candidate(candidates, prewarm_now_ms):
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("okx", "ETHUSDT"),
+            ("bybit", "ETHUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = {
+            ("okx", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_per_venue_budget = 1
+
+    class RestOnlyRefresher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
+            self.calls.append((venue, symbol))
+            return TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=100.0 if venue == "okx" else 100.2,
+                ask=101.0 if venue == "okx" else 101.2,
+                bid_size=50.0,
+                ask_size=60.0,
+                observed_at_ms=now_ms - 25,
+                received_at_ms=now_ms - 25,
+                source=f"{venue}_rest_topbook",
+            )
+
+    refresher = RestOnlyRefresher()
+    runtime.ws_bbo_rest_refresher = refresher
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        prewarm_budget_excludes_top_candidate,
+    )
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    kinds = [record["kind"] for record in records]
+    failures = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_revalidate_failed"
+    ]
+
+    assert len(executor.contexts) == 1
+    assert sorted(refresher.calls) == [("bybit", "BTCUSDT"), ("okx", "BTCUSDT")]
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
+    assert "runtime.quote_stale" not in kinds
+    assert not failures
+    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
+    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 2
+    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 0
+    assert runtime.state.last_scan["budget_excluded_without_rest_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_explicit(
+    tmp_path,
+    monkeypatch,
+):
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5_000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=100,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingEntryExecutor()
+    runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    async def prewarm_budget_excludes_top_candidate(candidates, prewarm_now_ms):
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("okx", "ETHUSDT"),
+            ("bybit", "ETHUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = {
+            ("okx", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_per_venue_budget = 1
+
+    class NoRestCapability:
+        pass
+
+    runtime.ws_bbo_rest_refresher = NoRestCapability()
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        prewarm_budget_excludes_top_candidate,
+    )
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    failures = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_revalidate_failed"
+    ]
+
+    assert not executor.contexts
+    assert runtime.state.last_scan["dispatched_candidate_count"] == 0
+    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
+    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 0
+    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 2
+    assert runtime.state.last_scan["budget_excluded_without_rest_count"] == 2
+    assert runtime.state.last_scan["top_quote_blocker_buckets"] == {
+        "budget_excluded_without_rest": 2
+    }
+    assert {payload["outcome"] for payload in failures} == {
+        "budget_excluded_rest_unavailable"
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_entry_quote_probe_diagnostics_are_disabled_by_default(
     tmp_path,
     monkeypatch,
