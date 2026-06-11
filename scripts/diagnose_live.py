@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -645,6 +646,133 @@ def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
     return identity
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _hyperliquid_spot_balances(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return []
+    balances: list[dict[str, Any]] = []
+    for item in raw.get("balances") or []:
+        if not isinstance(item, dict):
+            continue
+        coin = str(item.get("coin", "") or "")
+        total = _optional_float(item.get("total"))
+        hold = _optional_float(item.get("hold"))
+        entry_ntl = _optional_float(item.get("entryNtl"))
+        if not coin:
+            continue
+        balances.append({
+            "coin": coin,
+            "total": total,
+            "hold": hold,
+            "entry_ntl": entry_ntl,
+        })
+    return balances
+
+
+def _hyperliquid_balance_view_payload(
+    *,
+    account_address: str,
+    perp_raw: Any,
+    spot_raw: Any,
+) -> dict[str, Any]:
+    perp = perp_raw if isinstance(perp_raw, dict) else {}
+    spot_balances = _hyperliquid_spot_balances(spot_raw)
+    usdc_total = sum(
+        float(item.get("total") or 0.0)
+        for item in spot_balances
+        if str(item.get("coin", "") or "").upper() == "USDC"
+    )
+
+    cross = perp.get("crossMarginSummary")
+    margin = perp.get("marginSummary")
+    if not isinstance(cross, dict):
+        cross = {}
+    if not isinstance(margin, dict):
+        margin = {}
+    account_value = (
+        _optional_float(cross.get("accountValue"))
+        if cross else None
+    )
+    if account_value is None:
+        account_value = _optional_float(margin.get("accountValue"))
+    total_margin_used = (
+        _optional_float(cross.get("totalMarginUsed"))
+        if cross else None
+    )
+    if total_margin_used is None:
+        total_margin_used = _optional_float(margin.get("totalMarginUsed"))
+    withdrawable = _optional_float(perp.get("withdrawable"))
+
+    if (withdrawable or 0.0) <= 1e-9 and usdc_total > 1e-9:
+        classification = "usdc_present_margin_view_zero"
+    elif (withdrawable or 0.0) <= 1e-9:
+        classification = "margin_view_zero"
+    else:
+        classification = "margin_view_available"
+
+    return {
+        "classification": classification,
+        "account_address_masked": _mask_address(account_address),
+        "account_address_hash": _address_hash(account_address),
+        "perp": {
+            "withdrawable": withdrawable,
+            "account_value": account_value,
+            "total_margin_used": total_margin_used,
+            "asset_position_count": len(perp.get("assetPositions") or []),
+        },
+        "spot": {
+            "usdc_total": usdc_total,
+            "balances": spot_balances[:20],
+        },
+    }
+
+
+async def _fetch_hyperliquid_balance_view(
+    adapter: Any,
+    credential: Any,
+) -> dict[str, Any]:
+    account_address = str(getattr(credential, "account_address", "") or "").strip()
+    transport = getattr(adapter, "_transport", None)
+    if not account_address:
+        return {"classification": "account_address_unavailable"}
+    if transport is None:
+        return {"classification": "transport_unavailable"}
+    try:
+        perp_raw = await transport._request(
+            "POST",
+            "/info",
+            body={"type": "clearinghouseState", "user": account_address},
+            private=True,
+        )
+        spot_raw = await transport._request(
+            "POST",
+            "/info",
+            body={"type": "spotClearinghouseState", "user": account_address},
+            private=True,
+        )
+        return _hyperliquid_balance_view_payload(
+            account_address=account_address,
+            perp_raw=perp_raw,
+            spot_raw=spot_raw,
+        )
+    except Exception as exc:
+        return {
+            "classification": "balance_view_probe_failed",
+            "account_address_masked": _mask_address(account_address),
+            "account_address_hash": _address_hash(account_address),
+            "error": str(exc)[:200],
+        }
+
+
 def _probe_venue_symbol(adapter: Any, symbol: str) -> str:
     transport = getattr(adapter, "_transport", None)
     convert = getattr(transport, "_venue_symbol", None)
@@ -1013,6 +1141,7 @@ async def _build_exchange_truth_async(
     all_position_probe_evidence: dict[str, dict[str, Any]] = {}
     all_open_order_probe_evidence: dict[str, dict[str, Any]] = {}
     credential_identity: dict[str, dict[str, Any]] = {}
+    balance_views: dict[str, dict[str, Any]] = {}
     available_venues: list[str] = []
     fetch_status: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
@@ -1092,6 +1221,12 @@ async def _build_exchange_truth_async(
             ord_evidence = {}
         all_open_order_probe_evidence[venue] = ord_evidence
 
+        if venue.lower() == "hyperliquid":
+            balance_views[venue] = await _fetch_hyperliquid_balance_view(
+                adapter,
+                credential,
+            )
+
         try:
             await adapter.shutdown()
         except Exception:
@@ -1162,6 +1297,7 @@ async def _build_exchange_truth_async(
         "positions": all_positions,
         "open_orders": all_open_orders,
         "credential_identity": credential_identity,
+        "balance_views": balance_views,
         "position_probe_evidence": all_position_probe_evidence,
         "open_order_probe_evidence": all_open_order_probe_evidence,
         "has_nonzero_position": has_any_position,
@@ -2275,6 +2411,9 @@ def _build_production_acceptance_gate(
     snapshot_fallback_blocking_count = 0
     bulk_health_diagnostic_count = 0
     contained_admission_count = 0
+    hyperliquid_margin_view_zero_count = 0
+    hyperliquid_balance_view_advice: list[str] = []
+    hyperliquid_balance_view_details: list[dict[str, Any]] = []
     required_position_truth_unavailable_count = 0
     entry_opened_count = 0
     position_opened_count = 0
@@ -2347,6 +2486,73 @@ def _build_production_acceptance_gate(
             ):
                 contained_admission_count += 1
                 exception_conclusions["contained_admission"] = "contained_admission"
+                if venue == "hyperliquid" and "insufficient_margin" in reason_text:
+                    balance_views = exchange_truth.get("balance_views") or {}
+                    hyperliquid_balance = balance_views.get("hyperliquid") or {}
+                    balance_classification = str(
+                        hyperliquid_balance.get("classification", "") or ""
+                    )
+                    available_balance = _optional_float(
+                        payload.get("available_balance_quote")
+                    )
+                    required_margin = _optional_float(
+                        payload.get("required_initial_margin_quote")
+                    )
+                    if (
+                        balance_classification
+                        or (
+                            available_balance is not None
+                            and available_balance <= 1e-9
+                            and (required_margin or 0.0) > 0.0
+                        )
+                    ):
+                        hyperliquid_margin_view_zero_count += 1
+                        conclusion = (
+                            balance_classification
+                            or "margin_view_zero"
+                        )
+                        exception_conclusions[
+                            "hyperliquid_margin_view_zero"
+                        ] = conclusion
+                        spot = hyperliquid_balance.get("spot") or {}
+                        perp = hyperliquid_balance.get("perp") or {}
+                        detail = {
+                            "classification": conclusion,
+                            "available_balance_quote": available_balance,
+                            "required_initial_margin_quote": required_margin,
+                            "entry_notional_quote": _optional_float(
+                                payload.get("entry_notional_quote")
+                            ),
+                            "live_target_leverage": _optional_float(
+                                payload.get("live_target_leverage")
+                            ),
+                            "margin_buffer_bps": _optional_float(
+                                payload.get("margin_buffer_bps")
+                            ),
+                            "spot_usdc_total": _optional_float(
+                                spot.get("usdc_total")
+                            ),
+                            "perp_withdrawable": _optional_float(
+                                perp.get("withdrawable")
+                            ),
+                            "perp_account_value": _optional_float(
+                                perp.get("account_value")
+                            ),
+                        }
+                        hyperliquid_balance_view_details.append(detail)
+                        if (
+                            conclusion == "usdc_present_margin_view_zero"
+                            and not hyperliquid_balance_view_advice
+                        ):
+                            hyperliquid_balance_view_advice.append(
+                                "Hyperliquid USDC is present, but the "
+                                "admission margin view reads zero available "
+                                "margin; do not assume a spot-to-perp "
+                                "transfer is possible. Check the configured "
+                                "account address, API wallet parent account, "
+                                "collateral eligibility, and the balance "
+                                "source used by the admission prefilter."
+                            )
 
         if kind in ("runtime.local_l2_sequence_gap_rebuild", "runtime.local_l2_snapshot_error"):
             if _has_official_sequence_rebuild_evidence(payload):
@@ -2514,6 +2720,7 @@ def _build_production_acceptance_gate(
         "snapshot_fallback_blocking": snapshot_fallback_blocking_count,
         "nonblocking_health_diagnostic": bulk_health_diagnostic_count,
         "contained_admission": contained_admission_count,
+        "hyperliquid_margin_view_zero": hyperliquid_margin_view_zero_count,
         "resolved_order_truth_gap": resolved_order_truth_gap_count,
         "blocking_required_truth": (
             required_position_truth_unavailable_count
@@ -2546,6 +2753,9 @@ def _build_production_acceptance_gate(
         "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,
+        "hyperliquid_margin_view_zero_count": hyperliquid_margin_view_zero_count,
+        "hyperliquid_balance_view_details": hyperliquid_balance_view_details[:10],
+        "hyperliquid_balance_view_advice": hyperliquid_balance_view_advice,
         "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "required_position_truth_unavailable_count": (
@@ -2779,6 +2989,15 @@ def _build_conclusion(
                 ", ".join(gate_blockers[:5]) if gate_blockers else "unknown"
             )
         )
+    balance_view_advice = (
+        list(production_acceptance_gate.get("hyperliquid_balance_view_advice", []) or [])
+        if production_acceptance_gate is not None
+        else []
+    )
+    if balance_view_advice:
+        summary_parts.append(
+            "Hyperliquid USDC present but admission margin view reads zero"
+        )
 
     summary = "; ".join(summary_parts) if summary_parts else "no issues detected"
 
@@ -2830,6 +3049,9 @@ def _build_conclusion(
                 ", ".join(gate_blockers[:5]) if gate_blockers else "unknown"
             )
         )
+    for advice in balance_view_advice:
+        if advice not in next_actions:
+            next_actions.append(advice)
     if not next_actions:
         next_actions.append("no immediate action required")
 

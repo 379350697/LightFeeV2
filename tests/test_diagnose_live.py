@@ -16,6 +16,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from scripts.diagnose_live import run_diagnose
 
 
@@ -377,6 +379,96 @@ def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_containe
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
+    from scripts import diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1779816049100,
+            "kind": "runtime.entry_admission_venue_degraded",
+            "payload": {
+                "venue": "hyperliquid",
+                "reason": "insufficient_margin_admission_prefiltered",
+                "block_scope": "venue",
+                "evidence_gap": False,
+                "available_balance_quote": 0.0,
+                "required_initial_margin_quote": 12.5075,
+                "entry_notional_quote": 50.0,
+                "live_target_leverage": 4.0,
+                "margin_buffer_bps": 6.0,
+            },
+        }
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "positions": {"hyperliquid": {"*": []}},
+        "open_orders": {"hyperliquid": {"*": []}},
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "balance_views": {
+            "hyperliquid": {
+                "classification": "usdc_present_margin_view_zero",
+                "perp": {
+                    "withdrawable": 0.0,
+                    "account_value": 0.0,
+                },
+                "spot": {
+                    "usdc_total": 145.863168,
+                },
+            }
+        },
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["contained_admission_count"] == 1
+    assert gate["hyperliquid_margin_view_zero_count"] == 1
+    assert gate["exception_conclusions"]["contained_admission"] == "contained_admission"
+    assert (
+        gate["exception_conclusions"]["hyperliquid_margin_view_zero"]
+        == "usdc_present_margin_view_zero"
+    )
+    expected_advice = (
+        "Hyperliquid USDC is present, but the admission margin view reads zero "
+        "available margin; do not assume a spot-to-perp transfer is possible. "
+        "Check the configured account address, API wallet parent account, "
+        "collateral eligibility, and the balance source used by the admission "
+        "prefilter."
+    )
+    assert gate["hyperliquid_balance_view_advice"] == [expected_advice]
+    assert gate["blocking_reasons"] == []
+    assert gate["gate_passed"] is True
+
+    conclusion = dl._build_conclusion(
+        {"ok": True, "critical_count": 0, "fingerprints": []},
+        {"state_mismatch": False, "local_open_exchange_flat": False},
+        {"overall": "complete"},
+        [],
+        {
+            "missing_l2_or_tick_count": 0,
+            "stale_rebuild_count": 0,
+            "sequence_gap_count": 0,
+        },
+        {"stale_or_degraded_count": 0},
+        exchange_truth,
+        gate,
+    )
+    assert (
+        "Hyperliquid USDC present but admission margin view reads zero"
+        in conclusion["summary"]
+    )
+    assert expected_advice in conclusion["next_actions"]
 
 
 def test_run_diagnose_acceptance_gate_blocks_required_position_truth_unavailable(monkeypatch):
@@ -2102,6 +2194,73 @@ def test_exchange_truth_hyperliquid_queries_configured_account_when_signer_diffe
     assert "wallet_private_key" not in result["credential_identity"]["hyperliquid"]
     assert result["positions"]["hyperliquid"]["OPUSDT"]["quantity"] == 397.9
     assert result["positions"]["hyperliquid"]["OPUSDT"]["side"].endswith("SELL")
+
+
+def test_exchange_truth_hyperliquid_reports_usdc_present_when_margin_view_zero(monkeypatch):
+    import asyncio
+    import httpx
+    from scripts import diagnose_live as dl
+
+    private_key = "0x" + "1" * 64
+    account = "0x" + "2" * 40
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_PRIVATE_KEY", private_key)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS", account)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_WALLET_MODE", "agent_wallet")
+
+    original_create = dl._create_readonly_adapter
+
+    def create_adapter(venue, credential):
+        adapter = original_create(venue, credential)
+        assert adapter is not None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info" and body.get("type") == "clearinghouseState":
+                return httpx.Response(
+                    200,
+                    json={
+                        "assetPositions": [],
+                        "withdrawable": "0.0",
+                        "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
+                        "crossMarginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
+                    },
+                )
+            if request.url.path == "/info" and body.get("type") == "spotClearinghouseState":
+                return httpx.Response(
+                    200,
+                    json={
+                        "balances": [
+                            {
+                                "coin": "USDC",
+                                "total": "145.863168",
+                                "hold": "0.0",
+                                "entryNtl": "0.0",
+                            }
+                        ]
+                    },
+                )
+            if request.url.path == "/info" and body.get("type") == "openOrders":
+                return httpx.Response(200, json=[])
+            raise AssertionError(f"unexpected request: {request.url.path} {body}")
+
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return adapter
+
+    monkeypatch.setattr(dl, "_create_readonly_adapter", create_adapter)
+
+    result = asyncio.run(dl._build_exchange_truth_async(
+        runtime_dir="/unused",
+        symbols=[],
+        venues=["hyperliquid"],
+    ))
+
+    balance = result["balance_views"]["hyperliquid"]
+    assert balance["classification"] == "usdc_present_margin_view_zero"
+    assert balance["perp"]["withdrawable"] == pytest.approx(0.0)
+    assert balance["perp"]["account_value"] == pytest.approx(0.0)
+    assert balance["spot"]["usdc_total"] == pytest.approx(145.863168)
+    assert balance["spot"]["balances"][0]["coin"] == "USDC"
+    assert "account_address" not in balance
 
 
 def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):

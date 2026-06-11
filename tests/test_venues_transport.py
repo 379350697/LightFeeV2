@@ -432,6 +432,70 @@ class TestBinanceAsterPostSigning:
         assert snapshot.locked == pytest.approx(29.78001 - 24.5)
         assert snapshot.observed_at_ms > 0
 
+    @pytest.mark.asyncio
+    async def test_hyperliquid_unified_account_balance_uses_spot_usdc_when_withdrawable_zero(self):
+        credential = LiveCredential(
+            wallet_private_key="0x" + "1" * 64,
+            account_address="0x" + "2" * 40,
+        )
+        transport = VenueTransport(
+            spec=hyperliquid_spec(),
+            mode="live",
+            credential=credential,
+        )
+        seen_types = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            assert method == "POST"
+            assert path == "/info"
+            assert body["user"] == transport._credential.account_address
+            assert private is True
+            seen_types.append(body["type"])
+            if body["type"] == "clearinghouseState":
+                return {
+                    "marginSummary": {
+                        "accountValue": "0.0",
+                        "totalMarginUsed": "0.0",
+                    },
+                    "crossMarginSummary": {
+                        "accountValue": "0.0",
+                        "totalMarginUsed": "0.0",
+                    },
+                    "withdrawable": "0.0",
+                    "time": 1778787002000,
+                    "assetPositions": [],
+                }
+            if body["type"] == "userAbstraction":
+                return "unifiedAccount"
+            if body["type"] == "spotClearinghouseState":
+                return {
+                    "balances": [
+                        {
+                            "coin": "USDC",
+                            "total": "145.863168",
+                            "hold": "0.5",
+                            "entryNtl": "0.0",
+                        }
+                    ]
+                }
+            raise AssertionError(f"unexpected request body: {body}")
+
+        transport._request = mock_request
+
+        snapshot = await transport.fetch_account_balance_snapshot()
+
+        assert seen_types == [
+            "clearinghouseState",
+            "userAbstraction",
+            "spotClearinghouseState",
+        ]
+        assert snapshot is not None
+        assert snapshot.venue == Venue.HYPERLIQUID
+        assert snapshot.asset == "USDC"
+        assert snapshot.free == pytest.approx(145.363168)
+        assert snapshot.locked == pytest.approx(0.5)
+        assert snapshot.observed_at_ms > 0
+
     def test_binance_post_signature_matches_signed_payload(self):
         """The signature must be HMAC-SHA256 of the URL-encoded query params (V1 order, with recvWindow)."""
         spec = binance_spec()

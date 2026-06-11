@@ -302,6 +302,24 @@ def _parse_optional_float(value: Any) -> Optional[float]:
     return result
 
 
+def _hyperliquid_spot_usdc_available(raw: Any) -> Optional[tuple[float, float]]:
+    if not isinstance(raw, dict):
+        return None
+    for item in raw.get("balances") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("coin", "") or "").upper() != "USDC":
+            continue
+        total = _parse_optional_float(item.get("total"))
+        hold = _parse_optional_float(item.get("hold"))
+        if total is None:
+            return None
+        held = max(hold or 0.0, 0.0)
+        available = max(total - held, 0.0)
+        return available, held
+    return None
+
+
 def _require_bybit_success(raw: dict[str, Any], context: str) -> None:
     """Raise REJECTED if Bybit retCode is non-zero."""
     if int(raw.get("retCode", 0) or 0) != 0:
@@ -3339,6 +3357,32 @@ class VenueTransport(MarketDataClient):
                 locked = 0.0
                 if account_value is not None:
                     locked = max(account_value - withdrawable, 0.0)
+                if withdrawable <= 1e-9:
+                    abstraction = await self._request(
+                        "POST",
+                        "/info",
+                        body={
+                            "type": "userAbstraction",
+                            "user": account_address,
+                        },
+                        private=True,
+                    )
+                    if abstraction == "unifiedAccount":
+                        spot_raw = await self._request(
+                            "POST",
+                            "/info",
+                            body={
+                                "type": "spotClearinghouseState",
+                                "user": account_address,
+                            },
+                            private=True,
+                        )
+                        spot_available = _hyperliquid_spot_usdc_available(spot_raw)
+                        if spot_available is not None:
+                            available, held = spot_available
+                            if available > withdrawable:
+                                withdrawable = available
+                                locked = held
                 return AccountBalanceSnapshot(
                     venue=Venue.HYPERLIQUID,
                     asset="USDC",
