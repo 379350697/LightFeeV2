@@ -144,6 +144,152 @@ def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     }
 
 
+def _balanced_active_exchange_truth(runtime_dir, symbols, venues=None):
+    venues = venues or []
+    symbol = symbols[0] if symbols else "KATUSDT"
+    return {
+        "available": True,
+        "available_venues": venues,
+        "confidence": "high",
+        "positions": {
+            "okx": {
+                symbol: {
+                    "symbol": symbol,
+                    "side": "Side.BUY",
+                    "quantity": 7600.0,
+                    "venue": "okx",
+                }
+            },
+            "bybit": {
+                symbol: {
+                    "symbol": symbol,
+                    "side": "Side.SELL",
+                    "quantity": 7600.0,
+                    "venue": "bybit",
+                }
+            },
+        },
+        "open_orders": {
+            "okx": {symbol: []},
+            "bybit": {symbol: []},
+        },
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "fetch_status": {
+            "okx": {
+                "status": "ok",
+                "positions_succeeded": [symbol],
+                "positions_failed": [],
+                "orders_succeeded": [symbol],
+                "orders_failed": [],
+            },
+            "bybit": {
+                "status": "ok",
+                "positions_succeeded": [symbol],
+                "positions_failed": [],
+                "orders_succeeded": [symbol],
+                "orders_failed": [],
+            },
+        },
+        "errors": [],
+        "missing_evidence": [],
+    }
+
+
+def test_run_diagnose_active_balanced_position_is_not_high_risk(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "open_positions": [
+                {
+                    "position_id": "pos_kat_001",
+                    "symbol": "KATUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "quantity": 7600.0,
+                    "matched_quantity": 7600.0,
+                    "opened_at_ms": 1700000000000,
+                }
+            ],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "runtime.position_opened",
+                "payload": {
+                    "position_id": "pos_kat_001",
+                    "symbol": "KATUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "quantity": 7600.0,
+                },
+            }
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _balanced_active_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="KATUSDT",
+            venues=["okx", "bybit"],
+            now_ms=1700000005000,
+        )
+
+        assert result["state_consistency"]["state_mismatch"] is False
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["open_position_count"] == 1
+        assert gate["max_concurrent_positions"] == 8
+        assert gate["remaining_position_slots"] == 7
+        assert "active_positions_with_capacity" in gate["fingerprints"]
+        assert "local_open_positions_present" not in gate["blocking_reasons"]
+        assert "exchange_truth_nonzero_position" not in gate["blocking_reasons"]
+        assert result["conclusion"]["risk"] != "high"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 9,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        state_consistency={"state_mismatch": True},
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["open_position_count"] == 9
+    assert gate["max_concurrent_positions"] == 8
+    assert gate["remaining_position_slots"] == 0
+    assert "open_positions_exceed_configured_max" in gate["blocking_reasons"]
+
+
 def test_run_diagnose_emits_fixture_replay_acceptance_gate(monkeypatch):
     """Production-window fixture replay must expose the final read-only gate."""
     from scripts import diagnose_live as dl

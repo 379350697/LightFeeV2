@@ -1448,7 +1448,9 @@ def _local_expected_legs(local_state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _side_matches(actual: str, expected: str) -> bool:
-    actual = str(actual or "").lower()
+    actual = str(actual or "").strip().lower()
+    if "." in actual:
+        actual = actual.rsplit(".", 1)[-1]
     if expected == "long":
         return actual in ("buy", "long")
     if expected == "short":
@@ -2431,6 +2433,7 @@ def _build_production_acceptance_gate(
     events: list[dict[str, Any]],
     local_state: dict[str, Any],
     exchange_truth: dict[str, Any],
+    state_consistency: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fill_ratios: list[float] = []
     passive_maker_zero_fill_count = 0
@@ -2634,6 +2637,12 @@ def _build_production_acceptance_gate(
     quick_flat_count = int(quick_flat_summary.get("quick_flat_count", 0) or 0)
     recovery_lifecycle = _build_recovery_lifecycle_summary(events)
     open_position_count = int(local_state.get("open_position_count", 0) or 0)
+    max_concurrent_positions = int(
+        local_state.get("max_concurrent_positions")
+        or (local_state.get("last_scan") or {}).get("max_concurrent_positions")
+        or 8
+    )
+    remaining_position_slots = max(max_concurrent_positions - open_position_count, 0)
     pending_entry_count = int(local_state.get("pending_entry_count", 0) or 0)
     pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
     pending_residual_repair_count = int(
@@ -2735,8 +2744,33 @@ def _build_production_acceptance_gate(
                     "closed_by_current_exchange_truth"
                 )
 
+    state_consistency = state_consistency or {}
+    state_consistent = not bool(state_consistency.get("state_mismatch"))
+    active_positions_with_capacity = (
+        open_position_count > 0
+        and open_position_count <= max_concurrent_positions
+        and pending_entry_count == 0
+        and pending_close_count == 0
+        and pending_residual_repair_count == 0
+        and exchange_truth.get("available")
+        and not exchange_truth_flat
+        and exchange_truth_no_open_orders
+        and str(local_state.get("lifecycle", "") or "").lower() == "running"
+        and str(local_state.get("risk_mode", "") or "").lower() == "running"
+        and state_consistent
+    )
+    if active_positions_with_capacity:
+        fingerprints.append("active_positions_with_capacity")
+        fingerprints.append("acceptance_pending_open_lifecycle")
+        if position_opened_count or entry_opened_count:
+            exception_conclusions["position_opened"] = "active_lifecycle_in_progress"
+            if entry_opened_count:
+                exception_conclusions["entry_opened"] = "active_lifecycle_in_progress"
+
     blocking_reasons: list[str] = []
-    if open_position_count:
+    if open_position_count > max_concurrent_positions:
+        blocking_reasons.append("open_positions_exceed_configured_max")
+    elif open_position_count and not active_positions_with_capacity:
         blocking_reasons.append("local_open_positions_present")
     if pending_entry_count or pending_close_count:
         blocking_reasons.append("local_pending_entries_or_closes_present")
@@ -2749,11 +2783,15 @@ def _build_production_acceptance_gate(
     if not exchange_truth.get("available"):
         blocking_reasons.append("exchange_truth_unavailable")
     else:
-        if not exchange_truth_flat:
+        if not exchange_truth_flat and not active_positions_with_capacity:
             blocking_reasons.append("exchange_truth_nonzero_position")
         if not exchange_truth_no_open_orders:
             blocking_reasons.append("exchange_truth_open_orders_present")
-    if (entry_opened_count or position_opened_count) and not trade_lifecycle_closed:
+    if (
+        (entry_opened_count or position_opened_count)
+        and not trade_lifecycle_closed
+        and not active_positions_with_capacity
+    ):
         blocking_reasons.append("entry_or_position_opened_without_fixture_finalized_evidence")
     if required_position_truth_unavailable_count and exception_conclusions.get(
         "blocking_required_truth"
@@ -2819,6 +2857,9 @@ def _build_production_acceptance_gate(
         "entry_opened_count": entry_opened_count,
         "position_opened_count": position_opened_count,
         "open_position_count": open_position_count,
+        "max_concurrent_positions": max_concurrent_positions,
+        "remaining_position_slots": remaining_position_slots,
+        "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,
         "pending_residual_repair_count": pending_residual_repair_count,
@@ -3227,7 +3268,7 @@ def run_diagnose(
     snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
     production_acceptance_gate = _build_production_acceptance_gate(
-        all_events, local_state, exchange_truth,
+        all_events, local_state, exchange_truth, state_consistency,
     )
     for fingerprint in production_acceptance_gate.get("fingerprints", []) or []:
         if fingerprint not in health.get("fingerprints", []):

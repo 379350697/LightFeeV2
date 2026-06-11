@@ -41,9 +41,23 @@ class OkxMetadataAdapter:
     okx_base_quantity_step = 0.0
     trading_capability_trusted = True
 
+    def passive_metadata(self, symbol: str) -> dict:
+        return {
+            "min_notional": 0.0,
+            "min_quantity": 0.001,
+            "quantity_step": 0.001,
+        }
+
 
 class BybitMetadataAdapter:
     trading_capability_trusted = True
+
+    def passive_metadata(self, symbol: str) -> dict:
+        return {
+            "min_notional": 0.0,
+            "min_quantity": 0.001,
+            "quantity_step": 0.001,
+        }
 
 
 def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
@@ -1092,7 +1106,13 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
             snapshot_path=str(tmp_path / "state.json"),
         ),
     )
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
@@ -1396,7 +1416,13 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
             snapshot_path=str(tmp_path / "state.json"),
         ),
     )
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
@@ -1483,7 +1509,13 @@ async def test_runtime_blocks_required_sidecar_liquidity_when_current_row_has_no
             snapshot_path=str(tmp_path / "state.json"),
         ),
     )
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
@@ -1568,7 +1600,13 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
             snapshot_path=str(tmp_path / "state.json"),
         ),
     )
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
@@ -1796,7 +1834,13 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             snapshot_path=str(tmp_path / "state.json"),
         ),
     )
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: OkxMetadataAdapter()})
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()

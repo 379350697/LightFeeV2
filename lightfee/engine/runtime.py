@@ -5660,6 +5660,13 @@ class LiveRuntime:
             "tradeable_count": 0,
             "selected_candidate_count": 0,
             "dispatched_candidate_count": 0,
+            "max_concurrent_positions": max(self.config.strategy.max_concurrent_positions, 1),
+            "open_position_count": len(self.state.open_positions),
+            "remaining_slots": max(
+                max(self.config.strategy.max_concurrent_positions, 1)
+                - len(self.state.open_positions),
+                0,
+            ),
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
@@ -5967,6 +5974,9 @@ class LiveRuntime:
                 # entry window, primary L2 tracking, or dual-ready books.
                 max_slots = max(self.config.strategy.max_concurrent_positions, 1)
                 remaining_slots = max(max_slots - len(self.state.open_positions), 0)
+                self.state.last_scan["max_concurrent_positions"] = max_slots
+                self.state.last_scan["open_position_count"] = len(self.state.open_positions)
+                self.state.last_scan["remaining_slots"] = remaining_slots
                 admission_blocker_counts: Counter[str] = Counter()
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
@@ -16932,7 +16942,10 @@ class LiveRuntime:
             "tradeable_count",
             "selected_candidate_count",
             "dispatched_candidate_count",
+            "max_concurrent_positions",
+            "open_position_count",
             "remaining_slots",
+            "capacity_blocked",
             "blocked_reason_counts",
             "entry_candidate_blocked_counts",
             "unsupported_symbol_blocked_counts",
@@ -17135,6 +17148,12 @@ class LiveRuntime:
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
         }
+        max_concurrent_positions = max(
+            int(getattr(self.config.strategy, "max_concurrent_positions", 0) or 0),
+            1,
+        )
+        open_position_count = len(self.state.open_positions)
+        normalized_remaining_slots = max(int(remaining_slots), 0)
 
         payload = {
             "reason": reason,
@@ -17151,7 +17170,11 @@ class LiveRuntime:
             "tradeable_count": len(tradeable),
             "selected_candidate_count": selected_candidate_count,
             "dispatched_candidate_count": dispatched_candidate_count,
-            "remaining_slots": max(int(remaining_slots), 0),
+            "max_concurrent_positions": max_concurrent_positions,
+            "open_position_count": open_position_count,
+            "remaining_slots": normalized_remaining_slots,
+            "capacity_blocked": open_position_count >= max_concurrent_positions
+            and normalized_remaining_slots <= 0,
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
             "unsupported_symbol_blocked_counts": dict(
@@ -17215,6 +17238,9 @@ class LiveRuntime:
             "tradeable_count": payload["tradeable_count"],
             "selected_candidate_count": payload["selected_candidate_count"],
             "dispatched_candidate_count": payload["dispatched_candidate_count"],
+            "max_concurrent_positions": payload["max_concurrent_positions"],
+            "open_position_count": payload["open_position_count"],
+            "remaining_slots": payload["remaining_slots"],
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
             "entry_local_l2_primary_not_ready_reason_totals": payload.get(
                 "entry_local_l2_primary_not_ready_reason_totals", {},
@@ -17236,6 +17262,9 @@ class LiveRuntime:
         summary_fingerprint = self._payload_fingerprint({
             "reason": payload["reason"],
             "generic_reason": payload["generic_reason"],
+            "max_concurrent_positions": payload["max_concurrent_positions"],
+            "open_position_count": payload["open_position_count"],
+            "remaining_slots": payload["remaining_slots"],
             "blocked_reason_keys": sorted(payload["blocked_reason_counts"].keys()),
             "unsupported_symbol_blocked_keys": sorted(
                 payload["unsupported_symbol_blocked_counts"].keys()
@@ -17274,6 +17303,21 @@ class LiveRuntime:
             self._last_no_entry_diag_ts_ms = now_ms
             self._no_entry_suppressed_full_payload_count = 0
             self._last_no_entry_diagnostics = payload
+            if self.state.last_scan is not None:
+                self.state.last_scan.update({
+                    "no_entry_reason": payload["reason"],
+                    "max_concurrent_positions": payload["max_concurrent_positions"],
+                    "open_position_count": payload["open_position_count"],
+                    "remaining_slots": payload["remaining_slots"],
+                    "capacity_blocked": payload["capacity_blocked"],
+                    "selection_bucket_counts": payload["selection_bucket_counts"],
+                    "tradeable_selection_blocker_counts": payload[
+                        "tradeable_selection_blocker_counts"
+                    ],
+                    "candidate_stage_blocked_counts": payload[
+                        "candidate_stage_blocked_counts"
+                    ],
+                })
             self.journal.append("scan.no_entry_diagnostics", payload)
             return
 
@@ -17284,6 +17328,21 @@ class LiveRuntime:
         self._last_no_entry_diag_fingerprint = summary_fingerprint
         self._last_no_entry_diag_ts_ms = now_ms
         self._last_no_entry_diagnostics = payload
+        if self.state.last_scan is not None:
+            self.state.last_scan.update({
+                "no_entry_reason": payload["reason"],
+                "max_concurrent_positions": payload["max_concurrent_positions"],
+                "open_position_count": payload["open_position_count"],
+                "remaining_slots": payload["remaining_slots"],
+                "capacity_blocked": payload["capacity_blocked"],
+                "selection_bucket_counts": payload["selection_bucket_counts"],
+                "tradeable_selection_blocker_counts": payload[
+                    "tradeable_selection_blocker_counts"
+                ],
+                "candidate_stage_blocked_counts": payload[
+                    "candidate_stage_blocked_counts"
+                ],
+            })
         compact_payload = self._compact_scan_no_entry_diagnostics_payload(
             payload,
             suppressed_full_payload_count=self._no_entry_suppressed_full_payload_count,

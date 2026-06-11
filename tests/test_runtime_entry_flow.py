@@ -495,6 +495,139 @@ def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
     }
 
 
+def test_scan_no_entry_diagnostics_exposes_capacity_context(config, tmp_journal):
+    from lightfee.engine.runtime import LiveRuntime
+
+    config.strategy.max_concurrent_positions = 8
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.state.open_positions["pos_open"] = OpenPosition(
+        position_id="pos_open",
+        symbol="KATUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        long_quantity=7600.0,
+        short_quantity=7600.0,
+        long_entry_price=0.006251,
+        short_entry_price=0.006252,
+        opened_at_ms=999_000,
+        matched_quantity=7600.0,
+    )
+
+    runtime._emit_scan_no_entry_diagnostics(
+        reason="tradeable_candidates_blocked_by_entry_local_l2_readiness",
+        snapshot=SimpleNamespace(candidates=[]),
+        tradeable=[],
+        selected_candidate_count=0,
+        dispatched_candidate_count=0,
+        remaining_slots=7,
+        tradeable_selection_blocker_counts=Counter({
+            "entry_local_l2_waiting_for_dual_ready": 2,
+        }),
+        candidate_blockers={},
+        now_ms=1_000_000,
+        admission_blocker_counts=Counter(),
+    )
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert payload["max_concurrent_positions"] == 8
+    assert payload["open_position_count"] == 1
+    assert payload["remaining_slots"] == 7
+    assert payload["capacity_blocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_capacity(
+    config, tmp_journal
+):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class ReadinessProvider:
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            return EntryReadinessDecision.allow()
+
+    class CapturingExecutor:
+        ctx = None
+
+        async def execute(self, ctx):
+            self.ctx = ctx
+            return EntryExecutionResult(
+                route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                state=EntryState.COMPLETED,
+            )
+
+    config.strategy.max_concurrent_positions = 8
+    config.strategy.min_scan_minutes_before_funding = 0
+    binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+    bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+    adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.journal = tmp_journal
+    runtime.entry_readiness_provider = ReadinessProvider()
+    executor = CapturingExecutor()
+    runtime.entry_executor = executor
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.state.open_positions["pos_active"] = OpenPosition(
+        position_id="pos_active",
+        symbol="KATUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=7600.0,
+        short_quantity=7600.0,
+        long_entry_price=0.006251,
+        short_entry_price=0.006252,
+        opened_at_ms=999_000,
+        matched_quantity=7600.0,
+    )
+
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="BTCUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=500.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+
+    selected = runtime._select_entry_candidates(
+        [candidate],
+        now_ms=now_ms,
+        remaining_slots=7,
+        selection_blocker_counts=Counter(),
+        candidate_blockers={},
+    )
+
+    assert selected == [candidate]
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0)
+
+    assert dispatched is True
+    assert executor.ctx is not None
+    assert executor.ctx.symbol == "BTCUSDT"
+    blocked_gates = [
+        record
+        for record in runtime.journal.read_all()
+        if record["kind"] == "runtime.entry_blocked_gate"
+    ]
+    assert not blocked_gates
+
+
 def test_scan_no_entry_diagnostics_includes_entry_admission_prefilter_stage(
     config, tmp_journal
 ):
@@ -963,6 +1096,168 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+
+    @staticmethod
+    def _binance_bybit_candidate(symbol: str = "BTCUSDT"):
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        return CandidateInput(
+            long_venue="binance",
+            short_venue="bybit",
+            symbol=symbol,
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+    @staticmethod
+    def _capturing_executor():
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        return CapturingExecutor()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_pending_close_reconciliation_blocks_only_matching_pair(
+        self, config, tmp_journal,
+    ):
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        executor = self._capturing_executor()
+        runtime.entry_executor = executor
+        runtime.state.set_pending_close_reconciliations([
+            {
+                "position_id": "pos-closing",
+                "kind": "final",
+                "symbol": "BTCUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            }
+        ])
+
+        blocked_candidate = self._binance_bybit_candidate("BTCUSDT")
+        allowed_candidate = self._binance_bybit_candidate("ETHUSDT")
+
+        blocked = await runtime._dispatch_entry(
+            blocked_candidate,
+            5000,
+            price_hint=50000.0,
+        )
+        dispatched = await runtime._dispatch_entry(
+            allowed_candidate,
+            5001,
+            price_hint=50000.0,
+        )
+
+        assert blocked is False
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.symbol == "ETHUSDT"
+        blocked_events = [
+            record
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_gate"
+        ]
+        assert len(blocked_events) == 1
+        assert blocked_events[0]["payload"] == {
+            "gate": "pending_close_reconciliation",
+            "reason": "pending_close_reconciliation_conflict",
+            "symbol": "BTCUSDT",
+            "ts_ms": 5000,
+        }
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_pending_passive_close_blocks_only_matching_pair(
+        self, config, tmp_journal,
+    ):
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        executor = self._capturing_executor()
+        runtime.entry_executor = executor
+        position = OpenPosition(
+            position_id="pos-closing",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=50000.0,
+            short_entry_price=50000.0,
+            opened_at_ms=1000,
+            matched_quantity=0.01,
+        )
+        runtime.state.open_positions[position.position_id] = position
+        runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+            ),
+            next_retry_at_ms=5000,
+        )
+
+        blocked_candidate = self._binance_bybit_candidate("BTCUSDT")
+        allowed_candidate = self._binance_bybit_candidate("ETHUSDT")
+
+        blocked = await runtime._dispatch_entry(
+            blocked_candidate,
+            5000,
+            price_hint=50000.0,
+        )
+        dispatched = await runtime._dispatch_entry(
+            allowed_candidate,
+            5001,
+            price_hint=50000.0,
+        )
+
+        assert blocked is False
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.symbol == "ETHUSDT"
+        blocked_events = [
+            record
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_gate"
+        ]
+        assert len(blocked_events) == 1
+        assert blocked_events[0]["payload"] == {
+            "gate": "passive_close_in_flight",
+            "reason": "passive_close_in_flight",
+            "symbol": "BTCUSDT",
+            "ts_ms": 5000,
+        }
 
     @pytest.mark.asyncio
     async def test_tick_refreshes_recovery_ledger_before_dispatch(
