@@ -119,6 +119,314 @@ def _snapshot_fallback_conclusion(payload: dict[str, Any]) -> str:
     return "insufficient_evidence"
 
 
+def _add_count(counter: Counter[str], key: str, count: Any = 1) -> None:
+    try:
+        value = int(count or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value > 0:
+        counter[key] += value
+
+
+def _add_mapping_total(counter: Counter[str], key: str, values: Any) -> None:
+    if isinstance(values, dict):
+        for count in values.values():
+            _add_count(counter, key, count)
+    else:
+        _add_count(counter, key, values)
+
+
+def _mapping_has_counts(values: Any) -> bool:
+    if not isinstance(values, dict):
+        return False
+    for count in values.values():
+        try:
+            if int(count or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+_STRATEGY_BLOCKER_REASONS = {
+    "funding_edge_below_floor",
+    "expected_edge_below_floor",
+    "worst_case_edge_below_floor",
+    "zero_order_size",
+    "funding_window_passed",
+    "outside_scan_window",
+    "no_near_term_settlement",
+    "stagger_gap_too_wide",
+    "missing_candidate_identity_or_funding_timestamp",
+}
+
+
+def _is_strategy_blocker_reason(reason: str) -> bool:
+    return reason in _STRATEGY_BLOCKER_REASONS
+
+
+def _is_open_interest_blocker_reason(reason: str) -> bool:
+    return (
+        "open_interest" in reason
+        or reason.startswith("oi_")
+        or reason.startswith("perp_oi_")
+    )
+
+
+def _is_liquidity_blocker_reason(reason: str) -> bool:
+    return "liquidity" in reason or reason.startswith("execution_")
+
+
+def _add_reason_total(
+    counter: Counter[str],
+    key: str,
+    values: Any,
+    predicate,
+) -> None:
+    if not isinstance(values, dict):
+        return
+    for reason, count in values.items():
+        if predicate(str(reason)):
+            _add_count(counter, key, count)
+
+
+def _add_total_or_mapping(
+    counter: Counter[str],
+    key: str,
+    total: Any,
+    values: Any,
+) -> bool:
+    if total is not None:
+        _add_count(counter, key, total)
+        return True
+    _add_mapping_total(counter, key, values)
+    return _mapping_has_counts(values)
+
+
+def _is_nonblocking_bulk_probe(payload: dict[str, Any]) -> bool:
+    truth_required_by = payload.get("truth_required_by") or []
+    return not truth_required_by and payload.get("blocking") is not True
+
+
+def _code_side_view(
+    *,
+    category_counts: Counter[str],
+    reason_counts: Counter[str],
+    filtered_out_counts: Counter[str],
+    exclude_strategy: bool,
+    exclude_liquidity: bool,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    view_enabled = bool(exclude_strategy or exclude_liquidity) if enabled is None else enabled
+    if not view_enabled:
+        return {
+            "enabled": False,
+            "excluded_filters": [],
+            "category_counts": {},
+            "reason_counts": {},
+            "filtered_out_counts": {},
+        }
+    return {
+        "enabled": True,
+        "excluded_filters": [
+            name
+            for name, enabled in (
+                ("strategy", exclude_strategy),
+                ("liquidity", exclude_liquidity),
+                ("open_interest", exclude_liquidity),
+            )
+            if enabled
+        ],
+        "category_counts": dict(sorted(category_counts.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "filtered_out_counts": dict(sorted(filtered_out_counts.items())),
+    }
+
+
+def _record_code_side_blocker(
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    category_counts: Counter[str],
+    reason_counts: Counter[str],
+    filtered_out_counts: Counter[str],
+    exclude_strategy: bool,
+    exclude_liquidity: bool,
+) -> None:
+    if kind == "scan.no_entry_diagnostics":
+        ws_bbo_totals = payload.get("entry_ws_bbo_blocker_counts", {}) or {}
+        for reason, count in ws_bbo_totals.items():
+            reason_text = str(reason)
+            if reason_text == "entry_ws_bbo_quote_lease_budget_exhausted":
+                _add_count(category_counts, "ws_bbo_budget", count)
+                _add_count(reason_counts, reason_text, count)
+        snapshot_totals = payload.get("snapshot_freshness_blocked_counts", {}) or {}
+        for reason, count in snapshot_totals.items():
+            reason_text = str(reason)
+            if reason_text in {"invalid_quote", "quote_stale", "missing_quote"}:
+                _add_count(category_counts, "code_data_freshness", count)
+                _add_count(reason_counts, reason_text, count)
+        for admission_key in (
+            "entry_admission_blocker_counts",
+            "entry_admission_venue_degraded_counts",
+        ):
+            admission_totals = payload.get(admission_key, {}) or {}
+            if not isinstance(admission_totals, dict):
+                continue
+            for reason, count in admission_totals.items():
+                reason_text = str(reason or "entry_admission_blocked")
+                _add_count(category_counts, "account/admission", count)
+                _add_count(reason_counts, reason_text, count)
+        if exclude_strategy:
+            strategy_counts = payload.get("strategy_blocker_counts", {}) or {}
+            strategy_total = payload.get("strategy_blocked_count")
+            strategy_counted = _add_total_or_mapping(
+                filtered_out_counts,
+                "strategy",
+                strategy_total,
+                strategy_counts,
+            )
+            if not strategy_counted:
+                _add_reason_total(
+                    filtered_out_counts,
+                    "strategy",
+                    payload.get("blocked_reason_counts", {}) or {},
+                    _is_strategy_blocker_reason,
+                )
+        if exclude_liquidity:
+            liquidity_counts = payload.get("liquidity_blocker_counts", {}) or {}
+            open_interest_counts = payload.get("open_interest_blocker_counts", {}) or {}
+            execution_liquidity_counts = (
+                payload.get("execution_liquidity_blocked_counts", {}) or {}
+            )
+            liquidity_total = payload.get("liquidity_blocked_count")
+            if liquidity_total is not None:
+                _add_count(filtered_out_counts, "liquidity", liquidity_total)
+                liquidity_counted = True
+            else:
+                _add_mapping_total(
+                    filtered_out_counts,
+                    "liquidity",
+                    liquidity_counts,
+                )
+                _add_mapping_total(
+                    filtered_out_counts,
+                    "liquidity",
+                    execution_liquidity_counts,
+                )
+                liquidity_counted = (
+                    _mapping_has_counts(liquidity_counts)
+                    or _mapping_has_counts(execution_liquidity_counts)
+                )
+            oi_counted = _add_total_or_mapping(
+                filtered_out_counts,
+                "open_interest",
+                payload.get("open_interest_blocked_count"),
+                open_interest_counts,
+            )
+            blocked_reason_counts = payload.get("blocked_reason_counts", {}) or {}
+            if not liquidity_counted:
+                _add_reason_total(
+                    filtered_out_counts,
+                    "liquidity",
+                    blocked_reason_counts,
+                    _is_liquidity_blocker_reason,
+                )
+            if not oi_counted:
+                _add_reason_total(
+                    filtered_out_counts,
+                    "open_interest",
+                    blocked_reason_counts,
+                    _is_open_interest_blocker_reason,
+                )
+
+    if kind == "runtime.snapshot_freshness_decision":
+        reason = str(payload.get("reason", "") or "")
+        if reason in {"invalid_quote", "quote_stale", "missing_quote"}:
+            _add_count(category_counts, "code_data_freshness")
+            _add_count(reason_counts, reason)
+
+    if kind == "runtime.entry_blocked_ws_bbo_selection":
+        reason = str(payload.get("reason", "") or "")
+        if reason == "entry_ws_bbo_quote_lease_budget_exhausted":
+            _add_count(category_counts, "ws_bbo_budget")
+            _add_count(reason_counts, reason)
+
+    if kind == "runtime.live_scan_revalidate_required":
+        fallback_source = str(payload.get("fallback_source", "") or "")
+        reason = str(payload.get("reason", "") or "")
+        if (
+            payload.get("targeted_revalidate_required") is True
+            or fallback_source == "last_good_sidecar"
+            or "last_good_sidecar" in reason
+        ):
+            _add_count(category_counts, "code_data_freshness")
+            _add_count(reason_counts, "last_good_sidecar_revalidate_required")
+
+    if kind == "runtime.snapshot_fallback_last_good" and _snapshot_fallback_blocked(payload):
+        blocked_scope_count = len(_snapshot_fallback_blocking_scope(payload)) or 1
+        _add_count(category_counts, "code_data_freshness", blocked_scope_count)
+        _add_count(
+            reason_counts,
+            "last_good_sidecar_revalidate_required",
+            blocked_scope_count,
+        )
+
+    if (
+        kind == "recovery.live_position_bulk_diagnostic_error"
+        and _is_nonblocking_bulk_probe(payload)
+    ):
+        _add_count(category_counts, "exchange_truth_probe")
+        classification = str(payload.get("classification", "") or "")
+        reason = (
+            "bulk_position_probe_timeout"
+            if classification == "timeout"
+            else "bulk_position_probe_diagnostic_error"
+        )
+        _add_count(reason_counts, reason)
+
+    if kind in {
+        "exit.passive_close_hedge_ack_pending_reconcile",
+        "exit.accepted_order_truth_gap_registered",
+    } or payload.get("accepted_order_truth_gap") is True:
+        _add_count(category_counts, "order_truth_gap")
+        _add_count(reason_counts, "accepted_order_truth_gap")
+
+    if exclude_liquidity and kind == "execution.entry_liquidity_blocked":
+        _add_count(filtered_out_counts, "liquidity")
+
+
+def build_code_side_blocker_view(
+    records: list[dict[str, Any]],
+    *,
+    exclude_strategy: bool = False,
+    exclude_liquidity: bool = False,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    category_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    filtered_out_counts: Counter[str] = Counter()
+    for record in records:
+        payload = _payload(record)
+        _record_code_side_blocker(
+            kind=str(record.get("kind", "") or ""),
+            payload=payload,
+            category_counts=category_counts,
+            reason_counts=reason_counts,
+            filtered_out_counts=filtered_out_counts,
+            exclude_strategy=exclude_strategy,
+            exclude_liquidity=exclude_liquidity,
+        )
+    return _code_side_view(
+        category_counts=category_counts,
+        reason_counts=reason_counts,
+        filtered_out_counts=filtered_out_counts,
+        exclude_strategy=exclude_strategy,
+        exclude_liquidity=exclude_liquidity,
+        enabled=enabled,
+    )
+
+
 def _has_official_sequence_evidence(payload: dict[str, Any]) -> bool:
     return has_official_sequence_rebuild_evidence(payload)
 
@@ -213,6 +521,9 @@ def analyze_event_file(
     path: Path | str,
     now_ms: int = 0,
     windows: list[str] | None = None,
+    *,
+    exclude_strategy: bool = False,
+    exclude_liquidity: bool = False,
 ) -> dict[str, Any]:
     """Analyze a JSONL event file with windowed breakdowns.
 
@@ -270,6 +581,9 @@ def analyze_event_file(
         exchange_error_counts: Counter[str] = Counter()
         pending_entry_counts: Counter[str] = Counter()
         incident_counts: Counter[str] = Counter()
+        code_side_category_counts: Counter[str] = Counter()
+        code_side_reason_counts: Counter[str] = Counter()
+        code_side_filtered_counts: Counter[str] = Counter()
         incident_conclusions: dict[str, str] = {}
         w_first = 0
         w_last = 0
@@ -290,6 +604,15 @@ def analyze_event_file(
             if not isinstance(readiness, dict):
                 readiness = {}
             provider = str(payload.get("provider") or readiness.get("provider") or "")
+            _record_code_side_blocker(
+                kind=kind,
+                payload=payload,
+                category_counts=code_side_category_counts,
+                reason_counts=code_side_reason_counts,
+                filtered_out_counts=code_side_filtered_counts,
+                exclude_strategy=exclude_strategy,
+                exclude_liquidity=exclude_liquidity,
+            )
 
             if kind in {
                 "runtime.entry_blocked_local_l2_selection",
@@ -442,6 +765,13 @@ def analyze_event_file(
             "pending_entry_counts": dict(sorted(pending_entry_counts.items())),
             "incident_counts": dict(sorted(incident_counts.items())),
             "incident_conclusions": dict(sorted(incident_conclusions.items())),
+            "code_side_blocker_view": _code_side_view(
+                category_counts=code_side_category_counts,
+                reason_counts=code_side_reason_counts,
+                filtered_out_counts=code_side_filtered_counts,
+                exclude_strategy=exclude_strategy,
+                exclude_liquidity=exclude_liquidity,
+            ),
             "blocker_reason_counts": blocker_reason_counts,
             "first_ts_ms": w_first,
             "last_ts_ms": w_last,
@@ -583,6 +913,10 @@ def main() -> None:
                         help="Comma-separated window names (default: last_2h,last_24h,run_window)")
     parser.add_argument("--no-secrets", action="store_true", default=True,
                         help="Strip secrets from output (default: on)")
+    parser.add_argument("--exclude-strategy", action="store_true",
+                        help="Add a code-side blocker view that filters strategy blockers")
+    parser.add_argument("--exclude-liquidity", action="store_true",
+                        help="Add a code-side blocker view that filters liquidity and OI blockers")
     args = parser.parse_args()
 
     events_path = args.events_path or args.json_path or args.journal
@@ -591,7 +925,12 @@ def main() -> None:
 
     windows = [w.strip() for w in args.windows.split(",") if w.strip()]
 
-    report = analyze_event_file(Path(events_path), windows=windows)
+    report = analyze_event_file(
+        Path(events_path),
+        windows=windows,
+        exclude_strategy=args.exclude_strategy,
+        exclude_liquidity=args.exclude_liquidity,
+    )
 
     # Add state and snapshot summaries if provided
     if args.state_path:
