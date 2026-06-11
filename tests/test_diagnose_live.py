@@ -381,6 +381,75 @@ def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_containe
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_can_report_code_side_blockers_without_changing_gate(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1781111910000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781111900100,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {
+                    "snapshot_freshness_blocked_counts": {"invalid_quote": 50},
+                    "entry_ws_bbo_blocker_counts": {
+                        "entry_ws_bbo_quote_lease_budget_exhausted": 8,
+                    },
+                    "strategy_blocker_counts": {"funding_edge_below_floor": 80},
+                    "open_interest_blocker_counts": {"oi_below_floor": 70},
+                    "liquidity_blocker_counts": {"depth_too_low": 60},
+                },
+            },
+            {
+                "ts_ms": 1781111900400,
+                "kind": "recovery.live_position_bulk_diagnostic_error",
+                "payload": {
+                    "venue": "okx",
+                    "classification": "timeout",
+                    "diagnostic_scope": "best_effort_bulk_positions",
+                    "truth_required_by": [],
+                    "blocking": False,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1781111910000,
+            code_side_blockers=True,
+            exclude_strategy=True,
+            exclude_liquidity=True,
+        )
+
+        assert result["production_acceptance_gate"]["gate_passed"] is True
+        view = result["code_side_blocker_view"]
+        assert view["category_counts"] == {
+            "code_data_freshness": 50,
+            "exchange_truth_probe": 1,
+            "ws_bbo_budget": 8,
+        }
+        assert view["filtered_out_counts"] == {
+            "liquidity": 60,
+            "open_interest": 70,
+            "strategy": 80,
+        }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_production_gate_classifies_hyperliquid_usdc_present_margin_view_zero():
     from scripts import diagnose_live as dl
 

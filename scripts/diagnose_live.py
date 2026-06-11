@@ -3079,6 +3079,9 @@ def run_diagnose(
     now_ms: int = 0,
     since_deploy: bool = False,
     venues: list[str] | None = None,
+    code_side_blockers: bool = False,
+    exclude_strategy: bool = False,
+    exclude_liquidity: bool = False,
 ) -> dict[str, Any]:
     generated_at_ms = now_ms or _now_ms()
 
@@ -3176,6 +3179,23 @@ def run_diagnose(
         all_events,
         production_acceptance_gate,
     )
+    if code_side_blockers or exclude_strategy or exclude_liquidity:
+        from scripts.analyze_production_blockers import build_code_side_blocker_view
+
+        code_side_blocker_view = build_code_side_blocker_view(
+            all_events,
+            exclude_strategy=exclude_strategy,
+            exclude_liquidity=exclude_liquidity,
+            enabled=True,
+        )
+    else:
+        code_side_blocker_view = {
+            "enabled": False,
+            "excluded_filters": [],
+            "category_counts": {},
+            "reason_counts": {},
+            "filtered_out_counts": {},
+        }
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -3207,6 +3227,7 @@ def run_diagnose(
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
+        "code_side_blocker_view": code_side_blocker_view,
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,
         "runtime_warnings": runtime_warnings,
@@ -3409,6 +3430,12 @@ def main() -> None:
                        help="Max events to parse (default: {})".format(DEFAULT_MAX_EVENTS))
     parser.add_argument("--now-ms", type=int, default=0,
                        help="Override current time in ms (testing)")
+    parser.add_argument("--code-side-blockers", action="store_true",
+                       help="Include a code-side blocker view in the JSON report")
+    parser.add_argument("--exclude-strategy", action="store_true",
+                       help="Filter strategy blockers out of the code-side blocker view")
+    parser.add_argument("--exclude-liquidity", action="store_true",
+                       help="Filter liquidity and OI blockers out of the code-side blocker view")
     args = parser.parse_args()
     venues = [
         venue.strip().lower()
@@ -3427,6 +3454,9 @@ def main() -> None:
         now_ms=args.now_ms,
         since_deploy=args.since_deploy,
         venues=venues,
+        code_side_blockers=args.code_side_blockers,
+        exclude_strategy=args.exclude_strategy,
+        exclude_liquidity=args.exclude_liquidity,
     )
 
     if args.json:

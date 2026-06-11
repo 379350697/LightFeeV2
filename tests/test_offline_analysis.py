@@ -1426,3 +1426,229 @@ class TestProductionBlockerAnalyzer:
         assert result["classification"]["entry_local_l2_waiting_for_primary_tracking"] == "current_new_high_frequency"
         assert result["classification"]["entry_local_l2_waiting_for_dual_ready"] == "current_new_high_frequency"
         assert result["classification"]["pending_entry.hedge_submit_result:min_notional_rejected"] == "exchange_rule_residual"
+
+    def test_code_side_view_filters_strategy_liquidity_and_oi_from_incident_window(self, tmp_path):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        journal = tmp_path / "code_side_blockers.jsonl"
+        records = _code_side_blocker_incident_records()
+        journal.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+        result = analyze_event_file(
+            journal,
+            now_ms=1781111910000,
+            windows=["run_window"],
+            exclude_strategy=True,
+            exclude_liquidity=True,
+        )
+
+        view = result["windows"]["run_window"]["code_side_blocker_view"]
+        assert view["filtered_out_counts"] == {
+            "liquidity": 68,
+            "open_interest": 76,
+            "strategy": 85,
+        }
+        assert view["category_counts"] == {
+            "account/admission": 2,
+            "code_data_freshness": 52,
+            "exchange_truth_probe": 1,
+            "order_truth_gap": 1,
+            "ws_bbo_budget": 8,
+        }
+        assert view["reason_counts"] == {
+            "accepted_order_truth_gap": 1,
+            "bulk_position_probe_timeout": 1,
+            "entry_ws_bbo_quote_lease_budget_exhausted": 8,
+            "invalid_quote": 50,
+            "insufficient_margin_admission_prefiltered": 2,
+            "last_good_sidecar_revalidate_required": 2,
+        }
+
+    def test_code_side_view_cli_flags_are_read_only_report_filters(self, tmp_path):
+        journal = tmp_path / "code_side_blockers.jsonl"
+        journal.write_text(
+            "\n".join(json.dumps(record) for record in _code_side_blocker_incident_records())
+            + "\n"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/analyze_production_blockers.py",
+                "--events",
+                str(journal),
+                "--windows",
+                "run_window",
+                "--exclude-strategy",
+                "--exclude-liquidity",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report = json.loads(result.stdout)
+
+        view = report["windows"]["run_window"]["code_side_blocker_view"]
+        assert view["excluded_filters"] == ["strategy", "liquidity", "open_interest"]
+        assert view["category_counts"]["code_data_freshness"] == 52
+        assert view["filtered_out_counts"] == {
+            "liquidity": 68,
+            "open_interest": 76,
+            "strategy": 85,
+        }
+
+    def test_code_side_view_default_is_compatibility_only(self, tmp_path):
+        from scripts.analyze_production_blockers import analyze_event_file
+
+        journal = tmp_path / "code_side_blockers.jsonl"
+        journal.write_text(
+            "\n".join(json.dumps(record) for record in _code_side_blocker_incident_records())
+            + "\n"
+        )
+
+        result = analyze_event_file(journal, windows=["run_window"])
+
+        view = result["windows"]["run_window"]["code_side_blocker_view"]
+        assert view["enabled"] is False
+        assert view["excluded_filters"] == []
+        assert view["category_counts"] == {}
+        assert view["reason_counts"] == {}
+        assert view["filtered_out_counts"] == {}
+        assert result["windows"]["run_window"]["entry_ws_bbo_blocker_counts"] == {
+            "entry_ws_bbo_quote_lease_budget_exhausted": 8,
+        }
+
+    def test_code_side_view_does_not_double_count_total_and_breakdown_fields(self):
+        from scripts.analyze_production_blockers import build_code_side_blocker_view
+
+        view = build_code_side_blocker_view(
+            [
+                {
+                    "kind": "scan.no_entry_diagnostics",
+                    "payload": {
+                        "strategy_blocker_counts": {
+                            "funding_edge_below_floor": 3,
+                        },
+                        "strategy_blocked_count": 3,
+                        "liquidity_blocker_counts": {
+                            "depth_too_low": 4,
+                        },
+                        "liquidity_blocked_count": 4,
+                        "open_interest_blocker_counts": {
+                            "oi_below_floor": 5,
+                        },
+                        "open_interest_blocked_count": 5,
+                    },
+                },
+            ],
+            exclude_strategy=True,
+            exclude_liquidity=True,
+        )
+
+        assert view["filtered_out_counts"] == {
+            "liquidity": 4,
+            "open_interest": 5,
+            "strategy": 3,
+        }
+
+
+def _code_side_blocker_incident_records():
+    return [
+            {
+                "ts_ms": 1781111900000,
+                "kind": "runtime.snapshot_freshness_decision",
+                "payload": {
+                    "symbol": "SAHARAUSDT",
+                    "venue": "bybit",
+                    "reason": "invalid_quote",
+                    "invalid_quote_fields": ["bid", "ask"],
+                },
+            },
+            {
+                "ts_ms": 1781111900100,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {
+                    "snapshot_freshness_blocked_counts": {"invalid_quote": 49},
+                    "entry_ws_bbo_blocker_counts": {
+                        "entry_ws_bbo_quote_lease_budget_exhausted": 8,
+                    },
+                    "strategy_blocker_counts": {
+                        "funding_edge_below_floor": 80,
+                    },
+                    "open_interest_blocker_counts": {
+                        "oi_below_floor": 70,
+                    },
+                    "liquidity_blocker_counts": {
+                        "depth_too_low": 60,
+                    },
+                    "entry_admission_blocker_counts": {
+                        "insufficient_margin_admission_prefiltered": 2,
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781111900150,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {
+                    "blocked_reason_counts": {
+                        "funding_window_passed": 5,
+                        "perp_open_interest_below_floor": 6,
+                        "execution_liquidity_depth_too_low": 7,
+                    },
+                    "execution_liquidity_blocked_counts": {},
+                },
+            },
+            {
+                "ts_ms": 1781111900200,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "CLUSDT",
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "CLUSDT",
+                            "candidate_pair_id": "clus:okx->bybit",
+                            "domain": "market_observed",
+                            "venue": "global",
+                            "blocked": True,
+                            "block_reason": "last_good_sidecar",
+                        },
+                    ],
+                },
+            },
+            {
+                "ts_ms": 1781111900300,
+                "kind": "runtime.live_scan_revalidate_required",
+                "payload": {
+                    "symbol": "CLUSDT",
+                    "fallback_source": "last_good_sidecar",
+                    "targeted_revalidate_required": True,
+                },
+            },
+            {
+                "ts_ms": 1781111900400,
+                "kind": "recovery.live_position_bulk_diagnostic_error",
+                "payload": {
+                    "venue": "okx",
+                    "classification": "timeout",
+                    "diagnostic_scope": "best_effort_bulk_positions",
+                    "truth_required_by": [],
+                    "blocking": False,
+                },
+            },
+            {
+                "ts_ms": 1781111900500,
+                "kind": "exit.passive_close_hedge_ack_pending_reconcile",
+                "payload": {
+                    "venue": "bybit",
+                    "symbol": "KATUSDT",
+                    "accepted_order_truth_gap": True,
+                    "accepted_order_id": "oid-1",
+                    "accepted_client_order_id": "cid-1",
+                },
+            },
+            {
+                "ts_ms": 1781111900600,
+                "kind": "execution.entry_liquidity_blocked",
+                "payload": {"reason": "depth_too_low"},
+            },
+    ]
