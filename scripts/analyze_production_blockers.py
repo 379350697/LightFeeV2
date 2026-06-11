@@ -260,6 +260,7 @@ def _code_side_view(
     *,
     category_counts: Counter[str],
     reason_counts: Counter[str],
+    resolution_counts: Counter[str] | None = None,
     filtered_out_counts: Counter[str],
     exclude_strategy: bool,
     exclude_liquidity: bool,
@@ -272,8 +273,10 @@ def _code_side_view(
             "excluded_filters": [],
             "category_counts": {},
             "reason_counts": {},
+            "resolution_counts": {},
             "filtered_out_counts": {},
         }
+    resolution_counts = resolution_counts or Counter()
     return {
         "enabled": True,
         "excluded_filters": [
@@ -287,6 +290,7 @@ def _code_side_view(
         ],
         "category_counts": dict(sorted(category_counts.items())),
         "reason_counts": dict(sorted(reason_counts.items())),
+        "resolution_counts": dict(sorted(resolution_counts.items())),
         "filtered_out_counts": dict(sorted(filtered_out_counts.items())),
     }
 
@@ -297,11 +301,26 @@ def _record_code_side_blocker(
     payload: dict[str, Any],
     category_counts: Counter[str],
     reason_counts: Counter[str],
+    resolution_counts: Counter[str],
     filtered_out_counts: Counter[str],
     exclude_strategy: bool,
     exclude_liquidity: bool,
 ) -> None:
     if kind == "scan.no_entry_diagnostics":
+        for key in (
+            "quote_revalidate_resolved_count",
+            "quote_revalidate_failed_count",
+        ):
+            try:
+                count = int(payload.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                _add_count(
+                    resolution_counts,
+                    key.replace("_count", ""),
+                    count,
+                )
         ws_bbo_totals = payload.get("entry_ws_bbo_blocker_counts", {}) or {}
         for reason, count in ws_bbo_totals.items():
             reason_text = str(reason)
@@ -412,6 +431,25 @@ def _record_code_side_blocker(
             _add_count(category_counts, "ws_bbo_budget")
             _add_count(reason_counts, reason)
 
+    if kind == "runtime.entry_quote_revalidate_resolved":
+        _add_count(resolution_counts, "quote_revalidate_resolved")
+        source = str(payload.get("source", "") or "")
+        if source:
+            _add_count(resolution_counts, f"quote_revalidate_source:{source}")
+
+    if kind == "runtime.last_good_revalidated_by_entry_quote_truth":
+        _add_count(resolution_counts, "last_good_revalidated")
+
+    if kind == "runtime.entry_quote_revalidate_failed":
+        _add_count(category_counts, "code_data_freshness")
+        outcome = str(
+            payload.get("outcome")
+            or payload.get("reason")
+            or "quote_revalidate_failed"
+        )
+        _add_count(reason_counts, outcome)
+        _add_count(resolution_counts, "quote_revalidate_failed")
+
     if kind == "runtime.live_scan_revalidate_required":
         fallback_source = str(payload.get("fallback_source", "") or "")
         reason = str(payload.get("reason", "") or "")
@@ -465,6 +503,7 @@ def build_code_side_blocker_view(
 ) -> dict[str, Any]:
     category_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
+    resolution_counts: Counter[str] = Counter()
     filtered_out_counts: Counter[str] = Counter()
     for record in records:
         payload = _payload(record)
@@ -473,6 +512,7 @@ def build_code_side_blocker_view(
             payload=payload,
             category_counts=category_counts,
             reason_counts=reason_counts,
+            resolution_counts=resolution_counts,
             filtered_out_counts=filtered_out_counts,
             exclude_strategy=exclude_strategy,
             exclude_liquidity=exclude_liquidity,
@@ -480,6 +520,7 @@ def build_code_side_blocker_view(
     return _code_side_view(
         category_counts=category_counts,
         reason_counts=reason_counts,
+        resolution_counts=resolution_counts,
         filtered_out_counts=filtered_out_counts,
         exclude_strategy=exclude_strategy,
         exclude_liquidity=exclude_liquidity,
@@ -643,6 +684,7 @@ def analyze_event_file(
         incident_counts: Counter[str] = Counter()
         code_side_category_counts: Counter[str] = Counter()
         code_side_reason_counts: Counter[str] = Counter()
+        code_side_resolution_counts: Counter[str] = Counter()
         code_side_filtered_counts: Counter[str] = Counter()
         incident_conclusions: dict[str, str] = {}
         w_first = 0
@@ -669,6 +711,7 @@ def analyze_event_file(
                 payload=payload,
                 category_counts=code_side_category_counts,
                 reason_counts=code_side_reason_counts,
+                resolution_counts=code_side_resolution_counts,
                 filtered_out_counts=code_side_filtered_counts,
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,
@@ -828,6 +871,7 @@ def analyze_event_file(
             "code_side_blocker_view": _code_side_view(
                 category_counts=code_side_category_counts,
                 reason_counts=code_side_reason_counts,
+                resolution_counts=code_side_resolution_counts,
                 filtered_out_counts=code_side_filtered_counts,
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,

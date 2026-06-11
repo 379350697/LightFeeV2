@@ -34,7 +34,14 @@ class CapturingEntryExecutor:
 
 class TrustedVenueAdapter:
     trading_capability_trusted = True
-    okx_base_quantity_step = 0.0
+    okx_base_quantity_step = 0.001
+
+    def passive_metadata(self, symbol: str):
+        return {
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional": 0.0,
+        }
 
 
 def _candidate(

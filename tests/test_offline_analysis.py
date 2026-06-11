@@ -1449,7 +1449,7 @@ class TestProductionBlockerAnalyzer:
             "strategy": 85,
         }
         assert view["category_counts"] == {
-            "code_data_freshness": 52,
+            "code_data_freshness": 53,
             "exchange_truth_probe": 1,
             "order_truth_gap": 1,
             "ws_bbo_budget": 8,
@@ -1460,6 +1460,13 @@ class TestProductionBlockerAnalyzer:
             "entry_ws_bbo_quote_lease_budget_exhausted": 8,
             "invalid_quote": 50,
             "last_good_sidecar_revalidate_required": 2,
+            "quote_revalidate_unavailable": 1,
+        }
+        assert view["resolution_counts"] == {
+            "last_good_revalidated": 1,
+            "quote_revalidate_failed": 1,
+            "quote_revalidate_resolved": 1,
+            "quote_revalidate_source:bybit_bbo_ws": 1,
         }
 
     def test_code_side_view_cli_flags_are_read_only_report_filters(self, tmp_path):
@@ -1488,7 +1495,8 @@ class TestProductionBlockerAnalyzer:
 
         view = report["windows"]["run_window"]["code_side_blocker_view"]
         assert view["excluded_filters"] == ["strategy", "liquidity", "open_interest"]
-        assert view["category_counts"]["code_data_freshness"] == 52
+        assert view["category_counts"]["code_data_freshness"] == 53
+        assert view["resolution_counts"]["quote_revalidate_resolved"] == 1
         assert view["filtered_out_counts"] == {
             "liquidity": 68,
             "open_interest": 76,
@@ -1511,6 +1519,7 @@ class TestProductionBlockerAnalyzer:
         assert view["excluded_filters"] == []
         assert view["category_counts"] == {}
         assert view["reason_counts"] == {}
+        assert view["resolution_counts"] == {}
         assert view["filtered_out_counts"] == {}
         assert result["windows"]["run_window"]["entry_ws_bbo_blocker_counts"] == {
             "entry_ws_bbo_quote_lease_budget_exhausted": 8,
@@ -1640,6 +1649,34 @@ def _code_side_blocker_incident_records():
                     "symbol": "CLUSDT",
                     "fallback_source": "last_good_sidecar",
                     "targeted_revalidate_required": True,
+                },
+            },
+            {
+                "ts_ms": 1781111900320,
+                "kind": "runtime.entry_quote_revalidate_resolved",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "CLUSDT",
+                    "source": "bybit_bbo_ws",
+                    "outcome": "resolved",
+                },
+            },
+            {
+                "ts_ms": 1781111900330,
+                "kind": "runtime.last_good_revalidated_by_entry_quote_truth",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "CLUSDT",
+                    "source": "entry_quote_truth",
+                },
+            },
+            {
+                "ts_ms": 1781111900340,
+                "kind": "runtime.entry_quote_revalidate_failed",
+                "payload": {
+                    "venue": "gate",
+                    "symbol": "CLUSDT",
+                    "outcome": "quote_revalidate_unavailable",
                 },
             },
             {

@@ -3306,6 +3306,7 @@ def run_diagnose(
             "excluded_filters": [],
             "category_counts": {},
             "reason_counts": {},
+            "resolution_counts": {},
             "filtered_out_counts": {},
         }
 

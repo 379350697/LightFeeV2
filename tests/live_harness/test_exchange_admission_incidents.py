@@ -20,6 +20,32 @@ pytestmark = pytest.mark.live_harness
 _ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
 
 
+class TrustedVenueAdapter:
+    trading_capability_trusted = True
+    okx_base_quantity_step = 0.001
+
+    def passive_metadata(self, symbol: str):
+        return {
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional": 0.0,
+        }
+
+
+def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
+    adapter = TrustedVenueAdapter()
+    return LiveRuntime(
+        make_test_config(tmp_path),
+        venue_adapters={
+            Venue.ASTER: adapter,
+            Venue.BINANCE: adapter,
+            Venue.BYBIT: adapter,
+            Venue.HYPERLIQUID: adapter,
+            Venue.OKX: adapter,
+        },
+    )
+
+
 def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespace:
     return SimpleNamespace(
         symbol=symbol,
@@ -142,7 +168,7 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
     evidence_gap: bool,
 ):
     with tempfile.TemporaryDirectory() as td:
-        runtime = LiveRuntime(make_test_config(td))
+        runtime = _runtime_with_metadata(td)
         runtime.journal.open()
         executor = RejectingExecutor(raw_error)
         runtime.entry_executor = executor
@@ -709,7 +735,7 @@ async def test_binance_5022_exception_path_creates_cooldown_without_admission_bl
     )
 
     with tempfile.TemporaryDirectory() as td:
-        runtime = LiveRuntime(make_test_config(td))
+        runtime = _runtime_with_metadata(td)
         runtime.journal.open()
 
         class RaisingExecutor:
@@ -751,7 +777,7 @@ async def test_binance_5022_exception_path_creates_cooldown_without_admission_bl
 @pytest.mark.asyncio
 async def test_recovered_admission_block_prevents_dispatch_until_ttl_expires():
     with tempfile.TemporaryDirectory() as td:
-        runtime = LiveRuntime(make_test_config(td))
+        runtime = _runtime_with_metadata(td)
         runtime.journal.open()
         runtime.state.venue_entry_cooldowns["bybit:LITEUSDT"] = {
             "venue": "bybit",

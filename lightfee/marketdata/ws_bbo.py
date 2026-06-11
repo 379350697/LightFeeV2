@@ -121,7 +121,15 @@ def hyperliquid_bbo_stream_url() -> str:
 class RestTopBookQuoteRefresher:
     """Short-timeout public REST top-book refresh for tracked WS BBO gaps."""
 
-    SUPPORTED_VENUES = {"binance", "aster", "bybit", "okx"}
+    SUPPORTED_VENUES = {
+        "binance",
+        "aster",
+        "bybit",
+        "okx",
+        "bitget",
+        "gate",
+        "hyperliquid",
+    }
     MIN_ATTEMPT_INTERVAL_MS = 1_000
 
     def __init__(
@@ -240,12 +248,75 @@ class RestTopBookQuoteRefresher:
                 received_at_ms=now_ms,
             )
 
+        if venue == "bitget":
+            raw = self._get_json(
+                spec.public_base_url + spec.market_snapshot_path,
+                params={"productType": "USDT-FUTURES", "symbol": venue_symbol},
+            )
+            rows = raw.get("data") if isinstance(raw, dict) else raw
+            row = self._select_row(rows, venue_symbol)
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(row.get("bidPr"), row.get("bid1Price")),
+                ask=_float_value(row.get("askPr"), row.get("ask1Price")),
+                bid_size=_float_value(row.get("bidSz"), row.get("bid1Size")),
+                ask_size=_float_value(row.get("askSz"), row.get("ask1Size")),
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("requestTime"), now_ms),
+                received_at_ms=now_ms,
+            )
+
+        if venue == "gate":
+            raw = self._get_json(
+                spec.public_base_url + spec.market_snapshot_path,
+                params={"contract": venue_symbol},
+            )
+            row = self._select_row(raw, venue_symbol)
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(row.get("highest_bid"), row.get("bid")),
+                ask=_float_value(row.get("lowest_ask"), row.get("ask")),
+                bid_size=_float_value(row.get("highest_size"), row.get("bid_size")),
+                ask_size=_float_value(row.get("lowest_size"), row.get("ask_size")),
+                observed_at_ms=_int_ms(row.get("time_ms"), row.get("time"), now_ms),
+                received_at_ms=now_ms,
+            )
+
+        if venue == "hyperliquid":
+            raw = self._post_json(
+                spec.public_base_url + spec.market_snapshot_path,
+                json={"type": "l2Book", "coin": venue_symbol},
+            )
+            levels = raw.get("levels") if isinstance(raw, dict) else []
+            bids = levels[0] if isinstance(levels, list) and len(levels) > 0 else []
+            asks = levels[1] if isinstance(levels, list) and len(levels) > 1 else []
+            bid_row = _first_row(bids)
+            ask_row = _first_row(asks)
+            return self._make_rest_quote(
+                venue=venue,
+                symbol=symbol,
+                bid=_float_value(bid_row.get("px"), bid_row.get("price")),
+                ask=_float_value(ask_row.get("px"), ask_row.get("price")),
+                bid_size=_float_value(bid_row.get("sz"), bid_row.get("size")),
+                ask_size=_float_value(ask_row.get("sz"), ask_row.get("size")),
+                observed_at_ms=_int_ms(raw.get("time"), now_ms),
+                received_at_ms=now_ms,
+            )
+
         return None
 
     def _get_json(self, url: str, *, params: dict[str, Any]) -> Any:
         if self._client is None:
             self._client = httpx.Client(timeout=httpx.Timeout(self._timeout_s))
         response = self._client.get(url, params=params, timeout=self._timeout_s)
+        response.raise_for_status()
+        return response.json()
+
+    def _post_json(self, url: str, *, json: dict[str, Any]) -> Any:
+        if self._client is None:
+            self._client = httpx.Client(timeout=httpx.Timeout(self._timeout_s))
+        response = self._client.post(url, json=json, timeout=self._timeout_s)
         response.raise_for_status()
         return response.json()
 
@@ -260,7 +331,12 @@ class RestTopBookQuoteRefresher:
         for row in raw:
             if not isinstance(row, dict):
                 continue
-            symbol = str(row.get("symbol") or row.get("instId") or "")
+            symbol = str(
+                row.get("symbol")
+                or row.get("instId")
+                or row.get("contract")
+                or ""
+            )
             if symbol == venue_symbol:
                 return row
         return {}

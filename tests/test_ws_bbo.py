@@ -336,6 +336,120 @@ def test_rest_top_book_refresher_fetches_okx_ticker_with_venue_symbol():
     )
 
 
+def test_rest_top_book_refresher_fetches_bitget_ticker():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "code": "00000",
+                "data": [{
+                    "symbol": "ARIAUSDT",
+                    "bidPr": "0.0390",
+                    "bidSz": "700",
+                    "askPr": "0.0392",
+                    "askSz": "800",
+                    "ts": "1778985599980",
+                }],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("bitget", "ARIAUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "bitget"
+    assert quote.symbol == "ARIAUSDT"
+    assert quote.bid == 0.0390
+    assert quote.ask == 0.0392
+    assert quote.observed_at_ms == 1778985599980
+    assert str(requests[0].url) == (
+        "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES&symbol=ARIAUSDT"
+    )
+
+
+def test_rest_top_book_refresher_fetches_gate_futures_ticker():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=[{
+                "contract": "ARIA_USDT",
+                "highest_bid": "0.0390",
+                "lowest_ask": "0.0392",
+                "highest_size": "700",
+                "lowest_size": "800",
+                "time_ms": 1778985599980,
+            }],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("gate", "ARIAUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "gate"
+    assert quote.symbol == "ARIAUSDT"
+    assert quote.bid == 0.0390
+    assert quote.ask == 0.0392
+    assert quote.observed_at_ms == 1778985599980
+    assert str(requests[0].url) == (
+        "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=ARIA_USDT"
+    )
+
+
+def test_rest_top_book_refresher_fetches_hyperliquid_l2_top():
+    import json
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert json.loads(request.content.decode()) == {
+            "type": "l2Book",
+            "coin": "ARIA",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "time": 1778985599980,
+                "levels": [
+                    [{"px": "0.0390", "sz": "700"}],
+                    [{"px": "0.0392", "sz": "800"}],
+                ],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    quote = refresher.refresh_quote("hyperliquid", "ARIAUSDT", now_ms=1778985600000)
+
+    assert quote is not None
+    assert quote.venue == "hyperliquid"
+    assert quote.symbol == "ARIAUSDT"
+    assert quote.bid == 0.0390
+    assert quote.ask == 0.0392
+    assert quote.observed_at_ms == 1778985599980
+    assert str(requests[0].url) == "https://api.hyperliquid.xyz/info"
+
+
 def test_rest_top_book_refresher_rejects_one_sided_quote():
     import httpx
     from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher

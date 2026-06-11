@@ -5216,6 +5216,453 @@ class LiveRuntime:
             retained_max_age_ms=300_000,
         )
 
+    @staticmethod
+    def _entry_quote_truth_empty_stats() -> dict[str, Any]:
+        return {
+            "target_count": 0,
+            "all_target_count": 0,
+            "budgeted_target_count": 0,
+            "budget_exhausted_count": 0,
+            "skipped_unbudgeted_count": 0,
+            "cache_initial_hit_count": 0,
+            "cache_wait_hit_count": 0,
+            "rest_attempt_count": 0,
+            "rest_resolved_count": 0,
+            "rest_failed_count": 0,
+            "wait_budget_ms": 0,
+            "wait_elapsed_ms": 0,
+            "resolved_count": 0,
+            "failed_count": 0,
+            "sources": Counter(),
+            "top_quote_blocker_buckets": Counter(),
+        }
+
+    def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]) -> None:
+        self.state.last_scan["quote_revalidate_target_count"] = int(
+            stats.get("target_count", 0) or 0
+        )
+        self.state.last_scan["quote_revalidate_resolved_count"] = int(
+            stats.get("resolved_count", 0) or 0
+        )
+        self.state.last_scan["quote_revalidate_failed_count"] = int(
+            stats.get("failed_count", 0) or 0
+        )
+        sources = stats.get("sources", Counter())
+        self.state.last_scan["quote_revalidate_sources"] = dict(
+            sorted((str(k), int(v)) for k, v in sources.items())
+        )
+        buckets = stats.get("top_quote_blocker_buckets", Counter())
+        self.state.last_scan["top_quote_blocker_buckets"] = dict(
+            sorted((str(k), int(v)) for k, v in buckets.items())
+        )
+
+    def _entry_quote_probe_diagnostics_enabled(self) -> bool:
+        return bool(
+            getattr(
+                getattr(self.config, "runtime", None),
+                "debug_journal_diagnostics_enabled",
+                False,
+            )
+        )
+
+    def _emit_entry_quote_revalidate_probe(
+        self,
+        *,
+        stats: dict[str, Any],
+        candidate_count: int,
+        now_ms: int,
+    ) -> None:
+        if not self._entry_quote_probe_diagnostics_enabled():
+            return
+        payload = {
+            "enabled": True,
+            "candidate_count": int(candidate_count or 0),
+            "all_target_count": int(stats.get("all_target_count", 0) or 0),
+            "target_count": int(stats.get("target_count", 0) or 0),
+            "budgeted_target_count": int(stats.get("budgeted_target_count", 0) or 0),
+            "budget_exhausted_count": int(stats.get("budget_exhausted_count", 0) or 0),
+            "skipped_unbudgeted_count": int(stats.get("skipped_unbudgeted_count", 0) or 0),
+            "cache_initial_hit_count": int(stats.get("cache_initial_hit_count", 0) or 0),
+            "cache_wait_hit_count": int(stats.get("cache_wait_hit_count", 0) or 0),
+            "rest_attempt_count": int(stats.get("rest_attempt_count", 0) or 0),
+            "rest_resolved_count": int(stats.get("rest_resolved_count", 0) or 0),
+            "rest_failed_count": int(stats.get("rest_failed_count", 0) or 0),
+            "resolved_count": int(stats.get("resolved_count", 0) or 0),
+            "failed_count": int(stats.get("failed_count", 0) or 0),
+            "wait_budget_ms": int(stats.get("wait_budget_ms", 0) or 0),
+            "wait_elapsed_ms": int(stats.get("wait_elapsed_ms", 0) or 0),
+            "resolved_sources": dict(
+                sorted((str(k), int(v)) for k, v in stats.get("sources", Counter()).items())
+            ),
+            "top_quote_blocker_buckets": dict(
+                sorted(
+                    (str(k), int(v))
+                    for k, v in stats.get("top_quote_blocker_buckets", Counter()).items()
+                )
+            ),
+            "ts_ms": now_ms,
+        }
+        self._append_runtime_diagnostic_event(
+            "runtime.entry_quote_revalidate_probe",
+            payload,
+            now_ms=now_ms,
+            key_parts=("entry_quote_revalidate",),
+            interval_ms=1000,
+        )
+
+    def _entry_quote_truth_overlay_quote(
+        self,
+        overlay: dict[tuple[str, str], Any] | None,
+        venue: str,
+        symbol: str,
+    ) -> Any | None:
+        if not overlay:
+            return None
+        return overlay.get((str(venue or "").lower(), str(symbol or "").upper()))
+
+    def _entry_quote_truth_market_quotes(
+        self,
+        market_quotes: Any,
+        overlay: dict[tuple[str, str], Any] | None,
+    ) -> dict:
+        merged = dict(market_quotes or {})
+        for (venue, symbol), quote in (overlay or {}).items():
+            merged[f"{venue}:{symbol}"] = quote
+        return merged
+
+    def _entry_quote_truth_price_hint(
+        self,
+        candidate: Any,
+        *,
+        price_hints: dict[str, float],
+        overlay: dict[tuple[str, str], Any] | None,
+    ) -> float:
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        mids: list[float] = []
+        for venue_attr in ("long_venue", "short_venue"):
+            venue = str(getattr(candidate, venue_attr, "") or "").lower()
+            quote = self._entry_quote_truth_overlay_quote(overlay, venue, symbol)
+            if quote is None:
+                continue
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            if bid > 0.0 and ask > bid:
+                mids.append((bid + ask) / 2.0)
+        if mids:
+            return sum(mids) / len(mids)
+        return float(price_hints.get(symbol, 0.0) or 0.0)
+
+    def _entry_quote_revalidate_need(
+        self,
+        *,
+        snapshot,
+        quote: Any,
+        now_ms: int,
+        fallback_source: str,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if quote is None:
+            return False, "", {}
+        observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
+        direct_observed_at_ms = self._snapshot_quote_direct_observed_at_ms(quote)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        budget_ms = self._snapshot_domain_budget_ms("quote")
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        if direct_observed_at_ms <= 0 or bid <= 0.0 or ask <= 0.0 or ask <= bid:
+            return False, "", {}
+        evidence = {
+            "sidecar_source": self._snapshot_quote_source(quote),
+            "sidecar_observed_at_ms": observed_at_ms,
+            "sidecar_age_ms": age_ms,
+            "sidecar_budget_ms": budget_ms,
+            "fallback_source": fallback_source,
+        }
+        if age_ms > budget_ms:
+            return True, "quote_stale", evidence
+        if fallback_source == "last_good_sidecar":
+            return True, "last_good_sidecar", evidence
+        return False, "", {}
+
+    def _entry_quote_revalidate_targets(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+    ) -> list[dict[str, Any]]:
+        quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
+        fallback_source = self._snapshot_fallback_source(snapshot)
+        targets: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for rank, candidate in enumerate(list(candidates or []), start=1):
+            symbol = str(getattr(candidate, "symbol", "") or "").upper()
+            if not symbol:
+                continue
+            for venue_attr in ("long_venue", "short_venue"):
+                venue = str(getattr(candidate, venue_attr, "") or "").lower()
+                if not venue:
+                    continue
+                key = (venue, symbol)
+                if key in seen:
+                    continue
+                quote = quote_lookup.get(key)
+                needs, reason, evidence = self._entry_quote_revalidate_need(
+                    snapshot=snapshot,
+                    quote=quote,
+                    now_ms=now_ms,
+                    fallback_source=fallback_source,
+                )
+                if not needs:
+                    continue
+                seen.add(key)
+                targets.append({
+                    "venue": venue,
+                    "symbol": symbol,
+                    "candidate_rank": rank,
+                    "pair_id": self._candidate_pair_id(candidate),
+                    "reason": reason,
+                    **evidence,
+                })
+        return targets
+
+    def _entry_quote_truth_fresh_quote(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> Any | None:
+        cache = getattr(self, "ws_bbo_cache", None)
+        if cache is None:
+            return None
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            return None
+        return cache.fresh_quote(venue, symbol, now_ms=now_ms, max_age_ms=budget_ms)
+
+    def _entry_quote_truth_refresher(self) -> Any:
+        refresher = getattr(self, "ws_bbo_rest_refresher", None)
+        if refresher is not None:
+            return refresher
+        from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+        refresher = RestTopBookQuoteRefresher(timeout_ms=750)
+        setattr(self, "ws_bbo_rest_refresher", refresher)
+        return refresher
+
+    def _entry_quote_truth_accept_quote(
+        self,
+        quote: Any,
+        *,
+        now_ms: int,
+    ) -> bool:
+        if quote is None:
+            return False
+        observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        return (
+            observed_at_ms > 0
+            and age_ms <= self._entry_quote_lease_max_age_ms()
+            and bid > 0.0
+            and ask > bid
+        )
+
+    async def _entry_quote_revalidate_for_candidates(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+    ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
+        overlay: dict[tuple[str, str], Any] = {}
+        stats = self._entry_quote_truth_empty_stats()
+        if (
+            not candidates
+            or not self._entry_readiness_provider_uses_ws_bbo()
+            or self.config.runtime.mode == "paper"
+        ):
+            self._entry_quote_truth_record_last_scan(stats)
+            self._emit_entry_quote_revalidate_probe(
+                stats=stats,
+                candidate_count=len(candidates or []),
+                now_ms=now_ms,
+            )
+            return overlay, stats
+
+        await self._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
+        all_targets = self._entry_quote_revalidate_targets(
+            candidates,
+            snapshot=snapshot,
+            now_ms=now_ms,
+        )
+        stats["all_target_count"] = len(all_targets)
+        if not all_targets:
+            self._entry_quote_truth_record_last_scan(stats)
+            self._emit_entry_quote_revalidate_probe(
+                stats=stats,
+                candidate_count=len(candidates or []),
+                now_ms=now_ms,
+            )
+            return overlay, stats
+
+        budgeted_keys = set(getattr(self, "_entry_bbo_subscription_budgeted_keys", set()) or set())
+        budget_excluded_keys = set(
+            getattr(self, "_entry_bbo_subscription_budget_excluded_keys", set()) or set()
+        )
+        targets: list[dict[str, Any]] = []
+        for target in all_targets:
+            key = (target["venue"], target["symbol"])
+            if key in budget_excluded_keys:
+                stats["failed_count"] += 1
+                stats["budget_exhausted_count"] += 1
+                stats["top_quote_blocker_buckets"]["ws_bbo_rewarm_budget_exhausted"] += 1
+                self.journal.append(
+                    "runtime.entry_ws_bbo_top_candidate_rewarm_budget_exhausted",
+                    {**target, "ts_ms": now_ms},
+                )
+                self.journal.append(
+                    "runtime.entry_quote_revalidate_failed",
+                    {
+                        **target,
+                        "outcome": "budget_exhausted",
+                        "source": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+            if budgeted_keys and key not in budgeted_keys:
+                stats["skipped_unbudgeted_count"] += 1
+                continue
+            targets.append(target)
+
+        stats["target_count"] = len(targets)
+        stats["budgeted_target_count"] = len(targets)
+        if targets:
+            self.journal.append(
+                "runtime.entry_quote_revalidate_targeted",
+                {
+                    "target_count": len(targets),
+                    "targets": targets[:24],
+                    "wait_budget_ms": min(self._entry_quote_lease_max_age_ms(), 750),
+                    "ts_ms": now_ms,
+                },
+            )
+            self.journal.append(
+                "runtime.entry_ws_bbo_top_candidate_rewarm_started",
+                {
+                    "target_count": len(targets),
+                    "targets": targets[:24],
+                    "ts_ms": now_ms,
+                },
+            )
+
+        unresolved: dict[tuple[str, str], dict[str, Any]] = {
+            (target["venue"], target["symbol"]): target
+            for target in targets
+        }
+
+        def collect_fresh_from_cache(stage: str) -> None:
+            for key, target in list(unresolved.items()):
+                quote = self._entry_quote_truth_fresh_quote(
+                    target["venue"],
+                    target["symbol"],
+                    now_ms=now_ms,
+                )
+                if quote is None:
+                    continue
+                overlay[key] = quote
+                unresolved.pop(key, None)
+                if stage == "initial":
+                    stats["cache_initial_hit_count"] += 1
+                else:
+                    stats["cache_wait_hit_count"] += 1
+
+        collect_fresh_from_cache("initial")
+        wait_budget_ms = min(self._entry_quote_lease_max_age_ms(), 750)
+        stats["wait_budget_ms"] = wait_budget_ms
+        elapsed_ms = 0
+        while unresolved and elapsed_ms < wait_budget_ms:
+            await asyncio.sleep(0.05)
+            elapsed_ms += 50
+            collect_fresh_from_cache("wait")
+        stats["wait_elapsed_ms"] = elapsed_ms
+
+        refresher = self._entry_quote_truth_refresher()
+        refresh_quote = getattr(refresher, "refresh_quote", None)
+        if callable(refresh_quote):
+            for key, target in list(unresolved.items()):
+                stats["rest_attempt_count"] += 1
+                try:
+                    refreshed = refresh_quote(
+                        target["venue"],
+                        target["symbol"],
+                        now_ms=now_ms,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive telemetry
+                    target["rest_error"] = f"{type(exc).__name__}: {exc}"[:240]
+                    refreshed = None
+                if not self._entry_quote_truth_accept_quote(refreshed, now_ms=now_ms):
+                    stats["rest_failed_count"] += 1
+                    continue
+                cache = getattr(self, "ws_bbo_cache", None)
+                if cache is not None and hasattr(cache, "update_quote"):
+                    cache.update_quote(refreshed)
+                overlay[key] = refreshed
+                unresolved.pop(key, None)
+                stats["rest_resolved_count"] += 1
+
+        for key, quote in overlay.items():
+            source = str(getattr(quote, "source", "") or "entry_quote_truth")
+            stats["resolved_count"] += 1
+            stats["sources"][source] += 1
+            target = next(
+                (item for item in targets if (item["venue"], item["symbol"]) == key),
+                {"venue": key[0], "symbol": key[1]},
+            )
+            payload = {
+                **target,
+                "source": source,
+                "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
+                "age_ms": max(
+                    now_ms - int(getattr(quote, "observed_at_ms", 0) or 0),
+                    0,
+                ),
+                "quote_bid": float(getattr(quote, "bid", 0.0) or 0.0),
+                "quote_ask": float(getattr(quote, "ask", 0.0) or 0.0),
+                "outcome": "resolved",
+                "ts_ms": now_ms,
+            }
+            self.journal.append("runtime.entry_quote_revalidate_resolved", payload)
+            self.journal.append(
+                "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
+                payload,
+            )
+
+        for target in unresolved.values():
+            stats["failed_count"] += 1
+            stats["top_quote_blocker_buckets"]["quote_revalidate_unavailable"] += 1
+            payload = {
+                **target,
+                "outcome": "quote_revalidate_unavailable",
+                "source": "entry_quote_truth",
+                "ts_ms": now_ms,
+            }
+            self.journal.append("runtime.entry_quote_revalidate_failed", payload)
+            self.journal.append(
+                "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+                payload,
+            )
+
+        self._entry_quote_truth_record_last_scan(stats)
+        self._emit_entry_quote_revalidate_probe(
+            stats=stats,
+            candidate_count=len(candidates or []),
+            now_ms=now_ms,
+        )
+        return overlay, stats
+
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot.
 
@@ -5753,16 +6200,20 @@ class LiveRuntime:
 
         def emit_stale_quote_diagnostics(
             entry_quote_keys: set[tuple[str, str]],
+            resolved_quote_keys: set[tuple[str, str]] | None = None,
         ) -> None:
             nonlocal stale_quote_diagnostics_emitted
             if stale_quote_diagnostics_emitted:
                 return
             stale_quote_diagnostics_emitted = True
+            resolved_quote_keys = resolved_quote_keys or set()
             stale_order_quote_samples: list[dict] = []
             stale_health_quote_samples: list[dict] = []
             stale_order_quote_count = 0
             stale_health_quote_count = 0
             for quote_scope_key, sample in stale_quote_records:
+                if quote_scope_key in resolved_quote_keys:
+                    continue
                 if quote_scope_key in entry_quote_keys:
                     stale_order_quote_count += 1
                     if len(stale_order_quote_samples) < 10:
@@ -5845,8 +6296,28 @@ class LiveRuntime:
                     venue = str(getattr(candidate, venue_attr, "") or "").lower()
                     if venue:
                         entry_quote_keys.add((venue, symbol))
-            emit_stale_quote_diagnostics(entry_quote_keys)
             l2_tracking_tradeable = list(tradeable)
+            entry_bbo_prewarm_attempted = (
+                self._entry_readiness_provider_uses_ws_bbo()
+                and bool(l2_tracking_tradeable)
+            )
+            entry_quote_truth_overlay, _entry_quote_truth_stats = (
+                await self._entry_quote_revalidate_for_candidates(
+                    l2_tracking_tradeable,
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                )
+            )
+            emit_stale_quote_diagnostics(
+                entry_quote_keys,
+                resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
+            )
+            for quote in entry_quote_truth_overlay.values():
+                symbol = str(getattr(quote, "symbol", "") or "").upper()
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                if symbol and bid > 0.0 and ask > bid:
+                    price_hints[symbol] = (bid + ask) / 2.0
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 tradeable,
                 snapshot=snapshot,
@@ -5855,6 +6326,7 @@ class LiveRuntime:
                 ages=snapshot_freshness_ages,
                 budgets=snapshot_freshness_budgets,
                 publish_intervals=snapshot_freshness_publish_intervals,
+                entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
@@ -5945,7 +6417,11 @@ class LiveRuntime:
                 self._apply_shadow_promotion_if_eligible(
                     tracked, now_ms,
                 )
-            if self._entry_readiness_provider_uses_ws_bbo() and l2_tracking_tradeable:
+            if (
+                self._entry_readiness_provider_uses_ws_bbo()
+                and l2_tracking_tradeable
+                and not entry_bbo_prewarm_attempted
+            ):
                 await self._ensure_entry_bbo_active_for_candidates(
                     l2_tracking_tradeable,
                     now_ms,
@@ -5986,7 +6462,10 @@ class LiveRuntime:
                     remaining_slots=remaining_slots,
                     selection_blocker_counts=selection_blocker_counts,
                     candidate_blockers=candidate_blockers,
-                    market_quotes=snapshot.quotes,
+                    market_quotes=self._entry_quote_truth_market_quotes(
+                        snapshot.quotes,
+                        entry_quote_truth_overlay,
+                    ),
                     admission_blocker_counts=admission_blocker_counts,
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
@@ -5994,7 +6473,11 @@ class LiveRuntime:
                 for candidate in finalists:
                     if len(self.state.open_positions) >= max_slots:
                         break
-                    mid_price = price_hints.get(candidate.symbol, 0.0)
+                    mid_price = self._entry_quote_truth_price_hint(
+                        candidate,
+                        price_hints=price_hints,
+                        overlay=entry_quote_truth_overlay,
+                    )
                     if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
                         dispatched += 1
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
@@ -15958,6 +16441,7 @@ class LiveRuntime:
         snapshot,
         now_ms: int,
         record_liquidity_qualification: bool = False,
+        entry_quote_truth_overlay: dict[tuple[str, str], Any] | None = None,
     ) -> list[dict]:
         if snapshot is None:
             return []
@@ -15999,13 +16483,40 @@ class LiveRuntime:
                     source = "snapshot.market_observed_at_ms"
                 bid = float(getattr(quote, "bid", 0.0) or 0.0)
                 ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                overlay_quote = self._entry_quote_truth_overlay_quote(
+                    entry_quote_truth_overlay,
+                    venue,
+                    symbol,
+                )
+                overlay_resolved = self._entry_quote_truth_decision(
+                    venue=venue,
+                    symbol=symbol,
+                    quote=overlay_quote,
+                    now_ms=now_ms,
+                    fallback_source=fallback_source,
+                    sidecar_source=source,
+                    sidecar_observed_at_ms=observed_at_ms,
+                    sidecar_age_ms=age_ms,
+                    sidecar_budget_ms=quote_budget_ms,
+                    sidecar_reason=(
+                        "last_good_sidecar"
+                        if fallback_source == "last_good_sidecar"
+                        else "quote_stale"
+                        if age_ms > quote_budget_ms
+                        else "fresh_sidecar"
+                    ),
+                )
                 if (
                     observed_at_ms <= 0
                     or age_ms > quote_budget_ms
                     or bid <= 0.0
                     or ask <= 0.0
+                    or ask <= bid
                 ):
                     reason = "quote_stale" if age_ms > quote_budget_ms else "invalid_quote"
+                    if reason == "quote_stale" and overlay_resolved is not None:
+                        decisions.append(overlay_resolved)
+                        continue
                     if reason == "quote_stale":
                         resolved = self._ws_bbo_entry_quote_resolution(
                             venue=venue,
@@ -16044,6 +16555,36 @@ class LiveRuntime:
                     )
                     if reason == "quote_stale":
                         payload["event_kind"] = "runtime.quote_stale"
+                    decisions.append(payload)
+                elif (
+                    fallback_source == "last_good_sidecar"
+                    and self._entry_readiness_provider_uses_ws_bbo()
+                ):
+                    if overlay_resolved is not None:
+                        decisions.append(overlay_resolved)
+                        continue
+                    payload = {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "domain": "quote",
+                        "source": source,
+                        "observed_at_ms": observed_at_ms,
+                        "age_ms": age_ms,
+                        "budget_ms": quote_budget_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": fallback_source,
+                        "reason": "last_good_sidecar_revalidate_required",
+                        "blocking": True,
+                        "event_kind": "runtime.entry_quote_revalidate_failed",
+                    }
+                    payload.update(
+                        self._snapshot_quote_evidence(
+                            quote=quote,
+                            observed_at_ms=observed_at_ms,
+                            age_ms=age_ms,
+                            budget_ms=quote_budget_ms,
+                        )
+                    )
                     decisions.append(payload)
 
             liquidity = liquidity_rows.get(venue)
@@ -16211,6 +16752,65 @@ class LiveRuntime:
             "metric_fresh": True,
         }
 
+    def _entry_quote_truth_decision(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        quote: Any | None,
+        now_ms: int,
+        fallback_source: str,
+        sidecar_source: str,
+        sidecar_observed_at_ms: int,
+        sidecar_age_ms: int,
+        sidecar_budget_ms: int,
+        sidecar_reason: str,
+    ) -> dict | None:
+        if not self._entry_quote_truth_accept_quote(quote, now_ms=now_ms):
+            return None
+        observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        reason = (
+            "last_good_revalidated_by_entry_quote_truth"
+            if sidecar_reason == "last_good_sidecar"
+            else f"{sidecar_reason}_resolved_by_entry_quote_truth"
+        )
+        event_kind = (
+            "runtime.last_good_revalidated_by_entry_quote_truth"
+            if sidecar_reason == "last_good_sidecar"
+            else "runtime.entry_quote_evidence_resolved_by_ws_bbo"
+        )
+        return {
+            "venue": str(venue or "").lower(),
+            "symbol": str(symbol or "").upper(),
+            "domain": "quote",
+            "source": "entry_quote_truth",
+            "provider": "entry_quote_revalidator",
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+            "budget_ms": self._entry_quote_lease_max_age_ms(),
+            "decision": "continue",
+            "fallback_source": fallback_source,
+            "reason": reason,
+            "blocking": False,
+            "event_kind": event_kind,
+            "sidecar_reason": str(sidecar_reason or ""),
+            "sidecar_source": str(sidecar_source or ""),
+            "sidecar_observed_at_ms": int(sidecar_observed_at_ms or 0),
+            "sidecar_age_ms": int(sidecar_age_ms or 0),
+            "sidecar_budget_ms": int(sidecar_budget_ms or 0),
+            "entry_quote_truth_source": str(getattr(quote, "source", "") or ""),
+            "quote_bid": bid,
+            "quote_ask": ask,
+            "quote_bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
+            "quote_ask_size": float(getattr(quote, "ask_size", 0.0) or 0.0),
+            "invalid_quote_fields": [],
+            "blocker_family": "quote_revalidate_resolved",
+            "metric_fresh": True,
+        }
+
     @staticmethod
     def _snapshot_freshness_evidence_fields(decision: dict) -> dict:
         keys = (
@@ -16240,6 +16840,7 @@ class LiveRuntime:
         *,
         snapshot,
         now_ms: int,
+        entry_quote_truth_overlay: dict[tuple[str, str], Any] | None = None,
     ) -> list[dict]:
         return [
             decision
@@ -16247,6 +16848,7 @@ class LiveRuntime:
                 candidate,
                 snapshot=snapshot,
                 now_ms=now_ms,
+                entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             if decision.get("decision") == "skip_entry"
         ]
@@ -16527,6 +17129,7 @@ class LiveRuntime:
         ages: dict,
         budgets: dict | None = None,
         publish_intervals: dict | None = None,
+        entry_quote_truth_overlay: dict[tuple[str, str], Any] | None = None,
     ) -> list:
         filtered = []
         self._last_snapshot_freshness_filter_blockers = Counter()
@@ -16541,6 +17144,7 @@ class LiveRuntime:
                 snapshot=snapshot,
                 now_ms=now_ms,
                 record_liquidity_qualification=True,
+                entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             if not decisions:
                 filtered.append(candidate)
