@@ -755,6 +755,137 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
 
 
 @pytest.mark.asyncio
+async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
+    tmp_path,
+    monkeypatch,
+):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5_000,
+            live_scan_recovery_success_count=1,
+            debug_journal_diagnostics_enabled=True,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=100,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+            max_concurrent_positions=2,
+            entry_local_l2_primary_count=2,
+            shadow_entry_opportunity_count=1,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidates = [
+        _freshness_candidate(symbol=f"S{i:02d}USDT")
+        for i in range(50)
+    ]
+    for index, candidate in enumerate(candidates):
+        candidate.ranking_edge_bps = 100.0 - index
+        candidate.funding_edge_bps = 100.0 - index
+        candidate.funding_diff_bps = 100.0 - index
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"{venue}:{candidate.symbol}": _quote_with_liquidity(
+                venue,
+                candidate.symbol,
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            )
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        },
+        candidates=candidates,
+    )
+
+    prewarm_candidate_counts: list[int] = []
+
+    async def prewarm_without_quotes(candidates, prewarm_now_ms):
+        prewarm_candidate_counts.append(len(candidates))
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            (venue, str(candidate.symbol).upper())
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = set()
+        runtime._entry_bbo_subscription_per_venue_budget = 10
+
+    class RecordingRestRefresher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
+            self.calls.append((venue, symbol))
+            return TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=100.0,
+                ask=101.0,
+                bid_size=50.0,
+                ask_size=60.0,
+                observed_at_ms=now_ms - 25,
+                received_at_ms=now_ms - 25,
+                source=f"{venue}_rest_topbook",
+            )
+
+    refresher = RecordingRestRefresher()
+    runtime.ws_bbo_rest_refresher = refresher
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    probe = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_revalidate_probe"
+    ][-1]
+
+    assert prewarm_candidate_counts == [3]
+    assert len(refresher.calls) == 6
+    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "v1_primary_shadow"
+    assert runtime.state.last_scan["quote_revalidate_candidate_count"] == 3
+    assert runtime.state.last_scan["quote_revalidate_target_count"] == 6
+    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 94
+    assert probe["candidate_scope"] == "v1_primary_shadow"
+    assert probe["candidate_count"] == 3
+    assert probe["skipped_untracked_count"] == 94
+
+
+@pytest.mark.asyncio
 async def test_runtime_entry_quote_revalidate_budget_excluded_top_candidate_uses_rest(
     tmp_path,
     monkeypatch,

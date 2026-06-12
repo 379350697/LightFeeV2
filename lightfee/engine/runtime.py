@@ -5267,9 +5267,44 @@ class LiveRuntime:
             retained_max_age_ms=300_000,
         )
 
+    def _select_v1_entry_tracked_scope(self, candidates) -> tuple[list, list]:
+        """Return V1 primary+shadow tracked opportunities and candidates."""
+        from lightfee.engine.entry_local_l2 import select_tracked_opportunities
+
+        source_candidates = list(candidates or [])
+        primary_count = min(
+            max(int(getattr(self.config.strategy, "entry_local_l2_primary_count", 0) or 0), 0),
+            max(int(getattr(self.config.strategy, "max_concurrent_positions", 1) or 1), 1),
+        )
+        shadow_count = max(
+            int(
+                getattr(
+                    self.config.strategy,
+                    "shadow_entry_opportunity_count",
+                    getattr(self.config.strategy, "entry_local_l2_shadow_count", 0),
+                )
+                or 0
+            ),
+            0,
+        )
+        tracked = select_tracked_opportunities(
+            source_candidates,
+            primary_count,
+            shadow_count,
+        )
+        tracked_pair_ids = {opportunity.pair_id for opportunity in tracked}
+        tracked_candidates = [
+            candidate
+            for candidate in source_candidates
+            if self._candidate_pair_id(candidate) in tracked_pair_ids
+        ]
+        return tracked, tracked_candidates
+
     @staticmethod
     def _entry_quote_truth_empty_stats() -> dict[str, Any]:
         return {
+            "candidate_scope": "",
+            "candidate_count": 0,
             "target_count": 0,
             "all_target_count": 0,
             "must_resolve_count": 0,
@@ -5277,6 +5312,7 @@ class LiveRuntime:
             "budget_exhausted_count": 0,
             "budget_excluded_without_rest_count": 0,
             "skipped_unbudgeted_count": 0,
+            "skipped_untracked_count": 0,
             "cache_initial_hit_count": 0,
             "cache_wait_hit_count": 0,
             "ws_resolved_count": 0,
@@ -5292,8 +5328,20 @@ class LiveRuntime:
         }
 
     def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]) -> None:
+        self.state.last_scan["quote_revalidate_candidate_scope"] = str(
+            stats.get("candidate_scope", "") or ""
+        )
+        self.state.last_scan["quote_revalidate_candidate_count"] = int(
+            stats.get("candidate_count", 0) or 0
+        )
+        self.state.last_scan["quote_revalidate_all_target_count"] = int(
+            stats.get("all_target_count", 0) or 0
+        )
         self.state.last_scan["quote_revalidate_target_count"] = int(
             stats.get("target_count", 0) or 0
+        )
+        self.state.last_scan["quote_revalidate_skipped_untracked_count"] = int(
+            stats.get("skipped_untracked_count", 0) or 0
         )
         self.state.last_scan["quote_revalidate_resolved_count"] = int(
             stats.get("resolved_count", 0) or 0
@@ -5348,6 +5396,7 @@ class LiveRuntime:
             return
         payload = {
             "enabled": True,
+            "candidate_scope": str(stats.get("candidate_scope", "") or ""),
             "candidate_count": int(candidate_count or 0),
             "all_target_count": int(stats.get("all_target_count", 0) or 0),
             "target_count": int(stats.get("target_count", 0) or 0),
@@ -5358,6 +5407,7 @@ class LiveRuntime:
                 stats.get("budget_excluded_without_rest_count", 0) or 0
             ),
             "skipped_unbudgeted_count": int(stats.get("skipped_unbudgeted_count", 0) or 0),
+            "skipped_untracked_count": int(stats.get("skipped_untracked_count", 0) or 0),
             "cache_initial_hit_count": int(stats.get("cache_initial_hit_count", 0) or 0),
             "cache_wait_hit_count": int(stats.get("cache_wait_hit_count", 0) or 0),
             "ws_resolved_count": int(stats.get("ws_resolved_count", 0) or 0),
@@ -5552,9 +5602,14 @@ class LiveRuntime:
         *,
         snapshot,
         now_ms: int,
+        candidate_scope: str = "",
+        skipped_untracked_count: int = 0,
     ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
         overlay: dict[tuple[str, str], Any] = {}
         stats = self._entry_quote_truth_empty_stats()
+        stats["candidate_scope"] = candidate_scope
+        stats["candidate_count"] = len(candidates or [])
+        stats["skipped_untracked_count"] = max(int(skipped_untracked_count or 0), 0)
         if (
             not candidates
             or not self._entry_readiness_provider_uses_ws_bbo()
@@ -6420,15 +6475,38 @@ class LiveRuntime:
                     if venue:
                         entry_quote_keys.add((venue, symbol))
             l2_tracking_tradeable = list(tradeable)
+            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+                l2_tracking_tradeable
+            )
             entry_bbo_prewarm_attempted = (
                 self._entry_readiness_provider_uses_ws_bbo()
-                and bool(l2_tracking_tradeable)
+                and bool(tracked_candidates)
             )
-            entry_quote_truth_overlay, _entry_quote_truth_stats = (
-                await self._entry_quote_revalidate_for_candidates(
+            skipped_untracked_quote_count = 0
+            if entry_bbo_prewarm_attempted:
+                all_quote_targets = self._entry_quote_revalidate_targets(
                     l2_tracking_tradeable,
                     snapshot=snapshot,
                     now_ms=now_ms,
+                )
+                tracked_quote_targets = self._entry_quote_revalidate_targets(
+                    tracked_candidates,
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                )
+                skipped_untracked_quote_count = max(
+                    len(all_quote_targets) - len(tracked_quote_targets),
+                    0,
+                )
+            entry_quote_truth_overlay, _entry_quote_truth_stats = (
+                await self._entry_quote_revalidate_for_candidates(
+                    tracked_candidates,
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    candidate_scope=(
+                        "v1_primary_shadow" if entry_bbo_prewarm_attempted else ""
+                    ),
+                    skipped_untracked_count=skipped_untracked_quote_count,
                 )
             )
             emit_stale_quote_diagnostics(
@@ -6497,24 +6575,7 @@ class LiveRuntime:
                 self._local_l2_effective_enabled()
                 and l2_tracking_tradeable
             ):
-                primary_count = getattr(
-                    self.config.strategy, "entry_local_l2_primary_count", 3,
-                )
-                shadow_count = getattr(
-                    self.config.strategy,
-                    "shadow_entry_opportunity_count",
-                    getattr(self.config.strategy, "entry_local_l2_shadow_count", 2),
-                )
-                from lightfee.engine.entry_local_l2 import select_tracked_opportunities
-
-                tracked = select_tracked_opportunities(
-                    l2_tracking_tradeable, primary_count, shadow_count,
-                )
                 tracked_pair_ids = {t.pair_id for t in tracked}
-                tracked_candidates = [
-                    candidate for candidate in l2_tracking_tradeable
-                    if self._candidate_pair_id(candidate) in tracked_pair_ids
-                ]
                 # V1: activity_local_l2_symbols() follows the tracked
                 # primary+shadow scope, not the whole tradeable shortlist.
                 await self._ensure_l2_active_for_candidates(
@@ -6545,7 +6606,7 @@ class LiveRuntime:
                 and not entry_bbo_prewarm_attempted
             ):
                 await self._ensure_entry_bbo_active_for_candidates(
-                    l2_tracking_tradeable,
+                    tracked_candidates,
                     now_ms,
                 )
 
