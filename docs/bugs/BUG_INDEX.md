@@ -17,28 +17,39 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest WS-BBO quote revalidate fanout root fix, 2026-06-12: post-cutover
+Latest WS-BBO tracked-scope data-plane root fix, 2026-06-12: post-cutover
 production evidence showed `live_tick_stale` was recurring after settled checks,
-not just during warmup. Exchange truth stayed flat/no-open-orders, but
-`runtime_progress.active_lane=full_tick` exceeded its 60s budget and the journal
-showed one scan resolving 112 quote revalidate targets, including 58 serial REST
-top-book resolutions. The root cause was a V1 scope drift introduced by the
-WS-BBO data-plane switch: V2 revalidated quote truth across the whole tradeable
-shortlist, while V1 assigns execution-grade market data only to primary plus
-shadow tracked opportunities. The local fix adds a shared V1 tracked-scope
-helper, drives WS-BBO prewarm/revalidate only for that primary+shadow scope,
-keeps CL-071 REST fallback for tracked budget-excluded top candidates, and adds
-`quote_revalidate_candidate_scope`, `quote_revalidate_candidate_count`,
-`quote_revalidate_all_target_count`, and
-`quote_revalidate_skipped_untracked_count` to `last_scan` / probe diagnostics.
-The focused RED/GREEN reproduced 50 stale candidates shrinking to 3 tracked
-candidates / 6 quote legs with 94 untracked quote targets skipped; CL-071
-fallback and the Local-L2 V1 primary+shadow activation test stayed green. No
-health budget, WS-BBO budget/TTL, REST concurrency, strategy/OI/liquidity,
-admission, sizing, order, close, recovery, residual-repair, or production config
-semantics changed. Cloud deploy and settled verification are still pending.
+not just during warmup. Exchange truth stayed flat/no-open-orders. The first
+root was a V1 scope drift introduced by the WS-BBO data-plane switch: V2
+revalidated quote truth across the whole tradeable shortlist, while V1 assigns
+execution-grade market data only to primary plus shadow tracked opportunities.
+The first fix narrowed WS-BBO prewarm/revalidate to primary+shadow and kept
+CL-071 REST fallback for tracked budget-excluded top candidates. After that
+deployed as `26d4ff1`, post-deploy no-entry diagnostics showed
+`tradeable_count=0` and all `quote_truth_*` counters at `0`, but
+`live_tick_stale` recurred again with the live process CPU-bound around 96%.
+The remaining root was the same scope drift in snapshot-freshness
+observability: `_snapshot_freshness_observability()` expanded the full snapshot
+candidate universe, including transfer lifecycle status, before tradeable or
+tracked narrowing. The local follow-up now keeps initial snapshot freshness
+observability at global snapshot/quote scope and refreshes candidate-scoped
+status only for V1 primary+shadow tracked candidates when they exist, while
+final per-candidate freshness filtering remains fail-closed. Diagnostics now
+include `quote_revalidate_candidate_scope`,
+`quote_revalidate_candidate_count`, `quote_revalidate_all_target_count`,
+`quote_revalidate_skipped_untracked_count`,
+`snapshot_freshness_candidate_scope`,
+`snapshot_freshness_candidate_count`, and
+`snapshot_freshness_skipped_untracked_count`. RED/GREEN reproduced both failure
+layers: 50 stale candidates shrank to 3 tracked candidates / 6 quote legs with
+94 untracked quote targets skipped, and 64 no-tradeable snapshot candidates no
+longer enter freshness observability. CL-071 fallback and the Local-L2 V1
+primary+shadow activation test stayed green. No health budget, WS-BBO
+budget/TTL, REST concurrency, strategy/OI/liquidity, admission, sizing, order,
+close, recovery, residual-repair, or production config semantics changed. Cloud
+deploy and settled verification are still pending.
 Full evidence is recorded in
-[`daily/2026-06-12.md#cluster-cl-075-ws-bbo-quote-revalidate-full-shortlist-rest-fanout`](daily/2026-06-12.md#cluster-cl-075-ws-bbo-quote-revalidate-full-shortlist-rest-fanout).
+[`daily/2026-06-12.md#cluster-cl-075-ws-bbo-tracked-scope-data-plane-fanout`](daily/2026-06-12.md#cluster-cl-075-ws-bbo-tracked-scope-data-plane-fanout).
 
 Latest runtime heartbeat/health-gate root fix, 2026-06-12: the
 `live_tick_stale` line now separates current-state exporter freshness from real

@@ -1518,6 +1518,76 @@ def test_runtime_snapshot_freshness_status_includes_transfer_domain(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_scope_when_no_tradeable(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            min_expected_edge_bps=1000,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            max_concurrent_positions=2,
+            shadow_entry_opportunity_count=1,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidates = [
+        _freshness_candidate(symbol=f"SYM{idx}USDT")
+        for idx in range(64)
+    ]
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        candidates=candidates,
+        transfer_lifecycle=[
+            TransferLifecycle(
+                from_venue="okx",
+                to_venue="bybit",
+                observed_at_ms=69000,
+                coverage_usable=1,
+            )
+        ],
+    )
+
+    observed_candidate_counts: list[int] = []
+
+    def observe_scope(*, snapshot, candidates, now_ms):
+        observed_candidate_counts.append(len(candidates))
+        return {}, {}, {}, {}, {}
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+    monkeypatch.setattr(runtime, "_snapshot_freshness_observability", observe_scope)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert observed_candidate_counts
+    assert max(observed_candidate_counts) == 0
+    assert runtime.state.last_scan["candidate_count"] == 64
+    assert runtime.state.last_scan["tradeable_count"] == 0
+    assert runtime.state.last_scan["no_entry_reason"] == "candidate_edge_insufficient"
+
+
+@pytest.mark.asyncio
 async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(

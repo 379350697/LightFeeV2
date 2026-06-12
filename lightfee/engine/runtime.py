@@ -6297,7 +6297,7 @@ class LiveRuntime:
         ) = (
             self._snapshot_freshness_observability(
                 snapshot=snapshot,
-                candidates=list(getattr(snapshot, "candidates", []) or []),
+                candidates=[],
                 now_ms=now_ms,
             )
         )
@@ -6308,6 +6308,16 @@ class LiveRuntime:
             snapshot_freshness_publish_intervals
         )
         self.state.last_scan["snapshot_freshness_status"] = snapshot_freshness_status
+        self.state.last_scan["snapshot_freshness_candidate_scope"] = "global_snapshot"
+        self.state.last_scan["snapshot_freshness_candidate_count"] = 0
+        self.state.last_scan["snapshot_freshness_all_candidate_count"] = (
+            len(getattr(snapshot, "candidates", []) or [])
+            if snapshot is not None
+            else 0
+        )
+        self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = (
+            self.state.last_scan["snapshot_freshness_all_candidate_count"]
+        )
         try:
             self._maybe_export_current_state_snapshot(ExportState(), now_ms)
         except Exception as exc:
@@ -6478,6 +6488,46 @@ class LiveRuntime:
             tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
                 l2_tracking_tradeable
             )
+            if tracked_candidates:
+                (
+                    snapshot_freshness_metrics,
+                    snapshot_freshness_ages,
+                    snapshot_freshness_budgets,
+                    snapshot_freshness_publish_intervals,
+                    snapshot_freshness_status,
+                ) = self._snapshot_freshness_observability(
+                    snapshot=snapshot,
+                    candidates=tracked_candidates,
+                    now_ms=now_ms,
+                )
+                self.state.last_scan["snapshot_freshness_metrics"] = (
+                    snapshot_freshness_metrics
+                )
+                self.state.last_scan["snapshot_freshness_observed_age_ms"] = (
+                    snapshot_freshness_ages
+                )
+                self.state.last_scan["snapshot_freshness_budget_ms"] = (
+                    snapshot_freshness_budgets
+                )
+                self.state.last_scan["snapshot_freshness_publish_interval_ms"] = (
+                    snapshot_freshness_publish_intervals
+                )
+                self.state.last_scan["snapshot_freshness_status"] = (
+                    snapshot_freshness_status
+                )
+                self.state.last_scan["snapshot_freshness_candidate_scope"] = (
+                    "v1_primary_shadow"
+                )
+                self.state.last_scan["snapshot_freshness_candidate_count"] = len(
+                    tracked_candidates
+                )
+                self.state.last_scan["snapshot_freshness_all_candidate_count"] = len(
+                    l2_tracking_tradeable
+                )
+                self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = max(
+                    len(l2_tracking_tradeable) - len(tracked_candidates),
+                    0,
+                )
             entry_bbo_prewarm_attempted = (
                 self._entry_readiness_provider_uses_ws_bbo()
                 and bool(tracked_candidates)
