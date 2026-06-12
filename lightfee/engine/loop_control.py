@@ -190,6 +190,9 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "venue_entry_cooldowns": dict(getattr(state, "venue_entry_cooldowns", {}) or {}),
         "last_scan": getattr(state, "last_scan", None),
         "runtime_progress": runtime_progress,
+        "runtime_market_data_config": dict(
+            getattr(state, "runtime_market_data_config", {}) or {}
+        ),
     }
     write_json_atomic(path, data)
 

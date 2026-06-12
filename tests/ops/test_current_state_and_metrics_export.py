@@ -142,6 +142,39 @@ class TestCurrentStateExportV1Semantics:
         finally:
             os.unlink(path)
 
+    def test_export_includes_runtime_market_data_config(self):
+        """Current-state exposes effective market-data provider diagnostics."""
+        state = EngineState(
+            lifecycle=EngineLifecycle.RUNNING,
+            risk_mode=GlobalRiskMode.RUNNING,
+        )
+        state.runtime_market_data_config = {
+            "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+            "local_l2_configured_enabled": True,
+            "local_l2_effective_enabled": False,
+            "local_l2_effective_disabled_reason": (
+                "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
+            ),
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            _export_current_state_snapshot(state, path)
+            with open(path) as f:
+                data = json.load(f)
+
+            effective = data["runtime_market_data_config"]
+            assert (
+                effective["entry_readiness_provider_effective"]
+                == "ws_bbo_quote_lease"
+            )
+            assert effective["local_l2_configured_enabled"] is True
+            assert effective["local_l2_effective_enabled"] is False
+        finally:
+            os.unlink(path)
+
     def test_export_includes_open_position_details(self):
         """V1: each open position exports position_id, symbol, long_venue, short_venue, quantity."""
         from lightfee.core.domain import Venue
