@@ -224,6 +224,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.live_scan_recovery_warmup",
         "runtime.order_quote_stale_health_summary",
         "runtime.private_ws_started",
+        "runtime.private_ws_stopped",
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
         "scan.no_entry_diagnostics",

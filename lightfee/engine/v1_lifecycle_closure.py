@@ -1011,6 +1011,7 @@ _EVENT_KIND_PHASES = {
     "runtime.stopped": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.shutdown_stage": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.private_ws_started": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.private_ws_stopped": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.live_scan_revalidate_required": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.live_scan_recovery_warmup": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.order_quote_stale_health_summary": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
