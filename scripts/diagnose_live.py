@@ -331,11 +331,23 @@ def _read_deploy_version(runtime_dir: str, project_dir: str = "/opt/lightfee-v2"
         return ""
 
 
+def _deploy_versions_match(git_head: str, deploy_version: str) -> bool:
+    git_head = str(git_head or "").strip()
+    deploy_version = str(deploy_version or "").strip()
+    if not git_head or not deploy_version:
+        return False
+    return git_head == deploy_version or deploy_version.startswith(git_head)
+
+
 def _build_deploy_status(runtime_dir: str) -> dict[str, Any]:
     git_head = _git_head()
     commit_time = _git_commit_time()
     deploy_version = _read_deploy_version(runtime_dir)
-    mismatch = bool(git_head and deploy_version and git_head != deploy_version)
+    mismatch = bool(
+        git_head
+        and deploy_version
+        and not _deploy_versions_match(git_head, deploy_version)
+    )
     return {
         "git_head": git_head,
         "commit_time": commit_time,

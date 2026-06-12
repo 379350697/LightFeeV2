@@ -21,6 +21,21 @@ import pytest
 from scripts.diagnose_live import run_diagnose
 
 
+def test_deploy_status_treats_short_git_head_as_matching_full_deploy_version(monkeypatch):
+    import scripts.diagnose_live as diagnose_live
+
+    full = "33d56e761ec7b88e66099695d1350b73887b56fd"
+    monkeypatch.setattr(diagnose_live, "_git_head", lambda: full[:7])
+    monkeypatch.setattr(diagnose_live, "_git_commit_time", lambda: "2026-06-12T14:41:31+08:00")
+    monkeypatch.setattr(diagnose_live, "_read_deploy_version", lambda runtime_dir: full)
+
+    status = diagnose_live._build_deploy_status("/tmp/runtime")
+
+    assert status["git_head"] == full[:7]
+    assert status["deploy_version"] == full
+    assert status["version_mismatch"] is False
+
+
 def _write_jsonl(path, records):
     with open(path, "w") as f:
         for r in records:
