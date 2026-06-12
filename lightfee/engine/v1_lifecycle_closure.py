@@ -1017,6 +1017,7 @@ _EVENT_KIND_PHASES = {
     "runtime.reconciling": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "scan.no_entry_diagnostics": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "startup.order_path_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "startup.trading_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "entry.opened": V1LifecycleClosurePhase.PENDING_ENTRY.value,
@@ -1037,7 +1038,20 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_quote_revalidate_targeted": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_quote_revalidate_failed": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_quote_revalidate_resolved": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.entry_quote_evidence_resolved_by_ws_bbo": (
+        V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
+    ),
+    "runtime.order_quote_stale_skipped": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.quote_stale": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.ws_bbo_dynamic_ws_started": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.snapshot_fallback_last_good": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.candidate_symbol_skipped": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "runtime.candidates_tradeable": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "runtime.tradeable_candidates_catalog_filtered": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "execution.entry_liquidity_advisory": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "execution.entry_liquidity_blocked": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.current_state_heartbeat_loop_export_error": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
 }
 
