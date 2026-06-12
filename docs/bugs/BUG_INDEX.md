@@ -17,6 +17,23 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest SAHARA entry residual dust warning split, 2026-06-12: post-deploy
+review of `6b92cd1` found current production flat/no-open-orders and one
+`SAHARAUSDT` lifecycle that opened, repaired residual, and closed. The
+short-window quantity evidence was Bybit maker `2871.070969...`, OKX hedge
+`2860`, residual `11`, approximately `0.38%` of the matched `2860`. The local
+fix tightens entry residual dust tolerance from `<=5%` to `<=2%` and still
+requires exchange-min terminal evidence (`exchange_min_quantity_dust` or
+`exchange_min_notional_dust`) before emitting
+`execution.entry_residual_dust_tolerated`; exchange-min entry residuals above
+`2%` pause the residual repair instead of releasing the pair gate. Diagnose now keeps raw
+`hedge_quantity_undercut` / `common_quantity_mismatch` counters while adding
+warning counters that exclude tolerated `<=2%` exchange-min dust entries.
+Hyperliquid `account_wallet_signer_mismatch` remains a separate preflight/env
+identity issue, not part of the SAHARA residual family. Full evidence is
+recorded in
+[`daily/2026-06-12.md#cluster-cl-073-sahara-entry-residual-dust-2-warning-split`](daily/2026-06-12.md#cluster-cl-073-sahara-entry-residual-dust-2-warning-split).
+
 Latest quote-truth budget-excluded REST closure, 2026-06-11: post-deploy
 evidence showed the quote stale/last-good pre-filter revalidation path was active
 but incomplete. `runtime.entry_quote_revalidate_resolved` and

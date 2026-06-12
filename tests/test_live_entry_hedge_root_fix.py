@@ -7109,29 +7109,31 @@ class TestResidualRepairExecutionV1Parity:
         assert terminal[-1]["payload"]["repair_quantity"] == pytest.approx(0.5)
 
     @pytest.mark.asyncio
-    async def test_entry_open_unrepairable_contract_dust_is_marked_tolerated(self, tmp_path):
+    async def test_entry_open_unrepairable_contract_dust_within_two_percent_is_marked_tolerated(
+        self, tmp_path,
+    ):
         runtime = _make_open_runtime(tmp_path)
         now_ms = 1779422875621
-        runtime.state.open_positions["entry-home-dust"] = OpenPosition(
-            position_id="entry-home-dust",
-            symbol="HOMEUSDT",
+        runtime.state.open_positions["entry-sahara-dust"] = OpenPosition(
+            position_id="entry-sahara-dust",
+            symbol="SAHARAUSDT",
             long_venue=Venue.OKX,
             short_venue=Venue.BYBIT,
-            long_quantity=690.0,
-            short_quantity=690.0,
-            long_entry_price=0.033,
-            short_entry_price=0.033,
+            long_quantity=2860.0,
+            short_quantity=2860.0,
+            long_entry_price=0.0167,
+            short_entry_price=0.0167,
             opened_at_ms=now_ms - 5_000,
-            matched_quantity=690.0,
+            matched_quantity=2860.0,
         )
         runtime.state.pending_residual_repairs.append({
-            "position_id": "entry-home-dust",
-            "pair_id": "home:okx->bybit",
-            "symbol": "HOMEUSDT",
+            "position_id": "entry-sahara-dust",
+            "pair_id": "sahara:okx->bybit",
+            "symbol": "SAHARAUSDT",
             "origin": "entry_open",
             "repair_venue": "okx",
             "repair_side": "sell",
-            "repair_quantity": 10.0,
+            "repair_quantity": 11.0,
             "created_at_ms": now_ms - 1000,
             "deadline_ms": now_ms + 30_000,
             "retry_count": 0,
@@ -7142,10 +7144,10 @@ class TestResidualRepairExecutionV1Parity:
         okx.normalized_quantity = 0.0
         okx.position = PositionSnapshot(
             venue=Venue.OKX,
-            symbol="HOMEUSDT",
+            symbol="SAHARAUSDT",
             side=Side.BUY,
-            quantity=700.0,
-            entry_price=0.033,
+            quantity=2871.0,
+            entry_price=0.0167,
             observed_at_ms=now_ms,
         )
         runtime._venue_adapters = {Venue.OKX: okx}
@@ -7159,33 +7161,33 @@ class TestResidualRepairExecutionV1Parity:
         ]
         assert tolerated
         payload = tolerated[-1]["payload"]
-        assert payload["position_id"] == "entry-home-dust"
-        assert payload["repair_quantity"] == pytest.approx(10.0)
-        assert payload["matched_quantity"] == pytest.approx(690.0)
-        assert payload["residual_ratio"] < 0.05
+        assert payload["position_id"] == "entry-sahara-dust"
+        assert payload["repair_quantity"] == pytest.approx(11.0)
+        assert payload["matched_quantity"] == pytest.approx(2860.0)
+        assert payload["residual_ratio"] <= 0.02
 
     @pytest.mark.asyncio
-    async def test_entry_open_contract_dust_over_five_percent_is_not_marked_tolerated(
+    async def test_entry_open_contract_dust_within_two_percent_is_marked_tolerated(
         self, tmp_path,
     ):
         runtime = _make_open_runtime(tmp_path)
         now_ms = 1779422875621
-        runtime.state.open_positions["entry-home-dust-large"] = OpenPosition(
-            position_id="entry-home-dust-large",
-            symbol="HOMEUSDT",
+        runtime.state.open_positions["entry-sahara-dust-large"] = OpenPosition(
+            position_id="entry-sahara-dust-large",
+            symbol="SAHARAUSDT",
             long_venue=Venue.OKX,
             short_venue=Venue.BYBIT,
-            long_quantity=690.0,
-            short_quantity=690.0,
-            long_entry_price=0.033,
-            short_entry_price=0.033,
+            long_quantity=2860.0,
+            short_quantity=2860.0,
+            long_entry_price=0.0167,
+            short_entry_price=0.0167,
             opened_at_ms=now_ms - 5_000,
-            matched_quantity=690.0,
+            matched_quantity=2860.0,
         )
         runtime.state.pending_residual_repairs.append({
-            "position_id": "entry-home-dust-large",
-            "pair_id": "home:okx->bybit",
-            "symbol": "HOMEUSDT",
+            "position_id": "entry-sahara-dust-large",
+            "pair_id": "sahara:okx->bybit",
+            "symbol": "SAHARAUSDT",
             "origin": "entry_open",
             "repair_venue": "okx",
             "repair_side": "sell",
@@ -7200,21 +7202,217 @@ class TestResidualRepairExecutionV1Parity:
         okx.normalized_quantity = 0.0
         okx.position = PositionSnapshot(
             venue=Venue.OKX,
-            symbol="HOMEUSDT",
+            symbol="SAHARAUSDT",
             side=Side.BUY,
-            quantity=730.0,
-            entry_price=0.033,
+            quantity=2900.0,
+            entry_price=0.0167,
             observed_at_ms=now_ms,
         )
         runtime._venue_adapters = {Venue.OKX: okx}
 
         await runtime._recover_residual_repairs(now_ms)
 
+        assert runtime.state.pending_residual_repairs == []
         tolerated = [
             event for event in runtime.journal.read_all()
             if event["kind"] == "execution.entry_residual_dust_tolerated"
         ]
-        assert tolerated == []
+        assert tolerated
+        payload = tolerated[-1]["payload"]
+        assert payload["terminal_reason"] == "exchange_min_quantity_dust"
+        assert payload["residual_ratio"] <= 0.02
+
+    @pytest.mark.asyncio
+    async def test_entry_open_contract_dust_over_two_percent_pauses_residual(
+        self, tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-sahara-dust-over-two"] = OpenPosition(
+            position_id="entry-sahara-dust-over-two",
+            symbol="SAHARAUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=2860.0,
+            short_quantity=2860.0,
+            long_entry_price=0.0167,
+            short_entry_price=0.0167,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=2860.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-sahara-dust-over-two",
+            "pair_id": "sahara:okx->bybit",
+            "symbol": "SAHARAUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 80.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 0.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="SAHARAUSDT",
+            side=Side.BUY,
+            quantity=2940.0,
+            entry_price=0.0167,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert runtime.state.pending_residual_repairs
+        task = runtime.state.pending_residual_repairs[-1]
+        assert task["position_id"] == "entry-sahara-dust-over-two"
+        assert task["local_entry_paused"] is True
+        assert task["last_error"] == "entry_residual_dust_over_tolerance"
+        events = runtime.journal.read_all()
+        assert not any(
+            event["kind"] == "execution.entry_residual_dust_tolerated"
+            for event in events
+        )
+        assert not any(
+            event["kind"] == "execution.residual_repair_terminal"
+            for event in events
+        )
+        paused = [
+            event for event in events
+            if event["kind"] == "execution.residual_repair_paused"
+        ]
+        assert paused
+        payload = paused[-1]["payload"]
+        assert payload["terminal_reason"] == "exchange_min_quantity_dust"
+        assert payload["residual_ratio"] > 0.02
+
+    @pytest.mark.asyncio
+    async def test_entry_open_min_notional_dust_within_two_percent_is_marked_tolerated(
+        self, tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-sahara-min-notional-large"] = OpenPosition(
+            position_id="entry-sahara-min-notional-large",
+            symbol="SAHARAUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=2860.0,
+            short_quantity=2860.0,
+            long_entry_price=0.0167,
+            short_entry_price=0.0167,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=2860.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-sahara-min-notional-large",
+            "pair_id": "sahara:okx->bybit",
+            "symbol": "SAHARAUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 40.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 40.0
+        okx.min_notional_quote = 100.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="SAHARAUSDT",
+            side=Side.BUY,
+            quantity=2900.0,
+            entry_price=0.0167,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert runtime.state.pending_residual_repairs == []
+        assert okx._place_order_calls == []
+        tolerated = [
+            event for event in runtime.journal.read_all()
+            if event["kind"] == "execution.entry_residual_dust_tolerated"
+        ]
+        assert tolerated
+        payload = tolerated[-1]["payload"]
+        assert payload["terminal_reason"] == "exchange_min_notional_dust"
+        assert payload["residual_ratio"] <= 0.02
+
+    @pytest.mark.asyncio
+    async def test_entry_open_min_notional_dust_over_two_percent_pauses_residual(
+        self, tmp_path,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.open_positions["entry-sahara-min-notional-over-two"] = OpenPosition(
+            position_id="entry-sahara-min-notional-over-two",
+            symbol="SAHARAUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=2860.0,
+            short_quantity=2860.0,
+            long_entry_price=0.0167,
+            short_entry_price=0.0167,
+            opened_at_ms=now_ms - 5_000,
+            matched_quantity=2860.0,
+        )
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-sahara-min-notional-over-two",
+            "pair_id": "sahara:okx->bybit",
+            "symbol": "SAHARAUSDT",
+            "origin": "entry_open",
+            "repair_venue": "okx",
+            "repair_side": "sell",
+            "repair_quantity": 80.0,
+            "created_at_ms": now_ms - 1000,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+        })
+        okx = _FakeVenueAdapter(Venue.OKX)
+        okx.normalized_quantity = 80.0
+        okx.min_notional_quote = 100.0
+        okx.position = PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="SAHARAUSDT",
+            side=Side.BUY,
+            quantity=2940.0,
+            entry_price=0.0167,
+            observed_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.OKX: okx}
+
+        await runtime._recover_residual_repairs(now_ms)
+
+        assert runtime.state.pending_residual_repairs
+        task = runtime.state.pending_residual_repairs[-1]
+        assert task["position_id"] == "entry-sahara-min-notional-over-two"
+        assert task["local_entry_paused"] is True
+        assert task["last_error"] == "entry_residual_dust_over_tolerance"
+        assert okx._place_order_calls == []
+        events = runtime.journal.read_all()
+        assert not any(
+            event["kind"] == "execution.entry_residual_dust_tolerated"
+            for event in events
+        )
+        assert not any(
+            event["kind"] == "execution.residual_repair_terminal"
+            for event in events
+        )
+        paused = [
+            event for event in events
+            if event["kind"] == "execution.residual_repair_paused"
+        ]
+        assert paused
+        payload = paused[-1]["payload"]
+        assert payload["terminal_reason"] == "exchange_min_notional_dust"
+        assert payload["residual_ratio"] > 0.02
 
     @pytest.mark.asyncio
     async def test_entry_open_repairable_residual_is_not_marked_tolerated(

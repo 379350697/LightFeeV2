@@ -13976,9 +13976,40 @@ class LiveRuntime:
                         },
                     )
                     continue
+            matched_quantity = 0.0
+            residual_ratio = 0.0
+            if task.get("origin") == "entry_open":
+                open_position = self.state.open_positions.get(position_id)
+                if open_position is not None:
+                    matched_quantity = abs(
+                        float(getattr(open_position, "matched_quantity", 0.0) or 0.0)
+                    )
+                if matched_quantity > 1e-9:
+                    residual_ratio = (
+                        abs(float(live_excess_quantity or 0.0)) / matched_quantity
+                    )
+
             if repair_quantity <= 1e-9:
                 if repair_venue == Venue.OKX:
                     live_price = abs(float(getattr(live_position, "entry_price", 0.0) or 0.0))
+                    if (
+                        task.get("origin") == "entry_open"
+                        and matched_quantity > 1e-9
+                        and residual_ratio > 0.02 + 1e-12
+                    ):
+                        task["last_error"] = "entry_residual_dust_over_tolerance"
+                        self._pause_pending_residual_repair(
+                            task,
+                            now_ms,
+                            evidence={
+                                "terminal_reason": "exchange_min_quantity_dust",
+                                "live_excess_quantity": live_excess_quantity,
+                                "matched_quantity": matched_quantity,
+                                "residual_ratio": residual_ratio,
+                                "normalized_quantity": repair_quantity,
+                            },
+                        )
+                        continue
                     self._terminalize_residual_repair_task(
                         task,
                         now_ms,
@@ -14015,6 +14046,26 @@ class LiveRuntime:
                 and repair_quantity * live_price + 1e-12 < min_notional
                 and not venue_reduce_only_close_exempts_min_notional(repair_venue)
             ):
+                if (
+                    task.get("origin") == "entry_open"
+                    and matched_quantity > 1e-9
+                    and residual_ratio > 0.02 + 1e-12
+                ):
+                    task["last_error"] = "entry_residual_dust_over_tolerance"
+                    self._pause_pending_residual_repair(
+                        task,
+                        now_ms,
+                        evidence={
+                            "terminal_reason": "exchange_min_notional_dust",
+                            "live_excess_quantity": live_excess_quantity,
+                            "repair_quantity": repair_quantity,
+                            "live_price": live_price,
+                            "min_notional": min_notional,
+                            "matched_quantity": matched_quantity,
+                            "residual_ratio": residual_ratio,
+                        },
+                    )
+                    continue
                 self._terminalize_residual_repair_task(
                     task,
                     now_ms,
@@ -15077,7 +15128,7 @@ class LiveRuntime:
                 "exchange_min_notional_dust",
             }
             and matched_quantity > 1e-9
-            and residual_ratio <= 0.05 + 1e-12
+            and residual_ratio <= 0.02 + 1e-12
         ):
             self.journal.append(
                 "execution.entry_residual_dust_tolerated",

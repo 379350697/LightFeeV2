@@ -2938,11 +2938,12 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
                 "ts_ms": 1781096100400,
                 "kind": "execution.entry_residual_dust_tolerated",
                 "payload": {
-                    "position_id": "entry-home",
-                    "symbol": "HOMEUSDT",
-                    "repair_quantity": 10.0,
-                    "matched_quantity": 690.0,
-                    "residual_ratio": 0.01449,
+                    "position_id": "entry-sahara-dust",
+                    "symbol": "SAHARAUSDT",
+                    "repair_quantity": 40.0,
+                    "matched_quantity": 2860.0,
+                    "residual_ratio": 0.013986,
+                    "terminal_reason": "exchange_min_quantity_dust",
                 },
             },
             {
@@ -2953,6 +2954,16 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
                     "symbol": "HOMEUSDT",
                     "missing_hedge_quantity": 700.0,
                     "normalized_quantity": 690.0,
+                },
+            },
+            {
+                "ts_ms": 1781096100550,
+                "kind": "pending_entry.hedge_quantity_undercut",
+                "payload": {
+                    "entry_id": "entry-sahara-dust",
+                    "symbol": "SAHARAUSDT",
+                    "missing_hedge_quantity": 2871.0,
+                    "normalized_quantity": 2860.0,
                 },
             },
             {
@@ -2979,6 +2990,19 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
                     "initial_maker_target_quantity": 690.0,
                     "route": "passive_incremental",
                     "okx_base_quantity_step": 100.0,
+                },
+            },
+            {
+                "ts_ms": 1781096100800,
+                "kind": "execution.entry_quantity_plan",
+                "payload": {
+                    "entry_id": "entry-sahara-dust",
+                    "symbol": "SAHARAUSDT",
+                    "common_quantity": 2990.0,
+                    "full_target_quantity": 2871.0709692855226,
+                    "initial_maker_target_quantity": 2871.0709692855226,
+                    "route": "passive_incremental",
+                    "okx_base_quantity_step": 10.0,
                 },
             },
         ])
@@ -3008,9 +3032,20 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
         assert summary["stale_fail_closed_after_flat_count"] == 1
         entry_summary = result["entry_quantity_terminal_summary"]
         assert entry_summary["entry_residual_dust_tolerated_count"] == 1
-        assert entry_summary["hedge_quantity_undercut_count"] == 1
-        assert entry_summary["common_quantity_mismatch_count"] == 1
-        assert entry_summary["common_quantity_mismatch_entry_ids"] == ["entry-mismatch"]
+        assert entry_summary["hedge_quantity_undercut_count"] == 2
+        assert entry_summary["hedge_quantity_undercut_warning_count"] == 1
+        assert entry_summary["hedge_quantity_undercut_warning_entry_ids"] == [
+            "entry-undercut"
+        ]
+        assert entry_summary["common_quantity_mismatch_count"] == 2
+        assert entry_summary["common_quantity_mismatch_warning_count"] == 1
+        assert entry_summary["common_quantity_mismatch_entry_ids"] == [
+            "entry-mismatch",
+            "entry-sahara-dust",
+        ]
+        assert entry_summary["common_quantity_mismatch_warning_entry_ids"] == [
+            "entry-mismatch"
+        ]
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

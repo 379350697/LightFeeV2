@@ -3358,8 +3358,34 @@ def _build_entry_quantity_terminal_summary(
     hedge_quantity_undercut_count = 0
     common_quantity_mismatch_count = 0
     dust_tolerated_positions: set[str] = set()
+    tolerated_dust_entry_ids: set[str] = set()
     hedge_undercut_entries: set[str] = set()
     quantity_mismatch_entries: set[str] = set()
+    hedge_undercut_warning_entries: set[str] = set()
+    quantity_mismatch_warning_entries: set[str] = set()
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if kind != "execution.entry_residual_dust_tolerated":
+            continue
+        try:
+            residual_ratio = float(payload.get("residual_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            residual_ratio = 0.0
+        terminal_reason = str(payload.get("terminal_reason", "") or "")
+        position_id = str(payload.get("position_id") or payload.get("entry_id") or "")
+        if (
+            position_id
+            and residual_ratio <= 0.02 + 1e-12
+            and terminal_reason in {
+                "exchange_min_quantity_dust",
+                "exchange_min_notional_dust",
+            }
+        ):
+            tolerated_dust_entry_ids.add(position_id)
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -3376,6 +3402,8 @@ def _build_entry_quantity_terminal_summary(
             entry_id = str(payload.get("entry_id") or payload.get("position_id") or "")
             if entry_id:
                 hedge_undercut_entries.add(entry_id)
+                if entry_id not in tolerated_dust_entry_ids:
+                    hedge_undercut_warning_entries.add(entry_id)
         elif kind == "execution.entry_quantity_plan":
             try:
                 common_quantity = float(payload.get("common_quantity", 0.0) or 0.0)
@@ -3389,6 +3417,8 @@ def _build_entry_quantity_terminal_summary(
                 entry_id = str(payload.get("entry_id") or "")
                 if entry_id:
                     quantity_mismatch_entries.add(entry_id)
+                    if entry_id not in tolerated_dust_entry_ids:
+                        quantity_mismatch_warning_entries.add(entry_id)
 
     fingerprints = []
     if production_acceptance_gate:
@@ -3400,11 +3430,19 @@ def _build_entry_quantity_terminal_summary(
     return {
         "entry_residual_dust_tolerated_count": entry_residual_dust_tolerated_count,
         "hedge_quantity_undercut_count": hedge_quantity_undercut_count,
+        "hedge_quantity_undercut_warning_count": len(hedge_undercut_warning_entries),
         "common_quantity_mismatch_count": common_quantity_mismatch_count,
+        "common_quantity_mismatch_warning_count": len(quantity_mismatch_warning_entries),
         "lifecycle_release_not_applied_count": lifecycle_release_not_applied_count,
         "dust_tolerated_position_ids": sorted(dust_tolerated_positions),
         "hedge_undercut_entry_ids": sorted(hedge_undercut_entries),
+        "hedge_quantity_undercut_warning_entry_ids": sorted(
+            hedge_undercut_warning_entries
+        ),
         "common_quantity_mismatch_entry_ids": sorted(quantity_mismatch_entries),
+        "common_quantity_mismatch_warning_entry_ids": sorted(
+            quantity_mismatch_warning_entries
+        ),
     }
 
 
