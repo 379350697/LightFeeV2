@@ -5758,6 +5758,19 @@ class LiveRuntime:
         )
         return overlay, stats
 
+    def _clear_local_l2_runtime_state(self) -> None:
+        """Drop Local-L2 runtime and persisted snapshots for non-Local-L2 profiles."""
+        self.state.retained_local_l2_books = []
+        self.state.local_l2_books_snapshot = []
+        self.state.local_l2_session_snapshot = []
+        self.local_l2_runtime.books.clear()
+        self.local_l2_runtime.assignments.clear()
+        self.local_l2_runtime.leases.clear()
+        self.local_l2_runtime.pending_events.clear()
+        self.local_l2_runtime._refresh_metrics(wall_clock_now_ms())
+        self.entry_l2_sessions.sessions.clear()
+        self.entry_l2_sessions.sticky_pair_ids.clear()
+
     async def _restore_local_l2_state(self) -> None:
         """Phase 6: Restore retained local-L2 books and session state from snapshot.
 
@@ -5766,6 +5779,9 @@ class LiveRuntime:
         """
         from lightfee.marketdata.l2 import PriceLevel
 
+        if not self._local_l2_effective_enabled():
+            self._clear_local_l2_runtime_state()
+            return
         if not hasattr(self.state, "local_l2_books_snapshot"):
             return
         snap = getattr(self.state, "local_l2_books_snapshot", None)
@@ -15733,6 +15749,9 @@ class LiveRuntime:
 
         V1: PersistedRetainedLocalL2Book with bids/asks + generation tracking.
         """
+        if not self._local_l2_effective_enabled():
+            self._clear_local_l2_runtime_state()
+            return
         diag = self.local_l2_runtime.diagnostics_snapshot()
         # Retained books metadata (V1: persisted with full book data)
         self.state.retained_local_l2_books = [
