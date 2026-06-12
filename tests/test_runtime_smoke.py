@@ -1,5 +1,6 @@
 """End-to-end configuration and runtime smoke tests."""
 
+import json
 import subprocess
 import sys
 
@@ -209,6 +210,48 @@ class TestRuntimeLaneScheduling:
         finally:
             import shutil
             shutil.rmtree(td, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_tick_exports_current_state_before_long_or_early_return_tick(self, tmp_path):
+        """Runtime heartbeat: current-state refresh must not wait for full tick completion."""
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.loop_control import current_state_export_path
+        from lightfee.engine.runtime import LiveRuntime
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                poll_interval_ms=1000,
+                sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+                sidecar_snapshot_max_age_ms=1000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                local_l2_enabled=False,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "live-state.json"),
+            ),
+            venues=[],
+            symbols=["BTCUSDT"],
+        )
+        runtime = LiveRuntime(config)
+        runtime.journal.open()
+        try:
+            await runtime.tick()
+        finally:
+            runtime.journal.close()
+
+        current_state_path = current_state_export_path(config)
+        with open(current_state_path) as f:
+            exported = json.load(f)
+        assert exported["tick_count"] == 1
+        assert exported["last_tick_ms"] > 0
+        assert exported["open_position_count"] == 0
 
 
 class TestReplaySmoke:

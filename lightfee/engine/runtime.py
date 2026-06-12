@@ -6078,6 +6078,15 @@ class LiveRuntime:
         now_ms = wall_clock_now_ms()
         self.state.last_tick_ms = now_ms
         self.state.tick_count += 1
+        try:
+            maybe_export_current_state_snapshot(
+                self.state, self.config, ExportState(), now_ms
+            )
+        except Exception as exc:
+            self.journal.append(
+                "runtime.current_state_heartbeat_export_error",
+                {"error": str(exc)},
+            )
 
         # --- Load sidecar snapshot ---
         snapshot = load_snapshot(self.config.runtime.sidecar_snapshot_path)
