@@ -6190,6 +6190,15 @@ class LiveRuntime:
             snapshot_freshness_publish_intervals
         )
         self.state.last_scan["snapshot_freshness_status"] = snapshot_freshness_status
+        try:
+            maybe_export_current_state_snapshot(
+                self.state, self.config, ExportState(), now_ms
+            )
+        except Exception as exc:
+            self.journal.append(
+                "runtime.current_state_scan_progress_export_error",
+                {"error": str(exc)},
+            )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             self.journal.append(
                 "runtime.live_scan_revalidate_required",

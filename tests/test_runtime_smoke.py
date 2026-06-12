@@ -253,6 +253,76 @@ class TestRuntimeLaneScheduling:
         assert exported["last_tick_ms"] > 0
         assert exported["open_position_count"] == 0
 
+    @pytest.mark.asyncio
+    async def test_tick_exports_current_state_after_scan_progress_before_long_await(
+        self, tmp_path, monkeypatch
+    ):
+        """Health heartbeat: long ticks must export fresh scan progress early."""
+        import time
+
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.loop_control import current_state_export_path
+        from lightfee.engine.runtime import LiveRuntime
+
+        now_ms = int(time.time() * 1000)
+        sidecar_path = tmp_path / "sidecar.json"
+        sidecar_path.write_text(json.dumps({
+            "schema_version": 2,
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms,
+            "quotes": {
+                "BINANCE:BTCUSDT": {
+                    "venue": "binance",
+                    "symbol": "BTCUSDT",
+                    "bid": 50000.0,
+                    "ask": 50005.0,
+                    "observed_at_ms": now_ms,
+                },
+            },
+            "candidates": [],
+            "degraded_venues": [],
+        }))
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                poll_interval_ms=1000,
+                sidecar_snapshot_path=str(sidecar_path),
+                sidecar_snapshot_max_age_ms=600_000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                local_l2_enabled=False,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "live-state.json"),
+            ),
+            venues=[],
+            symbols=["BTCUSDT"],
+        )
+        runtime = LiveRuntime(config)
+        exported_during_scan: dict[str, object] = {}
+
+        async def observe_exported_progress(now_ms_arg: int, *, scan_promoted: bool = False):
+            with open(current_state_export_path(config)) as f:
+                exported_during_scan.update(json.load(f))
+
+        monkeypatch.setattr(runtime, "_sync_local_l2_data", observe_exported_progress)
+        runtime.journal.open()
+        try:
+            await runtime.tick()
+        finally:
+            runtime.journal.close()
+
+        assert exported_during_scan["tick_count"] == 1
+        last_scan = exported_during_scan.get("last_scan")
+        assert isinstance(last_scan, dict)
+        assert last_scan["ts_ms"] == exported_during_scan["last_tick_ms"]
+        assert last_scan["snapshot_freshness"] == "fresh"
+
 
 class TestReplaySmoke:
     """V2: smoke tests for replay dataset structured reads and journal fallback."""
