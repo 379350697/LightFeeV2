@@ -27,18 +27,25 @@ rows, each with a stable `closure_decision_id`. Runtime entry admission now
 reads `closure.summary.entry_allowed`; recovery block/clear, pending removal,
 passive close terminal events, residual terminal/dust release, diagnose,
 production health, and current-state export all consume or emit closure-table
-identity. The implementation deliberately reuses the runtime-owned
-`RecoveryLedger` and `V1RecoveryDecisionCore` result when available, after
-local regression caught the exact drift that would otherwise misclassify an
-owned live order as orphan during a second owner-unaware projection. Local
-verification passed the closure table suite (`16 passed`), the related
+identity. The first cloud verification intentionally did not pass the closure
+bar: it caught exported-state owner drift around the `positions` /
+`open_positions` alias and several startup/runtime diagnostic event kinds that
+were still unmapped. Follow-ups `02f1a4e` and `2e9dfd0` fixed those gaps before
+final closure. Final local verification passed the closure table suite
+(`17 passed`), the related
 diagnose/production-health/snapshot/startup/entry/passive regression set
-(`551 passed`), compileall, diff-check, and GitNexus detect-changes reported
-low risk / affected processes `0` with the known caveat that `runtime.py` is
-too large for method-level GitNexus indexing. No order submit/cancel,
+(`552 passed`), compileall, deploy manifest, diff-check, and GitNexus
+detect-changes. Final cloud verification at `2e9dfd0` passed remote manifest,
+compileall, focused closure tests (`17 passed`), service health, production
+verifier, and since-deploy diagnose: `ok=true`, `critical_count=0`,
+`warning_count=0`, `gate_passed=true`, `unmapped_event_kinds=[]`,
+`full_universe_hot_path_detected=false`, exchange truth flat/no-open-orders,
+and recovery clear. The known caveat remains that `runtime.py` is too large for
+method-level GitNexus indexing, so runtime impact is covered by source-read
+plus targeted regression evidence. No order submit/cancel, manual
 runtime-state mutation, strategy, sizing, Local-L2 opt-in, WS-BBO budget/TTL,
 close executor, residual-repair submit, or recovery flatten policy changed.
-Cloud deployment is pending. Full evidence is recorded in
+Full evidence is recorded in
 [`daily/2026-06-13.md#cluster-cl-076-v1-lifecycle-closure-table-runtime-gaterelease-unification`](daily/2026-06-13.md#cluster-cl-076-v1-lifecycle-closure-table-runtime-gaterelease-unification).
 
 Latest WS-BBO tracked-scope data-plane root fix, 2026-06-12: post-cutover
