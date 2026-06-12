@@ -61,7 +61,14 @@ was fast-forwarded to `7180ab8` by `git pull --ff-only origin main`,
 retained/book/session Local-L2 snapshots `0/0/0`, diagnose passed with
 `local_l2_residual_runtime_enabled_count=0`, no opens/pending/residual/open
 orders, and the final settled production verifier reported `ok=true`,
-`critical_count=0`. Full evidence is
+`critical_count=0`. A later docs-only fast-forward did not restart services;
+one verifier sample briefly observed `risk_only` with `block_reason=orphan_maker_order`
+and `pending_entry_count=1` during a Bybit `TRUMPUSDT` maker abort/cleanup
+cycle. The settled follow-up diagnose/verifier returned to `RUNNING_CLEAN`,
+`running/running`, no open positions, no open orders, no pending entry/close or
+residual work, and diagnose still reported `entry_opened_count=0` and
+`position_opened_count=0`; track any recurrence as pending-entry lifecycle
+churn, separate from the WS BBO/Local-L2 data-plane closure. Full evidence is
 recorded in
 [`daily/2026-06-12.md#cluster-cl-074-runtime-heartbeat-health-gate-exporter-only-false-progress`](daily/2026-06-12.md#cluster-cl-074-runtime-heartbeat-health-gate-exporter-only-false-progress).
 
