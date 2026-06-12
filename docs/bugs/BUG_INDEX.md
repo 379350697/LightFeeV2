@@ -31,11 +31,15 @@ identity. The first cloud verification intentionally did not pass the closure
 bar: it caught exported-state owner drift around the `positions` /
 `open_positions` alias and several startup/runtime diagnostic event kinds that
 were still unmapped. Follow-ups `02f1a4e` and `2e9dfd0` fixed those gaps before
-final closure. Final local verification passed the closure table suite
+the docs-only cloud pull exposed active-window WS-BBO/scanner/liquidity events
+that still needed explicit mapping. `1c65f53` mapped those quote events to
+`ENTRY_QUOTE_LEASE` and scanner/catalog/liquidity events to `DIAGNOSTIC_ONLY`;
+the restart-window follow-up `3ad1a47` mapped `runtime.private_ws_stopped` to
+`RUNTIME_PROGRESS`. Final local verification passed the closure table suite
 (`17 passed`), the related
 diagnose/production-health/snapshot/startup/entry/passive regression set
 (`552 passed`), compileall, deploy manifest, diff-check, and GitNexus
-detect-changes. Final cloud verification at `2e9dfd0` passed remote manifest,
+detect-changes. Final cloud verification at `3ad1a47` passed remote manifest,
 compileall, focused closure tests (`17 passed`), service health, production
 verifier, and since-deploy diagnose: `ok=true`, `critical_count=0`,
 `warning_count=0`, `gate_passed=true`, `unmapped_event_kinds=[]`,
