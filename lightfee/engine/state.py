@@ -1019,6 +1019,7 @@ class EngineState:
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
     local_l2_session_snapshot: list[dict] = field(default_factory=list)
     last_scan: dict | None = None
+    runtime_progress: dict[str, Any] = field(default_factory=dict)
     # --- V1 PassiveOrderManager runtime state persistence ---
     # Maps entry_id -> PassiveOrderManager.runtime_dict()
     passive_order_manager_states: dict[str, dict] = field(default_factory=dict)
@@ -1090,6 +1091,7 @@ class EngineState:
                 self.pending_close_reconciliations
             ),
             "last_scan": self.last_scan,
+            "runtime_progress": dict(self.runtime_progress or {}),
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,

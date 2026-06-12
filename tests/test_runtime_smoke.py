@@ -279,6 +279,10 @@ class TestRuntimeLaneScheduling:
                 exported = json.load(f)
             assert exported["tick_count"] == 1
             assert exported["last_tick_ms"] == runtime.state.last_tick_ms
+            runtime_progress = exported["runtime_progress"]
+            assert runtime_progress["last_lane_progress_ms"] == 0
+            assert runtime_progress["active_lane"] == "full_tick"
+            assert runtime_progress["active_lane_overdue"] is False
             runtime._running = False
             await run_task
         finally:

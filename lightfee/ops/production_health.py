@@ -147,6 +147,13 @@ def _safe_abs_quantity(value: Any) -> float:
         return 0.0
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any]]:
     live: list[dict[str, Any]] = []
     for venue, positions in (exchange_truth.get("positions") or {}).items():
@@ -274,6 +281,96 @@ def _exchange_truth_position_mismatches(
     return mismatches
 
 
+def _runtime_progress_summary(
+    state: dict[str, Any],
+    *,
+    now_ms: int,
+    progress_budget_ms: int,
+    last_scan_age_ms: int | None,
+    current_state_age_ms: int | None,
+) -> tuple[str, bool, bool, dict[str, Any]]:
+    raw_progress = state.get("runtime_progress")
+    runtime_progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+    last_lane_progress_ms = _safe_int(runtime_progress.get("last_lane_progress_ms"))
+    active_lane = str(runtime_progress.get("active_lane") or "")
+    active_lane_started_ms = _safe_int(runtime_progress.get("active_lane_started_ms"))
+    active_lane_budget_ms = _safe_int(runtime_progress.get("active_lane_budget_ms"))
+    loop_iteration_started_ms = _safe_int(runtime_progress.get("loop_iteration_started_ms"))
+    loop_iteration_completed_ms = _safe_int(runtime_progress.get("loop_iteration_completed_ms"))
+
+    last_lane_progress_age_ms = (
+        now_ms - last_lane_progress_ms if last_lane_progress_ms > 0 else None
+    )
+    active_lane_age_ms = (
+        now_ms - active_lane_started_ms
+        if active_lane and active_lane_started_ms > 0
+        else None
+    )
+    active_lane_overdue = bool(runtime_progress.get("active_lane_overdue"))
+    if (
+        active_lane_age_ms is not None
+        and active_lane_age_ms >= 0
+        and active_lane_budget_ms > 0
+        and active_lane_age_ms > active_lane_budget_ms
+    ):
+        active_lane_overdue = True
+
+    recent_last_scan = (
+        last_scan_age_ms is not None
+        and last_scan_age_ms >= 0
+        and last_scan_age_ms <= progress_budget_ms
+    )
+    recent_lane_progress = (
+        last_lane_progress_age_ms is not None
+        and last_lane_progress_age_ms >= 0
+        and last_lane_progress_age_ms <= progress_budget_ms
+    )
+    active_bounded_lane = (
+        bool(active_lane)
+        and active_lane_age_ms is not None
+        and active_lane_age_ms >= 0
+        and active_lane_budget_ms > 0
+        and active_lane_age_ms <= active_lane_budget_ms
+        and not active_lane_overdue
+    )
+    exporter_fresh = (
+        current_state_age_ms is not None
+        and current_state_age_ms >= 0
+        and current_state_age_ms <= progress_budget_ms
+    )
+
+    if recent_last_scan:
+        progress_source = "last_scan"
+    elif recent_lane_progress:
+        progress_source = "runtime_lane"
+    elif active_bounded_lane:
+        progress_source = "active_bounded_lane"
+    elif exporter_fresh:
+        progress_source = "exporter_only"
+    else:
+        progress_source = "none"
+
+    runtime_progress_details = {
+        "loop_iteration_started_ms": loop_iteration_started_ms,
+        "loop_iteration_completed_ms": loop_iteration_completed_ms,
+        "last_lane_progress_ms": last_lane_progress_ms,
+        "last_lane_progress_age_ms": last_lane_progress_age_ms,
+        "active_lane": active_lane,
+        "active_lane_started_ms": active_lane_started_ms,
+        "active_lane_age_ms": active_lane_age_ms,
+        "active_lane_budget_ms": active_lane_budget_ms,
+        "active_lane_overdue": active_lane_overdue,
+    }
+    runtime_progress_valid = recent_last_scan or recent_lane_progress or active_bounded_lane
+    exporter_only_progress = progress_source == "exporter_only"
+    return (
+        progress_source,
+        exporter_only_progress,
+        runtime_progress_valid,
+        runtime_progress_details,
+    )
+
+
 def analyze_current_state(
     state: dict[str, Any],
     *,
@@ -343,17 +440,17 @@ def analyze_current_state(
         else False
     )
     progress_budget_ms = max(int(max_tick_age_ms or 0) * 4, 60_000)
-    recent_runtime_progress = (
-        (
-            last_scan_age_ms is not None
-            and last_scan_age_ms >= 0
-            and last_scan_age_ms <= progress_budget_ms
-        )
-        or (
-            current_state_age_ms is not None
-            and current_state_age_ms >= 0
-            and current_state_age_ms <= progress_budget_ms
-        )
+    (
+        progress_source,
+        exporter_only_progress,
+        recent_runtime_progress,
+        runtime_progress,
+    ) = _runtime_progress_summary(
+        state,
+        now_ms=now_ms,
+        progress_budget_ms=progress_budget_ms,
+        last_scan_age_ms=last_scan_age_ms,
+        current_state_age_ms=current_state_age_ms,
     )
     tick_stale = tick_age_ms is None or tick_age_ms < 0 or tick_age_ms > max_tick_age_ms
     tick_stale_suppressed_by_runtime_progress = (
@@ -364,6 +461,8 @@ def analyze_current_state(
     )
     if tick_stale and not tick_stale_suppressed_by_runtime_progress:
         fingerprints.append("live_tick_stale")
+        if exporter_only_progress:
+            fingerprints.append("exporter_only_progress")
     if require_exchange_truth:
         if not isinstance(exchange_truth, dict):
             fingerprints.append("exchange_truth_missing")
@@ -430,6 +529,9 @@ def analyze_current_state(
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
             "current_state_age_ms": current_state_age_ms,
+            "progress_source": progress_source,
+            "exporter_only_progress": exporter_only_progress,
+            "runtime_progress": runtime_progress,
             "tick_stale_suppressed_by_runtime_progress": tick_stale_suppressed_by_runtime_progress,
             "exchange_truth_required": require_exchange_truth,
             "exchange_truth_available": exchange_truth_available,
