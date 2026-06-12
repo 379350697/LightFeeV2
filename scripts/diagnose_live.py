@@ -1520,6 +1520,15 @@ def _runtime_progress_from_state(local_state: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _runtime_market_data_config_from_state(
+    local_state: dict[str, Any],
+) -> dict[str, Any]:
+    config = local_state.get("runtime_market_data_config")
+    if isinstance(config, dict):
+        return dict(config)
+    return {}
+
+
 def _build_state_consistency(
     local_state: dict[str, Any], exchange_truth: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1536,6 +1545,7 @@ def _build_state_consistency(
     et_confidence = exchange_truth.get("confidence", "low")
     fetch_status = exchange_truth.get("fetch_status", {})
     runtime_progress = _runtime_progress_from_state(local_state)
+    runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
 
     # Collect local symbols for cross-reference
     local_symbols = [
@@ -1683,6 +1693,7 @@ def _build_state_consistency(
         "details": details,
         "confidence": "high",
         "runtime_progress": runtime_progress,
+        "runtime_market_data_config": runtime_market_data_config,
     }
 
 
@@ -2477,6 +2488,16 @@ def _build_production_acceptance_gate(
     residual_count = 0
     exception_conclusions: dict[str, str] = {}
     runtime_progress = _runtime_progress_from_state(local_state)
+    runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
+    ws_bbo_effective_mode = (
+        str(
+            runtime_market_data_config.get("entry_readiness_provider_effective", "")
+            or ""
+        )
+        == "ws_bbo_quote_lease"
+        and runtime_market_data_config.get("local_l2_effective_enabled") is False
+    )
+    local_l2_residual_runtime_enabled_count = 0
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -2636,6 +2657,15 @@ def _build_production_acceptance_gate(
                 exception_conclusions["local_l2_official_rebuild"] = "official_doc"
             else:
                 exception_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
+        if ws_bbo_effective_mode and (
+            kind.startswith("runtime.local_l2_")
+            or kind
+            in {
+                "runtime.entry_blocked_local_l2_selection",
+                "runtime.entry_local_l2_readiness_diagnostics",
+            }
+        ):
+            local_l2_residual_runtime_enabled_count += 1
 
         if kind == "runtime.snapshot_fallback_last_good" and _is_snapshot_fallback_blocking(payload):
             snapshot_fallback_blocking_count += 1
@@ -2701,6 +2731,9 @@ def _build_production_acceptance_gate(
         and str(local_state.get("lifecycle", "") or "").lower() == "risk_only"
     ):
         fingerprints.append("lifecycle_release_not_applied")
+    if local_l2_residual_runtime_enabled_count:
+        fingerprints.append("local_l2_residual_runtime_enabled")
+        exception_conclusions["local_l2_residual_runtime_enabled"] = "regression"
     if (
         required_position_truth_unavailable_count
         and exception_conclusions.get("blocking_required_truth")
@@ -2821,6 +2854,8 @@ def _build_production_acceptance_gate(
         "blocking_required_truth"
     ) == "blocking_required_truth":
         blocking_reasons.append("blocking_required_truth")
+    if local_l2_residual_runtime_enabled_count:
+        blocking_reasons.append("local_l2_residual_runtime_enabled")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -2828,6 +2863,9 @@ def _build_production_acceptance_gate(
         "okx_recovery_probe_rate_limited": okx_recovery_probe_rate_limited_count,
         "okx_instrument_missing_skipped": okx_instrument_missing_skipped_count,
         "local_l2_official_rebuild": local_l2_official_rebuild_count,
+        "local_l2_residual_runtime_enabled": (
+            local_l2_residual_runtime_enabled_count
+        ),
         "snapshot_fallback_blocking": snapshot_fallback_blocking_count,
         "nonblocking_health_diagnostic": bulk_health_diagnostic_count,
         "contained_admission": contained_admission_count,
@@ -2892,6 +2930,9 @@ def _build_production_acceptance_gate(
         "okx_recovery_probe_rate_limited_count": okx_recovery_probe_rate_limited_count,
         "okx_instrument_missing_skipped_count": okx_instrument_missing_skipped_count,
         "local_l2_official_rebuild_count": local_l2_official_rebuild_count,
+        "local_l2_residual_runtime_enabled_count": (
+            local_l2_residual_runtime_enabled_count
+        ),
         "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,
@@ -2929,6 +2970,7 @@ def _build_production_acceptance_gate(
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
         "recovery_decision": recovery_decision,
         "runtime_progress": runtime_progress,
+        "runtime_market_data_config": runtime_market_data_config,
         "fingerprints": fingerprints,
         "exception_conclusions": exception_conclusions,
         "unclassified_exceptions": unclassified_exceptions,

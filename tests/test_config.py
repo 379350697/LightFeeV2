@@ -74,6 +74,69 @@ class TestConfigLoading:
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
 
+    def test_live_missing_entry_provider_defaults_to_ws_bbo_even_with_legacy_local_l2_flag(
+        self, tmp_path
+    ):
+        path = tmp_path / "live.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "live"
+
+[strategy]
+local_l2_enabled = true
+local_l2_ws_enabled = true
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.strategy.entry_readiness_provider == "ws_bbo_quote_lease"
+        assert config.strategy.local_l2_enabled is True
+        assert config.strategy.local_l2_ws_enabled is True
+
+    def test_live_explicit_local_l2_provider_keeps_v1_local_l2_mode(self, tmp_path):
+        path = tmp_path / "live.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "live"
+
+[strategy]
+entry_readiness_provider = "local_l2"
+local_l2_enabled = true
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.strategy.entry_readiness_provider == "local_l2"
+
+    def test_paper_missing_entry_provider_keeps_schema_default(self, tmp_path):
+        path = tmp_path / "paper.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+
+[strategy]
+local_l2_enabled = true
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.strategy.entry_readiness_provider == "local_l2"
+
     def test_loads_v1_entry_perp_liquidity_thresholds(self, tmp_path):
         path = tmp_path / "paper.toml"
         path.write_text(

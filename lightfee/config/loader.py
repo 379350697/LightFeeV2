@@ -44,7 +44,7 @@ def load_config(path: str | Path) -> AppConfig:
         symbols = []
 
     runtime = _load_runtime(raw.get("runtime", {}))
-    strategy = _load_strategy(raw.get("strategy", {}))
+    strategy = _load_strategy(raw.get("strategy", {}), runtime=runtime)
     persistence = _load_persistence(raw.get("persistence", {}))
     venues = _load_venues(raw.get("venues", []))
 
@@ -81,10 +81,21 @@ def _load_runtime(raw: dict[str, Any]) -> RuntimeConfig:
     return cfg
 
 
-def _load_strategy(raw: dict[str, Any]) -> StrategyConfig:
+def _load_strategy(
+    raw: dict[str, Any],
+    *,
+    runtime: RuntimeConfig | None = None,
+) -> StrategyConfig:
     cfg = default_strategy()
+    provider_configured = "entry_readiness_provider" in raw
     raw = _normalize_entry_perp_liquidity_thresholds(raw)
     _merge_defaults(cfg, raw)
+    if (
+        runtime is not None
+        and str(getattr(runtime, "mode", "") or "").lower() == "live"
+        and not provider_configured
+    ):
+        cfg.entry_readiness_provider = "ws_bbo_quote_lease"
     return cfg
 
 

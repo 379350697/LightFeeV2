@@ -228,6 +228,7 @@ class LiveRuntime:
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
         from lightfee.engine.entry_readiness import build_entry_readiness_provider
         self.entry_readiness_provider = build_entry_readiness_provider(self)
+        self._refresh_runtime_market_data_config_state()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
         self._last_entry_l2_readiness_diag_fingerprint: str = ""
@@ -1341,6 +1342,39 @@ class LiveRuntime:
             "ws_top_book",
             "ws_bbo_quote_lease",
         }
+
+    def _local_l2_effective_enabled(self) -> bool:
+        """Whether Local-L2 data plane is effective for this runtime profile."""
+        return (
+            bool(getattr(self.config.strategy, "local_l2_enabled", False))
+            and self._entry_readiness_provider_uses_local_l2()
+        )
+
+    def _runtime_market_data_config_summary(self) -> dict[str, Any]:
+        provider = self._entry_readiness_provider_name()
+        return {
+            "entry_readiness_provider_effective": provider,
+            "local_l2_configured_enabled": bool(
+                getattr(self.config.strategy, "local_l2_enabled", False)
+            ),
+            "local_l2_ws_configured_enabled": bool(
+                getattr(self.config.strategy, "local_l2_ws_enabled", False)
+            ),
+            "local_l2_effective_enabled": self._local_l2_effective_enabled(),
+            "local_l2_effective_disabled_reason": (
+                "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
+                if (
+                    provider == "ws_bbo_quote_lease"
+                    and bool(getattr(self.config.strategy, "local_l2_enabled", False))
+                )
+                else ""
+            ),
+        }
+
+    def _refresh_runtime_market_data_config_state(self) -> None:
+        self.state.runtime_market_data_config = (
+            self._runtime_market_data_config_summary()
+        )
 
     def _entry_quote_lease_max_age_ms(self) -> int:
         budgets = []
@@ -4581,6 +4615,10 @@ class LiveRuntime:
         Runtime L2 activation for new entry symbols is handled separately by
         _ensure_l2_active_for_candidates() on each tick.
         """
+        self._refresh_runtime_market_data_config_state()
+        if not self._local_l2_effective_enabled():
+            return
+
         self.journal.append(
             "runtime.local_l2_phase_start",
             {"ts_ms": now_ms},
@@ -4589,7 +4627,7 @@ class LiveRuntime:
         # V1: startup_local_l2_symbols() → retained + hot symbols only
         # NOT all config.symbols — L2 is only bootstrapped for symbols with activity
         target_pairs: set[tuple[str, str]] = set()
-        if self.config.strategy.local_l2_enabled:
+        if self._local_l2_effective_enabled():
             active_venues = list(self._venue_adapters.keys())
             venue_set = {
                 v.value if hasattr(v, 'value') else str(v)
@@ -4703,7 +4741,7 @@ class LiveRuntime:
         # Step 2: Start WS streams FIRST for all venues (V1: start_local_l2_ws)
         # This ensures delta updates are captured (buffered) during bootstrap gap
         if (
-            self.config.strategy.local_l2_enabled
+            self._local_l2_effective_enabled()
             and getattr(self.config.strategy, 'local_l2_ws_enabled', False)
             and self.config.runtime.mode != "paper"
         ):
@@ -4816,7 +4854,8 @@ class LiveRuntime:
 
         Respects local_l2_hot_exec_per_venue_budget (V1).
         """
-        if not self.config.strategy.local_l2_enabled:
+        self._refresh_runtime_market_data_config_state()
+        if not self._local_l2_effective_enabled():
             return
         if self.config.runtime.mode == "paper":
             return
@@ -6434,8 +6473,7 @@ class LiveRuntime:
             # V1: refresh tracked entry local L2 opportunities from the scan
             # shortlist before quote freshness can block final entry selection.
             if (
-                self.config.strategy.local_l2_enabled
-                and self._entry_readiness_provider_uses_local_l2()
+                self._local_l2_effective_enabled()
                 and l2_tracking_tradeable
             ):
                 primary_count = getattr(
@@ -6759,7 +6797,8 @@ class LiveRuntime:
 
         Delegates to the data plane which respects per-book cooldown intervals.
         """
-        if not self.config.strategy.local_l2_enabled:
+        self._refresh_runtime_market_data_config_state()
+        if not self._local_l2_effective_enabled():
             return
 
         try:
@@ -6809,12 +6848,15 @@ class LiveRuntime:
         if not pending_passive:
             return
 
-        local_l2_enabled = self.config.strategy.local_l2_enabled
+        self._refresh_runtime_market_data_config_state()
+        local_l2_enabled = self._local_l2_effective_enabled()
         non_parity_mode = self.config.runtime.opportunity_input_mode == "non_parity"
 
         if local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
             await self._maybe_tick_maker_event_local_l2(now_ms, pending_passive)
+        elif self._entry_readiness_provider_uses_ws_bbo():
+            await self._maybe_tick_maker_event_ws_bbo(now_ms, pending_passive)
         elif non_parity_mode:
             # --- Explicit non-parity fallback: sidecar mid-price ---
             await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
@@ -6826,6 +6868,9 @@ class LiveRuntime:
                 {
                     "ts_ms": now_ms,
                     "local_l2_enabled": local_l2_enabled,
+                    "local_l2_configured_enabled": bool(
+                        getattr(self.config.strategy, "local_l2_enabled", False)
+                    ),
                     "opportunity_input_mode": self.config.runtime.opportunity_input_mode,
                     "reason": "non-parity fallback requires explicit opportunity_input_mode='non_parity'",
                 },
@@ -7027,6 +7072,192 @@ class LiveRuntime:
                 "ts_ms": now_ms,
             },
         )
+
+    async def _maybe_tick_maker_event_ws_bbo(
+        self, now_ms: int, pending_passive: list,
+    ) -> None:
+        """WS BBO maker-event lane using the in-situ pending hedge driver."""
+        strategy = self.config.strategy
+        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        reprice_threshold_bps = strategy.passive_reprice_threshold_bps
+        cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
+
+        from lightfee.engine.entry_sync import _adapter_supports_amend
+        from lightfee.engine.passive_order_manager import (
+            PassiveOrderManager,
+            PassiveOrderManagerDecisionType,
+            PassiveOrderManagerProfile,
+            PassiveOrderDecisionInput,
+            PassiveSkipReason,
+        )
+
+        woke_positions = 0
+        missing_quotes: list[dict[str, Any]] = []
+        venues: set[str] = set()
+        max_quote_age_ms = 0
+        min_quote_age_ms = 1_000_000_000
+
+        for entry_id, pending in pending_passive:
+            maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
+            venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
+            quote = None
+            try:
+                quote = self.ws_bbo_cache.get_quote(venue_str, pending.symbol)
+            except Exception:
+                quote = None
+            budget_ms = self._entry_quote_lease_max_age_ms()
+            bid = ask = 0.0
+            observed_at_ms = 0
+            if quote is not None:
+                try:
+                    bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                    ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                    observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+                except Exception:
+                    bid = ask = 0.0
+                    observed_at_ms = 0
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            valid = bid > 0.0 and ask > bid
+            fresh = (
+                valid
+                and observed_at_ms > 0
+                and budget_ms > 0
+                and age_ms is not None
+                and age_ms <= budget_ms
+            )
+            if not fresh:
+                missing_quotes.append(
+                    {
+                        "entry_id": entry_id,
+                        "venue": venue_str,
+                        "symbol": pending.symbol,
+                        "reason": (
+                            "stale_quote"
+                            if valid and age_ms is not None and budget_ms > 0 and age_ms > budget_ms
+                            else "missing_or_invalid_quote"
+                        ),
+                        "age_ms": age_ms,
+                        "budget_ms": budget_ms,
+                    }
+                )
+                continue
+
+            mid = (bid + ask) / 2.0
+            stored = self._maker_event_state.get(entry_id)
+            if isinstance(stored, tuple) and len(stored) == 2:
+                manager, stored_price = stored
+            else:
+                profile = PassiveOrderManagerProfile(
+                    max_consecutive_failures=strategy.passive_max_consecutive_failures,
+                    failure_cooldown_ms=strategy.passive_failure_cooldown_ms,
+                    reprice_threshold_bps=reprice_threshold_bps,
+                    cancel_replace_threshold_bps=cancel_replace_threshold_bps,
+                )
+                manager = PassiveOrderManager(profile)
+                stored_price = stored.get("maker_price", 0.0) if isinstance(stored, dict) else 0.0
+                if isinstance(stored, dict) and stored.get("consecutive_failures", 0) > 0:
+                    for _ in range(stored.get("consecutive_failures", 0)):
+                        manager.note_failure(stored.get("last_reprice_ms", now_ms))
+
+            adapter = self._venue_adapters.get(maker_venue)
+            supports_amend = _adapter_supports_amend(adapter)
+            decision_input = PassiveOrderDecisionInput(
+                tick_size=0.1,
+                reference_mid_price=mid,
+                target_price=mid,
+                current_price=stored_price if stored_price > 0 else None,
+                target_quantity=getattr(pending, "long_quantity", 0) or 0,
+                supports_amend=supports_amend,
+            )
+            decision = manager.decide(decision_input, now_ms)
+            if decision.kind == PassiveOrderManagerDecisionType.PLACE:
+                self._maker_event_state[entry_id] = (manager, mid)
+                continue
+            if decision.kind == PassiveOrderManagerDecisionType.COOLDOWN:
+                continue
+            if decision.kind == PassiveOrderManagerDecisionType.HOLD:
+                if decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED:
+                    self.journal.append(
+                        "execution.passive_ops_rate_limited",
+                        {
+                            "entry_id": entry_id,
+                            "reason": "ops_budget_exceeded",
+                            "source": "ws_bbo_quote_lease",
+                            "ts_ms": now_ms,
+                        },
+                    )
+                continue
+            if decision.kind == PassiveOrderManagerDecisionType.AMEND:
+                action = "reprice"
+            elif decision.kind == PassiveOrderManagerDecisionType.CANCEL_REPLACE:
+                action = "cancel_replace"
+            else:
+                continue
+            if self.entry_executor is None:
+                continue
+
+            try:
+                manager.note_operation(now_ms)
+                if action == "cancel_replace":
+                    manager.note_operation(now_ms)
+                result = await self._reprice_passive_maker_l2(
+                    pending, mid, stored_price, action, now_ms, entry_id,
+                )
+                manager.note_success(now_ms)
+                self._maker_event_state[entry_id] = (manager, mid)
+                pe = self.state.pending_entries.get(entry_id)
+                if pe is not None:
+                    pe.maker_price = mid
+                    if result.order_id:
+                        pe.maker_order_id = result.order_id
+                woke_positions += 1
+                venues.add(venue_str)
+                if age_ms is not None:
+                    min_quote_age_ms = min(min_quote_age_ms, age_ms)
+                    max_quote_age_ms = max(max_quote_age_ms, age_ms)
+            except Exception as e:
+                manager.note_failure(now_ms)
+                self._maker_event_state[entry_id] = (manager, stored_price)
+                self.journal.append(
+                    "runtime.maker_event_reprice_error",
+                    {
+                        "entry_id": entry_id,
+                        "action": action,
+                        "error": str(e),
+                        "source": "ws_bbo_quote_lease",
+                    },
+                )
+
+        if missing_quotes:
+            self.journal.append(
+                "runtime.maker_event_no_ws_bbo_quote",
+                {
+                    "ts_ms": now_ms,
+                    "pending_passive_total": len(pending_passive),
+                    "missing_quote_count": len(missing_quotes),
+                    "samples": missing_quotes[:8],
+                    "source": "ws_bbo_quote_lease",
+                    "provider": "ws_bbo_quote_lease",
+                    "reason": "missing_stale_or_invalid_ws_bbo_quote",
+                },
+            )
+
+        self._last_maker_event_ms = now_ms
+        if woke_positions > 0:
+            self.journal.append(
+                "runtime.maker_event_lane_wake",
+                {
+                    "position_count": woke_positions,
+                    "pending_passive_total": len(pending_passive),
+                    "source": "ws_bbo_quote_lease",
+                    "venues": sorted(venues),
+                    "min_quote_age_ms": (
+                        min_quote_age_ms if min_quote_age_ms < 1_000_000_000 else 0
+                    ),
+                    "max_quote_age_ms": max_quote_age_ms,
+                    "ts_ms": now_ms,
+                },
+            )
 
     async def _maybe_tick_maker_event_sidecar(
         self, now_ms: int, pending_passive: list,
@@ -15793,7 +16024,7 @@ class LiveRuntime:
                 return False, "would_cross_bbo", payload
             return True, "", payload
 
-        if not self.config.strategy.local_l2_enabled:
+        if not self._local_l2_effective_enabled():
             return True, "", payload
 
         book = self.local_l2_runtime.get_book(venue_str, symbol)
@@ -17555,7 +17786,7 @@ class LiveRuntime:
 
     def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
         """Sync entry-local-L2 session legs from local-L2 book readiness."""
-        if not self.config.strategy.local_l2_enabled:
+        if not self._local_l2_effective_enabled():
             return
         from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
 
@@ -18092,8 +18323,7 @@ class LiveRuntime:
         if local_l2_provider_active:
             payload.update({
                 "entry_local_l2_primary_ready_filter_active": bool(
-                    self.config.strategy.local_l2_enabled
-                    and self._tracked_primary_pair_ids
+                    self._local_l2_effective_enabled() and self._tracked_primary_pair_ids
                 ),
                 "entry_local_l2_primary_not_ready_reason_counts": readiness["reason_counts"],
                 "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
@@ -18754,7 +18984,7 @@ class LiveRuntime:
         # V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms
         first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
         if first_funding_ts <= 0:
-            if not self.config.strategy.local_l2_enabled:
+            if not self._local_l2_effective_enabled():
                 return None
             return "entry_local_l2_waiting_for_prewarm_window"
         remaining_ms = first_funding_ts - max(now_ms, 0)
@@ -18764,7 +18994,7 @@ class LiveRuntime:
         )
         if finalization_blocker:
             return finalization_blocker
-        if not self.config.strategy.local_l2_enabled:
+        if not self._local_l2_effective_enabled():
             return None
         prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
         if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
@@ -19109,8 +19339,7 @@ class LiveRuntime:
     ) -> dict | None:
         if (
             self.config.runtime.mode != "live"
-            or not self.config.strategy.local_l2_enabled
-            or not self._entry_readiness_provider_uses_local_l2()
+            or not self._local_l2_effective_enabled()
         ):
             return None
         long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
@@ -19427,10 +19656,7 @@ class LiveRuntime:
 
         # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
         # but either leg's book is not ready (stale, degraded, cold, etc.)
-        if (
-            self.config.strategy.local_l2_enabled
-            and self._entry_readiness_provider_uses_local_l2()
-        ):
+        if self._local_l2_effective_enabled():
             from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
             long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)

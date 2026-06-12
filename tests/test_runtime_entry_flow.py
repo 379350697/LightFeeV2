@@ -1546,6 +1546,112 @@ class TestPlannerDispatchIntegration:
         assert len(runtime.state.pending_entries) == 1
 
     @pytest.mark.asyncio
+    async def test_ws_bbo_provider_maker_event_uses_in_situ_reprice_not_new_entry(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.passive_order_manager import (
+            PassiveOrderManager,
+            PassiveOrderManagerProfile,
+        )
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.runtime.maker_event_lane_enabled = True
+        config.runtime.maker_event_lane_min_wake_interval_ms = 0
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.local_l2_enabled = True
+        config.strategy.passive_reprice_threshold_bps = 1.0
+        config.strategy.passive_cancel_replace_threshold_bps = 100.0
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
+                Venue.OKX: FakeVenueAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="pe-ws-bbo",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            entry_type="passive_incremental",
+            maker_price=50000.0,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        profile = PassiveOrderManagerProfile(
+            max_consecutive_failures=3,
+            failure_cooldown_ms=0,
+            reprice_threshold_bps=1.0,
+            cancel_replace_threshold_bps=100.0,
+        )
+        runtime._maker_event_state[pending.pending_id] = (
+            PassiveOrderManager(profile),
+            50000.0,
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50020.0,
+                ask=50030.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="okx_bbo_ws",
+            )
+        )
+
+        class RejectNewEntryExecutor:
+            async def execute(self, ctx):
+                raise AssertionError("WS BBO maker-event must not start a new entry flow")
+
+        calls: list[tuple[float, float, str, str]] = []
+
+        async def fake_reprice(pending_arg, new_price, old_price, action, now_ms, entry_id):
+            calls.append((new_price, old_price, action, entry_id))
+            return SimpleNamespace(order_id="amended-maker-1")
+
+        runtime.entry_executor = RejectNewEntryExecutor()
+        monkeypatch.setattr(runtime, "_reprice_passive_maker_l2", fake_reprice)
+
+        await runtime._maybe_tick_maker_event(5000)
+
+        assert calls == [(50025.0, 50000.0, "cancel_replace", pending.pending_id)]
+        assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
+        assert runtime.state.pending_entries[pending.pending_id].maker_order_id == "amended-maker-1"
+        records = tmp_journal.read_all()
+        assert any(
+            record["kind"] == "runtime.maker_event_lane_wake"
+            and record["payload"]["source"] == "ws_bbo_quote_lease"
+            for record in records
+        )
+        assert all(
+            not str(record["kind"]).startswith("runtime.local_l2_")
+            for record in records
+        )
+
+    @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_requires_selected_quote_lease(
         self,
         config,

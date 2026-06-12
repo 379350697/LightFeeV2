@@ -96,6 +96,17 @@ def _admissible_dispatch_candidate(
     )
 
 
+def _fake_adapters_for_venues(
+    *venues: str,
+    overrides: dict[Venue, FakeVenueAdapter] | None = None,
+) -> dict[Venue, FakeVenueAdapter]:
+    adapters = dict(overrides or {})
+    for venue in venues:
+        ven = Venue.from_str(venue)
+        adapters.setdefault(ven, FakeVenueAdapter(ven))
+    return adapters
+
+
 class TestBootstrapHelpers:
     """Test bootstrap utility functions."""
 
@@ -190,7 +201,10 @@ class TestRuntimePreflight:
     async def test_bybit_trading_terms_reject_blocks_symbol_admission(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            runtime = LiveRuntime(config)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues("bybit", "binance"),
+            )
             runtime.journal.open()
 
             class RejectingExecutor:
@@ -254,7 +268,14 @@ class TestRuntimePreflight:
                     raise AssertionError("maker dispatch must be blocked by Bybit precheck")
 
             bybit = PrecheckRejectingBybit()
-            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BYBIT: bybit},
+                ),
+            )
             executor = RecordingExecutor()
             runtime.entry_executor = executor
             runtime.journal.open()
@@ -325,7 +346,14 @@ class TestRuntimePreflight:
                     )
 
             bybit = PrecheckOkBybit()
-            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BYBIT: bybit},
+                ),
+            )
             executor = RecordingExecutor()
             runtime.entry_executor = executor
             runtime.journal.open()
@@ -352,7 +380,10 @@ class TestRuntimePreflight:
     async def test_aster_max_leverage_reject_blocks_symbol_admission(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            runtime = LiveRuntime(config)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues("aster", "bybit"),
+            )
             runtime.journal.open()
 
             class RejectingExecutor:
@@ -446,7 +477,11 @@ class TestRuntimePreflight:
     ):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            runtime = LiveRuntime(config)
+            short_venue = "bybit" if venue != "bybit" else "binance"
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(venue, short_venue),
+            )
             runtime.journal.open()
 
             class RejectingExecutor:
@@ -465,7 +500,7 @@ class TestRuntimePreflight:
             candidate = _admissible_dispatch_candidate(
                 symbol=symbol,
                 long_venue=venue,
-                short_venue="bybit" if venue != "bybit" else "binance",
+                short_venue=short_venue,
             )
 
             assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0) is True
@@ -1581,6 +1616,7 @@ class TestRuntimePreflight:
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.strategy.local_l2_enabled = True
+            config.strategy.entry_readiness_provider = "local_l2"
             config.strategy.local_l2_ws_enabled = False
 
             class SupportedOnlyAdapter(FakeVenueAdapter):
@@ -1621,11 +1657,68 @@ class TestRuntimePreflight:
             assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
 
     @pytest.mark.asyncio
+    async def test_ws_bbo_effective_mode_skips_local_l2_startup_despite_legacy_flag(
+        self,
+    ):
+        """WS BBO provider must suppress Local-L2 data-plane startup noise."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+            config.strategy.local_l2_enabled = True
+            config.strategy.local_l2_ws_enabled = True
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.loaded = False
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"] if self.loaded else []
+
+                async def ensure_supported_symbols_loaded(self) -> None:
+                    self.loaded = True
+
+            binance = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
+            runtime.state.retained_local_l2_books = [
+                {"venue": "binance", "symbol": "BTCUSDT"},
+            ]
+            started: list[dict] = []
+            runtime.l2_data_plane.start_background_bootstrap = (
+                lambda **kwargs: started.append(kwargs)
+            )
+
+            runtime.journal.open()
+            try:
+                await runtime._activate_local_l2_phase(now_ms=1700000010000)
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            assert started == []
+            assert binance.loaded is False
+            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
+            assert all(
+                not str(record["kind"]).startswith("runtime.local_l2_")
+                for record in records
+            )
+            state = runtime.state.to_dict()
+            effective = state["runtime_market_data_config"]
+            assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+            assert effective["local_l2_configured_enabled"] is True
+            assert effective["local_l2_effective_enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_local_l2_snapshot_restore_filters_unsupported_venue_symbols(self):
         """Persisted full-book snapshots must not resurrect non-trading contracts."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.strategy.local_l2_enabled = True
+            config.strategy.entry_readiness_provider = "local_l2"
 
             class SupportedOnlyAdapter(FakeVenueAdapter):
                 def __init__(self):
