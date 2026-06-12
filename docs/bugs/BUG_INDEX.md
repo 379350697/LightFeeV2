@@ -28,7 +28,13 @@ requires exchange-min terminal evidence (`exchange_min_quantity_dust` or
 `execution.entry_residual_dust_tolerated`; exchange-min entry residuals above
 `2%` pause the residual repair instead of releasing the pair gate. Diagnose now keeps raw
 `hedge_quantity_undercut` / `common_quantity_mismatch` counters while adding
-warning counters that exclude tolerated `<=2%` exchange-min dust entries.
+warning counters that exclude tolerated `<=2%` exchange-min dust entries, and
+the production acceptance gate exposes short-window warning families separately
+from final flat health. The fix was deployed as `deec77f`; cloud read-only
+verification showed matching remote `git_head` / `.deploy_version`, flat
+exchange truth, no open orders, no pending work, and zero entry quantity
+warnings in the deploy window. One HOME passive-close order-truth gap remains
+classified separately as closed by current exchange truth.
 Hyperliquid `account_wallet_signer_mismatch` remains a separate preflight/env
 identity issue, not part of the SAHARA residual family. Full evidence is
 recorded in

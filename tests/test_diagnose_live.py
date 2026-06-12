@@ -3046,6 +3046,91 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
         assert entry_summary["common_quantity_mismatch_warning_entry_ids"] == [
             "entry-mismatch"
         ]
+        gate = result["production_acceptance_gate"]
+        assert gate["short_window_warning_count"] == 2
+        assert gate["short_window_warning_families"] == [
+            "entry_quantity_mismatch",
+            "hedge_quantity_undercut",
+        ]
+        assert gate["short_window_warning_details"] == {
+            "entry_quantity_mismatch": 1,
+            "hedge_quantity_undercut": 1,
+            "passive_close_truth_gap": 0,
+            "passive_zero_fill_exhausted_then_recovered": 0,
+        }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_reports_passive_zero_fill_recovered_short_window(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781097000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781096100000,
+                "kind": "execution.passive_cycle_zero_fill",
+                "payload": {
+                    "position_id": "entry-zero-recovered",
+                    "symbol": "ZEROUSDT",
+                    "zero_fill_cycles": 3,
+                    "max_zero_fill_cycles": 3,
+                },
+            },
+            {
+                "ts_ms": 1781096100500,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-zero-recovered",
+                    "symbol": "ZEROUSDT",
+                    "problem": False,
+                    "single_leg_fast_flatten": False,
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1781097000000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["short_window_warning_count"] == 1
+        assert gate["short_window_warning_families"] == [
+            "passive_zero_fill_exhausted_then_recovered"
+        ]
+        assert gate["short_window_warning_details"][
+            "passive_zero_fill_exhausted_then_recovered"
+        ] == 1
+        assert gate["gate_passed"] is True
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

@@ -2819,6 +2819,34 @@ def _build_production_acceptance_gate(
             else 0
         ),
     }
+    entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(events)
+    passive_zero_fill_exhausted_then_recovered_count = _count_passive_zero_fill_exhausted_then_recovered(
+        events
+    )
+    short_window_warning_details = {
+        "entry_quantity_mismatch": int(
+            entry_quantity_terminal_summary.get(
+                "common_quantity_mismatch_warning_count", 0
+            )
+            or 0
+        ),
+        "hedge_quantity_undercut": int(
+            entry_quantity_terminal_summary.get(
+                "hedge_quantity_undercut_warning_count", 0
+            )
+            or 0
+        ),
+        "passive_close_truth_gap": resolved_order_truth_gap_count,
+        "passive_zero_fill_exhausted_then_recovered": (
+            passive_zero_fill_exhausted_then_recovered_count
+        ),
+    }
+    short_window_warning_families = [
+        family
+        for family, count in short_window_warning_details.items()
+        if count
+    ]
+    short_window_warning_count = sum(short_window_warning_details.values())
     unclassified_exceptions = [
         name for name, count in diagnostic_counts.items()
         if count and name not in exception_conclusions
@@ -2880,6 +2908,9 @@ def _build_production_acceptance_gate(
         "exception_conclusions": exception_conclusions,
         "unclassified_exceptions": unclassified_exceptions,
         "insufficient_evidence_exceptions": insufficient_evidence_exceptions,
+        "short_window_warning_count": short_window_warning_count,
+        "short_window_warning_families": short_window_warning_families,
+        "short_window_warning_details": short_window_warning_details,
         "blocking_reasons": blocking_reasons,
         "gate_passed": not blocking_reasons,
     }
@@ -2915,6 +2946,43 @@ def _recovery_decision_payload(
         "clear_reason": decision.clear_reason,
         "diagnostic_severity": decision.diagnostic_severity,
     }
+
+
+def _count_passive_zero_fill_exhausted_then_recovered(
+    events: list[dict[str, Any]],
+) -> int:
+    exhausted_positions: set[str] = set()
+    recovered_positions: set[str] = set()
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        position_id = str(payload.get("position_id") or payload.get("entry_id") or "")
+        if not position_id:
+            continue
+        if kind == "exit.passive_close_fallback_zero_fill_no_pending":
+            exhausted_positions.add(position_id)
+        elif kind == "execution.passive_cycle_zero_fill":
+            try:
+                zero_fill_cycles = int(payload.get("zero_fill_cycles", 0) or 0)
+            except (TypeError, ValueError):
+                zero_fill_cycles = 0
+            try:
+                max_zero_fill_cycles = int(
+                    payload.get("max_zero_fill_cycles", 0) or 0
+                )
+            except (TypeError, ValueError):
+                max_zero_fill_cycles = 0
+            if max_zero_fill_cycles > 0 and zero_fill_cycles >= max_zero_fill_cycles:
+                exhausted_positions.add(position_id)
+        elif kind in {
+            "exit.passive_close_resolved",
+            "exit.passive_close_recovery_probe_flat",
+            "exit.passive_close_fallback_terminal_flat",
+        }:
+            recovered_positions.add(position_id)
+    return len(exhausted_positions & recovered_positions)
 
 
 def _state_collection_or_count(
