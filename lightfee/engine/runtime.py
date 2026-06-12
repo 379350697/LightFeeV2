@@ -50,6 +50,7 @@ from lightfee.engine.lifecycle import (
 )
 from lightfee.engine.loop_control import (
     ExportState,
+    current_state_export_interval_ms,
     maybe_export_current_state_snapshot,
     maybe_export_runtime_metrics,
 )
@@ -7250,83 +7251,107 @@ class LiveRuntime:
     # Main loop
     # ------------------------------------------------------------------
 
+    async def _current_state_heartbeat_loop(self) -> None:
+        """Export current-state while long tick lanes are awaiting IO."""
+        interval_s = current_state_export_interval_ms(self.config) / 1000.0
+        while self._running:
+            now_ms = wall_clock_now_ms()
+            try:
+                maybe_export_current_state_snapshot(
+                    self.state, self.config, self._export_state, now_ms
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "runtime.current_state_heartbeat_loop_export_error",
+                    {"error": str(exc)},
+                )
+            await asyncio.sleep(interval_s)
+
     async def run_loop(self) -> None:
         """Multi-lane tick loop with backoff, housekeeping, and periodic export."""
         self._running = True
         poll_ms = self.config.runtime.poll_interval_ms
+        heartbeat_task = asyncio.create_task(self._current_state_heartbeat_loop())
 
-        while self._running:
-            now_ms = wall_clock_now_ms()
-            active_count = len(self.state.open_positions)
+        try:
+            while self._running:
+                now_ms = wall_clock_now_ms()
+                active_count = len(self.state.open_positions)
 
-            # --- Full tick lane (backoff-gated) ---
-            if full_tick_ready(self._tick_backoff_until_ms, now_ms):
-                try:
-                    await self.tick()
-                    self._tick_backoff_until_ms = None
-                except Exception as e:
-                    self._apply_tick_backoff(is_active=False)
-                    self.journal.append("runtime.tick_error", {"error": str(e)})
-
-            # --- Active-position fast tick lane ---
-            if active_position_poll_enabled(
-                self.state.lifecycle, poll_ms, active_count
-            ):
-                if active_position_tick_ready(
-                    self._active_tick_backoff_until_ms, now_ms
-                ):
+                # --- Full tick lane (backoff-gated) ---
+                if full_tick_ready(self._tick_backoff_until_ms, now_ms):
                     try:
-                        await self.tick_active_positions()
-                        self._active_tick_backoff_until_ms = None
+                        await self.tick()
+                        self._tick_backoff_until_ms = None
                     except Exception as e:
-                        self._apply_tick_backoff(is_active=True)
+                        self._apply_tick_backoff(is_active=False)
+                        self.journal.append("runtime.tick_error", {"error": str(e)})
+
+                # --- Active-position fast tick lane ---
+                if active_position_poll_enabled(
+                    self.state.lifecycle, poll_ms, active_count
+                ):
+                    if active_position_tick_ready(
+                        self._active_tick_backoff_until_ms, now_ms
+                    ):
+                        try:
+                            await self.tick_active_positions()
+                            self._active_tick_backoff_until_ms = None
+                        except Exception as e:
+                            self._apply_tick_backoff(is_active=True)
+                            self.journal.append(
+                                "runtime.active_tick_error", {"error": str(e)}
+                            )
+
+                # --- Rate-limit periodic reload (V1: rate_limit_reload_interval) ---
+                await self._maybe_reload_rate_limits(now_ms)
+
+                # --- Local-L2 snapshot refresh (periodic REST bootstrap for books) ---
+                await self._sync_local_l2_data(now_ms)
+
+                # --- Passive close lane (V1: process_pending_passive_closes) ---
+                await self._maybe_tick_passive_close(now_ms)
+
+                # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
+                await self._maybe_process_normal_exits(now_ms)
+
+                # --- Maker-event lane (V1: maker_event_interval, optional, with backoff) ---
+                if full_tick_ready(self._maker_tick_backoff_until_ms, now_ms):
+                    try:
+                        await self._maybe_tick_maker_event(now_ms)
+                        self._maker_tick_backoff_until_ms = None
+                    except Exception as e:
+                        self._apply_tick_backoff(is_maker=True)
                         self.journal.append(
-                            "runtime.active_tick_error", {"error": str(e)}
+                            "runtime.maker_event_tick_error", {"error": str(e)}
                         )
 
-            # --- Rate-limit periodic reload (V1: rate_limit_reload_interval) ---
-            await self._maybe_reload_rate_limits(now_ms)
+                # --- Passive maker maintenance (V1: maintain_pending_entry_passive_order) ---
+                # Active tick-level lifecycle for resting maker orders:
+                # progress query → try_window check → rest_timeout → cancel → abort/finalize
+                await self._maintain_pending_entry_passive_orders(now_ms)
 
-            # --- Local-L2 snapshot refresh (periodic REST bootstrap for books) ---
-            await self._sync_local_l2_data(now_ms)
+                # --- Post-tick housekeeping ---
+                await self._post_tick_housekeeping(now_ms)
 
-            # --- Passive close lane (V1: process_pending_passive_closes) ---
-            await self._maybe_tick_passive_close(now_ms)
+                # --- Snapshot local-L2 state for persistence ---
+                self._snapshot_local_l2_state()
 
-            # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
-            await self._maybe_process_normal_exits(now_ms)
+                # --- Persist state snapshot ---
+                self._sync_passive_order_manager_states()
+                self.snapshot_store.write(build_persistent_state_view(self.state))
 
-            # --- Maker-event lane (V1: maker_event_interval, optional, with backoff) ---
-            if full_tick_ready(self._maker_tick_backoff_until_ms, now_ms):
-                try:
-                    await self._maybe_tick_maker_event(now_ms)
-                    self._maker_tick_backoff_until_ms = None
-                except Exception as e:
-                    self._apply_tick_backoff(is_maker=True)
-                    self.journal.append(
-                        "runtime.maker_event_tick_error", {"error": str(e)}
-                    )
-
-            # --- Passive maker maintenance (V1: maintain_pending_entry_passive_order) ---
-            # Active tick-level lifecycle for resting maker orders:
-            # progress query → try_window check → rest_timeout → cancel → abort/finalize
-            await self._maintain_pending_entry_passive_orders(now_ms)
-
-            # --- Post-tick housekeeping ---
-            await self._post_tick_housekeeping(now_ms)
-
-            # --- Snapshot local-L2 state for persistence ---
-            self._snapshot_local_l2_state()
-
-            # --- Persist state snapshot ---
-            self._sync_passive_order_manager_states()
-            self.snapshot_store.write(build_persistent_state_view(self.state))
-
-            # --- Sleep until next poll ---
-            active_poll_ms = active_position_poll_interval_ms(
-                self.state.lifecycle, poll_ms, active_count
-            )
-            await asyncio.sleep(min(poll_ms, active_poll_ms) / 1000.0)
+                # --- Sleep until next poll ---
+                active_poll_ms = active_position_poll_interval_ms(
+                    self.state.lifecycle, poll_ms, active_count
+                )
+                await asyncio.sleep(min(poll_ms, active_poll_ms) / 1000.0)
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     # ------------------------------------------------------------------
     # Passive entry maintenance (V1 maintain_pending_entry_passive_order — Fix 1)

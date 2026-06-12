@@ -1,5 +1,6 @@
 """End-to-end configuration and runtime smoke tests."""
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -210,6 +211,78 @@ class TestRuntimeLaneScheduling:
         finally:
             import shutil
             shutil.rmtree(td, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_run_loop_exports_current_state_while_full_tick_is_awaiting(
+        self, tmp_path, monkeypatch
+    ):
+        """Current-state heartbeat must run independently while full tick awaits IO."""
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        from lightfee.engine.bootstrap import wall_clock_now_ms
+        from lightfee.engine.loop_control import current_state_export_path
+        from lightfee.engine.runtime import LiveRuntime
+
+        monkeypatch.setenv("LIGHTFEE_CURRENT_STATE_EXPORT_INTERVAL_MS", "1000")
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                poll_interval_ms=100,
+                sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+                sidecar_snapshot_max_age_ms=1000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                local_l2_enabled=False,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "live-state.json"),
+            ),
+            venues=[],
+            symbols=["BTCUSDT"],
+        )
+        runtime = LiveRuntime(config)
+        tick_started = asyncio.Event()
+
+        async def slow_tick():
+            runtime.state.last_tick_ms = wall_clock_now_ms()
+            runtime.state.tick_count += 1
+            tick_started.set()
+            await asyncio.sleep(2.0)
+            runtime._running = False
+
+        async def noop_lane(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(runtime, "tick", slow_tick)
+        monkeypatch.setattr(runtime, "tick_active_positions", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_reload_rate_limits", noop_lane)
+        monkeypatch.setattr(runtime, "_sync_local_l2_data", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_tick_passive_close", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_process_normal_exits", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_tick_maker_event", noop_lane)
+        monkeypatch.setattr(runtime, "_maintain_pending_entry_passive_orders", noop_lane)
+        monkeypatch.setattr(runtime, "_post_tick_housekeeping", noop_lane)
+        monkeypatch.setattr(runtime, "_snapshot_local_l2_state", lambda: None)
+        monkeypatch.setattr(runtime.snapshot_store, "write", lambda state: None)
+
+        runtime.journal.open()
+        try:
+            run_task = asyncio.create_task(runtime.run_loop())
+            await tick_started.wait()
+            await asyncio.sleep(1.2)
+            current_state_path = current_state_export_path(config)
+            with open(current_state_path) as f:
+                exported = json.load(f)
+            assert exported["tick_count"] == 1
+            assert exported["last_tick_ms"] == runtime.state.last_tick_ms
+            runtime._running = False
+            await run_task
+        finally:
+            runtime.journal.close()
 
     @pytest.mark.asyncio
     async def test_tick_exports_current_state_before_long_or_early_return_tick(self, tmp_path):
