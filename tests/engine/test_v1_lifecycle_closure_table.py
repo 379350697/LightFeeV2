@@ -1,0 +1,430 @@
+import json
+from pathlib import Path
+
+from lightfee.engine.loop_control import _export_current_state_snapshot
+from lightfee.engine.state import EngineState
+from lightfee.ops.production_health import analyze_current_state
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+from scripts.diagnose_live import _build_production_acceptance_gate
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _clean_exchange_truth():
+    return {
+        "available": True,
+        "truth_available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {},
+        "open_orders": {},
+    }
+
+
+def test_unavailable_truth_without_local_work_is_nonblocking_evidence_gap():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": False,
+            "truth_available": False,
+            "confidence": "low",
+            "missing_evidence": ["exchange_truth_fetch_timeout"],
+            "errors": ["timeout"],
+        },
+        generated_at_ms=1770000000000,
+    )
+
+    payload = table.to_dict()
+    assert payload["summary"]["entry_allowed"] is True
+    assert payload["summary"]["recovery_block_policy"] == "warn_evidence_gap"
+    assert payload["summary"]["recovery_decision_kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+    assert payload["rows"][0]["phase"] == "RECOVERY_TRUTH"
+    assert payload["rows"][0]["evidence_class"] == "partial_evidence_gap"
+
+
+def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {},
+            "open_orders": {
+                "bybit": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "venue": "bybit",
+                        "quantity": 1.0,
+                        "price": 100.0,
+                        "reduce_only": False,
+                        "order_id": "order-1",
+                    }
+                }
+            },
+        },
+        generated_at_ms=1770000000000,
+    )
+
+    payload = table.to_dict()
+    assert payload["summary"]["entry_allowed"] is False
+    assert payload["summary"]["recovery_block_reason"] == "orphan_maker_order"
+    assert payload["summary"]["recovery_decision_kind"] == "BLOCK_OR_FLATTEN_LIVE_ARTIFACT"
+    assert any(
+        row["phase"] == "OPEN_POSITION"
+        and row["recovery_policy"] == "block_or_flatten_live_artifact"
+        for row in payload["rows"]
+    )
+
+
+def test_pending_entry_with_live_order_retains_owner_and_blocks_removal():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "pending_entries": {
+                "entry-1": {
+                    "pending_id": "entry-1",
+                    "position_id": "entry-1",
+                    "symbol": "BTCUSDT",
+                    "maker_leg_filled": 0.0,
+                    "hedge_leg_filled": 0.0,
+                }
+            },
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "open_orders": {
+                "bybit": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "venue": "bybit",
+                        "quantity": 1.0,
+                        "reduce_only": False,
+                    }
+                }
+            },
+        },
+        generated_at_ms=1770000000000,
+    )
+
+    row = next(row for row in table.to_dict()["rows"] if row["phase"] == "PENDING_ENTRY")
+    assert row["owner_id"] == "entry-1"
+    assert row["terminality"] == "retain_live_open_order"
+    assert row["entry_policy"] == "block_conflicting_new_risk"
+    assert row["recovery_policy"] == "manage_pending_entry"
+
+
+def test_residual_dust_rows_split_tolerated_and_blocking_abnormal():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "pending_residual_repairs": [
+                {
+                    "task_id": "dust-ok",
+                    "symbol": "SAHARAUSDT",
+                    "origin": "entry_open",
+                    "terminal_reason": "exchange_min_notional_dust",
+                    "residual_ratio": 0.015,
+                },
+                {
+                    "task_id": "dust-bad",
+                    "symbol": "SAHARAUSDT",
+                    "origin": "entry_open",
+                    "terminal_reason": "exchange_min_notional_dust",
+                    "residual_ratio": 0.03,
+                },
+            ],
+        },
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    )
+
+    rows = {
+        row["owner_id"]: row
+        for row in table.to_dict()["rows"]
+        if row["phase"] == "RESIDUAL_REPAIR"
+    }
+    assert rows["dust-ok"]["terminality"] == "terminal_dust_tolerated"
+    assert rows["dust-ok"]["entry_policy"] == "allow_after_terminal"
+    assert rows["dust-bad"]["terminality"] == "retain_residual_repair"
+    assert rows["dust-bad"]["entry_policy"] == "block_conflicting_new_risk"
+
+
+def test_ws_bbo_scope_flags_full_universe_hot_path_regression():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "runtime_market_data_config": {
+                "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+                "local_l2_effective_enabled": False,
+            },
+            "last_scan": {
+                "quote_revalidate_candidate_scope": "full_shortlist",
+                "quote_revalidate_candidate_count": 50,
+                "quote_revalidate_all_target_count": 100,
+                "quote_revalidate_target_count": 100,
+                "quote_revalidate_skipped_untracked_count": 0,
+            },
+        },
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    )
+
+    payload = table.to_dict()
+    assert payload["performance_scope"]["entry_quote_scope"] == "full_shortlist"
+    assert payload["performance_scope"]["full_universe_hot_path_detected"] is True
+    assert any(
+        row["phase"] == "ENTRY_QUOTE_LEASE"
+        and row["diagnostic_severity"] == "critical"
+        and row["recovery_policy"] == "diagnostic_regression"
+        for row in payload["rows"]
+    )
+
+
+def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
+    from lightfee.engine.v1_lifecycle_closure import map_lifecycle_event_kind
+
+    recent_event_kinds = [
+        "runtime.entry_quote_revalidate_targeted",
+        "runtime.entry_quote_revalidate_failed",
+        "runtime.snapshot_fallback_last_good",
+        "entry.opened",
+        "runtime.position_opened",
+        "exit.passive_close_fallback_terminal_flat",
+        "exit.passive_close_hedge_duplicate_client_order_reconciled",
+        "execution.entry_residual_dust_tolerated",
+        "execution.residual_repair_terminal",
+        "recovery.flat",
+        "runtime.position_lifecycle_terminal",
+        "runtime.current_state_heartbeat_loop_export_error",
+    ]
+
+    unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
+    assert unmapped == []
+
+
+def test_unchanged_rows_reuse_previous_closure_decision_id():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    previous = build_v1_lifecycle_closure_table(
+        local_state={"runtime_progress": {"active_lane": "scan"}},
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    ).to_dict()
+    previous["rows"][0]["closure_decision_id"] = "stable-decision-id"
+
+    current = build_v1_lifecycle_closure_table(
+        local_state={"runtime_progress": {"active_lane": "scan"}},
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000001000,
+        previous_table=previous,
+    ).to_dict()
+
+    assert current["rows"][0]["closure_decision_id"] == "stable-decision-id"
+
+
+def test_entry_gate_decision_reads_closure_summary_only():
+    from lightfee.engine.v1_lifecycle_closure import entry_gate_from_closure
+
+    allowed, reason = entry_gate_from_closure(
+        {
+            "summary": {
+                "entry_allowed": False,
+                "entry_block_reason": "",
+                "recovery_block_reason": "orphan_maker_order",
+            }
+        }
+    )
+
+    assert allowed is False
+    assert reason == "orphan_maker_order"
+
+
+def test_closure_event_fields_select_owner_row_for_release_events():
+    from lightfee.engine.v1_lifecycle_closure import (
+        build_v1_lifecycle_closure_table,
+        closure_event_fields,
+    )
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "pending_entries": {
+                "entry-1": {
+                    "pending_id": "entry-1",
+                    "symbol": "BTCUSDT",
+                    "maker_leg_filled": 0.0,
+                    "hedge_leg_filled": 0.0,
+                }
+            },
+        },
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    ).to_dict()
+
+    fields = closure_event_fields(
+        table,
+        phase="PENDING_ENTRY",
+        owner_id="entry-1",
+    )
+
+    assert fields["closure_phase"] == "PENDING_ENTRY"
+    assert fields["closure_row_key"] == "pending_entry:entry-1"
+    assert fields["closure_decision_id"].startswith("v1lc-")
+
+
+def test_current_state_export_includes_v1_lifecycle_closure(tmp_path):
+    state = EngineState(
+        lifecycle=EngineLifecycle.RUNNING,
+        risk_mode=GlobalRiskMode.RUNNING,
+    )
+    path = tmp_path / "current.json"
+
+    _export_current_state_snapshot(state, str(path))
+
+    payload = json.loads(path.read_text())
+    closure = payload["v1_lifecycle_closure"]
+    assert closure["version"] == "v1.lifecycle_closure.v1"
+    assert closure["summary"]["entry_allowed"] is True
+    assert closure["rows"]
+
+
+def test_diagnose_gate_exposes_existing_v1_lifecycle_closure_payload():
+    closure = {
+        "version": "v1.lifecycle_closure.v1",
+        "summary": {"entry_allowed": True},
+        "rows": [],
+        "unmapped_event_kinds": [],
+        "performance_scope": {},
+    }
+    gate = _build_production_acceptance_gate(
+        [],
+        {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "v1_lifecycle_closure": closure,
+        },
+        _clean_exchange_truth(),
+    )
+
+    assert gate["v1_lifecycle_closure"] == closure
+
+
+def test_production_health_exposes_existing_v1_lifecycle_closure_payload():
+    closure = {
+        "version": "v1.lifecycle_closure.v1",
+        "summary": {"entry_allowed": True},
+        "rows": [],
+        "unmapped_event_kinds": [],
+        "performance_scope": {},
+    }
+    report = analyze_current_state(
+        {
+            "schema": "lightfee.current_state.v1",
+            "generated_at_ms": 1770000000000,
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "last_tick_ms": 1770000000000,
+            "last_scan": {"ts_ms": 1770000000000},
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "exchange_truth": _clean_exchange_truth(),
+            "v1_lifecycle_closure": closure,
+        },
+        now_ms=1770000001000,
+        max_tick_age_ms=10_000,
+    )
+
+    assert report.details["v1_lifecycle_closure"] == closure
+
+
+def test_static_runtime_snapshot_refreshes_closure_before_export():
+    source = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
+    start = source.index("def _maybe_export_current_state_snapshot")
+    end = source.index("def _entry_quote_lease_max_age_ms")
+    body = source[start:end]
+
+    assert "_refresh_runtime_market_data_config_state()" in body
+    assert "_refresh_v1_lifecycle_closure_state(now_ms)" in body
+    assert body.index("_refresh_runtime_market_data_config_state()") < body.index(
+        "_refresh_v1_lifecycle_closure_state(now_ms)"
+    ) < body.index("        maybe_export_current_state_snapshot(")
+
+
+def test_static_entry_recovery_gate_reads_v1_lifecycle_closure():
+    source = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
+    start = source.index("def _gate_recovery_ledger")
+    end = source.index("def _remove_pending_entry_after_terminal_decision")
+    body = source[start:end]
+
+    assert "_v1_lifecycle_entry_gate_decision()" in body
+    assert "recovery_decision.entry_allowed" not in body
+    assert "ledger.allows_new_entry" not in body
+
+
+def test_static_release_paths_attach_closure_decision_ids():
+    runtime = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
+    passive_close = (REPO_ROOT / "lightfee/engine/passive_close.py").read_text()
+
+    pending_start = runtime.index("def _remove_pending_entry_after_terminal_decision")
+    pending_end = runtime.index("async def _complete_pending_entry_terminal_removal")
+    pending_body = runtime[pending_start:pending_end]
+    residual_start = runtime.index("def _terminalize_residual_repair_task")
+    residual_end = runtime.index("def _reschedule_pending_residual_repair_task")
+    residual_body = runtime[residual_start:residual_end]
+    passive_start = passive_close.index("def _emit_passive_close_terminal_resolution")
+    passive_end = passive_close.index("def _clear_live_flat_state")
+    passive_body = passive_close[passive_start:passive_end]
+
+    assert "closure_decision_id" in pending_body
+    assert "closure_decision_id" in residual_body
+    assert "closure_decision_id" in passive_body
+
+
+def test_static_ops_boundaries_consume_lifecycle_closure_payload():
+    loop_control = (REPO_ROOT / "lightfee/engine/loop_control.py").read_text()
+    diagnose = (REPO_ROOT / "scripts/diagnose_live.py").read_text()
+    production_health = (
+        REPO_ROOT / "lightfee/ops/production_health.py"
+    ).read_text()
+
+    assert '"v1_lifecycle_closure": v1_lifecycle_closure' in loop_control
+    assert "_v1_lifecycle_closure_payload(" in diagnose
+    assert '"v1_lifecycle_closure": v1_lifecycle_closure' in diagnose
+    assert "_v1_lifecycle_closure_payload(" in production_health
+    assert '"v1_lifecycle_closure": v1_lifecycle_closure' in production_health

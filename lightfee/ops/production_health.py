@@ -7,6 +7,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 
 
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
@@ -415,6 +416,7 @@ def analyze_current_state(
     exchange_truth = state.get("exchange_truth")
     exchange_truth_mismatches: list[dict[str, Any]] = []
     recovery_decision = _recovery_decision_payload(state, exchange_truth)
+    v1_lifecycle_closure = _v1_lifecycle_closure_payload(state, exchange_truth, now_ms)
     exchange_truth_available = (
         isinstance(exchange_truth, dict)
         and bool(exchange_truth.get("available"))
@@ -537,9 +539,25 @@ def analyze_current_state(
             "exchange_truth_available": exchange_truth_available,
             "exchange_truth_confidence": exchange_truth_confidence,
             "recovery_decision": recovery_decision,
+            "v1_lifecycle_closure": v1_lifecycle_closure,
             "exchange_truth_mismatches": exchange_truth_mismatches,
         },
     )
+
+
+def _v1_lifecycle_closure_payload(
+    state: dict[str, Any],
+    exchange_truth: Any,
+    now_ms: int,
+) -> dict[str, Any]:
+    existing = state.get("v1_lifecycle_closure")
+    if isinstance(existing, dict) and existing.get("version"):
+        return dict(existing)
+    return build_v1_lifecycle_closure_table(
+        local_state=state,
+        exchange_truth=exchange_truth if isinstance(exchange_truth, dict) else None,
+        generated_at_ms=now_ms,
+    ).to_dict()
 
 
 def _recovery_decision_payload(

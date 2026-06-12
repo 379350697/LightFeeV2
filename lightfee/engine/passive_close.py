@@ -80,6 +80,10 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.v1_lifecycle_closure import (
+    build_v1_lifecycle_closure_table,
+    closure_event_fields,
+)
 from lightfee.risk.modes import GlobalRiskMode
 
 # ---------------------------------------------------------------------------
@@ -288,6 +292,28 @@ class PassiveCloseExecutor:
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _v1_lifecycle_passive_close_event_fields(
+        self,
+        state: EngineState,
+        position_id: str,
+        now_ms: int,
+        *,
+        exchange_truth: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        previous = dict(getattr(state, "v1_lifecycle_closure", {}) or {})
+        closure = build_v1_lifecycle_closure_table(
+            local_state=state,
+            exchange_truth=exchange_truth,
+            generated_at_ms=now_ms,
+            previous_table=previous,
+        ).to_dict()
+        state.v1_lifecycle_closure = closure
+        return closure_event_fields(
+            closure,
+            phase="PASSIVE_CLOSE",
+            owner_id=str(position_id or ""),
+        )
 
     def _adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._adapters.get(venue)
@@ -3220,6 +3246,12 @@ class PassiveCloseExecutor:
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(pending.position_id, None)
 
+        closure_fields = self._v1_lifecycle_passive_close_event_fields(
+            state,
+            pending.position_id,
+            now_ms,
+        )
+
         # Clean up pending passive close
         state.pending_passive_closes.pop(pending.position_id, None)
 
@@ -3234,6 +3266,7 @@ class PassiveCloseExecutor:
                 "net_quote": close.net_quote,
                 "chunk_count": pending.chunk_count(),
                 "total_legs": len(long_legs) + len(short_legs),
+                **closure_fields,
             },
         )
         return True
@@ -3803,6 +3836,13 @@ class PassiveCloseExecutor:
         )
 
         extra_payload = dict(extra or {})
+        closure_fields = dict(extra_payload.get("closure_fields") or {})
+        if not closure_fields:
+            closure_fields = {
+                "closure_phase": "PASSIVE_CLOSE",
+                "closure_row_key": "",
+                "closure_decision_id": "",
+            }
         truth_payload = exchange_truth or {
             "truth_available": True,
             "positions_flat": actual_long_size <= 1e-9 and actual_short_size <= 1e-9,
@@ -3838,6 +3878,7 @@ class PassiveCloseExecutor:
                 "first_progress_ms": first_progress_ms,
                 "resolved_at_ms": now_ms,
                 "exchange_truth": truth_payload,
+                **closure_fields,
             },
         )
 
@@ -3899,8 +3940,15 @@ class PassiveCloseExecutor:
             "client_order_ids": client_order_ids,
             "order_ids": order_ids,
         }
+        closure_fields = self._v1_lifecycle_passive_close_event_fields(
+            state,
+            pending.position_id,
+            self._now_ms(),
+            exchange_truth=exchange_truth,
+        )
         if extra:
             payload.update(extra)
+        payload.update(closure_fields)
         missing = object()
         original_pending = state.pending_passive_closes.get(pending.position_id, missing)
         original_open = state.open_positions.get(pending.position_id, missing)
@@ -3962,13 +4010,15 @@ class PassiveCloseExecutor:
                 journal=self._journal,
             )
             failure_reason = "terminal_close_resolution_failed"
+            terminal_extra = dict(extra or {})
+            terminal_extra["closure_fields"] = closure_fields
             self._emit_passive_close_terminal_resolution(
                 pending,
                 position,
                 source=source,
                 actual_long_size=actual_long_size,
                 actual_short_size=actual_short_size,
-                extra=extra,
+                extra=terminal_extra,
                 exchange_truth=exchange_truth,
             )
         except Exception as error:
@@ -4021,6 +4071,7 @@ class PassiveCloseExecutor:
                 "position_id": pending.position_id,
                 "symbol": position.symbol,
                 "source": source,
+                **closure_fields,
             },
         )
         self._journal.append(

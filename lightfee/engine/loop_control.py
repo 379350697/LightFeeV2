@@ -156,6 +156,17 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         runtime_progress["active_lane_overdue"] = (
             now_ms - active_lane_started_ms > active_lane_budget_ms
         )
+    v1_lifecycle_closure = dict(getattr(state, "v1_lifecycle_closure", {}) or {})
+    if not v1_lifecycle_closure:
+        from lightfee.engine.v1_lifecycle_closure import (
+            build_v1_lifecycle_closure_table,
+        )
+
+        v1_lifecycle_closure = build_v1_lifecycle_closure_table(
+            local_state=state,
+            exchange_truth=None,
+            generated_at_ms=now_ms,
+        ).to_dict()
 
     data = {
         "schema": "lightfee.current_state.v1",
@@ -193,6 +204,7 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "runtime_market_data_config": dict(
             getattr(state, "runtime_market_data_config", {}) or {}
         ),
+        "v1_lifecycle_closure": v1_lifecycle_closure,
     }
     write_json_atomic(path, data)
 

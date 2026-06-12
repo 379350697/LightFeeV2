@@ -34,6 +34,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
 
 # Schema version — bump when output shape changes
@@ -2713,6 +2714,11 @@ def _build_production_acceptance_gate(
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
     recovery_decision = _recovery_decision_payload(local_state, exchange_truth)
+    v1_lifecycle_closure = _v1_lifecycle_closure_payload(
+        local_state,
+        exchange_truth,
+        events,
+    )
     local_recovery_clean = (
         open_position_count == 0
         and pending_entry_count == 0
@@ -2973,6 +2979,7 @@ def _build_production_acceptance_gate(
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
         "recovery_decision": recovery_decision,
+        "v1_lifecycle_closure": v1_lifecycle_closure,
         "runtime_progress": runtime_progress,
         "runtime_market_data_config": runtime_market_data_config,
         "fingerprints": fingerprints,
@@ -2985,6 +2992,21 @@ def _build_production_acceptance_gate(
         "blocking_reasons": blocking_reasons,
         "gate_passed": not blocking_reasons,
     }
+
+
+def _v1_lifecycle_closure_payload(
+    local_state: dict[str, Any],
+    exchange_truth: dict[str, Any] | None,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    existing = local_state.get("v1_lifecycle_closure")
+    if isinstance(existing, dict) and existing.get("version"):
+        return dict(existing)
+    return build_v1_lifecycle_closure_table(
+        local_state=local_state,
+        exchange_truth=exchange_truth,
+        events=events,
+    ).to_dict()
 
 
 def _recovery_decision_payload(

@@ -75,6 +75,11 @@ from lightfee.engine.recovery_decision_core import (
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+from lightfee.engine.v1_lifecycle_closure import (
+    build_v1_lifecycle_closure_table,
+    closure_event_fields,
+    entry_gate_from_closure,
+)
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryLiveTruth,
     PendingEntryTerminalDecision,
@@ -258,6 +263,7 @@ class LiveRuntime:
         # V1 recovery dedup index: prevents duplicate orders after restart
         self._recovery_dedup_index: dict[str, str] = {}
         self.recovery_ledger: RecoveryLedger | None = None
+        self._last_recovery_exchange_truth: dict[str, Any] | None = None
 
         # V1 entry gate cooldown state
         self._venue_cooldown_until_ms: dict[str, int] = {}
@@ -1376,6 +1382,63 @@ class LiveRuntime:
             self._runtime_market_data_config_summary()
         )
 
+    def _refresh_v1_lifecycle_closure_state(
+        self,
+        now_ms: int,
+        *,
+        recovery_ledger: RecoveryLedger | None = None,
+        recovery_decision: Any | None = None,
+    ) -> None:
+        previous = dict(getattr(self.state, "v1_lifecycle_closure", {}) or {})
+        self.state.v1_lifecycle_closure = build_v1_lifecycle_closure_table(
+            local_state=self.state,
+            exchange_truth=self._last_recovery_exchange_truth,
+            generated_at_ms=now_ms,
+            previous_table=previous,
+            recovery_ledger=(
+                recovery_ledger
+                if recovery_ledger is not None
+                else getattr(self, "recovery_ledger", None)
+            ),
+            recovery_decision=(
+                recovery_decision
+                if recovery_decision is not None
+                else getattr(self, "recovery_decision", None)
+            ),
+        ).to_dict()
+
+    def _current_v1_lifecycle_closure(
+        self,
+        now_ms: int | None = None,
+        *,
+        recovery_ledger: RecoveryLedger | None = None,
+        recovery_decision: Any | None = None,
+    ) -> dict[str, Any]:
+        self._refresh_v1_lifecycle_closure_state(
+            now_ms if now_ms is not None else wall_clock_now_ms(),
+            recovery_ledger=recovery_ledger,
+            recovery_decision=recovery_decision,
+        )
+        return dict(getattr(self.state, "v1_lifecycle_closure", {}) or {})
+
+    def _v1_lifecycle_entry_gate_decision(self) -> tuple[bool, str]:
+        return entry_gate_from_closure(self._current_v1_lifecycle_closure())
+
+    def _v1_lifecycle_event_fields(
+        self,
+        *,
+        phase: str,
+        owner_id: str = "",
+        row_key: str = "",
+        now_ms: int | None = None,
+    ) -> dict[str, str]:
+        return closure_event_fields(
+            self._current_v1_lifecycle_closure(now_ms),
+            phase=phase,
+            owner_id=owner_id,
+            row_key=row_key,
+        )
+
     def _maybe_export_current_state_snapshot(
         self,
         export_state: ExportState,
@@ -1383,6 +1446,7 @@ class LiveRuntime:
     ) -> None:
         """Export current-state with runtime-owned static diagnostics refreshed."""
         self._refresh_runtime_market_data_config_state()
+        self._refresh_v1_lifecycle_closure_state(now_ms)
         maybe_export_current_state_snapshot(
             self.state, self.config, export_state, now_ms
         )
@@ -2102,6 +2166,7 @@ class LiveRuntime:
             owner_index=owner_index,
         )
         self.recovery_ledger = ledger
+        self._last_recovery_exchange_truth = dict(exchange_truth or {})
         core_decision = V1RecoveryDecisionCore().decide(
             RecoveryEvidenceSnapshot(
                 local_open_positions=tuple(
@@ -2125,12 +2190,29 @@ class LiveRuntime:
             )
         )
         self.recovery_decision = core_decision
+        closure = self._current_v1_lifecycle_closure(
+            now_ms,
+            recovery_ledger=ledger,
+            recovery_decision=core_decision,
+        )
+        closure_summary = dict(closure.get("summary") or {})
+        recovery_closure_fields = closure_event_fields(
+            closure,
+            phase="RECOVERY_TRUTH",
+            owner_id="core",
+        )
+        recovery_block_policy = str(
+            closure_summary.get("recovery_block_policy") or ""
+        )
+        recovery_block_reason = str(
+            closure_summary.get("recovery_block_reason") or ""
+        )
 
         # Block and clear are both driven by V1RecoveryDecisionCore so
         # evidence-gap states cannot oscillate between ledger block and stale
         # block cleanup.
-        if core_decision.block_reason:
-            self.state.recovery_blocked_reason = core_decision.block_reason
+        if recovery_block_policy == "block" and recovery_block_reason:
+            self.state.recovery_blocked_reason = recovery_block_reason
             self.state.recovery_blocked_at_ms = now_ms
             set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
             self.journal.append(
@@ -2145,9 +2227,10 @@ class LiveRuntime:
                         if item.blocking
                     ],
                     "ts_ms": now_ms,
+                    **recovery_closure_fields,
                 },
             )
-        elif (
+        elif recovery_block_policy in {"clear", "warn_evidence_gap"} and (
             core_decision.clear_previous_block
             and self.state.recovery_blocked_reason in CORE_CLEARABLE_BLOCK_REASONS
         ):
@@ -2158,6 +2241,7 @@ class LiveRuntime:
                     "reason": core_decision.clear_reason,
                     "decision": core_decision.kind.value,
                     "ts_ms": now_ms,
+                    **recovery_closure_fields,
                 },
             )
         else:
@@ -15606,17 +15690,44 @@ class LiveRuntime:
         live_price: float,
         min_notional: float,
     ) -> None:
+        pair_id = str(task.get("pair_id", ""))
+        symbol = str(task.get("symbol", ""))
+        position_id = str(task.get("position_id", "") or "")
+        position = self.state.open_positions.get(position_id)
+        matched_quantity = float(
+            getattr(position, "matched_quantity", 0.0) or 0.0
+        ) if position is not None else 0.0
+        residual_ratio = (
+            abs(float(repair_quantity or 0.0)) / matched_quantity
+            if matched_quantity > 1e-9
+            else 0.0
+        )
+        task["terminal_reason"] = terminal_reason
+        task["residual_ratio"] = residual_ratio
+        residual_owner_id = str(
+            task.get("repair_id")
+            or task.get("task_id")
+            or task.get("position_id")
+            or symbol
+            or "residual"
+        )
+        closure_fields = self._v1_lifecycle_event_fields(
+            phase="RESIDUAL_REPAIR",
+            owner_id=residual_owner_id,
+            now_ms=now_ms,
+        )
+        closure_phase = closure_fields.get("closure_phase", "RESIDUAL_REPAIR")
+        closure_row_key = closure_fields.get("closure_row_key", "")
+        closure_decision_id = closure_fields.get("closure_decision_id", "")
         try:
             self.state.pending_residual_repairs.remove(task)
         except ValueError:
             pass
-        pair_id = str(task.get("pair_id", ""))
-        symbol = str(task.get("symbol", ""))
         self._release_residual_repair_pair_gate(pair_id, symbol)
         self.journal.append(
             "execution.residual_repair_terminal",
             {
-                "position_id": task.get("position_id", ""),
+                "position_id": position_id,
                 "pair_id": pair_id,
                 "symbol": symbol,
                 "origin": task.get("origin", ""),
@@ -15632,17 +15743,10 @@ class LiveRuntime:
                     symbol,
                 ),
                 "ts_ms": now_ms,
+                "closure_phase": closure_phase,
+                "closure_row_key": closure_row_key,
+                "closure_decision_id": closure_decision_id,
             },
-        )
-        position_id = str(task.get("position_id", "") or "")
-        position = self.state.open_positions.get(position_id)
-        matched_quantity = float(
-            getattr(position, "matched_quantity", 0.0) or 0.0
-        ) if position is not None else 0.0
-        residual_ratio = (
-            abs(float(repair_quantity or 0.0)) / matched_quantity
-            if matched_quantity > 1e-9
-            else 0.0
         )
         if (
             str(task.get("origin", "") or "") == "entry_open"
@@ -15667,6 +15771,9 @@ class LiveRuntime:
                     "terminal_reason": terminal_reason,
                     "reason": "unrepairable_entry_residual_dust_within_tolerance",
                     "ts_ms": now_ms,
+                    "closure_phase": closure_phase,
+                    "closure_row_key": closure_row_key,
+                    "closure_decision_id": closure_decision_id,
                 },
             )
 
@@ -16248,16 +16355,9 @@ class LiveRuntime:
         return True, ""
 
     def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
-        core_decision = getattr(self, "recovery_decision", None)
-        if core_decision is not None:
-            if not core_decision.entry_allowed:
-                return False, "recovery_ledger_blocked"
-            return True, ""
-        ledger = self.recovery_ledger
-        if ledger is None:
-            return True, ""
-        if not ledger.allows_new_entry(candidate):
-            return False, "recovery_ledger_blocked"
+        allowed, reason = self._v1_lifecycle_entry_gate_decision()
+        if not allowed:
+            return False, reason or "v1_lifecycle_closure_blocked"
         return True, ""
 
     def _remove_pending_entry_after_terminal_decision(
@@ -16272,7 +16372,42 @@ class LiveRuntime:
         reconciliation decision has proven that retaining the pending entry is
         no longer the V1-safe action.
         """
-        self.state.pending_entries.pop(entry_id, None)
+        pending = self.state.pending_entries.get(entry_id)
+        owner_id = entry_id
+        if isinstance(pending, dict):
+            owner_id = str(
+                pending.get("pending_id")
+                or pending.get("position_id")
+                or pending.get("entry_id")
+                or entry_id
+            )
+        elif pending is not None:
+            owner_id = str(
+                getattr(pending, "pending_id", "")
+                or getattr(pending, "position_id", "")
+                or getattr(pending, "entry_id", "")
+                or entry_id
+            )
+        closure_fields = self._v1_lifecycle_event_fields(
+            phase="PENDING_ENTRY",
+            owner_id=owner_id,
+        )
+        closure_phase = closure_fields.get("closure_phase", "PENDING_ENTRY")
+        closure_row_key = closure_fields.get("closure_row_key", "")
+        closure_decision_id = closure_fields.get("closure_decision_id", "")
+        removed = self.state.pending_entries.pop(entry_id, None)
+        if removed is not None:
+            self.journal.append(
+                "pending_entry.removed_by_v1_lifecycle_closure",
+                {
+                    "entry_id": entry_id,
+                    "owner_id": owner_id,
+                    "reason": reason,
+                    "closure_phase": closure_phase,
+                    "closure_row_key": closure_row_key,
+                    "closure_decision_id": closure_decision_id,
+                },
+            )
 
     async def _complete_pending_entry_terminal_removal(
         self,
