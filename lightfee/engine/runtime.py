@@ -1376,6 +1376,17 @@ class LiveRuntime:
             self._runtime_market_data_config_summary()
         )
 
+    def _maybe_export_current_state_snapshot(
+        self,
+        export_state: ExportState,
+        now_ms: int,
+    ) -> None:
+        """Export current-state with runtime-owned static diagnostics refreshed."""
+        self._refresh_runtime_market_data_config_state()
+        maybe_export_current_state_snapshot(
+            self.state, self.config, export_state, now_ms
+        )
+
     def _entry_quote_lease_max_age_ms(self) -> int:
         budgets = []
         for value in (
@@ -6100,9 +6111,7 @@ class LiveRuntime:
         # Final current-state export
         now_ms = wall_clock_now_ms()
         path = self.config.persistence.snapshot_path.replace(".json", "-current.json")
-        maybe_export_current_state_snapshot(
-            self.state, self.config, self._export_state, now_ms
-        )
+        self._maybe_export_current_state_snapshot(self._export_state, now_ms)
 
         self.journal.append("runtime.stopped", {"ts_ms": wall_clock_now_ms()})
         _journal_shutdown_stage("exit_complete")
@@ -6119,9 +6128,7 @@ class LiveRuntime:
         self.state.last_tick_ms = now_ms
         self.state.tick_count += 1
         try:
-            maybe_export_current_state_snapshot(
-                self.state, self.config, ExportState(), now_ms
-            )
+            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
         except Exception as exc:
             self.journal.append(
                 "runtime.current_state_heartbeat_export_error",
@@ -6231,9 +6238,7 @@ class LiveRuntime:
         )
         self.state.last_scan["snapshot_freshness_status"] = snapshot_freshness_status
         try:
-            maybe_export_current_state_snapshot(
-                self.state, self.config, ExportState(), now_ms
-            )
+            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
         except Exception as exc:
             self.journal.append(
                 "runtime.current_state_scan_progress_export_error",
@@ -7541,9 +7546,7 @@ class LiveRuntime:
         while self._running:
             now_ms = wall_clock_now_ms()
             try:
-                maybe_export_current_state_snapshot(
-                    self.state, self.config, self._export_state, now_ms
-                )
+                self._maybe_export_current_state_snapshot(self._export_state, now_ms)
             except Exception as exc:
                 self.journal.append(
                     "runtime.current_state_heartbeat_loop_export_error",
@@ -15719,9 +15722,7 @@ class LiveRuntime:
         maybe_export_runtime_metrics(
             self.state, self.config, self._export_state, now_ms
         )
-        maybe_export_current_state_snapshot(
-            self.state, self.config, self._export_state, now_ms
-        )
+        self._maybe_export_current_state_snapshot(self._export_state, now_ms)
 
     # ------------------------------------------------------------------
     # Backoff

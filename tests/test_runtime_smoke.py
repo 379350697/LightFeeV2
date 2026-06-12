@@ -233,8 +233,9 @@ class TestRuntimeLaneScheduling:
                 sidecar_snapshot_max_age_ms=1000,
             ),
             strategy=StrategyConfig(
+                entry_readiness_provider="ws_bbo_quote_lease",
                 risk_monitor_enabled=False,
-                local_l2_enabled=False,
+                local_l2_enabled=True,
                 local_l2_ws_enabled=False,
             ),
             persistence=PersistenceConfig(
@@ -283,6 +284,10 @@ class TestRuntimeLaneScheduling:
             assert runtime_progress["last_lane_progress_ms"] == 0
             assert runtime_progress["active_lane"] == "full_tick"
             assert runtime_progress["active_lane_overdue"] is False
+            effective = exported["runtime_market_data_config"]
+            assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+            assert effective["local_l2_configured_enabled"] is True
+            assert effective["local_l2_effective_enabled"] is False
             runtime._running = False
             await run_task
         finally:
