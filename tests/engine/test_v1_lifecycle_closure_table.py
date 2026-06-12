@@ -215,6 +215,15 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     from lightfee.engine.v1_lifecycle_closure import map_lifecycle_event_kind
 
     recent_event_kinds = [
+        "runtime.booting",
+        "runtime.started",
+        "runtime.live_scan_revalidate_required",
+        "runtime.live_scan_recovery_warmup",
+        "runtime.private_ws_started",
+        "runtime.reconciling",
+        "runtime.recovery_block_reconcile_attempt",
+        "startup.order_path_preflight",
+        "startup.trading_preflight",
         "runtime.entry_quote_revalidate_targeted",
         "runtime.entry_quote_revalidate_failed",
         "runtime.snapshot_fallback_last_good",
@@ -231,6 +240,62 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
     assert unmapped == []
+
+
+def test_exported_positions_alias_prevents_diagnose_orphan_drift():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "risk_only",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "positions": [
+                {
+                    "position_id": "entry-1781286800856-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "quantity": 1500.0,
+                }
+            ],
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {
+                "okx": {
+                    "HOMEUSDT": {
+                        "symbol": "HOMEUSDT",
+                        "venue": "okx",
+                        "quantity": 1500.0,
+                        "side": "Side.BUY",
+                    }
+                },
+                "bybit": {
+                    "HOMEUSDT": {
+                        "symbol": "HOMEUSDT",
+                        "venue": "bybit",
+                        "quantity": 1500.0,
+                        "side": "Side.SELL",
+                    }
+                },
+            },
+            "open_orders": {
+                "okx": {"HOMEUSDT": []},
+                "bybit": {"HOMEUSDT": []},
+            },
+        },
+        generated_at_ms=1781286983860,
+    ).to_dict()
+
+    row_keys = {row["row_key"] for row in table["rows"]}
+    assert "open_position:entry-1781286800856-HOMEUSDT" in row_keys
+    assert not any(":unpaired_live_position:" in key for key in row_keys)
+    assert table["summary"]["recovery_block_reason"] is None
 
 
 def test_unchanged_rows_reuse_previous_closure_decision_id():

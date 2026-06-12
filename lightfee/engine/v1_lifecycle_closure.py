@@ -106,45 +106,46 @@ def build_v1_lifecycle_closure_table(
     owner_index: Any | None = None,
 ) -> V1LifecycleClosureTable:
     generated = int(generated_at_ms or _now_ms())
+    state = _local_state_with_open_positions_alias(local_state)
     truth = _normalized_exchange_truth(exchange_truth)
     ledger = recovery_ledger or RecoveryLedger.from_local_and_exchange_truth(
-        local=local_state,
+        local=state,
         exchange_truth=truth or {},
         owner_index=owner_index,
     )
     decision = recovery_decision or V1RecoveryDecisionCore().decide(
         RecoveryEvidenceSnapshot(
             local_open_positions=_state_collection_or_count(
-                local_state, "open_positions", "open_position_count"
+                state, "open_positions", "open_position_count"
             ),
             pending_entries=_state_collection_or_count(
-                local_state, "pending_entries", "pending_entry_count"
+                state, "pending_entries", "pending_entry_count"
             ),
             residual_repairs=_state_collection_or_count(
-                local_state, "pending_residual_repairs", "pending_residual_repair_count"
+                state, "pending_residual_repairs", "pending_residual_repair_count"
             ),
             passive_closes=_state_collection_or_count(
-                local_state, "pending_passive_closes", "pending_close_count"
+                state, "pending_passive_closes", "pending_close_count"
             ),
             exchange_truth=truth,
-            prior_recovery_block_reason=_get(local_state, "recovery_blocked_reason"),
+            prior_recovery_block_reason=_get(state, "recovery_blocked_reason"),
             recovery_work_items=tuple(ledger.work_items),
-            operator_fail_closed=_operator_fail_closed(local_state),
+            operator_fail_closed=_operator_fail_closed(state),
         )
     )
 
     rows: list[V1LifecycleClosureRow] = []
     rows.append(_recovery_truth_row(decision))
-    rows.extend(_entry_quote_lease_rows(local_state))
-    rows.extend(_pending_entry_rows(local_state, truth))
-    rows.extend(_open_position_rows(local_state, ledger))
-    rows.extend(_passive_close_rows(local_state))
-    rows.extend(_residual_repair_rows(local_state))
-    rows.extend(_runtime_progress_rows(local_state, generated))
+    rows.extend(_entry_quote_lease_rows(state))
+    rows.extend(_pending_entry_rows(state, truth))
+    rows.extend(_open_position_rows(state, ledger))
+    rows.extend(_passive_close_rows(state))
+    rows.extend(_residual_repair_rows(state))
+    rows.extend(_runtime_progress_rows(state, generated))
 
     rows = _apply_previous_row_reuse(rows, previous_table)
     unmapped = tuple(sorted(_unmapped_event_kinds(events)))
-    performance_scope = _performance_scope(local_state, rows)
+    performance_scope = _performance_scope(state, rows)
     summary = _summary_from_decision(decision, rows, performance_scope)
     return V1LifecycleClosureTable(
         version=VERSION,
@@ -769,7 +770,25 @@ def _state_collection_or_count(local_state: Any, key: str, count_key: str) -> tu
 
 
 def _state_collection(local_state: Any, key: str) -> list[Any]:
-    return _as_items(_get(local_state, key, []))
+    items = _as_items(_get(local_state, key, []))
+    if items:
+        return items
+    if key == "open_positions":
+        return _as_items(_get(local_state, "positions", []))
+    return items
+
+
+def _local_state_with_open_positions_alias(local_state: Any) -> Any:
+    if not isinstance(local_state, Mapping):
+        return local_state
+    if _as_items(local_state.get("open_positions", [])):
+        return local_state
+    positions = _as_items(local_state.get("positions", []))
+    if not positions:
+        return local_state
+    normalized = dict(local_state)
+    normalized["open_positions"] = positions
+    return normalized
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -986,6 +1005,15 @@ def _now_ms() -> int:
 
 
 _EVENT_KIND_PHASES = {
+    "runtime.booting": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.started": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.private_ws_started": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.live_scan_revalidate_required": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.live_scan_recovery_warmup": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.reconciling": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "startup.order_path_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "startup.trading_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "entry.opened": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.position_opened": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
