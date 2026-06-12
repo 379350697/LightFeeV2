@@ -284,6 +284,12 @@ def analyze_current_state(
     fingerprints: list[str] = []
     last_tick_ms = int(state.get("last_tick_ms") or 0)
     tick_age_ms = now_ms - last_tick_ms if last_tick_ms else None
+    generated_at_ms = 0
+    try:
+        generated_at_ms = int(state.get("generated_at_ms", 0) or 0)
+    except (TypeError, ValueError):
+        generated_at_ms = 0
+    current_state_age_ms = now_ms - generated_at_ms if generated_at_ms > 0 else None
     open_count = int(state.get("open_position_count") or 0)
     pending_entries = int(state.get("pending_entry_count") or 0)
     pending_closes = int(state.get("pending_close_count") or 0)
@@ -338,9 +344,16 @@ def analyze_current_state(
     )
     progress_budget_ms = max(int(max_tick_age_ms or 0) * 4, 60_000)
     recent_runtime_progress = (
-        last_scan_age_ms is not None
-        and last_scan_age_ms >= 0
-        and last_scan_age_ms <= progress_budget_ms
+        (
+            last_scan_age_ms is not None
+            and last_scan_age_ms >= 0
+            and last_scan_age_ms <= progress_budget_ms
+        )
+        or (
+            current_state_age_ms is not None
+            and current_state_age_ms >= 0
+            and current_state_age_ms <= progress_budget_ms
+        )
     )
     tick_stale = tick_age_ms is None or tick_age_ms < 0 or tick_age_ms > max_tick_age_ms
     tick_stale_suppressed_by_runtime_progress = (
@@ -416,6 +429,7 @@ def analyze_current_state(
             "pending_close_count": pending_closes,
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
+            "current_state_age_ms": current_state_age_ms,
             "tick_stale_suppressed_by_runtime_progress": tick_stale_suppressed_by_runtime_progress,
             "exchange_truth_required": require_exchange_truth,
             "exchange_truth_available": exchange_truth_available,
