@@ -33,18 +33,31 @@ observability: `_snapshot_freshness_observability()` expanded the full snapshot
 candidate universe, including transfer lifecycle status, before tradeable or
 tracked narrowing. The local follow-up now keeps initial snapshot freshness
 observability at global snapshot/quote scope and refreshes candidate-scoped
-status only for V1 primary+shadow tracked candidates when they exist, while
-final per-candidate freshness filtering remains fail-closed. Diagnostics now
+status only for V1 primary+shadow tracked candidates when they exist. After
+that follow-up was deployed as `13ea417`, quote fanout stayed at tracked-scope
+scale (`target_count=16`, `quote_truth_rest_resolved_count=4`), but
+`live_tick_stale` recurred once more: the final snapshot freshness filter still
+evaluated the full post-discovery tradeable set and emitted hundreds of
+`runtime.snapshot_freshness_decision` records for untracked candidates. The
+current local fix now feeds final freshness filtering only from V1
+primary+shadow in WS-BBO/Local-L2 effective modes, so only tracked candidates can
+obtain fresh execution-grade quote/freshness evidence and reach selection.
+Diagnostics now
 include `quote_revalidate_candidate_scope`,
 `quote_revalidate_candidate_count`, `quote_revalidate_all_target_count`,
 `quote_revalidate_skipped_untracked_count`,
 `snapshot_freshness_candidate_scope`,
 `snapshot_freshness_candidate_count`, and
-`snapshot_freshness_skipped_untracked_count`. RED/GREEN reproduced both failure
-layers: 50 stale candidates shrank to 3 tracked candidates / 6 quote legs with
-94 untracked quote targets skipped, and 64 no-tradeable snapshot candidates no
-longer enter freshness observability. CL-071 fallback and the Local-L2 V1
-primary+shadow activation test stayed green. No health budget, WS-BBO
+`snapshot_freshness_skipped_untracked_count`, plus the filter-scope counters
+`snapshot_freshness_filter_candidate_scope`,
+`snapshot_freshness_filter_candidate_count`, and
+`snapshot_freshness_filter_skipped_untracked_count`. RED/GREEN reproduced all
+failure layers: 50 stale candidates shrank to 3 tracked candidates / 6 quote
+legs with 94 untracked quote targets skipped, 64 no-tradeable snapshot
+candidates no longer enter freshness observability, and 64 tradeable candidates
+now feed only 8 primary+shadow candidates into the final freshness filter. CL-071
+fallback and the Local-L2 V1 primary+shadow activation test stayed green. No
+health budget, WS-BBO
 budget/TTL, REST concurrency, strategy/OI/liquidity, admission, sizing, order,
 close, recovery, residual-repair, or production config semantics changed. Cloud
 deploy and settled verification are still pending.

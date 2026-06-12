@@ -6569,8 +6569,36 @@ class LiveRuntime:
                 ask = float(getattr(quote, "ask", 0.0) or 0.0)
                 if symbol and bid > 0.0 and ask > bid:
                     price_hints[symbol] = (bid + ask) / 2.0
+            entry_freshness_filter_candidates = (
+                tracked_candidates
+                if (
+                    self._entry_readiness_provider_uses_ws_bbo()
+                    or self._local_l2_effective_enabled()
+                )
+                else tradeable
+            )
+            entry_freshness_filter_scope = (
+                "v1_primary_shadow"
+                if entry_freshness_filter_candidates is not tradeable
+                else "tradeable"
+            )
+            self.state.last_scan["snapshot_freshness_filter_candidate_scope"] = (
+                entry_freshness_filter_scope
+            )
+            self.state.last_scan["snapshot_freshness_filter_candidate_count"] = len(
+                entry_freshness_filter_candidates
+            )
+            self.state.last_scan["snapshot_freshness_filter_all_candidate_count"] = len(
+                l2_tracking_tradeable
+            )
+            self.state.last_scan[
+                "snapshot_freshness_filter_skipped_untracked_count"
+            ] = max(
+                len(l2_tracking_tradeable) - len(entry_freshness_filter_candidates),
+                0,
+            )
             tradeable = self._filter_candidates_by_snapshot_freshness(
-                tradeable,
+                entry_freshness_filter_candidates,
                 snapshot=snapshot,
                 now_ms=now_ms,
                 metrics=snapshot_freshness_metrics,

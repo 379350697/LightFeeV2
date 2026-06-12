@@ -1588,6 +1588,96 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
 
 
 @pytest.mark.asyncio
+async def test_runtime_snapshot_freshness_filter_uses_v1_primary_shadow_scope(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            max_concurrent_positions=6,
+            entry_local_l2_primary_count=6,
+            shadow_entry_opportunity_count=2,
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidates = []
+    for idx in range(64):
+        candidate = _freshness_candidate(symbol=f"SYM{idx}USDT")
+        candidate.pair_id = f"sym{idx}usdt:okx->bybit"
+        candidate.ranking_edge_bps = 100.0 - idx
+        candidates.append(candidate)
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"okx:SYM{idx}USDT": _quote_with_liquidity(
+                "okx",
+                f"SYM{idx}USDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+            )
+            for idx in range(64)
+        }
+        | {
+            f"bybit:SYM{idx}USDT": _quote_with_liquidity(
+                "bybit",
+                f"SYM{idx}USDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+            )
+            for idx in range(64)
+        },
+        candidates=candidates,
+    )
+
+    observed_filter_counts: list[int] = []
+
+    def observe_scope(candidates, **kwargs):
+        observed_filter_counts.append(len(candidates))
+        return []
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+    monkeypatch.setattr(
+        runtime,
+        "_filter_candidates_by_snapshot_freshness",
+        observe_scope,
+    )
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert observed_filter_counts == [8]
+    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_scope"] == (
+        "v1_primary_shadow"
+    )
+    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] == 8
+    assert runtime.state.last_scan["snapshot_freshness_filter_all_candidate_count"] == 64
+    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] == 56
+
+
+@pytest.mark.asyncio
 async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(
