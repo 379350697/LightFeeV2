@@ -39,10 +39,16 @@ scale (`target_count=16`, `quote_truth_rest_resolved_count=4`), but
 `live_tick_stale` recurred once more: the final snapshot freshness filter still
 evaluated the full post-discovery tradeable set and emitted hundreds of
 `runtime.snapshot_freshness_decision` records for untracked candidates. The
-current local fix now feeds final freshness filtering only from V1
-primary+shadow in WS-BBO/Local-L2 effective modes, so only tracked candidates can
-obtain fresh execution-grade quote/freshness evidence and reach selection.
-Diagnostics now
+next fix deployed as `a87c249`, but `live_tick_stale` recurred again during
+`last_good_sidecar` warmup. That recurrence had no quote revalidate fanout yet;
+instead `runtime.snapshot_fallback_last_good` still built its
+`candidate_freshness_scope` by running per-candidate freshness decisions across
+all 4689 snapshot candidates before primary+shadow tracking existed. The
+current local fix now feeds final freshness filtering and fallback health
+candidate-scope sampling only from V1 primary+shadow in WS-BBO/Local-L2
+effective modes, so only tracked candidates can obtain fresh execution-grade
+quote/freshness evidence and reach selection, and warmup diagnostics no longer
+walk the full candidate universe. Diagnostics now
 include `quote_revalidate_candidate_scope`,
 `quote_revalidate_candidate_count`, `quote_revalidate_all_target_count`,
 `quote_revalidate_skipped_untracked_count`,
@@ -51,12 +57,17 @@ include `quote_revalidate_candidate_scope`,
 `snapshot_freshness_skipped_untracked_count`, plus the filter-scope counters
 `snapshot_freshness_filter_candidate_scope`,
 `snapshot_freshness_filter_candidate_count`, and
-`snapshot_freshness_filter_skipped_untracked_count`. RED/GREEN reproduced all
+`snapshot_freshness_filter_skipped_untracked_count`, plus fallback-health
+counters `candidate_freshness_candidate_scope`,
+`candidate_freshness_candidate_count`, and
+`candidate_freshness_skipped_untracked_count`. RED/GREEN reproduced all
 failure layers: 50 stale candidates shrank to 3 tracked candidates / 6 quote
 legs with 94 untracked quote targets skipped, 64 no-tradeable snapshot
 candidates no longer enter freshness observability, and 64 tradeable candidates
-now feed only 8 primary+shadow candidates into the final freshness filter. CL-071
-fallback and the Local-L2 V1 primary+shadow activation test stayed green. No
+now feed only 8 primary+shadow candidates into the final freshness filter, while
+64 fallback-health candidates now call per-candidate freshness only for 8
+tracked candidates. CL-071 fallback and the Local-L2 V1 primary+shadow
+activation test stayed green. No
 health budget, WS-BBO
 budget/TTL, REST concurrency, strategy/OI/liquidity, admission, sizing, order,
 close, recovery, residual-repair, or production config semantics changed. Cloud

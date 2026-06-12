@@ -17547,12 +17547,17 @@ class LiveRuntime:
         degraded_domains: list[str],
         stale_degraded_domains: list[str],
         fallback_duration_ms: int,
+        candidates: list | None = None,
     ) -> list[dict]:
         scope: list[dict] = []
         if snapshot is None:
             return scope
 
-        candidates = list(getattr(snapshot, "candidates", []) or [])
+        candidates = (
+            list(candidates)
+            if candidates is not None
+            else list(getattr(snapshot, "candidates", []) or [])
+        )
         if not candidates:
             return scope
 
@@ -17696,6 +17701,20 @@ class LiveRuntime:
                     )
 
         return scope
+
+    def _snapshot_health_candidate_scope_candidates(self, snapshot) -> tuple[list, str, int, int]:
+        all_candidates = list(getattr(snapshot, "candidates", []) or []) if snapshot is not None else []
+        if not all_candidates:
+            return [], "empty", 0, 0
+        if self._entry_readiness_provider_uses_ws_bbo() or self._local_l2_effective_enabled():
+            _, tracked_candidates = self._select_v1_entry_tracked_scope(all_candidates)
+            return (
+                tracked_candidates,
+                "v1_primary_shadow",
+                len(all_candidates),
+                max(len(all_candidates) - len(tracked_candidates), 0),
+            )
+        return all_candidates, "all_snapshot_candidates", len(all_candidates), 0
 
     def _snapshot_freshness_decision_log_key(
         self,
@@ -17914,6 +17933,12 @@ class LiveRuntime:
                 if age_ms <= self._snapshot_domain_budget_ms("quote"):
                     fresh_source_ages.append(age_ms)
         fresh_source_age_ms = min(fresh_source_ages) if fresh_source_ages else 0
+        (
+            candidate_scope_candidates,
+            candidate_scope_mode,
+            candidate_scope_all_count,
+            candidate_scope_skipped_count,
+        ) = self._snapshot_health_candidate_scope_candidates(snapshot)
 
         return {
             "freshness": freshness,
@@ -17927,12 +17952,17 @@ class LiveRuntime:
             "fallback_duration_ms": fallback_duration_ms,
             "last_good_age_ms": max(snapshot_publish_age_ms, 0),
             "fresh_source_age_ms": fresh_source_age_ms,
+            "candidate_freshness_candidate_scope": candidate_scope_mode,
+            "candidate_freshness_candidate_count": len(candidate_scope_candidates),
+            "candidate_freshness_all_candidate_count": candidate_scope_all_count,
+            "candidate_freshness_skipped_untracked_count": candidate_scope_skipped_count,
             "candidate_freshness_scope": self._snapshot_health_candidate_freshness_scope(
                 snapshot=snapshot,
                 now_ms=now_ms,
                 degraded_domains=degraded_domains,
                 stale_degraded_domains=domains,
                 fallback_duration_ms=fallback_duration_ms,
+                candidates=candidate_scope_candidates,
             ),
             "per_venue_quote_count": dict(sorted(per_venue_quote_count.items())),
             "per_venue_candidate_count": dict(sorted(per_venue_candidate_count.items())),

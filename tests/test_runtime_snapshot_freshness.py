@@ -1677,6 +1677,78 @@ async def test_runtime_snapshot_freshness_filter_uses_v1_primary_shadow_scope(
     assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] == 56
 
 
+def test_runtime_snapshot_fallback_health_scope_uses_v1_primary_shadow_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            max_concurrent_positions=6,
+            entry_local_l2_primary_count=6,
+            shadow_entry_opportunity_count=2,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidates = []
+    for idx in range(64):
+        candidate = _freshness_candidate(symbol=f"SYM{idx}USDT")
+        candidate.pair_id = f"sym{idx}usdt:okx->bybit"
+        candidate.ranking_edge_bps = 100.0 - idx
+        candidates.append(candidate)
+    snapshot = SidecarSnapshot(
+        published_at_ms=1000,
+        market_observed_at_ms=1000,
+        acquisition_mode="last_good_sidecar",
+        candidates=candidates,
+    )
+    observed_pair_ids: list[str] = []
+
+    def observe_candidate(candidate, **_kwargs):
+        observed_pair_ids.append(candidate.pair_id)
+        return [
+            {
+                "venue": "okx",
+                "symbol": str(getattr(candidate, "symbol", "") or "").upper(),
+                "domain": "quote",
+                "source": "sidecar_quote",
+                "age_ms": 69000,
+                "decision": "skip_entry",
+                "reason": "quote_stale",
+                "blocking": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        runtime,
+        "_candidate_snapshot_freshness_decisions",
+        observe_candidate,
+    )
+
+    payload = runtime._snapshot_health_payload(
+        snapshot=snapshot,
+        now_ms=70000,
+        max_age_ms=10000,
+        freshness="last_good_fallback",
+    )
+
+    assert observed_pair_ids == [candidate.pair_id for candidate in candidates[:8]]
+    assert payload["candidate_freshness_candidate_scope"] == "v1_primary_shadow"
+    assert payload["candidate_freshness_candidate_count"] == 8
+    assert payload["candidate_freshness_all_candidate_count"] == 64
+    assert payload["candidate_freshness_skipped_untracked_count"] == 56
+    assert {
+        sample["candidate_pair_id"]
+        for sample in payload["candidate_freshness_scope"]
+    } <= {candidate.pair_id for candidate in candidates[:8]}
+
+
 @pytest.mark.asyncio
 async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
     config = AppConfig(
