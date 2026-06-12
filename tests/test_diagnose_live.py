@@ -387,6 +387,38 @@ def test_state_consistency_exposes_runtime_progress_diagnostics():
     assert consistency["runtime_progress"]["last_lane_progress_ms"] == 1778786994000
 
 
+def test_local_state_preserves_runtime_progress_and_market_data_config():
+    from scripts.diagnose_live import _build_local_state
+
+    local_state = _build_local_state(
+        {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1778786990000,
+            "runtime_progress": {
+                "active_lane": "full_tick",
+                "active_lane_budget_ms": 60_000,
+            },
+            "runtime_market_data_config": {
+                "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+                "local_l2_configured_enabled": True,
+                "local_l2_effective_enabled": False,
+            },
+        },
+        [],
+    )
+
+    assert local_state["runtime_progress"]["active_lane"] == "full_tick"
+    effective = local_state["runtime_market_data_config"]
+    assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+    assert effective["local_l2_configured_enabled"] is True
+    assert effective["local_l2_effective_enabled"] is False
+
+
 def test_run_diagnose_emits_fixture_replay_acceptance_gate(monkeypatch):
     """Production-window fixture replay must expose the final read-only gate."""
     from scripts import diagnose_live as dl

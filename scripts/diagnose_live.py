@@ -526,6 +526,10 @@ def _build_local_state(
         "pending_close_count": int(state.get("pending_close_count", 0) or 0),
         "positions": positions,
         "last_tick_ms": int(state.get("last_tick_ms", 0) or 0),
+        "runtime_progress": dict(state.get("runtime_progress") or {}),
+        "runtime_market_data_config": dict(
+            state.get("runtime_market_data_config") or {}
+        ),
         "state_path": state.get("_state_path", ""),
         "state_path_source": state.get("_state_path_source", ""),
     }
