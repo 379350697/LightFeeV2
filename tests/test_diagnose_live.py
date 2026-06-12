@@ -287,6 +287,10 @@ def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
             "pending_entry_count": 0,
             "pending_close_count": 0,
             "pending_residual_repair_count": 0,
+            "runtime_progress": {
+                "active_lane": "housekeeping",
+                "last_lane_progress_ms": 1778786994000,
+            },
         },
         exchange_truth={
             "available": True,
@@ -303,6 +307,39 @@ def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
     assert gate["max_concurrent_positions"] == 8
     assert gate["remaining_position_slots"] == 0
     assert "open_positions_exceed_configured_max" in gate["blocking_reasons"]
+    assert gate["runtime_progress"]["active_lane"] == "housekeeping"
+
+
+def test_state_consistency_exposes_runtime_progress_diagnostics():
+    from scripts.diagnose_live import _build_state_consistency
+
+    local_state = {
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "runtime_progress": {
+            "loop_iteration_started_ms": 1778786993000,
+            "loop_iteration_completed_ms": 1778786990000,
+            "last_lane_progress_ms": 1778786994000,
+            "active_lane": "passive_close",
+            "active_lane_started_ms": 1778786992000,
+            "active_lane_budget_ms": 15_000,
+            "active_lane_overdue": False,
+        },
+    }
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {},
+        "open_orders": {},
+    }
+
+    consistency = _build_state_consistency(local_state, exchange_truth)
+
+    assert consistency["runtime_progress"]["active_lane"] == "passive_close"
+    assert consistency["runtime_progress"]["last_lane_progress_ms"] == 1778786994000
 
 
 def test_run_diagnose_emits_fixture_replay_acceptance_gate(monkeypatch):

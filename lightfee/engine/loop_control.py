@@ -142,6 +142,21 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
 
     mode = config.runtime.mode
 
+    runtime_progress = dict(getattr(state, "runtime_progress", {}) or {})
+    active_lane = str(runtime_progress.get("active_lane") or "")
+    try:
+        active_lane_started_ms = int(runtime_progress.get("active_lane_started_ms") or 0)
+    except (TypeError, ValueError):
+        active_lane_started_ms = 0
+    try:
+        active_lane_budget_ms = int(runtime_progress.get("active_lane_budget_ms") or 0)
+    except (TypeError, ValueError):
+        active_lane_budget_ms = 0
+    if active_lane and active_lane_started_ms > 0 and active_lane_budget_ms > 0:
+        runtime_progress["active_lane_overdue"] = (
+            now_ms - active_lane_started_ms > active_lane_budget_ms
+        )
+
     data = {
         "schema": "lightfee.current_state.v1",
         "generated_at_ms": now_ms,
@@ -174,6 +189,7 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "live_recovery_reduce_only_pairs": list(getattr(state, "live_recovery_reduce_only_pairs", []) or []),
         "venue_entry_cooldowns": dict(getattr(state, "venue_entry_cooldowns", {}) or {}),
         "last_scan": getattr(state, "last_scan", None),
+        "runtime_progress": runtime_progress,
     }
     write_json_atomic(path, data)
 

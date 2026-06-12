@@ -1513,6 +1513,13 @@ def _exchange_truth_position_mismatches(
     return mismatches
 
 
+def _runtime_progress_from_state(local_state: dict[str, Any]) -> dict[str, Any]:
+    runtime_progress = local_state.get("runtime_progress")
+    if isinstance(runtime_progress, dict):
+        return dict(runtime_progress)
+    return {}
+
+
 def _build_state_consistency(
     local_state: dict[str, Any], exchange_truth: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1528,6 +1535,7 @@ def _build_state_consistency(
     et_available = exchange_truth.get("available", False)
     et_confidence = exchange_truth.get("confidence", "low")
     fetch_status = exchange_truth.get("fetch_status", {})
+    runtime_progress = _runtime_progress_from_state(local_state)
 
     # Collect local symbols for cross-reference
     local_symbols = [
@@ -1560,6 +1568,7 @@ def _build_state_consistency(
             "details": details,
             "confidence": "low",
             "missing_evidence": exchange_truth.get("missing_evidence", []),
+            "runtime_progress": runtime_progress,
         }
 
     # Determine which local symbols were successfully checked on exchange
@@ -1605,6 +1614,7 @@ def _build_state_consistency(
                 "exchange_truth_fetch_partial_or_failed_for_{}".format(s)
                 for s in local_with_failed_fetch[:5]
             ],
+            "runtime_progress": runtime_progress,
         }
 
     # Confidence high: all queries succeeded — we can reliably compare
@@ -1672,6 +1682,7 @@ def _build_state_consistency(
         "fingerprints": fingerprints,
         "details": details,
         "confidence": "high",
+        "runtime_progress": runtime_progress,
     }
 
 
@@ -2465,6 +2476,7 @@ def _build_production_acceptance_gate(
     position_opened_count = 0
     residual_count = 0
     exception_conclusions: dict[str, str] = {}
+    runtime_progress = _runtime_progress_from_state(local_state)
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -2916,6 +2928,7 @@ def _build_production_acceptance_gate(
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
         "recovery_decision": recovery_decision,
+        "runtime_progress": runtime_progress,
         "fingerprints": fingerprints,
         "exception_conclusions": exception_conclusions,
         "unclassified_exceptions": unclassified_exceptions,
