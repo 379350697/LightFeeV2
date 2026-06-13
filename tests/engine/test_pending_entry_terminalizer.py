@@ -248,6 +248,7 @@ def test_direct_pending_entry_removal_is_limited_to_terminality_allowlist():
     pattern = re.compile(r"pending_entries\.pop|del .*pending_entries")
     allowed = {
         "runtime.py": "_remove_pending_entry_after_terminal_decision",
+        "pending_entry_runtime.py": "_remove_pending_entry_after_terminal_decision",
         "pending_entry_terminalizer.py": "remove_if_allowed",
     }
     violations: list[str] = []
