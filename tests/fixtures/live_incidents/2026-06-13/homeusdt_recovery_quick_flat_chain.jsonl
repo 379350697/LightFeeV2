@@ -1,0 +1,6 @@
+{"ts_ms":1781293920000,"kind":"entry.opened","payload":{"position_id":"entry-1781293924792-HOMEUSDT","symbol":"HOMEUSDT","quantity":1500.0,"long_venue":"okx","short_venue":"bybit"}}
+{"ts_ms":1781293938000,"kind":"runtime.position_drift_detected","payload":{"position_id":"entry-1781293924792-HOMEUSDT","symbol":"HOMEUSDT","reason":"local_open_but_live_flat"}}
+{"ts_ms":1781293940000,"kind":"runtime.position_drift_corrected","payload":{"position_id":"entry-1781293924792-HOMEUSDT","symbol":"HOMEUSDT","reason":"exchange_truth_flat"}}
+{"ts_ms":1781293940500,"kind":"recovery.flat","payload":{"position_id":"entry-1781293924792-HOMEUSDT","symbol":"HOMEUSDT","reason":"exchange_truth_flat"}}
+{"ts_ms":1781294076000,"kind":"entry.opened","payload":{"position_id":"entry-1781294076754-HOMEUSDT","symbol":"HOMEUSDT","quantity":1500.0,"long_venue":"okx","short_venue":"bybit"}}
+{"ts_ms":1781294094000,"kind":"runtime.position_lifecycle_terminal","payload":{"position_id":"entry-1781294076754-HOMEUSDT","symbol":"HOMEUSDT","reason":"live_truth_flat"}}

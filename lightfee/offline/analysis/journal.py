@@ -118,6 +118,13 @@ _PAPER_OUTCOME_KINDS = frozenset({
     "opportunity.real_vs_paper_joined",
 })
 
+_QUICK_FLAT_TERMINAL_KIND_PRIORITY = {
+    "runtime.position_drift_corrected": 10,
+    "exit.closed": 20,
+    "runtime.position_lifecycle_terminal": 30,
+    "recovery.flat": 40,
+}
+
 
 def _event_payload(event: dict) -> dict:
     payload = event.get("payload", {})
@@ -129,7 +136,7 @@ def _event_ts_ms(event: dict) -> int:
 
 
 def quick_flat_event_key(event: dict) -> tuple:
-    """Return the best available duplicate key for an exit.closed event."""
+    """Return the best available duplicate key for a quick-flat terminal event."""
     payload = _event_payload(event)
     position_id = str(payload.get("position_id", "") or "")
     reason = str(payload.get("reason", "") or "")
@@ -137,7 +144,7 @@ def quick_flat_event_key(event: dict) -> tuple:
     close_id = payload.get("close_id")
     if close_id:
         return (position_id, reason, str(close_id), ts_ms)
-    return (position_id, reason, ts_ms)
+    return (str(event.get("kind", "") or ""), position_id, reason, ts_ms)
 
 
 def summarize_quick_flat_events(
@@ -145,7 +152,7 @@ def summarize_quick_flat_events(
     *,
     quick_flat_window_ms: int = 60_000,
 ) -> dict[str, int | str]:
-    """Summarize quick-flat close observations without double-counting exits."""
+    """Summarize quick-flat terminal observations without double-counting exits."""
     entry_opened_at: dict[str, int] = {}
     for record in records:
         if record.get("kind") != "entry.opened":
@@ -159,13 +166,14 @@ def summarize_quick_flat_events(
             entry_opened_at[position_id] = ts_ms
 
     seen_exit_keys: set[tuple] = set()
-    quick_flat_count = 0
+    quick_flat_positions: dict[str, dict] = {}
     duplicate_event_count = 0
     low_confidence_event_count = 0
     window_ms = int(quick_flat_window_ms or 0)
 
     for record in records:
-        if record.get("kind") != "exit.closed":
+        kind = str(record.get("kind", "") or "")
+        if kind not in _QUICK_FLAT_TERMINAL_KIND_PRIORITY:
             continue
         payload = _event_payload(record)
         position_id = str(payload.get("position_id", "") or "")
@@ -174,7 +182,7 @@ def summarize_quick_flat_events(
 
         key = quick_flat_event_key(record)
         has_close_id = bool(payload.get("close_id"))
-        if not has_close_id:
+        if kind == "exit.closed" and not has_close_id:
             low_confidence_event_count += 1
         if key in seen_exit_keys:
             duplicate_event_count += 1
@@ -187,15 +195,34 @@ def summarize_quick_flat_events(
         closed_at_ms = _event_ts_ms(record)
         elapsed_ms = closed_at_ms - opened_at_ms
         if 0 <= elapsed_ms <= window_ms:
-            quick_flat_count += 1
+            previous = quick_flat_positions.get(position_id)
+            priority = _QUICK_FLAT_TERMINAL_KIND_PRIORITY[kind]
+            if previous is None or (
+                priority,
+                closed_at_ms,
+            ) >= (
+                int(previous["priority"]),
+                int(previous["ts_ms"]),
+            ):
+                quick_flat_positions[position_id] = {
+                    "kind": kind,
+                    "priority": priority,
+                    "ts_ms": closed_at_ms,
+                }
+
+    terminal_kind_counts: dict[str, int] = {}
+    for terminal in quick_flat_positions.values():
+        kind = str(terminal["kind"])
+        terminal_kind_counts[kind] = terminal_kind_counts.get(kind, 0) + 1
 
     close_identity_confidence = "lower" if low_confidence_event_count else "high"
     return {
-        "quick_flat_count": quick_flat_count,
+        "quick_flat_count": len(quick_flat_positions),
         "duplicate_event_count": duplicate_event_count,
         "quick_flat_duplicate_event_count": duplicate_event_count,
         "low_confidence_event_count": low_confidence_event_count,
         "close_identity_confidence": close_identity_confidence,
+        "quick_flat_terminal_kind_counts": terminal_kind_counts,
     }
 
 

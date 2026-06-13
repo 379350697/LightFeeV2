@@ -17,6 +17,7 @@ class PendingEntryLiveTruth:
     has_live_open_order: bool = False
     has_live_position: bool = False
     error: str = ""
+    positive_fill_requires_live_position: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,24 @@ class PendingEntryTerminalizer:
                 matched_quantity=matched,
                 residual_quantity=residual,
                 contains_positive_fill_evidence=False,
+            )
+
+        if (
+            truth.positive_fill_requires_live_position
+            and has_positive_fill
+            and matched > 1e-9
+            and not truth.has_live_position
+        ):
+            return PendingEntryTerminalDecision(
+                outcome="positive_fill_live_truth_conflict",
+                reason="positive_fill_conflicts_with_live_flat_truth",
+                terminal=False,
+                allows_pending_removal=False,
+                healthy=False,
+                operator_block_required=True,
+                matched_quantity=matched,
+                residual_quantity=residual,
+                contains_positive_fill_evidence=True,
             )
 
         if not has_positive_fill:

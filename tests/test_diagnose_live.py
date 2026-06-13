@@ -1724,6 +1724,72 @@ def test_run_diagnose_deduplicates_duplicate_quick_flat_close_events(monkeypatch
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_blocks_home_recovery_flat_quick_flat_chain(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1781293950000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781293920000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1781293924792-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781293940000,
+                "kind": "runtime.position_drift_corrected",
+                "payload": {
+                    "position_id": "entry-1781293924792-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "reason": "exchange_truth_flat",
+                },
+            },
+            {
+                "ts_ms": 1781293940500,
+                "kind": "recovery.flat",
+                "payload": {
+                    "position_id": "entry-1781293924792-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "reason": "exchange_truth_flat",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["okx", "bybit"],
+            now_ms=1781293950000,
+        )
+
+        summary = result["quick_flat_summary"]
+        assert summary["quick_flat_count"] == 1
+        assert summary["quick_flat_terminal_kind_counts"] == {"recovery.flat": 1}
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert gate["quick_flat_count"] == 1
+        assert gate["blocking_reasons"] == ["quick_flat_events_present"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_does_not_count_okx_global_recovery_for_non_okx_venues(monkeypatch):
     from scripts import diagnose_live as dl
 

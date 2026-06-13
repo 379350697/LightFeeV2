@@ -139,6 +139,7 @@ def build_v1_lifecycle_closure_table(
     rows.extend(_entry_quote_lease_rows(state))
     rows.extend(_pending_entry_rows(state, truth))
     rows.extend(_open_position_rows(state, ledger))
+    rows.extend(_recovery_work_rows(ledger))
     rows.extend(_passive_close_rows(state))
     rows.extend(_residual_repair_rows(state))
     rows.extend(_runtime_progress_rows(state, generated))
@@ -359,6 +360,7 @@ def _pending_entry_rows(
                 has_live_open_order=has_live_order,
                 has_live_position=has_live_position,
                 error="" if truth_available else "exchange_truth_unavailable",
+                positive_fill_requires_live_position=True,
             ),
         )
         if decision.outcome == "deferred_live_open_order":
@@ -398,6 +400,7 @@ def _pending_entry_rows(
                 v1_anchor="PendingEntryTerminalizer live-truth authority",
                 details={
                     "symbol": symbol,
+                    "venues": sorted(_venues(pending)),
                     "decision_outcome": decision.outcome,
                     "decision_reason": decision.reason,
                     "matched_quantity": decision.matched_quantity,
@@ -460,11 +463,68 @@ def _open_position_rows(local_state: Any, ledger: RecoveryLedger) -> list[V1Life
     return rows
 
 
+def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
+    rows: list[V1LifecycleClosureRow] = []
+    for item in ledger.work_items:
+        kind = str(_get(item, "kind", "") or "")
+        if kind in {
+            "orphan_maker_order",
+            "unpaired_live_position",
+            "orphan_reduce_only_order",
+            "ambiguous_exchange_truth",
+            "owned_open_position",
+        }:
+            continue
+        owner = _get(item, "owner", None)
+        owner_id = _owner_id(
+            owner,
+            "owner_id",
+            default=_owner_id(
+                _first_item(_get(item, "artifacts", ())),
+                "order_id",
+                "client_order_id",
+                default=_symbol(item) or kind,
+            ),
+        )
+        phase = _recovery_work_phase(kind)
+        rows.append(
+            _row(
+                row_key=f"recovery_work:{kind}:{owner_id}",
+                phase=phase,
+                owner_id=owner_id,
+                evidence_class=kind,
+                terminality=kind,
+                entry_policy="block_conflicting_new_risk",
+                recovery_policy=f"manage_{kind}",
+                diagnostic_severity="warning",
+                v1_anchor="RecoveryLedger work scope feeds runtime entry gate",
+                details={
+                    "kind": kind,
+                    "symbol": _get(item, "symbol", ""),
+                    "venues": sorted(_get(item, "venues", ()) or ()),
+                    "decision_reason": _get(_get(item, "decision", None), "reason", ""),
+                },
+            )
+        )
+    return rows
+
+
+def _recovery_work_phase(kind: str) -> V1LifecycleClosurePhase:
+    if kind == "pending_passive_close":
+        return V1LifecycleClosurePhase.PASSIVE_CLOSE
+    if kind == "pending_residual_repair":
+        return V1LifecycleClosurePhase.RESIDUAL_REPAIR
+    if kind == "owned_pending_entry":
+        return V1LifecycleClosurePhase.PENDING_ENTRY
+    return V1LifecycleClosurePhase.RECOVERY_TRUTH
+
+
 def _passive_close_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
     rows: list[V1LifecycleClosureRow] = []
     for key in ("pending_closes", "pending_passive_closes"):
         for close in _state_collection(local_state, key):
             owner_id = _owner_id(close, "position_id", "close_id", default=_symbol(close) or key)
+            venues = _venues(close) | _venues(_get(close, "position_snapshot", {}))
             rows.append(
                 _row(
                     row_key=f"passive_close:{owner_id}",
@@ -476,7 +536,7 @@ def _passive_close_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
                     recovery_policy="manage_passive_close",
                     diagnostic_severity="warning",
                     v1_anchor="Passive close terminality converges on exchange truth",
-                    details={"source": key, "symbol": _symbol(close)},
+                    details={"source": key, "symbol": _symbol(close), "venues": sorted(venues)},
                 )
             )
     return rows
@@ -827,7 +887,10 @@ def _owner_id(obj: Any, *keys: str, default: str = "") -> str:
 
 
 def _symbol(obj: Any) -> str:
-    return str(_get(obj, "symbol", "") or "").upper()
+    symbol = str(_get(obj, "symbol", "") or "").upper()
+    if symbol:
+        return symbol
+    return str(_get(_get(obj, "position_snapshot", {}), "symbol", "") or "").upper()
 
 
 def _venue(obj: Any) -> str:

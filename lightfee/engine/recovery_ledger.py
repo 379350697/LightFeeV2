@@ -530,7 +530,10 @@ def _flatten_exchange_collection(value: Any) -> list[Any]:
 
 
 def _symbol(obj: Any) -> str:
-    return str(_get(obj, "symbol", "") or "").upper()
+    symbol = str(_get(obj, "symbol", "") or "").upper()
+    if symbol:
+        return symbol
+    return str(_get(_get(obj, "position_snapshot", {}), "symbol", "") or "").upper()
 
 
 def _venue(obj: Any) -> str:

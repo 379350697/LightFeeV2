@@ -6,6 +6,9 @@ execution liquidity blocks, local-L2 sequence gaps, local-L2 sync failures,
 fail-closed reasons, and classification breakdowns.
 """
 
+import json
+from pathlib import Path
+
 from lightfee.offline.analysis.journal import (
     JournalAnalysisReport,
     analyze_journal_records,
@@ -105,6 +108,27 @@ class TestEntryExitPnL:
 
 
 class TestQuickFlatObservability:
+    def test_home_recovery_flat_terminal_chain_counts_as_quick_flat(self):
+        records = [
+            json.loads(line)
+            for line in Path(
+                "tests/fixtures/live_incidents/2026-06-13/"
+                "homeusdt_recovery_quick_flat_chain.jsonl"
+            ).read_text().splitlines()
+            if line.strip()
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 2
+        assert summary["quick_flat_terminal_kind_counts"] == {
+            "recovery.flat": 1,
+            "runtime.position_lifecycle_terminal": 1,
+        }
+
     def test_quick_flat_close_count_deduplicates_double_exit_closed_projection(self):
         records = [
             {

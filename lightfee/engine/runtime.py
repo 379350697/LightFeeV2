@@ -1390,16 +1390,22 @@ class LiveRuntime:
         recovery_decision: Any | None = None,
     ) -> None:
         previous = dict(getattr(self.state, "v1_lifecycle_closure", {}) or {})
+        ledger = (
+            recovery_ledger
+            if recovery_ledger is not None
+            else getattr(self, "recovery_ledger", None)
+        )
+        exchange_truth = self._last_recovery_exchange_truth
+        if exchange_truth is None and ledger is not None:
+            exchange_truth = {
+                "truth_available": bool(getattr(ledger, "truth_available", False))
+            }
         self.state.v1_lifecycle_closure = build_v1_lifecycle_closure_table(
             local_state=self.state,
-            exchange_truth=self._last_recovery_exchange_truth,
+            exchange_truth=exchange_truth,
             generated_at_ms=now_ms,
             previous_table=previous,
-            recovery_ledger=(
-                recovery_ledger
-                if recovery_ledger is not None
-                else getattr(self, "recovery_ledger", None)
-            ),
+            recovery_ledger=ledger,
             recovery_decision=(
                 recovery_decision
                 if recovery_decision is not None
@@ -1423,6 +1429,123 @@ class LiveRuntime:
 
     def _v1_lifecycle_entry_gate_decision(self) -> tuple[bool, str]:
         return entry_gate_from_closure(self._current_v1_lifecycle_closure())
+
+    def _v1_lifecycle_closure_blocks_candidate(
+        self,
+        candidate: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        closure = dict(getattr(self.state, "v1_lifecycle_closure", {}) or {})
+        rows = [
+            row
+            for row in closure.get("rows", [])
+            if isinstance(row, dict)
+        ]
+        blocking_row_keys = set(
+            str(row_key or "")
+            for row_key in (closure.get("summary", {}) or {}).get("blocking_rows", [])
+        )
+        blocking_rows = [
+            row
+            for row in rows
+            if (
+                str(row.get("row_key") or "") in blocking_row_keys
+                or str(row.get("entry_policy") or "").startswith("block")
+                or str(row.get("recovery_policy") or "").startswith("block")
+            )
+        ]
+        blocking_rows = [
+            row
+            for row in blocking_rows
+            if not self._v1_lifecycle_row_is_candidate_owner(row, candidate)
+        ]
+        if not blocking_rows:
+            return False
+        if reason in {"orphan_maker_order", "unpaired_live_position"}:
+            return True
+        phases = {str(row.get("phase") or "") for row in blocking_rows}
+        if (
+            reason == "truth_unavailable_for_required_recovery"
+            and "PENDING_ENTRY" in phases
+        ):
+            return True
+        return any(
+            self._v1_lifecycle_row_conflicts_with_candidate(row, candidate)
+            for row in blocking_rows
+            if str(row.get("phase") or "") != "RECOVERY_TRUTH"
+        )
+
+    @staticmethod
+    def _v1_lifecycle_row_is_candidate_owner(
+        row: dict[str, Any],
+        candidate: Any,
+    ) -> bool:
+        if str(row.get("phase") or "") != "PENDING_ENTRY":
+            return False
+        row_owner = str(row.get("owner_id") or "")
+        if not row_owner:
+            return False
+        owner_ids = {
+            str(value or "")
+            for value in (
+                getattr(candidate, "pending_owner_id", ""),
+                getattr(candidate, "pending_id", ""),
+                getattr(candidate, "entry_id", ""),
+                getattr(candidate, "position_id", ""),
+            )
+            if str(value or "")
+        }
+        return row_owner in owner_ids
+
+    @staticmethod
+    def _v1_lifecycle_row_conflicts_with_candidate(
+        row: dict[str, Any],
+        candidate: Any,
+    ) -> bool:
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        entry_policy = str(row.get("entry_policy") or "")
+        if entry_policy == "block_all_new_risk":
+            return True
+        candidate_symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        row_symbol = str(details.get("symbol") or "").upper()
+        if candidate_symbol and row_symbol and candidate_symbol != row_symbol:
+            return False
+        candidate_venues = {
+            str(value.value if hasattr(value, "value") else value or "").lower()
+            for value in (
+                getattr(candidate, "venue", ""),
+                getattr(candidate, "long_venue", ""),
+                getattr(candidate, "short_venue", ""),
+            )
+            if str(value.value if hasattr(value, "value") else value or "")
+        }
+        raw_venues = details.get("venues") or ()
+        if isinstance(raw_venues, str):
+            raw_venues = (raw_venues,)
+        row_venues = {
+            str(value.value if hasattr(value, "value") else value or "").lower()
+            for value in raw_venues
+            if str(value.value if hasattr(value, "value") else value or "")
+        }
+        if candidate_venues and row_venues:
+            return bool(candidate_venues & row_venues)
+        return bool(candidate_symbol and row_symbol and candidate_symbol == row_symbol)
+
+    @staticmethod
+    def _v1_lifecycle_runtime_gate_reason(reason: str) -> str:
+        if reason in {
+            "orphan_maker_order",
+            "unpaired_live_position",
+            "owned_recovery_work",
+            "pending_residual_repair",
+            "pending_passive_close",
+            "owned_pending_entry",
+            "truth_unavailable_for_required_recovery",
+            "exchange_truth_recovery_ledger_blocked",
+        }:
+            return "recovery_ledger_blocked"
+        return reason or "v1_lifecycle_closure_blocked"
 
     def _v1_lifecycle_event_fields(
         self,
@@ -7935,6 +8058,12 @@ class LiveRuntime:
                 short_venue=(
                     short_venue.value if hasattr(short_venue, "value") else str(short_venue)
                 ),
+                pending_owner_id=str(
+                    getattr(pending, "pending_id", "")
+                    or getattr(pending, "position_id", "")
+                    or getattr(pending, "entry_id", "")
+                    or ""
+                ),
                 blocked=True,
                 blocked_reasons=["legacy_no_frozen_candidate_out_of_scope"],
                 ranking_edge_bps=0.0,
@@ -7952,6 +8081,15 @@ class LiveRuntime:
         long_venue = getattr(pending, "long_venue", "")
         short_venue = getattr(pending, "short_venue", "")
         data.setdefault("symbol", getattr(pending, "symbol", ""))
+        data.setdefault(
+            "pending_owner_id",
+            str(
+                getattr(pending, "pending_id", "")
+                or getattr(pending, "position_id", "")
+                or getattr(pending, "entry_id", "")
+                or ""
+            ),
+        )
         data.setdefault(
             "long_venue",
             long_venue.value if hasattr(long_venue, "value") else str(long_venue),
@@ -13611,6 +13749,90 @@ class LiveRuntime:
             has_live_position=True,
         )
 
+    async def _pending_entry_positive_fill_live_truth(
+        self,
+        pending,
+        entry_id: str,
+        now_ms: int,
+    ) -> PendingEntryLiveTruth:
+        if str(getattr(self.config.runtime, "mode", "") or "") != "live":
+            return PendingEntryLiveTruth(
+                available=True,
+                has_live_open_order=False,
+                has_live_position=True,
+                positive_fill_requires_live_position=False,
+            )
+
+        open_order_truth = PendingEntryLiveTruth(available=True)
+        if self._pending_entry_has_maker_order_reference(pending):
+            open_order_truth = await self._pending_entry_zero_fill_has_live_maker_open_order(
+                pending,
+                entry_id,
+                now_ms,
+            )
+            if open_order_truth.has_live_open_order:
+                return PendingEntryLiveTruth(
+                    available=True,
+                    has_live_open_order=True,
+                    has_live_position=False,
+                    positive_fill_requires_live_position=True,
+                )
+
+        live_positions: dict[str, float] = {}
+        errors: list[str] = []
+        for venue in (pending.long_venue, pending.short_venue):
+            adapter = self.get_venue_adapter(venue)
+            fetch_position = getattr(adapter, "fetch_position", None) if adapter else None
+            venue_name = getattr(venue, "value", str(venue))
+            if not callable(fetch_position):
+                errors.append(f"{venue_name}:fetch_position_unavailable")
+                continue
+            try:
+                position = await fetch_position(pending.symbol)
+            except Exception as exc:
+                errors.append(f"{venue_name}:{str(exc) or exc.__class__.__name__}")
+                continue
+            live_positions[venue_name] = abs(
+                float(getattr(position, "quantity", 0.0) or 0.0)
+            ) if position else 0.0
+
+        if errors:
+            error_text = ";".join(
+                [error for error in (open_order_truth.error, *errors) if error]
+            )
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
+            self.journal.append(
+                "pending_entry.positive_fill_live_truth_unavailable",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                    "live_positions": live_positions,
+                    "error": error_text or "positive_fill_live_truth_unavailable",
+                    "reason": "positive_fill_requires_live_position_truth",
+                },
+            )
+            return PendingEntryLiveTruth(
+                available=False,
+                has_live_open_order=open_order_truth.has_live_open_order,
+                has_live_position=False,
+                error=error_text or "positive_fill_live_truth_unavailable",
+                positive_fill_requires_live_position=True,
+            )
+
+        has_live_position = any(qty > 1e-9 for qty in live_positions.values())
+        return PendingEntryLiveTruth(
+            available=True,
+            has_live_open_order=False,
+            has_live_position=has_live_position,
+            positive_fill_requires_live_position=True,
+        )
+
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
         """Finalize a completed pending entry: build OpenPosition, write entry.opened.
 
@@ -13870,9 +14092,14 @@ class LiveRuntime:
             return True
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
+        live_truth = await self._pending_entry_positive_fill_live_truth(
+            pending,
+            entry_id,
+            now_ms,
+        )
         decision = PendingEntryTerminalizer().decide(
             pending,
-            live_truth=PendingEntryLiveTruth(available=True),
+            live_truth=live_truth,
         )
         self.journal.append(
             "pending_entry.terminalizer_decision",
@@ -13884,6 +14111,24 @@ class LiveRuntime:
             ),
         )
         if not decision.allows_pending_removal:
+            if decision.outcome == "positive_fill_live_truth_conflict":
+                pending.uncertain_outcome = True
+                pending.reconcile_next_attempt_ms = max(
+                    int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                    now_ms + 1_000,
+                )
+                self.journal.append(
+                    "pending_entry.positive_fill_live_truth_conflict",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "matched_quantity": decision.matched_quantity,
+                        "residual_quantity": decision.residual_quantity,
+                        "reason": decision.reason,
+                    },
+                )
             return False
 
         open_maker_fill_quantity = min(
@@ -16357,7 +16602,12 @@ class LiveRuntime:
     def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
         allowed, reason = self._v1_lifecycle_entry_gate_decision()
         if not allowed:
-            return False, reason or "v1_lifecycle_closure_blocked"
+            if not self._v1_lifecycle_closure_blocks_candidate(
+                candidate,
+                reason=reason,
+            ):
+                return True, ""
+            return False, self._v1_lifecycle_runtime_gate_reason(reason)
         return True, ""
 
     def _remove_pending_entry_after_terminal_decision(
@@ -16395,6 +16645,7 @@ class LiveRuntime:
         closure_phase = closure_fields.get("closure_phase", "PENDING_ENTRY")
         closure_row_key = closure_fields.get("closure_row_key", "")
         closure_decision_id = closure_fields.get("closure_decision_id", "")
+        # _remove_pending_entry_after_terminal_decision is the only direct pop authority.
         removed = self.state.pending_entries.pop(entry_id, None)
         if removed is not None:
             self.journal.append(
