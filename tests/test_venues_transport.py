@@ -548,7 +548,7 @@ class TestBinanceAsterPostSigning:
                 "type": "clearinghouseState",
                 "user": transport._credential.account_address,
             }
-            assert private is True
+            assert private is False
             return {
                 "marginSummary": {
                     "accountValue": "29.78001",
@@ -594,7 +594,7 @@ class TestBinanceAsterPostSigning:
             assert method == "POST"
             assert path == "/info"
             assert body["user"] == transport._credential.account_address
-            assert private is True
+            assert private is False
             seen_types.append(body["type"])
             if body["type"] == "clearinghouseState":
                 return {
@@ -645,6 +645,62 @@ class TestBinanceAsterPostSigning:
         assert snapshot.spot_usdc_available == pytest.approx(145.363168)
 
     @pytest.mark.asyncio
+    async def test_hyperliquid_account_balance_uses_operation_contract_registry(self, monkeypatch):
+        import lightfee.venues.transport as transport_module
+
+        credential = LiveCredential(
+            wallet_private_key="0x" + "1" * 64,
+            account_address="0x" + "2" * 40,
+        )
+        transport = VenueTransport(
+            spec=hyperliquid_spec(),
+            mode="live",
+            credential=credential,
+        )
+        seen_operations: list[VenueOperation] = []
+        original_get_operation_contract = transport_module.get_operation_contract
+
+        def recording_get_operation_contract(spec, operation, **kwargs):
+            seen_operations.append(operation)
+            return original_get_operation_contract(spec, operation, **kwargs)
+
+        monkeypatch.setattr(
+            transport_module,
+            "get_operation_contract",
+            recording_get_operation_contract,
+        )
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            assert method == "POST"
+            assert path == "/info"
+            assert body["user"] == transport._credential.account_address
+            assert private is False
+            if body["type"] == "clearinghouseState":
+                return {
+                    "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
+                    "crossMarginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
+                    "withdrawable": "0.0",
+                    "assetPositions": [],
+                }
+            if body["type"] == "userAbstraction":
+                return "unifiedAccount"
+            if body["type"] == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "145", "hold": "0"}]}
+            raise AssertionError(f"unexpected request body: {body}")
+
+        transport._request = mock_request
+
+        snapshot = await transport.fetch_account_balance_snapshot()
+
+        assert snapshot is not None
+        assert seen_operations == [
+            VenueOperation.POSITION,
+            VenueOperation.USER_ABSTRACTION,
+            VenueOperation.SPOT_CLEARINGHOUSE_STATE,
+        ]
+        assert snapshot.balance_classification == "unified_collateral_available"
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_non_unified_account_does_not_use_spot_usdc_for_perp_admission(self):
         credential = LiveCredential(
             wallet_private_key="0x" + "1" * 64,
@@ -661,7 +717,7 @@ class TestBinanceAsterPostSigning:
             assert method == "POST"
             assert path == "/info"
             assert body["user"] == transport._credential.account_address
-            assert private is True
+            assert private is False
             seen_types.append(body["type"])
             if body["type"] == "clearinghouseState":
                 return {

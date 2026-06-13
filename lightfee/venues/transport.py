@@ -1436,6 +1436,46 @@ class VenueTransport(MarketDataClient):
                 f"live mode requires passphrase for {self._spec.venue_id.value}"
             )
 
+    def _hyperliquid_info_operation_request(
+        self,
+        operation: VenueOperation,
+        *,
+        account_address: str,
+    ) -> tuple[str, str, dict[str, Any], bool]:
+        contract = get_operation_contract(self._spec, operation)
+        if (
+            self._spec.venue_id != Venue.HYPERLIQUID
+            or not contract.supported
+            or contract.method.upper() != "POST"
+            or contract.path != "/info"
+            or contract.payload != "body"
+        ):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"hyperliquid info operation contract invalid: {operation.value}",
+            )
+
+        body: dict[str, Any] = {}
+        for param in contract.required_params:
+            key, sep, raw_value = param.partition("=")
+            if not sep or not key:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"hyperliquid info operation contract malformed: {operation.value}",
+                )
+            if raw_value == "configured_account_address":
+                value = account_address
+            else:
+                value = raw_value
+            body[key] = value
+
+        if body.get("user") != account_address or not body.get("type"):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"hyperliquid info operation contract incomplete: {operation.value}",
+            )
+        return contract.method.upper(), contract.path, body, contract.private
+
     @property
     def trading_capability_trusted(self) -> bool:
         """True only after read-only live preflight trusts order submission."""
@@ -3391,11 +3431,15 @@ class VenueTransport(MarketDataClient):
                 account_address = self._credential.account_address if self._credential else ""
                 if not account_address:
                     return None
+                method, path, body, private = self._hyperliquid_info_operation_request(
+                    VenueOperation.POSITION,
+                    account_address=account_address,
+                )
                 raw = await self._request(
-                    "POST",
-                    "/info",
-                    body={"type": "clearinghouseState", "user": account_address},
-                    private=True,
+                    method,
+                    path,
+                    body=body,
+                    private=private,
                 )
                 if not isinstance(raw, dict):
                     return None
@@ -3420,25 +3464,27 @@ class VenueTransport(MarketDataClient):
                 user_abstraction = ""
                 spot_usdc_available = None
                 if withdrawable <= 1e-9:
+                    method, path, body, private = self._hyperliquid_info_operation_request(
+                        VenueOperation.USER_ABSTRACTION,
+                        account_address=account_address,
+                    )
                     abstraction = await self._request(
-                        "POST",
-                        "/info",
-                        body={
-                            "type": "userAbstraction",
-                            "user": account_address,
-                        },
-                        private=True,
+                        method,
+                        path,
+                        body=body,
+                        private=private,
                     )
                     user_abstraction = str(abstraction or "")
                     if abstraction == "unifiedAccount":
+                        method, path, body, private = self._hyperliquid_info_operation_request(
+                            VenueOperation.SPOT_CLEARINGHOUSE_STATE,
+                            account_address=account_address,
+                        )
                         spot_raw = await self._request(
-                            "POST",
-                            "/info",
-                            body={
-                                "type": "spotClearinghouseState",
-                                "user": account_address,
-                            },
-                            private=True,
+                            method,
+                            path,
+                            body=body,
+                            private=private,
                         )
                         spot_available = _hyperliquid_spot_usdc_available(spot_raw)
                         if spot_available is not None:
