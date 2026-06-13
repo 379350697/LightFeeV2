@@ -9,7 +9,6 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderRequest, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
@@ -21,46 +20,14 @@ from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     is_client_order_id_duplicate,
 )
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.runtime_context import EntryDispatchRuntimeContext
 from lightfee.engine.v1_lifecycle import V1TradingLifecycle
 from lightfee.venues.cid import generate_exchange_cid
 
 
 class EntryDispatchRuntime:
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: EntryDispatchRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def entry_readiness_provider(self):
-        return self.ctx.entry_readiness_provider
-
-    @property
-    def local_l2_runtime(self):
-        return self.ctx.local_l2_runtime
-
-    @property
-    def entry_executor(self):
-        return self.ctx.entry_executor
-
-    @property
-    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
-        return self.ctx.venue_adapters
-
-    @property
-    def _recovery_dedup_index(self):
-        return self.ctx._recovery_dedup_index
 
     def get_venue_adapter(self, *args: Any, **kwargs: Any):
         return self.ctx.get_venue_adapter(*args, **kwargs)
@@ -173,7 +140,7 @@ class EntryDispatchRuntime:
     ) -> bool:
         if Venue.BYBIT not in (long_venue, short_venue):
             return True
-        adapter = self._venue_adapters.get(Venue.BYBIT)
+        adapter = self.ctx.venue_adapters.get(Venue.BYBIT)
         precheck = getattr(adapter, "precheck_order_admission", None)
         if adapter is None or not callable(precheck):
             return True
@@ -223,7 +190,7 @@ class EntryDispatchRuntime:
                     candidate_pair_id=pair_id,
                 )
                 return False
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_admission_precheck_rejected",
                 {
                     "venue": Venue.BYBIT.value,
@@ -238,7 +205,7 @@ class EntryDispatchRuntime:
             )
             return False
         except Exception as exc:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_admission_precheck_uncertain",
                 {
                     "venue": Venue.BYBIT.value,
@@ -436,12 +403,12 @@ class EntryDispatchRuntime:
             return reason, lease, evidence
 
         if (
-            self.config.runtime.mode != "live"
+            self.ctx.config.runtime.mode != "live"
             or not self._entry_readiness_provider_uses_quote_lease()
         ):
             return "", None, evidence
 
-        get_lease = getattr(self.entry_readiness_provider, "get_lease", None)
+        get_lease = getattr(self.ctx.entry_readiness_provider, "get_lease", None)
         if not callable(get_lease):
             return blocked("missing_quote_lease_provider", None)
         lease = get_lease(evidence["pair_id"])
@@ -519,7 +486,7 @@ class EntryDispatchRuntime:
         if self._entry_readiness_provider_name() != "ws_bbo_quote_lease":
             return quote_lease_reason, quote_lease, quote_lease_evidence
 
-        decide = getattr(self.entry_readiness_provider, "decide", None)
+        decide = getattr(self.ctx.entry_readiness_provider, "decide", None)
         if not callable(decide):
             return quote_lease_reason, quote_lease, quote_lease_evidence
 
@@ -569,12 +536,12 @@ class EntryDispatchRuntime:
         now_ms: int,
     ) -> dict | None:
         if (
-            self.config.runtime.mode != "live"
+            self.ctx.config.runtime.mode != "live"
             or not self._local_l2_effective_enabled()
         ):
             return None
-        long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-        short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
+        long_book = self.ctx.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
+        short_book = self.ctx.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
         if long_book is None or short_book is None:
             return None
         long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
@@ -582,7 +549,7 @@ class EntryDispatchRuntime:
         if long_observed_at_ms <= 0 or short_observed_at_ms <= 0:
             return None
         max_skew_ms = max(
-            int(getattr(self.config.strategy, "entry_final_gate_max_skew_ms", 0) or 0),
+            int(getattr(self.ctx.config.strategy, "entry_final_gate_max_skew_ms", 0) or 0),
             0,
         )
         skew_ms = abs(long_observed_at_ms - short_observed_at_ms)
@@ -603,13 +570,7 @@ class EntryDispatchRuntime:
             "ts_ms": now_ms,
         }
 
-    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
-        """Transform a tradeable candidate into an entry context and execute via entry_executor.
-
-        V1: entry route/maker-leg/price gate from config and execution planner.
-        Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
-        Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
-        """
+    def _entry_initial_gate_blocked(self, candidate, now_ms: int) -> bool:
         admission_block = self._candidate_admission_block(candidate, now_ms)
         if admission_block:
             pair_id = self._candidate_pair_id(candidate)
@@ -624,14 +585,14 @@ class EntryDispatchRuntime:
             if payload.get("source"):
                 payload["cooldown_source"] = payload["source"]
             payload["source"] = "initial_entry"
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_admission_blocked",
                 payload,
             )
-            return False
+            return True
 
         if not self._candidate_is_tradeable_for_selection(candidate):
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_blocked_trading_capability",
                 {
                     "symbol": getattr(candidate, "symbol", ""),
@@ -641,17 +602,17 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return True
 
         decision = V1TradingLifecycle.entry_admissibility(
             candidate,
             now_ms=now_ms,
-            strategy=self.config.strategy,
+            strategy=self.ctx.config.strategy,
             recovery_ledger=getattr(self, "recovery_ledger", None),
             source="dispatch",
         )
         if not decision.allowed:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_blocked_lifecycle",
                 {
                     "symbol": getattr(candidate, "symbol", ""),
@@ -662,7 +623,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return True
 
         # V1: apply_runtime_entry_guards — 8+ gate checks before entry
         gates = [
@@ -678,12 +639,12 @@ class EntryDispatchRuntime:
         for gate_name, gate_fn, gate_args in gates:
             allowed, reason = gate_fn(candidate, *gate_args)
             if not allowed:
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
                 )
                 # V1: review.candidate_rejected — per-candidate rejection logging
-                self.journal.append(
+                self.ctx.journal.append(
                     "review.candidate_rejected",
                     {
                         "symbol": candidate.symbol,
@@ -697,8 +658,15 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
-                return False
+                return True
+        return False
 
+    def _entry_price_resolution(
+        self,
+        candidate,
+        now_ms: int,
+        price_hint: float,
+    ) -> tuple[float, float, float, Any] | None:
         quote_lease = None
         quote_lease_evidence: dict = {}
         quote_lease_reason, quote_lease, quote_lease_evidence = (
@@ -720,8 +688,8 @@ class EntryDispatchRuntime:
                 "reason": quote_lease_reason,
                 "ts_ms": now_ms,
             }
-            self.journal.append("runtime.entry_blocked_quote_lease", payload)
-            self.journal.append(
+            self.ctx.journal.append("runtime.entry_blocked_quote_lease", payload)
+            self.ctx.journal.append(
                 "review.candidate_rejected",
                 {
                     "symbol": candidate.symbol,
@@ -735,7 +703,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return None
         long_order_price_hint = price_hint
         short_order_price_hint = price_hint
         if quote_lease is not None:
@@ -749,7 +717,7 @@ class EntryDispatchRuntime:
 
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_skipped_no_quote",
                 {
                     "symbol": candidate.symbol,
@@ -758,7 +726,7 @@ class EntryDispatchRuntime:
                     "reason": "no valid quote to construct entry — V1 rejects",
                 },
             )
-            self.journal.append(
+            self.ctx.journal.append(
                 "review.candidate_rejected",
                 {
                     "symbol": candidate.symbol,
@@ -770,11 +738,18 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return None
+        return price_hint, long_order_price_hint, short_order_price_hint, quote_lease
 
-        # Resolve venue enums from candidate string fields
-        long_venue = Venue.from_str(candidate.long_venue)
-        short_venue = Venue.from_str(candidate.short_venue)
+    async def _resolve_entry_quantity_steps(
+        self,
+        *,
+        candidate,
+        long_venue: Venue,
+        short_venue: Venue,
+        price_hint: float,
+        now_ms: int,
+    ) -> tuple[float, float, float, float | None, float | None] | None:
         raw_quantity = candidate.entry_notional_quote / price_hint
         quantity = raw_quantity
         quantity, okx_base_step = await self._okx_aligned_entry_quantity(
@@ -785,7 +760,7 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
         )
         if okx_base_step is None:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_skipped_okx_contract_metadata_missing",
                 {
                     "symbol": candidate.symbol,
@@ -796,9 +771,9 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return None
         if quantity <= 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_skipped_okx_contract_step",
                 {
                     "symbol": candidate.symbol,
@@ -810,7 +785,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return None
 
         long_quantity_step, long_missing_quantity_fields = await self._entry_venue_quantity_metadata(
             long_venue,
@@ -844,7 +819,7 @@ class EntryDispatchRuntime:
                 missing_fields[short_venue.value] = (
                     short_missing_quantity_fields or ["quantity_step"]
                 )
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_skipped_quantity_metadata_missing",
                 {
                     "symbol": candidate.symbol,
@@ -858,399 +833,184 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            return False
+            return None
+        return raw_quantity, quantity, okx_base_step, long_quantity_step, short_quantity_step
 
-        # V1 runtime entry guards (apply_runtime_entry_guards)
-        gate_checks = [
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation),
-            ("passive_close_pending", self._gate_passive_close_pending),
-            ("reduce_only", self._gate_reduce_only),
-            ("venue_cooldown", self._gate_venue_cooldown),
-            ("zero_fill_cooldown", self._gate_zero_fill_cooldown),
-        ]
-        for gate_name, gate_fn in gate_checks:
-            allowed, reason = gate_fn(candidate, now_ms) if gate_name in ("venue_cooldown", "zero_fill_cooldown") else gate_fn(candidate)
-            if not allowed:
-                self.journal.append(
-                    "runtime.entry_blocked_gate",
-                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
-                )
-                return False
-
+    def _entry_local_l2_gate_blocked(
+        self,
+        *,
+        candidate,
+        long_venue: Venue,
+        short_venue: Venue,
+        now_ms: int,
+    ) -> bool:
         # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
         # but either leg's book is not ready (stale, degraded, cold, etc.)
-        if self._local_l2_effective_enabled():
-            from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
+        if not self._local_l2_effective_enabled():
+            return False
 
-            long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-            short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
+        from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
-            not_ready_reasons: list[str] = []
-            l2_stale_decisions: list[dict] = []
-            max_age_ms = self.config.strategy.max_liquidity_snapshot_age_ms
-            if long_book is None:
+        long_book = self.ctx.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
+        short_book = self.ctx.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
+
+        not_ready_reasons: list[str] = []
+        l2_stale_decisions: list[dict] = []
+        max_age_ms = self.ctx.config.strategy.max_liquidity_snapshot_age_ms
+        if long_book is None:
+            not_ready_reasons.append(
+                f"long book missing: {long_venue.value}:{candidate.symbol} "
+                f"max_age_ms={max_age_ms}"
+            )
+            l2_stale_decisions.append({
+                "venue": long_venue.value,
+                "symbol": candidate.symbol,
+                "domain": "execution_l2",
+                "source": "local_l2",
+                "observed_at_ms": 0,
+                "age_ms": 0,
+                "budget_ms": max_age_ms,
+                "decision": "skip_entry",
+                "fallback_source": "none",
+                "reason": "execution_l2_stale",
+                "l2_reason": "missing_book",
+                "blocking": True,
+            })
+        else:
+            liq = execution_liquidity_from_local_l2(
+                long_book, max_age_ms=max_age_ms,
+                now_ms=now_ms, require_ready=True,
+            )
+            long_age_ms = long_book.age_ms(now_ms)
+            if not liq.book_ready:
                 not_ready_reasons.append(
-                    f"long book missing: {long_venue.value}:{candidate.symbol} "
-                    f"max_age_ms={max_age_ms}"
+                    f"long leg not ready: {long_venue.value}:{candidate.symbol} "
+                    f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
+                    f"age={long_age_ms}ms max_age_ms={max_age_ms}"
                 )
                 l2_stale_decisions.append({
                     "venue": long_venue.value,
                     "symbol": candidate.symbol,
                     "domain": "execution_l2",
                     "source": "local_l2",
-                    "observed_at_ms": 0,
-                    "age_ms": 0,
+                    "observed_at_ms": int(getattr(long_book, "observed_at_ms", 0) or 0),
+                    "age_ms": int(long_age_ms),
                     "budget_ms": max_age_ms,
                     "decision": "skip_entry",
                     "fallback_source": "none",
                     "reason": "execution_l2_stale",
-                    "l2_reason": "missing_book",
+                    "l2_reason": liq.fallback_reason or "book_not_ready",
+                    "book_status": long_book.status.value,
                     "blocking": True,
                 })
-            else:
-                liq = execution_liquidity_from_local_l2(
-                    long_book, max_age_ms=max_age_ms,
-                    now_ms=now_ms, require_ready=True,
-                )
-                long_age_ms = long_book.age_ms(now_ms)
-                if not liq.book_ready:
-                    not_ready_reasons.append(
-                        f"long leg not ready: {long_venue.value}:{candidate.symbol} "
-                        f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
-                        f"age={long_age_ms}ms max_age_ms={max_age_ms}"
-                    )
-                    l2_stale_decisions.append({
-                        "venue": long_venue.value,
-                        "symbol": candidate.symbol,
-                        "domain": "execution_l2",
-                        "source": "local_l2",
-                        "observed_at_ms": int(getattr(long_book, "observed_at_ms", 0) or 0),
-                        "age_ms": int(long_age_ms),
-                        "budget_ms": max_age_ms,
-                        "decision": "skip_entry",
-                        "fallback_source": "none",
-                        "reason": "execution_l2_stale",
-                        "l2_reason": liq.fallback_reason or "book_not_ready",
-                        "book_status": long_book.status.value,
-                        "blocking": True,
-                    })
 
-            if short_book is None:
+        if short_book is None:
+            not_ready_reasons.append(
+                f"short book missing: {short_venue.value}:{candidate.symbol} "
+                f"max_age_ms={max_age_ms}"
+            )
+            l2_stale_decisions.append({
+                "venue": short_venue.value,
+                "symbol": candidate.symbol,
+                "domain": "execution_l2",
+                "source": "local_l2",
+                "observed_at_ms": 0,
+                "age_ms": 0,
+                "budget_ms": max_age_ms,
+                "decision": "skip_entry",
+                "fallback_source": "none",
+                "reason": "execution_l2_stale",
+                "l2_reason": "missing_book",
+                "blocking": True,
+            })
+        else:
+            liq = execution_liquidity_from_local_l2(
+                short_book, max_age_ms=max_age_ms,
+                now_ms=now_ms, require_ready=True,
+            )
+            short_age_ms = short_book.age_ms(now_ms)
+            if not liq.book_ready:
                 not_ready_reasons.append(
-                    f"short book missing: {short_venue.value}:{candidate.symbol} "
-                    f"max_age_ms={max_age_ms}"
+                    f"short leg not ready: {short_venue.value}:{candidate.symbol} "
+                    f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
+                    f"age={short_age_ms}ms max_age_ms={max_age_ms}"
                 )
                 l2_stale_decisions.append({
                     "venue": short_venue.value,
                     "symbol": candidate.symbol,
                     "domain": "execution_l2",
                     "source": "local_l2",
-                    "observed_at_ms": 0,
-                    "age_ms": 0,
+                    "observed_at_ms": int(getattr(short_book, "observed_at_ms", 0) or 0),
+                    "age_ms": int(short_age_ms),
                     "budget_ms": max_age_ms,
                     "decision": "skip_entry",
                     "fallback_source": "none",
                     "reason": "execution_l2_stale",
-                    "l2_reason": "missing_book",
+                    "l2_reason": liq.fallback_reason or "book_not_ready",
+                    "book_status": short_book.status.value,
                     "blocking": True,
                 })
-            else:
-                liq = execution_liquidity_from_local_l2(
-                    short_book, max_age_ms=max_age_ms,
-                    now_ms=now_ms, require_ready=True,
-                )
-                short_age_ms = short_book.age_ms(now_ms)
-                if not liq.book_ready:
-                    not_ready_reasons.append(
-                        f"short leg not ready: {short_venue.value}:{candidate.symbol} "
-                        f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
-                        f"age={short_age_ms}ms max_age_ms={max_age_ms}"
-                    )
-                    l2_stale_decisions.append({
-                        "venue": short_venue.value,
-                        "symbol": candidate.symbol,
-                        "domain": "execution_l2",
-                        "source": "local_l2",
-                        "observed_at_ms": int(getattr(short_book, "observed_at_ms", 0) or 0),
-                        "age_ms": int(short_age_ms),
-                        "budget_ms": max_age_ms,
-                        "decision": "skip_entry",
-                        "fallback_source": "none",
-                        "reason": "execution_l2_stale",
-                        "l2_reason": liq.fallback_reason or "book_not_ready",
-                        "book_status": short_book.status.value,
-                        "blocking": True,
-                    })
 
-            if not_ready_reasons:
-                pair_id = self._candidate_pair_id(candidate)
-                for payload in l2_stale_decisions:
-                    payload = dict(payload)
-                    payload["pair_id"] = pair_id
-                    payload["ts_ms"] = now_ms
-                    self.journal.append("runtime.snapshot_freshness_decision", payload)
-                    self.journal.append("runtime.execution_l2_stale", payload)
-                self.journal.append(
-                    "runtime.entry_blocked_local_l2_not_ready",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "reasons": not_ready_reasons,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-
-            skew_blocker = self._entry_final_gate_skew_blocker(
-                candidate,
-                long_venue=long_venue,
-                short_venue=short_venue,
-                now_ms=now_ms,
-            )
-            if skew_blocker is not None:
-                self.journal.append("runtime.entry_blocked_final_gate", skew_blocker)
-                self.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "rejected_stage": "entry_final_gate",
-                        "rejected_reason": skew_blocker["reason"],
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-
-        # V1 entry route planning: derive route and maker leg from execution planner.
-        # Strategy config provides min-notional; venue-specific chunk/min-notional
-        # are resolved from the adapter or spec when available.
-        strategy = self.config.strategy
-        min_notional = strategy.min_entry_leg_notional_quote
-        # V1: maker leg from strategy config (funding arb: long side is typically maker)
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
-        if quote_lease is not None:
-            if maker_leg == Side.BUY:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_bid", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_bid", 0.0) or 0.0
-                )
-            else:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_ask", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_ask", 0.0) or 0.0
-                )
-        maker_planner_price = (
-            long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
-        )
-        hedge_planner_price = (
-            short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
-        )
-
-        # V1: min_hedgeable_chunk aligns to venue step and notional floor
-        min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
-        if okx_base_step and okx_base_step > 0:
-            min_hedgeable_chunk = max(min_hedgeable_chunk, okx_base_step)
-
-        route, plan = plan_incremental_entry_execution(
-            target_quantity=quantity,
-            slice_ratio=strategy.maker_initial_slice_ratio,
-            min_hedgeable_chunk=min_hedgeable_chunk,
-            maker_min_notional_quote=min_notional,
-            maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
-            max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
-            hedge_min_notional_quote=min_notional,
-            hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
-        )
-
-        if route == ExecutionRoute.REJECTED:
-            self.journal.append(
-                "runtime.entry_skipped_planner_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "target_quantity": quantity,
-                    "reason": plan.reason or "planner rejected entry",
-                },
-            )
-            return False
-
-        if (
-            okx_base_step is not None
-            and okx_base_step > 0
-            and route == ExecutionRoute.PASSIVE_INCREMENTAL
-            and plan.full_target_quantity > 0
-        ):
-            plan.initial_maker_target_quantity = plan.full_target_quantity
-
-        # Map planner route to EntryType
-        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
-            entry_type = EntryType.PASSIVE_INCREMENTAL
-            effective_quantity = plan.initial_maker_target_quantity
-        elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-        else:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-
-        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            long_order_price_hint = float(
-                getattr(quote_lease, "long_ask", 0.0) or 0.0
-            )
-            short_order_price_hint = float(
-                getattr(quote_lease, "short_bid", 0.0) or 0.0
-            )
-
-        entry_id = f"entry-{now_ms}-{candidate.symbol}"
-
-        # --- V1 recovery dedup: check for duplicate entries after restart ---
-        # Must use the same CID generation as build_entry_orders so the
-        # dedup index keys match the actual on-wire clientOrderId.
-        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
-        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
-        maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
-        hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
-        self.journal.append(
-            "execution.entry_quantity_plan",
-            {
-                "entry_id": entry_id,
-                "symbol": candidate.symbol,
-                "long_venue": long_venue.value,
-                "short_venue": short_venue.value,
-                "raw_quantity": raw_quantity,
-                "common_quantity": quantity,
-                "full_target_quantity": plan.full_target_quantity,
-                "initial_maker_target_quantity": plan.initial_maker_target_quantity,
-                "effective_quantity": effective_quantity,
-                "route": route.value,
-                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
-                "min_hedgeable_chunk": min_hedgeable_chunk,
-                "okx_base_quantity_step": okx_base_step,
-                "venue_quantity_steps": {
-                    long_venue.value: long_quantity_step or 0.0,
-                    short_venue.value: short_quantity_step or 0.0,
-                },
-                "ts_ms": now_ms,
-            },
-        )
-
-        if is_client_order_id_duplicate(maker_cid, self._recovery_dedup_index):
-            self.journal.append(
-                "runtime.entry_skipped_duplicate_client_order_id",
-                {
-                    "entry_id": entry_id,
-                    "client_order_id": maker_cid,
-                    "reason": "duplicate maker clientOrderId in recovery dedup index",
-                },
-            )
-            return False
-
-        if is_client_order_id_duplicate(hedge_cid, self._recovery_dedup_index):
-            self.journal.append(
-                "runtime.entry_skipped_duplicate_client_order_id",
-                {
-                    "entry_id": entry_id,
-                    "client_order_id": hedge_cid,
-                    "reason": "duplicate hedge clientOrderId in recovery dedup index",
-                },
-            )
-            return False
-
-        # Check for existing pending entry on same symbol pair
-        if has_pending_entry_for_symbol(
-            self.state, candidate.symbol,
-            long_venue.value, short_venue.value,
-        ):
-            self.journal.append(
-                "runtime.entry_skipped_existing_pending",
+        if not_ready_reasons:
+            pair_id = self._candidate_pair_id(candidate)
+            for payload in l2_stale_decisions:
+                payload = dict(payload)
+                payload["pair_id"] = pair_id
+                payload["ts_ms"] = now_ms
+                self.ctx.journal.append("runtime.snapshot_freshness_decision", payload)
+                self.ctx.journal.append("runtime.execution_l2_stale", payload)
+            self.ctx.journal.append(
+                "runtime.entry_blocked_local_l2_not_ready",
                 {
                     "symbol": candidate.symbol,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "reason": "pending entry already exists for this symbol pair",
+                    "reasons": not_ready_reasons,
+                    "ts_ms": now_ms,
                 },
             )
-            return False
+            return True
 
-        if not await self._precheck_bybit_entry_admission(
-            candidate=candidate,
-            now_ms=now_ms,
+        skew_blocker = self._entry_final_gate_skew_blocker(
+            candidate,
             long_venue=long_venue,
             short_venue=short_venue,
-            quantity=effective_quantity,
-            long_order_price_hint=long_order_price_hint,
-            short_order_price_hint=short_order_price_hint,
-            maker_venue=maker_venue,
-            entry_type=entry_type,
-            maker_client_order_id=maker_cid,
-            hedge_client_order_id=hedge_cid,
-        ):
-            return False
-
-        maker_bbo_evidence: dict = {}
-        if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
-            maker_order_price_hint = (
-                long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
-            )
-            bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
-                venue=maker_venue,
-                symbol=candidate.symbol,
-                side=maker_leg,
-                price=maker_order_price_hint,
-                now_ms=now_ms,
-            )
-            if not bbo_ok:
-                payload = {
-                    **maker_bbo_evidence,
+            now_ms=now_ms,
+        )
+        if skew_blocker is not None:
+            self.ctx.journal.append("runtime.entry_blocked_final_gate", skew_blocker)
+            self.ctx.journal.append(
+                "review.candidate_rejected",
+                {
+                    "symbol": candidate.symbol,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "reason": bbo_reason,
+                    "rejected_stage": "entry_final_gate",
+                    "rejected_reason": skew_blocker["reason"],
+                    "ranking_edge_bps": candidate.ranking_edge_bps,
+                    "expected_edge_bps": candidate.expected_edge_bps,
+                    "funding_edge_bps": candidate.funding_edge_bps,
                     "ts_ms": now_ms,
-                }
-                self.journal.append("runtime.entry_blocked_post_only_bbo", payload)
-                self.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "rejected_stage": "post_only_bbo_gate",
-                        "rejected_reason": bbo_reason,
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-            repriced_price = float(
-                maker_bbo_evidence.get("repriced_price", 0.0) or 0.0
+                },
             )
-            if repriced_price > 0.0:
-                maker_order_price_hint = repriced_price
-                if maker_leg == Side.BUY:
-                    long_order_price_hint = repriced_price
-                else:
-                    short_order_price_hint = repriced_price
-                self.journal.append(
-                    "runtime.entry_post_only_bbo_repriced",
-                    {
-                        **maker_bbo_evidence,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "reason": "post_only_would_cross_repriced",
-                        "ts_ms": now_ms,
-                    },
-                )
+            return True
+        return False
 
+    def _build_entry_context(
+        self,
+        *,
+        candidate,
+        entry_id: str,
+        long_venue: Venue,
+        short_venue: Venue,
+        effective_quantity: float,
+        long_order_price_hint: float,
+        short_order_price_hint: float,
+        maker_leg: Side,
+        entry_type: EntryType,
+        route: ExecutionRoute,
+        now_ms: int,
+    ) -> EntryContext:
         def _positive_ms(value) -> int:
             try:
                 parsed = int(value or 0)
@@ -1317,7 +1077,7 @@ class EntryDispatchRuntime:
         )
         exit_after_first_stage = (
             opportunity_type == "staggered"
-            and str(getattr(self.config.strategy, "staggered_exit_mode", "") or "").lower()
+            and str(getattr(self.ctx.config.strategy, "staggered_exit_mode", "") or "").lower()
             == "after_first_stage"
         )
 
@@ -1378,7 +1138,7 @@ class EntryDispatchRuntime:
         )
 
         # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
-        self.journal.append(
+        self.ctx.journal.append(
             "review.candidate_shortlisted",
             {
                 "symbol": candidate.symbol,
@@ -1402,36 +1162,50 @@ class EntryDispatchRuntime:
                 "ts_ms": now_ms,
             },
         )
+        return ctx
 
+    async def _execute_entry_context(
+        self,
+        *,
+        ctx: EntryContext,
+        candidate,
+        route: ExecutionRoute,
+        effective_quantity: float,
+        price_hint: float,
+        maker_venue: Venue,
+        maker_leg: Side,
+        maker_bbo_evidence: dict,
+        now_ms: int,
+    ) -> bool:
         try:
             # V1: execution.entry_selected — engine decided to open this candidate
-            self.journal.append(
+            self.ctx.journal.append(
                 "execution.entry_selected",
                 {
                     "symbol": candidate.symbol,
-                    "entry_id": entry_id,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
+                    "entry_id": ctx.entry_id,
+                    "long_venue": ctx.long_venue.value,
+                    "short_venue": ctx.short_venue.value,
                     "quantity": effective_quantity,
                     "route": route.value,
                     "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                     "price_hint": price_hint,
-                    "opportunity_type": opportunity_type,
-                    "funding_timestamp_ms": funding_timestamp_ms,
-                    "first_funding_timestamp_ms": first_funding_timestamp_ms,
-                    "long_funding_timestamp_ms": long_funding_timestamp_ms,
-                    "short_funding_timestamp_ms": short_funding_timestamp_ms,
-                    "second_funding_timestamp_ms": second_funding_timestamp_ms,
-                    "first_funding_leg": first_funding_leg,
-                    "exit_after_first_stage": exit_after_first_stage,
-                    "funding_edge_bps_entry": funding_edge_bps_entry,
-                    "total_funding_edge_bps_entry": total_funding_edge_bps_entry,
-                    "expected_edge_bps_entry": expected_edge_bps_entry,
+                    "opportunity_type": ctx.opportunity_type,
+                    "funding_timestamp_ms": ctx.funding_timestamp_ms,
+                    "first_funding_timestamp_ms": ctx.first_funding_timestamp_ms,
+                    "long_funding_timestamp_ms": ctx.long_funding_timestamp_ms,
+                    "short_funding_timestamp_ms": ctx.short_funding_timestamp_ms,
+                    "second_funding_timestamp_ms": ctx.second_funding_timestamp_ms,
+                    "first_funding_leg": ctx.first_funding_leg,
+                    "exit_after_first_stage": ctx.exit_after_first_stage,
+                    "funding_edge_bps_entry": ctx.funding_edge_bps_entry,
+                    "total_funding_edge_bps_entry": ctx.total_funding_edge_bps_entry,
+                    "expected_edge_bps_entry": ctx.expected_edge_bps_entry,
                     "ts_ms": now_ms,
                 },
             )
-            result = await self.entry_executor.execute(ctx)
-            self.journal.append(
+            result = await self.ctx.entry_executor.execute(ctx)
+            self.ctx.journal.append(
                 "runtime.entry_dispatched",
                 {
                     "entry_id": ctx.entry_id,
@@ -1458,8 +1232,8 @@ class EntryDispatchRuntime:
                 )
                 return True
             if result.open_position is not None:
-                self.state.open_positions[result.open_position.position_id] = result.open_position
-                self.journal.append(
+                self.ctx.state.open_positions[result.open_position.position_id] = result.open_position
+                self.ctx.journal.append(
                     "runtime.position_opened",
                     {"position_id": result.open_position.position_id},
                 )
@@ -1471,7 +1245,7 @@ class EntryDispatchRuntime:
                 )
             if result.pending_entry is not None:
                 if getattr(result.pending_entry, "outcome", "") == "rejected":
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "runtime.rejected_pending_suppressed",
                         {
                             "pending_id": result.pending_entry.pending_id,
@@ -1485,7 +1259,7 @@ class EntryDispatchRuntime:
                 # Track pending entry for reconciliation
                 if getattr(result.pending_entry, "created_cycle", 0) == 0:
                     result.pending_entry.created_cycle = int(
-                        getattr(self.state, "tick_count", 0) or 0
+                        getattr(self.ctx.state, "tick_count", 0) or 0
                     )
                 if getattr(result.pending_entry, "frozen_candidate", None) is None:
                     from dataclasses import asdict, is_dataclass
@@ -1496,10 +1270,10 @@ class EntryDispatchRuntime:
                         result.pending_entry.frozen_candidate = dict(
                             getattr(candidate, "__dict__", {}) or {}
                         )
-                self.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
-                self._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
-                self._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
-                self.journal.append(
+                self.ctx.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
+                self.ctx._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
+                self.ctx._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
+                self.ctx.journal.append(
                     "runtime.pending_entry_registered",
                     {
                         "pending_id": result.pending_entry.pending_id,
@@ -1534,10 +1308,315 @@ class EntryDispatchRuntime:
                     error_text,
                     now_ms,
                 )
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_dispatch_error",
                 {"entry_id": ctx.entry_id, "error": error_text},
             )
             return False
 
         return True
+
+    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
+        """Transform a tradeable candidate into an entry context and execute via entry_executor.
+
+        V1: entry route/maker-leg/price gate from config and execution planner.
+        Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
+        Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
+        """
+        if self._entry_initial_gate_blocked(candidate, now_ms):
+            return False
+
+        price_resolution = self._entry_price_resolution(candidate, now_ms, price_hint)
+        if price_resolution is None:
+            return False
+        price_hint, long_order_price_hint, short_order_price_hint, quote_lease = price_resolution
+
+        # Resolve venue enums from candidate string fields
+        long_venue = Venue.from_str(candidate.long_venue)
+        short_venue = Venue.from_str(candidate.short_venue)
+        quantity_resolution = await self._resolve_entry_quantity_steps(
+            candidate=candidate,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            price_hint=price_hint,
+            now_ms=now_ms,
+        )
+        if quantity_resolution is None:
+            return False
+        raw_quantity, quantity, okx_base_step, long_quantity_step, short_quantity_step = quantity_resolution
+
+        # V1 runtime entry guards (apply_runtime_entry_guards)
+        gate_checks = [
+            ("pending_close_reconciliation", self._gate_pending_close_reconciliation),
+            ("passive_close_pending", self._gate_passive_close_pending),
+            ("reduce_only", self._gate_reduce_only),
+            ("venue_cooldown", self._gate_venue_cooldown),
+            ("zero_fill_cooldown", self._gate_zero_fill_cooldown),
+        ]
+        for gate_name, gate_fn in gate_checks:
+            allowed, reason = gate_fn(candidate, now_ms) if gate_name in ("venue_cooldown", "zero_fill_cooldown") else gate_fn(candidate)
+            if not allowed:
+                self.ctx.journal.append(
+                    "runtime.entry_blocked_gate",
+                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
+                )
+                return False
+
+        if self._entry_local_l2_gate_blocked(
+            candidate=candidate,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            now_ms=now_ms,
+        ):
+            return False
+
+        # V1 entry route planning: derive route and maker leg from execution planner.
+        # Strategy config provides min-notional; venue-specific chunk/min-notional
+        # are resolved from the adapter or spec when available.
+        strategy = self.ctx.config.strategy
+        min_notional = strategy.min_entry_leg_notional_quote
+        # V1: maker leg from strategy config (funding arb: long side is typically maker)
+        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        if quote_lease is not None:
+            if maker_leg == Side.BUY:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_bid", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_bid", 0.0) or 0.0
+                )
+            else:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_ask", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_ask", 0.0) or 0.0
+                )
+        maker_planner_price = (
+            long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
+        )
+        hedge_planner_price = (
+            short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
+        )
+
+        # V1: min_hedgeable_chunk aligns to venue step and notional floor
+        min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
+        if okx_base_step and okx_base_step > 0:
+            min_hedgeable_chunk = max(min_hedgeable_chunk, okx_base_step)
+
+        route, plan = plan_incremental_entry_execution(
+            target_quantity=quantity,
+            slice_ratio=strategy.maker_initial_slice_ratio,
+            min_hedgeable_chunk=min_hedgeable_chunk,
+            maker_min_notional_quote=min_notional,
+            maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
+            max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
+            hedge_min_notional_quote=min_notional,
+            hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
+        )
+
+        if route == ExecutionRoute.REJECTED:
+            self.ctx.journal.append(
+                "runtime.entry_skipped_planner_rejected",
+                {
+                    "symbol": candidate.symbol,
+                    "target_quantity": quantity,
+                    "reason": plan.reason or "planner rejected entry",
+                },
+            )
+            return False
+
+        if (
+            okx_base_step is not None
+            and okx_base_step > 0
+            and route == ExecutionRoute.PASSIVE_INCREMENTAL
+            and plan.full_target_quantity > 0
+        ):
+            plan.initial_maker_target_quantity = plan.full_target_quantity
+
+        # Map planner route to EntryType
+        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
+            entry_type = EntryType.PASSIVE_INCREMENTAL
+            effective_quantity = plan.initial_maker_target_quantity
+        elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
+            entry_type = EntryType.STANDARD_DUAL_TAKER
+            effective_quantity = plan.full_target_quantity
+        else:
+            entry_type = EntryType.STANDARD_DUAL_TAKER
+            effective_quantity = plan.full_target_quantity
+
+        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
+            long_order_price_hint = float(
+                getattr(quote_lease, "long_ask", 0.0) or 0.0
+            )
+            short_order_price_hint = float(
+                getattr(quote_lease, "short_bid", 0.0) or 0.0
+            )
+
+        entry_id = f"entry-{now_ms}-{candidate.symbol}"
+
+        # --- V1 recovery dedup: check for duplicate entries after restart ---
+        # Must use the same CID generation as build_entry_orders so the
+        # dedup index keys match the actual on-wire clientOrderId.
+        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
+        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
+        maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
+        hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
+        self.ctx.journal.append(
+            "execution.entry_quantity_plan",
+            {
+                "entry_id": entry_id,
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "raw_quantity": raw_quantity,
+                "common_quantity": quantity,
+                "full_target_quantity": plan.full_target_quantity,
+                "initial_maker_target_quantity": plan.initial_maker_target_quantity,
+                "effective_quantity": effective_quantity,
+                "route": route.value,
+                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
+                "min_hedgeable_chunk": min_hedgeable_chunk,
+                "okx_base_quantity_step": okx_base_step,
+                "venue_quantity_steps": {
+                    long_venue.value: long_quantity_step or 0.0,
+                    short_venue.value: short_quantity_step or 0.0,
+                },
+                "ts_ms": now_ms,
+            },
+        )
+
+        if is_client_order_id_duplicate(maker_cid, self.ctx._recovery_dedup_index):
+            self.ctx.journal.append(
+                "runtime.entry_skipped_duplicate_client_order_id",
+                {
+                    "entry_id": entry_id,
+                    "client_order_id": maker_cid,
+                    "reason": "duplicate maker clientOrderId in recovery dedup index",
+                },
+            )
+            return False
+
+        if is_client_order_id_duplicate(hedge_cid, self.ctx._recovery_dedup_index):
+            self.ctx.journal.append(
+                "runtime.entry_skipped_duplicate_client_order_id",
+                {
+                    "entry_id": entry_id,
+                    "client_order_id": hedge_cid,
+                    "reason": "duplicate hedge clientOrderId in recovery dedup index",
+                },
+            )
+            return False
+
+        # Check for existing pending entry on same symbol pair
+        if has_pending_entry_for_symbol(
+            self.ctx.state, candidate.symbol,
+            long_venue.value, short_venue.value,
+        ):
+            self.ctx.journal.append(
+                "runtime.entry_skipped_existing_pending",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "reason": "pending entry already exists for this symbol pair",
+                },
+            )
+            return False
+
+        if not await self._precheck_bybit_entry_admission(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            quantity=effective_quantity,
+            long_order_price_hint=long_order_price_hint,
+            short_order_price_hint=short_order_price_hint,
+            maker_venue=maker_venue,
+            entry_type=entry_type,
+            maker_client_order_id=maker_cid,
+            hedge_client_order_id=hedge_cid,
+        ):
+            return False
+
+        maker_bbo_evidence: dict = {}
+        if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
+            maker_order_price_hint = (
+                long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
+            )
+            bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
+                venue=maker_venue,
+                symbol=candidate.symbol,
+                side=maker_leg,
+                price=maker_order_price_hint,
+                now_ms=now_ms,
+            )
+            if not bbo_ok:
+                payload = {
+                    **maker_bbo_evidence,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "reason": bbo_reason,
+                    "ts_ms": now_ms,
+                }
+                self.ctx.journal.append("runtime.entry_blocked_post_only_bbo", payload)
+                self.ctx.journal.append(
+                    "review.candidate_rejected",
+                    {
+                        "symbol": candidate.symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "rejected_stage": "post_only_bbo_gate",
+                        "rejected_reason": bbo_reason,
+                        "ranking_edge_bps": candidate.ranking_edge_bps,
+                        "expected_edge_bps": candidate.expected_edge_bps,
+                        "funding_edge_bps": candidate.funding_edge_bps,
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+            repriced_price = float(
+                maker_bbo_evidence.get("repriced_price", 0.0) or 0.0
+            )
+            if repriced_price > 0.0:
+                maker_order_price_hint = repriced_price
+                if maker_leg == Side.BUY:
+                    long_order_price_hint = repriced_price
+                else:
+                    short_order_price_hint = repriced_price
+                self.ctx.journal.append(
+                    "runtime.entry_post_only_bbo_repriced",
+                    {
+                        **maker_bbo_evidence,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "reason": "post_only_would_cross_repriced",
+                        "ts_ms": now_ms,
+                    },
+                )
+
+        ctx = self._build_entry_context(
+            candidate=candidate,
+            entry_id=entry_id,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            effective_quantity=effective_quantity,
+            long_order_price_hint=long_order_price_hint,
+            short_order_price_hint=short_order_price_hint,
+            maker_leg=maker_leg,
+            entry_type=entry_type,
+            route=route,
+            now_ms=now_ms,
+        )
+
+        return await self._execute_entry_context(
+            ctx=ctx,
+            candidate=candidate,
+            route=route,
+            effective_quantity=effective_quantity,
+            price_hint=price_hint,
+            maker_venue=maker_venue,
+            maker_leg=maker_leg,
+            maker_bbo_evidence=maker_bbo_evidence,
+            now_ms=now_ms,
+        )

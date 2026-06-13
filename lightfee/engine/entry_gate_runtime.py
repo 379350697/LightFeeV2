@@ -11,7 +11,7 @@ from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import AccountBalanceSnapshot, Venue
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.runtime_context import EntryGateRuntimeContext
 from lightfee.risk.modes import EngineLifecycle
 
 
@@ -22,48 +22,12 @@ def wall_clock_now_ms() -> int:
 
 
 class EntryGateRuntime:
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: EntryGateRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def snapshot_store(self):
-        return self.ctx.snapshot_store
-
-    @property
-    def entry_readiness_provider(self):
-        return self.ctx.entry_readiness_provider
-
-    @property
-    def entry_l2_sessions(self):
-        return self.ctx.entry_l2_sessions
-
-    @property
-    def local_l2_runtime(self):
-        return self.ctx.local_l2_runtime
-
-    @property
-    def ws_bbo_cache(self):
-        return self.ctx.ws_bbo_cache
 
     @property
     def recovery_ledger(self):
         return getattr(self.ctx, "recovery_ledger", None)
-
-    @property
-    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
-        return self.ctx.venue_adapters
 
     @property
     def _tracked_primary_pair_ids(self) -> set[str]:
@@ -361,7 +325,7 @@ class EntryGateRuntime:
         evidence = self._entry_admission_evidence(reason)
         try:
             live_target_leverage = float(
-                getattr(self.config.strategy, "live_target_leverage", 1.0) or 1.0
+                getattr(self.ctx.config.strategy, "live_target_leverage", 1.0) or 1.0
             )
         except (TypeError, ValueError):
             live_target_leverage = 1.0
@@ -453,7 +417,7 @@ class EntryGateRuntime:
         try:
             entry_notional = float(
                 getattr(
-                    self.config.strategy,
+                    self.ctx.config.strategy,
                     "fixed_live_entry_notional_quote",
                     0.0,
                 ) or 0.0
@@ -689,7 +653,7 @@ class EntryGateRuntime:
             state_until_ms = 0
             for state_key in (f"{venue.value}:{symbol}", f"{venue.value}:*"):
                 candidate_payload = dict(
-                    self.state.venue_entry_cooldowns.get(state_key, {}) or {}
+                    self.ctx.state.venue_entry_cooldowns.get(state_key, {}) or {}
                 )
                 try:
                     candidate_until_ms = int(
@@ -865,7 +829,7 @@ class EntryGateRuntime:
         """
         self._last_candidate_catalog_filter_blockers = Counter()
         self._last_candidate_catalog_filter_samples = []
-        if self.config.runtime.mode == "paper":
+        if self.ctx.config.runtime.mode == "paper":
             return list(candidates)
 
         venue_symbols: dict[Venue, set[str]] = {}
@@ -940,7 +904,7 @@ class EntryGateRuntime:
             }
             if len(self._last_candidate_catalog_filter_samples) < 24:
                 self._last_candidate_catalog_filter_samples.append(sample_payload)
-            if getattr(self.journal, "_file", None) is not None:
+            if getattr(self.ctx.journal, "_file", None) is not None:
                 self._append_runtime_diagnostic_event(
                     skip_event_kind,
                     sample_payload,
@@ -955,8 +919,8 @@ class EntryGateRuntime:
                     interval_ms=self._CANDIDATE_SYMBOL_SKIPPED_LOG_INTERVAL_MS,
                 )
 
-        if skipped > 0 and getattr(self.journal, "_file", None) is not None:
-            self.journal.append(
+        if skipped > 0 and getattr(self.ctx.journal, "_file", None) is not None:
+            self.ctx.journal.append(
                 "runtime.tradeable_candidates_catalog_filtered",
                 {
                     "input_count": len(candidates),
@@ -975,10 +939,10 @@ class EntryGateRuntime:
         sym = getattr(candidate, 'symbol', '')
         long_v = getattr(candidate, 'long_venue', '')
         short_v = getattr(candidate, 'short_venue', '')
-        self.state.set_pending_close_reconciliations(
-            getattr(self.state, "pending_close_reconciliations", [])
+        self.ctx.state.set_pending_close_reconciliations(
+            getattr(self.ctx.state, "pending_close_reconciliations", [])
         )
-        for rec in self.state.pending_close_reconciliations:
+        for rec in self.ctx.state.pending_close_reconciliations:
             if not isinstance(rec, dict):
                 continue
             snapshot = rec.get("position_snapshot", {})
@@ -1002,8 +966,8 @@ class EntryGateRuntime:
         sym = getattr(candidate, 'symbol', '')
         long_v = getattr(candidate, 'long_venue', '')
         short_v = getattr(candidate, 'short_venue', '')
-        for pos_id in list(self.state.pending_passive_closes.keys()):
-            pos = self.state.open_positions.get(pos_id)
+        for pos_id in list(self.ctx.state.pending_passive_closes.keys()):
+            pos = self.ctx.state.open_positions.get(pos_id)
             if pos is None:
                 continue
             if getattr(pos, 'symbol', '') != sym:
@@ -1019,10 +983,10 @@ class EntryGateRuntime:
 
     def _gate_reduce_only(self, candidate) -> tuple[bool, str]:
         """Block new entry when lifecycle/risk mode is reduce-only or fail-closed."""
-        if self.state.lifecycle == EngineLifecycle.RISK_ONLY:
-            return False, f"lifecycle_{self.state.lifecycle.value}"
-        if self.state.risk_mode.value in ("reduce_only", "fail_closed"):
-            return False, f"risk_mode_{self.state.risk_mode.value}"
+        if self.ctx.state.lifecycle == EngineLifecycle.RISK_ONLY:
+            return False, f"lifecycle_{self.ctx.state.lifecycle.value}"
+        if self.ctx.state.risk_mode.value in ("reduce_only", "fail_closed"):
+            return False, f"risk_mode_{self.ctx.state.risk_mode.value}"
         return True, ""
 
     def _gate_venue_cooldown(self, candidate, now_ms: int) -> tuple[bool, str]:
@@ -1060,7 +1024,7 @@ class EntryGateRuntime:
         sym = getattr(candidate, 'symbol', '')
         long_v = getattr(candidate, 'long_venue', '')
         short_v = getattr(candidate, 'short_venue', '')
-        if has_pending_entry_for_symbol(self.state, sym, long_v, short_v):
+        if has_pending_entry_for_symbol(self.ctx.state, sym, long_v, short_v):
             return False, "pending_entry_protection"
         return True, ""
 
@@ -1087,13 +1051,13 @@ class EntryGateRuntime:
         )
 
         return EntryLiquidityQualificationState.from_records(
-            getattr(self.state, "entry_liquidity_qualification_records", []) or []
+            getattr(self.ctx.state, "entry_liquidity_qualification_records", []) or []
         )
 
     def _entry_liquidity_volume_floor_quote(self, venue: str) -> float:
         from lightfee.config.schema import V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
 
-        getter = getattr(self.config.strategy, "entry_volume_floor_quote", None)
+        getter = getattr(self.ctx.config.strategy, "entry_volume_floor_quote", None)
         if callable(getter):
             return float(getter(venue))
         return float(V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE)
@@ -1101,7 +1065,7 @@ class EntryGateRuntime:
     def _entry_liquidity_open_interest_floor_quote(self, venue: str) -> float:
         from lightfee.config.schema import V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE
 
-        getter = getattr(self.config.strategy, "entry_open_interest_floor_quote", None)
+        getter = getattr(self.ctx.config.strategy, "entry_open_interest_floor_quote", None)
         if callable(getter):
             return float(getter(venue))
         return float(V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE)
@@ -1175,9 +1139,9 @@ class EntryGateRuntime:
         fallback_source: str,
         record_result: bool = False,
     ) -> list[dict]:
-        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
             return []
-        if not bool(getattr(self.config.strategy, "execution_liquidity_enabled", True)):
+        if not bool(getattr(self.ctx.config.strategy, "execution_liquidity_enabled", True)):
             return []
 
         from lightfee.engine.entry_liquidity_qualification import (
@@ -1333,7 +1297,7 @@ class EntryGateRuntime:
                 )
 
         if record_result:
-            self.state.entry_liquidity_qualification_records = state.to_records()
+            self.ctx.state.entry_liquidity_qualification_records = state.to_records()
         return decisions
 
     def _compact_scan_no_entry_diagnostics_payload(
@@ -1397,7 +1361,7 @@ class EntryGateRuntime:
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
     ) -> None:
-        if getattr(self.journal, "_file", None) is None:
+        if getattr(self.ctx.journal, "_file", None) is None:
             return
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 
@@ -1564,12 +1528,12 @@ class EntryGateRuntime:
             ),
         }
         max_concurrent_positions = max(
-            int(getattr(self.config.strategy, "max_concurrent_positions", 0) or 0),
+            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
             1,
         )
-        open_position_count = len(self.state.open_positions)
+        open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
-        last_scan = self.state.last_scan if isinstance(self.state.last_scan, dict) else {}
+        last_scan = self.ctx.state.last_scan if isinstance(self.ctx.state.last_scan, dict) else {}
         quote_truth_payload = {
             "quote_truth_must_resolve_count": int(
                 last_scan.get("quote_truth_must_resolve_count", 0) or 0
@@ -1745,8 +1709,8 @@ class EntryGateRuntime:
             self._last_no_entry_diag_ts_ms = now_ms
             self._no_entry_suppressed_full_payload_count = 0
             self._last_no_entry_diagnostics = payload
-            if self.state.last_scan is not None:
-                self.state.last_scan.update({
+            if self.ctx.state.last_scan is not None:
+                self.ctx.state.last_scan.update({
                     "no_entry_reason": payload["reason"],
                     "max_concurrent_positions": payload["max_concurrent_positions"],
                     "open_position_count": payload["open_position_count"],
@@ -1760,7 +1724,7 @@ class EntryGateRuntime:
                         "candidate_stage_blocked_counts"
                     ],
                 })
-            self.journal.append("scan.no_entry_diagnostics", payload)
+            self.ctx.journal.append("scan.no_entry_diagnostics", payload)
             return
 
         self._no_entry_suppressed_full_payload_count += 1
@@ -1770,8 +1734,8 @@ class EntryGateRuntime:
         self._last_no_entry_diag_fingerprint = summary_fingerprint
         self._last_no_entry_diag_ts_ms = now_ms
         self._last_no_entry_diagnostics = payload
-        if self.state.last_scan is not None:
-            self.state.last_scan.update({
+        if self.ctx.state.last_scan is not None:
+            self.ctx.state.last_scan.update({
                 "no_entry_reason": payload["reason"],
                 "max_concurrent_positions": payload["max_concurrent_positions"],
                 "open_position_count": payload["open_position_count"],
@@ -1790,7 +1754,7 @@ class EntryGateRuntime:
             suppressed_full_payload_count=self._no_entry_suppressed_full_payload_count,
         )
         self._no_entry_suppressed_full_payload_count = 0
-        self.journal.append("scan.no_entry_diagnostics", compact_payload)
+        self.ctx.journal.append("scan.no_entry_diagnostics", compact_payload)
 
     def _entry_selection_target(self, remaining_slots: int) -> int:
         """V1 selection buffer: remaining slots, expanded up to eight candidates."""
@@ -1901,7 +1865,7 @@ class EntryGateRuntime:
         )
 
     def _has_pending_residual_pair(self, pair_id: str) -> bool:
-        for task in self.state.pending_residual_repairs:
+        for task in self.ctx.state.pending_residual_repairs:
             if isinstance(task, dict):
                 task_pair_id = task.get("pair_id", "")
             else:
@@ -1942,11 +1906,11 @@ class EntryGateRuntime:
 
         active_symbols = {
             str(getattr(position, "symbol", ""))
-            for position in self.state.open_positions.values()
+            for position in self.ctx.state.open_positions.values()
         }
         active_symbols.update(
             str(getattr(pending, "symbol", ""))
-            for pending in self.state.pending_entries.values()
+            for pending in self.ctx.state.pending_entries.values()
         )
         selected_symbols: set[str] = set()
         ranked: list = []
@@ -1969,7 +1933,7 @@ class EntryGateRuntime:
                 readiness_evidence["source"] = "initial_entry"
                 readiness_evidence["candidate_pair_id"] = pair_id
                 readiness_evidence["pair_id"] = pair_id
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.entry_admission_blocked",
                     {
                         **readiness_evidence,
@@ -1983,7 +1947,7 @@ class EntryGateRuntime:
                 decision = V1TradingLifecycle.entry_admissibility(
                     candidate,
                     now_ms=now_ms,
-                    strategy=self.config.strategy,
+                    strategy=self.ctx.config.strategy,
                     recovery_ledger=getattr(self, "recovery_ledger", None),
                     source="selection",
                 )
@@ -2002,7 +1966,7 @@ class EntryGateRuntime:
                     self._entry_ws_bbo_subscription_blocker(candidate)
                 )
                 if not blocker:
-                    readiness = self.entry_readiness_provider.decide(
+                    readiness = self.ctx.entry_readiness_provider.decide(
                         candidate,
                         now_ms,
                         market_quotes=market_quotes,
@@ -2121,8 +2085,8 @@ class EntryGateRuntime:
     ) -> str | None:
         """V1 final entry window: entries are allowed in [min_before, entry_window]."""
         remaining_ms = first_funding_timestamp_ms - max(now_ms, 0)
-        min_before_ms = self.config.strategy.min_scan_minutes_before_funding * 60_000
-        entry_window_ms = self.config.strategy.entry_window_secs * 1000
+        min_before_ms = self.ctx.config.strategy.min_scan_minutes_before_funding * 60_000
+        entry_window_ms = self.ctx.config.strategy.entry_window_secs * 1000
 
         if remaining_ms <= 0 or (min_before_ms > 0 and remaining_ms < min_before_ms):
             return "entry_finalization_window_expired"
@@ -2150,7 +2114,7 @@ class EntryGateRuntime:
         - entry_local_l2_waiting_for_primary_tracking
         - entry_local_l2_waiting_for_dual_ready
         """
-        if self.config.runtime.mode != "live":
+        if self.ctx.config.runtime.mode != "live":
             return None
 
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
@@ -2177,7 +2141,7 @@ class EntryGateRuntime:
             return finalization_blocker
         if not self._local_l2_effective_enabled():
             return None
-        prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
+        prewarm_window_ms = self.ctx.config.strategy.entry_local_l2_prewarm_window_secs * 1000
         if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
             return "entry_local_l2_waiting_for_prewarm_window"
 
@@ -2186,7 +2150,7 @@ class EntryGateRuntime:
             return "entry_local_l2_waiting_for_primary_tracking"
 
         # Session dual-ready check
-        session = self.entry_l2_sessions.sessions.get(pair_id)
+        session = self.ctx.entry_l2_sessions.sessions.get(pair_id)
         if session is None:
             return "entry_local_l2_waiting_for_dual_ready"
 

@@ -13,57 +13,13 @@ from typing import Any
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 
 
 class MarketDataRuntime:
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: MarketDataRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def snapshot_store(self):
-        return self.ctx.snapshot_store
-
-    @property
-    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
-        return self.ctx.venue_adapters
-
-    @property
-    def local_l2_runtime(self):
-        return self.ctx.local_l2_runtime
-
-    @property
-    def l2_data_plane(self):
-        return self.ctx.l2_data_plane
-
-    @property
-    def ws_bbo_cache(self):
-        return self.ctx.ws_bbo_cache
-
-    @property
-    def ws_bbo_data_plane(self):
-        return self.ctx.ws_bbo_data_plane
-
-    @property
-    def entry_l2_sessions(self):
-        return self.ctx.entry_l2_sessions
-
-    @property
-    def entry_readiness_provider(self):
-        return self.ctx.entry_readiness_provider
 
     @property
     def ws_bbo_rest_refresher(self):
@@ -211,32 +167,32 @@ class MarketDataRuntime:
         return {
             "entry_readiness_provider_effective": provider,
             "local_l2_configured_enabled": bool(
-                getattr(self.config.strategy, "local_l2_enabled", False)
+                getattr(self.ctx.config.strategy, "local_l2_enabled", False)
             ),
             "local_l2_ws_configured_enabled": bool(
-                getattr(self.config.strategy, "local_l2_ws_enabled", False)
+                getattr(self.ctx.config.strategy, "local_l2_ws_enabled", False)
             ),
             "local_l2_effective_enabled": self._local_l2_effective_enabled(),
             "local_l2_effective_disabled_reason": (
                 "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
                 if (
                     provider == "ws_bbo_quote_lease"
-                    and bool(getattr(self.config.strategy, "local_l2_enabled", False))
+                    and bool(getattr(self.ctx.config.strategy, "local_l2_enabled", False))
                 )
                 else ""
             ),
         }
 
     def _refresh_runtime_market_data_config_state(self) -> None:
-        self.state.runtime_market_data_config = (
+        self.ctx.state.runtime_market_data_config = (
             self._runtime_market_data_config_summary()
         )
 
     def _entry_quote_lease_max_age_ms(self) -> int:
         budgets = []
         for value in (
-            getattr(self.config.runtime, "max_market_age_ms", 0),
-            getattr(self.config.strategy, "entry_quote_lease_ttl_ms", 0),
+            getattr(self.ctx.config.runtime, "max_market_age_ms", 0),
+            getattr(self.ctx.config.strategy, "entry_quote_lease_ttl_ms", 0),
         ):
             try:
                 parsed = int(value or 0)
@@ -267,7 +223,7 @@ class MarketDataRuntime:
         if not self._local_l2_effective_enabled():
             return
 
-        self.journal.append(
+        self.ctx.journal.append(
             "runtime.local_l2_phase_start",
             {"ts_ms": now_ms},
         )
@@ -276,14 +232,14 @@ class MarketDataRuntime:
         # NOT all config.symbols — L2 is only bootstrapped for symbols with activity
         target_pairs: set[tuple[str, str]] = set()
         if self._local_l2_effective_enabled():
-            active_venues = list(self._venue_adapters.keys())
+            active_venues = list(self.ctx.venue_adapters.keys())
             venue_set = {
                 v.value if hasattr(v, 'value') else str(v)
                 for v in active_venues
             }
 
             # 1. Retained books from previous run (V1: retained_local_l2_books)
-            for book in (self.state.retained_local_l2_books or []):
+            for book in (self.ctx.state.retained_local_l2_books or []):
                 ven = book.get("venue", "")
                 sym = book.get("symbol", "")
                 if ven in venue_set and sym:
@@ -291,14 +247,14 @@ class MarketDataRuntime:
 
             # 2. Hot symbols from active positions (V1: hot_local_l2_symbols)
             hot_budget = max(
-                getattr(self.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
+                getattr(self.ctx.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
             )
             hot_global_budget = max(
-                getattr(self.config.strategy, 'local_l2_hot_exec_global_budget', 0), 0,
+                getattr(self.ctx.config.strategy, 'local_l2_hot_exec_global_budget', 0), 0,
             )
             hot_count = 0
             hot_global_count = 0
-            for pos in getattr(self.state, 'open_positions', []) or []:
+            for pos in getattr(self.ctx.state, 'open_positions', []) or []:
                 if hot_count >= hot_budget:
                     break
                 if hot_global_budget > 0 and hot_global_count >= hot_global_budget:
@@ -317,7 +273,7 @@ class MarketDataRuntime:
                         hot_global_count += 1
 
         if not target_pairs:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.local_l2_phase_complete",
                 {
                     "books_bootstrapped": 0,
@@ -327,7 +283,7 @@ class MarketDataRuntime:
             )
             return
 
-        if self.config.runtime.mode != "paper":
+        if self.ctx.config.runtime.mode != "paper":
             from lightfee.core.domain import Venue as VenueEnum
 
             filtered_pairs: set[tuple[str, str]] = set()
@@ -338,7 +294,7 @@ class MarketDataRuntime:
             for venue_str, symbols in venue_symbols_for_filter.items():
                 try:
                     ven = VenueEnum.from_str(venue_str)
-                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                    adapter = self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
                 except (ValueError, KeyError):
                     adapter = None
                     ven = None
@@ -356,7 +312,7 @@ class MarketDataRuntime:
             target_pairs = filtered_pairs
 
         if not target_pairs:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.local_l2_phase_complete",
                 {
                     "books_bootstrapped": 0,
@@ -372,11 +328,11 @@ class MarketDataRuntime:
         books_created = 0
         for venue_str, symbol in sorted(target_pairs):
             rules = get_venue_rules(venue_str)
-            book = self.local_l2_runtime.ensure_book(venue_str, symbol)
+            book = self.ctx.local_l2_runtime.ensure_book(venue_str, symbol)
             book.max_depth = rules.default_depth
             book.max_sequence_gap = rules.max_sequence_gap
             if book.status == L2BookStatus.COLD:
-                if self.config.runtime.mode == "paper":
+                if self.ctx.config.runtime.mode == "paper":
                     book.transition_to_hot()
                 else:
                     book.transition_to_bootstrapping(now_ms)
@@ -390,28 +346,28 @@ class MarketDataRuntime:
         # This ensures delta updates are captured (buffered) during bootstrap gap
         if (
             self._local_l2_effective_enabled()
-            and getattr(self.config.strategy, 'local_l2_ws_enabled', False)
-            and self.config.runtime.mode != "paper"
+            and getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False)
+            and self.ctx.config.runtime.mode != "paper"
         ):
             ws_started = 0
             for venue_str, symbols in venue_symbols.items():
                 try:
                     from lightfee.core.domain import Venue as VenueEnum
                     ven = VenueEnum.from_str(venue_str)
-                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                    adapter = self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
                 except (ValueError, KeyError):
                     adapter = None
 
-                registered = self.l2_data_plane.start_ws_streams(
+                registered = self.ctx.l2_data_plane.start_ws_streams(
                     venue_str, symbols, adapter=adapter,
                 )
                 if registered > 0:
                     ws_started += registered
 
             if ws_started > 0:
-                connected = await self.l2_data_plane.connect_ws_streams()
+                connected = await self.ctx.l2_data_plane.connect_ws_streams()
                 ws_started = connected
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.local_l2_ws_started",
                     {
                         "stream_count": ws_started,
@@ -422,24 +378,24 @@ class MarketDataRuntime:
 
         # Step 3: Start per-venue background bootstrap workers (V1: start_local_l2_bootstrap)
         # Each worker fetches REST snapshots with concurrency control and retry
-        if self.config.runtime.mode != "paper":
+        if self.ctx.config.runtime.mode != "paper":
             bs_total = 0
-            bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
-            bs_jitter = getattr(self.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
-            bs_retry = getattr(self.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+            bs_batch = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_batch_size', 4)
+            bs_jitter = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
+            bs_retry = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
 
             for venue_str, symbols in venue_symbols.items():
                 try:
                     from lightfee.core.domain import Venue as VenueEnum
                     ven = VenueEnum.from_str(venue_str)
-                    adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                    adapter = self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
                 except (ValueError, KeyError):
                     adapter = None
 
                 if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
                     continue
 
-                self.l2_data_plane.start_background_bootstrap(
+                self.ctx.l2_data_plane.start_background_bootstrap(
                     venue=venue_str,
                     symbols=symbols,
                     adapter=adapter,
@@ -449,7 +405,7 @@ class MarketDataRuntime:
                 )
                 bs_total += len(symbols)
 
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.local_l2_bootstrap_started",
                 {
                     "venues": sorted(venue_symbols.keys()),
@@ -460,20 +416,20 @@ class MarketDataRuntime:
 
         # Restore retained books from previous state
         books_retained = 0
-        if hasattr(self.state, "retained_local_l2_books"):
-            for entry in getattr(self.state, "retained_local_l2_books", []):
+        if hasattr(self.ctx.state, "retained_local_l2_books"):
+            for entry in getattr(self.ctx.state, "retained_local_l2_books", []):
                 venue = entry.get("venue", "")
                 sym = entry.get("symbol", "")
                 if (venue, sym) not in target_pairs:
                     continue
                 if venue and sym:
-                    book = self.local_l2_runtime.ensure_book(venue, sym)
+                    book = self.ctx.local_l2_runtime.ensure_book(venue, sym)
                     if book.status == L2BookStatus.COLD:
                         book.pool = L2PoolAssignment.RETAINED
                         book.transition_to_bootstrapping(now_ms)
                         books_retained += 1
 
-        self.journal.append(
+        self.ctx.journal.append(
             "runtime.local_l2_phase_complete",
             {
                 "books_created": books_created,
@@ -505,7 +461,7 @@ class MarketDataRuntime:
         self._refresh_runtime_market_data_config_state()
         if not self._local_l2_effective_enabled():
             return
-        if self.config.runtime.mode == "paper":
+        if self.ctx.config.runtime.mode == "paper":
             return
 
         candidates = list(candidates or [])
@@ -556,7 +512,7 @@ class MarketDataRuntime:
         from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
 
         def hot_book_needs_ws_lifecycle_attention(venue: str, symbol: str) -> bool:
-            if not getattr(self.config.strategy, 'local_l2_ws_enabled', False):
+            if not getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False):
                 return False
             policy = policy_for_venue(venue)
             if policy.bridge_mode not in (
@@ -564,7 +520,7 @@ class MarketDataRuntime:
                 BridgeMode.STREAM_ONLY,
             ):
                 return False
-            stream_state_fn = getattr(self.l2_data_plane, "ws_stream_state", None)
+            stream_state_fn = getattr(self.ctx.l2_data_plane, "ws_stream_state", None)
             if not callable(stream_state_fn):
                 return False
             stream_state = stream_state_fn(venue, symbol)
@@ -576,7 +532,7 @@ class MarketDataRuntime:
         def venue_adapter_for_local_l2(venue: str):
             try:
                 ven = Venue.from_str(venue)
-                return self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                return self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
             except (ValueError, KeyError):
                 return None
 
@@ -585,11 +541,11 @@ class MarketDataRuntime:
             adapter = venue_adapter_for_local_l2(venue)
             if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
                 return
-            before_state = self.l2_data_plane.ws_stream_state(venue, symbol)
-            registered = self.l2_data_plane.start_ws_streams(
+            before_state = self.ctx.l2_data_plane.ws_stream_state(venue, symbol)
+            registered = self.ctx.l2_data_plane.start_ws_streams(
                 venue, [symbol], adapter=adapter,
             )
-            after_state = self.l2_data_plane.ws_stream_state(venue, symbol)
+            after_state = self.ctx.l2_data_plane.ws_stream_state(venue, symbol)
             if registered > 0:
                 registered_total += registered
             if (
@@ -610,8 +566,8 @@ class MarketDataRuntime:
             nonlocal connect_ws_streams_needed
             if not connect_ws_streams_needed:
                 return
-            connected = await self.l2_data_plane.connect_ws_streams()
-            self.journal.append(
+            connected = await self.ctx.l2_data_plane.connect_ws_streams()
+            self.ctx.journal.append(
                 "runtime.local_l2_dynamic_ws_started",
                 {
                     "registered_stream_count": registered_total,
@@ -632,9 +588,9 @@ class MarketDataRuntime:
                 pool_by_key.setdefault(key, L2PoolAssignment.HOT_EXEC)
                 desired_pool = pool_by_key.get(key, L2PoolAssignment.HOT_EXEC)
                 # Skip if already active
-                book = self.local_l2_runtime.get_book(ven_str, sym)
+                book = self.ctx.local_l2_runtime.get_book(ven_str, sym)
                 if book is not None:
-                    self.local_l2_runtime.assign(
+                    self.ctx.local_l2_runtime.assign(
                         ven_str, sym, desired_pool, now_ms=now_ms,
                     )
                     if book.status == L2BookStatus.HOT:
@@ -654,17 +610,17 @@ class MarketDataRuntime:
                         continue
                 needed.setdefault(ven_str, set()).add(sym)
 
-        for position in getattr(self.state, "open_positions", {}).values():
+        for position in getattr(self.ctx.state, "open_positions", {}).values():
             sym = getattr(position, "symbol", "")
             remember_key(getattr(position, "long_venue", ""), sym, L2PoolAssignment.RETAINED)
             remember_key(getattr(position, "short_venue", ""), sym, L2PoolAssignment.RETAINED)
 
-        for pending in getattr(self.state, "pending_entries", {}).values():
+        for pending in getattr(self.ctx.state, "pending_entries", {}).values():
             sym = getattr(pending, "symbol", "")
             remember_key(getattr(pending, "long_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
             remember_key(getattr(pending, "short_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
 
-        for pending_close in getattr(self.state, "pending_passive_closes", {}).values():
+        for pending_close in getattr(self.ctx.state, "pending_passive_closes", {}).values():
             position = getattr(pending_close, "position_snapshot", None)
             if position is None:
                 continue
@@ -674,7 +630,7 @@ class MarketDataRuntime:
 
         if not needed:
             await connect_registered_ws_streams()
-            self.l2_data_plane.prune_untracked_books(
+            self.ctx.l2_data_plane.prune_untracked_books(
                 tracked_keys,
                 now_ms,
                 retained_max_age_ms=max(stale_after_ms, 300_000),
@@ -682,7 +638,7 @@ class MarketDataRuntime:
             return
 
         per_venue_budget = max(
-            getattr(self.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
+            getattr(self.ctx.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
         )
         from lightfee.marketdata.local_l2_venues import get_venue_rules
 
@@ -695,7 +651,7 @@ class MarketDataRuntime:
             try:
                 from lightfee.core.domain import Venue as VenueEnum
                 ven = VenueEnum.from_str(ven_str)
-                adapter = self.get_venue_adapter(ven) if ven in self._venue_adapters else None
+                adapter = self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
             except (ValueError, KeyError):
                 adapter = None
             if adapter is None or not hasattr(adapter, 'fetch_l2_snapshot'):
@@ -716,8 +672,8 @@ class MarketDataRuntime:
                 rules = get_venue_rules(ven_str)
                 key = LocalL2BookKey(venue=ven_str, symbol=sym)
                 desired_pool = pool_by_key.get(key, L2PoolAssignment.HOT_EXEC)
-                book = self.local_l2_runtime.ensure_book(ven_str, sym)
-                self.local_l2_runtime.assign(
+                book = self.ctx.local_l2_runtime.ensure_book(ven_str, sym)
+                self.ctx.local_l2_runtime.assign(
                     ven_str, sym, desired_pool, now_ms=now_ms,
                 )
                 book.max_depth = rules.default_depth
@@ -725,8 +681,8 @@ class MarketDataRuntime:
                 if book.status == L2BookStatus.COLD:
                     book.transition_to_bootstrapping(now_ms)
 
-            if getattr(self.config.strategy, 'local_l2_ws_enabled', False):
-                stream_state_fn = getattr(self.l2_data_plane, "ws_stream_state", None)
+            if getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False):
+                stream_state_fn = getattr(self.ctx.l2_data_plane, "ws_stream_state", None)
                 before_states = (
                     {
                         sym: stream_state_fn(ven_str, sym)
@@ -735,7 +691,7 @@ class MarketDataRuntime:
                     if callable(stream_state_fn)
                     else {}
                 )
-                registered = self.l2_data_plane.start_ws_streams(
+                registered = self.ctx.l2_data_plane.start_ws_streams(
                     ven_str, symbols_list, adapter=adapter,
                 )
                 after_states = (
@@ -757,10 +713,10 @@ class MarketDataRuntime:
                     connect_ws_streams_needed = True
 
             # Start background bootstrap worker
-            bs_batch = getattr(self.config.strategy, 'local_l2_bootstrap_batch_size', 4)
-            bs_jitter = getattr(self.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
-            bs_retry = getattr(self.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
-            self.l2_data_plane.start_background_bootstrap(
+            bs_batch = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_batch_size', 4)
+            bs_jitter = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
+            bs_retry = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+            self.ctx.l2_data_plane.start_background_bootstrap(
                 venue=ven_str,
                 symbols=symbols_list,
                 adapter=adapter,
@@ -771,7 +727,7 @@ class MarketDataRuntime:
 
         await connect_registered_ws_streams()
 
-        self.l2_data_plane.prune_untracked_books(
+        self.ctx.l2_data_plane.prune_untracked_books(
             tracked_keys,
             now_ms,
             retained_max_age_ms=max(stale_after_ms, 300_000),
@@ -792,7 +748,7 @@ class MarketDataRuntime:
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
             return
-        if self.config.runtime.mode == "paper":
+        if self.ctx.config.runtime.mode == "paper":
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
@@ -822,7 +778,7 @@ class MarketDataRuntime:
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
-            self.ws_bbo_data_plane.prune_untracked_quotes(
+            self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
                 tracked_keys,
                 now_ms,
                 retained_max_age_ms=300_000,
@@ -831,9 +787,9 @@ class MarketDataRuntime:
 
         per_venue_budget = max(
             getattr(
-                self.config.strategy,
+                self.ctx.config.strategy,
                 "entry_ws_bbo_per_venue_budget",
-                getattr(self.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
+                getattr(self.ctx.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
             ),
             1,
         )
@@ -861,7 +817,7 @@ class MarketDataRuntime:
                 venue_enum = Venue.from_str(venue_str)
                 adapter = (
                     self.get_venue_adapter(venue_enum)
-                    if venue_enum in self._venue_adapters
+                    if venue_enum in self.ctx.venue_adapters
                     else None
                 )
             except (ValueError, KeyError):
@@ -877,7 +833,7 @@ class MarketDataRuntime:
             if not symbols_list:
                 continue
 
-            registered = self.ws_bbo_data_plane.start_ws_streams(
+            registered = self.ctx.ws_bbo_data_plane.start_ws_streams(
                 venue_str,
                 symbols_list,
                 adapter=adapter,
@@ -887,8 +843,8 @@ class MarketDataRuntime:
                 registered_venues.add(venue_str)
 
         if registered_total > 0:
-            connected = await self.ws_bbo_data_plane.connect_ws_streams()
-            self.journal.append(
+            connected = await self.ctx.ws_bbo_data_plane.connect_ws_streams()
+            self.ctx.journal.append(
                 "runtime.ws_bbo_dynamic_ws_started",
                 {
                     "registered_stream_count": registered_total,
@@ -898,7 +854,7 @@ class MarketDataRuntime:
                 },
             )
 
-        self.ws_bbo_data_plane.prune_untracked_quotes(
+        self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
             tracked_keys,
             now_ms,
             retained_max_age_ms=300_000,
@@ -932,58 +888,58 @@ class MarketDataRuntime:
         }
 
     def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]) -> None:
-        self.state.last_scan["quote_revalidate_candidate_scope"] = str(
+        self.ctx.state.last_scan["quote_revalidate_candidate_scope"] = str(
             stats.get("candidate_scope", "") or ""
         )
-        self.state.last_scan["quote_revalidate_candidate_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_candidate_count"] = int(
             stats.get("candidate_count", 0) or 0
         )
-        self.state.last_scan["quote_revalidate_all_target_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_all_target_count"] = int(
             stats.get("all_target_count", 0) or 0
         )
-        self.state.last_scan["quote_revalidate_target_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_target_count"] = int(
             stats.get("target_count", 0) or 0
         )
-        self.state.last_scan["quote_revalidate_skipped_untracked_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_skipped_untracked_count"] = int(
             stats.get("skipped_untracked_count", 0) or 0
         )
-        self.state.last_scan["quote_revalidate_resolved_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_resolved_count"] = int(
             stats.get("resolved_count", 0) or 0
         )
-        self.state.last_scan["quote_revalidate_failed_count"] = int(
+        self.ctx.state.last_scan["quote_revalidate_failed_count"] = int(
             stats.get("failed_count", 0) or 0
         )
-        self.state.last_scan["quote_truth_must_resolve_count"] = int(
+        self.ctx.state.last_scan["quote_truth_must_resolve_count"] = int(
             stats.get("must_resolve_count", stats.get("target_count", 0)) or 0
         )
-        self.state.last_scan["quote_truth_resolved_count"] = int(
+        self.ctx.state.last_scan["quote_truth_resolved_count"] = int(
             stats.get("resolved_count", 0) or 0
         )
-        self.state.last_scan["quote_truth_failed_count"] = int(
+        self.ctx.state.last_scan["quote_truth_failed_count"] = int(
             stats.get("failed_count", 0) or 0
         )
-        self.state.last_scan["quote_truth_ws_resolved_count"] = int(
+        self.ctx.state.last_scan["quote_truth_ws_resolved_count"] = int(
             stats.get("ws_resolved_count", 0) or 0
         )
-        self.state.last_scan["quote_truth_rest_resolved_count"] = int(
+        self.ctx.state.last_scan["quote_truth_rest_resolved_count"] = int(
             stats.get("rest_resolved_count", 0) or 0
         )
-        self.state.last_scan["budget_excluded_without_rest_count"] = int(
+        self.ctx.state.last_scan["budget_excluded_without_rest_count"] = int(
             stats.get("budget_excluded_without_rest_count", 0) or 0
         )
         sources = stats.get("sources", Counter())
-        self.state.last_scan["quote_revalidate_sources"] = dict(
+        self.ctx.state.last_scan["quote_revalidate_sources"] = dict(
             sorted((str(k), int(v)) for k, v in sources.items())
         )
         buckets = stats.get("top_quote_blocker_buckets", Counter())
-        self.state.last_scan["top_quote_blocker_buckets"] = dict(
+        self.ctx.state.last_scan["top_quote_blocker_buckets"] = dict(
             sorted((str(k), int(v)) for k, v in buckets.items())
         )
 
     def _entry_quote_probe_diagnostics_enabled(self) -> bool:
         return bool(
             getattr(
-                getattr(self.config, "runtime", None),
+                getattr(self.ctx.config, "runtime", None),
                 "debug_journal_diagnostics_enabled",
                 False,
             )
@@ -1163,7 +1119,7 @@ class MarketDataRuntime:
         *,
         now_ms: int,
     ) -> Any | None:
-        cache = getattr(self, "ws_bbo_cache", None)
+        cache = self.ctx.ws_bbo_cache
         if cache is None:
             return None
         budget_ms = self._entry_quote_lease_max_age_ms()
@@ -1217,7 +1173,7 @@ class MarketDataRuntime:
         if (
             not candidates
             or not self._entry_readiness_provider_uses_ws_bbo()
-            or self.config.runtime.mode == "paper"
+            or self.ctx.config.runtime.mode == "paper"
         ):
             self._entry_quote_truth_record_last_scan(stats)
             self._emit_entry_quote_revalidate_probe(
@@ -1254,7 +1210,7 @@ class MarketDataRuntime:
                 stats["budget_exhausted_count"] += 1
                 target["ws_budget_excluded"] = True
                 target["rest_fallback_planned"] = True
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.entry_ws_bbo_top_candidate_rewarm_budget_exhausted",
                     {
                         **target,
@@ -1277,7 +1233,7 @@ class MarketDataRuntime:
             1 for target in targets if not bool(target.get("ws_budget_excluded"))
         )
         if targets:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_quote_revalidate_targeted",
                 {
                     "target_count": len(targets),
@@ -1286,7 +1242,7 @@ class MarketDataRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.entry_ws_bbo_top_candidate_rewarm_started",
                 {
                     "target_count": len(targets),
@@ -1344,7 +1300,7 @@ class MarketDataRuntime:
                 if not self._entry_quote_truth_accept_quote(refreshed, now_ms=now_ms):
                     stats["rest_failed_count"] += 1
                     continue
-                cache = getattr(self, "ws_bbo_cache", None)
+                cache = self.ctx.ws_bbo_cache
                 if cache is not None and hasattr(cache, "update_quote"):
                     cache.update_quote(refreshed)
                 overlay[key] = refreshed
@@ -1376,8 +1332,8 @@ class MarketDataRuntime:
                 "outcome": "resolved",
                 "ts_ms": now_ms,
             }
-            self.journal.append("runtime.entry_quote_revalidate_resolved", payload)
-            self.journal.append(
+            self.ctx.journal.append("runtime.entry_quote_revalidate_resolved", payload)
+            self.ctx.journal.append(
                 "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
                 payload,
             )
@@ -1403,8 +1359,8 @@ class MarketDataRuntime:
                 "source": "entry_quote_truth",
                 "ts_ms": now_ms,
             }
-            self.journal.append("runtime.entry_quote_revalidate_failed", payload)
-            self.journal.append(
+            self.ctx.journal.append("runtime.entry_quote_revalidate_failed", payload)
+            self.ctx.journal.append(
                 "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
                 payload,
             )
@@ -1425,9 +1381,9 @@ class MarketDataRuntime:
         if not self._local_l2_effective_enabled():
             self._clear_local_l2_runtime_state()
             return
-        diag = self.local_l2_runtime.diagnostics_snapshot()
+        diag = self.ctx.local_l2_runtime.diagnostics_snapshot()
         # Retained books metadata (V1: persisted with full book data)
-        self.state.retained_local_l2_books = [
+        self.ctx.state.retained_local_l2_books = [
             {
                 "venue": b.venue,
                 "symbol": b.symbol,
@@ -1441,11 +1397,11 @@ class MarketDataRuntime:
                 "bids": [{"price": l.price, "quantity": l.quantity} for l in b.bids] if hasattr(b, 'bids') else [],
                 "asks": [{"price": l.price, "quantity": l.quantity} for l in b.asks] if hasattr(b, 'asks') else [],
             }
-            for b in self.local_l2_runtime.books.values()
+            for b in self.ctx.local_l2_runtime.books.values()
             if b.pool == L2PoolAssignment.RETAINED
         ]
         # Full books snapshot for recovery
-        self.state.local_l2_books_snapshot = [
+        self.ctx.state.local_l2_books_snapshot = [
             {
                 "venue": b.venue,
                 "symbol": b.symbol,
@@ -1460,12 +1416,12 @@ class MarketDataRuntime:
                 "bids": [{"price": l.price, "quantity": l.quantity} for l in b.bids] if hasattr(b, 'bids') else [],
                 "asks": [{"price": l.price, "quantity": l.quantity} for l in b.asks] if hasattr(b, 'asks') else [],
             }
-            for b in self.local_l2_runtime.books.values()
+            for b in self.ctx.local_l2_runtime.books.values()
         ]
         # Session snapshot
-        self.state.local_l2_session_snapshot = [
+        self.ctx.state.local_l2_session_snapshot = [
             s.diagnostics_snapshot(now_ms=wall_clock_now_ms(), stale_after_ms=5000)
-            for s in self.entry_l2_sessions.sessions.values()
+            for s in self.ctx.entry_l2_sessions.sessions.values()
         ]
 
     def _snapshot_domain_budget_ms(self, domain: str, row=None) -> int:
@@ -1473,19 +1429,19 @@ class MarketDataRuntime:
         if domain_s == "liquidity":
             configured_ms = int(
                 getattr(
-                    self.config.runtime,
+                    self.ctx.config.runtime,
                     "sidecar_perp_liquidity_budget_ms",
-                    self.config.strategy.max_liquidity_snapshot_age_ms,
+                    self.ctx.config.strategy.max_liquidity_snapshot_age_ms,
                 )
                 or 0
             )
             refresh_ms = int(
-                getattr(self.config.runtime, "sidecar_refresh_ms", 0) or 0
+                getattr(self.ctx.config.runtime, "sidecar_refresh_ms", 0) or 0
             )
             timeout_ms = int(
                 float(
                     getattr(
-                        self.config.runtime,
+                        self.ctx.config.runtime,
                         "sidecar_liquidity_timeout_s",
                         10.0,
                     )
@@ -1500,7 +1456,7 @@ class MarketDataRuntime:
             return int(
                 max(
                     configured_ms,
-                    int(self.config.strategy.max_liquidity_snapshot_age_ms or 0),
+                    int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0),
                     refresh_ms * 3 if refresh_ms > 0 else 0,
                     refresh_ms + timeout_ms * 2 if timeout_ms > 0 else 0,
                     publish_interval_ms * 2 if publish_interval_ms > 0 else 0,
@@ -1509,18 +1465,18 @@ class MarketDataRuntime:
             )
         if domain_s == "quote":
             return int(
-                getattr(self.config.runtime, "max_order_quote_age_ms", 0)
-                or self.config.runtime.max_market_age_ms
-                or self.config.runtime.sidecar_snapshot_max_age_ms
+                getattr(self.ctx.config.runtime, "max_order_quote_age_ms", 0)
+                or self.ctx.config.runtime.max_market_age_ms
+                or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "market":
             return int(
-                getattr(self.config.runtime, "max_market_age_ms", 0)
-                or self.config.runtime.sidecar_snapshot_max_age_ms
+                getattr(self.ctx.config.runtime, "max_market_age_ms", 0)
+                or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "funding":
-            return int(self.config.runtime.sidecar_snapshot_max_age_ms)
-        return int(self.config.runtime.sidecar_snapshot_max_age_ms)
+            return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
+        return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
 
     @staticmethod
     def _snapshot_metric_key(venue: str, symbol: str, domain: str) -> str:
@@ -1623,7 +1579,7 @@ class MarketDataRuntime:
             if market_observed_at_ms > 0 else 0
         )
         market_budget_ms = int(
-            getattr(self.config.runtime, "max_market_age_ms", 0)
+            getattr(self.ctx.config.runtime, "max_market_age_ms", 0)
             or self._snapshot_domain_budget_ms("market")
         )
         self._record_snapshot_scoped_status(
@@ -2011,7 +1967,7 @@ class MarketDataRuntime:
             return None
         if not self._entry_readiness_provider_uses_ws_bbo():
             return None
-        cache = getattr(self, "ws_bbo_cache", None)
+        cache = self.ctx.ws_bbo_cache
         if cache is None:
             return None
         budget_ms = self._entry_quote_lease_max_age_ms()
@@ -2173,10 +2129,10 @@ class MarketDataRuntime:
         snapshot_max_age_ms = int(
             max_age_ms
             if max_age_ms is not None
-            else self.config.runtime.sidecar_snapshot_max_age_ms
+            else self.ctx.config.runtime.sidecar_snapshot_max_age_ms
         )
         market_max_age_ms = int(
-            getattr(self.config.runtime, "max_market_age_ms", snapshot_max_age_ms)
+            getattr(self.ctx.config.runtime, "max_market_age_ms", snapshot_max_age_ms)
             or snapshot_max_age_ms
         )
         stale_overages: list[int] = []
@@ -2442,9 +2398,9 @@ class MarketDataRuntime:
             event_payload["suppressed_count"] = 0
         self._snapshot_freshness_decision_last_emit_ms[key] = now_ms
         self._snapshot_freshness_decision_suppressed.pop(key, None)
-        self.journal.append("runtime.snapshot_freshness_decision", event_payload)
+        self.ctx.journal.append("runtime.snapshot_freshness_decision", event_payload)
         if event_kind:
-            self.journal.append(event_kind, event_payload)
+            self.ctx.journal.append(event_kind, event_payload)
 
     def _filter_candidates_by_snapshot_freshness(
         self,
@@ -2572,7 +2528,7 @@ class MarketDataRuntime:
             now_ms - market_observed_at_ms if market_observed_at_ms > 0 else 0
         )
         market_max_age_ms = int(
-            getattr(self.config.runtime, "max_market_age_ms", max_age_ms) or max_age_ms
+            getattr(self.ctx.config.runtime, "max_market_age_ms", max_age_ms) or max_age_ms
         )
         degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
         degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
@@ -2605,9 +2561,9 @@ class MarketDataRuntime:
                 if reason and lifecycle_name not in domains:
                     domains.append(lifecycle_name)
 
-        snapshot_path = str(self.config.runtime.sidecar_snapshot_path)
+        snapshot_path = str(self.ctx.config.runtime.sidecar_snapshot_path)
         config_hash = hashlib.sha256(
-            f"{snapshot_path}|{max_age_ms}|{self.config.runtime.mode}".encode()
+            f"{snapshot_path}|{max_age_ms}|{self.ctx.config.runtime.mode}".encode()
         ).hexdigest()[:12]
         fallback_duration_ms = self._snapshot_fallback_duration_ms(
             snapshot=snapshot,

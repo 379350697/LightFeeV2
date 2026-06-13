@@ -9,12 +9,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -24,40 +23,8 @@ class CloseRuntime:
     _RECONCILE_RETRY_MAX_MS = 300_000
     _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
 
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
-        return self.ctx.venue_adapters
-
-    @property
-    def local_l2_runtime(self):
-        return self.ctx.local_l2_runtime
-
-    @property
-    def ws_bbo_cache(self):
-        return self.ctx.ws_bbo_cache
-
-    @property
-    def close_executor(self):
-        return self.ctx.close_executor
-
-    @property
-    def passive_close_executor(self):
-        return self.ctx.passive_close_executor
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
         return self.ctx._flush_adapter_order_diagnostics(adapter)
@@ -177,7 +144,7 @@ class CloseRuntime:
     ) -> list[Any] | None:
         if not isinstance(legs, list):
             return []
-        adapter = self._venue_adapters.get(venue)
+        adapter = self.ctx.venue_adapters.get(venue)
         if adapter is None:
             return None
         fetch = getattr(adapter, "fetch_order_fill_reconciliation", None)
@@ -212,8 +179,8 @@ class CloseRuntime:
         long_venue: Venue,
         short_venue: Venue,
     ) -> tuple[float, float] | None:
-        long_adapter = self._venue_adapters.get(long_venue)
-        short_adapter = self._venue_adapters.get(short_venue)
+        long_adapter = self.ctx.venue_adapters.get(long_venue)
+        short_adapter = self.ctx.venue_adapters.get(short_venue)
         if long_adapter is None or short_adapter is None:
             return None
         try:
@@ -242,7 +209,7 @@ class CloseRuntime:
         position_id = str(reconciliation.get("position_id") or "")
         if any(
             str(getattr(position, "position_id", "")) == position_id
-            for position in self.state.open_positions.values()
+            for position in self.ctx.state.open_positions.values()
         ):
             return False
 
@@ -258,7 +225,7 @@ class CloseRuntime:
         if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
             return False
 
-        self.journal.append_critical(
+        self.ctx.journal.append_critical(
             now_ms,
             "exit.reconciliation_abandoned",
             {
@@ -282,9 +249,9 @@ class CloseRuntime:
         )
         return True
     def _venue_private_position_confirmed(self, venue: Venue, symbol: str) -> bool:
-        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
             return True
-        adapter = self._venue_adapters.get(venue)
+        adapter = self.ctx.venue_adapters.get(venue)
         if adapter is None:
             return False
         if not bool(getattr(adapter, "supports_private_health", False)):
@@ -318,7 +285,7 @@ class CloseRuntime:
         return all(
             self._call_venue_private_position_confirmed(position.long_venue, position.symbol)
             and self._call_venue_private_position_confirmed(position.short_venue, position.symbol)
-            for position in self.state.open_positions.values()
+            for position in self.ctx.state.open_positions.values()
         )
     @staticmethod
     def _aggregate_close_reconciliation_fills(fills: list[Any]) -> dict[str, Any]:
@@ -417,18 +384,18 @@ class CloseRuntime:
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
-        self.state.set_pending_close_reconciliations(
-            getattr(self.state, "pending_close_reconciliations", [])
+        self.ctx.state.set_pending_close_reconciliations(
+            getattr(self.ctx.state, "pending_close_reconciliations", [])
         )
-        pending_reconciliations = self.state.pending_close_reconciliations
+        pending_reconciliations = self.ctx.state.pending_close_reconciliations
         if not pending_reconciliations:
             return
-        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
             return
 
         retained: list[Any] = []
         eligible: list[dict[str, Any]] = []
-        current_cycle = int(getattr(self.state, "tick_count", 0) or 0)
+        current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
         for reconciliation in list(pending_reconciliations):
             if not isinstance(reconciliation, dict):
                 retained.append(reconciliation)
@@ -461,7 +428,7 @@ class CloseRuntime:
                 reconciliation.get("short_venue") or snapshot.get("short_venue")
             )
             if long_venue is None or short_venue is None:
-                self.journal.append(
+                self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
                         "position_id": reconciliation.get("position_id", ""),
@@ -478,7 +445,7 @@ class CloseRuntime:
                 self._has_close_reconciliation_leg_identity(reconciliation.get("long_legs"))
                 or self._has_close_reconciliation_leg_identity(reconciliation.get("short_legs"))
             ):
-                self.journal.append(
+                self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
                         "position_id": reconciliation.get("position_id", ""),
@@ -503,7 +470,7 @@ class CloseRuntime:
                 legs=reconciliation.get("short_legs"),
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
-                self.journal.append_critical(
+                self.ctx.journal.append_critical(
                     now_ms,
                     "exit.reconciled",
                     self._exit_reconciled_payload_from_leg_fills(
@@ -516,7 +483,7 @@ class CloseRuntime:
                 changed = True
                 continue
             if long_fills == [] and short_fills == []:
-                self.journal.append(
+                self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
                         "position_id": reconciliation.get("position_id", ""),
@@ -545,15 +512,15 @@ class CloseRuntime:
             retained.append(reconciliation)
             changed = True
 
-        self.state.pending_close_reconciliations = retained
+        self.ctx.state.pending_close_reconciliations = retained
         if changed:
-            active_empty = not self.state.open_positions
-            pending_entries_empty = not self.state.pending_entries
-            pending_passive_empty = not self.state.pending_passive_closes
-            pending_reconciliations_empty = not self.state.pending_close_reconciliations
+            active_empty = not self.ctx.state.open_positions
+            pending_entries_empty = not self.ctx.state.pending_entries
+            pending_passive_empty = not self.ctx.state.pending_passive_closes
+            pending_reconciliations_empty = not self.ctx.state.pending_close_reconciliations
             fail_closed = (
-                self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-                or self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+                self.ctx.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+                or self.ctx.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
             )
             if (
                 active_empty
@@ -561,17 +528,17 @@ class CloseRuntime:
                 and pending_entries_empty
                 and pending_passive_empty
             ):
-                set_lifecycle(self.state, EngineLifecycle.RUNNING)
-                self.state.last_error = None
+                set_lifecycle(self.ctx.state, EngineLifecycle.RUNNING)
+                self.ctx.state.last_error = None
             elif fail_closed:
-                set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
-                self.state.last_error = "pending_close_reconciliations_fail_closed"
+                set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
+                self.ctx.state.last_error = "pending_close_reconciliations_fail_closed"
             elif active_empty or self._call_open_positions_private_confirmation_ready():
-                set_lifecycle(self.state, EngineLifecycle.RUNNING)
-                self.state.last_error = None
-            elif self.state.pending_close_reconciliations:
-                set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
-                self.state.last_error = "pending_close_reconciliations_active"
+                set_lifecycle(self.ctx.state, EngineLifecycle.RUNNING)
+                self.ctx.state.last_error = None
+            elif self.ctx.state.pending_close_reconciliations:
+                set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
+                self.ctx.state.last_error = "pending_close_reconciliations_active"
     async def _maybe_process_normal_exits(self, now_ms: int) -> None:
         """Evaluate normal exit reasons for open positions and route to close path.
 
@@ -591,16 +558,16 @@ class CloseRuntime:
         )
         from lightfee.engine.exit import ExitReason
 
-        if not self.state.open_positions:
+        if not self.ctx.state.open_positions:
             return
 
-        for position in list(self.state.open_positions.values()):
+        for position in list(self.ctx.state.open_positions.values()):
             # Skip positions already in passive close
-            if position.position_id in self.state.pending_passive_closes:
+            if position.position_id in self.ctx.state.pending_passive_closes:
                 continue
 
             staggered_exit_mode = str(
-                getattr(self.config.strategy, "staggered_exit_mode", "") or ""
+                getattr(self.ctx.config.strategy, "staggered_exit_mode", "") or ""
             ).lower()
             if (
                 position.opportunity_type == "staggered"
@@ -608,7 +575,7 @@ class CloseRuntime:
                 and not position.exit_after_first_stage
             ):
                 position.exit_after_first_stage = True
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.staggered_exit_mode_backfilled",
                     {
                         "position_id": position.position_id,
@@ -624,7 +591,7 @@ class CloseRuntime:
             funding_captured_before = position.funding_captured
             second_stage_before = position.second_stage_funding_captured
             post_funding_hold_ms = int(
-                getattr(self.config.strategy, "post_funding_hold_secs", 0) or 0
+                getattr(self.ctx.config.strategy, "post_funding_hold_secs", 0) or 0
             ) * 1000
             update_position_funding_capture_state(
                 position,
@@ -635,7 +602,7 @@ class CloseRuntime:
                 position.funding_captured != funding_captured_before
                 or position.second_stage_funding_captured != second_stage_before
             ):
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.funding_capture_state_updated",
                     {
                         "position_id": position.position_id,
@@ -657,8 +624,8 @@ class CloseRuntime:
 
             reason = (
                 ExitReason.SETTLEMENT_FORCE_CLOSE
-                if force_close_due(position, self.config.strategy, now_ms)
-                else standard_close_reason(position, self.config.strategy, now_ms)
+                if force_close_due(position, self.ctx.config.strategy, now_ms)
+                else standard_close_reason(position, self.ctx.config.strategy, now_ms)
             )
             if reason is None:
                 continue
@@ -667,8 +634,8 @@ class CloseRuntime:
 
             if normal_close_reason_uses_passive_maker_taker(reason_str):
                 # Route to passive close
-                if self.passive_close_executor is not None:
-                    self.journal.append(
+                if self.ctx.passive_close_executor is not None:
+                    self.ctx.journal.append(
                         "runtime.normal_close_routing_passive",
                         {
                             "position_id": position.position_id,
@@ -676,8 +643,8 @@ class CloseRuntime:
                             "matched_quantity": position.matched_quantity,
                         },
                     )
-                    pending = await self.passive_close_executor.start_pending_passive_close(
-                        self.state,
+                    pending = await self.ctx.passive_close_executor.start_pending_passive_close(
+                        self.ctx.state,
                         position,
                         reason_str,
                         long_price_hint=self._call_resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
@@ -687,13 +654,13 @@ class CloseRuntime:
                     )
                     if pending is not None:
                         # Immediately drive one cycle
-                        await self.passive_close_executor.drive_pending_passive_close(
-                            self.state, position.position_id, wait_until_terminal=False,
+                        await self.ctx.passive_close_executor.drive_pending_passive_close(
+                            self.ctx.state, position.position_id, wait_until_terminal=False,
                         )
             else:
                 # Route to aggressive close (hard_stop, risk, etc.)
-                if self.close_executor is not None:
-                    self.journal.append(
+                if self.ctx.close_executor is not None:
+                    self.ctx.journal.append(
                         "runtime.normal_close_routing_aggressive",
                         {
                             "position_id": position.position_id,
@@ -701,11 +668,11 @@ class CloseRuntime:
                             "matched_quantity": position.matched_quantity,
                         },
                     )
-                    await self.close_executor.execute_close(
+                    await self.ctx.close_executor.execute_close(
                         position, reason_str, now_ms,
                         long_price_hint=self._call_resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
                         short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
-                        state=self.state,
+                        state=self.ctx.state,
                     )
     def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
         """Resolve a close price hint from the active WS BBO quote provider."""
@@ -714,7 +681,7 @@ class CloseRuntime:
 
         budget_ms = self._entry_quote_lease_max_age_ms()
         if budget_ms <= 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -731,9 +698,9 @@ class CloseRuntime:
             return 0.0
 
         try:
-            cache = getattr(self, "ws_bbo_cache", None)
+            cache = self.ctx.ws_bbo_cache
             if cache is None or not hasattr(cache, "get_quote"):
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.close_price_evidence_missing",
                     {
                         "venue": venue_value,
@@ -750,7 +717,7 @@ class CloseRuntime:
                 return 0.0
             quote = cache.get_quote(venue_value, symbol)
             if quote is None:
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.close_price_evidence_missing",
                     {
                         "venue": venue_value,
@@ -777,7 +744,7 @@ class CloseRuntime:
                 or bid <= 0.0
                 or ask <= bid
             ):
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.close_price_evidence_stale",
                     {
                         "venue": venue_value,
@@ -794,7 +761,7 @@ class CloseRuntime:
                 return 0.0
 
             mid = (bid + ask) / 2.0
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_fallback",
                 {
                     "venue": venue_value,
@@ -813,7 +780,7 @@ class CloseRuntime:
             )
             return mid
         except Exception as exc:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -836,13 +803,13 @@ class CloseRuntime:
         venue_value = venue.value if hasattr(venue, 'value') else str(venue)
         if self._entry_readiness_provider_uses_ws_bbo():
             return self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
-        budget_ms = int(self.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
         try:
-            book = self.local_l2_runtime.get_book(venue_value, symbol)
+            book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
             if book is not None and book.status.value == "hot":
                 age_ms = book.age_ms(now_ms)
                 if budget_ms > 0 and book.is_stale(budget_ms, now_ms):
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "runtime.close_price_evidence_stale",
                         {
                             "venue": venue_value,
@@ -869,7 +836,7 @@ class CloseRuntime:
         if not self._entry_readiness_provider_uses_local_l2():
             return None
         try:
-            book = self.local_l2_runtime.get_book(
+            book = self.ctx.local_l2_runtime.get_book(
                 venue.value if hasattr(venue, "value") else str(venue),
                 symbol,
             )
@@ -894,7 +861,7 @@ class CloseRuntime:
         venue_value = venue.value if hasattr(venue, "value") else str(venue)
         budget_ms = self._entry_quote_lease_max_age_ms()
         if budget_ms <= 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -911,9 +878,9 @@ class CloseRuntime:
             )
             return None
         try:
-            quote = self.ws_bbo_cache.get_quote(venue_value, symbol)
+            quote = self.ctx.ws_bbo_cache.get_quote(venue_value, symbol)
         except Exception as exc:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -931,7 +898,7 @@ class CloseRuntime:
             )
             return None
         if quote is None:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -953,7 +920,7 @@ class CloseRuntime:
             bid = float(getattr(quote, "bid", 0.0) or 0.0)
             ask = float(getattr(quote, "ask", 0.0) or 0.0)
         except Exception as exc:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.close_price_evidence_missing",
                 {
                     "venue": venue_value,
@@ -979,7 +946,7 @@ class CloseRuntime:
             and ask > bid
         ):
             return bid, ask
-        self.journal.append(
+        self.ctx.journal.append(
             "runtime.close_price_evidence_stale",
             {
                 "venue": venue_value,

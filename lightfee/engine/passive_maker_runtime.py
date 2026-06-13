@@ -8,46 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import Side, Venue
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.core.domain import Side
+from lightfee.engine.runtime_context import PassiveMakerRuntimeContext
 
 
 class PassiveMakerRuntime:
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: PassiveMakerRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def snapshot_store(self):
-        return self.ctx.snapshot_store
-
-    @property
-    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
-        return self.ctx.venue_adapters
-
-    @property
-    def local_l2_runtime(self):
-        return self.ctx.local_l2_runtime
-
-    @property
-    def ws_bbo_cache(self):
-        return self.ctx.ws_bbo_cache
-
-    @property
-    def entry_executor(self):
-        return self.ctx.entry_executor
 
     @property
     def _maker_event_state(self) -> dict[str, object]:
@@ -131,18 +98,18 @@ class PassiveMakerRuntime:
         1. local-L2 mode (parity): driven by local-L2 book events
         2. sidecar-mid fallback (non-parity): driven by snapshot mid-price moves
         """
-        if not self.config.runtime.maker_event_lane_enabled:
+        if not self.ctx.config.runtime.maker_event_lane_enabled:
             self._maker_event_state.clear()
             return
 
         # Min wake interval gating
-        min_interval = self.config.runtime.maker_event_lane_min_wake_interval_ms
+        min_interval = self.ctx.config.runtime.maker_event_lane_min_wake_interval_ms
         if self._last_maker_event_ms > 0 and (now_ms - self._last_maker_event_ms) < min_interval:
             return
 
         # Only process when there are pending entries with passive maker legs
         pending_passive = [
-            (eid, pe) for eid, pe in self.state.pending_entries.items()
+            (eid, pe) for eid, pe in self.ctx.state.pending_entries.items()
             if pe.entry_type and "passive" in str(pe.entry_type).lower()
         ]
         if not pending_passive:
@@ -150,7 +117,7 @@ class PassiveMakerRuntime:
 
         self._refresh_runtime_market_data_config_state()
         local_l2_enabled = self._local_l2_effective_enabled()
-        non_parity_mode = self.config.runtime.opportunity_input_mode == "non_parity"
+        non_parity_mode = self.ctx.config.runtime.opportunity_input_mode == "non_parity"
 
         if local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
@@ -163,15 +130,15 @@ class PassiveMakerRuntime:
         else:
             # Neither parity nor non-parity — sidecar fallback must be explicit opt-in.
             # local_l2_enabled=False alone does NOT activate the sidecar path.
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_no_eligible_mode",
                 {
                     "ts_ms": now_ms,
                     "local_l2_enabled": local_l2_enabled,
                     "local_l2_configured_enabled": bool(
-                        getattr(self.config.strategy, "local_l2_enabled", False)
+                        getattr(self.ctx.config.strategy, "local_l2_enabled", False)
                     ),
-                    "opportunity_input_mode": self.config.runtime.opportunity_input_mode,
+                    "opportunity_input_mode": self.ctx.config.runtime.opportunity_input_mode,
                     "reason": "non-parity fallback requires explicit opportunity_input_mode='non_parity'",
                 },
             )
@@ -181,7 +148,7 @@ class PassiveMakerRuntime:
     ) -> None:
         """Local-L2 parity maker-event lane: sync runtime, drain events, drive hedges."""
         # Sync local-L2 runtime
-        events = self.local_l2_runtime.sync(now_ms)
+        events = self.ctx.local_l2_runtime.sync(now_ms)
         # V1: event-driven session refresh — L2 events may have changed book readiness
         # (entry_local_l2_sessions.rs:275-297 → BookUpdated → mark_leg_ready etc.)
         if events:
@@ -203,7 +170,7 @@ class PassiveMakerRuntime:
             # V1 parity mode: no auto sidecar fallback when local_l2_enabled=True.
             # When no matching local-L2 events exist, journal the reason and return.
             # Sidecar-mid is only reachable via explicit sidecar mode (local_l2_enabled=False).
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_no_local_l2_events",
                 {
                     "ts_ms": now_ms,
@@ -216,7 +183,7 @@ class PassiveMakerRuntime:
             )
             return
 
-        strategy = self.config.strategy
+        strategy = self.ctx.config.strategy
         maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
@@ -237,8 +204,8 @@ class PassiveMakerRuntime:
                 continue
 
             # Get current mid price from local-L2 books
-            long_book = self.local_l2_runtime.get_book(pending.long_venue.value, pending.symbol)
-            short_book = self.local_l2_runtime.get_book(pending.short_venue.value, pending.symbol)
+            long_book = self.ctx.local_l2_runtime.get_book(pending.long_venue.value, pending.symbol)
+            short_book = self.ctx.local_l2_runtime.get_book(pending.short_venue.value, pending.symbol)
 
             long_mid = long_book.mid_price() if long_book else 0.0
             short_mid = short_book.mid_price() if short_book else 0.0
@@ -280,7 +247,7 @@ class PassiveMakerRuntime:
             # Must check __dict__ for override, not hasattr which returns True
             # for the base class NotImplementedError stub.
             from lightfee.engine.entry_sync import _adapter_supports_amend
-            adapter = self._venue_adapters.get(maker_venue)
+            adapter = self.ctx.venue_adapters.get(maker_venue)
             supports_amend = _adapter_supports_amend(adapter)
 
             decision_input = PassiveOrderDecisionInput(
@@ -301,7 +268,7 @@ class PassiveMakerRuntime:
                 continue
             if decision.kind == PassiveOrderManagerDecisionType.HOLD:
                 if decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED:
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.passive_ops_rate_limited",
                         {"entry_id": entry_id, "reason": "ops_budget_exceeded",
                          "ts_ms": now_ms},
@@ -316,7 +283,7 @@ class PassiveMakerRuntime:
             else:
                 continue
 
-            if self.entry_executor is None:
+            if self.ctx.entry_executor is None:
                 continue
 
             # Collect event metadata
@@ -342,7 +309,7 @@ class PassiveMakerRuntime:
                 manager.note_success(now_ms)
                 self._maker_event_state[entry_id] = (manager, mid)
                 # Write back to authoritative PendingEntry state
-                pe = self.state.pending_entries.get(entry_id)
+                pe = self.ctx.state.pending_entries.get(entry_id)
                 if pe is not None:
                     pe.maker_price = mid
                     if result.order_id:
@@ -351,14 +318,14 @@ class PassiveMakerRuntime:
             except Exception as e:
                 manager.note_failure(now_ms)
                 self._maker_event_state[entry_id] = (manager, stored_price)
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
                     {"entry_id": entry_id, "action": action, "error": str(e)},
                 )
 
         self._last_maker_event_ms = now_ms
-        self.local_l2_runtime.metrics.maker_event_lane_wake_total += 1
-        self.journal.append(
+        self.ctx.local_l2_runtime.metrics.maker_event_lane_wake_total += 1
+        self.ctx.journal.append(
             "execution.maker_event_lane_wake",
             {
                 "event_count": len(matching_events),
@@ -377,7 +344,7 @@ class PassiveMakerRuntime:
         self, now_ms: int, pending_passive: list,
     ) -> None:
         """WS BBO maker-event lane using the in-situ pending hedge driver."""
-        strategy = self.config.strategy
+        strategy = self.ctx.config.strategy
         maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
@@ -402,7 +369,7 @@ class PassiveMakerRuntime:
             venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
             quote = None
             try:
-                quote = self.ws_bbo_cache.get_quote(venue_str, pending.symbol)
+                quote = self.ctx.ws_bbo_cache.get_quote(venue_str, pending.symbol)
             except Exception:
                 quote = None
             budget_ms = self._entry_quote_lease_max_age_ms()
@@ -459,7 +426,7 @@ class PassiveMakerRuntime:
                     for _ in range(stored.get("consecutive_failures", 0)):
                         manager.note_failure(stored.get("last_reprice_ms", now_ms))
 
-            adapter = self._venue_adapters.get(maker_venue)
+            adapter = self.ctx.venue_adapters.get(maker_venue)
             supports_amend = _adapter_supports_amend(adapter)
             decision_input = PassiveOrderDecisionInput(
                 tick_size=0.1,
@@ -477,7 +444,7 @@ class PassiveMakerRuntime:
                 continue
             if decision.kind == PassiveOrderManagerDecisionType.HOLD:
                 if decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED:
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.passive_ops_rate_limited",
                         {
                             "entry_id": entry_id,
@@ -493,7 +460,7 @@ class PassiveMakerRuntime:
                 action = "cancel_replace"
             else:
                 continue
-            if self.entry_executor is None:
+            if self.ctx.entry_executor is None:
                 continue
 
             try:
@@ -505,7 +472,7 @@ class PassiveMakerRuntime:
                 )
                 manager.note_success(now_ms)
                 self._maker_event_state[entry_id] = (manager, mid)
-                pe = self.state.pending_entries.get(entry_id)
+                pe = self.ctx.state.pending_entries.get(entry_id)
                 if pe is not None:
                     pe.maker_price = mid
                     if result.order_id:
@@ -518,7 +485,7 @@ class PassiveMakerRuntime:
             except Exception as e:
                 manager.note_failure(now_ms)
                 self._maker_event_state[entry_id] = (manager, stored_price)
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
                     {
                         "entry_id": entry_id,
@@ -529,7 +496,7 @@ class PassiveMakerRuntime:
                 )
 
         if missing_quotes:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_no_ws_bbo_quote",
                 {
                     "ts_ms": now_ms,
@@ -544,7 +511,7 @@ class PassiveMakerRuntime:
 
         self._last_maker_event_ms = now_ms
         if woke_positions > 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_lane_wake",
                 {
                     "position_count": woke_positions,
@@ -565,7 +532,7 @@ class PassiveMakerRuntime:
         """Non-parity fallback: sidecar mid-price driven maker repricing."""
         from lightfee.sidecar.publisher import load_snapshot as _load_snap
 
-        snapshot = _load_snap(self.config.runtime.sidecar_snapshot_path)
+        snapshot = _load_snap(self.ctx.config.runtime.sidecar_snapshot_path)
         if snapshot is None:
             return
 
@@ -574,7 +541,7 @@ class PassiveMakerRuntime:
             if quote.bid > 0 and quote.ask > 0:
                 price_hints[quote.symbol] = (quote.bid + quote.ask) / 2.0
 
-        strategy = self.config.strategy
+        strategy = self.ctx.config.strategy
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
         cooldown_ms = strategy.passive_failure_cooldown_ms
@@ -613,7 +580,7 @@ class PassiveMakerRuntime:
             else:
                 continue
 
-            if self.entry_executor is None:
+            if self.ctx.entry_executor is None:
                 continue
 
             try:
@@ -632,14 +599,14 @@ class PassiveMakerRuntime:
                     "last_reprice_ms": now_ms,
                     "consecutive_failures": failures + 1,
                 }
-                self.journal.append(
+                self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
                     {"entry_id": entry_id, "action": action, "error": str(e)},
                 )
 
         self._last_maker_event_ms = now_ms
         if woke_positions > 0:
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_lane_wake",
                 {
                     "position_count": woke_positions,
@@ -661,7 +628,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry import EntryContext, EntryType
 
-        maker_leg = Side.BUY if self.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -714,8 +681,8 @@ class PassiveMakerRuntime:
             blocked_reasons=list(pending.blocked_reasons),
             exit_after_first_stage=pending.exit_after_first_stage,
         )
-        await self.entry_executor.execute(ctx)
-        self.journal.append(
+        await self.ctx.entry_executor.execute(ctx)
+        self.ctx.journal.append(
             "runtime.maker_event_reprice",
             {
                 "entry_id": entry_id,
@@ -743,7 +710,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry_sync import drive_pending_entry_hedge
 
-        maker_leg = Side.BUY if self.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
 
         result = await drive_pending_entry_hedge(
             entry_id=entry_id,
@@ -752,8 +719,8 @@ class PassiveMakerRuntime:
             old_price=old_price,
             action=action,
             now_ms=now_ms,
-            adapters=self._venue_adapters,
-            journal=self.journal,
+            adapters=self.ctx.venue_adapters,
+            journal=self.ctx.journal,
             maker_leg=maker_leg,
             symbol=pending.symbol,
             long_venue=pending.long_venue,
@@ -761,7 +728,7 @@ class PassiveMakerRuntime:
         )
 
         if result.outcome in ("applied", "uncertain"):
-            self.journal.append(
+            self.ctx.journal.append(
                 "runtime.maker_event_reprice",
                 {
                     "entry_id": entry_id,

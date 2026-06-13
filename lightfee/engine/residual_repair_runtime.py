@@ -34,29 +34,13 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
-from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.runtime_context import ResidualRepairRuntimeContext
 from lightfee.risk.modes import GlobalRiskMode
 
 
 class ResidualRepairRuntime:
-    def __init__(self, ctx: RuntimeContext) -> None:
+    def __init__(self, ctx: ResidualRepairRuntimeContext) -> None:
         self.ctx = ctx
-
-    @property
-    def state(self):
-        return self.ctx.state
-
-    @property
-    def config(self):
-        return self.ctx.config
-
-    @property
-    def journal(self):
-        return self.ctx.journal
-
-    @property
-    def snapshot_store(self):
-        return self.ctx.snapshot_store
 
     def get_venue_adapter(self, venue: Venue) -> VenueAdapter | None:
         return self.ctx.get_venue_adapter(venue)
@@ -91,24 +75,24 @@ class ResidualRepairRuntime:
 
     async def recover_residual_repairs(self, now_ms: int) -> None:
         """Process ready pending residual repair tasks during normal runtime."""
-        if not self.state.pending_residual_repairs:
+        if not self.ctx.state.pending_residual_repairs:
             return
 
         from lightfee.core.domain import OrderRequest
         from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
 
         repaired = 0
-        for task in list(self.state.pending_residual_repairs):
+        for task in list(self.ctx.state.pending_residual_repairs):
             if not isinstance(task, dict):
                 continue
 
             fields = self._pending_residual_repair_fields(task)
             if fields is None:
-                self.journal.append(
+                self.ctx.journal.append(
                     "recovery.residual_repair_invalid_removed",
                     {"position_id": task.get("position_id", ""), "symbol": task.get("symbol", "")},
                 )
-                self.state.pending_residual_repairs.remove(task)
+                self.ctx.state.pending_residual_repairs.remove(task)
                 continue
 
             repair_venue, repair_side, task_repair_quantity = fields
@@ -130,7 +114,7 @@ class ResidualRepairRuntime:
                     self._pause_pending_residual_repair(task, now_ms)
                     continue
                 self._reschedule_pending_residual_repair_task(task, now_ms, "adapter_missing")
-                self.journal.append(
+                self.ctx.journal.append(
                     "recovery.residual_repair_failed",
                     {
                         "position_id": position_id,
@@ -186,7 +170,7 @@ class ResidualRepairRuntime:
                         live_excess_quantity - float(accepted_fill.quantity or 0.0),
                         0.0,
                     )
-                    self.state.pending_residual_repairs.remove(task)
+                    self.ctx.state.pending_residual_repairs.remove(task)
                     self._clear_residual_repair_accepted_order_gap(task)
                     if remaining_quantity > 1e-9:
                         updated = dict(task)
@@ -196,7 +180,7 @@ class ResidualRepairRuntime:
                         updated["retry_count"] = 0
                         updated["last_attempt_at_ms"] = now_ms
                         updated["next_attempt_ms"] = now_ms
-                        self.state.pending_residual_repairs.append(updated)
+                        self.ctx.state.pending_residual_repairs.append(updated)
                     else:
                         self._release_residual_repair_pair_gate(pair_id, symbol)
                         repaired += 1
@@ -215,13 +199,13 @@ class ResidualRepairRuntime:
                         "fill_price": float(getattr(accepted_fill, "price", 0.0) or 0.0),
                     }
                     completed_payload.update(accepted_payload)
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.residual_repair_completed",
                         completed_payload,
                     )
                     continue
                 if status == "live_flat":
-                    self.state.pending_residual_repairs.remove(task)
+                    self.ctx.state.pending_residual_repairs.remove(task)
                     self._clear_residual_repair_accepted_order_gap(task)
                     self._release_residual_repair_pair_gate(pair_id, symbol)
                     repaired += 1
@@ -235,7 +219,7 @@ class ResidualRepairRuntime:
                         "result": "accepted_order_live_flat",
                     }
                     completed_payload.update(accepted_payload)
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.residual_repair_completed",
                         completed_payload,
                     )
@@ -258,7 +242,7 @@ class ResidualRepairRuntime:
                     "error": task["last_error"],
                 }
                 failed_payload.update(accepted_payload)
-                self.journal.append(
+                self.ctx.journal.append(
                     "recovery.residual_repair_failed",
                     failed_payload,
                 )
@@ -295,7 +279,7 @@ class ResidualRepairRuntime:
                     is_locally_paused
                     or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
                 ):
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "recovery.residual_repair_failed",
                         {
                             "position_id": position_id,
@@ -311,7 +295,7 @@ class ResidualRepairRuntime:
                     self._pause_pending_residual_repair(task, now_ms)
                     continue
                 self._reschedule_pending_residual_repair_task(task, now_ms, error)
-                self.journal.append(
+                self.ctx.journal.append(
                     "recovery.residual_repair_failed",
                     {
                         "position_id": position_id,
@@ -333,7 +317,7 @@ class ResidualRepairRuntime:
                 live_excess_quantity = max(baseline - live_size, 0.0)
 
             if live_excess_quantity <= 1e-9:
-                has_local_position = position_id in self.state.open_positions
+                has_local_position = position_id in self.ctx.state.open_positions
                 all_probed_positions_flat = all(
                     abs(self._signed_position_size(pos)) <= 1e-9
                     for pos in live_positions.values()
@@ -368,7 +352,7 @@ class ResidualRepairRuntime:
                     live_excess_quantity = abs(live_size)
                     task["repair_side"] = repair_side.value
                     task["repair_quantity"] = live_excess_quantity
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.residual_repair_side_rebuilt_from_live_truth",
                         {
                             "position_id": position_id,
@@ -396,10 +380,10 @@ class ResidualRepairRuntime:
                         self._reschedule_pending_residual_repair_task(task, now_ms, error)
                     continue
                 else:
-                    self.state.pending_residual_repairs.remove(task)
+                    self.ctx.state.pending_residual_repairs.remove(task)
                     self._release_residual_repair_pair_gate(pair_id, symbol)
                     repaired += 1
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "execution.residual_repair_completed",
                         {
                             "position_id": position_id,
@@ -426,7 +410,7 @@ class ResidualRepairRuntime:
                     repair_quantity = await adapter.normalize_quantity(symbol, repair_quantity)
                 except Exception as e:
                     self._reschedule_pending_residual_repair_task(task, now_ms, str(e))
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "recovery.residual_repair_failed",
                         {
                             "position_id": position_id,
@@ -442,7 +426,7 @@ class ResidualRepairRuntime:
             matched_quantity = 0.0
             residual_ratio = 0.0
             if task.get("origin") == "entry_open":
-                open_position = self.state.open_positions.get(position_id)
+                open_position = self.ctx.state.open_positions.get(position_id)
                 if open_position is not None:
                     matched_quantity = abs(
                         float(getattr(open_position, "matched_quantity", 0.0) or 0.0)
@@ -487,7 +471,7 @@ class ResidualRepairRuntime:
                 self._reschedule_pending_residual_repair_task(
                     task, now_ms, "normalized_repair_quantity_zero"
                 )
-                self.journal.append(
+                self.ctx.journal.append(
                     "recovery.residual_repair_failed",
                     {
                         "position_id": position_id,
@@ -545,7 +529,7 @@ class ResidualRepairRuntime:
                 is_locally_paused
                 or self._residual_repair_deadline_or_attempts_exhausted(task, now_ms)
             ):
-                self.journal.append(
+                self.ctx.journal.append(
                     "execution.residual_repair_resumed",
                     {
                         "position_id": position_id,
@@ -610,7 +594,7 @@ class ResidualRepairRuntime:
                         target_qty=repair_quantity,
                         live_pos_before=live_position,
                     )
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "order.reconcile_result",
                         build_order_reconcile_result_payload(
                             result=duplicate_reconcile,
@@ -646,15 +630,15 @@ class ResidualRepairRuntime:
                         duplicate_payload["live_fetch_error"] = (
                             duplicate_reconcile.live_fetch_error
                         )
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "recovery.residual_repair_duplicate_client_order_reconcile_result",
                         duplicate_payload,
                     )
                     if duplicate_reconcile.clear_state:
-                        self.state.pending_residual_repairs.remove(task)
+                        self.ctx.state.pending_residual_repairs.remove(task)
                         self._release_residual_repair_pair_gate(pair_id, symbol)
                         repaired += 1
-                        self.journal.append(
+                        self.ctx.journal.append(
                             "execution.residual_repair_completed",
                             {
                                 "position_id": position_id,
@@ -798,7 +782,7 @@ class ResidualRepairRuntime:
                                 - float(accepted_fill.quantity or 0.0),
                                 0.0,
                             )
-                            self.state.pending_residual_repairs.remove(task)
+                            self.ctx.state.pending_residual_repairs.remove(task)
                             self._clear_residual_repair_accepted_order_gap(task)
                             if remaining_quantity > 1e-9:
                                 updated = dict(task)
@@ -811,7 +795,7 @@ class ResidualRepairRuntime:
                                 updated["retry_count"] = 0
                                 updated["last_attempt_at_ms"] = now_ms
                                 updated["next_attempt_ms"] = now_ms
-                                self.state.pending_residual_repairs.append(updated)
+                                self.ctx.state.pending_residual_repairs.append(updated)
                             else:
                                 self._release_residual_repair_pair_gate(pair_id, symbol)
                                 repaired += 1
@@ -843,13 +827,13 @@ class ResidualRepairRuntime:
                                 ),
                             }
                             completed_payload.update(accepted_payload)
-                            self.journal.append(
+                            self.ctx.journal.append(
                                 "execution.residual_repair_completed",
                                 completed_payload,
                             )
                             continue
                         if status == "live_flat":
-                            self.state.pending_residual_repairs.remove(task)
+                            self.ctx.state.pending_residual_repairs.remove(task)
                             self._clear_residual_repair_accepted_order_gap(task)
                             self._release_residual_repair_pair_gate(pair_id, symbol)
                             repaired += 1
@@ -866,7 +850,7 @@ class ResidualRepairRuntime:
                                 "remaining_quantity": 0.0,
                             }
                             completed_payload.update(accepted_payload)
-                            self.journal.append(
+                            self.ctx.journal.append(
                                 "execution.residual_repair_completed",
                                 completed_payload,
                             )
@@ -893,7 +877,7 @@ class ResidualRepairRuntime:
                             "error": task["last_error"],
                         }
                         failed_payload.update(accepted_payload)
-                        self.journal.append(
+                        self.ctx.journal.append(
                             "recovery.residual_repair_failed",
                             failed_payload,
                         )
@@ -919,12 +903,12 @@ class ResidualRepairRuntime:
                             duplicate_live_nonzero_error
                             == "residual_repair_duplicate_live_nonzero_blocked"
                         ):
-                            enter_fail_closed(self.state)
-                            self.state.recovery_blocked_reason = (
+                            enter_fail_closed(self.ctx.state)
+                            self.ctx.state.recovery_blocked_reason = (
                                 duplicate_live_nonzero_error
                             )
-                            self.state.recovery_blocked_at_ms = now_ms
-                            self.state.last_error = duplicate_live_nonzero_error
+                            self.ctx.state.recovery_blocked_at_ms = now_ms
+                            self.ctx.state.last_error = duplicate_live_nonzero_error
                             task["last_error"] = duplicate_live_nonzero_error
                             blocker_payload = dict(duplicate_live_nonzero_evidence)
                             blocker_payload.update({
@@ -932,7 +916,7 @@ class ResidualRepairRuntime:
                                 "blocked_new_entry": True,
                                 "ts_ms": now_ms,
                             })
-                            self.journal.append(
+                            self.ctx.journal.append(
                                 "recovery.residual_repair_duplicate_live_nonzero_blocked",
                                 blocker_payload,
                             )
@@ -951,14 +935,14 @@ class ResidualRepairRuntime:
                             "error": str(e),
                     }
                     failed_payload.update(order_gap_evidence)
-                    self.journal.append(
+                    self.ctx.journal.append(
                         "recovery.residual_repair_failed",
                         failed_payload,
                     )
                     continue
 
             remaining_quantity = max(live_excess_quantity - float(fill.quantity or 0.0), 0.0)
-            self.state.pending_residual_repairs.remove(task)
+            self.ctx.state.pending_residual_repairs.remove(task)
             if remaining_quantity > 1e-9:
                 updated = dict(task)
                 updated["repair_venue"] = repair_venue.value
@@ -970,11 +954,11 @@ class ResidualRepairRuntime:
                 updated["retry_count"] = 0
                 updated["last_attempt_at_ms"] = now_ms
                 updated["next_attempt_ms"] = now_ms
-                self.state.pending_residual_repairs.append(updated)
+                self.ctx.state.pending_residual_repairs.append(updated)
             else:
                 self._release_residual_repair_pair_gate(pair_id, symbol)
                 repaired += 1
-            self.journal.append(
+            self.ctx.journal.append(
                 "execution.residual_repair_completed",
                 {
                     "position_id": position_id,
@@ -1014,9 +998,9 @@ class ResidualRepairRuntime:
                         self._recovery_state_collection("pending_passive_closes")
                     ),
                     exchange_truth=None,
-                    prior_recovery_block_reason=self.state.recovery_blocked_reason,
+                    prior_recovery_block_reason=self.ctx.state.recovery_blocked_reason,
                     operator_fail_closed=(
-                        self.state.operator.requested_mode
+                        self.ctx.state.operator.requested_mode
                         == GlobalRiskMode.FAIL_CLOSED
                     ),
                 )
@@ -1024,11 +1008,11 @@ class ResidualRepairRuntime:
             self.ctx.recovery_decision = core_decision
             if (
                 core_decision.clear_previous_block
-                and self.state.recovery_blocked_reason
+                and self.ctx.state.recovery_blocked_reason
                 in CORE_CLEARABLE_BLOCK_REASONS
             ):
-                clear_risk_mode_for_recovery(self.state, core_decision)
-                self.journal.append(
+                clear_risk_mode_for_recovery(self.ctx.state, core_decision)
+                self.ctx.journal.append(
                     "recovery.residual_repairs_core_clear",
                     {
                         "reason": core_decision.clear_reason,
@@ -1036,7 +1020,7 @@ class ResidualRepairRuntime:
                         "ts_ms": now_ms,
                     },
                 )
-            self.journal.append(
+            self.ctx.journal.append(
                 "recovery.residual_repairs_complete",
                 {"repaired": repaired, "ts_ms": now_ms},
             )
@@ -1454,7 +1438,7 @@ class ResidualRepairRuntime:
 
     def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
         position_id = task.get("position_id", "")
-        position = self.state.open_positions.get(position_id)
+        position = self.ctx.state.open_positions.get(position_id)
         if position is None:
             return 0.0
         matched_quantity = float(
@@ -1509,16 +1493,16 @@ class ResidualRepairRuntime:
         }
         if evidence:
             payload.update(evidence)
-        self.journal.append(
+        self.ctx.journal.append(
             "execution.residual_repair_paused",
             payload,
         )
 
     def _release_residual_repair_pair_gate(self, pair_id: str, symbol: str) -> None:
-        if not getattr(self.state, "live_recovery_reduce_only_pairs", None):
+        if not getattr(self.ctx.state, "live_recovery_reduce_only_pairs", None):
             return
         kept = []
-        for item in self.state.live_recovery_reduce_only_pairs:
+        for item in self.ctx.state.live_recovery_reduce_only_pairs:
             item_pair_id = ""
             item_symbol = ""
             if isinstance(item, dict):
@@ -1532,7 +1516,7 @@ class ResidualRepairRuntime:
             if not pair_id and symbol and item_symbol == symbol:
                 continue
             kept.append(item)
-        self.state.live_recovery_reduce_only_pairs = kept
+        self.ctx.state.live_recovery_reduce_only_pairs = kept
 
     def _terminalize_residual_repair_task(
         self,
@@ -1549,7 +1533,7 @@ class ResidualRepairRuntime:
         pair_id = str(task.get("pair_id", ""))
         symbol = str(task.get("symbol", ""))
         position_id = str(task.get("position_id", "") or "")
-        position = self.state.open_positions.get(position_id)
+        position = self.ctx.state.open_positions.get(position_id)
         matched_quantity = float(
             getattr(position, "matched_quantity", 0.0) or 0.0
         ) if position is not None else 0.0
@@ -1576,11 +1560,11 @@ class ResidualRepairRuntime:
         closure_row_key = closure_fields.get("closure_row_key", "")
         closure_decision_id = closure_fields.get("closure_decision_id", "")
         try:
-            self.state.pending_residual_repairs.remove(task)
+            self.ctx.state.pending_residual_repairs.remove(task)
         except ValueError:
             pass
         self._release_residual_repair_pair_gate(pair_id, symbol)
-        self.journal.append(
+        self.ctx.journal.append(
             "execution.residual_repair_terminal",
             {
                 "position_id": position_id,
@@ -1613,7 +1597,7 @@ class ResidualRepairRuntime:
             and matched_quantity > 1e-9
             and residual_ratio <= 0.02 + 1e-12
         ):
-            self.journal.append(
+            self.ctx.journal.append(
                 "execution.entry_residual_dust_tolerated",
                 {
                     "position_id": position_id,
