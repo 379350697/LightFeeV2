@@ -139,6 +139,18 @@ class PendingEntryTerminalizer:
                 contains_positive_fill_evidence=False,
             )
 
+        decision_live_long = _quantity(_get(truth, "live_long_quantity", 0.0))
+        decision_live_short = _quantity(_get(truth, "live_short_quantity", 0.0))
+        decision_live_balanced = _quantity(
+            _get(truth, "live_balanced_quantity", 0.0)
+        )
+        if (
+            truth.positive_fill_requires_live_position
+            and matched > 1e-9
+            and decision_live_balanced + 1e-9 >= matched
+        ):
+            decision_live_balanced = matched
+
         if matched > 1e-9:
             outcome = (
                 "open_position_with_residual"
@@ -154,6 +166,9 @@ class PendingEntryTerminalizer:
                 matched_quantity=matched,
                 residual_quantity=residual,
                 contains_positive_fill_evidence=True,
+                live_long_quantity=decision_live_long,
+                live_short_quantity=decision_live_short,
+                live_balanced_quantity=decision_live_balanced,
             )
 
         return PendingEntryTerminalDecision(
@@ -165,6 +180,9 @@ class PendingEntryTerminalizer:
             matched_quantity=0.0,
             residual_quantity=residual,
             contains_positive_fill_evidence=True,
+            live_long_quantity=decision_live_long,
+            live_short_quantity=decision_live_short,
+            live_balanced_quantity=decision_live_balanced,
         )
 
     def decide_supervision_stale_clear(

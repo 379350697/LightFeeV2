@@ -2157,6 +2157,71 @@ async def test_positive_fill_finalize_defers_when_live_truth_is_single_leg(
 
 
 @pytest.mark.asyncio
+async def test_positive_fill_finalize_records_balanced_live_truth_on_open(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="HOMEUSDT",
+                side=Side.BUY,
+                quantity=1600.0,
+                entry_price=0.02852,
+                observed_at_ms=1781376760000,
+            )),
+            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="HOMEUSDT",
+                side=Side.SELL,
+                quantity=1600.0,
+                entry_price=0.028914,
+                observed_at_ms=1781376760000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1781376722066-HOMEUSDT",
+        symbol="HOMEUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        target_quantity=1600.0,
+        maker_leg="long",
+        maker_order_id="home-maker-order",
+        maker_client_order_id="home-maker-cid",
+        hedge_order_id="home-hedge-order",
+        hedge_client_order_id="home-hedge-cid",
+        maker_leg_filled=1600.0,
+        hedge_leg_filled=1600.0,
+        maker_fill_price=0.02852,
+        hedge_fill_price=0.028914,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1781376760000,
+    )
+
+    assert finalized is True
+    decision = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.terminalizer_decision"
+    ][-1]
+    assert decision["outcome"] == "open_position"
+    assert decision["reason"] == "positive_fill_terminalized_with_matched_exposure"
+    assert decision["matched_quantity"] == pytest.approx(1600.0)
+    assert decision["live_long_quantity"] == pytest.approx(1600.0)
+    assert decision["live_short_quantity"] == pytest.approx(1600.0)
+    assert decision["live_balanced_quantity"] == pytest.approx(1600.0)
+
+
+@pytest.mark.asyncio
 async def test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1(
     config, tmp_journal,
 ):

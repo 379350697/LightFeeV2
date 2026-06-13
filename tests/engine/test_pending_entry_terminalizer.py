@@ -101,6 +101,9 @@ def test_positive_fill_requires_direction_correct_live_balanced_quantity():
     assert decision.outcome == "open_position"
     assert decision.matched_quantity == 1600.0
     assert decision.allows_pending_removal is True
+    assert decision.live_long_quantity == 1600.0
+    assert decision.live_short_quantity == 1600.0
+    assert decision.live_balanced_quantity == 1600.0
 
 
 def test_positive_fill_requiring_live_truth_rejects_single_leg_position():
