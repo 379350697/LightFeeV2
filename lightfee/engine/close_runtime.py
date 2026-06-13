@@ -1,0 +1,1022 @@
+"""Close runtime delegate.
+
+This module owns close reconciliation and normal-exit helpers mechanically moved
+from LiveRuntime. Keep journal events, payload keys, and close semantics stable.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from lightfee.core.contracts import VenueAdapter
+from lightfee.core.domain import Venue
+from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.lifecycle import set_lifecycle
+from lightfee.engine.reconciliation import _recon_fill_price
+from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+
+class CloseRuntime:
+    # V1 reconciliation retry constants (Rust V1 recovery.rs)
+    _RECONCILE_RETRY_BASE_MS = 30_000
+    _RECONCILE_RETRY_MAX_MS = 300_000
+    _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self.ctx = ctx
+
+    @property
+    def state(self):
+        return self.ctx.state
+
+    @property
+    def config(self):
+        return self.ctx.config
+
+    @property
+    def journal(self):
+        return self.ctx.journal
+
+    @property
+    def _venue_adapters(self) -> dict[Venue, VenueAdapter]:
+        return self.ctx.venue_adapters
+
+    @property
+    def local_l2_runtime(self):
+        return self.ctx.local_l2_runtime
+
+    @property
+    def ws_bbo_cache(self):
+        return self.ctx.ws_bbo_cache
+
+    @property
+    def close_executor(self):
+        return self.ctx.close_executor
+
+    @property
+    def passive_close_executor(self):
+        return self.ctx.passive_close_executor
+
+    def _flush_adapter_order_diagnostics(self, adapter) -> None:
+        return self.ctx._flush_adapter_order_diagnostics(adapter)
+
+    def _entry_readiness_provider_uses_local_l2(self) -> bool:
+        return self.ctx._entry_readiness_provider_uses_local_l2()
+
+    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
+        return self.ctx._entry_readiness_provider_uses_ws_bbo()
+
+    def _entry_quote_lease_max_age_ms(self) -> int:
+        return self.ctx._entry_quote_lease_max_age_ms()
+
+    def _runtime_method_override(self, method_name: str):
+        method = getattr(self.ctx, method_name, None)
+        class_method = getattr(type(self.ctx), method_name, None)
+        if getattr(method, "__func__", None) is class_method:
+            return None
+        return method if callable(method) else None
+
+    async def _call_fetch_close_leg_reconciliations(self, **kwargs):
+        override = self._runtime_method_override("_fetch_close_leg_reconciliations")
+        if override is not None:
+            return await override(**kwargs)
+        return await self._fetch_close_leg_reconciliations(**kwargs)
+
+    async def _call_fetch_pending_close_terminal_live_sizes(self, **kwargs):
+        override = self._runtime_method_override("_fetch_pending_close_terminal_live_sizes")
+        if override is not None:
+            return await override(**kwargs)
+        return await self._fetch_pending_close_terminal_live_sizes(**kwargs)
+
+    async def _call_try_abandon_stale_pending_close_reconciliation(self, *args, **kwargs):
+        override = self._runtime_method_override(
+            "_try_abandon_stale_pending_close_reconciliation"
+        )
+        if override is not None:
+            return await override(*args, **kwargs)
+        return await self._try_abandon_stale_pending_close_reconciliation(*args, **kwargs)
+
+    def _call_venue_private_position_confirmed(self, *args, **kwargs) -> bool:
+        override = self._runtime_method_override("_venue_private_position_confirmed")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._venue_private_position_confirmed(*args, **kwargs)
+
+    def _call_open_positions_private_confirmation_ready(self) -> bool:
+        override = self._runtime_method_override("_open_positions_private_confirmation_ready")
+        if override is not None:
+            return override()
+        return self._open_positions_private_confirmation_ready()
+
+    def _call_apply_pending_close_reconciliation_backoff(self, *args, **kwargs) -> None:
+        override = self._runtime_method_override("_apply_pending_close_reconciliation_backoff")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._apply_pending_close_reconciliation_backoff(*args, **kwargs)
+
+    def _call_resolve_ws_bbo_close_mid(self, *args, **kwargs) -> float:
+        override = self._runtime_method_override("_resolve_ws_bbo_close_mid")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._resolve_ws_bbo_close_mid(*args, **kwargs)
+
+    def _call_resolve_local_l2_mid(self, *args, **kwargs) -> float:
+        override = self._runtime_method_override("_resolve_local_l2_mid")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._resolve_local_l2_mid(*args, **kwargs)
+
+    def _call_resolve_ws_bbo_close_quote(self, *args, **kwargs):
+        override = self._runtime_method_override("_resolve_ws_bbo_close_quote")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._resolve_ws_bbo_close_quote(*args, **kwargs)
+
+    def _call_resolve_local_l2_quote(self, *args, **kwargs):
+        override = self._runtime_method_override("_resolve_local_l2_quote")
+        if override is not None:
+            return override(*args, **kwargs)
+        return self._resolve_local_l2_quote(*args, **kwargs)
+
+    @staticmethod
+    def _venue_from_close_reconciliation(value: Any) -> Venue | None:
+        if isinstance(value, Venue):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                return Venue.from_str(value)
+            except ValueError:
+                return None
+        return None
+    @staticmethod
+    def _close_reconciliation_leg_identity(leg: Any) -> tuple[str, str]:
+        if not isinstance(leg, dict):
+            return "", ""
+        return str(leg.get("order_id") or ""), str(leg.get("client_order_id") or "")
+    @classmethod
+    def _has_close_reconciliation_leg_identity(cls, legs: Any) -> bool:
+        if not isinstance(legs, list):
+            return False
+        for leg in legs:
+            order_id, client_order_id = cls._close_reconciliation_leg_identity(leg)
+            if order_id or client_order_id:
+                return True
+        return False
+    @staticmethod
+    def _close_reconciliation_fill_qty(fill: Any) -> float:
+        qty = getattr(fill, "quantity", 0.0) if fill is not None else 0.0
+        return float(qty) if isinstance(qty, (int, float)) and math.isfinite(float(qty)) else 0.0
+    async def _fetch_close_leg_reconciliations(
+        self,
+        *,
+        symbol: str,
+        venue: Venue,
+        legs: Any,
+    ) -> list[Any] | None:
+        if not isinstance(legs, list):
+            return []
+        adapter = self._venue_adapters.get(venue)
+        if adapter is None:
+            return None
+        fetch = getattr(adapter, "fetch_order_fill_reconciliation", None)
+        if not callable(fetch):
+            return None
+
+        fills: list[Any] = []
+        for leg in legs:
+            order_id, client_order_id = self._close_reconciliation_leg_identity(leg)
+            if not order_id and not client_order_id:
+                return None
+            fill = await fetch(symbol, order_id, client_order_id)
+            self._flush_adapter_order_diagnostics(adapter)
+            if fill is None:
+                return None
+            fills.append(fill)
+        return fills
+    @staticmethod
+    def _close_reconciliation_live_size(position: Any) -> float:
+        if position is None:
+            return 0.0
+        raw = getattr(position, "quantity", getattr(position, "size", 0.0))
+        try:
+            size = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return size if math.isfinite(size) else 0.0
+    async def _fetch_pending_close_terminal_live_sizes(
+        self,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> tuple[float, float] | None:
+        long_adapter = self._venue_adapters.get(long_venue)
+        short_adapter = self._venue_adapters.get(short_venue)
+        if long_adapter is None or short_adapter is None:
+            return None
+        try:
+            long_position = await long_adapter.fetch_position(symbol)
+            self._flush_adapter_order_diagnostics(long_adapter)
+            short_position = await short_adapter.fetch_position(symbol)
+            self._flush_adapter_order_diagnostics(short_adapter)
+        except Exception:
+            return None
+        return (
+            self._close_reconciliation_live_size(long_position),
+            self._close_reconciliation_live_size(short_position),
+        )
+    async def _try_abandon_stale_pending_close_reconciliation(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+        error: str,
+    ) -> bool:
+        if str(reconciliation.get("kind") or "final") != "final":
+            return False
+        position_id = str(reconciliation.get("position_id") or "")
+        if any(
+            str(getattr(position, "position_id", "")) == position_id
+            for position in self.state.open_positions.values()
+        ):
+            return False
+
+        next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+        terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        )
+        if terminal_sizes is None:
+            return False
+        long_live_size, short_live_size = terminal_sizes
+        if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
+            return False
+
+        self.journal.append_critical(
+            now_ms,
+            "exit.reconciliation_abandoned",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "kind": "final",
+                "reason": reconciliation.get("reason", ""),
+                "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                "attempt_count": next_attempt_count,
+                "terminal_reason": "fill_reconciliation_unavailable_after_terminal_budget",
+                "error": error,
+                "lifetime_ms": max(
+                    0,
+                    now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                ),
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "long_live_size": long_live_size,
+                "short_live_size": short_live_size,
+            },
+        )
+        return True
+    def _venue_private_position_confirmed(self, venue: Venue, symbol: str) -> bool:
+        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+            return True
+        adapter = self._venue_adapters.get(venue)
+        if adapter is None:
+            return False
+        if not bool(getattr(adapter, "supports_private_health", False)):
+            return True
+
+        worker_count = getattr(adapter, "private_ws_worker_count", None)
+        transport = getattr(adapter, "_transport", None)
+        if not callable(worker_count) and transport is not None:
+            worker_count = getattr(transport, "private_ws_worker_count", None)
+        if callable(worker_count):
+            try:
+                if int(worker_count() or 0) == 0:
+                    return True
+            except (TypeError, ValueError):
+                return True
+
+        health_fn = getattr(adapter, "cached_private_connection_health", None)
+        if not callable(health_fn):
+            return False
+        health = health_fn()
+        if health is None:
+            return False
+        is_unhealthy = getattr(health, "is_unhealthy", None)
+        if callable(is_unhealthy) and is_unhealthy():
+            return False
+        cached_position = getattr(adapter, "cached_position", None)
+        if not callable(cached_position):
+            return False
+        return cached_position(symbol) is not None
+    def _open_positions_private_confirmation_ready(self) -> bool:
+        return all(
+            self._call_venue_private_position_confirmed(position.long_venue, position.symbol)
+            and self._call_venue_private_position_confirmed(position.short_venue, position.symbol)
+            for position in self.state.open_positions.values()
+        )
+    @staticmethod
+    def _aggregate_close_reconciliation_fills(fills: list[Any]) -> dict[str, Any]:
+        qty = 0.0
+        notional = 0.0
+        fee_quote = 0.0
+        leg_payloads: list[dict[str, Any]] = []
+        for fill in fills:
+            leg_qty = CloseRuntime._close_reconciliation_fill_qty(fill)
+            price = _recon_fill_price(fill)
+            fee = float(getattr(fill, "fee_quote", None) or 0.0)
+            qty += leg_qty
+            notional += leg_qty * price
+            fee_quote += fee
+            leg_payloads.append({
+                "venue": getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", "")),
+                "order_id": getattr(fill, "order_id", "") or "",
+                "client_order_id": getattr(fill, "client_order_id", None) or "",
+                "quantity": leg_qty,
+                "average_price": price,
+                "fee_quote": fee,
+                "filled_at_ms": int(getattr(fill, "filled_at_ms", 0) or 0),
+            })
+        average_price = notional / qty if qty > 1e-12 else 0.0
+        first = fills[0] if fills else None
+        return {
+            "quantity": qty,
+            "average_price": average_price,
+            "fee_quote": fee_quote,
+            "order_id": getattr(first, "order_id", "") if first is not None else "",
+            "client_order_id": (
+                getattr(first, "client_order_id", None) if first is not None else ""
+            ) or "",
+            "legs": leg_payloads,
+        }
+    def _apply_pending_close_reconciliation_backoff(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+    ) -> None:
+        attempt = int(reconciliation.get("attempt_count") or 0) + 1
+        reconciliation["attempt_count"] = attempt
+        delay = min(
+            self._RECONCILE_RETRY_BASE_MS * (2 ** max(attempt - 1, 0)),
+            self._RECONCILE_RETRY_MAX_MS,
+        )
+        reconciliation["next_attempt_ms"] = now_ms + delay
+    def _exit_reconciled_payload_from_leg_fills(
+        self,
+        reconciliation: dict[str, Any],
+        long_fills: list[Any],
+        short_fills: list[Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        snapshot = reconciliation.get("position_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+
+        long = self._aggregate_close_reconciliation_fills(long_fills)
+        short = self._aggregate_close_reconciliation_fills(short_fills)
+        long_qty = float(long["quantity"])
+        short_qty = float(short["quantity"])
+        long_entry = float(snapshot.get("long_entry_price") or 0.0)
+        short_entry = float(snapshot.get("short_entry_price") or 0.0)
+        funding_quote = float(snapshot.get("captured_funding_quote") or 0.0)
+        entry_fee = float(snapshot.get("total_entry_fee_quote") or 0.0)
+        price_pnl = ((float(long["average_price"]) - long_entry) * long_qty) + (
+            (short_entry - float(short["average_price"])) * short_qty
+        )
+        exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
+        complete = long_qty > 1e-12 and short_qty > 1e-12
+        return {
+            "position_id": reconciliation.get("position_id", ""),
+            "symbol": reconciliation.get("symbol", snapshot.get("symbol", "")),
+            "kind": reconciliation.get("kind", "final"),
+            "reason": reconciliation.get("reason", ""),
+            "closed_at_ms": int(reconciliation.get("closed_at_ms") or now_ms),
+            "reconciled_at_ms": now_ms,
+            "long_closed_qty": long_qty,
+            "short_closed_qty": short_qty,
+            "long_average_price": float(long["average_price"]),
+            "short_average_price": float(short["average_price"]),
+            "long_order_id": long["order_id"],
+            "short_order_id": short["order_id"],
+            "long_client_order_id": long["client_order_id"],
+            "short_client_order_id": short["client_order_id"],
+            "long_legs": long["legs"],
+            "short_legs": short["legs"],
+            "price_pnl": price_pnl,
+            "funding_pnl_quote": funding_quote,
+            "entry_fee_quote": entry_fee,
+            "exit_fee_quote": exit_fee,
+            "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
+            "venue_statement_reconciled": complete,
+            "evidence_gap": not complete,
+            "source": reconciliation.get("source", "pending_close_reconciliation"),
+        }
+    async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
+        self.state.set_pending_close_reconciliations(
+            getattr(self.state, "pending_close_reconciliations", [])
+        )
+        pending_reconciliations = self.state.pending_close_reconciliations
+        if not pending_reconciliations:
+            return
+        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
+            return
+
+        retained: list[Any] = []
+        eligible: list[dict[str, Any]] = []
+        current_cycle = int(getattr(self.state, "tick_count", 0) or 0)
+        for reconciliation in list(pending_reconciliations):
+            if not isinstance(reconciliation, dict):
+                retained.append(reconciliation)
+                continue
+            created_cycle = int(reconciliation.get("created_cycle") or 0)
+            if current_cycle != 0 and created_cycle >= current_cycle:
+                retained.append(reconciliation)
+                continue
+            if int(reconciliation.get("next_attempt_ms") or 0) > now_ms:
+                retained.append(reconciliation)
+                continue
+            eligible.append(reconciliation)
+
+        changed = False
+        for reconciliation in sorted(
+            eligible,
+            key=lambda item: (
+                int(item.get("closed_at_ms") or 0),
+                0 if str(item.get("kind") or "final") == "partial" else 1,
+                str(item.get("position_id") or ""),
+            ),
+        ):
+            snapshot = reconciliation.get("position_snapshot") or {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            long_venue = self._venue_from_close_reconciliation(
+                reconciliation.get("long_venue") or snapshot.get("long_venue")
+            )
+            short_venue = self._venue_from_close_reconciliation(
+                reconciliation.get("short_venue") or snapshot.get("short_venue")
+            )
+            if long_venue is None or short_venue is None:
+                self.journal.append(
+                    "reconciliation.pending_close_reconciliation_invalid",
+                    {
+                        "position_id": reconciliation.get("position_id", ""),
+                        "symbol": reconciliation.get("symbol", ""),
+                        "reason": "missing_position_snapshot_venues",
+                    },
+                )
+                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+                retained.append(reconciliation)
+                changed = True
+                continue
+
+            if not (
+                self._has_close_reconciliation_leg_identity(reconciliation.get("long_legs"))
+                or self._has_close_reconciliation_leg_identity(reconciliation.get("short_legs"))
+            ):
+                self.journal.append(
+                    "reconciliation.pending_close_reconciliation_invalid",
+                    {
+                        "position_id": reconciliation.get("position_id", ""),
+                        "symbol": reconciliation.get("symbol", ""),
+                        "reason": "missing_order_identity",
+                    },
+                )
+                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+                retained.append(reconciliation)
+                changed = True
+                continue
+
+            symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
+            long_fills = await self._call_fetch_close_leg_reconciliations(
+                symbol=symbol,
+                venue=long_venue,
+                legs=reconciliation.get("long_legs"),
+            )
+            short_fills = await self._call_fetch_close_leg_reconciliations(
+                symbol=symbol,
+                venue=short_venue,
+                legs=reconciliation.get("short_legs"),
+            )
+            if long_fills is not None and short_fills is not None and (long_fills or short_fills):
+                self.journal.append_critical(
+                    now_ms,
+                    "exit.reconciled",
+                    self._exit_reconciled_payload_from_leg_fills(
+                        reconciliation,
+                        long_fills,
+                        short_fills,
+                        now_ms,
+                    ),
+                )
+                changed = True
+                continue
+            if long_fills == [] and short_fills == []:
+                self.journal.append(
+                    "reconciliation.pending_close_reconciliation_invalid",
+                    {
+                        "position_id": reconciliation.get("position_id", ""),
+                        "symbol": symbol,
+                        "reason": "missing_order_identity",
+                    },
+                )
+                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+                retained.append(reconciliation)
+                changed = True
+                continue
+
+            abandoned = await self._call_try_abandon_stale_pending_close_reconciliation(
+                reconciliation,
+                now_ms,
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                error="close fill reconciliation not yet available",
+            )
+            if abandoned:
+                changed = True
+                continue
+
+            self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+            retained.append(reconciliation)
+            changed = True
+
+        self.state.pending_close_reconciliations = retained
+        if changed:
+            active_empty = not self.state.open_positions
+            pending_entries_empty = not self.state.pending_entries
+            pending_passive_empty = not self.state.pending_passive_closes
+            pending_reconciliations_empty = not self.state.pending_close_reconciliations
+            fail_closed = (
+                self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+                or self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+            )
+            if (
+                active_empty
+                and pending_reconciliations_empty
+                and pending_entries_empty
+                and pending_passive_empty
+            ):
+                set_lifecycle(self.state, EngineLifecycle.RUNNING)
+                self.state.last_error = None
+            elif fail_closed:
+                set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+                self.state.last_error = "pending_close_reconciliations_fail_closed"
+            elif active_empty or self._call_open_positions_private_confirmation_ready():
+                set_lifecycle(self.state, EngineLifecycle.RUNNING)
+                self.state.last_error = None
+            elif self.state.pending_close_reconciliations:
+                set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+                self.state.last_error = "pending_close_reconciliations_active"
+    async def _maybe_process_normal_exits(self, now_ms: int) -> None:
+        """Evaluate normal exit reasons for open positions and route to close path.
+
+        V1: standard_close_reason() identifies which positions should close.
+        normal_close_reason_uses_passive_maker_taker() determines the close path:
+        - passive close: funding_capture, trailing_exit, first_stage_capture,
+          second_stage_capture, settlement_half_close, settlement_force_close
+        - aggressive close: hard_stop, risk_delever, protection
+
+        This method CONSUMES the predicate that was previously only unit-tested.
+        """
+        from lightfee.engine.exit_decision import (
+            force_close_due,
+            normal_close_reason_uses_passive_maker_taker,
+            standard_close_reason,
+            update_position_funding_capture_state,
+        )
+        from lightfee.engine.exit import ExitReason
+
+        if not self.state.open_positions:
+            return
+
+        for position in list(self.state.open_positions.values()):
+            # Skip positions already in passive close
+            if position.position_id in self.state.pending_passive_closes:
+                continue
+
+            staggered_exit_mode = str(
+                getattr(self.config.strategy, "staggered_exit_mode", "") or ""
+            ).lower()
+            if (
+                position.opportunity_type == "staggered"
+                and staggered_exit_mode == "after_first_stage"
+                and not position.exit_after_first_stage
+            ):
+                position.exit_after_first_stage = True
+                self.journal.append(
+                    "runtime.staggered_exit_mode_backfilled",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "opportunity_type": position.opportunity_type,
+                        "staggered_exit_mode": staggered_exit_mode,
+                        "exit_after_first_stage": True,
+                        "source": "strategy_config",
+                        "ts_ms": now_ms,
+                    },
+                )
+
+            funding_captured_before = position.funding_captured
+            second_stage_before = position.second_stage_funding_captured
+            post_funding_hold_ms = int(
+                getattr(self.config.strategy, "post_funding_hold_secs", 0) or 0
+            ) * 1000
+            update_position_funding_capture_state(
+                position,
+                now_ms,
+                post_funding_hold_ms,
+            )
+            if (
+                position.funding_captured != funding_captured_before
+                or position.second_stage_funding_captured != second_stage_before
+            ):
+                self.journal.append(
+                    "runtime.funding_capture_state_updated",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "opportunity_type": position.opportunity_type,
+                        "funding_timestamp_ms": position.funding_timestamp_ms,
+                        "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                        "post_funding_hold_ms": post_funding_hold_ms,
+                        "funding_captured_before": funding_captured_before,
+                        "funding_captured_after": position.funding_captured,
+                        "second_stage_funding_captured_before": second_stage_before,
+                        "second_stage_funding_captured_after": (
+                            position.second_stage_funding_captured
+                        ),
+                        "exit_after_first_stage": position.exit_after_first_stage,
+                        "ts_ms": now_ms,
+                    },
+                )
+
+            reason = (
+                ExitReason.SETTLEMENT_FORCE_CLOSE
+                if force_close_due(position, self.config.strategy, now_ms)
+                else standard_close_reason(position, self.config.strategy, now_ms)
+            )
+            if reason is None:
+                continue
+
+            reason_str = reason.value if hasattr(reason, 'value') else str(reason)
+
+            if normal_close_reason_uses_passive_maker_taker(reason_str):
+                # Route to passive close
+                if self.passive_close_executor is not None:
+                    self.journal.append(
+                        "runtime.normal_close_routing_passive",
+                        {
+                            "position_id": position.position_id,
+                            "reason": reason_str,
+                            "matched_quantity": position.matched_quantity,
+                        },
+                    )
+                    pending = await self.passive_close_executor.start_pending_passive_close(
+                        self.state,
+                        position,
+                        reason_str,
+                        long_price_hint=self._call_resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
+                        short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
+                        short_stage="exit_short",
+                        long_stage="exit_long",
+                    )
+                    if pending is not None:
+                        # Immediately drive one cycle
+                        await self.passive_close_executor.drive_pending_passive_close(
+                            self.state, position.position_id, wait_until_terminal=False,
+                        )
+            else:
+                # Route to aggressive close (hard_stop, risk, etc.)
+                if self.close_executor is not None:
+                    self.journal.append(
+                        "runtime.normal_close_routing_aggressive",
+                        {
+                            "position_id": position.position_id,
+                            "reason": reason_str,
+                            "matched_quantity": position.matched_quantity,
+                        },
+                    )
+                    await self.close_executor.execute_close(
+                        position, reason_str, now_ms,
+                        long_price_hint=self._call_resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
+                        short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
+                        state=self.state,
+                    )
+    def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
+        """Resolve a close price hint from the active WS BBO quote provider."""
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return 0.0
+
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_lease_budget_unavailable",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return 0.0
+
+        try:
+            cache = getattr(self, "ws_bbo_cache", None)
+            if cache is None or not hasattr(cache, "get_quote"):
+                self.journal.append(
+                    "runtime.close_price_evidence_missing",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "reason": "cache_unavailable",
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+            quote = cache.get_quote(venue_value, symbol)
+            if quote is None:
+                self.journal.append(
+                    "runtime.close_price_evidence_missing",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "reason": "missing_quote",
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            if (
+                observed_at_ms <= 0
+                or age_ms is None
+                or age_ms > budget_ms
+                or bid <= 0.0
+                or ask <= bid
+            ):
+                self.journal.append(
+                    "runtime.close_price_evidence_stale",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "ws_bbo_cache",
+                        "age_ms": age_ms,
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "ws_bbo_quote_lease",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+
+            mid = (bid + ask) / 2.0
+            self.journal.append(
+                "runtime.close_price_evidence_fallback",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "observed_at_ms": observed_at_ms,
+                    "age_ms": age_ms,
+                    "budget_ms": budget_ms,
+                    "decision": "use_price_hint",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return mid
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "fallback_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return 0.0
+    def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
+        """Get mid price from local L2 book or active close-price fallback for venue+symbol."""
+        if now_ms is None:
+            now_ms = wall_clock_now_ms()
+        venue_value = venue.value if hasattr(venue, 'value') else str(venue)
+        if self._entry_readiness_provider_uses_ws_bbo():
+            return self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
+        budget_ms = int(self.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        try:
+            book = self.local_l2_runtime.get_book(venue_value, symbol)
+            if book is not None and book.status.value == "hot":
+                age_ms = book.age_ms(now_ms)
+                if budget_ms > 0 and book.is_stale(budget_ms, now_ms):
+                    self.journal.append(
+                        "runtime.close_price_evidence_stale",
+                        {
+                            "venue": venue_value,
+                            "symbol": symbol,
+                            "domain": "local_l2_book",
+                            "age_ms": age_ms,
+                            "budget_ms": budget_ms,
+                            "decision": "reject_price_hint",
+                            "fallback_source": "none",
+                            "ts_ms": now_ms,
+                        },
+                    )
+                    return 0.0
+                mid = book.mid_price()
+                if mid and mid > 0:
+                    return mid
+        except Exception:
+            pass
+        return 0.0
+    def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
+        """Get best bid/ask from the local L2 book for passive tick inference."""
+        if self._entry_readiness_provider_uses_ws_bbo():
+            return self._call_resolve_ws_bbo_close_quote(venue, symbol)
+        if not self._entry_readiness_provider_uses_local_l2():
+            return None
+        try:
+            book = self.local_l2_runtime.get_book(
+                venue.value if hasattr(venue, "value") else str(venue),
+                symbol,
+            )
+            if book is not None and book.status.value == "hot":
+                best_bid = book.best_bid()
+                best_ask = book.best_ask()
+                if best_bid > 0 and best_ask > best_bid:
+                    return best_bid, best_ask
+        except Exception:
+            pass
+        return None
+    def _resolve_ws_bbo_close_quote(
+        self,
+        venue,
+        symbol: str,
+        now_ms: int | None = None,
+    ) -> tuple[float, float] | None:
+        if not self._entry_readiness_provider_uses_ws_bbo():
+            return None
+        if now_ms is None:
+            now_ms = wall_clock_now_ms()
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_lease_budget_unavailable",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        try:
+            quote = self.ws_bbo_cache.get_quote(venue_value, symbol)
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "fallback_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        if quote is None:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "missing_quote",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        try:
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        except Exception as exc:
+            self.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "ws_bbo_cache",
+                    "reason": "quote_parse_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "ws_bbo_quote_lease",
+                    "source": "ws_bbo_quote_lease",
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
+        if (
+            observed_at_ms > 0
+            and age_ms is not None
+            and budget_ms > 0
+            and age_ms <= budget_ms
+            and bid > 0.0
+            and ask > bid
+        ):
+            return bid, ask
+        self.journal.append(
+            "runtime.close_price_evidence_stale",
+            {
+                "venue": venue_value,
+                "symbol": symbol,
+                "domain": "ws_bbo_cache",
+                "reason": (
+                    "quote_stale"
+                    if age_ms is not None and age_ms > budget_ms
+                    else "invalid_quote"
+                ),
+                "observed_at_ms": observed_at_ms,
+                "age_ms": age_ms,
+                "budget_ms": budget_ms,
+                "decision": "reject_price_hint",
+                "fallback_source": "none",
+                "provider": "ws_bbo_quote_lease",
+                "source": "ws_bbo_quote_lease",
+                "ts_ms": now_ms,
+            },
+        )
+        return None
+    def _resolve_close_price_hint_mid_with_source(self, venue, symbol: str):
+        if self._entry_readiness_provider_uses_ws_bbo():
+            now_ms = wall_clock_now_ms()
+            venue_value = venue.value if hasattr(venue, "value") else str(venue)
+            return (
+                self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms),
+                "ws_bbo_quote_lease",
+            )
+        return self._call_resolve_local_l2_mid(venue, symbol), "local_l2"
+    def _resolve_close_price_hint_quote_with_source(self, venue, symbol: str):
+        if self._entry_readiness_provider_uses_ws_bbo():
+            quote = self._call_resolve_ws_bbo_close_quote(venue, symbol)
+            if quote is None:
+                return None
+            return quote[0], quote[1], "ws_bbo_quote_lease"
+        quote = self._call_resolve_local_l2_quote(venue, symbol)
+        if quote is None:
+            return None
+        return quote[0], quote[1], "local_l2"
