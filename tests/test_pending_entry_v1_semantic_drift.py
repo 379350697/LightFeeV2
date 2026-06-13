@@ -2083,6 +2083,80 @@ async def test_positive_fill_finalize_defers_when_live_truth_is_flat(
 
 
 @pytest.mark.asyncio
+async def test_positive_fill_finalize_defers_when_live_truth_is_single_leg(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    flat_long = PositionSnapshot(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1781373163000,
+    )
+    live_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=1600.0,
+        entry_price=0.01529,
+        observed_at_ms=1781373163000,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: _LivePositionAdapter(flat_long),
+            Venue.BYBIT: _LivePositionAdapter(live_short),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1781373126018-HOMEUSDT",
+        symbol="HOMEUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        target_quantity=1600.0,
+        maker_leg="long",
+        maker_order_id="home-maker-order",
+        maker_client_order_id="home-maker-cid",
+        hedge_order_id="home-hedge-order",
+        hedge_client_order_id="home-hedge-cid",
+        maker_leg_filled=1600.0,
+        hedge_leg_filled=1600.0,
+        maker_fill_price=0.01531,
+        hedge_fill_price=0.01529,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1781373163000,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.pending_id not in runtime.state.open_positions
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "entry.opened" not in kinds
+    assert "pending_entry.pending_entry_finalized" not in kinds
+    conflict = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.positive_fill_live_truth_conflict"
+    ][-1]
+    assert conflict["entry_id"] == pending.pending_id
+    assert conflict["symbol"] == "HOMEUSDT"
+    assert conflict["matched_quantity"] == pytest.approx(1600.0)
+    assert conflict["live_long_quantity"] == pytest.approx(0.0)
+    assert conflict["live_short_quantity"] == pytest.approx(1600.0)
+    assert conflict["live_balanced_quantity"] == pytest.approx(0.0)
+    assert conflict["reason"] == "positive_fill_conflicts_with_live_unmatched_truth"
+
+
+@pytest.mark.asyncio
 async def test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1(
     config, tmp_journal,
 ):

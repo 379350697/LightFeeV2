@@ -142,6 +142,52 @@ def test_pending_entry_with_live_order_retains_owner_and_blocks_removal():
     assert row["recovery_policy"] == "manage_pending_entry"
 
 
+def test_pending_entry_positive_fill_single_leg_live_truth_blocks_open_terminality():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "pending_entries": {
+                "entry-1781373126018-HOMEUSDT": {
+                    "pending_id": "entry-1781373126018-HOMEUSDT",
+                    "position_id": "entry-1781373126018-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                }
+            },
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {
+                "okx": {"HOMEUSDT": {"quantity": 0.0, "side": "Side.BUY"}},
+                "bybit": {"HOMEUSDT": {"quantity": 1600.0, "side": "Side.SELL"}},
+            },
+            "open_orders": {},
+        },
+        generated_at_ms=1781373163000,
+    )
+
+    row = next(row for row in table.to_dict()["rows"] if row["phase"] == "PENDING_ENTRY")
+    assert row["owner_id"] == "entry-1781373126018-HOMEUSDT"
+    assert row["terminality"] == "positive_fill_live_truth_conflict"
+    assert row["entry_policy"] == "block_conflicting_new_risk"
+    assert row["recovery_policy"] == "manage_pending_entry"
+    assert row["details"]["decision_reason"] == "positive_fill_conflicts_with_live_unmatched_truth"
+    assert row["details"]["matched_quantity"] == 1600.0
+    assert row["details"]["live_long_quantity"] == 0.0
+    assert row["details"]["live_short_quantity"] == 1600.0
+    assert row["details"]["live_balanced_quantity"] == 0.0
+
+
 def test_residual_dust_rows_split_tolerated_and_blocking_abnormal():
     from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 

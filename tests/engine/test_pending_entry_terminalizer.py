@@ -84,6 +84,48 @@ def test_maker_positive_fill_plus_hedge_partial_returns_matched_open_and_residua
     assert decision.allows_pending_removal is True
 
 
+def test_positive_fill_requires_direction_correct_live_balanced_quantity():
+    decision = PendingEntryTerminalizer().decide(
+        _pending(maker_leg_filled=1600.0, hedge_leg_filled=1600.0),
+        live_truth=PendingEntryLiveTruth(
+            available=True,
+            has_live_position=True,
+            positive_fill_requires_live_position=True,
+            live_long_quantity=1600.0,
+            live_short_quantity=1600.0,
+            live_balanced_quantity=1600.0,
+        ),
+    )
+
+    assert decision.terminal is True
+    assert decision.outcome == "open_position"
+    assert decision.matched_quantity == 1600.0
+    assert decision.allows_pending_removal is True
+
+
+def test_positive_fill_requiring_live_truth_rejects_single_leg_position():
+    decision = PendingEntryTerminalizer().decide(
+        _pending(maker_leg_filled=1600.0, hedge_leg_filled=1600.0),
+        live_truth=PendingEntryLiveTruth(
+            available=True,
+            has_live_position=True,
+            positive_fill_requires_live_position=True,
+            live_long_quantity=0.0,
+            live_short_quantity=1600.0,
+            live_balanced_quantity=0.0,
+        ),
+    )
+
+    assert decision.terminal is False
+    assert decision.outcome == "positive_fill_live_truth_conflict"
+    assert decision.reason == "positive_fill_conflicts_with_live_unmatched_truth"
+    assert decision.allows_pending_removal is False
+    assert decision.operator_block_required is True
+    assert decision.live_long_quantity == 0.0
+    assert decision.live_short_quantity == 1600.0
+    assert decision.live_balanced_quantity == 0.0
+
+
 def test_maker_positive_fill_plus_no_hedge_returns_unmatched_residual_cleanup():
     decision = PendingEntryTerminalizer().decide(
         _pending(maker_leg_filled=455.0, hedge_leg_filled=0.0),

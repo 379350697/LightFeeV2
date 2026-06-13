@@ -6,6 +6,8 @@ Rust V1 reference: src/execution_core/entry_local_l2.rs
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from lightfee.engine.entry_local_l2 import (
@@ -19,10 +21,14 @@ from lightfee.engine.entry_local_l2 import (
     TrackedOpportunity,
     TrackedOpportunityClass,
     deduplicated_tracked_legs,
+    make_candidate_pair_id,
     primary_hold_window_allows_replacement,
     select_tracked_opportunities,
     shadow_promotion_is_eligible,
 )
+
+if TYPE_CHECKING:
+    from lightfee.sidecar.snapshot import CandidateInput
 
 
 # ---------------------------------------------------------------------------
@@ -511,14 +517,6 @@ class TestSelectTrackedOpportunities:
         assert result[2].class_ == TrackedOpportunityClass.SHADOW
 
 
-# ---------------------------------------------------------------------------
-# make_candidate_pair_id
-# ---------------------------------------------------------------------------
-
-
-from lightfee.engine.entry_local_l2 import make_candidate_pair_id
-
-
 class TestMakeCandidatePairId:
     def test_stable_format(self):
         pid = make_candidate_pair_id("BTCUSDT", "binance", "bybit")
@@ -940,6 +938,10 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         times = iter([1_000, 2_000, 61_000])
         monkeypatch.setattr(
             "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: next(times),
+        )
+        monkeypatch.setattr(
+            "lightfee.engine.entry_gate_runtime.wall_clock_now_ms",
             lambda: next(times),
         )
 

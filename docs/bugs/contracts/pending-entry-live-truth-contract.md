@@ -126,6 +126,11 @@ The minimum semantic surface from V1 is:
 6. Balanced quantity opens only the matched portion.
    `min(maker_fill, hedge_fill) > 0` creates a managed open position for that
    matched quantity. Any excess is residual repair or deterministic cleanup.
+   In live mode, matched local fill evidence is not enough by itself: positive
+   fill terminality requires direction-correct live long and short quantities
+   whose balanced live quantity covers the matched local quantity. A single
+   live leg remains unresolved/fail-closed evidence, not open-position
+   terminality.
 
 7. One-sided fill is not local flat.
    `maker_fill > 0, hedge_fill == 0` or the inverse creates unmatched residual
@@ -178,7 +183,7 @@ The minimum semantic surface from V1 is:
 | PE-13 | zero-fill terminal maker state with configured taker fallback/repost/cooldown | try V1 fallback/repost path or record zero-fill cooldown before accepting terminal no-entry | clear and immediately churn the same pair |
 | PE-14 | stale pending backlog, zero fills, no inflight/cancel, resting order fetch returns none | supervision may clear as terminal no-fill | clear when any fill/inflight/cancel/progress exists |
 | PE-15 | live balanced exposure exists while local fill/order details are incomplete | hydrate from live truth and then finalize/open/residualize | require manual recovery or discard live truth |
-| PE-16 | live exposure is ambiguous, untrusted, or cannot be mapped to the pending contract | retain/fail-closed with explicit evidence and no new-entry risk | guess healthy/open/flat |
+| PE-16 | live exposure is ambiguous, untrusted, single-leg, or cannot be mapped to direction-correct balanced long/short pending exposure | retain/fail-closed with explicit evidence and no new-entry risk | guess healthy/open/flat |
 | PE-17 | unresolved pending entry exists for the same symbol and the new candidate shares either venue | block the new entry with `pending_entry_protection` until the pending entry terminalizes or cleanup proves flat | open a second overlapping pending entry by changing only one venue |
 | PE-18 | `_finalize_pending_entry()` defers because fill details, open-order truth, or live-position truth are incomplete | caller retains pending work, applies backoff, and does not add the entry to resolved/pop paths | treat a deferred finalizer call as terminal completion |
 | RC-01 | residual task, live excess tradeable, open orders empty | submit one reduce-only IOC and complete/backoff from fill truth | use stale local repair quantity blindly |
@@ -230,7 +235,7 @@ The minimum semantic surface from V1 is:
 | PE-13 | `tests/engine/test_v1_real_config_gap_semantics.py`; `tests/test_v1_config_defaults_parity_red.py`; `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_force_terminal_zero_fill_uses_finalizer_not_blind_pop` | covered for zero-fill terminal completion through the V1 finalizer; add incident REDs before changing fallback/repost routing if a configured fallback recurrence appears |
 | PE-14 | `tests/engine/test_pending_entry_terminalizer.py::test_supervision_stale_clear_allows_zero_fill_resting_when_progress_absent`, `test_supervision_stale_clear_retains_when_open_order_truth_unavailable`, `test_supervision_stale_clear_retains_matching_live_open_order`, `test_supervision_stale_clear_retains_any_fill_inflight_cancel_or_progress` | covered locally for V1 supervision stale-backlog clear: zero-fill/resting/progress-absent/no-live-artifact may clear; fill, inflight hedge, cancel requested, non-resting/progress evidence, live open order, live position, or unavailable live truth retains pending |
 | PE-15 | `tests/test_pending_entry_v1_semantic_drift.py::test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_v1` | covered with PE-07/PE-08 |
-| PE-16 | `tests/live_harness/test_residual_repair_incident_replay.py::test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed`; pending-entry ambiguous-live coverage still needs targeted RED if production evidence appears | partially covered |
+| PE-16 | `tests/live_harness/test_residual_repair_incident_replay.py::test_exhausted_residual_repair_live_nonzero_repairs_but_untrusted_stays_fail_closed`; `tests/test_pending_entry_v1_semantic_drift.py::test_positive_fill_finalize_defers_when_live_truth_is_single_leg`; `tests/engine/test_v1_lifecycle_closure_table.py::test_pending_entry_positive_fill_single_leg_live_truth_blocks_open_terminality` | covered for residual untrusted live exposure and 2026-06-14 HOMEUSDT positive-fill single-leg live truth recurrence |
 | PE-17 | `tests/test_runtime_entry_flow.py::TestPendingEntryTracking::test_pending_entry_dedup_blocks_same_symbol_venue_overlap_like_v1`; `tests/test_v1_record_layer_parity.py -k has_pending_entry_for_symbol` | covered for V1 same-symbol venue-overlap pending protection |
 | PE-18 | `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_reconcile_retains_pending_when_finalize_defers_missing_fill_details`; runtime caller audit grep for `_finalize_pending_entry()` | covered for normal reconciliation incomplete-fill defer and caller-side pop/resolve guards |
 | RC-01, RC-02, RC-05 | `tests/test_live_entry_hedge_root_fix.py::TestResidualRepairExecutionV1Parity` | covered |
@@ -290,9 +295,11 @@ The minimum semantic surface from V1 is:
    and retains when any fill/inflight/cancel/non-resting evidence exists.
 
 8. `PE-16` / ambiguous live exposure:
-   if production evidence shows live truth that cannot be mapped to balanced,
-   residual, or deterministic cleanup semantics, add RED tests requiring
-   fail-closed retention rather than guessed open/flat state.
+   2026-06-14 HOMEUSDT production evidence showed positive local matched fills
+   with only the Bybit short leg live. RED/GREEN now requires fail-closed
+   retention unless live long and short quantities map to direction-correct
+   balanced pending exposure. Future unmapped live-truth shapes still need a
+   targeted RED before code changes.
 
 9. `PE-17` / same-symbol venue-overlap pending protection:
    RED/GREEN added in `tests/test_runtime_entry_flow.py` and record-layer parity
@@ -424,7 +431,8 @@ The same follow-up added V1 same-symbol venue-overlap pending protection and
 Hyperliquid insufficient-margin venue cooldown coverage. Remaining open matrix
 rows are evidence-driven, not active production bugs: `PE-14` needs supervision
 backlog RED tests before any stale-backlog clear change, and pending-entry
-`PE-16` needs targeted RED only if future live truth is ambiguous or untrusted.
+`PE-16` needs a new targeted RED only for future live-truth shapes not covered
+by the single-leg positive-fill recurrence.
 
 Implementation follow-up on 2026-06-05 added the first unified V1-style
 recovery ledger boundary:

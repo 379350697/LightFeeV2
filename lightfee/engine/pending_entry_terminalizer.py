@@ -18,6 +18,9 @@ class PendingEntryLiveTruth:
     has_live_position: bool = False
     error: str = ""
     positive_fill_requires_live_position: bool = False
+    live_long_quantity: float = 0.0
+    live_short_quantity: float = 0.0
+    live_balanced_quantity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,9 @@ class PendingEntryTerminalDecision:
     matched_quantity: float = 0.0
     residual_quantity: float = 0.0
     contains_positive_fill_evidence: bool = False
+    live_long_quantity: float = 0.0
+    live_short_quantity: float = 0.0
+    live_balanced_quantity: float = 0.0
 
 
 class PendingEntryTerminalizer:
@@ -90,19 +96,36 @@ class PendingEntryTerminalizer:
             truth.positive_fill_requires_live_position
             and has_positive_fill
             and matched > 1e-9
-            and not truth.has_live_position
         ):
-            return PendingEntryTerminalDecision(
-                outcome="positive_fill_live_truth_conflict",
-                reason="positive_fill_conflicts_with_live_flat_truth",
-                terminal=False,
-                allows_pending_removal=False,
-                healthy=False,
-                operator_block_required=True,
-                matched_quantity=matched,
-                residual_quantity=residual,
-                contains_positive_fill_evidence=True,
+            live_balanced = _quantity(
+                _get(truth, "live_balanced_quantity", 0.0)
             )
+            if live_balanced + 1e-9 >= matched:
+                live_balanced = matched
+            else:
+                reason = (
+                    "positive_fill_conflicts_with_live_unmatched_truth"
+                    if truth.has_live_position
+                    else "positive_fill_conflicts_with_live_flat_truth"
+                )
+                return PendingEntryTerminalDecision(
+                    outcome="positive_fill_live_truth_conflict",
+                    reason=reason,
+                    terminal=False,
+                    allows_pending_removal=False,
+                    healthy=False,
+                    operator_block_required=True,
+                    matched_quantity=matched,
+                    residual_quantity=residual,
+                    contains_positive_fill_evidence=True,
+                    live_long_quantity=_quantity(
+                        _get(truth, "live_long_quantity", 0.0)
+                    ),
+                    live_short_quantity=_quantity(
+                        _get(truth, "live_short_quantity", 0.0)
+                    ),
+                    live_balanced_quantity=live_balanced,
+                )
 
         if not has_positive_fill:
             return PendingEntryTerminalDecision(

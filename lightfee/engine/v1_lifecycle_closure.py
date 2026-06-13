@@ -353,6 +353,12 @@ def _pending_entry_rows(
         )
         has_live_order = _has_live_open_order(exchange_truth, symbol)
         has_live_position = _has_live_position(exchange_truth, symbol)
+        live_long_quantity, live_short_quantity = _pending_entry_live_leg_quantities(
+            exchange_truth,
+            pending,
+            symbol,
+        )
+        live_balanced_quantity = min(live_long_quantity, live_short_quantity)
         decision = PendingEntryTerminalizer().decide(
             pending,
             live_truth=PendingEntryLiveTruth(
@@ -361,6 +367,9 @@ def _pending_entry_rows(
                 has_live_position=has_live_position,
                 error="" if truth_available else "exchange_truth_unavailable",
                 positive_fill_requires_live_position=True,
+                live_long_quantity=live_long_quantity,
+                live_short_quantity=live_short_quantity,
+                live_balanced_quantity=live_balanced_quantity,
             ),
         )
         if decision.outcome == "deferred_live_open_order":
@@ -369,6 +378,8 @@ def _pending_entry_rows(
             terminality = "retain_live_position"
         elif decision.outcome == "deferred_missing_live_truth":
             terminality = "retain_missing_live_truth"
+        elif decision.outcome == "positive_fill_live_truth_conflict":
+            terminality = decision.outcome
         elif decision.contains_positive_fill_evidence:
             terminality = "terminal_positive_fill_evidence"
         else:
@@ -407,6 +418,9 @@ def _pending_entry_rows(
                     "residual_quantity": decision.residual_quantity,
                     "has_live_open_order": has_live_order,
                     "has_live_position": has_live_position,
+                    "live_long_quantity": live_long_quantity,
+                    "live_short_quantity": live_short_quantity,
+                    "live_balanced_quantity": live_balanced_quantity,
                 },
             )
         )
@@ -894,10 +908,26 @@ def _symbol(obj: Any) -> str:
 
 
 def _venue(obj: Any) -> str:
-    value = _get(obj, "venue", "")
+    return _venue_text(_get(obj, "venue", ""))
+
+
+def _venue_text(value: Any) -> str:
     if hasattr(value, "value"):
         value = value.value
     return str(value or "").lower()
+
+
+def _side_text(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    text = str(value or "").lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    if text.endswith("buy"):
+        return "buy"
+    if text.endswith("sell"):
+        return "sell"
+    return text
 
 
 def _venues(obj: Any) -> set[str]:
@@ -936,6 +966,30 @@ def _has_live_position(exchange_truth: Mapping[str, Any] | None, symbol: str) ->
         if _quantity(position) > EPSILON:
             return True
     return False
+
+
+def _pending_entry_live_leg_quantities(
+    exchange_truth: Mapping[str, Any] | None,
+    pending: Any,
+    symbol: str,
+) -> tuple[float, float]:
+    long_venue = _venue_text(_get(pending, "long_venue", ""))
+    short_venue = _venue_text(_get(pending, "short_venue", ""))
+    live_long = 0.0
+    live_short = 0.0
+    for position in _exchange_positions(exchange_truth):
+        if symbol and _symbol(position) != symbol:
+            continue
+        quantity = _quantity(position)
+        if quantity <= EPSILON:
+            continue
+        venue = _venue(position)
+        side = _side_text(_get(position, "side", ""))
+        if venue == long_venue and side == "buy":
+            live_long = max(live_long, quantity)
+        elif venue == short_venue and side == "sell":
+            live_short = max(live_short, quantity)
+    return live_long, live_short
 
 
 def _exchange_open_orders(exchange_truth: Mapping[str, Any] | None) -> list[Any]:

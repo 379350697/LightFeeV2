@@ -1202,8 +1202,14 @@ class PendingEntryRuntime:
                 )
 
         live_positions: dict[str, float] = {}
+        live_position_details: dict[str, dict[str, Any]] = {}
+        live_long_quantity = 0.0
+        live_short_quantity = 0.0
         errors: list[str] = []
-        for venue in (pending.long_venue, pending.short_venue):
+        for venue, expected_side, leg_name in (
+            (pending.long_venue, Side.BUY, "long"),
+            (pending.short_venue, Side.SELL, "short"),
+        ):
             adapter = self.ctx.get_venue_adapter(venue)
             fetch_position = getattr(adapter, "fetch_position", None) if adapter else None
             venue_name = getattr(venue, "value", str(venue))
@@ -1215,9 +1221,24 @@ class PendingEntryRuntime:
             except Exception as exc:
                 errors.append(f"{venue_name}:{str(exc) or exc.__class__.__name__}")
                 continue
-            live_positions[venue_name] = abs(
+            raw_quantity = abs(
                 float(getattr(position, "quantity", 0.0) or 0.0)
             ) if position else 0.0
+            position_side = getattr(position, "side", None) if position else None
+            side_matches = position_side == expected_side
+            matched_quantity = raw_quantity if side_matches else 0.0
+            live_positions[venue_name] = raw_quantity
+            live_position_details[venue_name] = {
+                "leg": leg_name,
+                "quantity": raw_quantity,
+                "matched_quantity": matched_quantity,
+                "side": getattr(position_side, "value", str(position_side)),
+                "expected_side": expected_side.value,
+            }
+            if leg_name == "long":
+                live_long_quantity = matched_quantity
+            else:
+                live_short_quantity = matched_quantity
 
         if errors:
             error_text = ";".join(
@@ -1236,6 +1257,7 @@ class PendingEntryRuntime:
                     "maker_leg_filled": pending.maker_leg_filled,
                     "hedge_leg_filled": pending.hedge_leg_filled,
                     "live_positions": live_positions,
+                    "live_position_details": live_position_details,
                     "error": error_text or "positive_fill_live_truth_unavailable",
                     "reason": "positive_fill_requires_live_position_truth",
                 },
@@ -1246,14 +1268,21 @@ class PendingEntryRuntime:
                 has_live_position=False,
                 error=error_text or "positive_fill_live_truth_unavailable",
                 positive_fill_requires_live_position=True,
+                live_long_quantity=live_long_quantity,
+                live_short_quantity=live_short_quantity,
+                live_balanced_quantity=min(live_long_quantity, live_short_quantity),
             )
 
         has_live_position = any(qty > 1e-9 for qty in live_positions.values())
+        live_balanced_quantity = min(live_long_quantity, live_short_quantity)
         return PendingEntryLiveTruth(
             available=True,
             has_live_open_order=False,
             has_live_position=has_live_position,
             positive_fill_requires_live_position=True,
+            live_long_quantity=live_long_quantity,
+            live_short_quantity=live_short_quantity,
+            live_balanced_quantity=live_balanced_quantity,
         )
 
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
@@ -1549,6 +1578,9 @@ class PendingEntryRuntime:
                         "hedge_leg_filled": pending.hedge_leg_filled,
                         "matched_quantity": decision.matched_quantity,
                         "residual_quantity": decision.residual_quantity,
+                        "live_long_quantity": decision.live_long_quantity,
+                        "live_short_quantity": decision.live_short_quantity,
+                        "live_balanced_quantity": decision.live_balanced_quantity,
                         "reason": decision.reason,
                     },
                 )
@@ -1834,6 +1866,9 @@ class PendingEntryRuntime:
             "operator_block_required": decision.operator_block_required,
             "matched_quantity": decision.matched_quantity,
             "residual_quantity": decision.residual_quantity,
+            "live_long_quantity": decision.live_long_quantity,
+            "live_short_quantity": decision.live_short_quantity,
+            "live_balanced_quantity": decision.live_balanced_quantity,
             "contains_positive_fill_evidence": (
                 decision.contains_positive_fill_evidence
             ),

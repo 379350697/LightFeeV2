@@ -65,6 +65,11 @@ momentary flat probes. Live exchange truth dominates local false-flat state.
 Balanced live-position evidence can hydrate pending fills with quantity and
 price and finalize by V1 quantity+price semantics.
 
+Positive local matched fills are not balanced live-position evidence unless
+the exchange truth contains direction-correct live long and short quantities
+covering the matched local quantity. A single live leg must defer/fail-closed
+with explicit evidence, not emit `entry.opened`.
+
 Zero-fill reconciliation is terminal evidence only when the maker/order status
 is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
 entry unresolved, and a later stale zero reconciliation must not erase a
