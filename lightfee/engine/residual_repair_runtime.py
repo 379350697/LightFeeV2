@@ -11,7 +11,6 @@ from typing import Any
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
-    OrderRequest,
     PositionSnapshot,
     Side,
     TimeInForce,

@@ -741,7 +741,7 @@ class PassiveMakerRuntime:
         Returns HedgeDriveResult so the caller can write back to PendingEntry state.
         """
         from lightfee.core.domain import Side
-        from lightfee.engine.entry_sync import drive_pending_entry_hedge, HedgeDriveResult
+        from lightfee.engine.entry_sync import drive_pending_entry_hedge
 
         maker_leg = Side.BUY if self.config.strategy.maker_leg_default == "buy" else Side.SELL
 
