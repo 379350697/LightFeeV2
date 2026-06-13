@@ -29,6 +29,7 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
 )
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.recovery_decision_core import (
     CORE_CLEARABLE_BLOCK_REASONS,
@@ -1250,6 +1251,9 @@ class ResidualRepairRuntime:
             "accepted_order_id": accepted_order_id,
             "accepted_client_order_id": accepted_client_order_id,
             "accepted_order_truth_gap": True,
+            "order_truth_state": str(
+                task.get("order_truth_state") or "ack_only_accepted"
+            ),
             "truth_required_by": "accepted_order_truth_gap",
             "terminal_without_truth": False,
             "next_action": "reconcile_accepted_order_or_probe_live_position",
@@ -1268,6 +1272,11 @@ class ResidualRepairRuntime:
             except Exception as e:
                 payload["fill_reconciliation_result"] = "error"
                 payload["fill_reconciliation_error"] = str(e) or e.__class__.__name__
+                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(
+                    "truth_unavailable"
+                )
+                payload["resolution_state"] = decision.state
+                payload["ledger_decision"] = decision.decision
                 return "truth_unavailable", None, payload
 
             recon_qty = self._close_reconciliation_fill_qty(reconciliation)
@@ -1293,6 +1302,9 @@ class ResidualRepairRuntime:
                         getattr(reconciliation, "filled_at_ms", 0) or now_ms
                     ),
                 )
+                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("filled")
+                payload["resolution_state"] = decision.state
+                payload["ledger_decision"] = decision.decision
                 return "filled", fill, payload
             payload["fill_reconciliation_result"] = "missing_or_zero_fill"
         else:
@@ -1314,6 +1326,11 @@ class ResidualRepairRuntime:
                 )
             except Exception as e:
                 payload["live_truth_error"] = str(e) or e.__class__.__name__
+                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(
+                    "truth_unavailable"
+                )
+                payload["resolution_state"] = decision.state
+                payload["ledger_decision"] = decision.decision
                 return "truth_unavailable", None, payload
             venue_open_order_count = len(open_orders)
             open_order_count += venue_open_order_count
@@ -1337,9 +1354,18 @@ class ResidualRepairRuntime:
             }
         )
         if open_order_count > 0:
+            decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("open_order_present")
+            payload["resolution_state"] = decision.state
+            payload["ledger_decision"] = decision.decision
             return "open_order_present", None, payload
         if live_excess_quantity <= 1e-9:
+            decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("live_flat")
+            payload["resolution_state"] = decision.state
+            payload["ledger_decision"] = decision.decision
             return "live_flat", None, payload
+        decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
+        payload["resolution_state"] = decision.state
+        payload["ledger_decision"] = decision.decision
         return "truth_gap", None, payload
 
     def _retain_residual_repair_accepted_order_gap(
@@ -1359,6 +1385,9 @@ class ResidualRepairRuntime:
             retry_count
         )
         task["accepted_order_truth_gap"] = True
+        decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(status)
+        task["order_truth_state"] = decision.state
+        task["ledger_decision"] = decision.decision
         if accepted_order_id:
             task["accepted_order_id"] = accepted_order_id
         if accepted_client_order_id:
@@ -1370,6 +1399,8 @@ class ResidualRepairRuntime:
             "accepted_order_truth_gap",
             "accepted_order_id",
             "accepted_client_order_id",
+            "order_truth_state",
+            "ledger_decision",
         ):
             task.pop(key, None)
 

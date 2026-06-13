@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from lightfee.core.domain import Venue
@@ -34,6 +35,34 @@ PRIVATE_WS_TRUTH_TOPICS: dict[Venue, dict[str, str]] = {
         "private_ws_order_topic": "ORDER_TRADE_UPDATE",
     },
 }
+
+
+@dataclass(frozen=True)
+class OrderTruthDecision:
+    """Owner-neutral next action for uncertain order truth."""
+
+    state: str
+    classification: str
+    decision: str
+    target_qty: float = 0.0
+    reconciled_qty: float = 0.0
+    live_qty: float = 0.0
+    remaining_qty: float = 0.0
+    retry_qty: float = 0.0
+    live_side: str | None = None
+    order_id: str = ""
+    client_order_id: str = ""
+    average_price: float = 0.0
+    reconcile_error: str = ""
+    live_fetch_error: str = ""
+
+    @property
+    def clear_state(self) -> bool:
+        return self.decision in ("clear", "clear_live_flat")
+
+    @property
+    def should_retry_with_new_client_id(self) -> bool:
+        return self.decision == "retry_new_client_order_id" and self.retry_qty > 1e-9
 
 
 class OrderTruthLedger:
@@ -143,6 +172,155 @@ class OrderTruthLedger:
             or "order response contains no order id" in text
         )
 
+    def accepted_order_state(self, error: Exception) -> str:
+        if bool(getattr(error, "order_ack_only", False)):
+            return "ack_only_accepted"
+        if self.is_order_truth_gap(error):
+            return "truth_gap"
+        return "unresolved"
+
+    def truth_gap_status_decision(self, status: str) -> OrderTruthDecision:
+        status_text = str(status or "").lower()
+        if status_text in {"filled", "accepted_order_reconciled"}:
+            return OrderTruthDecision(
+                state="resolved_flat",
+                classification=status_text,
+                decision="clear",
+            )
+        if status_text in {"live_flat", "accepted_order_live_flat"}:
+            return OrderTruthDecision(
+                state="resolved_flat",
+                classification=status_text,
+                decision="clear_live_flat",
+            )
+        if status_text in {"open_order_present", "position_present", "live_position_present"}:
+            return OrderTruthDecision(
+                state="resolved_position",
+                classification=status_text,
+                decision="retain",
+            )
+        return OrderTruthDecision(
+            state="unresolved",
+            classification=status_text or "truth_gap",
+            decision="backoff_recheck",
+        )
+
+    def duplicate_reconcile_state(self, *, classification: str, decision: str) -> str:
+        classification_text = str(classification or "").lower()
+        decision_text = str(decision or "").lower()
+        if decision_text in {"clear", "clear_live_flat"}:
+            return "resolved_flat"
+        if decision_text in {"retry_new_client_order_id", "retain"}:
+            return "resolved_position"
+        if decision_text in {"backoff_recheck", "reconcile_before_terminal"}:
+            return "unresolved"
+        if classification_text == "full":
+            return "resolved_flat"
+        if classification_text in {"partial", "stale_full_live_nonzero"}:
+            return "resolved_position"
+        return "unresolved"
+
+    def resolve_duplicate_conflict(
+        self,
+        *,
+        venue: Venue,
+        symbol: str,
+        client_order_id: str,
+        target_qty: float,
+        reconciliation: Any = None,
+        live_pos_before: Any = None,
+        live_pos_after: Any = None,
+        reconcile_error: str = "",
+        live_fetch_error: str = "",
+        live_fetch_attempted: bool = False,
+    ) -> OrderTruthDecision:
+        """Resolve duplicate client-id conflicts from order, fill, and position truth."""
+
+        reconciled_qty = _positive_float(getattr(reconciliation, "quantity", 0.0))
+        target_qty = max(_positive_float(target_qty), 0.0)
+        remaining_qty = max(target_qty - reconciled_qty, 0.0)
+        live_pos = (
+            live_pos_after
+            if live_fetch_attempted and live_fetch_error == ""
+            else live_pos_before
+        )
+        live_qty = _positive_float(getattr(live_pos, "quantity", 0.0))
+        live_side = getattr(getattr(live_pos, "side", None), "value", None)
+        live_flat = live_fetch_attempted and live_fetch_error == "" and live_qty <= 1e-9
+
+        if (
+            reconciled_qty >= max(target_qty - 1e-9, 0.0)
+            and reconciled_qty > 0.0
+            and live_fetch_error
+        ):
+            state = "unresolved"
+            classification = "unknown_transient"
+            decision = "backoff_recheck"
+        elif (
+            reconciled_qty >= max(target_qty - 1e-9, 0.0)
+            and reconciled_qty > 0.0
+            and live_qty > 1e-9
+        ):
+            state = "resolved_position"
+            classification = "stale_full_live_nonzero"
+            decision = "retry_new_client_order_id"
+            remaining_qty = live_qty
+        elif reconciled_qty >= max(target_qty - 1e-9, 0.0) and reconciled_qty > 0.0:
+            state = "resolved_flat"
+            classification = "full"
+            decision = "clear_live_flat"
+        elif live_flat:
+            state = "resolved_flat"
+            classification = "none" if reconciled_qty <= 1e-9 else "partial"
+            decision = "clear_live_flat"
+        elif reconciled_qty > 1e-9:
+            state = "resolved_position"
+            classification = "partial"
+            decision = "retry_new_client_order_id"
+        elif reconcile_error or live_fetch_error:
+            state = "unresolved"
+            classification = "unknown_transient"
+            decision = "backoff_recheck"
+        else:
+            state = "unresolved"
+            classification = "none"
+            decision = "backoff_recheck"
+
+        retry_qty = remaining_qty
+        if decision == "retry_new_client_order_id" and live_qty > 1e-9:
+            retry_qty = min(remaining_qty, live_qty)
+
+        return OrderTruthDecision(
+            state=state,
+            classification=classification,
+            decision=decision,
+            target_qty=target_qty,
+            reconciled_qty=reconciled_qty,
+            live_qty=live_qty,
+            remaining_qty=remaining_qty,
+            retry_qty=retry_qty,
+            live_side=live_side,
+            order_id=(
+                getattr(reconciliation, "order_id", "")
+                if reconciliation is not None
+                else ""
+            ),
+            client_order_id=(
+                getattr(reconciliation, "client_order_id", None) or client_order_id
+                if reconciliation is not None
+                else client_order_id
+            ),
+            average_price=_positive_float(
+                getattr(
+                    reconciliation,
+                    "average_price",
+                    getattr(reconciliation, "price", 0.0),
+                )
+            ),
+            reconcile_error=reconcile_error,
+            live_fetch_error=live_fetch_error,
+        )
+
     def build_submit_uncertainty_payload(
         self,
         error: OrderSubmitError,
@@ -174,6 +352,7 @@ class OrderTruthLedger:
 
         if bool(getattr(error, "order_ack_only", False)):
             payload["order_ack_only"] = True
+        payload["order_truth_state"] = self.accepted_order_state(error)
         payload["accepted_order_truth_gap"] = True
         payload["truth_required_by"] = "accepted_order_truth_gap"
         payload["terminal_without_truth"] = False
@@ -205,6 +384,7 @@ class OrderTruthLedger:
                     payload["missing_evidence"].append(item)
         payload["order_truth_probe_paths"] = self.probe_paths(venue)
         payload["next_action"] = ORDER_TRUTH_GAP_NEXT_ACTION
+        payload["ledger_decision"] = "backoff_recheck"
         return payload
 
     def duplicate_reconcile_endpoints(self, venue: Venue) -> tuple[str, ...]:
@@ -238,10 +418,20 @@ class OrderTruthLedger:
         endpoints = list(self.duplicate_reconcile_endpoints(venue))
         order_id = str(getattr(result, "order_id", "") or "")
         classification = str(getattr(result, "classification", "") or "")
+        decision = str(getattr(result, "decision", "") or "")
         normalized_reason = self.normalize_duplicate_reason(reason)
         return {
             "venue": venue.value,
             "symbol": symbol,
+            "order_truth_state": str(
+                getattr(result, "order_truth_state", "")
+                or
+                getattr(result, "state", "")
+                or self.duplicate_reconcile_state(
+                    classification=classification,
+                    decision=decision,
+                )
+            ),
             "endpoint": endpoints[0] if endpoints else "",
             "queried_endpoints": endpoints,
             "endpoint_responses": [
@@ -275,7 +465,7 @@ class OrderTruthLedger:
                 "observed_at_ms": 0,
                 "source": "fetch_position",
             },
-            "next_action": str(getattr(result, "decision", "") or ""),
+            "next_action": decision,
             "hedge_submitted": False,
             "raw_price": None,
             "raw_qty": None,
@@ -301,6 +491,16 @@ class OrderTruthLedger:
         ):
             return "duplicate_client_id"
         return "duplicate_client_id"
+
+
+def _positive_float(value: Any) -> float:
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed < 0.0:
+        return abs(parsed)
+    return parsed
 
 
 ORDER_TRUTH_LEDGER = OrderTruthLedger()

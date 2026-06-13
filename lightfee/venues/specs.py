@@ -30,6 +30,8 @@ class VenueOperation(Enum):
     ACCOUNT_RISK = "account_risk"
     L2_BOOK = "l2_book"
     INFO = "info"
+    USER_ABSTRACTION = "user_abstraction"
+    SPOT_CLEARINGHOUSE_STATE = "spot_clearinghouse_state"
 
 
 class BitgetContractFamily(Enum):
@@ -529,6 +531,23 @@ def hyperliquid_spec() -> VenueSpec:
                 "/info",
                 private=False,
                 required_params=("type=clearinghouseState", "user=configured_account_address"),
+                symbol_shape="coin",
+            ),
+            VenueOperation.USER_ABSTRACTION: _contract(
+                "POST",
+                "/info",
+                private=False,
+                required_params=("type=userAbstraction", "user=configured_account_address"),
+                symbol_shape="coin",
+            ),
+            VenueOperation.SPOT_CLEARINGHOUSE_STATE: _contract(
+                "POST",
+                "/info",
+                private=False,
+                required_params=(
+                    "type=spotClearinghouseState",
+                    "user=configured_account_address",
+                ),
                 symbol_shape="coin",
             ),
             VenueOperation.L2_BOOK: _contract(

@@ -2733,6 +2733,120 @@ def test_exchange_truth_hyperliquid_reports_unified_collateral_available(monkeyp
     assert "account_address" not in balance
 
 
+def test_hyperliquid_balance_view_uses_operation_contracts(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from lightfee.core.domain import Venue
+    from lightfee.venues.specs import VenueOperation
+    import scripts.diagnose_live as dl
+
+    account = "0x" + "2" * 40
+    operations: list[VenueOperation] = []
+    users: list[str] = []
+
+    async def fake_request_venue_operation(
+        transport,
+        venue,
+        operation,
+        *,
+        account_address="",
+        agent_wallet_address="",
+        **kwargs,
+    ):
+        operations.append(operation)
+        users.append(account_address)
+        assert venue == Venue.HYPERLIQUID
+        assert agent_wallet_address == ""
+        if operation == VenueOperation.POSITION:
+            return (
+                {
+                    "assetPositions": [],
+                    "withdrawable": "0.0",
+                    "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"},
+                    "crossMarginSummary": {
+                        "accountValue": "0.0",
+                        "totalMarginUsed": "0.0",
+                    },
+                },
+                SimpleNamespace(),
+            )
+        if operation == getattr(VenueOperation, "USER_ABSTRACTION"):
+            return ("unifiedAccount", SimpleNamespace())
+        if operation == getattr(VenueOperation, "SPOT_CLEARINGHOUSE_STATE"):
+            return ({"balances": [{"coin": "USDC", "total": "145", "hold": "0"}]}, SimpleNamespace())
+        raise AssertionError(f"unexpected operation: {operation}")
+
+    monkeypatch.setattr(dl, "request_venue_operation", fake_request_venue_operation)
+
+    result = asyncio.run(
+        dl._fetch_hyperliquid_balance_view(
+            SimpleNamespace(_transport=object()),
+            SimpleNamespace(account_address=account),
+        )
+    )
+
+    assert operations == [
+        VenueOperation.POSITION,
+        getattr(VenueOperation, "USER_ABSTRACTION"),
+        getattr(VenueOperation, "SPOT_CLEARINGHOUSE_STATE"),
+    ]
+    assert set(users) == {account}
+    assert result["classification"] == "unified_collateral_available"
+
+
+def test_hyperliquid_balance_view_502_is_venue_diagnostic_without_owned_exposure(monkeypatch):
+    import asyncio
+    import httpx
+    from scripts import diagnose_live as dl
+
+    private_key = "0x" + "1" * 64
+    account = "0x" + "2" * 40
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_PRIVATE_KEY", private_key)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS", account)
+    monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_WALLET_MODE", "agent_wallet")
+
+    original_create = dl._create_readonly_adapter
+
+    def create_adapter(venue, credential):
+        adapter = original_create(venue, credential)
+        assert adapter is not None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if request.url.path == "/info" and body.get("type") == "clearinghouseState":
+                return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
+            if request.url.path == "/info" and body.get("type") == "openOrders":
+                return httpx.Response(200, json=[])
+            if request.url.path == "/info" and body.get("type") in {
+                "userAbstraction",
+                "spotClearinghouseState",
+            }:
+                return httpx.Response(502, text="bad gateway")
+            raise AssertionError(f"unexpected request: {request.url.path} {body}")
+
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return adapter
+
+    monkeypatch.setattr(dl, "_create_readonly_adapter", create_adapter)
+
+    result = asyncio.run(
+        dl._build_exchange_truth_async(
+            runtime_dir="/unused",
+            symbols=[],
+            venues=["hyperliquid"],
+        )
+    )
+
+    assert result["available"] is True
+    assert result["has_nonzero_position"] is False
+    assert result["has_open_order"] is False
+    assert result["missing_evidence"] == []
+    assert result["balance_views"]["hyperliquid"]["classification"] == (
+        "balance_view_probe_failed"
+    )
+
+
 def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
     import asyncio
     from scripts import diagnose_live as dl

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lightfee.core.domain import PositionSnapshot, Venue
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthDecision
 
 
 BYBIT_DUPLICATE_RECONCILE_ENDPOINTS = list(
@@ -31,6 +31,7 @@ class BybitDuplicateReconcileResult:
     live_qty: float
     remaining_qty: float
     retry_qty: float
+    order_truth_state: str = ""
     live_side: str | None = None
     order_id: str = ""
     client_order_id: str = ""
@@ -66,10 +67,6 @@ async def reconcile_bybit_duplicate_client_order(
     except Exception as exc:
         reconcile_error = str(exc)
 
-    reconciled_qty = _positive_float(getattr(reconciliation, "quantity", 0.0))
-    target_qty = max(_positive_float(target_qty), 0.0)
-    remaining_qty = max(target_qty - reconciled_qty, 0.0)
-
     live_pos_after = None
     live_fetch_error = ""
     live_fetch_attempted = False
@@ -79,75 +76,19 @@ async def reconcile_bybit_duplicate_client_order(
     except Exception as exc:
         live_fetch_error = str(exc)
 
-    live_pos = (
-        live_pos_after
-        if live_fetch_attempted and live_fetch_error == ""
-        else live_pos_before
-    )
-    live_qty = _positive_float(getattr(live_pos, "quantity", 0.0))
-    live_side = getattr(getattr(live_pos, "side", None), "value", None)
-    live_flat = live_fetch_attempted and live_fetch_error == "" and live_qty <= 1e-9
-
-    if (
-        reconciled_qty >= max(target_qty - 1e-9, 0.0)
-        and reconciled_qty > 0.0
-        and live_fetch_error
-    ):
-        classification = "unknown_transient"
-        decision = "backoff_recheck"
-    elif (
-        reconciled_qty >= max(target_qty - 1e-9, 0.0)
-        and reconciled_qty > 0.0
-        and live_qty > 1e-9
-    ):
-        classification = "stale_full_live_nonzero"
-        decision = "retry_new_client_order_id"
-        remaining_qty = live_qty
-    elif reconciled_qty >= max(target_qty - 1e-9, 0.0) and reconciled_qty > 0.0:
-        classification = "full"
-        decision = "clear_live_flat"
-    elif live_flat:
-        classification = "none" if reconciled_qty <= 1e-9 else "partial"
-        decision = "clear_live_flat"
-    elif reconciled_qty > 1e-9:
-        classification = "partial"
-        decision = "retry_new_client_order_id"
-    elif reconcile_error or live_fetch_error:
-        classification = "unknown_transient"
-        decision = "backoff_recheck"
-    else:
-        classification = "none"
-        decision = "backoff_recheck"
-
-    retry_qty = remaining_qty
-    if decision == "retry_new_client_order_id" and live_qty > 1e-9:
-        retry_qty = min(remaining_qty, live_qty)
-
-    return BybitDuplicateReconcileResult(
-        classification=classification,
-        decision=decision,
+    decision = ORDER_TRUTH_LEDGER.resolve_duplicate_conflict(
+        venue=Venue.BYBIT,
+        symbol=symbol,
+        client_order_id=client_order_id,
         target_qty=target_qty,
-        reconciled_qty=reconciled_qty,
-        live_qty=live_qty,
-        remaining_qty=remaining_qty,
-        retry_qty=retry_qty,
-        live_side=live_side,
-        order_id=getattr(reconciliation, "order_id", "") if reconciliation is not None else "",
-        client_order_id=(
-            getattr(reconciliation, "client_order_id", None) or client_order_id
-            if reconciliation is not None
-            else client_order_id
-        ),
-        average_price=_positive_float(
-            getattr(
-                reconciliation,
-                "average_price",
-                getattr(reconciliation, "price", 0.0),
-            )
-        ),
+        reconciliation=reconciliation,
+        live_pos_before=live_pos_before,
+        live_pos_after=live_pos_after,
         reconcile_error=reconcile_error,
         live_fetch_error=live_fetch_error,
+        live_fetch_attempted=live_fetch_attempted,
     )
+    return _to_bybit_duplicate_result(decision)
 
 
 def build_order_reconcile_result_payload(
@@ -168,11 +109,43 @@ def build_order_reconcile_result_payload(
     )
 
 
-def _positive_float(value: Any) -> float:
-    try:
-        parsed = float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    if parsed < 0.0:
-        return abs(parsed)
-    return parsed
+def _to_bybit_duplicate_result(result: Any) -> BybitDuplicateReconcileResult:
+    if isinstance(result, BybitDuplicateReconcileResult):
+        return result
+    if not isinstance(result, OrderTruthDecision):
+        return BybitDuplicateReconcileResult(
+            classification=str(getattr(result, "classification", "") or ""),
+            decision=str(getattr(result, "decision", "") or ""),
+            target_qty=float(getattr(result, "target_qty", 0.0) or 0.0),
+            reconciled_qty=float(getattr(result, "reconciled_qty", 0.0) or 0.0),
+            live_qty=float(getattr(result, "live_qty", 0.0) or 0.0),
+            remaining_qty=float(getattr(result, "remaining_qty", 0.0) or 0.0),
+            retry_qty=float(getattr(result, "retry_qty", 0.0) or 0.0),
+            order_truth_state=str(
+                getattr(result, "order_truth_state", "")
+                or getattr(result, "state", "")
+                or ""
+            ),
+            live_side=getattr(result, "live_side", None),
+            order_id=str(getattr(result, "order_id", "") or ""),
+            client_order_id=str(getattr(result, "client_order_id", "") or ""),
+            average_price=float(getattr(result, "average_price", 0.0) or 0.0),
+            reconcile_error=str(getattr(result, "reconcile_error", "") or ""),
+            live_fetch_error=str(getattr(result, "live_fetch_error", "") or ""),
+        )
+    return BybitDuplicateReconcileResult(
+        classification=result.classification,
+        decision=result.decision,
+        target_qty=result.target_qty,
+        reconciled_qty=result.reconciled_qty,
+        live_qty=result.live_qty,
+        remaining_qty=result.remaining_qty,
+        retry_qty=result.retry_qty,
+        order_truth_state=result.state,
+        live_side=result.live_side,
+        order_id=result.order_id,
+        client_order_id=result.client_order_id,
+        average_price=result.average_price,
+        reconcile_error=result.reconcile_error,
+        live_fetch_error=result.live_fetch_error,
+    )

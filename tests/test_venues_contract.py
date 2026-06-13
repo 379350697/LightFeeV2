@@ -957,6 +957,25 @@ class TestCanonicalSymbolRoundTrip:
         assert spec.symbol_from_venue("BTC-USDT-SWAP") == "BTCUSDT"
         assert spec.symbol_from_venue("ETH-USDT-SWAP") == "ETHUSDT"
 
+    def test_okx_private_truth_operations_use_wire_symbol_params(self):
+        from lightfee.engine.exchange_truth import build_venue_operation_request
+        from lightfee.venues.specs import VenueOperation
+
+        for operation in (
+            VenueOperation.AMEND_ORDER,
+            VenueOperation.CANCEL_ORDER,
+            VenueOperation.ORDER_STATUS,
+            VenueOperation.OPEN_ORDERS,
+            VenueOperation.POSITION,
+        ):
+            request = build_venue_operation_request(
+                Venue.OKX,
+                operation,
+                symbol="UBUSDT",
+            )
+            assert request.params.get("instId") == "UB-USDT-SWAP"
+            assert "UBUSDT" not in repr(request.params)
+
     def test_gate_canonical_to_wire(self):
         from lightfee.venues.specs import get_spec
         spec = get_spec(Venue.GATE)

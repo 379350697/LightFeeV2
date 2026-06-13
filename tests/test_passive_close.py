@@ -2290,6 +2290,7 @@ class TestFallbackResidualReal:
         assert len(state.pending_close_reconciliations) == 1
         reconciliation = state.pending_close_reconciliations[0]
         assert reconciliation["kind"] == "accepted_order_truth_gap"
+        assert reconciliation["order_truth_state"] == "ack_only_accepted"
         assert reconciliation["truth_required_by"] == "accepted_order_truth_gap"
         assert reconciliation["short_legs"][0]["order_id"] == "ack-one-sided-oid"
         assert reconciliation["short_legs"][0]["client_order_id"]

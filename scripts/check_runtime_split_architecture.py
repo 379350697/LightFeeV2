@@ -47,6 +47,14 @@ PRIVATE_TRUTH_ENDPOINT_LITERALS = (
     "/api/v2/mix/order/orders-pending",
     "/v5/order/realtime",
     "/info openOrders",
+    '"type": "clearinghouseState"',
+    '"type": "userAbstraction"',
+    '"type": "spotClearinghouseState"',
+)
+HYPERLIQUID_INFO_TYPE_VALUES = (
+    "clearinghouseState",
+    "userAbstraction",
+    "spotClearinghouseState",
 )
 BITGET_PRIVATE_TRUTH_ENDPOINT_LITERALS = (
     "/api/v2/mix/order/place-order",
@@ -240,6 +248,7 @@ def contract_truth_endpoint_bypass_hits() -> list[str]:
             for literal in PRIVATE_TRUTH_ENDPOINT_LITERALS:
                 if literal in line:
                     hits.append(f"{rel}:{lineno}:{literal}")
+        hits.extend(_hyperliquid_info_type_body_hits(path, text))
 
     bitget_guard_files = [
         path
@@ -258,6 +267,50 @@ def contract_truth_endpoint_bypass_hits() -> list[str]:
                 if literal in line:
                     hits.append(f"{rel}:{lineno}:{literal}")
     return hits
+
+
+def _hyperliquid_info_type_body_hits(path: Path, text: str) -> list[str]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+
+    rel = path.relative_to(ROOT).as_posix()
+    hits: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        values: list[str] = []
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value == "type"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                    and value.value in HYPERLIQUID_INFO_TYPE_VALUES
+                ):
+                    values.append(value.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "dict"
+        ):
+            for keyword in node.keywords:
+                value = keyword.value
+                if (
+                    keyword.arg == "type"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                    and value.value in HYPERLIQUID_INFO_TYPE_VALUES
+                ):
+                    values.append(value.value)
+        for value in values:
+            key = (node.lineno, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append((node.lineno, f"{rel}:{node.lineno}:type={value}"))
+    return [hit for _lineno, hit in sorted(hits, key=lambda item: item[0])]
 
 
 def main() -> int:

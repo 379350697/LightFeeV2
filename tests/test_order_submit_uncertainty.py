@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
+
 from lightfee.core.domain import Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.bybit_duplicate_reconcile import (
     BybitDuplicateReconcileResult,
     build_order_reconcile_result_payload,
+    reconcile_bybit_duplicate_client_order,
 )
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthDecision
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
@@ -134,3 +137,90 @@ def test_ack_gap_and_duplicate_reconcile_share_order_truth_ledger():
     assert duplicate_payload["order_truth_probe_paths"] == (
         ORDER_TRUTH_LEDGER.probe_paths(Venue.BYBIT)
     )
+
+
+@pytest.mark.parametrize(
+    ("classification", "decision", "expected_state"),
+    [
+        ("full", "clear", "resolved_flat"),
+        ("partial", "retry_new_client_order_id", "resolved_position"),
+    ],
+)
+def test_duplicate_reconcile_payload_fallback_state_uses_duplicate_decision(
+    classification,
+    decision,
+    expected_state,
+):
+    payload = build_order_reconcile_result_payload(
+        result=BybitDuplicateReconcileResult(
+            classification=classification,
+            decision=decision,
+            target_qty=10.0,
+            reconciled_qty=4.0,
+            live_qty=6.0,
+            remaining_qty=6.0,
+            retry_qty=6.0,
+            client_order_id="cid-duplicate",
+        ),
+        symbol="HOMEUSDT",
+        client_order_id="cid-duplicate",
+        reason="duplicate_client_id",
+    )
+
+    assert payload["order_truth_state"] == expected_state
+
+
+@pytest.mark.asyncio
+async def test_bybit_duplicate_facade_delegates_decision_to_order_truth_ledger(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class Adapter:
+        async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id):
+            return type(
+                "Fill",
+                (),
+                {
+                    "quantity": 0.0,
+                    "order_id": "",
+                    "client_order_id": client_order_id,
+                    "average_price": 0.0,
+                },
+            )()
+
+        async def fetch_position(self, symbol):
+            return type("Position", (), {"quantity": 3.0, "side": None})()
+
+    def fake_resolve_duplicate_conflict(**kwargs):
+        calls.append(kwargs)
+        return OrderTruthDecision(
+            state="resolved_position",
+            classification="ledger_decided",
+            decision="retry_new_client_order_id",
+            target_qty=3.0,
+            reconciled_qty=0.0,
+            live_qty=3.0,
+            remaining_qty=3.0,
+            retry_qty=3.0,
+            client_order_id="cid-ledger",
+        )
+
+    monkeypatch.setattr(
+        ORDER_TRUTH_LEDGER,
+        "resolve_duplicate_conflict",
+        fake_resolve_duplicate_conflict,
+    )
+
+    result = await reconcile_bybit_duplicate_client_order(
+        adapter=Adapter(),
+        symbol="HOMEUSDT",
+        client_order_id="cid-ledger",
+        target_qty=3.0,
+    )
+
+    assert calls
+    assert calls[0]["venue"] == Venue.BYBIT
+    assert calls[0]["symbol"] == "HOMEUSDT"
+    assert calls[0]["client_order_id"] == "cid-ledger"
+    assert result.classification == "ledger_decided"
+    assert result.order_truth_state == "resolved_position"
+    assert result.should_retry_with_new_client_id is True

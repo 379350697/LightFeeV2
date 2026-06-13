@@ -62,6 +62,28 @@ class BitgetAdapter:
     assert hits == ["lightfee/venues/bitget.py:4:/api/v3/position/current-position"]
 
 
+def test_runtime_split_checker_catches_hyperliquid_info_body_variants(monkeypatch):
+    import scripts.check_runtime_split_architecture as guard
+
+    diagnose_path = guard.ROOT / "scripts" / "diagnose_live.py"
+    source = """
+async def illegal_direct_info_body(account):
+    await client.post('/info', json={'type': 'clearinghouseState', 'user': account})
+    return dict(type='userAbstraction', user=account)
+"""
+
+    monkeypatch.setattr(guard, "tracked_python_files", lambda: [])
+    monkeypatch.setattr(guard, "TRUTH_ENDPOINT_GUARD_FILES", [diagnose_path])
+    monkeypatch.setattr(guard, "read", lambda path: source)
+
+    hits = guard.contract_truth_endpoint_bypass_hits()
+
+    assert hits == [
+        "scripts/diagnose_live.py:3:type=clearinghouseState",
+        "scripts/diagnose_live.py:4:type=userAbstraction",
+    ]
+
+
 def test_passive_amend_cannot_reuse_generic_order_path():
     source = Path("lightfee/venues/transport.py").read_text(encoding="utf-8")
     amend_source = _function_source(
@@ -144,6 +166,24 @@ def test_order_truth_paths_are_derived_from_venue_operation_contracts():
         "/info orderStatus",
     ):
         assert forbidden not in body
+
+
+def test_diagnose_live_does_not_hardcode_hyperliquid_info_type_bodies():
+    source = Path("scripts/diagnose_live.py").read_text(encoding="utf-8")
+    body = _function_source(
+        source,
+        "async def _fetch_hyperliquid_balance_view",
+        "def _probe_venue_symbol",
+    )
+
+    for forbidden in (
+        '"type": "clearinghouseState"',
+        '"type": "userAbstraction"',
+        '"type": "spotClearinghouseState"',
+    ):
+        assert forbidden not in body
+    assert "request_venue_operation" in body
+    assert "VenueOperation.POSITION" in body
 
 
 def test_runtime_context_exposes_runtime_split_semantic_services():

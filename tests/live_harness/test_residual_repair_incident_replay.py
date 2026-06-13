@@ -240,6 +240,7 @@ async def test_residual_repair_ack_only_submit_preserves_order_truth_gap_evidenc
         if event["kind"] == "recovery.residual_repair_failed"
     ][-1]
     assert failed["order_ack_only"] is True
+    assert failed["order_truth_state"] == "ack_only_accepted"
     assert failed["accepted_order_id"] == "repair-ack-oid"
     assert failed["accepted_client_order_id"] == "repair-ack-cid"
     assert failed["fill_confirmation_missing_fields"] == ["executedQty", "cumQty"]
@@ -438,6 +439,68 @@ async def test_residual_repair_ack_only_open_order_retains_then_reconciles_befor
         "repair-ack-oid",
         "repair-ack-cid",
     )
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_partial_accepted_fill_clears_stale_ledger_fields(
+    tmp_path,
+):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-ack-partial",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "accepted_order_truth_gap": True,
+        "accepted_order_id": "repair-ack-oid",
+        "accepted_client_order_id": "repair-ack-cid",
+        "order_truth_state": "resolved_position",
+        "ledger_decision": "retain",
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 300_000,
+        "retry_count": 2,
+        "last_attempt_at_ms": now_ms - 60_000,
+        "next_attempt_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        entry_price=1.0,
+        observed_at_ms=now_ms,
+    )
+    bybit.order_fill_reconciliation = OrderFillReconciliation(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.BUY,
+        quantity=4.0,
+        average_price=1.0,
+        order_id="repair-ack-oid",
+        client_order_id="repair-ack-cid",
+        filled_at_ms=now_ms + 2,
+    )
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    remaining = runtime.state.pending_residual_repairs[0]
+    assert remaining["repair_quantity"] == pytest.approx(6.0)
+    for cleared_key in (
+        "accepted_order_truth_gap",
+        "accepted_order_id",
+        "accepted_client_order_id",
+        "order_truth_state",
+        "ledger_decision",
+    ):
+        assert cleared_key not in remaining
 
 
 @pytest.mark.asyncio

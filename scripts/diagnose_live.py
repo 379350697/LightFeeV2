@@ -787,28 +787,34 @@ async def _fetch_hyperliquid_balance_view(
     if transport is None:
         return {"classification": "transport_unavailable"}
     try:
-        perp_raw = await transport._request(
-            "POST",
-            "/info",
-            body={"type": "clearinghouseState", "user": account_address},
-            private=True,
+        agent_wallet_address = str(
+            getattr(credential, "agent_wallet_address", "") or ""
+        ).strip()
+        perp_raw, _ = await request_venue_operation(
+            transport,
+            Venue.HYPERLIQUID,
+            VenueOperation.POSITION,
+            account_address=account_address,
+            agent_wallet_address=agent_wallet_address,
         )
         user_abstraction = ""
         try:
-            raw_abstraction = await transport._request(
-                "POST",
-                "/info",
-                body={"type": "userAbstraction", "user": account_address},
-                private=True,
+            raw_abstraction, _ = await request_venue_operation(
+                transport,
+                Venue.HYPERLIQUID,
+                VenueOperation.USER_ABSTRACTION,
+                account_address=account_address,
+                agent_wallet_address=agent_wallet_address,
             )
             user_abstraction = str(raw_abstraction or "")
         except Exception:
             user_abstraction = "unavailable"
-        spot_raw = await transport._request(
-            "POST",
-            "/info",
-            body={"type": "spotClearinghouseState", "user": account_address},
-            private=True,
+        spot_raw, _ = await request_venue_operation(
+            transport,
+            Venue.HYPERLIQUID,
+            VenueOperation.SPOT_CLEARINGHOUSE_STATE,
+            account_address=account_address,
+            agent_wallet_address=agent_wallet_address,
         )
         return _hyperliquid_balance_view_payload(
             account_address=account_address,

@@ -54,6 +54,7 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     is_order_truth_gap,
 )
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
@@ -3741,6 +3742,14 @@ class PassiveCloseExecutor:
             return
 
         now_ms = self._now_ms()
+        ledger_decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
+        order_truth_state = str(
+            payload.get("order_truth_state") or ledger_decision.state
+        )
+        next_action = str(
+            payload.get("next_action")
+            or "reconcile_accepted_order_or_probe_live_position"
+        )
         reconciliation = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
@@ -3759,13 +3768,11 @@ class PassiveCloseExecutor:
             "attempt_count": 0,
             "next_attempt_ms": now_ms,
             "accepted_order_truth_gap": True,
+            "order_truth_state": order_truth_state,
             "truth_required_by": "accepted_order_truth_gap",
             "terminal_without_truth": False,
             "requested_quantity": float(quantity or 0.0),
-            "next_action": payload.get(
-                "next_action",
-                "reconcile_accepted_order_or_probe_live_position",
-            ),
+            "next_action": next_action,
             "probe_paths": dict(payload.get("order_truth_probe_paths") or {}),
         }
         state.enqueue_pending_close_reconciliation(reconciliation)
@@ -3780,6 +3787,7 @@ class PassiveCloseExecutor:
                 "source": source,
                 "order_id": accepted_order_id,
                 "client_order_id": accepted_client_order_id,
+                "order_truth_state": order_truth_state,
                 "truth_required_by": "accepted_order_truth_gap",
                 "next_action": reconciliation["next_action"],
                 "probe_paths": reconciliation["probe_paths"],
