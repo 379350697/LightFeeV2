@@ -16,7 +16,6 @@ from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
     OrderFill,
-    OrderRequest,
     PassiveOrderState,
     PositionSnapshot,
     Side,
@@ -45,11 +44,9 @@ from lightfee.engine.bootstrap import (
 )
 from lightfee.engine.lifecycle import (
     can_enter_new_positions,
-    clear_risk_mode_for_recovery,
     enter_fail_closed,
     set_lifecycle,
     transition_to_reconciling,
-    transition_to_running,
 )
 from lightfee.engine.loop_control import (
     ExportState,
@@ -57,28 +54,19 @@ from lightfee.engine.loop_control import (
     maybe_export_current_state_snapshot,
     maybe_export_runtime_metrics,
 )
-from lightfee.engine.order_submit_uncertainty import (
-    build_order_submit_uncertainty_payload,
-    order_truth_probe_paths,
-)
 from lightfee.engine.recovery import (
     recover_from_snapshot,
     build_recovery_dedup_index,
-    is_client_order_id_duplicate,
-    has_pending_entry_for_symbol,
     clear_stale_fail_closed_if_recovery_clean,
     clear_legacy_recovery_block_via_core,
     build_persistent_state_view,
 )
 from lightfee.engine.recovery_decision_core import (
-    CORE_CLEARABLE_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
-    RecoveryDecisionKind,
     V1RecoveryDecisionCore,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_startup_runtime import RecoveryStartupRuntime
-from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.market_data_runtime import MarketDataRuntime
 from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
 from lightfee.engine.pending_entry_runtime import PendingEntryRuntime
@@ -87,11 +75,6 @@ from lightfee.engine.v1_lifecycle_closure import (
     build_v1_lifecycle_closure_table,
     closure_event_fields,
     entry_gate_from_closure,
-)
-from lightfee.engine.pending_entry_terminalizer import (
-    PendingEntryLiveTruth,
-    PendingEntryTerminalDecision,
-    PendingEntryTerminalizer,
 )
 from lightfee.engine.pending_entry_lifecycle import (
     advance_pending_entry_zero_fill_phase,
@@ -126,7 +109,7 @@ from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
+from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
@@ -1573,7 +1556,7 @@ class LiveRuntime:
         )
 
         # Phase 4 – Recovery-aware startup (Rust V1: finalize_startup_position_recovery)
-        from lightfee.engine.recovery import needs_reconciliation, classify_startup_recovery_state
+        from lightfee.engine.recovery import classify_startup_recovery_state
 
         classified_recovery_state = classify_startup_recovery_state(self.state)
 
@@ -6300,7 +6283,6 @@ class LiveRuntime:
         return False
 
     @staticmethod
-    @staticmethod
     def _apply_reconcile_backoff(pending, now_ms: int) -> None:
         """Apply exponential backoff to a PendingEntry or PendingClose.
 
@@ -6313,36 +6295,29 @@ class LiveRuntime:
         pending.reconcile_next_attempt_ms = now_ms + backoff
 
     @staticmethod
-    @staticmethod
     def _pending_entry_reconcile_maker_status(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_reconcile_maker_status(*args, **kwargs)
 
-    @staticmethod
     @staticmethod
     def _order_status_is_terminal_no_fill(*args, **kwargs):
         return PendingEntryRuntime._order_status_is_terminal_no_fill(*args, **kwargs)
 
     @staticmethod
-    @staticmethod
     def _fill_reconciliation_terminal_no_fill(*args, **kwargs):
         return PendingEntryRuntime._fill_reconciliation_terminal_no_fill(*args, **kwargs)
 
-    @staticmethod
     @staticmethod
     def _pending_entry_has_terminal_maker_zero_fill_evidence(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_has_terminal_maker_zero_fill_evidence(*args, **kwargs)
 
     @staticmethod
-    @staticmethod
     def _pending_entry_has_maker_order_reference(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_has_maker_order_reference(*args, **kwargs)
 
     @staticmethod
-    @staticmethod
     def _pending_entry_maker_order_identifiers(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_maker_order_identifiers(*args, **kwargs)
 
-    @staticmethod
     @staticmethod
     def _pending_entry_maker_cancel_requested(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_maker_cancel_requested(*args, **kwargs)
@@ -6350,7 +6325,6 @@ class LiveRuntime:
     def _mark_pending_entry_maker_cancel_requested(self, *args, **kwargs):
         return self.pending_entry_runtime._mark_pending_entry_maker_cancel_requested(*args, **kwargs)
 
-    @staticmethod
     @staticmethod
     def _pending_entry_open_order_matches(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_open_order_matches(*args, **kwargs)
@@ -9721,7 +9695,6 @@ class LiveRuntime:
             now_ms=now_ms,
         )
 
-    @staticmethod
     @staticmethod
     def _pending_entry_terminalizer_decision_payload(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_terminalizer_decision_payload(*args, **kwargs)
