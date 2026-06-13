@@ -10,6 +10,162 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from lightfee.core.domain import Venue
+from lightfee.venues.specs import VenueOperation, get_operation_contract, get_spec
+from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+
+@dataclass(frozen=True)
+class VenueOperationRequest:
+    method: str
+    path: str
+    params: dict[str, Any] = field(default_factory=dict)
+    body: dict[str, Any] = field(default_factory=dict)
+    private: bool = True
+
+    @property
+    def label(self) -> str:
+        suffix = ""
+        if self.path == "/info":
+            info_type = self.body.get("type")
+            if info_type:
+                suffix = f" {info_type}"
+        return f"{self.method} {self.path}{suffix}"
+
+
+def build_venue_operation_request(
+    venue: Venue,
+    operation: VenueOperation,
+    *,
+    symbol: str = "",
+    account_address: str = "",
+    agent_wallet_address: str = "",
+    resolved_account_family: Any = None,
+) -> VenueOperationRequest:
+    """Build a private-truth request from the venue operation contract."""
+    spec = get_spec(venue)
+    contract = get_operation_contract(
+        spec,
+        operation,
+        resolved_account_family=resolved_account_family,
+    )
+    if not contract.supported:
+        raise NotImplementedError(f"{venue.value}:{operation.value}:unsupported")
+
+    venue_symbol = _venue_contract_symbol(spec, symbol)
+    params: dict[str, Any] = {}
+    body: dict[str, Any] = {}
+    fixed = body if contract.payload == "body" and contract.path == "/info" else params
+    for item in contract.required_params:
+        if "=" not in item:
+            continue
+        key, raw_value = item.split("=", 1)
+        fixed[key] = _resolve_contract_param_value(
+            raw_value,
+            venue_symbol=venue_symbol,
+            account_address=account_address,
+            agent_wallet_address=agent_wallet_address,
+        )
+
+    if venue in (Venue.BINANCE, Venue.ASTER):
+        if venue_symbol:
+            params.setdefault("symbol", venue_symbol)
+    elif venue == Venue.BYBIT:
+        params.setdefault("category", "linear")
+        if operation in (VenueOperation.OPEN_ORDERS, VenueOperation.ORDER_STATUS):
+            params.setdefault("settleCoin", "USDT")
+        if venue_symbol:
+            params.setdefault("symbol", venue_symbol)
+    elif venue == Venue.OKX:
+        if venue_symbol:
+            params.setdefault("instId", venue_symbol)
+        elif operation in (VenueOperation.OPEN_ORDERS, VenueOperation.POSITION):
+            params.setdefault("instType", "SWAP")
+    elif venue == Venue.BITGET:
+        if venue_symbol:
+            params.setdefault("symbol", venue_symbol)
+    elif venue == Venue.GATE:
+        if operation == VenueOperation.OPEN_ORDERS:
+            params.setdefault("status", "open")
+        if venue_symbol:
+            params.setdefault("contract", venue_symbol)
+
+    return VenueOperationRequest(
+        method=contract.method,
+        path=contract.path,
+        params=params,
+        body=body,
+        private=contract.private,
+    )
+
+
+async def request_venue_operation(
+    transport: Any,
+    venue: Venue,
+    operation: VenueOperation,
+    *,
+    symbol: str = "",
+    account_address: str = "",
+    agent_wallet_address: str = "",
+    resolved_account_family: Any = None,
+) -> tuple[Any, VenueOperationRequest]:
+    if venue == Venue.BITGET and resolved_account_family is None:
+        resolver = getattr(transport, "_bitget_resolve_contract_family", None)
+        if callable(resolver):
+            resolved_account_family = await resolver()
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "Bitget private truth requires an explicit account family resolver",
+                status_code=400,
+                body='{"code":"LFV2_BITGET_FAMILY_UNRESOLVED","msg":"missing Bitget account family resolver"}',
+            )
+    request = build_venue_operation_request(
+        venue,
+        operation,
+        symbol=symbol,
+        account_address=account_address,
+        agent_wallet_address=agent_wallet_address,
+        resolved_account_family=resolved_account_family,
+    )
+    kwargs: dict[str, Any] = {"private": request.private}
+    if request.params:
+        kwargs["params"] = request.params
+    elif request.method == "GET":
+        kwargs["params"] = {}
+    if request.body:
+        kwargs["body"] = request.body
+    raw = await transport._request(request.method, request.path, **kwargs)
+    return raw, request
+
+
+def _venue_contract_symbol(spec: Any, symbol: str) -> str:
+    if not symbol:
+        return ""
+    convert = getattr(spec, "symbol_to_venue", None)
+    if callable(convert):
+        try:
+            return str(convert(symbol))
+        except Exception:
+            return symbol
+    return symbol
+
+
+def _resolve_contract_param_value(
+    raw_value: str,
+    *,
+    venue_symbol: str,
+    account_address: str,
+    agent_wallet_address: str,
+) -> str:
+    if raw_value == "configured_account_address":
+        return account_address
+    if raw_value == "agent_wallet_address":
+        return agent_wallet_address
+    if raw_value == "coin":
+        return venue_symbol
+    return raw_value
+
 
 @dataclass(frozen=True)
 class ExchangeTruthPosition:

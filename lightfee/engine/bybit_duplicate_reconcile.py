@@ -14,13 +14,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from lightfee.core.domain import PositionSnapshot, Venue
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 
 
-BYBIT_DUPLICATE_RECONCILE_ENDPOINTS = [
-    "bybit_order_realtime",
-    "bybit_order_history",
-    "bybit_execution_list",
-]
+BYBIT_DUPLICATE_RECONCILE_ENDPOINTS = list(
+    ORDER_TRUTH_LEDGER.duplicate_reconcile_endpoints(Venue.BYBIT)
+)
 
 
 @dataclass(frozen=True)
@@ -160,53 +159,13 @@ def build_order_reconcile_result_payload(
 ) -> dict[str, Any]:
     """Build the unified order.reconcile_result payload used by cleanup paths."""
 
-    return {
-        "venue": Venue.BYBIT.value,
-        "symbol": symbol,
-        "endpoint": BYBIT_DUPLICATE_RECONCILE_ENDPOINTS[0],
-        "queried_endpoints": list(BYBIT_DUPLICATE_RECONCILE_ENDPOINTS),
-        "endpoint_responses": [
-            {
-                "endpoint": endpoint,
-                "classification": result.classification,
-            }
-            for endpoint in BYBIT_DUPLICATE_RECONCILE_ENDPOINTS
-        ],
-        "product_type": "reconciliation",
-        "category": "reconciliation",
-        "order_id": result.order_id,
-        "exchange_order_id": result.order_id,
-        "client_order_id": client_order_id,
-        "status": result.classification,
-        "reason": reason,
-        "uncertain_subtype": "duplicate_client_id",
-        "raw_exchange_status": result.classification,
-        "fill_qty": result.reconciled_qty,
-        "fill_price": result.average_price,
-        "position_qty": result.live_qty,
-        "position_side": result.live_side or "",
-        "live_position_delta": {
-            "quantity": result.live_qty,
-            "signed_quantity": result.live_qty,
-            "side": result.live_side or "",
-            "observed_at_ms": 0,
-            "source": "fetch_position",
-        },
-        "next_action": result.decision,
-        "hedge_submitted": False,
-        "raw_price": None,
-        "raw_qty": None,
-        "quantized_price": None,
-        "quantized_qty": None,
-        "tick_size": None,
-        "quantity_step": None,
-        "response_classification": result.classification,
-        "target_qty": result.target_qty,
-        "reconciled_qty": result.reconciled_qty,
-        "live_qty": result.live_qty,
-        "remaining_qty": result.remaining_qty,
-        "retry_qty": result.retry_qty,
-    }
+    return ORDER_TRUTH_LEDGER.build_duplicate_reconcile_result_payload(
+        result=result,
+        venue=Venue.BYBIT,
+        symbol=symbol,
+        client_order_id=client_order_id,
+        reason=reason,
+    )
 
 
 def _positive_float(value: Any) -> float:

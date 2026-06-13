@@ -28,6 +28,43 @@ DELEGATES = [
 ]
 DELEGATE_ATTR_SUFFIX = "_runtime"
 DYNAMIC_PROXY_PATTERNS = ("__getattr__", "get_delegate", "register_delegate")
+TRUTH_ENDPOINT_GUARD_FILES = [
+    ENGINE / "recovery_startup_runtime.py",
+    ROOT / "scripts" / "diagnose_live.py",
+    ENGINE / "passive_close.py",
+    ENGINE / "residual_repair_runtime.py",
+]
+TRUTH_ENDPOINT_ALLOWED_FILES = {
+    ROOT / "scripts" / "check_runtime_split_architecture.py",
+    ROOT / "lightfee" / "rate_limit" / "config.py",
+    ROOT / "lightfee" / "venues" / "specs.py",
+}
+BITGET_ADAPTER_ENDPOINT_ALLOWED_SCOPES = {"detect_position_hedge_mode"}
+PRIVATE_TRUTH_ENDPOINT_LITERALS = (
+    "/fapi/v1/openOrders",
+    "/fapi/v3/openOrders",
+    "/api/v5/trade/orders-pending",
+    "/api/v2/mix/order/orders-pending",
+    "/v5/order/realtime",
+    "/info openOrders",
+)
+BITGET_PRIVATE_TRUTH_ENDPOINT_LITERALS = (
+    "/api/v2/mix/order/place-order",
+    "/api/v2/mix/order/cancel-order",
+    "/api/v2/mix/order/detail",
+    "/api/v2/mix/order/orders-pending",
+    "/api/v2/mix/position/single-position",
+    "/api/v2/mix/position/all-position",
+    "/api/v2/mix/account/account",
+    "/api/v2/mix/account/accounts",
+    "/api/v3/trade/place-order",
+    "/api/v3/trade/cancel-order",
+    "/api/v3/trade/order-info",
+    "/api/v3/trade/unfilled-orders",
+    "/api/v3/position/current-position",
+    "/api/v3/account/assets",
+    "/api/v3/account/settings",
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +153,25 @@ def tracked_python_files() -> list[Path]:
     return [ROOT / line for line in result.stdout.splitlines() if line]
 
 
+def _function_line_ranges(path: Path) -> list[tuple[str, int, int]]:
+    tree = ast.parse(read(path))
+    ranges: list[tuple[str, int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end_lineno = getattr(node, "end_lineno", node.lineno)
+            ranges.append((node.name, node.lineno, end_lineno))
+    return ranges
+
+
+def _is_allowed_bitget_adapter_endpoint_literal(path: Path, lineno: int) -> bool:
+    if path != ROOT / "lightfee" / "venues" / "bitget.py":
+        return False
+    for name, start, end in _function_line_ranges(path):
+        if name in BITGET_ADAPTER_ENDPOINT_ALLOWED_SCOPES and start <= lineno <= end:
+            return True
+    return False
+
+
 def direct_reference_report(methods: list[RuntimeMethod]) -> list[str]:
     files = tracked_python_files()
     output: list[str] = []
@@ -175,6 +231,35 @@ def delegate_dependency_hits(path: Path) -> tuple[list[str], list[str]]:
     return live_runtime_hits, runtime_module_hits
 
 
+def contract_truth_endpoint_bypass_hits() -> list[str]:
+    hits: list[str] = []
+    for path in TRUTH_ENDPOINT_GUARD_FILES:
+        text = read(path)
+        rel = path.relative_to(ROOT).as_posix()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for literal in PRIVATE_TRUTH_ENDPOINT_LITERALS:
+                if literal in line:
+                    hits.append(f"{rel}:{lineno}:{literal}")
+
+    bitget_guard_files = [
+        path
+        for path in tracked_python_files()
+        if not path.relative_to(ROOT).as_posix().startswith("tests/")
+    ]
+    for path in sorted(bitget_guard_files):
+        if path in TRUTH_ENDPOINT_ALLOWED_FILES:
+            continue
+        text = read(path)
+        rel = path.relative_to(ROOT).as_posix()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if _is_allowed_bitget_adapter_endpoint_literal(path, lineno):
+                continue
+            for literal in BITGET_PRIVATE_TRUTH_ENDPOINT_LITERALS:
+                if literal in line:
+                    hits.append(f"{rel}:{lineno}:{literal}")
+    return hits
+
+
 def main() -> int:
     methods = runtime_methods()
     forwarding = [item for item in methods if item.forwarding]
@@ -186,6 +271,7 @@ def main() -> int:
     dynamic_hits = [
         pattern for pattern in DYNAMIC_PROXY_PATTERNS if pattern in runtime_text or pattern in delegate_text
     ]
+    truth_endpoint_hits = contract_truth_endpoint_bypass_hits()
     reverse_live_runtime_hits: list[str] = []
     runtime_module_hits: list[str] = []
     for path in DELEGATES:
@@ -215,7 +301,7 @@ def main() -> int:
     print(
         status(
             "delegate_runtime_module_dependency",
-            "WARN" if runtime_module_hits else "PASS",
+            "FAIL" if runtime_module_hits else "PASS",
             ", ".join(runtime_module_hits) if runtime_module_hits else "none",
         )
     )
@@ -226,11 +312,23 @@ def main() -> int:
             ", ".join(dynamic_hits) if dynamic_hits else "none",
         )
     )
+    print(
+        status(
+            "contract_truth_endpoint_registry_bypass",
+            "FAIL" if truth_endpoint_hits else "PASS",
+            ", ".join(truth_endpoint_hits) if truth_endpoint_hits else "none",
+        )
+    )
     print()
     print("## Forwarding Stub Reference Report")
     for line in direct_reference_report(methods):
         print(line)
-    return 1 if reverse_live_runtime_hits or dynamic_hits else 0
+    return 1 if (
+        reverse_live_runtime_hits
+        or runtime_module_hits
+        or dynamic_hits
+        or truth_endpoint_hits
+    ) else 0
 
 
 if __name__ == "__main__":

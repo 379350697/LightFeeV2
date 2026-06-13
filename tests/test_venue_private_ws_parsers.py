@@ -724,27 +724,21 @@ class TestBitgetPassiveProgressEndpoint:
         assert len(place_order_calls) == 0
 
     @pytest.mark.asyncio
-    async def test_uta_request_rejected_falls_back_to_classic(self, monkeypatch):
-        """UTA REQUEST_REJECTED → classic fallback /api/v2/mix/order/detail with
-        productType=USDT-FUTURES, returns correct progress."""
-        from lightfee.venues.transport import VenueTransport, TransportErrorCategory, TransportError
-        from lightfee.venues.specs import bitget_spec
+    async def test_classic_family_lock_uses_classic_order_detail_only(self, monkeypatch):
+        """Resolved classic family uses /api/v2/mix/order/detail without UTA probing."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
         from lightfee.core.domain import Side, PassiveOrderProgress
 
         spec = bitget_spec()
         calls = []
-        uta_calls_count = 0
         classic_calls_count = 0
 
         async def _fake_request(method, path, **kwargs):
-            nonlocal uta_calls_count, classic_calls_count
+            nonlocal classic_calls_count
             calls.append((method, path, kwargs.get("params")))
             if "/api/v3/trade/order-info" in path:
-                uta_calls_count += 1
-                raise TransportError(
-                    TransportErrorCategory.REQUEST_REJECTED,
-                    "classic account cannot use UTA",
-                )
+                raise AssertionError(f"must not probe UTA after classic family lock: {calls}")
             if "/api/v2/mix/order/detail" in path:
                 classic_calls_count += 1
                 return {
@@ -762,26 +756,30 @@ class TestBitgetPassiveProgressEndpoint:
                 }
             return {"code": "00000", "data": {}}
 
+        async def _resolve_classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
         with patch.object(VenueTransport, '_validate_live_credentials', return_value=None):
             transport = VenueTransport(spec, mode='mock')
         monkeypatch.setattr(transport, '_request', _fake_request)
         monkeypatch.setattr(transport, 'mode', 'mock')
         monkeypatch.setattr(transport, 'private_order_progress', lambda **kw: None)
+        monkeypatch.setattr(
+            transport,
+            '_bitget_resolve_contract_family',
+            _resolve_classic_family,
+            raising=False,
+        )
 
         result = await transport.query_passive_order_progress(
             "ETHUSDT", "o-classic-1", "c-classic-1", side=Side.BUY,
         )
 
-        # UTA must be attempted for at least the REST detail call
-        assert uta_calls_count >= 1, (
-            f"UTA must be attempted (for REST detail), got {uta_calls_count}"
-        )
-        # Must have called classic endpoint at least once (REST detail fallback)
-        assert classic_calls_count >= 1, (
-            f"Must fall back to /api/v2/mix/order/detail, got calls: {calls}"
-        )
+        assert classic_calls_count >= 1
+        assert all("/api/v3/" not in path for _method, path, _params in calls)
         classic_params = [c[2] for c in calls if "/api/v2/mix/order/detail" in c[1]]
         assert any(p.get("productType") == "USDT-FUTURES" for p in classic_params if p)
+        assert any(p.get("marginCoin") == "USDT" for p in classic_params if p)
         assert any(p.get("symbol") == "ETHUSDT" for p in classic_params if p)
         # Must NOT use place-order
         place_order_calls = [c for c in calls if "place-order" in str(c)]

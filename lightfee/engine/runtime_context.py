@@ -22,6 +22,24 @@ class RuntimeCommonContext(Protocol):
     @property
     def journal(self) -> Journal: ...
 
+    @property
+    def venue_contracts(self) -> Any: ...
+
+    @property
+    def order_truth(self) -> Any: ...
+
+    @property
+    def lifecycle_closure(self) -> Any: ...
+
+    @property
+    def quote_truth(self) -> Any: ...
+
+    @property
+    def catalog_support(self) -> Any: ...
+
+    @property
+    def exchange_truth(self) -> Any: ...
+
 
 class MarketDataRuntimeContext(RuntimeCommonContext, Protocol):
     @property

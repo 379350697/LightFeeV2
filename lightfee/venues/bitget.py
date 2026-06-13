@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from enum import Enum
 from typing import Any, Optional
 
@@ -15,7 +16,13 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
-from lightfee.venues.specs import bitget_spec
+from lightfee.engine.exchange_truth import request_venue_operation
+from lightfee.venues.specs import (
+    BitgetContractFamily,
+    VenueOperation,
+    bitget_spec,
+    get_operation_contract,
+)
 from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory, VenueTransport
 
 logger = logging.getLogger("lightfee.venues.bitget")
@@ -167,6 +174,160 @@ def _parse_bitget_risk_from_rowlike(raw: dict, now_ms: int):
     return snapshot
 
 
+def _profile_from_contract_family(family: BitgetContractFamily) -> BitgetAccountProfile:
+    if family == BitgetContractFamily.CLASSIC_MIX_V2:
+        return BitgetAccountProfile.CLASSIC
+    return BitgetAccountProfile.UTA
+
+
+def _contract_family_from_profile(profile: BitgetAccountProfile) -> BitgetContractFamily:
+    if profile == BitgetAccountProfile.CLASSIC:
+        return BitgetContractFamily.CLASSIC_MIX_V2
+    return BitgetContractFamily.UTA_V3
+
+
+def _coerce_bitget_contract_family(value: Any) -> BitgetContractFamily | None:
+    if value is None:
+        return None
+    if isinstance(value, BitgetContractFamily):
+        return value
+    text = str(value).strip().lower()
+    aliases = {
+        "classic": BitgetContractFamily.CLASSIC_MIX_V2,
+        "classic_mix": BitgetContractFamily.CLASSIC_MIX_V2,
+        "classic_mix_v2": BitgetContractFamily.CLASSIC_MIX_V2,
+        "mix_v2": BitgetContractFamily.CLASSIC_MIX_V2,
+        "v2": BitgetContractFamily.CLASSIC_MIX_V2,
+        "uta": BitgetContractFamily.UTA_V3,
+        "uta_v3": BitgetContractFamily.UTA_V3,
+        "v3": BitgetContractFamily.UTA_V3,
+    }
+    if text in aliases:
+        return aliases[text]
+    return BitgetContractFamily(text)
+
+
+def _bitget_contract_params(contract) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for item in contract.required_params:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        params[key] = value
+    return params
+
+
+def _transport_error_body_dict(error: TransportError) -> dict[str, Any]:
+    body = getattr(error, "body", "")
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+class BitgetContractFamilyResolver:
+    """Resolve and cache the Bitget private-truth contract family for this runtime."""
+
+    def __init__(
+        self,
+        transport: VenueTransport,
+        *,
+        configured_family: BitgetContractFamily | str | None = None,
+    ) -> None:
+        self._transport = transport
+        self._configured_family = _coerce_bitget_contract_family(configured_family)
+        self._resolved_family: BitgetContractFamily | None = None
+
+    @property
+    def resolved_family(self) -> BitgetContractFamily | None:
+        return self._resolved_family
+
+    def lock(self, family: BitgetContractFamily | str) -> BitgetContractFamily:
+        self._resolved_family = _coerce_bitget_contract_family(family)
+        if self._resolved_family is None:
+            raise ValueError("Bitget contract family cannot be None")
+        return self._resolved_family
+
+    async def resolve(self) -> BitgetContractFamily:
+        if self._resolved_family is not None:
+            return self._resolved_family
+
+        if self._transport.mode != "live":
+            return self.lock(BitgetContractFamily.UTA_V3)
+
+        target_family = self._configured_family
+        if target_family == BitgetContractFamily.CLASSIC_MIX_V2:
+            self._resolved_family = await self._resolve_explicit_classic()
+            return self._resolved_family
+        if target_family == BitgetContractFamily.UTA_V3:
+            await self._probe_uta()
+            return self.lock(BitgetContractFamily.UTA_V3)
+
+        try:
+            raw = await self._probe_uta()
+        except TransportError as error:
+            if self._is_classic_mismatch(error):
+                await self._probe_classic()
+                return self.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+            raise
+        if _payload_indicates_classic(raw):
+            await self._probe_classic()
+            return self.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+        return self.lock(BitgetContractFamily.UTA_V3)
+
+    async def _resolve_explicit_classic(self) -> BitgetContractFamily:
+        try:
+            raw = await self._probe_uta()
+        except TransportError as error:
+            if self._is_classic_mismatch(error):
+                await self._probe_classic()
+                return self.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+            raise
+        if _payload_indicates_classic(raw):
+            await self._probe_classic()
+            return self.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+        raise TransportError(
+            TransportErrorCategory.REQUEST_REJECTED,
+            "Bitget configured classic family validation failed: UTA probe succeeded",
+            status_code=400,
+            body='{"code":"LFV2_BITGET_FAMILY_MISMATCH","msg":"configured classic but account resolved UTA"}',
+        )
+
+    async def _probe_uta(self) -> dict[str, Any]:
+        contract = get_operation_contract(
+            self._transport._spec,
+            VenueOperation.POSITION,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        )
+        return await self._transport._request(
+            contract.method,
+            contract.path,
+            params=_bitget_contract_params(contract),
+            private=contract.private,
+        )
+
+    async def _probe_classic(self) -> dict[str, Any]:
+        contract = get_operation_contract(
+            self._transport._spec,
+            VenueOperation.ALL_POSITIONS,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
+        return await self._transport._request(
+            contract.method,
+            contract.path,
+            params=_bitget_contract_params(contract),
+            private=contract.private,
+        )
+
+    @staticmethod
+    def _is_classic_mismatch(error: TransportError) -> bool:
+        status_code = getattr(error, "status_code", 0)
+        return _is_classic_mode_error(status_code, _transport_error_body_dict(error))
+
+
 class BitgetAdapter(VenueAdapter):
     """Bitget Mix V2 adapter with classic-vs-UTA detection.
 
@@ -182,6 +343,7 @@ class BitgetAdapter(VenueAdapter):
         credential: Optional[LiveCredential] = None,
         exchange_http_timeout_ms: int = 10000,
         rate_limiter: Any = None,
+        account_family: BitgetContractFamily | str | None = None,
     ) -> None:
         spec = bitget_spec()
         self._transport = VenueTransport(spec=spec, mode=mode, credential=credential,
@@ -189,6 +351,11 @@ class BitgetAdapter(VenueAdapter):
                                          rate_limiter=rate_limiter)
         self._mode = mode
         self._profile: Optional[BitgetAccountProfile] = None
+        self._contract_family_resolver = BitgetContractFamilyResolver(
+            self._transport,
+            configured_family=account_family,
+        )
+        self._transport._bitget_resolve_contract_family = self.resolve_contract_family
         self._profile_locked: bool = False
         self._position_hedge_mode: Optional[bool] = None
 
@@ -223,6 +390,17 @@ class BitgetAdapter(VenueAdapter):
     @property
     def account_profile(self) -> Optional[BitgetAccountProfile]:
         return self._profile
+
+    @property
+    def resolved_contract_family(self) -> BitgetContractFamily | None:
+        return self._contract_family_resolver.resolved_family
+
+    async def resolve_contract_family(self) -> BitgetContractFamily:
+        if self._profile is not None and self._contract_family_resolver.resolved_family is None:
+            return self._contract_family_resolver.lock(_contract_family_from_profile(self._profile))
+        family = await self._contract_family_resolver.resolve()
+        self._profile = _profile_from_contract_family(family)
+        return family
 
     async def detect_position_hedge_mode(self, symbol: str) -> bool:
         """Detect Bitget position mode for classic futures accounts.
@@ -260,59 +438,8 @@ class BitgetAdapter(VenueAdapter):
         classic/UTA mismatch. Auth failures (401/403), rate limits (429),
         network errors, and other transport failures propagate immediately.
         """
-        if self._profile is not None:
-            return self._profile
-
-        # Paper mode defaults to UTA
-        if self._mode != "live":
-            self._profile = BitgetAccountProfile.UTA
-            return self._profile
-
-        # Probe UTA endpoint
-        try:
-            raw = await self._transport._request(
-                "GET",
-                "/api/v3/position/current-position",
-                params={"category": "USDT-FUTURES"},
-                private=True,
-            )
-            if _payload_indicates_classic(raw):
-                self._profile = BitgetAccountProfile.CLASSIC
-            else:
-                self._profile = BitgetAccountProfile.UTA
-        except TransportError as e:
-            # Only fall back to CLASSIC on explicit classic-mode errors
-            status_code = getattr(e, "status_code", 0)
-            body_str = getattr(e, "body", "")
-            body_dict: dict = {}
-            if body_str:
-                try:
-                    import json as _json
-                    body_dict = _json.loads(body_str)
-                except Exception:
-                    body_dict = {}
-            if _is_classic_mode_error(status_code, body_dict):
-                self._profile = BitgetAccountProfile.CLASSIC
-            elif e.category in (
-                TransportErrorCategory.AUTH_FAILURE,
-                TransportErrorCategory.AUTHORIZATION_FAILURE,
-            ):
-                raise TransportError(
-                    TransportErrorCategory.AUTH_FAILURE,
-                    f"Bitget profile detection failed: auth error (HTTP {status_code})",
-                    status_code=status_code,
-                    body=body_str,
-                ) from e
-            elif e.category == TransportErrorCategory.TRANSPORT_FAILURE:
-                raise TransportError(
-                    TransportErrorCategory.TRANSPORT_FAILURE,
-                    f"Bitget profile detection failed: transport error (HTTP {status_code})",
-                    status_code=status_code,
-                    body=body_str,
-                ) from e
-            else:
-                raise
-
+        family = await self.resolve_contract_family()
+        self._profile = _profile_from_contract_family(family)
         return self._profile
 
     # ------------------------------------------------------------------
@@ -323,26 +450,15 @@ class BitgetAdapter(VenueAdapter):
         if self._mode != "live":
             return await self._transport.fetch_position(symbol)
 
-        profile = await self.detect_profile()
+        family = await self.resolve_contract_family()
         venue_sym = self._transport._venue_symbol(symbol)
-
-        if profile == BitgetAccountProfile.CLASSIC:
-            params = {
-                "symbol": venue_sym,
-                "productType": "USDT-FUTURES",
-                "marginCoin": "USDT",
-            }
-            raw = await self._transport._request(
-                "GET", "/api/v2/mix/position/single-position", params=params, private=True
-            )
-        else:
-            params = {
-                "symbol": venue_sym,
-                "category": "USDT-FUTURES",
-            }
-            raw = await self._transport._request(
-                "GET", "/api/v3/position/current-position", params=params, private=True
-            )
+        raw, _request = await request_venue_operation(
+            self._transport,
+            Venue.BITGET,
+            VenueOperation.POSITION,
+            symbol=symbol,
+            resolved_account_family=family,
+        )
 
         now_ms = int(__import__("time").time() * 1000)
         return self._transport._parse_position(raw, venue_sym, now_ms)
@@ -351,21 +467,13 @@ class BitgetAdapter(VenueAdapter):
         if self._mode != "live":
             return await self._transport.fetch_all_positions()
 
-        profile = await self.detect_profile()
-        if profile == BitgetAccountProfile.CLASSIC:
-            raw = await self._transport._request(
-                "GET",
-                "/api/v2/mix/position/all-position",
-                params={"productType": "USDT-FUTURES", "marginCoin": "USDT"},
-                private=True,
-            )
-        else:
-            raw = await self._transport._request(
-                "GET",
-                "/api/v3/position/current-position",
-                params={"category": "USDT-FUTURES"},
-                private=True,
-            )
+        family = await self.resolve_contract_family()
+        raw, _request = await request_venue_operation(
+            self._transport,
+            Venue.BITGET,
+            VenueOperation.ALL_POSITIONS,
+            resolved_account_family=family,
+        )
 
         now_ms = int(__import__("time").time() * 1000)
         return self._transport._parse_all_positions(raw, now_ms)
@@ -381,19 +489,26 @@ class BitgetAdapter(VenueAdapter):
                 _require_bitget_success,
             )
 
-            profile = await self.detect_profile()
+            family = await self.resolve_contract_family()
+            profile = _profile_from_contract_family(family)
             venue_sym = self._transport._venue_symbol(request.symbol)
             now_ms = int(__import__("time").time() * 1000)
             hedge_mode = self._transport._hedge_mode
             if profile == BitgetAccountProfile.CLASSIC:
                 hedge_mode = await self.detect_position_hedge_mode(request.symbol)
 
-            req_path, body = _build_bitget_order_request(
+            _builder_path, body = _build_bitget_order_request(
                 request, venue_sym,
                 passive=False,
                 profile=profile.value,
                 hedge_mode=hedge_mode,
             )
+            contract = get_operation_contract(
+                self._transport._spec,
+                VenueOperation.CREATE_ORDER,
+                resolved_account_family=family,
+            )
+            req_path = contract.path
             attempt_payload = {
                 "venue": Venue.BITGET.value,
                 "symbol": venue_sym,
@@ -468,19 +583,26 @@ class BitgetAdapter(VenueAdapter):
                 _require_bitget_success,
             )
 
-            profile = await self.detect_profile()
+            family = await self.resolve_contract_family()
+            profile = _profile_from_contract_family(family)
             venue_sym = self._transport._venue_symbol(request.symbol)
             now_ms = int(__import__("time").time() * 1000)
             hedge_mode = self._transport._hedge_mode
             if profile == BitgetAccountProfile.CLASSIC:
                 hedge_mode = await self.detect_position_hedge_mode(request.symbol)
 
-            req_path, body = _build_bitget_order_request(
+            _builder_path, body = _build_bitget_order_request(
                 request, venue_sym,
                 passive=True,
                 profile=profile.value,
                 hedge_mode=hedge_mode,
             )
+            contract = get_operation_contract(
+                self._transport._spec,
+                VenueOperation.CREATE_ORDER,
+                resolved_account_family=family,
+            )
+            req_path = contract.path
             raw = await self._transport._request("POST", req_path, body=body, private=True)
 
             _require_bitget_success(raw, "bitget passive order failed")
@@ -501,81 +623,52 @@ class BitgetAdapter(VenueAdapter):
     # Risk snapshot with profile-aware classic fallback (V1: bitget.rs:836-866, 2896-2902)
     # ------------------------------------------------------------------
 
-    _BITGET_CLASSIC_ACCOUNT_PATH = "/api/v2/mix/account/accounts"
-    _BITGET_CLASSIC_PRODUCT_TYPE = "USDT-FUTURES"
-
     async def fetch_account_risk_snapshot(self):
         """Fetch account risk snapshot with profile-aware routing.
 
-        Rust V1 flow:
-        1. If profile is already CLASSIC → go directly to classic endpoint.
-        2. Try UTA endpoint /api/v3/account/assets.
-        3. If classic/UTA mismatch error → cache CLASSIC, retry classic endpoint.
-        4. If payload indicates classic mode → cache CLASSIC, retry classic endpoint.
-        5. Auth/rate-limit/network errors propagate — never fall back.
+        Uses the resolved Bitget contract family. Only an explicit classic/UTA
+        mismatch from the UTA risk endpoint may lock the runtime to Classic and
+        retry the Classic family risk contract.
         """
-        from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
         import time as _time
 
         if self._mode != "live":
             return None
 
         now_ms = int(_time.time() * 1000)
-
-        # If profile is already CLASSIC, go directly to classic endpoint
-        if self._profile == BitgetAccountProfile.CLASSIC:
-            return await self._fetch_classic_risk_snapshot(now_ms)
-
-        # Try UTA endpoint
+        family = await self.resolve_contract_family()
         try:
-            raw = await self._transport._request(
-                "GET", self._transport._spec.account_risk_path, private=True
+            raw, _request = await request_venue_operation(
+                self._transport,
+                Venue.BITGET,
+                VenueOperation.ACCOUNT_RISK,
+                resolved_account_family=family,
             )
-            # Check if successful payload indicates classic mode
             if _payload_indicates_classic(raw):
+                self._contract_family_resolver.lock(BitgetContractFamily.CLASSIC_MIX_V2)
                 self._profile = BitgetAccountProfile.CLASSIC
                 return await self._fetch_classic_risk_snapshot(now_ms)
-
             return _parse_bitget_risk_from_rowlike(raw, now_ms)
-
         except TransportError as e:
-            status_code = getattr(e, "status_code", 0)
-            body_str = getattr(e, "body", "")
-            body_dict: dict = {}
-            if body_str:
-                try:
-                    import json as _json
-                    body_dict = _json.loads(body_str)
-                except Exception:
-                    body_dict = {}
-
-            # Only classic/UTA mismatch triggers fallback
-            if _is_classic_mode_error(status_code, body_dict):
+            if (
+                family == BitgetContractFamily.UTA_V3
+                and BitgetContractFamilyResolver._is_classic_mismatch(e)
+            ):
+                self._contract_family_resolver.lock(BitgetContractFamily.CLASSIC_MIX_V2)
                 self._profile = BitgetAccountProfile.CLASSIC
                 return await self._fetch_classic_risk_snapshot(now_ms)
-
-            # Auth/rate-limit/network → propagate, never fall back
-            if e.category in (
-                TransportErrorCategory.AUTH_FAILURE,
-                TransportErrorCategory.AUTHORIZATION_FAILURE,
-                TransportErrorCategory.TRANSPORT_FAILURE,
-            ):
-                raise
-
             raise
 
     async def _fetch_classic_risk_snapshot(self, now_ms: int):
         """Fetch risk snapshot from Bitget classic account endpoint.
 
-        V1: GET /api/v2/mix/account/accounts?productType=USDT-FUTURES
+        V1: Classic risk uses the Mix v2 account risk family contract.
         """
-        from lightfee.engine.risk_actions import AccountRiskSnapshot as ARS
-
-        raw = await self._transport._request(
-            "GET",
-            self._BITGET_CLASSIC_ACCOUNT_PATH,
-            params={"productType": self._BITGET_CLASSIC_PRODUCT_TYPE},
-            private=True,
+        raw, _request = await request_venue_operation(
+            self._transport,
+            Venue.BITGET,
+            VenueOperation.ACCOUNT_RISK,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
         )
         return _parse_bitget_risk_from_rowlike(raw, now_ms)
 
@@ -649,7 +742,7 @@ class BitgetAdapter(VenueAdapter):
         order_id: str,
         client_order_id: Optional[str] = None,
     ) -> Optional["OrderFillReconciliation"]:
-        """V1: Bitget fetch_order_fill_reconciliation via /api/v3/trade/order-info.
+        """V1: Bitget fetch_order_fill_reconciliation via order-status truth.
 
         Uses clientOid for client_order_id lookup (V1: bitget.rs:2912-2948).
         Falls through to transport.fetch_order_status then converts to

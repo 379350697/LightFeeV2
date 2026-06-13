@@ -468,9 +468,9 @@ def test_static_runtime_snapshot_refreshes_closure_before_export():
 
 
 def test_static_entry_recovery_gate_reads_v1_lifecycle_closure():
-    source = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
+    source = (REPO_ROOT / "lightfee/engine/entry_gate_runtime.py").read_text()
     start = source.index("def _gate_recovery_ledger")
-    end = source.index("def _remove_pending_entry_after_terminal_decision")
+    end = source.index("def _gate_entry_sizing", start)
     body = source[start:end]
 
     assert "_v1_lifecycle_entry_gate_decision()" in body
@@ -479,15 +479,18 @@ def test_static_entry_recovery_gate_reads_v1_lifecycle_closure():
 
 
 def test_static_release_paths_attach_closure_decision_ids():
-    runtime = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
+    pending_entry = (REPO_ROOT / "lightfee/engine/pending_entry_runtime.py").read_text()
+    residual_repair = (
+        REPO_ROOT / "lightfee/engine/residual_repair_runtime.py"
+    ).read_text()
     passive_close = (REPO_ROOT / "lightfee/engine/passive_close.py").read_text()
 
-    pending_start = runtime.index("def _remove_pending_entry_after_terminal_decision")
-    pending_end = runtime.index("async def _complete_pending_entry_terminal_removal")
-    pending_body = runtime[pending_start:pending_end]
-    residual_start = runtime.index("def _terminalize_residual_repair_task")
-    residual_end = runtime.index("def _reschedule_pending_residual_repair_task")
-    residual_body = runtime[residual_start:residual_end]
+    pending_start = pending_entry.index("def _remove_pending_entry_after_terminal_decision")
+    pending_end = pending_entry.index("async def _complete_pending_entry_terminal_removal")
+    pending_body = pending_entry[pending_start:pending_end]
+    residual_start = residual_repair.index("def _terminalize_residual_repair_task")
+    residual_end = residual_repair.index("def _reschedule_pending_residual_repair_task")
+    residual_body = residual_repair[residual_start:residual_end]
     passive_start = passive_close.index("def _emit_passive_close_terminal_resolution")
     passive_end = passive_close.index("def _clear_live_flat_state")
     passive_body = passive_close[passive_start:passive_end]

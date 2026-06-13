@@ -35,12 +35,15 @@ from lightfee.venues.common import (
 from lightfee.venues.base import VenueAccountContract
 from lightfee.venues.specs import (
     AuthScheme,
+    VenueOperation,
+    VenueOperationContract,
     VenueSpec,
     binance_spec,
     okx_spec,
     bybit_spec,
     bitget_spec,
     gate_spec,
+    get_operation_contract,
     aster_spec,
     hyperliquid_spec,
 )
@@ -118,6 +121,145 @@ class TestTransportConstruction:
             assert spec.public_base_url
             transport = VenueTransport(spec=spec, mode="paper")
             assert transport.venue == spec.venue_id
+
+
+class TestVenueOperationContracts:
+    def test_okx_amend_contract_is_not_generic_order_path(self):
+        spec = okx_spec()
+
+        contract = get_operation_contract(spec, VenueOperation.AMEND_ORDER)
+
+        assert contract.method == "POST"
+        assert contract.path == "/api/v5/trade/amend-order"
+        assert contract.path != spec.order_path
+
+    def test_bybit_amend_contract_is_not_create_path(self):
+        spec = bybit_spec()
+
+        contract = get_operation_contract(spec, VenueOperation.AMEND_ORDER)
+
+        assert contract.method == "POST"
+        assert contract.path == "/v5/order/amend"
+        assert contract.path != spec.order_path
+
+    def test_bitget_private_truth_contracts_use_v2_mix_shape(self):
+        spec = bitget_spec()
+
+        open_orders = get_operation_contract(spec, VenueOperation.OPEN_ORDERS)
+        position = get_operation_contract(spec, VenueOperation.POSITION)
+
+        assert open_orders.path == "/api/v2/mix/order/orders-pending"
+        assert open_orders.required_params == ("productType=USDT-FUTURES", "marginCoin=USDT")
+        assert open_orders.symbol_shape == "BTCUSDT"
+        assert position.path == "/api/v2/mix/position/single-position"
+        assert position.required_params == (
+            "productType=USDT-FUTURES",
+            "marginCoin=USDT",
+        )
+        assert position.symbol_shape == "BTCUSDT"
+
+    def test_bitget_contracts_are_family_aware_for_classic_and_uta(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        spec = bitget_spec()
+
+        classic_open = get_operation_contract(
+            spec,
+            VenueOperation.OPEN_ORDERS,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
+        classic_position = get_operation_contract(
+            spec,
+            VenueOperation.POSITION,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
+        classic_all_positions = get_operation_contract(
+            spec,
+            VenueOperation.ALL_POSITIONS,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
+        uta_open = get_operation_contract(
+            spec,
+            VenueOperation.OPEN_ORDERS,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        )
+        uta_position = get_operation_contract(
+            spec,
+            VenueOperation.POSITION,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        )
+        uta_all_positions = get_operation_contract(
+            spec,
+            VenueOperation.ALL_POSITIONS,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        )
+
+        assert classic_open.path == "/api/v2/mix/order/orders-pending"
+        assert classic_position.path == "/api/v2/mix/position/single-position"
+        assert classic_all_positions.path == "/api/v2/mix/position/all-position"
+        assert classic_position.required_params == (
+            "productType=USDT-FUTURES",
+            "marginCoin=USDT",
+        )
+
+        assert uta_open.path == "/api/v3/trade/unfilled-orders"
+        assert uta_position.path == "/api/v3/position/current-position"
+        assert uta_all_positions.path == "/api/v3/position/current-position"
+        assert uta_position.required_params == ("category=USDT-FUTURES",)
+
+    @pytest.mark.asyncio
+    async def test_bitget_live_transport_order_status_without_family_resolver_fails_closed(self):
+        spec = bitget_spec()
+        transport = VenueTransport(
+            spec,
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+
+        async def _unexpected_request(method, path, **kwargs):
+            raise AssertionError(f"must not request Bitget truth without family resolver: {path}")
+
+        transport._request = _unexpected_request
+
+        with pytest.raises(TransportError) as exc:
+            await transport.fetch_order_status("HOMEUSDT", order_id="order-1")
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+        assert "family resolver" in str(exc.value)
+
+    def test_aster_private_truth_contracts_are_single_v3_scope(self):
+        spec = aster_spec()
+
+        assert get_operation_contract(
+            spec, VenueOperation.ORDER_STATUS
+        ).path == "/fapi/v3/order"
+        assert get_operation_contract(
+            spec, VenueOperation.OPEN_ORDERS
+        ).path == "/fapi/v3/openOrders"
+        assert get_operation_contract(
+            spec, VenueOperation.POSITION
+        ).path == "/fapi/v3/positionRisk"
+
+    def test_hyperliquid_info_contracts_require_configured_account_address(self):
+        spec = hyperliquid_spec()
+
+        for operation in (
+            VenueOperation.ORDER_STATUS,
+            VenueOperation.OPEN_ORDERS,
+            VenueOperation.POSITION,
+        ):
+            contract = get_operation_contract(spec, operation)
+            assert contract.method == "POST"
+            assert contract.path == "/info"
+            assert "user=configured_account_address" in contract.required_params
+            assert contract.symbol_shape == "coin"
+
+    def test_gate_cancel_contract_uses_path_template_not_body_payload(self):
+        contract = get_operation_contract(gate_spec(), VenueOperation.CANCEL_ORDER)
+
+        assert contract.method == "DELETE"
+        assert contract.path == "/api/v4/futures/usdt/orders/{order_id}"
+        assert contract.payload == "params"
 
 
 # ---------------------------------------------------------------------------
@@ -1741,6 +1883,89 @@ class TestBitgetProfileDetection:
         assert BitgetAccountProfile.UTA.value == "uta"
         assert BitgetAccountProfile.CLASSIC.value == "classic"
 
+    @pytest.mark.asyncio
+    async def test_contract_family_resolver_explicit_classic_fallbacks_only_on_mismatch(self):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetContractFamilyResolver
+        from lightfee.venues.specs import BitgetContractFamily
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        calls: list[tuple[str, str, dict[str, str]]] = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            calls.append((method, path, dict(params or {})))
+            if path == "/api/v3/position/current-position":
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "classic account not supported",
+                    status_code=400,
+                    body='{"code":"40034","msg":"classic account not supported"}',
+                )
+            if path == "/api/v2/mix/position/all-position":
+                return {"code": "00000", "data": []}
+            raise AssertionError(f"unexpected Bitget probe path: {path}")
+
+        adapter._transport._request = mock_request
+        resolver = BitgetContractFamilyResolver(
+            adapter._transport,
+            configured_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
+
+        family = await resolver.resolve()
+
+        assert family == BitgetContractFamily.CLASSIC_MIX_V2
+        assert calls == [
+            ("GET", "/api/v3/position/current-position", {"category": "USDT-FUTURES"}),
+            (
+                "GET",
+                "/api/v2/mix/position/all-position",
+                {"productType": "USDT-FUTURES", "marginCoin": "USDT"},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("category", "status_code", "body"),
+        [
+            (TransportErrorCategory.AUTH_FAILURE, 401, '{"code":"40100","msg":"Invalid API key"}'),
+            (TransportErrorCategory.AUTHORIZATION_FAILURE, 403, '{"code":"40300","msg":"Forbidden"}'),
+            (TransportErrorCategory.TRANSPORT_FAILURE, 429, '{"code":"42900","msg":"Too many requests"}'),
+            (TransportErrorCategory.TRANSPORT_FAILURE, 0, ""),
+        ],
+    )
+    async def test_contract_family_resolver_does_not_fallback_on_auth_rate_limit_or_network(
+        self,
+        category,
+        status_code,
+        body,
+    ):
+        from lightfee.venues.bitget import BitgetAdapter, BitgetContractFamilyResolver
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        calls: list[str] = []
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            calls.append(path)
+            raise TransportError(
+                category,
+                "probe failed",
+                status_code=status_code,
+                body=body,
+            )
+
+        adapter._transport._request = mock_request
+        resolver = BitgetContractFamilyResolver(adapter._transport)
+
+        with pytest.raises(TransportError):
+            await resolver.resolve()
+
+        assert calls == ["/api/v3/position/current-position"]
+
 
 # ---------------------------------------------------------------------------
 # All-seven fixture-driven parser tests (Deviation 6)
@@ -1981,6 +2206,13 @@ class TestPrivateBaseUrl:
             market_snapshot_path="/public/tickers",
             position_path="/private/positions",
             order_path="/private/order",
+            operation_contracts={
+                VenueOperation.CREATE_ORDER: VenueOperationContract(
+                    "POST",
+                    "/private/order",
+                    payload="params",
+                ),
+            },
             signature_param="signature",
             timestamp_param="timestamp",
             api_key_header="X-MBX-APIKEY",
@@ -2026,6 +2258,13 @@ class TestPrivateBaseUrl:
             market_snapshot_path="/public/tickers",
             position_path="/private/positions",
             order_path="/private/order",
+            operation_contracts={
+                VenueOperation.CREATE_ORDER: VenueOperationContract(
+                    "POST",
+                    "/private/order",
+                    payload="params",
+                ),
+            },
             signature_param="signature",
             timestamp_param="timestamp",
             api_key_header="X-MBX-APIKEY",
@@ -4148,8 +4387,8 @@ class TestBitgetRiskHealthRealMethod:
         assert result.health_ratio == 10.0
         assert result.available_balance_quote == 8000.0
         assert result.source == "bitget_account_risk"
-        # UTA path used: adapter delegates to spec.account_risk_path
-        assert any("/api/v2/mix/account/account" in u for u in call_urls)
+        # UTA path used: adapter delegates to resolved UTA v3 family contract.
+        assert any("/api/v3/account/assets" in u for u in call_urls)
 
     @pytest.mark.asyncio
     async def test_classic_cached_goes_direct_to_classic_endpoint(self):
@@ -6471,6 +6710,52 @@ class TestVenuePositionParsers:
         assert pos.side == Side.SELL
         assert pos.quantity == 0.01
 
+    def test_bitget_classic_position_parser_accepts_base_volume(self):
+        from lightfee.venues.transport import _parse_bitget_position
+
+        raw = {
+            "code": "00000",
+            "msg": "success",
+            "data": [
+                {
+                    "symbol": "HOMEUSDT",
+                    "baseVolume": "145",
+                    "holdSide": "long",
+                    "openPriceAvg": "0.0401",
+                }
+            ],
+        }
+
+        pos = _parse_bitget_position(raw, "HOMEUSDT", now_ms=1000)
+
+        assert pos.side == Side.BUY
+        assert pos.quantity == 145.0
+        assert pos.entry_price == 0.0401
+
+    def test_bitget_uta_position_parser_accepts_data_list_qty_and_avg_price(self):
+        from lightfee.venues.transport import _parse_bitget_position
+
+        raw = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "list": [
+                    {
+                        "symbol": "HOMEUSDT",
+                        "qty": "145",
+                        "posSide": "short",
+                        "avgPrice": "0.0401",
+                    }
+                ]
+            },
+        }
+
+        pos = _parse_bitget_position(raw, "HOMEUSDT", now_ms=1000)
+
+        assert pos.side == Side.SELL
+        assert pos.quantity == 145.0
+        assert pos.entry_price == 0.0401
+
     def test_okx_position_parser_scales_contracts_and_handles_empty_pos(self):
         from lightfee.venues.transport import _parse_okx_position
         raw = {
@@ -7128,6 +7413,8 @@ class TestBitgetAdapterHttpRedLight:
 
         async def mock_handler(request):
             url = str(request.url)
+            if "/api/v3/position/current-position" in url:
+                return httpx.Response(200, json={"code": "00000", "data": []})
             if "/api/v3/trade/order-info" in url:
                 return httpx.Response(200, json={
                     "code": "00000",
@@ -7282,6 +7569,8 @@ class TestBitgetAdapterHttpRedLight:
 
         async def mock_handler(request):
             url = str(request.url)
+            if "/api/v3/position/current-position" in url:
+                return httpx.Response(200, json={"code": "00000", "data": []})
             if "/api/v3/trade/order-info" in url:
                 return httpx.Response(200, json={
                     "code": "40001",
@@ -9519,6 +9808,99 @@ class TestPassiveAmendWireContracts:
         finally:
             await transport.close()
         assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_okx_amend_uses_amend_order_endpoint_and_contract_quantity(self):
+        cred = LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass")
+        transport = VenueTransport(spec=okx_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        transport.set_symbol_metadata({
+            "HOME-USDT-SWAP": {
+                "ctVal": "0.01",
+                "lotSz": "1",
+                "minSz": "1",
+                "ctType": "linear",
+            }
+        })
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["method"] = request.method
+            captured["path"] = request.url.path
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "code": "0",
+                    "data": [{"ordId": "okx-oid", "clOrdId": "okx-cid", "sCode": "0"}],
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="HOMEUSDT",
+            side=Side.SELL,
+            order_id="okx-oid",
+            client_order_id="okx-cid",
+            new_price_hint=0.044,
+            new_quantity=0.2,
+        )
+        try:
+            await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/api/v5/trade/amend-order"
+        assert captured["body"]["instId"] == "HOME-USDT-SWAP"
+        assert captured["body"]["ordId"] == "okx-oid"
+        assert captured["body"]["newPx"] == "0.044"
+        assert captured["body"]["newSz"] == "20"
+        assert captured["body"]["cxlOnFail"] is False
+
+    @pytest.mark.asyncio
+    async def test_bybit_amend_uses_v5_amend_endpoint_not_create_path(self):
+        cred = LiveCredential(api_key="key", api_secret="secret")
+        transport = VenueTransport(spec=bybit_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["method"] = request.method
+            captured["path"] = request.url.path
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"orderId": "bybit-oid", "orderLinkId": "bybit-cid"},
+                    "time": 1781350000000,
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            order_id="bybit-oid",
+            client_order_id="bybit-cid",
+            new_price_hint=0.045,
+            new_quantity=1500.0,
+        )
+        try:
+            await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/v5/order/amend"
+        assert captured["path"] != bybit_spec().order_path
+        assert captured["body"]["category"] == "linear"
+        assert captured["body"]["symbol"] == "HOMEUSDT"
+        assert captured["body"]["orderId"] == "bybit-oid"
+        assert captured["body"]["price"] == "0.045"
+        assert captured["body"]["qty"] == "1500"
 
 
 class TestBinanceAsterPrecisionFix:
