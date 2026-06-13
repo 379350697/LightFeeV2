@@ -9,3 +9,6 @@ runtime/
 !.env.example
 scripts/deploy.sh
 .deploy_manifest.json
+docs/superpowers/
+scripts/benchmark_quote_providers.py
+tests/test_benchmark_quote_providers.py
