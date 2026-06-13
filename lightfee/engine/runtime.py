@@ -32,6 +32,8 @@ from lightfee.engine.bybit_duplicate_reconcile import (
 )
 from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
@@ -241,6 +243,8 @@ class LiveRuntime:
         from lightfee.engine.entry_readiness import build_entry_readiness_provider
         self.entry_readiness_provider = build_entry_readiness_provider(self)
         self.market_data_runtime = MarketDataRuntime(self)
+        self.entry_gate_runtime = EntryGateRuntime(self)
+        self.entry_dispatch_runtime = EntryDispatchRuntime(self)
         self._refresh_runtime_market_data_config_state()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
@@ -522,38 +526,9 @@ class LiveRuntime:
         self,
         now_ms: int,
     ) -> tuple[AccountBalanceSnapshot | None, str | None]:
-        adapter = self.get_venue_adapter(Venue.HYPERLIQUID)
-        if adapter is None:
-            return None, "hyperliquid_adapter_unavailable"
-
-        cached_result, was_cached = self._cached_entry_balance_snapshot(
-            Venue.HYPERLIQUID,
-            now_ms,
+        return await self.entry_gate_runtime._fetch_hyperliquid_entry_balance_snapshot(
+            now_ms
         )
-        if was_cached:
-            ok, value = cached_result
-            if ok:
-                return value, None
-            return None, str(value or "hyperliquid_account_balance_unavailable")
-
-        try:
-            snapshot = await adapter.fetch_account_balance_snapshot()
-            self._store_entry_balance_snapshot(
-                Venue.HYPERLIQUID,
-                now_ms,
-                (True, snapshot),
-            )
-            if snapshot is None:
-                return None, "hyperliquid_account_balance_unavailable"
-            return snapshot, None
-        except Exception as e:
-            error = str(e) or e.__class__.__name__
-            self._store_entry_balance_snapshot(
-                Venue.HYPERLIQUID,
-                now_ms,
-                (False, error),
-            )
-            return None, error
 
     def _hyperliquid_balance_block_sample(
         self,
@@ -571,54 +546,20 @@ class LiveRuntime:
         user_abstraction: str = "",
         spot_usdc_available: float | None = None,
     ) -> dict:
-        evidence = self._entry_admission_evidence(reason)
-        try:
-            live_target_leverage = float(
-                getattr(self.config.strategy, "live_target_leverage", 1.0) or 1.0
-            )
-        except (TypeError, ValueError):
-            live_target_leverage = 1.0
-        candidate_pair_id = (
-            self._candidate_pair_id(candidate)
-            if candidate is not None
-            else "hyperliquid:*"
+        return self.entry_gate_runtime._hyperliquid_balance_block_sample(
+            candidate=candidate,
+            reason=reason,
+            now_ms=now_ms,
+            stage=stage,
+            source=source,
+            available_balance_quote=available_balance_quote,
+            required_initial_margin_quote=required_initial_margin_quote,
+            entry_notional_quote=entry_notional_quote,
+            raw_error=raw_error,
+            balance_classification=balance_classification,
+            user_abstraction=user_abstraction,
+            spot_usdc_available=spot_usdc_available,
         )
-        symbol = "*"
-        long_venue = ""
-        short_venue = ""
-        if candidate is not None:
-            symbol = str(getattr(candidate, "symbol", "*") or "*")
-            long_venue = str(getattr(candidate, "long_venue", "") or "")
-            short_venue = str(getattr(candidate, "short_venue", "") or "")
-        payload = {
-            "candidate_pair_id": candidate_pair_id,
-            "pair_id": candidate_pair_id,
-            "symbol": symbol,
-            "long_venue": long_venue,
-            "short_venue": short_venue,
-            "venue": Venue.HYPERLIQUID.value,
-            "reason": reason,
-            "block_scope": "venue",
-            "source": source,
-            "official_doc_url": str(evidence.get("official_doc_url") or ""),
-            "evidence_gap": bool(evidence.get("evidence_gap", True)),
-            "stage": stage,
-            "available_balance_quote": available_balance_quote,
-            "required_initial_margin_quote": required_initial_margin_quote,
-            "entry_notional_quote": entry_notional_quote,
-            "live_target_leverage": live_target_leverage,
-            "margin_buffer_bps": self._entry_admission_margin_buffer_bps(),
-            "ts_ms": now_ms,
-        }
-        if raw_error:
-            payload["raw_error"] = raw_error[:500]
-        if balance_classification:
-            payload["balance_classification"] = balance_classification
-        if user_abstraction:
-            payload["user_abstraction"] = user_abstraction
-        if spot_usdc_available is not None:
-            payload["spot_usdc_available"] = spot_usdc_available
-        return payload
 
     def _append_hyperliquid_balance_unavailable_event(
         self,
@@ -632,109 +573,21 @@ class LiveRuntime:
         allowed_count: int,
         samples: list[dict],
     ) -> None:
-        reason = "hyperliquid_account_balance_unavailable"
-        evidence = self._entry_admission_evidence(reason)
-        self._append_runtime_diagnostic_event(
-            "runtime.entry_admission_venue_degraded",
-            {
-                "venue": Venue.HYPERLIQUID.value,
-                "reason": reason,
-                "block_scope": "venue",
-                "source": source,
-                "official_doc_url": evidence["official_doc_url"],
-                "evidence_gap": True,
-                "stage": stage,
-                "candidate_count": candidate_count,
-                "blocked_count": blocked_count,
-                "allowed_count": allowed_count,
-                "blocked_reason_counts": {reason: blocked_count},
-                "samples": samples[:10],
-                "suppressed_count": max(blocked_count - len(samples), 0),
-                "raw_error": raw_error[:500],
-                "ts_ms": now_ms,
-            },
+        return self.entry_gate_runtime._append_hyperliquid_balance_unavailable_event(
             now_ms=now_ms,
-            key_parts=(stage, Venue.HYPERLIQUID.value, reason, source),
-            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+            stage=stage,
+            source=source,
+            raw_error=raw_error,
+            candidate_count=candidate_count,
+            blocked_count=blocked_count,
+            allowed_count=allowed_count,
+            samples=samples,
         )
 
     async def _refresh_hyperliquid_entry_balance_admission(self, now_ms: int) -> bool:
-        adapter = self.get_venue_adapter(Venue.HYPERLIQUID)
-        if adapter is None:
-            return True
-
-        try:
-            entry_notional = float(
-                getattr(
-                    self.config.strategy,
-                    "fixed_live_entry_notional_quote",
-                    0.0,
-                ) or 0.0
-            )
-        except (TypeError, ValueError):
-            entry_notional = 0.0
-        required_margin = self._hyperliquid_entry_required_initial_margin_quote(
-            entry_notional
+        return await self.entry_gate_runtime._refresh_hyperliquid_entry_balance_admission(
+            now_ms
         )
-        snapshot, error = await self._fetch_hyperliquid_entry_balance_snapshot(now_ms)
-        if snapshot is None:
-            reason = "hyperliquid_account_balance_unavailable"
-            sample = self._hyperliquid_balance_block_sample(
-                candidate=None,
-                reason=reason,
-                now_ms=now_ms,
-                stage="scan_start",
-                source="scan_start_balance_prefilter",
-                available_balance_quote=None,
-                required_initial_margin_quote=required_margin,
-                entry_notional_quote=entry_notional,
-                raw_error=error or reason,
-            )
-            self._append_hyperliquid_balance_unavailable_event(
-                now_ms=now_ms,
-                stage="scan_start",
-                source="scan_start_balance_prefilter",
-                raw_error=error or reason,
-                candidate_count=1,
-                blocked_count=1,
-                allowed_count=0,
-                samples=[sample],
-            )
-            return False
-
-        available = max(float(snapshot.free or 0.0), 0.0)
-        if available + 1e-9 >= required_margin:
-            return True
-
-        reason = "insufficient_margin_admission_prefiltered"
-        evidence = self._entry_admission_evidence(reason)
-        extra = self._hyperliquid_balance_block_sample(
-            candidate=None,
-            reason=reason,
-            now_ms=now_ms,
-            stage="scan_start",
-            source="scan_start_balance_prefilter",
-            available_balance_quote=available,
-            required_initial_margin_quote=required_margin,
-            entry_notional_quote=entry_notional,
-            balance_classification=str(
-                getattr(snapshot, "balance_classification", "") or ""
-            ),
-            user_abstraction=str(getattr(snapshot, "user_abstraction", "") or ""),
-            spot_usdc_available=getattr(snapshot, "spot_usdc_available", None),
-        )
-        self._record_symbol_admission_block(
-            venue=Venue.HYPERLIQUID,
-            symbol="*",
-            reason=reason,
-            raw_error="hyperliquid available balance below entry initial margin",
-            now_ms=now_ms,
-            evidence=evidence,
-            source="scan_start_balance_prefilter",
-            candidate_pair_id="hyperliquid:*",
-            extra_payload=extra,
-        )
-        return False
 
     async def _filter_candidates_by_entry_balance_admission(
         self,
@@ -743,220 +596,14 @@ class LiveRuntime:
         now_ms: int,
         stage: str,
     ) -> list:
-        if not candidates:
-            return []
-        if not any(
-            self._candidate_uses_venue(candidate, Venue.HYPERLIQUID)
-            for candidate in candidates
-        ):
-            return candidates
-        if self.get_venue_adapter(Venue.HYPERLIQUID) is None:
-            return candidates
-
-        snapshot, error = await self._fetch_hyperliquid_entry_balance_snapshot(now_ms)
-        allowed: list = []
-        blocked_samples: list[dict] = []
-        blocked_reason_counts: Counter[str] = Counter()
-        source = "candidate_balance_prefilter"
-
-        if snapshot is None:
-            reason = "hyperliquid_account_balance_unavailable"
-            for candidate in candidates:
-                if not self._candidate_uses_venue(candidate, Venue.HYPERLIQUID):
-                    allowed.append(candidate)
-                    continue
-                try:
-                    entry_notional = float(
-                        getattr(candidate, "entry_notional_quote", 0.0) or 0.0
-                    )
-                except (TypeError, ValueError):
-                    entry_notional = 0.0
-                required_margin = self._hyperliquid_entry_required_initial_margin_quote(
-                    entry_notional
-                )
-                blocked_reason_counts[reason] += 1
-                if len(blocked_samples) < 24:
-                    blocked_samples.append(
-                        self._hyperliquid_balance_block_sample(
-                            candidate=candidate,
-                            reason=reason,
-                            now_ms=now_ms,
-                            stage=stage,
-                            source=source,
-                            available_balance_quote=None,
-                            required_initial_margin_quote=required_margin,
-                            entry_notional_quote=entry_notional,
-                            raw_error=error or reason,
-                        )
-                    )
-            self._last_entry_admission_filter_blockers.update(blocked_reason_counts)
-            self._last_entry_admission_filter_samples.extend(blocked_samples)
-            self._append_hyperliquid_balance_unavailable_event(
-                now_ms=now_ms,
-                stage=stage,
-                source=source,
-                raw_error=error or reason,
-                candidate_count=len(candidates),
-                blocked_count=sum(blocked_reason_counts.values()),
-                allowed_count=len(allowed),
-                samples=blocked_samples,
-            )
-            return allowed
-
-        available = max(float(snapshot.free or 0.0), 0.0)
-        for candidate in candidates:
-            if not self._candidate_uses_venue(candidate, Venue.HYPERLIQUID):
-                allowed.append(candidate)
-                continue
-            try:
-                entry_notional = float(
-                    getattr(candidate, "entry_notional_quote", 0.0) or 0.0
-                )
-            except (TypeError, ValueError):
-                entry_notional = 0.0
-            required_margin = self._hyperliquid_entry_required_initial_margin_quote(
-                entry_notional
-            )
-            if available + 1e-9 >= required_margin:
-                allowed.append(candidate)
-                continue
-
-            reason = "insufficient_margin_admission_prefiltered"
-            blocked_reason_counts[reason] += 1
-            if len(blocked_samples) < 24:
-                blocked_samples.append(
-                    self._hyperliquid_balance_block_sample(
-                        candidate=candidate,
-                        reason=reason,
-                        now_ms=now_ms,
-                        stage=stage,
-                        source=source,
-                        available_balance_quote=available,
-                        required_initial_margin_quote=required_margin,
-                        entry_notional_quote=entry_notional,
-                        balance_classification=str(
-                            getattr(snapshot, "balance_classification", "") or ""
-                        ),
-                        user_abstraction=str(
-                            getattr(snapshot, "user_abstraction", "") or ""
-                        ),
-                        spot_usdc_available=getattr(
-                            snapshot,
-                            "spot_usdc_available",
-                            None,
-                        ),
-                    )
-                )
-
-        blocked_count = sum(blocked_reason_counts.values())
-        if blocked_count <= 0:
-            return allowed
-
-        self._last_entry_admission_filter_blockers.update(blocked_reason_counts)
-        self._last_entry_admission_filter_samples.extend(blocked_samples)
-        sorted_reasons = sorted(blocked_reason_counts)
-        reason = (
-            sorted_reasons[0]
-            if len(sorted_reasons) == 1
-            else "multiple_entry_balance_admission_blocks"
-        )
-        evidence = self._entry_admission_evidence(reason)
-        self._append_runtime_diagnostic_event(
-            "runtime.entry_admission_venue_degraded",
-            {
-                "venue": Venue.HYPERLIQUID.value,
-                "reason": reason,
-                "block_scope": "venue",
-                "source": source,
-                "official_doc_url": evidence.get("official_doc_url", ""),
-                "evidence_gap": bool(evidence.get("evidence_gap", True)),
-                "stage": stage,
-                "candidate_count": len(candidates),
-                "blocked_count": blocked_count,
-                "allowed_count": len(allowed),
-                "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
-                "samples": blocked_samples[:10],
-                "suppressed_count": max(blocked_count - len(blocked_samples), 0),
-                "ts_ms": now_ms,
-            },
+        return await self.entry_gate_runtime._filter_candidates_by_entry_balance_admission(
+            candidates,
             now_ms=now_ms,
-            key_parts=(stage, Venue.HYPERLIQUID.value, reason, source),
-            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+            stage=stage,
         )
-        return allowed
 
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
-        symbol = str(getattr(candidate, "symbol", "") or "")
-        candidate_pair_id = self._candidate_pair_id(candidate)
-        for raw_venue in (
-            getattr(candidate, "long_venue", ""),
-            getattr(candidate, "short_venue", ""),
-        ):
-            try:
-                venue = Venue.from_str(str(raw_venue))
-            except ValueError:
-                continue
-            key = (venue.value, symbol)
-            payload = {}
-            payload_state_key = ""
-            state_until_ms = 0
-            for state_key in (f"{venue.value}:{symbol}", f"{venue.value}:*"):
-                candidate_payload = dict(
-                    self.state.venue_entry_cooldowns.get(state_key, {}) or {}
-                )
-                try:
-                    candidate_until_ms = int(
-                        candidate_payload.get("blocked_until_ms", 0) or 0
-                    )
-                except (TypeError, ValueError):
-                    candidate_until_ms = 0
-                if candidate_until_ms > state_until_ms:
-                    state_until_ms = candidate_until_ms
-                    payload = candidate_payload
-                    payload_state_key = state_key
-            until_ms = max(
-                self._symbol_admission_blocked_until_ms.get(key, 0),
-                state_until_ms,
-            )
-            if until_ms > now_ms:
-                self._symbol_admission_blocked_until_ms[key] = until_ms
-                if payload:
-                    payload.setdefault("venue", venue.value)
-                    if payload.get("block_scope") == "venue":
-                        payload["blocked_symbol"] = (
-                            payload.get("blocked_symbol")
-                            or payload.get("symbol")
-                            or "*"
-                        )
-                        payload["symbol"] = symbol
-                    else:
-                        payload.setdefault("symbol", symbol)
-                    payload.setdefault(
-                        "block_scope",
-                        "venue" if payload_state_key.endswith(":*") else "symbol",
-                    )
-                    payload.setdefault("reason", "symbol_admission_blocked")
-                    payload["blocked_until_ms"] = until_ms
-                    payload.setdefault("ttl_ms", self._SYMBOL_ADMISSION_BLOCK_TTL_MS)
-                    payload.setdefault("raw_error", "")
-                    payload.setdefault("official_doc_url", "")
-                    payload.setdefault("evidence_gap", True)
-                    payload.setdefault("candidate_pair_id", candidate_pair_id)
-                    payload.setdefault("pair_id", candidate_pair_id)
-                    return payload
-                return {
-                    "venue": venue.value,
-                    "symbol": symbol,
-                    "reason": "symbol_admission_blocked",
-                    "blocked_until_ms": until_ms,
-                    "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
-                    "raw_error": "",
-                    "official_doc_url": "",
-                    "evidence_gap": True,
-                    "candidate_pair_id": candidate_pair_id,
-                    "pair_id": candidate_pair_id,
-                }
-        return None
+        return self.entry_gate_runtime._candidate_admission_block(candidate, now_ms)
 
     def _filter_candidates_by_entry_admission(
         self,
@@ -965,103 +612,11 @@ class LiveRuntime:
         now_ms: int,
         stage: str,
     ) -> list:
-        """V1-style pre-shortlist entry admission gate for venue-scope cooldowns."""
-        self._last_entry_admission_filter_blockers = Counter()
-        self._last_entry_admission_filter_samples = []
-        if not candidates:
-            return []
-
-        allowed: list = []
-        blocked_samples: list[dict] = []
-        blocked_until_ms = 0
-        blocked_venues: set[str] = set()
-        blocked_sources: set[str] = set()
-        official_doc_urls: set[str] = set()
-        evidence_gap_values: set[bool] = set()
-        for candidate in candidates:
-            block = self._candidate_admission_block(candidate, now_ms)
-            if not block or block.get("block_scope") != "venue":
-                allowed.append(candidate)
-                continue
-
-            reason = str(block.get("reason") or "venue_admission_blocked")
-            venue = str(block.get("venue") or "")
-            try:
-                candidate_blocked_until_ms = int(block.get("blocked_until_ms", 0) or 0)
-            except (TypeError, ValueError):
-                candidate_blocked_until_ms = 0
-            blocked_until_ms = max(blocked_until_ms, candidate_blocked_until_ms)
-            if venue:
-                blocked_venues.add(venue)
-            source = str(block.get("source") or "entry_admission_cooldown")
-            if source:
-                blocked_sources.add(source)
-            doc_url = str(block.get("official_doc_url") or "")
-            if doc_url:
-                official_doc_urls.add(doc_url)
-            evidence_gap_values.add(bool(block.get("evidence_gap", True)))
-            self._last_entry_admission_filter_blockers[reason] += 1
-            if len(blocked_samples) < 24:
-                blocked_samples.append({
-                    "candidate_pair_id": self._candidate_pair_id(candidate),
-                    "pair_id": self._candidate_pair_id(candidate),
-                    "symbol": str(getattr(candidate, "symbol", "") or ""),
-                    "long_venue": str(getattr(candidate, "long_venue", "") or ""),
-                    "short_venue": str(getattr(candidate, "short_venue", "") or ""),
-                    "venue": venue,
-                    "reason": reason,
-                    "block_scope": "venue",
-                    "blocked_until_ms": candidate_blocked_until_ms,
-                    "blocked_symbol": str(block.get("blocked_symbol") or ""),
-                    "source": source,
-                    "official_doc_url": doc_url,
-                    "evidence_gap": bool(block.get("evidence_gap", True)),
-                    "stage": stage,
-                })
-
-        self._last_entry_admission_filter_samples = blocked_samples
-        blocked_count = sum(self._last_entry_admission_filter_blockers.values())
-        if blocked_count <= 0:
-            return allowed
-
-        sorted_reasons = sorted(self._last_entry_admission_filter_blockers)
-        venue = next(iter(blocked_venues)) if len(blocked_venues) == 1 else "multiple"
-        reason = sorted_reasons[0] if len(sorted_reasons) == 1 else "multiple_entry_admission_blocks"
-        source = next(iter(blocked_sources)) if len(blocked_sources) == 1 else "multiple"
-        official_doc_url = (
-            next(iter(official_doc_urls)) if len(official_doc_urls) == 1 else ""
-        )
-        evidence_gap = (
-            next(iter(evidence_gap_values))
-            if len(evidence_gap_values) == 1
-            else True
-        )
-        self._append_runtime_diagnostic_event(
-            "runtime.entry_admission_venue_degraded",
-            {
-                "venue": venue,
-                "reason": reason,
-                "block_scope": "venue",
-                "blocked_until_ms": blocked_until_ms,
-                "source": source,
-                "official_doc_url": official_doc_url,
-                "evidence_gap": evidence_gap,
-                "stage": stage,
-                "candidate_count": len(candidates),
-                "blocked_count": blocked_count,
-                "allowed_count": len(allowed),
-                "blocked_reason_counts": dict(
-                    sorted(self._last_entry_admission_filter_blockers.items())
-                ),
-                "samples": blocked_samples[:10],
-                "suppressed_count": 0,
-                "ts_ms": now_ms,
-            },
+        return self.entry_gate_runtime._filter_candidates_by_entry_admission(
+            candidates,
             now_ms=now_ms,
-            key_parts=(stage, venue, reason, source),
-            interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+            stage=stage,
         )
-        return allowed
 
     def _record_symbol_admission_block(
         self,
@@ -1210,30 +765,17 @@ class LiveRuntime:
         )
         return True
 
-    def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
-        symbol = str(getattr(candidate, "symbol", "") or "")
-        candidate_pair_id = self._candidate_pair_id(candidate)
-        for raw_venue in (
-            getattr(candidate, "long_venue", ""),
-            getattr(candidate, "short_venue", ""),
-        ):
-            try:
-                venue = Venue.from_str(str(raw_venue))
-            except ValueError:
-                continue
-            metadata = self._entry_admission_reject_metadata(venue, reject_reason)
-            if metadata:
-                reason = str(metadata["reason"])
-                self._record_symbol_admission_block(
-                    venue=venue,
-                    symbol=symbol,
-                    reason=reason,
-                    raw_error=reject_reason,
-                    now_ms=now_ms,
-                    evidence=metadata,
-                    source="initial_entry",
-                    candidate_pair_id=candidate_pair_id,
-                )
+    def _record_entry_result_admission_blocks(
+        self,
+        candidate,
+        reject_reason: str,
+        now_ms: int,
+    ) -> None:
+        return self.entry_dispatch_runtime._record_entry_result_admission_blocks(
+            candidate,
+            reject_reason,
+            now_ms,
+        )
 
     async def _precheck_bybit_entry_admission(
         self,
@@ -1250,88 +792,19 @@ class LiveRuntime:
         maker_client_order_id: str,
         hedge_client_order_id: str,
     ) -> bool:
-        if Venue.BYBIT not in (long_venue, short_venue):
-            return True
-        adapter = self._venue_adapters.get(Venue.BYBIT)
-        precheck = getattr(adapter, "precheck_order_admission", None)
-        if adapter is None or not callable(precheck):
-            return True
-
-        symbol = str(getattr(candidate, "symbol", "") or "")
-        pair_id = self._candidate_pair_id(candidate)
-        entry_type_value = str(getattr(entry_type, "value", entry_type) or "")
-        bybit_is_maker = maker_venue == Venue.BYBIT
-        passive = bybit_is_maker and "passive" in entry_type_value
-        side = Side.BUY if long_venue == Venue.BYBIT else Side.SELL
-        price_hint = (
-            long_order_price_hint if long_venue == Venue.BYBIT else short_order_price_hint
-        )
-        client_order_id = (
-            maker_client_order_id if bybit_is_maker else hedge_client_order_id
-        )
-        request = OrderRequest(
-            venue=Venue.BYBIT,
-            symbol=symbol,
-            side=side,
+        return await self.entry_dispatch_runtime._precheck_bybit_entry_admission(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
             quantity=quantity,
-            price=price_hint if passive and price_hint > 0 else None,
-            reduce_only=False,
-            client_order_id=client_order_id,
-            post_only=passive,
-            time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
-            price_hint=price_hint if price_hint > 0 else None,
-            observed_at_ms=now_ms,
+            long_order_price_hint=long_order_price_hint,
+            short_order_price_hint=short_order_price_hint,
+            maker_venue=maker_venue,
+            entry_type=entry_type,
+            maker_client_order_id=maker_client_order_id,
+            hedge_client_order_id=hedge_client_order_id,
         )
-
-        try:
-            await precheck(request)
-            return True
-        except OrderSubmitError as exc:
-            error_text = str(exc)
-            metadata = self._entry_admission_reject_metadata(Venue.BYBIT, error_text)
-            if metadata:
-                reason = str(metadata["reason"])
-                self._record_symbol_admission_block(
-                    venue=Venue.BYBIT,
-                    symbol=symbol,
-                    reason=reason,
-                    raw_error=error_text,
-                    now_ms=now_ms,
-                    evidence=metadata,
-                    source="pre_entry_bybit_precheck",
-                    candidate_pair_id=pair_id,
-                )
-                return False
-            self.journal.append(
-                "runtime.entry_admission_precheck_rejected",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": error_text[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-        except Exception as exc:
-            self.journal.append(
-                "runtime.entry_admission_precheck_uncertain",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": str(exc)[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._venue_adapters.get(venue)
 
@@ -3801,119 +3274,10 @@ class LiveRuntime:
         *,
         skip_event_kind: str = "runtime.candidate_symbol_skipped",
     ) -> list:
-        """Filter live candidates through both venues' trading catalogs.
-
-        V1 build_scan_symbol_cache only admits symbols supported by both venues
-        in a directed pair. V2 sidecar snapshots can still contain public quote
-        rows for symbols that are not orderable on one venue, so runtime applies
-        the same catalog gate before shortlist/tracking/entry selection.
-        """
-        self._last_candidate_catalog_filter_blockers = Counter()
-        self._last_candidate_catalog_filter_samples = []
-        if self.config.runtime.mode == "paper":
-            return list(candidates)
-
-        venue_symbols: dict[Venue, set[str]] = {}
-        candidate_venues: list[tuple[object, Venue | None, Venue | None]] = []
-        for candidate in candidates:
-            try:
-                long_venue = Venue.from_str(str(getattr(candidate, "long_venue", "")))
-            except ValueError:
-                long_venue = None
-            try:
-                short_venue = Venue.from_str(str(getattr(candidate, "short_venue", "")))
-            except ValueError:
-                short_venue = None
-            candidate_venues.append((candidate, long_venue, short_venue))
-            symbol = str(getattr(candidate, "symbol", "") or "")
-            if not symbol:
-                continue
-            for venue in (long_venue, short_venue):
-                if venue is not None:
-                    venue_symbols.setdefault(venue, set()).add(symbol)
-
-        supported_by_venue: dict[Venue, set[str] | None] = {}
-        for venue, symbols in venue_symbols.items():
-            adapter = self.get_venue_adapter(venue)
-            if adapter is None:
-                supported_by_venue[venue] = None
-                continue
-            filtered = await self._filter_symbols_supported_by_venue(
-                venue,
-                adapter,
-                sorted(symbols),
-                skip_event_kind="",
-            )
-            supported_by_venue[venue] = set(filtered)
-
-        filtered_candidates: list = []
-        skipped = 0
-        for candidate, long_venue, short_venue in candidate_venues:
-            symbol = str(getattr(candidate, "symbol", "") or "")
-
-            def venue_supports(venue: Venue | None) -> bool:
-                if venue is None:
-                    return True
-                supported = supported_by_venue.get(venue)
-                return supported is None or symbol in supported
-
-            long_supported = venue_supports(long_venue)
-            short_supported = venue_supports(short_venue)
-            if long_supported and short_supported:
-                filtered_candidates.append(candidate)
-                continue
-
-            skipped += 1
-            self._last_candidate_catalog_filter_blockers["unsupported_symbol"] += 1
-            sample_payload = {
-                "symbol": symbol,
-                "candidate_pair_id": self._candidate_pair_id(candidate),
-                "pair_id": self._candidate_pair_id(candidate),
-                "long_venue": (
-                    long_venue.value
-                    if long_venue
-                    else str(getattr(candidate, "long_venue", ""))
-                ),
-                "short_venue": (
-                    short_venue.value
-                    if short_venue
-                    else str(getattr(candidate, "short_venue", ""))
-                ),
-                "long_supported": long_supported,
-                "short_supported": short_supported,
-                "reason": "unsupported_symbol",
-            }
-            if len(self._last_candidate_catalog_filter_samples) < 24:
-                self._last_candidate_catalog_filter_samples.append(sample_payload)
-            if getattr(self.journal, "_file", None) is not None:
-                self._append_runtime_diagnostic_event(
-                    skip_event_kind,
-                    sample_payload,
-                    now_ms=wall_clock_now_ms(),
-                    key_parts=(
-                        symbol,
-                        self._candidate_pair_id(candidate),
-                        "unsupported_symbol",
-                        str(long_supported),
-                        str(short_supported),
-                    ),
-                    interval_ms=self._CANDIDATE_SYMBOL_SKIPPED_LOG_INTERVAL_MS,
-                )
-
-        if skipped > 0 and getattr(self.journal, "_file", None) is not None:
-            self.journal.append(
-                "runtime.tradeable_candidates_catalog_filtered",
-                {
-                    "input_count": len(candidates),
-                    "output_count": len(filtered_candidates),
-                    "skipped_count": skipped,
-                    "blocked_reason_counts": dict(
-                        sorted(self._last_candidate_catalog_filter_blockers.items())
-                    ),
-                    "samples": self._last_candidate_catalog_filter_samples[:10],
-                },
-            )
-        return filtered_candidates
+        return await self.entry_gate_runtime._filter_candidates_supported_by_venue_catalog(
+            candidates,
+            skip_event_kind=skip_event_kind,
+        )
 
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
@@ -12764,89 +12128,20 @@ class LiveRuntime:
     # Entry guards (V1: apply_runtime_entry_guards)
     # ------------------------------------------------------------------
 
-    def _gate_pending_close_reconciliation(self, candidate) -> tuple[bool, str]:
-        """Block entry if a pending close reconciliation exists for same symbol+venues."""
-        sym = getattr(candidate, 'symbol', '')
-        long_v = getattr(candidate, 'long_venue', '')
-        short_v = getattr(candidate, 'short_venue', '')
-        self.state.set_pending_close_reconciliations(
-            getattr(self.state, "pending_close_reconciliations", [])
-        )
-        for rec in self.state.pending_close_reconciliations:
-            if not isinstance(rec, dict):
-                continue
-            snapshot = rec.get("position_snapshot", {})
-            if not isinstance(snapshot, dict):
-                snapshot = {}
-            if (rec.get("symbol") or snapshot.get("symbol") or "") != sym:
-                continue
-            pc_long = rec.get("long_venue") or snapshot.get("long_venue")
-            pc_short = rec.get("short_venue") or snapshot.get("short_venue")
-            pc_long_s = pc_long.value if hasattr(pc_long, "value") else str(pc_long)
-            pc_short_s = pc_short.value if hasattr(pc_short, "value") else str(pc_short)
-            if not pc_long_s or not pc_short_s:
-                return False, "pending_close_reconciliation_invalid"
-            if (pc_long_s == long_v and pc_short_s == short_v) or \
-               (pc_long_s == short_v and pc_short_s == long_v):
-                return False, "pending_close_reconciliation_conflict"
-        return True, ""
+    def _gate_pending_close_reconciliation(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_pending_close_reconciliation(*args, **kwargs)
 
-    def _gate_passive_close_pending(self, candidate) -> tuple[bool, str]:
-        """Block entry if a passive close is in-flight for the same symbol pair."""
-        sym = getattr(candidate, 'symbol', '')
-        long_v = getattr(candidate, 'long_venue', '')
-        short_v = getattr(candidate, 'short_venue', '')
-        for pos_id in list(self.state.pending_passive_closes.keys()):
-            pos = self.state.open_positions.get(pos_id)
-            if pos is None:
-                continue
-            if getattr(pos, 'symbol', '') != sym:
-                continue
-            pos_long = getattr(pos, 'long_venue', None)
-            pos_short = getattr(pos, 'short_venue', None)
-            pos_long_s = pos_long.value if hasattr(pos_long, 'value') else str(pos_long)
-            pos_short_s = pos_short.value if hasattr(pos_short, 'value') else str(pos_short)
-            if (pos_long_s == long_v and pos_short_s == short_v) or \
-               (pos_long_s == short_v and pos_short_s == long_v):
-                return False, "passive_close_in_flight"
-        return True, ""
+    def _gate_passive_close_pending(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_passive_close_pending(*args, **kwargs)
 
-    def _gate_reduce_only(self, candidate) -> tuple[bool, str]:
-        """Block new entry when lifecycle/risk mode is reduce-only or fail-closed."""
-        if self.state.lifecycle == EngineLifecycle.RISK_ONLY:
-            return False, f"lifecycle_{self.state.lifecycle.value}"
-        if self.state.risk_mode.value in ("reduce_only", "fail_closed"):
-            return False, f"risk_mode_{self.state.risk_mode.value}"
-        return True, ""
+    def _gate_reduce_only(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_reduce_only(*args, **kwargs)
 
-    def _gate_venue_cooldown(self, candidate, now_ms: int) -> tuple[bool, str]:
-        """Block entry if either venue is in cooldown."""
-        for ven_str in (getattr(candidate, 'long_venue', ''), getattr(candidate, 'short_venue', '')):
-            if not ven_str:
-                continue
-            until = self._venue_cooldown_until_ms.get(ven_str, 0)
-            if until > 0 and now_ms < until:
-                return False, f"venue_cooldown_{ven_str}"
-        return True, ""
+    def _gate_venue_cooldown(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_venue_cooldown(*args, **kwargs)
 
-    def _gate_zero_fill_cooldown(self, candidate, now_ms: int) -> tuple[bool, str]:
-        """Block entry if a zero-fill terminal event is in cooldown for the same pair.
-
-        Zero-fill means a recent entry attempt on this pair produced no fills,
-        indicating the venue may be rejecting orders or the spread is too wide.
-        """
-        pair_key = (getattr(candidate, 'symbol', ''), getattr(candidate, 'long_venue', ''), getattr(candidate, 'short_venue', ''))
-        until = self._zero_fill_cooldown_until_ms.get(pair_key, 0)
-        if until > 0 and now_ms < until:
-            return False, "zero_fill_cooldown"
-        symbol = getattr(candidate, "symbol", "")
-        for venue in (getattr(candidate, "long_venue", ""), getattr(candidate, "short_venue", "")):
-            if not venue:
-                continue
-            until = self._post_only_reject_cooldown_until_ms.get((symbol, venue), 0)
-            if until > 0 and now_ms < until:
-                return False, f"post_only_reject_cooldown_{venue}"
-        return True, ""
+    def _gate_zero_fill_cooldown(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_zero_fill_cooldown(*args, **kwargs)
 
     @staticmethod
     def _entry_reject_is_post_only_would_take(reason: str) -> bool:
@@ -13063,26 +12358,11 @@ class LiveRuntime:
             return False, "would_cross_bbo", payload
         return True, "", payload
 
-    def _gate_pending_entry_dedup(self, candidate) -> tuple[bool, str]:
-        """Block entry if a pending entry already exists for same symbol+venue pair."""
-        from lightfee.engine.recovery import has_pending_entry_for_symbol
-        sym = getattr(candidate, 'symbol', '')
-        long_v = getattr(candidate, 'long_venue', '')
-        short_v = getattr(candidate, 'short_venue', '')
-        if has_pending_entry_for_symbol(self.state, sym, long_v, short_v):
-            return False, "pending_entry_protection"
-        return True, ""
+    def _gate_pending_entry_dedup(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_pending_entry_dedup(*args, **kwargs)
 
-    def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
-        allowed, reason = self._v1_lifecycle_entry_gate_decision()
-        if not allowed:
-            if not self._v1_lifecycle_closure_blocks_candidate(
-                candidate,
-                reason=reason,
-            ):
-                return True, ""
-            return False, self._v1_lifecycle_runtime_gate_reason(reason)
-        return True, ""
+    def _gate_recovery_ledger(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_recovery_ledger(*args, **kwargs)
 
     def _remove_pending_entry_after_terminal_decision(
         self,
@@ -13263,11 +12543,8 @@ class LiveRuntime:
             "ts_ms": now_ms,
         }
 
-    def _gate_entry_sizing(self, candidate) -> tuple[bool, str]:
-        """Block entry if notional quote is zero or negative."""
-        if getattr(candidate, 'entry_notional_quote', 0.0) <= 0:
-            return False, "entry_notional_zero_or_negative"
-        return True, ""
+    def _gate_entry_sizing(self, *args, **kwargs):
+        return self.entry_gate_runtime._gate_entry_sizing(*args, **kwargs)
 
     def _entry_local_l2_stale_after_ms(self) -> int:
         return self._configured_entry_l2_stale_after_ms(self.config)
@@ -13316,89 +12593,17 @@ class LiveRuntime:
                 return True
         return False
 
-    def _entry_liquidity_qualification_state(self):
-        from lightfee.engine.entry_liquidity_qualification import (
-            EntryLiquidityQualificationState,
-        )
+    def _entry_liquidity_qualification_state(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_liquidity_qualification_state(*args, **kwargs)
 
-        return EntryLiquidityQualificationState.from_records(
-            getattr(self.state, "entry_liquidity_qualification_records", []) or []
-        )
+    def _entry_liquidity_volume_floor_quote(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_liquidity_volume_floor_quote(*args, **kwargs)
 
-    def _entry_liquidity_volume_floor_quote(self, venue: str) -> float:
-        from lightfee.config.schema import V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
+    def _entry_liquidity_open_interest_floor_quote(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_liquidity_open_interest_floor_quote(*args, **kwargs)
 
-        getter = getattr(self.config.strategy, "entry_volume_floor_quote", None)
-        if callable(getter):
-            return float(getter(venue))
-        return float(V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE)
-
-    def _entry_liquidity_open_interest_floor_quote(self, venue: str) -> float:
-        from lightfee.config.schema import V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE
-
-        getter = getattr(self.config.strategy, "entry_open_interest_floor_quote", None)
-        if callable(getter):
-            return float(getter(venue))
-        return float(V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE)
-
-    def _entry_liquidity_decision_payload(
-        self,
-        *,
-        venue: str,
-        symbol: str,
-        quote,
-        snapshot,
-        now_ms: int,
-        fallback_source: str,
-        reason: str,
-        decision: str,
-        event_kind: str,
-        eligibility_class: str,
-        observed_volume_24h_quote: float,
-        min_volume_24h_quote: float,
-        observed_open_interest_quote: float,
-        min_open_interest_quote: float,
-        state_record: dict | None = None,
-    ) -> dict:
-        observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
-        age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
-        payload = {
-            "venue": venue,
-            "symbol": symbol,
-            "domain": "liquidity",
-            "source_domain": "perp_liquidity",
-            "source": "sidecar_perp_liquidity",
-            "endpoint": "sidecar_perp_liquidity",
-            "observed_at_ms": observed_at_ms,
-            "age_ms": age_ms,
-            "budget_ms": self._snapshot_domain_budget_ms("liquidity"),
-            "decision": decision,
-            "fallback_source": fallback_source,
-            "reason": reason,
-            "event_kind": event_kind,
-            "blocking": decision == "skip_entry",
-            "observed_volume_24h_quote": observed_volume_24h_quote,
-            "min_volume_24h_quote": min_volume_24h_quote,
-            "observed_open_interest_quote": observed_open_interest_quote,
-            "min_open_interest_quote": min_open_interest_quote,
-            "eligibility_class": eligibility_class,
-            "floor": min_open_interest_quote,
-            "current_value": observed_open_interest_quote,
-            "targeted_revalidate_required": reason == "perp_open_interest_structural",
-            "targeted_revalidate_scope": "entry_candidate",
-        }
-        if state_record:
-            payload.update({
-                "consecutive_failures": int(
-                    state_record.get("consecutive_failures", 0) or 0
-                ),
-                "suppress_until_ms": state_record.get("suppress_until_ms"),
-                "last_failure_at_ms": state_record.get("last_failure_at_ms"),
-                "last_structural_probe_at_ms": state_record.get(
-                    "last_structural_probe_at_ms"
-                ),
-            })
-        return payload
+    def _entry_liquidity_decision_payload(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_liquidity_decision_payload(*args, **kwargs)
 
     def _entry_liquidity_qualification_decisions(
         self,
@@ -13410,166 +12615,14 @@ class LiveRuntime:
         fallback_source: str,
         record_result: bool = False,
     ) -> list[dict]:
-        if str(getattr(self.config.runtime, "mode", "") or "").lower() != "live":
-            return []
-        if not bool(getattr(self.config.strategy, "execution_liquidity_enabled", True)):
-            return []
-
-        from lightfee.engine.entry_liquidity_qualification import (
-            ENTRY_LIQUIDITY_STRUCTURAL_PROBE_INTERVAL_MS,
-            EntryLiquidityEligibilityClass,
+        return self.entry_gate_runtime._entry_liquidity_qualification_decisions(
+            candidate,
+            snapshot=snapshot,
+            quote_lookup=quote_lookup,
+            now_ms=now_ms,
+            fallback_source=fallback_source,
+            record_result=record_result,
         )
-
-        state = self._entry_liquidity_qualification_state()
-        decisions: list[dict] = []
-        symbol = str(getattr(candidate, "symbol", "") or "").upper()
-        if not symbol:
-            return decisions
-
-        for venue_attr in ("long_venue", "short_venue"):
-            venue = str(getattr(candidate, venue_attr, "") or "").lower()
-            if not venue:
-                continue
-            quote = quote_lookup.get((venue, symbol))
-            if quote is None:
-                continue
-            bid = float(getattr(quote, "bid", 0.0) or 0.0)
-            ask = float(getattr(quote, "ask", 0.0) or 0.0)
-            if bid <= 0.0 or ask <= 0.0:
-                continue
-
-            observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
-            volume_24h_quote = float(getattr(quote, "volume_24h_quote", 0.0) or 0.0)
-            open_interest_quote = float(getattr(quote, "open_interest", 0.0) or 0.0)
-            volume_floor = self._entry_liquidity_volume_floor_quote(venue)
-            open_interest_floor = self._entry_liquidity_open_interest_floor_quote(venue)
-            current_class = state.current_class(venue, symbol, now_ms=now_ms)
-
-            if record_result:
-                state.note_open_interest_observation(
-                    venue,
-                    symbol,
-                    open_interest_quote,
-                    observed_at_ms=observed_at_ms,
-                )
-
-            if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY:
-                if not record_result or not state.should_probe_structural(
-                    venue,
-                    symbol,
-                    now_ms=now_ms,
-                    probe_interval_ms=ENTRY_LIQUIDITY_STRUCTURAL_PROBE_INTERVAL_MS,
-                ):
-                    state_record = next(
-                        (
-                            record for record in state.to_records()
-                            if record["venue"] == venue and record["symbol"] == symbol
-                        ),
-                        None,
-                    )
-                    decisions.append(
-                        self._entry_liquidity_decision_payload(
-                            venue=venue,
-                            symbol=symbol,
-                            quote=quote,
-                            snapshot=snapshot,
-                            now_ms=now_ms,
-                            fallback_source=fallback_source,
-                            reason="perp_open_interest_structural",
-                            decision="skip_entry",
-                            event_kind="execution.entry_liquidity_blocked",
-                            eligibility_class=(
-                                EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY.value
-                            ),
-                            observed_volume_24h_quote=volume_24h_quote,
-                            min_volume_24h_quote=volume_floor,
-                            observed_open_interest_quote=open_interest_quote,
-                            min_open_interest_quote=open_interest_floor,
-                            state_record=state_record,
-                        )
-                    )
-                    continue
-
-            if volume_floor > 0.0 and volume_24h_quote < volume_floor:
-                decisions.append(
-                    self._entry_liquidity_decision_payload(
-                        venue=venue,
-                        symbol=symbol,
-                        quote=quote,
-                        snapshot=snapshot,
-                        now_ms=now_ms,
-                        fallback_source=fallback_source,
-                        reason="perp_volume_below_floor_advisory",
-                        decision="continue",
-                        event_kind="execution.entry_liquidity_advisory",
-                        eligibility_class=(
-                            EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR.value
-                        ),
-                        observed_volume_24h_quote=volume_24h_quote,
-                        min_volume_24h_quote=volume_floor,
-                        observed_open_interest_quote=open_interest_quote,
-                        min_open_interest_quote=open_interest_floor,
-                    )
-                )
-
-            if open_interest_floor > 0.0 and open_interest_quote < open_interest_floor:
-                if record_result:
-                    result_class = state.record_result(
-                        venue,
-                        symbol,
-                        EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR,
-                        now_ms=now_ms,
-                    )
-                else:
-                    result_class = (
-                        EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
-                        if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
-                        else EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR
-                    )
-                state_record = next(
-                    (
-                        record for record in state.to_records()
-                        if record["venue"] == venue and record["symbol"] == symbol
-                    ),
-                    None,
-                )
-                reason = (
-                    "perp_open_interest_structural"
-                    if result_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
-                    else "perp_open_interest_below_floor"
-                )
-                decisions.append(
-                    self._entry_liquidity_decision_payload(
-                        venue=venue,
-                        symbol=symbol,
-                        quote=quote,
-                        snapshot=snapshot,
-                        now_ms=now_ms,
-                        fallback_source=fallback_source,
-                        reason=reason,
-                        decision="skip_entry",
-                        event_kind="execution.entry_liquidity_blocked",
-                        eligibility_class=result_class.value,
-                        observed_volume_24h_quote=volume_24h_quote,
-                        min_volume_24h_quote=volume_floor,
-                        observed_open_interest_quote=open_interest_quote,
-                        min_open_interest_quote=open_interest_floor,
-                        state_record=state_record,
-                    )
-                )
-                continue
-
-            if record_result:
-                state.record_result(
-                    venue,
-                    symbol,
-                    EntryLiquidityEligibilityClass.ELIGIBLE,
-                    now_ms=now_ms,
-                )
-
-        if record_result:
-            self.state.entry_liquidity_qualification_records = state.to_records()
-        return decisions
 
     @staticmethod
     def _liquidity_degraded_reason_blocks_symbol(reason: str, symbol: str) -> bool:
@@ -13955,46 +13008,10 @@ class LiveRuntime:
         *,
         suppressed_full_payload_count: int,
     ) -> dict:
-        compact_keys = (
-            "reason",
-            "generic_reason",
-            "candidate_count",
-            "tradeable_count",
-            "selected_candidate_count",
-            "dispatched_candidate_count",
-            "max_concurrent_positions",
-            "open_position_count",
-            "remaining_slots",
-            "capacity_blocked",
-            "blocked_reason_counts",
-            "entry_candidate_blocked_counts",
-            "unsupported_symbol_blocked_counts",
-            "entry_admission_venue_degraded_counts",
-            "snapshot_freshness_blocked_counts",
-            "execution_liquidity_blocked_counts",
-            "entry_final_gate_blocked_counts",
-            "tradeable_selection_blocker_counts",
-            "entry_ws_bbo_blocker_counts",
-            "entry_admission_blocker_counts",
-            "quote_truth_must_resolve_count",
-            "quote_truth_resolved_count",
-            "quote_truth_failed_count",
-            "quote_truth_ws_resolved_count",
-            "quote_truth_rest_resolved_count",
-            "budget_excluded_without_rest_count",
-            "quote_revalidate_sources",
-            "top_quote_blocker_buckets",
-            "selection_bucket_counts",
-            "candidate_stage_blocked_counts",
-            "entry_local_l2_primary_ready_filter_active",
-            "entry_local_l2_primary_not_ready_reason_counts",
-            "entry_local_l2_primary_not_ready_reason_totals",
-            "ts_ms",
+        return self.entry_gate_runtime._compact_scan_no_entry_diagnostics_payload(
+            payload,
+            suppressed_full_payload_count=suppressed_full_payload_count,
         )
-        compact = {key: payload[key] for key in compact_keys if key in payload}
-        compact["compact"] = True
-        compact["suppressed_full_payload_count"] = suppressed_full_payload_count
-        return compact
 
     def _emit_scan_no_entry_diagnostics(
         self,
@@ -14010,410 +13027,25 @@ class LiveRuntime:
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
     ) -> None:
-        if getattr(self.journal, "_file", None) is None:
-            return
-        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
-
-        blocked_reason_counts: Counter[str] = Counter()
-        for candidate in getattr(snapshot, "candidates", []) or []:
-            for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
-                blocked_reason_counts[str(blocked_reason)] += 1
-        catalog_filter_blockers = Counter(
-            getattr(self, "_last_candidate_catalog_filter_blockers", Counter())
+        return self.entry_gate_runtime._emit_scan_no_entry_diagnostics(
+            reason=reason,
+            snapshot=snapshot,
+            tradeable=tradeable,
+            selected_candidate_count=selected_candidate_count,
+            dispatched_candidate_count=dispatched_candidate_count,
+            remaining_slots=remaining_slots,
+            tradeable_selection_blocker_counts=tradeable_selection_blocker_counts,
+            candidate_blockers=candidate_blockers,
+            now_ms=now_ms,
+            admission_blocker_counts=admission_blocker_counts,
         )
-        snapshot_freshness_blockers = Counter(
-            getattr(self, "_last_snapshot_freshness_filter_blockers", Counter())
-        )
-        entry_admission_filter_blockers = Counter(
-            getattr(self, "_last_entry_admission_filter_blockers", Counter())
-        )
-        if reason == "no_tradeable_candidates":
-            if (
-                entry_admission_filter_blockers
-                and not blocked_reason_counts
-                and not catalog_filter_blockers
-                and not snapshot_freshness_blockers
-            ):
-                reason = (
-                    self._v1_tradeable_no_entry_reason(
-                        Counter(),
-                        admission_blocker_counts=entry_admission_filter_blockers,
-                    )
-                    or "tradeable_candidates_blocked_by_entry_admission"
-                )
-            elif (
-                catalog_filter_blockers
-                and not blocked_reason_counts
-                and not entry_admission_filter_blockers
-                and not snapshot_freshness_blockers
-            ):
-                reason = "tradeable_candidates_blocked_by_unsupported_symbol"
-            else:
-                reason = self._no_tradeable_reason_from_candidate_blockers(
-                    blocked_reason_counts,
-                    snapshot_freshness_blockers,
-                )
-
-        readiness = self._entry_l2_readiness_diagnostics_payload()
-        local_l2_provider_active = self._entry_readiness_provider_uses_local_l2()
-        ws_bbo_provider_active = self._entry_readiness_provider_uses_ws_bbo()
-        candidate_samples = []
-        for rank, candidate in enumerate(list(tradeable)[:24], start=1):
-            pair_id = getattr(candidate, "pair_id", "")
-            if not pair_id:
-                pair_id = make_candidate_pair_id(
-                    str(getattr(candidate, "symbol", "")),
-                    str(getattr(candidate, "long_venue", "")),
-                    str(getattr(candidate, "short_venue", "")),
-                )
-            first_funding_ms = int(getattr(candidate, "first_funding_timestamp_ms", 0) or 0)
-            candidate_samples.append({
-                "rank": rank,
-                "pair_id": pair_id,
-                "symbol": str(getattr(candidate, "symbol", "")),
-                "long_venue": str(getattr(candidate, "long_venue", "")),
-                "short_venue": str(getattr(candidate, "short_venue", "")),
-                "remaining_ms": first_funding_ms - now_ms if first_funding_ms > 0 else 0,
-                "primary_tracked": pair_id in self._tracked_primary_pair_ids,
-                "ranking_edge_bps": float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
-                "blocked_reasons": list(getattr(candidate, "blocked_reasons", []) or [])[:8],
-                "selection_blocker": candidate_blockers.get(pair_id, ""),
-            })
-
-        execution_liquidity_blocked_counts: Counter[str] = Counter()
-        for reason_key, count in blocked_reason_counts.items():
-            if "liquidity" in reason_key or reason_key.startswith("execution_"):
-                execution_liquidity_blocked_counts[str(reason_key)] += int(count)
-
-        admission_counts = admission_blocker_counts if admission_blocker_counts is not None else {}
-        not_primary_tracked = int(
-            admission_counts.get("entry_local_l2_waiting_for_primary_tracking", 0)
-        )
-        lifecycle_selection_blocked = sum(
-            int(v) for k, v in tradeable_selection_blocker_counts.items()
-            if str(k) in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
-        )
-        ws_bbo_selection_blocked = sum(
-            int(v) for k, v in tradeable_selection_blocker_counts.items()
-            if str(k).startswith("entry_ws_bbo_quote_lease_")
-        )
-        entry_admission_blocked = sum(
-            int(v) for k, v in admission_counts.items()
-            if (
-                str(k).endswith("_admission_blocked")
-                or str(k) in {
-                    "bybit_trading_terms_required",
-                    "insufficient_margin_admission_prefiltered",
-                    "hyperliquid_account_balance_unavailable",
-                }
-            )
-        )
-        primary_tracked_not_ready = sum(
-            int(v) for k, v in tradeable_selection_blocker_counts.items()
-            if (
-                k not in {"entry_local_l2_waiting_for_primary_tracking"}
-                and str(k) not in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
-                and not str(k).startswith("entry_ws_bbo_quote_lease_")
-            )
-        )
-        selection_bucket_counts = {
-            "not_primary_tracked": not_primary_tracked,
-            "primary_tracked_not_ready": primary_tracked_not_ready,
-        }
-        if lifecycle_selection_blocked > 0:
-            selection_bucket_counts[
-                "lifecycle_selection_blocked"
-            ] = lifecycle_selection_blocked
-        if ws_bbo_selection_blocked > 0:
-            selection_bucket_counts["ws_bbo_not_ready"] = ws_bbo_selection_blocked
-        if entry_admission_blocked > 0:
-            selection_bucket_counts["entry_admission_blocked"] = entry_admission_blocked
-
-        entry_ws_bbo_blocker_counts = {
-            str(k): int(v)
-            for k, v in tradeable_selection_blocker_counts.items()
-            if str(k).startswith("entry_ws_bbo_quote_lease_") and int(v) > 0
-        }
-        entry_admission_blocker_counts = {
-            str(k): int(v)
-            for k, v in admission_counts.items()
-            if (
-                int(v) > 0
-                and (
-                    str(k).endswith("_admission_blocked")
-                    or str(k) in {
-                        "bybit_trading_terms_required",
-                        "insufficient_margin_admission_prefiltered",
-                        "hyperliquid_account_balance_unavailable",
-                    }
-                )
-            )
-        }
-        entry_ws_bbo_blocker_samples = [
-            sample
-            for sample in candidate_samples
-            if str(sample.get("selection_blocker", "")).startswith(
-                "entry_ws_bbo_quote_lease_"
-            )
-        ][:24]
-
-        candidate_stage_blocked_counts = {
-            "candidate_universe": sum(int(v) for v in blocked_reason_counts.values()),
-            "unsupported_symbol": sum(
-                int(v) for v in catalog_filter_blockers.values()
-            ),
-            "entry_admission_venue_degraded": sum(
-                int(v) for v in entry_admission_filter_blockers.values()
-            ),
-            "entry_admission": entry_admission_blocked,
-            "snapshot_quote_or_freshness": sum(
-                int(v) for v in snapshot_freshness_blockers.values()
-            ),
-            "execution_liquidity": sum(
-                int(v) for v in execution_liquidity_blocked_counts.values()
-            ),
-            "entry_selection": sum(
-                int(v) for v in tradeable_selection_blocker_counts.values()
-            ),
-        }
-        max_concurrent_positions = max(
-            int(getattr(self.config.strategy, "max_concurrent_positions", 0) or 0),
-            1,
-        )
-        open_position_count = len(self.state.open_positions)
-        normalized_remaining_slots = max(int(remaining_slots), 0)
-        last_scan = self.state.last_scan if isinstance(self.state.last_scan, dict) else {}
-        quote_truth_payload = {
-            "quote_truth_must_resolve_count": int(
-                last_scan.get("quote_truth_must_resolve_count", 0) or 0
-            ),
-            "quote_truth_resolved_count": int(
-                last_scan.get("quote_truth_resolved_count", 0) or 0
-            ),
-            "quote_truth_failed_count": int(
-                last_scan.get("quote_truth_failed_count", 0) or 0
-            ),
-            "quote_truth_ws_resolved_count": int(
-                last_scan.get("quote_truth_ws_resolved_count", 0) or 0
-            ),
-            "quote_truth_rest_resolved_count": int(
-                last_scan.get("quote_truth_rest_resolved_count", 0) or 0
-            ),
-            "budget_excluded_without_rest_count": int(
-                last_scan.get("budget_excluded_without_rest_count", 0) or 0
-            ),
-            "quote_revalidate_sources": dict(
-                last_scan.get("quote_revalidate_sources", {}) or {}
-            ),
-            "top_quote_blocker_buckets": dict(
-                last_scan.get("top_quote_blocker_buckets", {}) or {}
-            ),
-        }
-
-        payload = {
-            "reason": reason,
-            "generic_reason": (
-                "no_tradeable_candidates"
-                if reason in {
-                    "candidate_snapshot_domain_stale",
-                    "candidate_edge_insufficient",
-                    "candidate_window_mismatch",
-                }
-                else reason
-            ),
-            "candidate_count": len(getattr(snapshot, "candidates", []) or []),
-            "tradeable_count": len(tradeable),
-            "selected_candidate_count": selected_candidate_count,
-            "dispatched_candidate_count": dispatched_candidate_count,
-            "max_concurrent_positions": max_concurrent_positions,
-            "open_position_count": open_position_count,
-            "remaining_slots": normalized_remaining_slots,
-            "capacity_blocked": open_position_count >= max_concurrent_positions
-            and normalized_remaining_slots <= 0,
-            "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
-            "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
-            "unsupported_symbol_blocked_counts": dict(
-                sorted(catalog_filter_blockers.items())
-            ),
-            "unsupported_symbol_blocked_samples": list(
-                getattr(self, "_last_candidate_catalog_filter_samples", []) or []
-            )[:24],
-            "entry_admission_venue_degraded_counts": dict(
-                sorted(entry_admission_filter_blockers.items())
-            ),
-            "entry_admission_venue_degraded_samples": list(
-                getattr(self, "_last_entry_admission_filter_samples", []) or []
-            )[:24],
-            "snapshot_freshness_blocked_counts": dict(
-                sorted(snapshot_freshness_blockers.items())
-            ),
-            "snapshot_freshness_blocked_samples": list(
-                getattr(self, "_last_snapshot_freshness_filter_samples", []) or []
-            )[:24],
-            "execution_liquidity_blocked_counts": dict(
-                sorted(execution_liquidity_blocked_counts.items())
-            ),
-            "entry_final_gate_blocked_counts": dict(
-                sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
-            ),
-            "tradeable_selection_blocker_counts": dict(
-                sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
-            ),
-            "entry_ws_bbo_blocker_counts": dict(
-                sorted(entry_ws_bbo_blocker_counts.items())
-            ),
-            "entry_admission_blocker_counts": dict(
-                sorted(entry_admission_blocker_counts.items())
-            ),
-            "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
-            **quote_truth_payload,
-            "selection_bucket_counts": selection_bucket_counts,
-            "candidate_stage_blocked_counts": {
-                key: value
-                for key, value in candidate_stage_blocked_counts.items()
-                if value > 0
-            },
-            "candidates": candidate_samples,
-            "ts_ms": now_ms,
-        }
-        if local_l2_provider_active:
-            payload.update({
-                "entry_local_l2_primary_ready_filter_active": bool(
-                    self._local_l2_effective_enabled() and self._tracked_primary_pair_ids
-                ),
-                "entry_local_l2_primary_not_ready_reason_counts": readiness["reason_counts"],
-                "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
-                "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
-            })
-        elif ws_bbo_provider_active:
-            payload["entry_readiness_provider"] = "ws_bbo_quote_lease"
-        fingerprint = self._payload_fingerprint({
-            "reason": payload["reason"],
-            "candidate_count": payload["candidate_count"],
-            "tradeable_count": payload["tradeable_count"],
-            "selected_candidate_count": payload["selected_candidate_count"],
-            "dispatched_candidate_count": payload["dispatched_candidate_count"],
-            "max_concurrent_positions": payload["max_concurrent_positions"],
-            "open_position_count": payload["open_position_count"],
-            "remaining_slots": payload["remaining_slots"],
-            "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
-            "entry_local_l2_primary_not_ready_reason_totals": payload.get(
-                "entry_local_l2_primary_not_ready_reason_totals", {},
-            ),
-            "entry_ws_bbo_blocker_counts": payload.get(
-                "entry_ws_bbo_blocker_counts", {},
-            ),
-            "entry_admission_blocker_counts": payload.get(
-                "entry_admission_blocker_counts", {},
-            ),
-            "candidates": [
-                {
-                    "pair_id": c["pair_id"],
-                    "selection_blocker": c["selection_blocker"],
-                }
-                for c in payload["candidates"]
-            ],
-        })
-        summary_fingerprint = self._payload_fingerprint({
-            "reason": payload["reason"],
-            "generic_reason": payload["generic_reason"],
-            "max_concurrent_positions": payload["max_concurrent_positions"],
-            "open_position_count": payload["open_position_count"],
-            "remaining_slots": payload["remaining_slots"],
-            "blocked_reason_keys": sorted(payload["blocked_reason_counts"].keys()),
-            "unsupported_symbol_blocked_keys": sorted(
-                payload["unsupported_symbol_blocked_counts"].keys()
-            ),
-            "snapshot_freshness_blocker_keys": sorted(
-                payload["snapshot_freshness_blocked_counts"].keys()
-            ),
-            "entry_admission_venue_degraded_keys": sorted(
-                payload["entry_admission_venue_degraded_counts"].keys()
-            ),
-            "tradeable_selection_blocker_keys": sorted(
-                payload["tradeable_selection_blocker_counts"].keys()
-            ),
-            "entry_local_l2_primary_not_ready_reason_keys": sorted(
-                payload.get("entry_local_l2_primary_not_ready_reason_totals", {}).keys()
-            ),
-            "entry_ws_bbo_blocker_keys": sorted(
-                payload.get("entry_ws_bbo_blocker_counts", {}).keys()
-            ),
-            "entry_admission_blocker_keys": sorted(
-                payload.get("entry_admission_blocker_counts", {}).keys()
-            ),
-        })
-        full_due = (
-            self._last_no_entry_full_diag_reason != payload["reason"]
-            or self._last_no_entry_full_diag_ts_ms <= 0
-            or now_ms - self._last_no_entry_full_diag_ts_ms
-            >= self._NO_ENTRY_DIAGNOSTICS_FULL_INTERVAL_MS
-            or summary_fingerprint != self._last_no_entry_summary_fingerprint
-        )
-        if full_due:
-            self._last_no_entry_full_diag_reason = str(payload["reason"])
-            self._last_no_entry_full_diag_ts_ms = now_ms
-            self._last_no_entry_summary_fingerprint = summary_fingerprint
-            self._last_no_entry_diag_fingerprint = fingerprint
-            self._last_no_entry_diag_ts_ms = now_ms
-            self._no_entry_suppressed_full_payload_count = 0
-            self._last_no_entry_diagnostics = payload
-            if self.state.last_scan is not None:
-                self.state.last_scan.update({
-                    "no_entry_reason": payload["reason"],
-                    "max_concurrent_positions": payload["max_concurrent_positions"],
-                    "open_position_count": payload["open_position_count"],
-                    "remaining_slots": payload["remaining_slots"],
-                    "capacity_blocked": payload["capacity_blocked"],
-                    "selection_bucket_counts": payload["selection_bucket_counts"],
-                    "tradeable_selection_blocker_counts": payload[
-                        "tradeable_selection_blocker_counts"
-                    ],
-                    "candidate_stage_blocked_counts": payload[
-                        "candidate_stage_blocked_counts"
-                    ],
-                })
-            self.journal.append("scan.no_entry_diagnostics", payload)
-            return
-
-        self._no_entry_suppressed_full_payload_count += 1
-        if now_ms - self._last_no_entry_diag_ts_ms < self._NO_ENTRY_DIAGNOSTICS_COMPACT_INTERVAL_MS:
-            return
-
-        self._last_no_entry_diag_fingerprint = summary_fingerprint
-        self._last_no_entry_diag_ts_ms = now_ms
-        self._last_no_entry_diagnostics = payload
-        if self.state.last_scan is not None:
-            self.state.last_scan.update({
-                "no_entry_reason": payload["reason"],
-                "max_concurrent_positions": payload["max_concurrent_positions"],
-                "open_position_count": payload["open_position_count"],
-                "remaining_slots": payload["remaining_slots"],
-                "capacity_blocked": payload["capacity_blocked"],
-                "selection_bucket_counts": payload["selection_bucket_counts"],
-                "tradeable_selection_blocker_counts": payload[
-                    "tradeable_selection_blocker_counts"
-                ],
-                "candidate_stage_blocked_counts": payload[
-                    "candidate_stage_blocked_counts"
-                ],
-            })
-        compact_payload = self._compact_scan_no_entry_diagnostics_payload(
-            payload,
-            suppressed_full_payload_count=self._no_entry_suppressed_full_payload_count,
-        )
-        self._no_entry_suppressed_full_payload_count = 0
-        self.journal.append("scan.no_entry_diagnostics", compact_payload)
 
     # ------------------------------------------------------------------
     # Entry dispatch
     # ------------------------------------------------------------------
 
-    def _entry_selection_target(self, remaining_slots: int) -> int:
-        """V1 selection buffer: remaining slots, expanded up to eight candidates."""
-        if remaining_slots <= 0:
-            return 0
-        return min(max(remaining_slots, remaining_slots * 4), 8)
+    def _entry_selection_target(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_selection_target(*args, **kwargs)
 
     def _candidate_pair_id(self, candidate) -> str:
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
@@ -14444,120 +13076,29 @@ class LiveRuntime:
             venue_value(getattr(pending, "short_venue", "")),
         )
 
-    def _candidate_is_tradeable_for_selection(self, candidate) -> bool:
-        if bool(getattr(candidate, "blocked", False)):
-            return False
-        if list(getattr(candidate, "blocked_reasons", []) or []):
-            return False
-        if float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0) <= 0:
-            return False
-        for venue_raw in (
-            getattr(candidate, "long_venue", ""),
-            getattr(candidate, "short_venue", ""),
-        ):
-            try:
-                venue = Venue.from_str(str(venue_raw)) if venue_raw else None
-            except Exception:
-                venue = None
-            if venue is None:
-                continue
-            adapter = self.get_venue_adapter(venue)
-            transport = getattr(adapter, "_transport", adapter)
-            trusted = getattr(transport, "trading_capability_trusted", True)
-            if trusted is False:
-                return False
-        return True
+    def _candidate_is_tradeable_for_selection(self, *args, **kwargs):
+        return self.entry_gate_runtime._candidate_is_tradeable_for_selection(*args, **kwargs)
 
     def _market_quote_lookup(self, market_quotes):
         return self.market_data_runtime._market_quote_lookup(market_quotes)
 
-    def _candidate_quote(
-        self,
-        quote_lookup: dict[tuple[str, str], object],
-        venue: str,
-        symbol: str,
-    ):
-        return quote_lookup.get((str(venue).lower(), str(symbol).upper()))
+    def _candidate_quote(self, *args, **kwargs):
+        return self.entry_gate_runtime._candidate_quote(*args, **kwargs)
 
-    def _entry_leg_depth_score(
-        self,
-        candidate,
-        quote_lookup: dict[tuple[str, str], object],
-        *,
-        venue: str,
-        side: str,
-    ) -> float:
-        quote = self._candidate_quote(quote_lookup, venue, str(getattr(candidate, "symbol", "")))
-        if quote is None:
-            return 10.0
-        if side == "buy":
-            price = float(getattr(quote, "ask", 0.0) or 0.0)
-            top_size = float(getattr(quote, "ask_size", 0.0) or 0.0)
-        else:
-            price = float(getattr(quote, "bid", 0.0) or 0.0)
-            top_size = float(getattr(quote, "bid_size", 0.0) or 0.0)
-        if price <= 0.0 or top_size <= 0.0:
-            return 10.0
-        quantity = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0) / price
-        if quantity <= 0.0:
-            return 10.0
-        return quantity / top_size
+    def _entry_leg_depth_score(self, *args, **kwargs):
+        return self.entry_gate_runtime._entry_leg_depth_score(*args, **kwargs)
 
-    def _runtime_candidate_risk_score(
-        self,
-        candidate,
-        quote_lookup: dict[tuple[str, str], object],
-    ) -> float:
-        explicit_risk = getattr(candidate, "runtime_risk_score", None)
-        if explicit_risk is not None:
-            return max(float(explicit_risk or 0.0), 0.0)
+    def _runtime_candidate_risk_score(self, *args, **kwargs):
+        return self.entry_gate_runtime._runtime_candidate_risk_score(*args, **kwargs)
 
-        long_depth = self._entry_leg_depth_score(
-            candidate,
-            quote_lookup,
-            venue=str(getattr(candidate, "long_venue", "")),
-            side="buy",
-        )
-        short_depth = self._entry_leg_depth_score(
-            candidate,
-            quote_lookup,
-            venue=str(getattr(candidate, "short_venue", "")),
-            side="sell",
-        )
-        depth_risk = max(long_depth, short_depth, 0.0)
-        selection_risk = float(getattr(candidate, "selection_risk_score", 0.0) or 0.0)
-        return max(depth_risk, selection_risk, 0.0)
+    def _runtime_candidate_selection_score(self, *args, **kwargs):
+        return self.entry_gate_runtime._runtime_candidate_selection_score(*args, **kwargs)
 
-    def _runtime_candidate_selection_score(
-        self,
-        candidate,
-        quote_lookup: dict[tuple[str, str], object] | None = None,
-    ) -> float:
-        ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
-        risk_score = self._runtime_candidate_risk_score(candidate, quote_lookup or {})
-        return ranking_edge / (1.0 + max(risk_score, 0.0))
+    def _candidate_final_selection_sort_key(self, *args, **kwargs):
+        return self.entry_gate_runtime._candidate_final_selection_sort_key(*args, **kwargs)
 
-    def _candidate_final_selection_sort_key(
-        self,
-        candidate,
-        quote_lookup: dict[tuple[str, str], object] | None = None,
-    ) -> tuple[float, float, float, str]:
-        return (
-            -self._runtime_candidate_selection_score(candidate, quote_lookup),
-            -float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
-            -float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0),
-            self._candidate_pair_id(candidate),
-        )
-
-    def _has_pending_residual_pair(self, pair_id: str) -> bool:
-        for task in self.state.pending_residual_repairs:
-            if isinstance(task, dict):
-                task_pair_id = task.get("pair_id", "")
-            else:
-                task_pair_id = getattr(task, "pair_id", "")
-            if str(task_pair_id) == pair_id:
-                return True
-        return False
+    def _has_pending_residual_pair(self, *args, **kwargs):
+        return self.entry_gate_runtime._has_pending_residual_pair(*args, **kwargs)
 
     def _apply_shadow_promotion_if_eligible(
         self, tracked: list, now_ms: int,
@@ -14681,279 +13222,31 @@ class LiveRuntime:
         market_quotes=None,
         admission_blocker_counts: Counter | None = None,
     ) -> list:
-        """V1 select_entry_candidates_from_refs parity for the final entry list."""
-        from lightfee.engine.v1_lifecycle import V1TradingLifecycle
-
-        target = self._entry_selection_target(remaining_slots)
-        if target <= 0:
-            return []
-
-        admission_reasons = {
-            "entry_local_l2_waiting_for_primary_tracking",
-            "bybit_trading_terms_required",
-            "insufficient_balance_admission_blocked",
-            "insufficient_margin_admission_blocked",
-            "leverage_admission_blocked",
-            "max_notional_admission_blocked",
-        }
-        exchange_admission_reasons = admission_reasons - {
-            "entry_local_l2_waiting_for_primary_tracking",
-        }
-
-        active_symbols = {
-            str(getattr(position, "symbol", ""))
-            for position in self.state.open_positions.values()
-        }
-        active_symbols.update(
-            str(getattr(pending, "symbol", ""))
-            for pending in self.state.pending_entries.values()
+        return self.entry_gate_runtime._select_entry_candidates(
+            tradeable,
+            now_ms=now_ms,
+            remaining_slots=remaining_slots,
+            selection_blocker_counts=selection_blocker_counts,
+            candidate_blockers=candidate_blockers,
+            market_quotes=market_quotes,
+            admission_blocker_counts=admission_blocker_counts,
         )
-        selected_symbols: set[str] = set()
-        ranked: list = []
-        selected: list = []
-
-        for candidate in tradeable:
-            if not self._candidate_is_tradeable_for_selection(candidate):
-                continue
-            symbol = str(getattr(candidate, "symbol", ""))
-            pair_id = self._candidate_pair_id(candidate)
-            readiness_evidence: dict = {}
-            lifecycle_evidence: dict = {}
-            blocker = None
-            admission_block = self._candidate_admission_block(candidate, now_ms)
-            if admission_block:
-                blocker = str(admission_block.get("reason") or "symbol_admission_blocked")
-                readiness_evidence = dict(admission_block)
-                if readiness_evidence.get("source"):
-                    readiness_evidence["cooldown_source"] = readiness_evidence["source"]
-                readiness_evidence["source"] = "initial_entry"
-                readiness_evidence["candidate_pair_id"] = pair_id
-                readiness_evidence["pair_id"] = pair_id
-                self.journal.append(
-                    "runtime.entry_admission_blocked",
-                    {
-                        **readiness_evidence,
-                        "long_venue": getattr(candidate, "long_venue", ""),
-                        "short_venue": getattr(candidate, "short_venue", ""),
-                        "ts_ms": now_ms,
-                    },
-                )
-            decision = None
-            if not blocker:
-                decision = V1TradingLifecycle.entry_admissibility(
-                    candidate,
-                    now_ms=now_ms,
-                    strategy=self.config.strategy,
-                    recovery_ledger=getattr(self, "recovery_ledger", None),
-                    source="selection",
-                )
-            if decision is not None and not decision.allowed:
-                lifecycle_evidence = dict(getattr(decision, "evidence", {}) or {})
-                blocker = decision.reason
-            first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
-            if not blocker:
-                blocker = (
-                    self._entry_finalization_window_blocker(first_funding_ts, now_ms)
-                    if first_funding_ts > 0
-                    else None
-                )
-            if not blocker:
-                blocker, readiness_evidence = (
-                    self._entry_ws_bbo_subscription_blocker(candidate)
-                )
-                if not blocker:
-                    readiness = self.entry_readiness_provider.decide(
-                        candidate,
-                        now_ms,
-                        market_quotes=market_quotes,
-                    )
-                    readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
-                    blocker = None if readiness.allowed else (
-                        readiness.reason or "entry_readiness_provider_denied"
-                    )
-            if blocker:
-                blocker_str = str(blocker)
-                ws_bbo_blocker = blocker_str.startswith("entry_ws_bbo_quote_lease_")
-                admission_selection_blocker = blocker_str in exchange_admission_reasons
-                # Admission buckets (not primary tracked) vs readiness failures
-                if blocker_str in admission_reasons:
-                    if admission_blocker_counts is not None:
-                        admission_blocker_counts[blocker_str] += 1
-                else:
-                    selection_blocker_counts[blocker_str] += 1
-                candidate_blockers[pair_id] = blocker_str
-                if blocker_str not in {
-                    "entry_waiting_for_finalization_window_too_early",
-                    "entry_finalization_window_expired",
-                }:
-                    diagnostic_payload = {
-                        "symbol": symbol,
-                        "pair_id": pair_id,
-                        "reason": blocker_str,
-                        "ts_ms": now_ms,
-                    }
-                    if lifecycle_evidence:
-                        diagnostic_payload["lifecycle_evidence"] = lifecycle_evidence
-                    if readiness_evidence:
-                        if admission_selection_blocker:
-                            provider_name = self._entry_readiness_provider_name()
-                            readiness_evidence.setdefault("provider", provider_name)
-                            readiness_evidence.setdefault("source", "entry_admission")
-                            readiness_evidence.setdefault("domain", "entry_admission")
-                            readiness_evidence.setdefault(
-                                "blocker_family",
-                                "exchange_admission",
-                            )
-                            diagnostic_payload.update({
-                                "provider": provider_name,
-                                "source": "entry_admission",
-                                "domain": "entry_admission",
-                                "blocker_family": "exchange_admission",
-                            })
-                        elif ws_bbo_blocker:
-                            readiness_evidence.setdefault("provider", "ws_bbo_quote_lease")
-                            readiness_evidence.setdefault("source", "ws_bbo_quote_lease")
-                            domain = (
-                                "ws_bbo_subscription"
-                                if blocker_str in {
-                                    "entry_ws_bbo_quote_lease_waiting_for_subscription",
-                                    "entry_ws_bbo_quote_lease_budget_exhausted",
-                                }
-                                else "ws_bbo_cache"
-                            )
-                            readiness_evidence.setdefault("domain", domain)
-                            readiness_evidence.setdefault(
-                                "blocker_family",
-                                self._ws_bbo_selection_blocker_family(blocker_str),
-                            )
-                            diagnostic_payload.update({
-                                "provider": "ws_bbo_quote_lease",
-                                "source": "ws_bbo_quote_lease",
-                                "domain": readiness_evidence["domain"],
-                                "blocker_family": readiness_evidence["blocker_family"],
-                            })
-                        diagnostic_payload["readiness_evidence"] = readiness_evidence
-                    if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS:
-                        event_kind = "runtime.entry_blocked_lifecycle_selection"
-                    elif admission_selection_blocker:
-                        event_kind = "runtime.entry_blocked_admission_selection"
-                    elif ws_bbo_blocker:
-                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
-                    elif self._entry_readiness_provider_uses_local_l2():
-                        event_kind = "runtime.entry_blocked_local_l2_selection"
-                    else:
-                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
-                    self._append_runtime_diagnostic_event(
-                        event_kind,
-                        diagnostic_payload,
-                        now_ms=now_ms,
-                        key_parts=(symbol, pair_id, blocker_str),
-                        interval_ms=self._ENTRY_BLOCKED_LOCAL_L2_SELECTION_LOG_INTERVAL_MS,
-                    )
-                continue
-            ranked.append(candidate)
-
-        quote_lookup = self._market_quote_lookup(market_quotes)
-        ranked.sort(
-            key=lambda candidate: self._candidate_final_selection_sort_key(
-                candidate,
-                quote_lookup,
-            )
-        )
-
-        for candidate in ranked:
-            symbol = str(getattr(candidate, "symbol", ""))
-            pair_id = self._candidate_pair_id(candidate)
-            if symbol in active_symbols or symbol in selected_symbols:
-                continue
-            if self._has_pending_residual_pair(pair_id):
-                continue
-            selected.append(candidate)
-            selected_symbols.add(symbol)
-            if len(selected) >= target:
-                break
-        return selected
 
     def _entry_finalization_window_blocker(
         self,
         first_funding_timestamp_ms: int,
         now_ms: int,
-    ) -> str | None:
-        """V1 final entry window: entries are allowed in [min_before, entry_window]."""
-        remaining_ms = first_funding_timestamp_ms - max(now_ms, 0)
-        min_before_ms = self.config.strategy.min_scan_minutes_before_funding * 60_000
-        entry_window_ms = self.config.strategy.entry_window_secs * 1000
-
-        if remaining_ms <= 0 or (min_before_ms > 0 and remaining_ms < min_before_ms):
-            return "entry_finalization_window_expired"
-        if entry_window_ms > 0 and remaining_ms > entry_window_ms:
-            return "entry_waiting_for_finalization_window_too_early"
-        return None
-
-    def _entry_local_l2_selection_blocker(self, candidate, now_ms: int) -> str | None:
-        """V1 entry local L2 selection gate: check prewarm, primary tracking, dual-ready.
-
-        Returns a reason string if blocked, or None if ready to proceed.
-
-        V1 (Rust: market_data.rs:1518-1526, final_gate.rs entry_final_gate_result_from_candidate_local_l2):
-        - Live + local_l2_enabled → gate applies
-        - Candidate must be in primary tracked set
-        - Session must exist for pair_id
-        - Both legs must be ready (dual-ready)
-        - V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms;
-          remaining_ms > 0 && remaining_ms <= prewarm_window_secs * 1000
-
-        Blocker reasons (V1 stable labels):
-        - entry_waiting_for_finalization_window_too_early
-        - entry_finalization_window_expired
-        - entry_local_l2_waiting_for_prewarm_window
-        - entry_local_l2_waiting_for_primary_tracking
-        - entry_local_l2_waiting_for_dual_ready
-        """
-        if self.config.runtime.mode != "live":
-            return None
-
-        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
-
-        symbol = getattr(candidate, "symbol", "")
-        long_ven = str(getattr(candidate, "long_venue", ""))
-        short_ven = str(getattr(candidate, "short_venue", ""))
-        pair_id = getattr(candidate, "pair_id", None)
-        if not pair_id:
-            pair_id = make_candidate_pair_id(symbol, long_ven, short_ven)
-
-        # V1 prewarm: remaining_ms = first_funding_timestamp_ms - now_ms
-        first_funding_ts = getattr(candidate, "first_funding_timestamp_ms", 0)
-        if first_funding_ts <= 0:
-            if not self._local_l2_effective_enabled():
-                return None
-            return "entry_local_l2_waiting_for_prewarm_window"
-        remaining_ms = first_funding_ts - max(now_ms, 0)
-        finalization_blocker = self._entry_finalization_window_blocker(
-            first_funding_ts,
+    ) -> str:
+        return self.entry_gate_runtime._entry_finalization_window_blocker(
+            first_funding_timestamp_ms,
             now_ms,
         )
-        if finalization_blocker:
-            return finalization_blocker
-        if not self._local_l2_effective_enabled():
-            return None
-        prewarm_window_ms = self.config.strategy.entry_local_l2_prewarm_window_secs * 1000
-        if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
-            return "entry_local_l2_waiting_for_prewarm_window"
 
-        # Primary tracking: candidate must be in primary tracked set
-        if pair_id not in self._tracked_primary_pair_ids:
-            return "entry_local_l2_waiting_for_primary_tracking"
-
-        # Session dual-ready check
-        session = self.entry_l2_sessions.sessions.get(pair_id)
-        if session is None:
-            return "entry_local_l2_waiting_for_dual_ready"
-
-        if not session.both_legs_ready(now_ms, stale_after_ms=self._entry_local_l2_stale_after_ms()):
-            return "entry_local_l2_waiting_for_dual_ready"
-
-        return None
+    def _entry_local_l2_selection_blocker(self, candidate, now_ms: int) -> str:
+        return self.entry_gate_runtime._entry_local_l2_selection_blocker(
+            candidate,
+            now_ms,
+        )
 
     @staticmethod
     def _safe_positive_float(value) -> float:
@@ -14964,67 +13257,14 @@ class LiveRuntime:
         return result if math.isfinite(result) and result > 0 else 0.0
 
     async def _okx_entry_base_quantity_step(
-        self, venue: Venue, symbol: str,
+        self,
+        venue: Venue,
+        symbol: str,
     ) -> float | None:
-        if venue != Venue.OKX:
-            return 0.0
-        adapter = self.get_venue_adapter(venue)
-        if adapter is None:
-            return None
-
-        explicit_step = self._safe_positive_float(
-            getattr(adapter, "okx_base_quantity_step", 0.0)
+        return await self.entry_dispatch_runtime._okx_entry_base_quantity_step(
+            venue,
+            symbol,
         )
-        if explicit_step > 0:
-            return explicit_step
-
-        transport = getattr(adapter, "_transport", None)
-        if transport is None:
-            return 0.0
-
-        transport_step = self._safe_positive_float(
-            getattr(transport, "okx_base_quantity_step", 0.0)
-        )
-        if transport_step > 0:
-            return transport_step
-
-        venue_symbol = symbol
-        venue_symbol_fn = getattr(transport, "_venue_symbol", None)
-        if callable(venue_symbol_fn):
-            try:
-                venue_symbol = venue_symbol_fn(symbol)
-            except Exception:
-                venue_symbol = symbol
-
-        metadata = getattr(transport, "_symbol_metadata", {}) or {}
-        for key in (symbol, venue_symbol):
-            meta = metadata.get(key) or {}
-            if not isinstance(meta, dict):
-                continue
-            ct_val = self._safe_positive_float(
-                meta.get("ct_val") or meta.get("ctVal") or meta.get("contract_size")
-            )
-            lot_sz = self._safe_positive_float(
-                meta.get("lot_sz") or meta.get("lotSz") or meta.get("qty_step")
-            )
-            if ct_val > 0 and lot_sz > 0:
-                return ct_val * lot_sz
-
-        try:
-            from lightfee.venues.symbol_rules import get_symbol_rules_cache
-
-            rule = await get_symbol_rules_cache().get(transport, Venue.OKX, venue_symbol)
-            ct_val = self._safe_positive_float(getattr(rule, "ct_val", 0.0))
-            lot_sz = self._safe_positive_float(getattr(rule, "qty_step", 0.0))
-            if ct_val > 0 and lot_sz > 0:
-                return ct_val * lot_sz
-        except Exception:
-            pass
-
-        mode = str(getattr(transport, "mode", "") or "").lower()
-        if mode == "live":
-            return None
-        return 0.0
 
     async def _okx_aligned_entry_quantity(
         self,
@@ -15035,186 +13275,43 @@ class LiveRuntime:
         quantity: float,
         now_ms: int,
     ) -> tuple[float, float | None]:
-        okx_steps: list[float] = []
-        missing = False
-        for venue in (long_venue, short_venue):
-            step = await self._okx_entry_base_quantity_step(venue, symbol)
-            if step is None:
-                missing = True
-            elif step > 0:
-                okx_steps.append(step)
-        if missing:
-            return 0.0, None
-        if not okx_steps:
-            return quantity, 0.0
-        step = max(okx_steps)
-        aligned = math.floor((quantity / step) + 1e-12) * step
-        if aligned <= 0:
-            return 0.0, step
-        return aligned, step
+        return await self.entry_dispatch_runtime._okx_aligned_entry_quantity(
+            long_venue=long_venue,
+            short_venue=short_venue,
+            symbol=symbol,
+            quantity=quantity,
+            now_ms=now_ms,
+        )
 
     async def _entry_venue_quantity_step(
         self,
         venue: Venue,
         symbol: str,
     ) -> float | None:
-        quantity_step, missing_fields = await self._entry_venue_quantity_metadata(
+        return await self.entry_dispatch_runtime._entry_venue_quantity_step(
             venue,
             symbol,
         )
-        if missing_fields:
-            return None
-        return quantity_step
 
     async def _entry_venue_quantity_metadata(
         self,
         venue: Venue,
         symbol: str,
     ) -> tuple[float | None, list[str]]:
-        okx_step = await self._okx_entry_base_quantity_step(venue, symbol)
-        if okx_step is None:
-            return None, ["okx_contract_step"]
-        if okx_step > 0:
-            return okx_step, []
-
-        adapter = self.get_venue_adapter(venue)
-        passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
-        if callable(passive_metadata):
-            try:
-                metadata = passive_metadata(symbol) or {}
-                if not metadata:
-                    return None, ["metadata"]
-                quantity_step = self._safe_positive_float(
-                    metadata.get("quantity_step")
-                    or metadata.get("step_size")
-                    or metadata.get("qtyStep")
-                )
-                missing_fields: list[str] = []
-                if quantity_step > 0:
-                    for field_name, aliases in {
-                        "min_quantity": ("min_quantity", "min_qty", "minOrderQty"),
-                        "min_notional": (
-                            "min_notional",
-                            "min_notional_quote",
-                            "minNotionalValue",
-                        ),
-                    }.items():
-                        values = [
-                            metadata.get(alias)
-                            for alias in aliases
-                            if alias in metadata
-                        ]
-                        if not values:
-                            missing_fields.append(field_name)
-                            continue
-                        if field_name == "min_quantity":
-                            min_quantity = self._safe_positive_float(values[0])
-                            if min_quantity <= 0:
-                                missing_fields.append(field_name)
-                        else:
-                            try:
-                                min_notional = float(values[0] or 0.0)
-                            except (TypeError, ValueError):
-                                min_notional = -1.0
-                            if not math.isfinite(min_notional) or min_notional < 0:
-                                missing_fields.append(field_name)
-                    return quantity_step, missing_fields
-                missing_fields.append("quantity_step")
-                return None, missing_fields
-            except Exception:
-                return None, ["metadata"]
-        return None, ["metadata"]
+        return await self.entry_dispatch_runtime._entry_venue_quantity_metadata(
+            venue,
+            symbol,
+        )
 
     def _entry_quote_lease_execution_check(
         self,
         candidate,
         now_ms: int,
     ) -> tuple[str, object | None, dict]:
-        provider_name = self._entry_readiness_provider_name()
-        evidence = {
-            "provider": provider_name,
-            "source": provider_name,
-            "domain": "quote_lease_execution_gate",
-            "pair_id": self._candidate_pair_id(candidate),
-            "symbol": str(getattr(candidate, "symbol", "")),
-            "long_venue": str(getattr(candidate, "long_venue", "")),
-            "short_venue": str(getattr(candidate, "short_venue", "")),
-            "max_age_ms": self._entry_quote_lease_max_age_ms(),
-        }
-        def blocked(reason: str, lease: object | None):
-            evidence["blocker_family"] = self._quote_lease_blocker_family(reason)
-            return reason, lease, evidence
-
-        if (
-            self.config.runtime.mode != "live"
-            or not self._entry_readiness_provider_uses_quote_lease()
-        ):
-            return "", None, evidence
-
-        get_lease = getattr(self.entry_readiness_provider, "get_lease", None)
-        if not callable(get_lease):
-            return blocked("missing_quote_lease_provider", None)
-        lease = get_lease(evidence["pair_id"])
-        if lease is None:
-            return blocked("missing_quote_lease", None)
-
-        evidence.update(
-            {
-                "lease_provider": str(getattr(lease, "provider", "")),
-                "created_at_ms": int(getattr(lease, "created_at_ms", 0) or 0),
-                "expires_at_ms": int(getattr(lease, "expires_at_ms", 0) or 0),
-                "long_observed_at_ms": int(
-                    getattr(lease, "long_observed_at_ms", 0) or 0
-                ),
-                "short_observed_at_ms": int(
-                    getattr(lease, "short_observed_at_ms", 0) or 0
-                ),
-                "long_bid": float(getattr(lease, "long_bid", 0.0) or 0.0),
-                "long_ask": float(getattr(lease, "long_ask", 0.0) or 0.0),
-                "short_bid": float(getattr(lease, "short_bid", 0.0) or 0.0),
-                "short_ask": float(getattr(lease, "short_ask", 0.0) or 0.0),
-            }
+        return self.entry_dispatch_runtime._entry_quote_lease_execution_check(
+            candidate,
+            now_ms,
         )
-        if evidence["lease_provider"] != provider_name:
-            return blocked("quote_lease_provider_mismatch", lease)
-        if str(getattr(lease, "symbol", "")) != evidence["symbol"]:
-            return blocked("quote_lease_symbol_mismatch", lease)
-        if str(getattr(lease, "long_venue", "")) != evidence["long_venue"]:
-            return blocked("quote_lease_long_venue_mismatch", lease)
-        if str(getattr(lease, "short_venue", "")) != evidence["short_venue"]:
-            return blocked("quote_lease_short_venue_mismatch", lease)
-
-        expires_at_ms = evidence["expires_at_ms"]
-        if expires_at_ms <= 0 or now_ms >= expires_at_ms:
-            return blocked("expired_quote_lease", lease)
-
-        max_age_ms = int(evidence["max_age_ms"] or 0)
-        quote_age_ms: dict[str, int | None] = {}
-        for leg in ("long", "short"):
-            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            evidence[f"{leg}_age_ms"] = age_ms
-            quote_age_ms[leg] = age_ms
-        evidence["quote_age_ms"] = quote_age_ms
-        for leg in ("long", "short"):
-            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
-            age_ms = evidence[f"{leg}_age_ms"]
-            if (
-                observed_at_ms <= 0
-                or max_age_ms <= 0
-                or age_ms is None
-                or age_ms > max_age_ms
-            ):
-                return blocked("stale_quote_lease", lease)
-
-        if (
-            evidence["long_bid"] <= 0.0
-            or evidence["long_ask"] <= evidence["long_bid"]
-            or evidence["short_bid"] <= 0.0
-            or evidence["short_ask"] <= evidence["short_bid"]
-        ):
-            return blocked("invalid_quote_lease", lease)
-        return "", lease, evidence
 
     def _refresh_entry_quote_lease_for_execution(
         self,
@@ -15224,51 +13321,17 @@ class LiveRuntime:
         quote_lease: object | None,
         quote_lease_evidence: dict,
     ) -> tuple[str, object | None, dict]:
-        if quote_lease_reason not in {"expired_quote_lease", "stale_quote_lease"}:
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-        if self._entry_readiness_provider_name() != "ws_bbo_quote_lease":
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-
-        decide = getattr(self.entry_readiness_provider, "decide", None)
-        if not callable(decide):
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-
-        refresh_evidence = dict(quote_lease_evidence)
-        refresh_evidence["execution_refresh_attempted"] = True
-        refresh_evidence["execution_refresh_reason"] = quote_lease_reason
-        try:
-            decision = decide(candidate, now_ms)
-        except Exception as exc:
-            refresh_evidence["execution_refresh_error"] = (
-                f"{type(exc).__name__}: {str(exc)[:300]}"
-            )
-            return quote_lease_reason, quote_lease, refresh_evidence
-
-        if not getattr(decision, "allowed", False):
-            refresh_evidence["execution_refresh_block_reason"] = str(
-                getattr(decision, "reason", "")
-            )
-            refresh_evidence["execution_refresh_evidence"] = dict(
-                getattr(decision, "evidence", {}) or {}
-            )
-            return quote_lease_reason, quote_lease, refresh_evidence
-
-        new_reason, new_lease, new_evidence = self._entry_quote_lease_execution_check(
+        return self.entry_dispatch_runtime._refresh_entry_quote_lease_for_execution(
             candidate,
             now_ms,
+            quote_lease_reason,
+            quote_lease,
+            quote_lease_evidence,
         )
-        new_evidence = dict(new_evidence)
-        new_evidence["execution_refresh_attempted"] = True
-        new_evidence["execution_refresh_reason"] = quote_lease_reason
-        return new_reason, new_lease, new_evidence
 
     @staticmethod
     def _quote_lease_reference_price(lease) -> float:
-        long_ask = float(getattr(lease, "long_ask", 0.0) or 0.0)
-        short_bid = float(getattr(lease, "short_bid", 0.0) or 0.0)
-        if long_ask > 0.0 and short_bid > 0.0:
-            return (long_ask + short_bid) / 2.0
-        return max(long_ask, short_bid, 0.0)
+        return EntryDispatchRuntime._quote_lease_reference_price(lease)
 
     def _entry_final_gate_skew_blocker(
         self,
@@ -15278,990 +13341,26 @@ class LiveRuntime:
         short_venue,
         now_ms: int,
     ) -> dict | None:
-        if (
-            self.config.runtime.mode != "live"
-            or not self._local_l2_effective_enabled()
-        ):
-            return None
-        long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-        short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
-        if long_book is None or short_book is None:
-            return None
-        long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
-        short_observed_at_ms = int(getattr(short_book, "observed_at_ms", 0) or 0)
-        if long_observed_at_ms <= 0 or short_observed_at_ms <= 0:
-            return None
-        max_skew_ms = max(
-            int(getattr(self.config.strategy, "entry_final_gate_max_skew_ms", 0) or 0),
-            0,
-        )
-        skew_ms = abs(long_observed_at_ms - short_observed_at_ms)
-        if skew_ms <= max_skew_ms:
-            return None
-        return {
-            "pair_id": self._candidate_pair_id(candidate),
-            "symbol": candidate.symbol,
-            "long_venue": long_venue.value,
-            "short_venue": short_venue.value,
-            "reason": "execution_skew",
-            "skew_ms": skew_ms,
-            "max_skew_ms": max_skew_ms,
-            "left_venue": long_venue.value,
-            "left_observed_at_ms": long_observed_at_ms,
-            "right_venue": short_venue.value,
-            "right_observed_at_ms": short_observed_at_ms,
-            "ts_ms": now_ms,
-        }
-
-    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
-        """Transform a tradeable candidate into an entry context and execute via entry_executor.
-
-        V1: entry route/maker-leg/price gate from config and execution planner.
-        Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
-        Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
-        """
-        from lightfee.core.domain import Side, Venue
-        from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
-        from lightfee.engine.execution_planner import (
-            ExecutionRoute,
-            plan_incremental_entry_execution,
-        )
-        from lightfee.engine.v1_lifecycle import V1TradingLifecycle
-
-        admission_block = self._candidate_admission_block(candidate, now_ms)
-        if admission_block:
-            pair_id = self._candidate_pair_id(candidate)
-            payload = {
-                **admission_block,
-                "long_venue": getattr(candidate, "long_venue", ""),
-                "short_venue": getattr(candidate, "short_venue", ""),
-                "candidate_pair_id": pair_id,
-                "pair_id": pair_id,
-                "ts_ms": now_ms,
-            }
-            if payload.get("source"):
-                payload["cooldown_source"] = payload["source"]
-            payload["source"] = "initial_entry"
-            self.journal.append(
-                "runtime.entry_admission_blocked",
-                payload,
-            )
-            return False
-
-        if not self._candidate_is_tradeable_for_selection(candidate):
-            self.journal.append(
-                "runtime.entry_blocked_trading_capability",
-                {
-                    "symbol": getattr(candidate, "symbol", ""),
-                    "long_venue": getattr(candidate, "long_venue", ""),
-                    "short_venue": getattr(candidate, "short_venue", ""),
-                    "reason": "candidate_not_tradeable_for_selection",
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-
-        decision = V1TradingLifecycle.entry_admissibility(
+        return self.entry_dispatch_runtime._entry_final_gate_skew_blocker(
             candidate,
-            now_ms=now_ms,
-            strategy=self.config.strategy,
-            recovery_ledger=getattr(self, "recovery_ledger", None),
-            source="dispatch",
-        )
-        if not decision.allowed:
-            self.journal.append(
-                "runtime.entry_blocked_lifecycle",
-                {
-                    "symbol": getattr(candidate, "symbol", ""),
-                    "long_venue": getattr(candidate, "long_venue", ""),
-                    "short_venue": getattr(candidate, "short_venue", ""),
-                    "reason": decision.reason,
-                    **dict(getattr(decision, "evidence", {}) or {}),
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-
-        # V1: apply_runtime_entry_guards — 8+ gate checks before entry
-        gates = [
-            ("reduce_only", self._gate_reduce_only, ()),
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
-            ("passive_close_in_flight", self._gate_passive_close_pending, ()),
-            ("recovery_ledger", self._gate_recovery_ledger, ()),
-            ("pending_entry_duplicate", self._gate_pending_entry_dedup, ()),
-            ("entry_sizing", self._gate_entry_sizing, ()),
-            ("venue_cooldown", self._gate_venue_cooldown, (now_ms,)),
-            ("zero_fill_cooldown", self._gate_zero_fill_cooldown, (now_ms,)),
-        ]
-        for gate_name, gate_fn, gate_args in gates:
-            allowed, reason = gate_fn(candidate, *gate_args)
-            if not allowed:
-                self.journal.append(
-                    "runtime.entry_blocked_gate",
-                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
-                )
-                # V1: review.candidate_rejected — per-candidate rejection logging
-                self.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": candidate.long_venue,
-                        "short_venue": candidate.short_venue,
-                        "rejected_stage": "runtime_entry_gate",
-                        "rejected_reason": f"{gate_name}: {reason}",
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-
-        quote_lease = None
-        quote_lease_evidence: dict = {}
-        quote_lease_reason, quote_lease, quote_lease_evidence = (
-            self._entry_quote_lease_execution_check(candidate, now_ms)
-        )
-        if quote_lease_reason:
-            quote_lease_reason, quote_lease, quote_lease_evidence = (
-                self._refresh_entry_quote_lease_for_execution(
-                    candidate,
-                    now_ms,
-                    quote_lease_reason,
-                    quote_lease,
-                    quote_lease_evidence,
-                )
-            )
-        if quote_lease_reason:
-            payload = {
-                **quote_lease_evidence,
-                "reason": quote_lease_reason,
-                "ts_ms": now_ms,
-            }
-            self.journal.append("runtime.entry_blocked_quote_lease", payload)
-            self.journal.append(
-                "review.candidate_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": candidate.long_venue,
-                    "short_venue": candidate.short_venue,
-                    "rejected_stage": "quote_lease_execution_gate",
-                    "rejected_reason": quote_lease_reason,
-                    "ranking_edge_bps": candidate.ranking_edge_bps,
-                    "expected_edge_bps": candidate.expected_edge_bps,
-                    "funding_edge_bps": candidate.funding_edge_bps,
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-        long_order_price_hint = price_hint
-        short_order_price_hint = price_hint
-        if quote_lease is not None:
-            price_hint = self._quote_lease_reference_price(quote_lease)
-            long_order_price_hint = float(
-                getattr(quote_lease, "long_ask", 0.0) or 0.0
-            )
-            short_order_price_hint = float(
-                getattr(quote_lease, "short_bid", 0.0) or 0.0
-            )
-
-        # V1 price gate: require valid quote before constructing entry context
-        if price_hint <= 0 or candidate.entry_notional_quote <= 0:
-            self.journal.append(
-                "runtime.entry_skipped_no_quote",
-                {
-                    "symbol": candidate.symbol,
-                    "price_hint": price_hint,
-                    "notional": candidate.entry_notional_quote,
-                    "reason": "no valid quote to construct entry — V1 rejects",
-                },
-            )
-            self.journal.append(
-                "review.candidate_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": candidate.long_venue,
-                    "short_venue": candidate.short_venue,
-                    "rejected_stage": "price_gate",
-                    "rejected_reason": "no valid quote",
-                    "ranking_edge_bps": candidate.ranking_edge_bps,
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-
-        # Resolve venue enums from candidate string fields
-        long_venue = Venue.from_str(candidate.long_venue)
-        short_venue = Venue.from_str(candidate.short_venue)
-        raw_quantity = candidate.entry_notional_quote / price_hint
-        quantity = raw_quantity
-        quantity, okx_base_step = await self._okx_aligned_entry_quantity(
             long_venue=long_venue,
             short_venue=short_venue,
-            symbol=candidate.symbol,
-            quantity=quantity,
             now_ms=now_ms,
         )
-        if okx_base_step is None:
-            self.journal.append(
-                "runtime.entry_skipped_okx_contract_metadata_missing",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "raw_quantity": raw_quantity,
-                    "reason": "okx_ct_val_lot_sz_unconfirmed",
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-        if quantity <= 0:
-            self.journal.append(
-                "runtime.entry_skipped_okx_contract_step",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "okx_base_quantity_step": okx_base_step,
-                    "raw_quantity": raw_quantity,
-                    "reason": "quantity_below_okx_contract_step",
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
 
-        long_quantity_step, long_missing_quantity_fields = await self._entry_venue_quantity_metadata(
-            long_venue,
-            candidate.symbol,
-        )
-        short_quantity_step, short_missing_quantity_fields = await self._entry_venue_quantity_metadata(
-            short_venue,
-            candidate.symbol,
-        )
-        if (
-            long_quantity_step is None
-            or short_quantity_step is None
-            or long_missing_quantity_fields
-            or short_missing_quantity_fields
-        ):
-            missing_venues = []
-            missing_fields = {}
-            if long_quantity_step is None:
-                missing_venues.append(long_venue.value)
-            elif long_missing_quantity_fields:
-                missing_venues.append(long_venue.value)
-            if short_quantity_step is None:
-                missing_venues.append(short_venue.value)
-            elif short_missing_quantity_fields:
-                missing_venues.append(short_venue.value)
-            if long_quantity_step is None or long_missing_quantity_fields:
-                missing_fields[long_venue.value] = (
-                    long_missing_quantity_fields or ["quantity_step"]
-                )
-            if short_quantity_step is None or short_missing_quantity_fields:
-                missing_fields[short_venue.value] = (
-                    short_missing_quantity_fields or ["quantity_step"]
-                )
-            self.journal.append(
-                "runtime.entry_skipped_quantity_metadata_missing",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "missing_venues": missing_venues,
-                    "missing_fields": missing_fields,
-                    "raw_quantity": raw_quantity,
-                    "common_quantity": quantity,
-                    "reason": "quantity_metadata_missing",
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-
-        # V1 runtime entry guards (apply_runtime_entry_guards)
-        gate_checks = [
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation),
-            ("passive_close_pending", self._gate_passive_close_pending),
-            ("reduce_only", self._gate_reduce_only),
-            ("venue_cooldown", self._gate_venue_cooldown),
-            ("zero_fill_cooldown", self._gate_zero_fill_cooldown),
-        ]
-        for gate_name, gate_fn in gate_checks:
-            allowed, reason = gate_fn(candidate, now_ms) if gate_name in ("venue_cooldown", "zero_fill_cooldown") else gate_fn(candidate)
-            if not allowed:
-                self.journal.append(
-                    "runtime.entry_blocked_gate",
-                    {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
-                )
-                return False
-
-        # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
-        # but either leg's book is not ready (stale, degraded, cold, etc.)
-        if self._local_l2_effective_enabled():
-            from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
-
-            long_book = self.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-            short_book = self.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
-
-            not_ready_reasons: list[str] = []
-            l2_stale_decisions: list[dict] = []
-            max_age_ms = self.config.strategy.max_liquidity_snapshot_age_ms
-            if long_book is None:
-                not_ready_reasons.append(
-                    f"long book missing: {long_venue.value}:{candidate.symbol} "
-                    f"max_age_ms={max_age_ms}"
-                )
-                l2_stale_decisions.append({
-                    "venue": long_venue.value,
-                    "symbol": candidate.symbol,
-                    "domain": "execution_l2",
-                    "source": "local_l2",
-                    "observed_at_ms": 0,
-                    "age_ms": 0,
-                    "budget_ms": max_age_ms,
-                    "decision": "skip_entry",
-                    "fallback_source": "none",
-                    "reason": "execution_l2_stale",
-                    "l2_reason": "missing_book",
-                    "blocking": True,
-                })
-            else:
-                liq = execution_liquidity_from_local_l2(
-                    long_book, max_age_ms=max_age_ms,
-                    now_ms=now_ms, require_ready=True,
-                )
-                long_age_ms = long_book.age_ms(now_ms)
-                if not liq.book_ready:
-                    not_ready_reasons.append(
-                        f"long leg not ready: {long_venue.value}:{candidate.symbol} "
-                        f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
-                        f"age={long_age_ms}ms max_age_ms={max_age_ms}"
-                    )
-                    l2_stale_decisions.append({
-                        "venue": long_venue.value,
-                        "symbol": candidate.symbol,
-                        "domain": "execution_l2",
-                        "source": "local_l2",
-                        "observed_at_ms": int(getattr(long_book, "observed_at_ms", 0) or 0),
-                        "age_ms": int(long_age_ms),
-                        "budget_ms": max_age_ms,
-                        "decision": "skip_entry",
-                        "fallback_source": "none",
-                        "reason": "execution_l2_stale",
-                        "l2_reason": liq.fallback_reason or "book_not_ready",
-                        "book_status": long_book.status.value,
-                        "blocking": True,
-                    })
-
-            if short_book is None:
-                not_ready_reasons.append(
-                    f"short book missing: {short_venue.value}:{candidate.symbol} "
-                    f"max_age_ms={max_age_ms}"
-                )
-                l2_stale_decisions.append({
-                    "venue": short_venue.value,
-                    "symbol": candidate.symbol,
-                    "domain": "execution_l2",
-                    "source": "local_l2",
-                    "observed_at_ms": 0,
-                    "age_ms": 0,
-                    "budget_ms": max_age_ms,
-                    "decision": "skip_entry",
-                    "fallback_source": "none",
-                    "reason": "execution_l2_stale",
-                    "l2_reason": "missing_book",
-                    "blocking": True,
-                })
-            else:
-                liq = execution_liquidity_from_local_l2(
-                    short_book, max_age_ms=max_age_ms,
-                    now_ms=now_ms, require_ready=True,
-                )
-                short_age_ms = short_book.age_ms(now_ms)
-                if not liq.book_ready:
-                    not_ready_reasons.append(
-                        f"short leg not ready: {short_venue.value}:{candidate.symbol} "
-                        f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
-                        f"age={short_age_ms}ms max_age_ms={max_age_ms}"
-                    )
-                    l2_stale_decisions.append({
-                        "venue": short_venue.value,
-                        "symbol": candidate.symbol,
-                        "domain": "execution_l2",
-                        "source": "local_l2",
-                        "observed_at_ms": int(getattr(short_book, "observed_at_ms", 0) or 0),
-                        "age_ms": int(short_age_ms),
-                        "budget_ms": max_age_ms,
-                        "decision": "skip_entry",
-                        "fallback_source": "none",
-                        "reason": "execution_l2_stale",
-                        "l2_reason": liq.fallback_reason or "book_not_ready",
-                        "book_status": short_book.status.value,
-                        "blocking": True,
-                    })
-
-            if not_ready_reasons:
-                pair_id = self._candidate_pair_id(candidate)
-                for payload in l2_stale_decisions:
-                    payload = dict(payload)
-                    payload["pair_id"] = pair_id
-                    payload["ts_ms"] = now_ms
-                    self.journal.append("runtime.snapshot_freshness_decision", payload)
-                    self.journal.append("runtime.execution_l2_stale", payload)
-                self.journal.append(
-                    "runtime.entry_blocked_local_l2_not_ready",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "reasons": not_ready_reasons,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-
-            skew_blocker = self._entry_final_gate_skew_blocker(
-                candidate,
-                long_venue=long_venue,
-                short_venue=short_venue,
-                now_ms=now_ms,
-            )
-            if skew_blocker is not None:
-                self.journal.append("runtime.entry_blocked_final_gate", skew_blocker)
-                self.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "rejected_stage": "entry_final_gate",
-                        "rejected_reason": skew_blocker["reason"],
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-
-        # V1 entry route planning: derive route and maker leg from execution planner.
-        # Strategy config provides min-notional; venue-specific chunk/min-notional
-        # are resolved from the adapter or spec when available.
-        strategy = self.config.strategy
-        min_notional = strategy.min_entry_leg_notional_quote
-        # V1: maker leg from strategy config (funding arb: long side is typically maker)
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
-        if quote_lease is not None:
-            if maker_leg == Side.BUY:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_bid", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_bid", 0.0) or 0.0
-                )
-            else:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_ask", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_ask", 0.0) or 0.0
-                )
-        maker_planner_price = (
-            long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
-        )
-        hedge_planner_price = (
-            short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
+    async def _dispatch_entry(
+        self,
+        candidate,
+        now_ms: int,
+        price_hint: float = 0.0,
+    ) -> bool:
+        return await self.entry_dispatch_runtime._dispatch_entry(
+            candidate,
+            now_ms,
+            price_hint=price_hint,
         )
 
-        # V1: min_hedgeable_chunk aligns to venue step and notional floor
-        min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
-        if okx_base_step and okx_base_step > 0:
-            min_hedgeable_chunk = max(min_hedgeable_chunk, okx_base_step)
-
-        route, plan = plan_incremental_entry_execution(
-            target_quantity=quantity,
-            slice_ratio=strategy.maker_initial_slice_ratio,
-            min_hedgeable_chunk=min_hedgeable_chunk,
-            maker_min_notional_quote=min_notional,
-            maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
-            max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
-            hedge_min_notional_quote=min_notional,
-            hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
-        )
-
-        if route == ExecutionRoute.REJECTED:
-            self.journal.append(
-                "runtime.entry_skipped_planner_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "target_quantity": quantity,
-                    "reason": plan.reason or "planner rejected entry",
-                },
-            )
-            return False
-
-        if (
-            okx_base_step is not None
-            and okx_base_step > 0
-            and route == ExecutionRoute.PASSIVE_INCREMENTAL
-            and plan.full_target_quantity > 0
-        ):
-            plan.initial_maker_target_quantity = plan.full_target_quantity
-
-        # Map planner route to EntryType
-        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
-            entry_type = EntryType.PASSIVE_INCREMENTAL
-            effective_quantity = plan.initial_maker_target_quantity
-        elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-        else:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-
-        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            long_order_price_hint = float(
-                getattr(quote_lease, "long_ask", 0.0) or 0.0
-            )
-            short_order_price_hint = float(
-                getattr(quote_lease, "short_bid", 0.0) or 0.0
-            )
-
-        entry_id = f"entry-{now_ms}-{candidate.symbol}"
-
-        # --- V1 recovery dedup: check for duplicate entries after restart ---
-        # Must use the same CID generation as build_entry_orders so the
-        # dedup index keys match the actual on-wire clientOrderId.
-        from lightfee.venues.cid import generate_exchange_cid
-        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
-        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
-        maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
-        hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
-        self.journal.append(
-            "execution.entry_quantity_plan",
-            {
-                "entry_id": entry_id,
-                "symbol": candidate.symbol,
-                "long_venue": long_venue.value,
-                "short_venue": short_venue.value,
-                "raw_quantity": raw_quantity,
-                "common_quantity": quantity,
-                "full_target_quantity": plan.full_target_quantity,
-                "initial_maker_target_quantity": plan.initial_maker_target_quantity,
-                "effective_quantity": effective_quantity,
-                "route": route.value,
-                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
-                "min_hedgeable_chunk": min_hedgeable_chunk,
-                "okx_base_quantity_step": okx_base_step,
-                "venue_quantity_steps": {
-                    long_venue.value: long_quantity_step or 0.0,
-                    short_venue.value: short_quantity_step or 0.0,
-                },
-                "ts_ms": now_ms,
-            },
-        )
-
-        if is_client_order_id_duplicate(maker_cid, self._recovery_dedup_index):
-            self.journal.append(
-                "runtime.entry_skipped_duplicate_client_order_id",
-                {
-                    "entry_id": entry_id,
-                    "client_order_id": maker_cid,
-                    "reason": "duplicate maker clientOrderId in recovery dedup index",
-                },
-            )
-            return False
-
-        if is_client_order_id_duplicate(hedge_cid, self._recovery_dedup_index):
-            self.journal.append(
-                "runtime.entry_skipped_duplicate_client_order_id",
-                {
-                    "entry_id": entry_id,
-                    "client_order_id": hedge_cid,
-                    "reason": "duplicate hedge clientOrderId in recovery dedup index",
-                },
-            )
-            return False
-
-        # Check for existing pending entry on same symbol pair
-        if has_pending_entry_for_symbol(
-            self.state, candidate.symbol,
-            long_venue.value, short_venue.value,
-        ):
-            self.journal.append(
-                "runtime.entry_skipped_existing_pending",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "reason": "pending entry already exists for this symbol pair",
-                },
-            )
-            return False
-
-        if not await self._precheck_bybit_entry_admission(
-            candidate=candidate,
-            now_ms=now_ms,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            quantity=effective_quantity,
-            long_order_price_hint=long_order_price_hint,
-            short_order_price_hint=short_order_price_hint,
-            maker_venue=maker_venue,
-            entry_type=entry_type,
-            maker_client_order_id=maker_cid,
-            hedge_client_order_id=hedge_cid,
-        ):
-            return False
-
-        maker_bbo_evidence: dict = {}
-        if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
-            maker_order_price_hint = (
-                long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
-            )
-            bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
-                venue=maker_venue,
-                symbol=candidate.symbol,
-                side=maker_leg,
-                price=maker_order_price_hint,
-                now_ms=now_ms,
-            )
-            if not bbo_ok:
-                payload = {
-                    **maker_bbo_evidence,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "reason": bbo_reason,
-                    "ts_ms": now_ms,
-                }
-                self.journal.append("runtime.entry_blocked_post_only_bbo", payload)
-                self.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "rejected_stage": "post_only_bbo_gate",
-                        "rejected_reason": bbo_reason,
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-            repriced_price = float(
-                maker_bbo_evidence.get("repriced_price", 0.0) or 0.0
-            )
-            if repriced_price > 0.0:
-                maker_order_price_hint = repriced_price
-                if maker_leg == Side.BUY:
-                    long_order_price_hint = repriced_price
-                else:
-                    short_order_price_hint = repriced_price
-                self.journal.append(
-                    "runtime.entry_post_only_bbo_repriced",
-                    {
-                        **maker_bbo_evidence,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "reason": "post_only_would_cross_repriced",
-                        "ts_ms": now_ms,
-                    },
-                )
-
-        def _positive_ms(value) -> int:
-            try:
-                parsed = int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-            return parsed if parsed > 0 else 0
-
-        def _float_attr(name: str, default: float = 0.0) -> float:
-            try:
-                return float(getattr(candidate, name, default) or default)
-            except (TypeError, ValueError):
-                return default
-
-        def _str_attr(name: str, default: str = "") -> str:
-            return str(getattr(candidate, name, default) or default)
-
-        opportunity_type = normalize_opportunity_type(
-            str(getattr(candidate, "opportunity_type", "aligned") or "aligned")
-        )
-        long_funding_timestamp_ms = _positive_ms(
-            getattr(candidate, "long_funding_timestamp_ms", 0)
-        )
-        short_funding_timestamp_ms = _positive_ms(
-            getattr(candidate, "short_funding_timestamp_ms", 0)
-        )
-        funding_timestamp_ms = _positive_ms(getattr(candidate, "funding_timestamp_ms", 0))
-        first_funding_timestamp_ms = _positive_ms(
-            getattr(candidate, "first_funding_timestamp_ms", 0)
-        )
-        if first_funding_timestamp_ms <= 0 and (long_funding_timestamp_ms > 0 or short_funding_timestamp_ms > 0):
-            first_funding_timestamp_ms = min(
-                ts for ts in (long_funding_timestamp_ms, short_funding_timestamp_ms)
-                if ts > 0
-            )
-        if funding_timestamp_ms <= 0:
-            funding_timestamp_ms = first_funding_timestamp_ms
-        second_funding_timestamp_ms = _positive_ms(
-            getattr(candidate, "second_funding_timestamp_ms", 0)
-        )
-        if (
-            second_funding_timestamp_ms <= 0
-            and opportunity_type == "staggered"
-            and long_funding_timestamp_ms > 0
-            and short_funding_timestamp_ms > 0
-        ):
-            later_funding_ms = max(long_funding_timestamp_ms, short_funding_timestamp_ms)
-            if later_funding_ms > first_funding_timestamp_ms:
-                second_funding_timestamp_ms = later_funding_ms
-        funding_edge_bps_entry = float(getattr(candidate, "funding_edge_bps", 0.0) or 0.0)
-        total_funding_edge_bps_entry = float(
-            getattr(candidate, "total_funding_edge_bps", 0.0) or funding_edge_bps_entry
-        )
-        expected_edge_bps_entry = float(getattr(candidate, "expected_edge_bps", 0.0) or 0.0)
-        worst_case_edge_bps_entry = _float_attr("worst_case_edge_bps")
-        first_funding_leg = str(getattr(candidate, "first_funding_leg", "") or "")
-        entry_maker_leg = _str_attr(
-            "entry_maker_leg",
-            "long" if maker_leg == Side.BUY else "short",
-        )
-        entry_liquidity_source_at_entry = (
-            getattr(candidate, "entry_liquidity_source_at_entry", None)
-            or _str_attr("sizing_liquidity_source")
-            or None
-        )
-        exit_after_first_stage = (
-            opportunity_type == "staggered"
-            and str(getattr(self.config.strategy, "staggered_exit_mode", "") or "").lower()
-            == "after_first_stage"
-        )
-
-        ctx = EntryContext(
-            entry_id=entry_id,
-            symbol=candidate.symbol,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            long_quantity=effective_quantity,
-            short_quantity=effective_quantity,
-            long_price_hint=long_order_price_hint,
-            short_price_hint=short_order_price_hint,
-            maker_leg=maker_leg,
-            entry_type=entry_type,
-            created_at_ms=now_ms,
-            opportunity_type=opportunity_type,
-            funding_timestamp_ms=funding_timestamp_ms,
-            first_funding_timestamp_ms=first_funding_timestamp_ms,
-            long_funding_timestamp_ms=long_funding_timestamp_ms,
-            short_funding_timestamp_ms=short_funding_timestamp_ms,
-            second_funding_timestamp_ms=second_funding_timestamp_ms,
-            first_funding_leg=first_funding_leg,
-            funding_edge_bps_entry=funding_edge_bps_entry,
-            total_funding_edge_bps_entry=total_funding_edge_bps_entry,
-            expected_edge_bps_entry=expected_edge_bps_entry,
-            worst_case_edge_bps_entry=worst_case_edge_bps_entry,
-            entry_maker_leg=entry_maker_leg,
-            exit_maker_leg=_str_attr("exit_maker_leg"),
-            entry_cross_bps_entry=_float_attr("entry_cross_bps"),
-            fee_bps_entry=_float_attr("fee_bps"),
-            entry_slippage_bps_entry=_float_attr("entry_slippage_bps"),
-            transfer_bias_bps_entry=_float_attr("transfer_bias_bps"),
-            transfer_state_at_entry=getattr(candidate, "transfer_state_at_entry", None),
-            entry_liquidity_source_at_entry=entry_liquidity_source_at_entry,
-            long_volume_24h_quote_at_entry=_float_attr("long_volume_24h_quote"),
-            short_volume_24h_quote_at_entry=_float_attr("short_volume_24h_quote"),
-            long_open_interest_quote_at_entry=_float_attr("long_open_interest_quote_at_entry"),
-            short_open_interest_quote_at_entry=_float_attr("short_open_interest_quote_at_entry"),
-            long_entry_vwap=getattr(candidate, "long_entry_vwap", None),
-            short_entry_vwap=getattr(candidate, "short_entry_vwap", None),
-            entry_capacity_constrained=bool(
-                getattr(candidate, "entry_capacity_constrained", False)
-            ),
-            entry_target_quantity=_float_attr("entry_target_quantity"),
-            long_max_executable_quantity=_float_attr("long_max_executable_quantity"),
-            short_max_executable_quantity=_float_attr("short_max_executable_quantity"),
-            entry_max_executable_quantity=_float_attr("entry_max_executable_quantity"),
-            entry_depth_shortfall_quantity=_float_attr("entry_depth_shortfall_quantity"),
-            entry_max_executable_notional_quote=_float_attr(
-                "entry_max_executable_notional_quote"
-            ),
-            entry_depth_capped_at_entry=bool(
-                getattr(candidate, "entry_depth_capped_at_entry", False)
-            ),
-            advisories=list(getattr(candidate, "advisories", []) or []),
-            blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
-            exit_after_first_stage=exit_after_first_stage,
-        )
-
-        # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
-        self.journal.append(
-            "review.candidate_shortlisted",
-            {
-                "symbol": candidate.symbol,
-                "long_venue": long_venue.value,
-                "short_venue": short_venue.value,
-                "ranking_edge_bps": candidate.ranking_edge_bps,
-                "expected_edge_bps": candidate.expected_edge_bps,
-                "funding_edge_bps": candidate.funding_edge_bps,
-                "worst_case_edge_bps": candidate.worst_case_edge_bps,
-                "opportunity_type": opportunity_type,
-                "funding_timestamp_ms": funding_timestamp_ms,
-                "first_funding_timestamp_ms": first_funding_timestamp_ms,
-                "long_funding_timestamp_ms": long_funding_timestamp_ms,
-                "short_funding_timestamp_ms": short_funding_timestamp_ms,
-                "second_funding_timestamp_ms": second_funding_timestamp_ms,
-                "first_funding_leg": first_funding_leg,
-                "exit_after_first_stage": exit_after_first_stage,
-                "entry_notional_quote": candidate.entry_notional_quote,
-                "route": route.value,
-                "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
-                "ts_ms": now_ms,
-            },
-        )
-
-        try:
-            # V1: execution.entry_selected — engine decided to open this candidate
-            self.journal.append(
-                "execution.entry_selected",
-                {
-                    "symbol": candidate.symbol,
-                    "entry_id": entry_id,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "quantity": effective_quantity,
-                    "route": route.value,
-                    "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
-                    "price_hint": price_hint,
-                    "opportunity_type": opportunity_type,
-                    "funding_timestamp_ms": funding_timestamp_ms,
-                    "first_funding_timestamp_ms": first_funding_timestamp_ms,
-                    "long_funding_timestamp_ms": long_funding_timestamp_ms,
-                    "short_funding_timestamp_ms": short_funding_timestamp_ms,
-                    "second_funding_timestamp_ms": second_funding_timestamp_ms,
-                    "first_funding_leg": first_funding_leg,
-                    "exit_after_first_stage": exit_after_first_stage,
-                    "funding_edge_bps_entry": funding_edge_bps_entry,
-                    "total_funding_edge_bps_entry": total_funding_edge_bps_entry,
-                    "expected_edge_bps_entry": expected_edge_bps_entry,
-                    "ts_ms": now_ms,
-                },
-            )
-            result = await self.entry_executor.execute(ctx)
-            self.journal.append(
-                "runtime.entry_dispatched",
-                {
-                    "entry_id": ctx.entry_id,
-                    "symbol": candidate.symbol,
-                    "route": result.route.value,
-                    "state": result.state.value,
-                    "has_uncertainty": result.has_uncertainty,
-                },
-            )
-            if (
-                result.route == ExecutionRoute.REJECTED
-                and self._entry_reject_is_post_only_would_take(
-                    getattr(result, "reject_reason", "")
-                )
-            ):
-                self._record_post_only_reject_cooldown(
-                    candidate,
-                    now_ms,
-                    getattr(result, "reject_reason", ""),
-                    venue=maker_venue.value,
-                    side=maker_leg.value,
-                    price=price_hint,
-                    bbo=maker_bbo_evidence,
-                )
-                return True
-            if result.open_position is not None:
-                self.state.open_positions[result.open_position.position_id] = result.open_position
-                self.journal.append(
-                    "runtime.position_opened",
-                    {"position_id": result.open_position.position_id},
-                )
-            if result.route == ExecutionRoute.REJECTED and getattr(result, "reject_reason", ""):
-                self._record_entry_result_admission_blocks(
-                    candidate,
-                    str(result.reject_reason),
-                    now_ms,
-                )
-            if result.pending_entry is not None:
-                if getattr(result.pending_entry, "outcome", "") == "rejected":
-                    self.journal.append(
-                        "runtime.rejected_pending_suppressed",
-                        {
-                            "pending_id": result.pending_entry.pending_id,
-                            "symbol": result.pending_entry.symbol,
-                            "route": result.route.value,
-                            "state": result.state.value,
-                            "reason": "maker rejected is terminal in V1",
-                        },
-                    )
-                    return True
-                # Track pending entry for reconciliation
-                if getattr(result.pending_entry, "created_cycle", 0) == 0:
-                    result.pending_entry.created_cycle = int(
-                        getattr(self.state, "tick_count", 0) or 0
-                    )
-                if getattr(result.pending_entry, "frozen_candidate", None) is None:
-                    from dataclasses import asdict, is_dataclass
-
-                    if is_dataclass(candidate):
-                        result.pending_entry.frozen_candidate = asdict(candidate)
-                    else:
-                        result.pending_entry.frozen_candidate = dict(
-                            getattr(candidate, "__dict__", {}) or {}
-                        )
-                self.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
-                self._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
-                self._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
-                self.journal.append(
-                    "runtime.pending_entry_registered",
-                    {
-                        "pending_id": result.pending_entry.pending_id,
-                        "symbol": result.pending_entry.symbol,
-                        "outcome": result.pending_entry.outcome,
-                        "maker_client_order_id": result.pending_entry.maker_client_order_id,
-                        "hedge_client_order_id": result.pending_entry.hedge_client_order_id,
-                        "opportunity_type": result.pending_entry.opportunity_type,
-                        "funding_timestamp_ms": result.pending_entry.funding_timestamp_ms,
-                        "first_funding_timestamp_ms": result.pending_entry.first_funding_timestamp_ms,
-                        "long_funding_timestamp_ms": result.pending_entry.long_funding_timestamp_ms,
-                        "short_funding_timestamp_ms": result.pending_entry.short_funding_timestamp_ms,
-                        "second_funding_timestamp_ms": result.pending_entry.second_funding_timestamp_ms,
-                        "first_funding_leg": result.pending_entry.first_funding_leg,
-                    },
-                )
-        except Exception as e:
-            error_text = str(e)
-            if self._entry_reject_is_post_only_would_take(error_text):
-                self._record_post_only_reject_cooldown(
-                    candidate,
-                    now_ms,
-                    error_text,
-                    venue=maker_venue.value,
-                    side=maker_leg.value,
-                    price=price_hint,
-                    bbo=maker_bbo_evidence,
-                )
-            else:
-                self._record_entry_result_admission_blocks(
-                    candidate,
-                    error_text,
-                    now_ms,
-                )
-            self.journal.append(
-                "runtime.entry_dispatch_error",
-                {"entry_id": ctx.entry_id, "error": error_text},
-            )
-            return False
-
-        return True
-
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Passive close recovery (V1: recovery after restart)
     # ------------------------------------------------------------------
 
