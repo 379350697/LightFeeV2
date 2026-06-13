@@ -54,6 +54,7 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     is_order_truth_gap,
 )
+from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
@@ -73,7 +74,7 @@ from lightfee.venues.common import (
     venue_reduce_only_close_exempts_min_notional,
 )
 from lightfee.venues.capabilities import get_capability_flags
-from lightfee.venues.specs import get_spec
+from lightfee.venues.specs import VenueOperation, get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 from lightfee.engine.recovery import clear_legacy_recovery_block_via_core
 from lightfee.engine.recovery_decision_core import (
@@ -5578,37 +5579,18 @@ class PassiveCloseExecutor:
             # to preserve pending state, unless proven safe.
             return None, "open_orders_query_unsupported"
 
-        venue_symbol = symbol
-        to_venue_symbol = getattr(transport, "_venue_symbol", None)
-        if callable(to_venue_symbol):
-            venue_symbol = to_venue_symbol(symbol)
-
         try:
-            if venue in (Venue.BINANCE, Venue.ASTER):
-                raw = await transport._request(
-                    "GET", "/fapi/v1/openOrders",
-                    params={"symbol": venue_symbol},
-                    private=True,
-                )
-            elif venue == Venue.BYBIT:
-                raw = await transport._request(
-                    "GET", "/v5/order/realtime",
-                    params={
-                        "category": "linear",
-                        "symbol": venue_symbol,
-                        "settleCoin": "USDT",
-                    },
-                    private=True,
-                )
-            elif venue == Venue.OKX:
-                raw = await transport._request(
-                    "GET", "/api/v5/trade/orders-pending",
-                    params={"instId": venue_symbol},
-                    private=True,
-                )
-            else:
-                # Unsupported venue — conservatively treat as untrusted
-                return None, "open_orders_query_unsupported"
+            credential = getattr(transport, "_credential", None)
+            raw, _ = await request_venue_operation(
+                transport,
+                venue,
+                VenueOperation.OPEN_ORDERS,
+                symbol=symbol,
+                account_address=str(getattr(credential, "account_address", "") or ""),
+                agent_wallet_address=str(
+                    getattr(credential, "agent_wallet_address", "") or ""
+                ),
+            )
 
             # Parse response to list of orders
             items: list[Any] = []

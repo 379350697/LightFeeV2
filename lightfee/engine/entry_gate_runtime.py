@@ -11,14 +11,9 @@ from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import AccountBalanceSnapshot, Venue
+from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.runtime_context import EntryGateRuntimeContext
 from lightfee.risk.modes import EngineLifecycle
-
-
-def wall_clock_now_ms() -> int:
-    from lightfee.engine import runtime as runtime_module
-
-    return runtime_module.wall_clock_now_ms()
 
 
 class EntryGateRuntime:

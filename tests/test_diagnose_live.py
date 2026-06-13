@@ -2745,6 +2745,13 @@ def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
         def __init__(self, venue):
             self.venue = venue
             self._transport = FakeTransport()
+            if venue == "bitget":
+                from lightfee.venues.specs import BitgetContractFamily
+
+                async def _resolve_bitget_family():
+                    return BitgetContractFamily.UTA_V3
+
+                self._transport._bitget_resolve_contract_family = _resolve_bitget_family
 
         async def fetch_all_positions(self):
             return []

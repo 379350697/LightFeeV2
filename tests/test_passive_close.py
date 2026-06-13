@@ -5457,7 +5457,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert "open_orders_count=1" in error
         okx_transport._request.assert_called_once_with(
             "GET", "/api/v5/trade/orders-pending",
-            params={"instId": "UBUSDT"},
+            params={"instId": "UB-USDT-SWAP"},
             private=True,
         )
 

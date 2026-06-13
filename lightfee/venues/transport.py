@@ -49,7 +49,15 @@ from lightfee.marketdata.private_ws import (
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.venues.common import normalize_venue_quantity
 from lightfee.venues.market_data import MarketDataClient
-from lightfee.venues.specs import AuthScheme, VenueSpec
+from lightfee.venues.specs import (
+    AuthScheme,
+    BitgetContractFamily,
+    VenueOperation,
+    VenueOperationContract,
+    VenueSpec,
+    get_operation_contract,
+    get_spec,
+)
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
 
@@ -232,6 +240,20 @@ class TransportError(Exception):
         self.status_code = status_code
         self.body = body
         self.headers: dict[str, str] = headers or {}
+
+
+async def _resolve_bitget_contract_family_for_truth(transport: Any) -> BitgetContractFamily:
+    resolver = getattr(transport, "_bitget_resolve_contract_family", None)
+    if callable(resolver):
+        return await resolver()
+    if getattr(transport, "mode", "") != "live":
+        return BitgetContractFamily.UTA_V3
+    raise TransportError(
+        TransportErrorCategory.REQUEST_REJECTED,
+        "Bitget private truth requires an explicit account family resolver",
+        status_code=400,
+        body='{"code":"LFV2_BITGET_FAMILY_UNRESOLVED","msg":"missing Bitget account family resolver"}',
+    )
 
 
 def classify_transport_error(
@@ -423,10 +445,9 @@ def _build_bitget_order_request(
 ) -> tuple[str, dict[str, Any]]:
     """Build Bitget order path and body based on account profile (Classic vs UTA).
 
-    Classic: /api/v2/mix/order/place-order with productType/marginMode/marginCoin
-    UTA:     /api/v3/trade/place-order with category/qty/side/timeInForce/clientOid
-
-    Returns (request_path, body_dict).
+    Classic uses productType/marginMode/marginCoin. UTA uses
+    category/qty/side/timeInForce/clientOid. The request path is read from the
+    family-specific operation contract.
     """
     side = "buy" if request.side == Side.BUY else "sell"
     classic_side = side
@@ -451,7 +472,11 @@ def _build_bitget_order_request(
                 body["posSide"] = "long" if request.side == Side.BUY else "short"
         else:
             body["reduceOnly"] = "yes" if request.reduce_only else "no"
-        return "/api/v3/trade/place-order", body
+        return get_operation_contract(
+            get_spec(Venue.BITGET),
+            VenueOperation.CREATE_ORDER,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        ).path, body
 
     # Classic
     body = {
@@ -471,7 +496,30 @@ def _build_bitget_order_request(
         body["tradeSide"] = "open" if not request.reduce_only else "close"
     else:
         body["reduceOnly"] = "YES" if request.reduce_only else "NO"
-    return "/api/v2/mix/order/place-order", body
+    return get_operation_contract(
+        get_spec(Venue.BITGET),
+        VenueOperation.CREATE_ORDER,
+        resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+    ).path, body
+
+
+def _bitget_contract_params(
+    contract: "VenueOperationContract",
+    *,
+    venue_sym: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for item in contract.required_params:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        params[key] = value
+    if venue_sym:
+        params.setdefault("symbol", venue_sym)
+    if extra:
+        params.update(extra)
+    return params
 
 
 def _parse_retry_after_ms(headers: dict[str, str]) -> Optional[int]:
@@ -879,9 +927,9 @@ def _parse_bybit_position(raw: dict[str, Any], symbol: str, now_ms: int) -> "Pos
 def _parse_bitget_position(raw: dict[str, Any], symbol: str, now_ms: int) -> "PositionSnapshot":
     """Parse Bitget position response for both Classic and UTA formats.
 
-    Classic: {"code":"00000","data":[{"symbol":"BTCUSDT","total":"0.01","holdSide":"long",...}]}
-    UTA:     {"code":"00000","data":[{"symbol":"BTCUSDT","total":"0.01","holdSide":"long",...}]}
-    Both use data array; key fields: total/available, holdSide/posSide, openPriceAvg/avgPrice.
+    Classic uses data rows with holdSide/openPriceAvg and size-like fields such
+    as total, baseVolume, holdVolume, or size. UTA uses data.list rows with
+    posSide/avgPrice and qty/total/available.
     """
     _require_bitget_success(raw, "bitget position failed")
     data = raw.get("data", [])
@@ -893,7 +941,14 @@ def _parse_bitget_position(raw: dict[str, Any], symbol: str, now_ms: int) -> "Po
             continue
         if _normalize_symbol(row.get("symbol", "")) != _normalize_symbol(symbol):
             continue
-        qty = abs(_safe_float(row.get("total") or row.get("available") or row.get("holdVolume") or row.get("size")))
+        qty = abs(_safe_float(
+            row.get("total")
+            or row.get("baseVolume")
+            or row.get("qty")
+            or row.get("available")
+            or row.get("holdVolume")
+            or row.get("size")
+        ))
         hold_side = str(row.get("holdSide") or row.get("posSide") or "").lower()
         net += qty if hold_side in ("long", "buy") else -qty if hold_side in ("short", "sell") else qty
         entry_price = _safe_float(row.get("openPriceAvg") or row.get("avgPrice"), default=entry_price)
@@ -3977,11 +4032,26 @@ class VenueTransport(MarketDataClient):
                 }
             self._record_order_diagnostic("order.submit_attempt", preflight)
 
-            # V1: Binance/Aster use query-only private signing (order fields in query, not body)
-            if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
-                raw = await self._request("POST", spec.order_path, params=body, private=True)
+            contract = get_operation_contract(spec, VenueOperation.CREATE_ORDER)
+            if not contract.supported:
+                raise TransportError(
+                    TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"{spec.venue_id.value} create order contract unsupported",
+                )
+            if contract.payload == "params":
+                raw = await self._request(
+                    contract.method,
+                    contract.path,
+                    params=body,
+                    private=contract.private,
+                )
             else:
-                raw = await self._request("POST", spec.order_path, body=body, private=True)
+                raw = await self._request(
+                    contract.method,
+                    contract.path,
+                    body=body,
+                    private=contract.private,
+                )
 
             # V2: venue-specific success guard before parsing
             if spec.venue_id == Venue.BYBIT:
@@ -4367,9 +4437,8 @@ class VenueTransport(MarketDataClient):
           3. Aggregate execQty * execPrice for weighted avg, abs(execFee), max(execTime)
           4. total_quantity <= 0 → None
 
-        Bitget (V1: bitget.rs:2912-2949): single-step —
-          /api/v3/trade/order-info with orderId/clientOid,
-          multi-key fallback for price/fee, quantity <= 0 → None
+        Bitget uses the resolved account-family ORDER_STATUS contract with
+        orderId/clientOid, then applies multi-key fallback for price/fee.
 
         Returns OrderFillReconciliation with filled quantity if found, or None.
         """
@@ -4397,13 +4466,27 @@ class VenueTransport(MarketDataClient):
                 )
 
             elif spec.venue_id == Venue.BITGET:
-                params: dict[str, Any] = {}
+                query_params: dict[str, Any] = {}
                 if order_id:
-                    params["orderId"] = order_id
+                    query_params["orderId"] = order_id
                 if client_order_id:
-                    params["clientOid"] = client_order_id
+                    query_params["clientOid"] = client_order_id
+                family = await _resolve_bitget_contract_family_for_truth(self)
+                contract = get_operation_contract(
+                    spec,
+                    VenueOperation.ORDER_STATUS,
+                    resolved_account_family=family,
+                )
+                params = _bitget_contract_params(
+                    contract,
+                    venue_sym=venue_sym,
+                    extra=query_params,
+                )
                 raw = await self._request(
-                    "GET", "/api/v3/trade/order-info", params=params, private=True,
+                    contract.method,
+                    contract.path,
+                    params=params,
+                    private=contract.private,
                 )
                 return self._parse_order_status_bitget(raw, venue_sym, now_ms)
 
@@ -4982,7 +5065,7 @@ class VenueTransport(MarketDataClient):
     def _parse_order_status_bitget(
         self, raw: dict[str, Any], venue_sym: str, now_ms: int,
     ) -> Optional["OrderFillReconciliation"]:
-        """Parse Bitget /api/v3/trade/order-info response into OrderFillReconciliation.
+        """Parse Bitget order-status response into OrderFillReconciliation.
 
         V1: quantity <= 0 → None. Multi-key fallback for price/fee/orderId/clientOid.
         """
@@ -5305,14 +5388,26 @@ class VenueTransport(MarketDataClient):
             self._record_order_diagnostic("order.submit_attempt", attempt_payload)
 
             aster_retry_after_max_notional = False
+            contract = get_operation_contract(spec, VenueOperation.CREATE_ORDER)
+            if not contract.supported:
+                raise TransportError(
+                    TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"{spec.venue_id.value} passive create contract unsupported",
+                )
 
             async def _send_passive_order(current_body: dict[str, Any]):
-                if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                if contract.payload == "params":
                     return await self._request(
-                        "POST", spec.order_path, params=current_body, private=True
+                        contract.method,
+                        contract.path,
+                        params=current_body,
+                        private=contract.private,
                     )
                 return await self._request(
-                    "POST", spec.order_path, body=current_body, private=True
+                    contract.method,
+                    contract.path,
+                    body=current_body,
+                    private=contract.private,
                 )
 
             # --- Send request ---
@@ -6017,8 +6112,27 @@ class VenueTransport(MarketDataClient):
                     return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
                 return None
 
-            query_path = "/v5/order/realtime" if spec.venue_id == Venue.BYBIT else spec.order_path
-            raw = await self._request("GET", query_path, params=params, private=True)
+            contract = get_operation_contract(spec, VenueOperation.ORDER_STATUS)
+            if not contract.supported:
+                return None
+            query_path = contract.path
+            if "{order_id}" in query_path and order_id:
+                query_path = query_path.replace("{order_id}", str(order_id))
+                params.pop("order_id", None)
+            if contract.payload == "params":
+                raw = await self._request(
+                    contract.method,
+                    query_path,
+                    params=params,
+                    private=contract.private,
+                )
+            else:
+                raw = await self._request(
+                    contract.method,
+                    query_path,
+                    body=params,
+                    private=contract.private,
+                )
             return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
 
         except TransportError:
@@ -6254,11 +6368,7 @@ class VenueTransport(MarketDataClient):
     async def _fetch_bitget_order_detail(
         self, venue_sym: str, order_id: str, client_order_id: Optional[str],
     ) -> Optional[dict[str, Any]]:
-        """V1 fetch_bitget_order_detail (bitget.rs:3651-3730).
-
-        Tries UTA endpoint first (/api/v3/trade/order-info), then falls back
-        to classic (/api/v2/mix/order/detail) on classic-account error.
-        """
+        """Fetch Bitget order detail through the resolved account-family contract."""
         # Build query params: orderId or clientOid
         query_params: dict[str, Any] = {}
         if order_id and order_id != "bitget-unknown":
@@ -6268,38 +6378,23 @@ class VenueTransport(MarketDataClient):
         else:
             return None
 
-        # Try UTA first (V1: account_profile == Uta or unknown)
+        family = await _resolve_bitget_contract_family_for_truth(self)
+        contract = get_operation_contract(
+            self._spec,
+            VenueOperation.ORDER_STATUS,
+            resolved_account_family=family,
+        )
+        params = _bitget_contract_params(
+            contract,
+            venue_sym=venue_sym,
+            extra=query_params,
+        )
         try:
             raw = await self._request(
-                "GET", "/api/v3/trade/order-info", params=query_params, private=True,
-            )
-            code = str(raw.get("code", ""))
-            # V1: bitget_payload_indicates_absent_order — code 40109/43001
-            if code in ("40109", "43001"):
-                return None
-            # V1: bitget_data() — code must be 00000 or 0 for success
-            if code not in ("00000", "0"):
-                return None
-            return raw
-        except TransportError as e:
-            if e.category == TransportErrorCategory.REQUEST_REJECTED:
-                pass  # May be classic account — fall through
-            else:
-                return None
-        except Exception:
-            pass
-
-        # Fallback: classic endpoint (V1: account_profile == Classic, or UTA rejected)
-        # requires productType + symbol (bitget.rs:4803-4823)
-        classic_params: dict[str, Any] = {
-            "productType": "USDT-FUTURES",
-            "symbol": venue_sym,
-        }
-        classic_params.update(query_params)
-
-        try:
-            raw = await self._request(
-                "GET", "/api/v2/mix/order/detail", params=classic_params, private=True,
+                contract.method,
+                contract.path,
+                params=params,
+                private=contract.private,
             )
             code = str(raw.get("code", ""))
             if code in ("40109", "43001"):
@@ -6394,6 +6489,7 @@ class VenueTransport(MarketDataClient):
         spec = self._spec
         venue_sym = self._venue_symbol(request.symbol)
         now_ms = int(time.time() * 1000)
+        contract = get_operation_contract(spec, VenueOperation.AMEND_ORDER)
 
         if self.mode == "paper":
             return PassiveOrderAck(
@@ -6406,6 +6502,12 @@ class VenueTransport(MarketDataClient):
                 quantity=request.new_quantity or 0.0,
                 accepted_at_ms=now_ms,
                 state=PassiveOrderState.OPEN,
+            )
+
+        if not contract.supported:
+            raise NotImplementedError(
+                f"{spec.venue_id.value} passive amend not supported: "
+                f"{contract.official_doc_url or 'cancel_replace_required'}"
             )
 
         try:
@@ -6429,36 +6531,78 @@ class VenueTransport(MarketDataClient):
                 if request.new_client_order_id:
                     body["newClOrdId"] = request.new_client_order_id
                 if request.new_price_hint is not None and request.new_price_hint > 0:
-                    body["newPx"] = str(request.new_price_hint)
+                    body["newPx"] = _format_decimal(request.new_price_hint)
                 if request.new_quantity is not None and request.new_quantity > 0:
-                    body["newSz"] = str(request.new_quantity)
+                    if (
+                        self.mode == "live"
+                        and venue_sym not in self._symbol_metadata
+                        and request.symbol not in self._symbol_metadata
+                    ):
+                        await self._ensure_okx_swap_instrument_metadata_loaded()
+                    metadata = (
+                        self._symbol_metadata.get(venue_sym)
+                        or self._symbol_metadata.get(request.symbol)
+                        or {}
+                    )
+                    ct_val = _safe_float(
+                        metadata.get(
+                            "ct_val",
+                            metadata.get("ctVal", metadata.get("contract_size", 0.0)),
+                        ),
+                        default=0.0,
+                    )
+                    lot_sz = _safe_float(
+                        metadata.get(
+                            "lot_sz",
+                            metadata.get("lotSz", metadata.get("qty_step", 0.0)),
+                        ),
+                        default=0.0,
+                    )
+                    min_sz = _safe_float(
+                        metadata.get(
+                            "min_sz",
+                            metadata.get("minSz", metadata.get("min_qty", 0.0)),
+                        ),
+                        default=0.0,
+                    )
+                    sizing = _okx_contract_order_diagnostics(
+                        base_qty=float(request.new_quantity),
+                        ct_val=ct_val,
+                        lot_sz=lot_sz,
+                        min_sz=min_sz,
+                    )
+                    reject_reason = sizing.get("reject_reason")
+                    if reject_reason:
+                        raise TransportError(
+                            TransportErrorCategory.NORMALIZATION_FAILURE,
+                            "okx passive amend contract quantity invalid: "
+                            f"{reject_reason}",
+                        )
+                    body["newSz"] = _format_decimal(float(sizing["contract_qty"]))
+                body["cxlOnFail"] = False
             elif spec.venue_id == Venue.BYBIT:
                 body["category"] = "linear"
                 body["orderId"] = request.order_id
                 if request.new_price_hint is not None and request.new_price_hint > 0:
-                    body["price"] = str(request.new_price_hint)
+                    body["price"] = _format_decimal(request.new_price_hint)
                 if request.new_quantity is not None and request.new_quantity > 0:
-                    body["qty"] = str(request.new_quantity)
+                    body["qty"] = _format_decimal(request.new_quantity)
             elif spec.venue_id == Venue.BITGET:
-                body["orderId"] = request.order_id
-                if request.new_price_hint is not None and request.new_price_hint > 0:
-                    body["price"] = str(request.new_price_hint)
-                if request.new_quantity is not None and request.new_quantity > 0:
-                    body["size"] = str(request.new_quantity)
+                raise NotImplementedError("Bitget passive amend not supported")
             elif spec.venue_id == Venue.GATE:
-                body["order_id"] = request.order_id
-                if request.new_price_hint is not None and request.new_price_hint > 0:
-                    body["price"] = str(request.new_price_hint)
+                raise NotImplementedError("Gate passive amend not supported")
             elif spec.venue_id == Venue.HYPERLIQUID:
                 # Hyperliquid amend via cancel+replace only
                 raise NotImplementedError("Hyperliquid amend not supported")
 
-            if spec.venue_id == Venue.BINANCE:
+            if contract.payload == "params":
                 raw = await self._request(
-                    "PUT", spec.order_path, params=body, private=True
+                    contract.method, contract.path, params=body, private=contract.private
                 )
             else:
-                raw = await self._request("PUT", spec.order_path, body=body, private=True)
+                raw = await self._request(
+                    contract.method, contract.path, body=body, private=contract.private
+                )
             return self._parse_passive_order_ack(
                 raw,
                 OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=request.side,
@@ -6568,6 +6712,12 @@ class VenueTransport(MarketDataClient):
 
         try:
             params: dict[str, Any] = {}
+            contract = get_operation_contract(spec, VenueOperation.CANCEL_ORDER)
+            if not contract.supported:
+                raise TransportError(
+                    TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"{spec.venue_id.value} passive cancel contract unsupported",
+                )
             if spec.venue_id == Venue.BINANCE or spec.venue_id == Venue.ASTER:
                 params["symbol"] = venue_sym
                 if order_id:
@@ -6630,7 +6780,12 @@ class VenueTransport(MarketDataClient):
                     vault_address=None,
                     is_mainnet=True,
                 )
-                raw = await self._request("POST", spec.order_path, body=body, private=True)
+                raw = await self._request(
+                    contract.method,
+                    contract.path,
+                    body=body,
+                    private=contract.private,
+                )
                 cancel_already_terminal = _cancel_response_indicates_absent_order(
                     raw, spec.venue_id
                 )
@@ -6667,16 +6822,23 @@ class VenueTransport(MarketDataClient):
                     state=PassiveOrderState.CANCELED,
                 )
 
-            if spec.venue_id == Venue.BYBIT:
-                # Bybit V5 has a dedicated asynchronous cancel endpoint.
-                # Reusing order_path (/v5/order/create) with DELETE returns
-                # HTTP 404 and can incorrectly escalate recovery to fail-closed.
+            cancel_path = contract.path
+            if "{order_id}" in cancel_path and order_id:
+                cancel_path = cancel_path.replace("{order_id}", str(order_id))
+                params.pop("order_id", None)
+            if contract.payload == "params":
                 raw = await self._request(
-                    "POST", "/v5/order/cancel", body=params, private=True
+                    contract.method,
+                    cancel_path,
+                    params=params,
+                    private=contract.private,
                 )
             else:
                 raw = await self._request(
-                    "DELETE", spec.order_path, params=params, private=True
+                    contract.method,
+                    cancel_path,
+                    body=params,
+                    private=contract.private,
                 )
 
             # V1: successful HTTP response may still indicate order was already absent

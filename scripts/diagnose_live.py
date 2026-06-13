@@ -29,13 +29,18 @@ from typing import Any, Optional
 from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
-from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+from lightfee.core.domain import Venue
+from lightfee.engine.exchange_truth import (
+    normalize_exchange_truth_payload,
+    request_venue_operation,
+)
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
+from lightfee.venues.specs import VenueOperation
 
 # Schema version — bump when output shape changes
 SCHEMA_VERSION = 2
@@ -831,6 +836,14 @@ def _probe_venue_symbol(adapter: Any, symbol: str) -> str:
     return symbol
 
 
+def _venue_from_probe_text(venue: str) -> Venue | None:
+    venue_lower = venue.lower()
+    for item in Venue:
+        if item.value in venue_lower:
+            return item
+    return None
+
+
 def _unsupported_symbol_probe_error(exc: Exception) -> bool:
     text = str(exc or "").lower()
     return any(
@@ -1009,10 +1022,8 @@ async def _fetch_unfiltered_open_orders(
     transport: Any,
     venue: str,
 ) -> list[dict[str, Any]]:
-    venue_lower = venue.lower()
-    if "binance" in venue_lower:
-        raw = await transport._request("GET", "/fapi/v1/openOrders", params={}, private=True)
-    elif "aster" in venue_lower:
+    contract_venue = _venue_from_probe_text(venue)
+    if contract_venue == Venue.ASTER:
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if callable(fetch_open_orders):
             rows = await fetch_open_orders(None)
@@ -1021,38 +1032,16 @@ async def _fetch_unfiltered_open_orders(
                 for row in rows[:50]
                 if isinstance(row, dict)
             ]
-        raw = await transport._request("GET", "/fapi/v3/openOrders", params={}, private=True)
-    elif "bybit" in venue_lower:
-        raw = await transport._request(
-            "GET", "/v5/order/realtime",
-            params={"category": "linear", "settleCoin": "USDT"},
-            private=True,
-        )
-    elif "okx" in venue_lower:
-        raw = await transport._request(
-            "GET", "/api/v5/trade/orders-pending",
-            params={"instType": "SWAP"},
-            private=True,
-        )
-    elif "bitget" in venue_lower:
-        raw = await transport._request(
-            "GET", "/api/v2/mix/order/orders-pending",
-            params={"productType": "USDT-FUTURES"},
-            private=True,
-        )
-    elif "gate" in venue_lower:
-        raw = await transport._request(
-            "GET", "/api/v4/futures/usdt/orders",
-            params={"status": "open"},
-            private=True,
-        )
-    elif "hyperliquid" in venue_lower:
+    if contract_venue is not None:
         credential = getattr(transport, "_credential", None)
         account = str(getattr(credential, "account_address", "") or "")
-        raw = await transport._request(
-            "POST", "/info",
-            body={"type": "openOrders", "user": account},
-            private=False,
+        agent_wallet = str(getattr(credential, "agent_wallet_address", "") or "")
+        raw, _ = await request_venue_operation(
+            transport,
+            contract_venue,
+            VenueOperation.OPEN_ORDERS,
+            account_address=account,
+            agent_wallet_address=agent_wallet,
         )
     else:
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
@@ -1109,31 +1098,36 @@ async def _fetch_venue_open_orders(
     for sym in symbols:
         venue_symbol = _probe_venue_symbol(adapter, sym)
         try:
-            if "binance" in venue.lower():
-                raw = await transport._request(
-                    "GET", "/fapi/v1/openOrders", params={"symbol": venue_symbol}, private=True,
-                )
-            elif "bybit" in venue.lower():
-                raw = await transport._request(
-                    "GET", "/v5/order/realtime",
-                    params={"category": "linear", "symbol": venue_symbol, "settleCoin": "USDT"},
-                    private=True,
-                )
-            elif "aster" in venue.lower():
+            contract_venue = _venue_from_probe_text(venue)
+            if contract_venue == Venue.ASTER:
                 fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
                 if callable(fetch_open_orders):
                     raw = await fetch_open_orders(venue_symbol)
                 else:
-                    raw = await transport._request(
-                        "GET", "/fapi/v3/openOrders",
-                        params={"symbol": venue_symbol},
-                        private=True,
+                    credential = getattr(transport, "_credential", None)
+                    account = str(getattr(credential, "account_address", "") or "")
+                    agent_wallet = str(
+                        getattr(credential, "agent_wallet_address", "") or ""
                     )
-            elif "okx" in venue.lower():
-                raw = await transport._request(
-                    "GET", "/api/v5/trade/orders-pending",
-                    params={"instId": venue_symbol},
-                    private=True,
+                    raw, _ = await request_venue_operation(
+                        transport,
+                        contract_venue,
+                        VenueOperation.OPEN_ORDERS,
+                        symbol=sym,
+                        account_address=account,
+                        agent_wallet_address=agent_wallet,
+                    )
+            elif contract_venue is not None:
+                credential = getattr(transport, "_credential", None)
+                account = str(getattr(credential, "account_address", "") or "")
+                agent_wallet = str(getattr(credential, "agent_wallet_address", "") or "")
+                raw, _ = await request_venue_operation(
+                    transport,
+                    contract_venue,
+                    VenueOperation.OPEN_ORDERS,
+                    symbol=sym,
+                    account_address=account,
+                    agent_wallet_address=agent_wallet,
                 )
             else:
                 succeeded.add(sym)

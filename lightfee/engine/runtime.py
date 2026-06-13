@@ -142,6 +142,58 @@ class LiveRuntime:
     _PASSIVE_POST_ONLY_RETRY_BACKOFF_MS = (500, 1000, 2000, 4000, 6000, 8000, 10000)
     _MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR = 2.0
 
+    @property
+    def venue_contracts(self) -> Any:
+        from lightfee.venues import specs as venue_specs
+
+        return venue_specs
+
+    @property
+    def order_truth(self) -> Any:
+        from lightfee.engine import order_submit_uncertainty
+
+        return order_submit_uncertainty
+
+    @property
+    def lifecycle_closure(self) -> Any:
+        return SimpleNamespace(
+            build=build_v1_lifecycle_closure_table,
+            event_fields=closure_event_fields,
+            entry_gate=entry_gate_from_closure,
+        )
+
+    @property
+    def quote_truth(self) -> Any:
+        return self.market_data_runtime
+
+    @property
+    def catalog_support(self) -> Any:
+        return SimpleNamespace(
+            filter_symbols_supported_by_venue=self._filter_symbols_supported_by_venue,
+            unsupported_symbol_diagnostic_last_ms=(
+                self._unsupported_symbol_diagnostic_last_ms
+            ),
+        )
+
+    @property
+    def exchange_truth(self) -> Any:
+        from lightfee.engine.exchange_truth import (
+            build_venue_operation_request,
+            request_venue_operation,
+        )
+
+        return SimpleNamespace(
+            collect_recovery_ledger_account_truth=(
+                self._collect_recovery_ledger_account_truth
+            ),
+            collect_recovery_ledger_exchange_truth=(
+                self._collect_recovery_ledger_exchange_truth
+            ),
+            build_venue_operation_request=build_venue_operation_request,
+            request_venue_operation=request_venue_operation,
+            last_recovery_exchange_truth=self._last_recovery_exchange_truth,
+        )
+
     def __init__(self, config: AppConfig, venue_adapters: Optional[dict[Venue, VenueAdapter]] = None) -> None:
         self.config = config
         self.state = EngineState()

@@ -23,6 +23,7 @@ from lightfee.engine.bybit_duplicate_reconcile import (
     reconcile_bybit_duplicate_client_order,
 )
 from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
+from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.engine.lifecycle import clear_risk_mode_for_recovery, enter_fail_closed
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
@@ -36,6 +37,7 @@ from lightfee.engine.recovery_decision_core import (
 )
 from lightfee.engine.runtime_context import ResidualRepairRuntimeContext
 from lightfee.risk.modes import GlobalRiskMode
+from lightfee.venues.specs import VenueOperation
 
 
 class ResidualRepairRuntime:
@@ -1385,35 +1387,17 @@ class ResidualRepairRuntime:
         if transport is None or not hasattr(transport, "_request"):
             raise RuntimeError("open_orders_truth_unavailable")
 
-        venue_symbol = symbol
-        to_venue_symbol = getattr(transport, "_venue_symbol", None)
-        if callable(to_venue_symbol):
-            venue_symbol = to_venue_symbol(symbol)
-
-        if venue in (Venue.BINANCE, Venue.ASTER):
-            raw = await transport._request(
-                "GET", "/fapi/v1/openOrders",
-                params={"symbol": venue_symbol},
-                private=True,
-            )
-        elif venue == Venue.BYBIT:
-            raw = await transport._request(
-                "GET", "/v5/order/realtime",
-                params={
-                    "category": "linear",
-                    "symbol": venue_symbol,
-                    "settleCoin": "USDT",
-                },
-                private=True,
-            )
-        elif venue == Venue.OKX:
-            raw = await transport._request(
-                "GET", "/api/v5/trade/orders-pending",
-                params={"instId": venue_symbol},
-                private=True,
-            )
-        else:
-            raise RuntimeError(f"open_orders_truth_unsupported:{venue.value}")
+        credential = getattr(transport, "_credential", None)
+        raw, _ = await request_venue_operation(
+            transport,
+            venue,
+            VenueOperation.OPEN_ORDERS,
+            symbol=symbol,
+            account_address=str(getattr(credential, "account_address", "") or ""),
+            agent_wallet_address=str(
+                getattr(credential, "agent_wallet_address", "") or ""
+            ),
+        )
 
         return self._residual_repair_open_order_items(raw)
 

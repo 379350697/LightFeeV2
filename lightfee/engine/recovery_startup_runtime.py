@@ -5,6 +5,7 @@ from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import PositionSnapshot, Venue
+from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.engine.lifecycle import (
     clear_risk_mode_for_recovery,
     enter_fail_closed,
@@ -21,6 +22,7 @@ from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.runtime_context import RuntimeContext
 from lightfee.engine.v1_lifecycle_closure import closure_event_fields
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+from lightfee.venues.specs import VenueOperation
 
 
 class RecoveryStartupRuntime:
@@ -402,58 +404,25 @@ class RecoveryStartupRuntime:
                 if isinstance(rows, dict) and rows.get("error"):
                     raise RuntimeError(str(rows.get("error")))
                 return self.ctx._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
-            if callable(request):
-                raw = await request("GET", "/fapi/v3/openOrders", params={}, private=True)
-                return self.ctx._recovery_ledger_order_rows(raw), "/fapi/v3/openOrders"
 
-        if venue == Venue.BINANCE and callable(request):
-            raw = await request("GET", "/fapi/v1/openOrders", params={}, private=True)
-            return self.ctx._recovery_ledger_order_rows(raw), "/fapi/v1/openOrders"
-        if venue == Venue.BYBIT and callable(request):
-            raw = await request(
-                "GET",
-                "/v5/order/realtime",
-                params={"category": "linear", "settleCoin": "USDT"},
-                private=True,
-            )
-            return self.ctx._recovery_ledger_order_rows(raw), "/v5/order/realtime"
-        if venue == Venue.OKX and callable(request):
-            raw = await request(
-                "GET",
-                "/api/v5/trade/orders-pending",
-                params={"instType": "SWAP"},
-                private=True,
-            )
-            return self.ctx._recovery_ledger_order_rows(raw), "/api/v5/trade/orders-pending"
-        if venue == Venue.BITGET and callable(request):
-            raw = await request(
-                "GET",
-                "/api/v2/mix/order/orders-pending",
-                params={"productType": "USDT-FUTURES"},
-                private=True,
-            )
-            return (
-                self.ctx._recovery_ledger_order_rows(raw),
-                "/api/v2/mix/order/orders-pending",
-            )
-        if venue == Venue.GATE and callable(request):
-            raw = await request(
-                "GET",
-                "/api/v4/futures/usdt/orders",
-                params={"status": "open"},
-                private=True,
-            )
-            return self.ctx._recovery_ledger_order_rows(raw), "/api/v4/futures/usdt/orders"
-        if venue == Venue.HYPERLIQUID and callable(request):
+        if callable(request):
             credential = getattr(transport, "_credential", None)
             account = str(getattr(credential, "account_address", "") or "")
-            raw = await request(
-                "POST",
-                "/info",
-                body={"type": "openOrders", "user": account},
-                private=False,
+            agent_wallet = str(getattr(credential, "agent_wallet_address", "") or "")
+            exchange_truth_service = getattr(self.ctx, "exchange_truth", None)
+            operation_requester = getattr(
+                exchange_truth_service,
+                "request_venue_operation",
+                request_venue_operation,
             )
-            return self.ctx._recovery_ledger_order_rows(raw), "/info openOrders"
+            raw, contract_request = await operation_requester(
+                transport,
+                venue,
+                VenueOperation.OPEN_ORDERS,
+                account_address=account,
+                agent_wallet_address=agent_wallet,
+            )
+            return self.ctx._recovery_ledger_order_rows(raw), contract_request.label
 
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if not callable(fetch_open_orders):

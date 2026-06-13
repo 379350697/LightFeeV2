@@ -660,7 +660,8 @@ class TestBitgetProfileDetectionFullFlow:
         from lightfee.venues.bitget import BitgetAccountProfile
 
         # Response 1: UTA probe returns classic-mode error
-        # Response 2: Classic position endpoint returns success
+        # Response 2: Classic all-position family validation succeeds
+        # Response 3: Classic single-position endpoint returns success
         classic_error = {"code": "40034", "msg": "classic account not supported"}
         classic_position = {
             "code": "00000",
@@ -669,6 +670,7 @@ class TestBitgetProfileDetectionFullFlow:
         }
         mock = _build_multi_response_transport([
             (400, classic_error),
+            (200, {"code": "00000", "data": []}),
             (200, classic_position),
         ])
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")
