@@ -447,3 +447,13 @@ class TestRateLimitEngineV1Scopes:
         # V1: record_success is no-op; cooldown stays
         # This test confirms V1 behavior — success does NOT clear cooldown
         assert rl._cooldown_remaining_ms_for_scopes(["test"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_pace_for_scopes_reserves_first_slot(self):
+        from lightfee.venues.transport import EndpointRateLimiter
+
+        rl = EndpointRateLimiter(initial_ms=1000, max_ms=8000, pacing_interval_ms=50)
+
+        await rl.pace_for_scopes(["venue:aster"])
+
+        assert rl._last_request_ms["venue:aster"] > 0

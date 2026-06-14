@@ -829,11 +829,12 @@ class EndpointRateLimiter:
                 remaining = last + self._pacing_interval_ms - now_ms
                 if remaining > delay_ms:
                     delay_ms = remaining
-            if delay_ms > 0:
-                # Mark all scopes as being used at now_ms + delay_ms
-                next_at = now_ms + delay_ms
-                for scope in scopes:
-                    self._last_request_ms[scope] = next_at
+            # Reserve this request's pacing slot while holding the lock. The
+            # first request for a scope has delay 0, but still must publish a
+            # timestamp so concurrent first-batch callers cannot all pass.
+            next_at = now_ms + delay_ms
+            for scope in scopes:
+                self._last_request_ms[scope] = next_at
         if delay_ms > 0:
             await asyncio.sleep(delay_ms / 1000.0)
 
