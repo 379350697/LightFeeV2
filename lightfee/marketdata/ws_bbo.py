@@ -30,6 +30,24 @@ class TopBookQuote:
     source: str = ""
 
 
+@dataclass(frozen=True)
+class RestTopBookQuoteResult:
+    venue: str
+    symbol: str
+    outcome: str
+    quote: TopBookQuote | None = None
+    venue_symbol: str = ""
+    endpoint: str = ""
+    url: str = ""
+    http_status: int = 0
+    body_excerpt: str = ""
+    bid: float = 0.0
+    ask: float = 0.0
+    observed_at_ms: int = 0
+    attempt_interval_outcome: str = ""
+    error: str = ""
+
+
 class VenueBboCache:
     """Small normalized cache keyed by venue+canonical symbol."""
 
@@ -155,24 +173,124 @@ class RestTopBookQuoteRefresher:
         *,
         now_ms: int,
     ) -> TopBookQuote | None:
+        return self.refresh_quote_result(venue, symbol, now_ms=now_ms).quote
+
+    def refresh_quote_result(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> RestTopBookQuoteResult:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
         if venue_key not in self.SUPPORTED_VENUES or not symbol_key:
-            return None
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                outcome="unsupported_symbol",
+            )
 
         key = (venue_key, symbol_key)
+        metadata = self._quote_request_metadata(venue_key, symbol_key)
         last_attempt_ms = int(self._last_attempt_ms.get(key, 0) or 0)
         if (
             last_attempt_ms > 0
             and now_ms - last_attempt_ms < self.MIN_ATTEMPT_INTERVAL_MS
         ):
-            return None
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                venue_symbol=metadata.get("venue_symbol", ""),
+                endpoint=metadata.get("endpoint", ""),
+                url=metadata.get("url", ""),
+                outcome="throttled",
+                attempt_interval_outcome="min_interval_not_elapsed",
+            )
         self._last_attempt_ms[key] = now_ms
 
         try:
-            return self._refresh_quote_uncached(venue_key, symbol_key, now_ms)
+            quote = self._refresh_quote_uncached(venue_key, symbol_key, now_ms)
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            status = int(response.status_code if response is not None else 0)
+            body = _response_body_excerpt(response)
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                venue_symbol=metadata.get("venue_symbol", ""),
+                endpoint=metadata.get("endpoint", ""),
+                url=metadata.get("url", ""),
+                http_status=status,
+                body_excerpt=body,
+                outcome=(
+                    "unsupported_symbol"
+                    if _looks_like_unsupported_symbol(status, body)
+                    else "http_error"
+                ),
+                error=str(exc)[:240],
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                venue_symbol=metadata.get("venue_symbol", ""),
+                endpoint=metadata.get("endpoint", ""),
+                url=metadata.get("url", ""),
+                outcome="parse_error",
+                error=f"{type(exc).__name__}: {exc}"[:240],
+            )
+        except Exception as exc:
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                venue_symbol=metadata.get("venue_symbol", ""),
+                endpoint=metadata.get("endpoint", ""),
+                url=metadata.get("url", ""),
+                outcome="http_error",
+                error=f"{type(exc).__name__}: {exc}"[:240],
+            )
+        if quote is None:
+            return RestTopBookQuoteResult(
+                venue=venue_key,
+                symbol=symbol_key,
+                venue_symbol=metadata.get("venue_symbol", ""),
+                endpoint=metadata.get("endpoint", ""),
+                url=metadata.get("url", ""),
+                outcome="invalid_quote",
+            )
+        return RestTopBookQuoteResult(
+            venue=venue_key,
+            symbol=symbol_key,
+            quote=quote,
+            venue_symbol=metadata.get("venue_symbol", ""),
+            endpoint=metadata.get("endpoint", ""),
+            url=metadata.get("url", ""),
+            outcome="resolved",
+            bid=float(quote.bid),
+            ask=float(quote.ask),
+            observed_at_ms=int(quote.observed_at_ms or 0),
+        )
+
+    def _quote_request_metadata(self, venue: str, symbol: str) -> dict[str, str]:
+        from lightfee.core.domain import Venue
+        from lightfee.venues.specs import get_spec
+
+        try:
+            venue_enum = Venue.from_str(venue)
+            spec = get_spec(venue_enum)
+            venue_symbol = spec.symbol_to_venue(symbol) if spec.symbol_to_venue else symbol
         except Exception:
-            return None
+            return {"venue_symbol": symbol, "endpoint": "", "url": ""}
+        if venue == "okx":
+            endpoint = "/api/v5/market/ticker"
+        else:
+            endpoint = spec.market_snapshot_path
+        return {
+            "venue_symbol": venue_symbol,
+            "endpoint": endpoint,
+            "url": spec.public_base_url + endpoint,
+        }
 
     def _refresh_quote_uncached(
         self,
@@ -399,6 +517,26 @@ def _first_row(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _response_body_excerpt(response: httpx.Response | None) -> str:
+    if response is None:
+        return ""
+    try:
+        text = response.text
+    except Exception:
+        return ""
+    return text[:240]
+
+
+def _looks_like_unsupported_symbol(status: int, body: str) -> bool:
+    body_l = str(body or "").lower()
+    return status in {400, 404} and (
+        "invalid symbol" in body_l
+        or "unknown symbol" in body_l
+        or "symbol not found" in body_l
+        or "-1121" in body_l
+    )
 
 
 @dataclass

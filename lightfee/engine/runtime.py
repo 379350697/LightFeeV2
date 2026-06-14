@@ -3852,6 +3852,22 @@ class LiveRuntime:
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates, self.config.strategy, now_ms
             )
+            strategy_tradeable_count = len(tradeable)
+            raw_candidate_count = len(getattr(snapshot, "candidates", []) or [])
+            self.state.last_scan["raw_candidate_count"] = raw_candidate_count
+            self.state.last_scan["strategy_tradeable_count"] = strategy_tradeable_count
+            self.journal.append(
+                "scan.strategy_shortlist_ready",
+                {
+                    "stage": "strategy_passed",
+                    "raw_candidate_count": raw_candidate_count,
+                    "candidate_count": strategy_tradeable_count,
+                    "strategy_tradeable_count": strategy_tradeable_count,
+                    "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
+                    "best_pair_id": tradeable[0].pair_id if tradeable else None,
+                    "ts_ms": now_ms,
+                },
+            )
             tradeable = await self._filter_candidates_supported_by_venue_catalog(
                 tradeable,
             )
@@ -3864,6 +3880,9 @@ class LiveRuntime:
                 tradeable,
                 now_ms=now_ms,
                 stage="shortlist",
+            )
+            self.state.last_scan["catalog_admission_balance_passed_count"] = len(
+                tradeable
             )
             entry_quote_keys: set[tuple[str, str]] = set()
             for candidate in tradeable:
@@ -4087,10 +4106,22 @@ class LiveRuntime:
                 self.journal.append(
                     "scan.shortlist_ready",
                     {
+                        "stage": "execution_freshness_filtered",
+                        "raw_candidate_count": raw_candidate_count,
+                        "strategy_tradeable_count": strategy_tradeable_count,
+                        "tracked_candidate_count": len(tracked_candidates),
                         "candidate_count": len(tradeable),
                         "tradeable_count": len(tradeable),
                         "shortlist_candidate_count": len(tradeable),
                         "shortlist_tradeable_count": len(tradeable),
+                        "quote_truth_must_resolve_count": self.state.last_scan.get(
+                            "quote_truth_must_resolve_count",
+                            0,
+                        ),
+                        "quote_truth_failed_count": self.state.last_scan.get(
+                            "quote_truth_failed_count",
+                            0,
+                        ),
                         "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
                         "best_pair_id": tradeable[0].pair_id if tradeable else None,
                         "ts_ms": now_ms,

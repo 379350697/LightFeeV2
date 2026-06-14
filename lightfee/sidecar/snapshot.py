@@ -93,6 +93,7 @@ class QuoteSnapshot:
     index_price: float = 0.0
     volume_24h_quote: float = 0.0
     open_interest: float = 0.0
+    open_interest_evidence_status: str = "available"
 
 
 @dataclass

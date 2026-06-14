@@ -879,6 +879,7 @@ class MarketDataRuntime:
             "rest_attempt_count": 0,
             "rest_resolved_count": 0,
             "rest_failed_count": 0,
+            "rest_throttled_count": 0,
             "wait_budget_ms": 0,
             "wait_elapsed_ms": 0,
             "resolved_count": 0,
@@ -923,6 +924,9 @@ class MarketDataRuntime:
         )
         self.ctx.state.last_scan["quote_truth_rest_resolved_count"] = int(
             stats.get("rest_resolved_count", 0) or 0
+        )
+        self.ctx.state.last_scan["quote_truth_rest_throttled_count"] = int(
+            stats.get("rest_throttled_count", 0) or 0
         )
         self.ctx.state.last_scan["budget_excluded_without_rest_count"] = int(
             stats.get("budget_excluded_without_rest_count", 0) or 0
@@ -1284,18 +1288,50 @@ class MarketDataRuntime:
         stats["wait_elapsed_ms"] = elapsed_ms
 
         refresher = self._entry_quote_truth_refresher()
+        refresh_quote_result = getattr(refresher, "refresh_quote_result", None)
         refresh_quote = getattr(refresher, "refresh_quote", None)
-        if callable(refresh_quote):
+        if callable(refresh_quote_result) or callable(refresh_quote):
             for key, target in list(unresolved.items()):
                 stats["rest_attempt_count"] += 1
+                refreshed = None
                 try:
-                    refreshed = refresh_quote(
-                        target["venue"],
-                        target["symbol"],
-                        now_ms=now_ms,
-                    )
+                    if callable(refresh_quote_result):
+                        result = refresh_quote_result(
+                            target["venue"],
+                            target["symbol"],
+                            now_ms=now_ms,
+                        )
+                        refreshed = getattr(result, "quote", None)
+                        rest_outcome = str(getattr(result, "outcome", "") or "")
+                        target["rest_outcome"] = rest_outcome
+                        target["venue_symbol"] = str(
+                            getattr(result, "venue_symbol", "") or ""
+                        )
+                        target["url"] = str(getattr(result, "url", "") or "")
+                        target["endpoint"] = str(
+                            getattr(result, "endpoint", "") or "rest_topbook"
+                        )
+                        target["http_status"] = int(
+                            getattr(result, "http_status", 0) or 0
+                        )
+                        target["body_excerpt"] = str(
+                            getattr(result, "body_excerpt", "") or ""
+                        )
+                        target["attempt_interval_outcome"] = str(
+                            getattr(result, "attempt_interval_outcome", "") or ""
+                        )
+                        target["rest_error"] = str(getattr(result, "error", "") or "")
+                        if rest_outcome == "throttled":
+                            stats["rest_throttled_count"] += 1
+                    else:
+                        refreshed = refresh_quote(
+                            target["venue"],
+                            target["symbol"],
+                            now_ms=now_ms,
+                        )
                 except Exception as exc:  # pragma: no cover - defensive telemetry
                     target["rest_error"] = f"{type(exc).__name__}: {exc}"[:240]
+                    target["rest_outcome"] = "http_error"
                     refreshed = None
                 if not self._entry_quote_truth_accept_quote(refreshed, now_ms=now_ms):
                     stats["rest_failed_count"] += 1
@@ -1340,9 +1376,24 @@ class MarketDataRuntime:
 
         for target in unresolved.values():
             stats["failed_count"] += 1
-            if bool(target.get("ws_budget_excluded")) and not callable(refresh_quote):
+            rest_outcome = str(target.get("rest_outcome") or "")
+            if bool(target.get("ws_budget_excluded")) and not (
+                callable(refresh_quote_result) or callable(refresh_quote)
+            ):
                 outcome = "budget_excluded_rest_unavailable"
                 bucket = "budget_excluded_without_rest"
+            elif rest_outcome == "throttled":
+                outcome = "rest_attempt_throttled"
+                bucket = "rest_topbook_attempt_throttled"
+            elif rest_outcome == "unsupported_symbol":
+                outcome = "rest_unsupported_symbol"
+                bucket = "rest_topbook_unsupported_symbol"
+            elif rest_outcome in {"http_error", "parse_error"}:
+                outcome = f"rest_{rest_outcome}"
+                bucket = "rest_topbook_revalidate_failed"
+            elif rest_outcome == "invalid_quote":
+                outcome = "rest_invalid_quote"
+                bucket = "rest_topbook_revalidate_failed"
             elif target.get("rest_error"):
                 outcome = "rest_timeout"
                 bucket = "rest_topbook_revalidate_failed"
@@ -1365,7 +1416,14 @@ class MarketDataRuntime:
                 "source": "entry_quote_truth",
                 "age_ms": age_ms,
                 "budget_ms": self._entry_quote_lease_max_age_ms(),
-                "endpoint": "rest_topbook",
+                "endpoint": str(target.get("endpoint") or "rest_topbook"),
+                "venue_symbol": str(target.get("venue_symbol") or ""),
+                "url": str(target.get("url") or ""),
+                "http_status": int(target.get("http_status") or 0),
+                "body_excerpt": str(target.get("body_excerpt") or ""),
+                "attempt_interval_outcome": str(
+                    target.get("attempt_interval_outcome") or ""
+                ),
                 "rest_error": str(target.get("rest_error") or ""),
                 "ws_budget_excluded": bool(target.get("ws_budget_excluded")),
                 "ts_ms": now_ms,

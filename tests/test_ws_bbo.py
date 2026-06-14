@@ -471,6 +471,73 @@ def test_rest_top_book_refresher_rejects_one_sided_quote():
     assert refresher.refresh_quote("aster", "COSUSDT", now_ms=1778985600000) is None
 
 
+def test_rest_top_book_refresher_reports_structured_resolved_and_throttled_results():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "HEMIUSDT",
+                "bidPrice": "0.065",
+                "askPrice": "0.066",
+                "bidQty": "1000",
+                "askQty": "2000",
+                "time": 1778985599950,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    resolved = refresher.refresh_quote_result(
+        "binance",
+        "HEMIUSDT",
+        now_ms=1778985600000,
+    )
+    throttled = refresher.refresh_quote_result(
+        "binance",
+        "HEMIUSDT",
+        now_ms=1778985600010,
+    )
+
+    assert resolved.outcome == "resolved"
+    assert resolved.quote is not None
+    assert resolved.bid == 0.065
+    assert resolved.ask == 0.066
+    assert resolved.venue_symbol == "HEMIUSDT"
+    assert resolved.url.endswith("/fapi/v1/ticker/bookTicker")
+    assert throttled.outcome == "throttled"
+    assert throttled.attempt_interval_outcome == "min_interval_not_elapsed"
+    assert throttled.quote is None
+
+
+def test_rest_top_book_refresher_reports_unsupported_symbol_separately():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"code": -1121, "msg": "Invalid symbol."},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    result = refresher.refresh_quote_result(
+        "binance",
+        "NOPEUSDT",
+        now_ms=1778985600000,
+    )
+
+    assert result.outcome == "unsupported_symbol"
+    assert result.http_status == 400
+    assert result.quote is None
+
+
 @pytest.mark.asyncio
 async def test_bbo_ws_client_records_subscription_error_control_message():
     from lightfee.marketdata.ws_bbo import OkxBboWsClient, VenueBboCache

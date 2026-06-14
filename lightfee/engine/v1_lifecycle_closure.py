@@ -1141,6 +1141,7 @@ _EVENT_KIND_PHASES = {
     "runtime.reconciling": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "scan.no_entry_diagnostics": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "scan.strategy_shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "startup.order_path_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "startup.trading_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,

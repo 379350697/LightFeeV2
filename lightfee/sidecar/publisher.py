@@ -97,6 +97,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "index_price": q.index_price,
                 "volume_24h_quote": q.volume_24h_quote,
                 "open_interest": q.open_interest,
+                "open_interest_evidence_status": q.open_interest_evidence_status,
             }
             for k, q in s.quotes.items()
         },

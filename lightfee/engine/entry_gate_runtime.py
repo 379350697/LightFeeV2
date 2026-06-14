@@ -1083,6 +1083,7 @@ class EntryGateRuntime:
         observed_open_interest_quote: float,
         min_open_interest_quote: float,
         state_record: dict | None = None,
+        open_interest_evidence_status: str = "available",
     ) -> dict:
         observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
         age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
@@ -1105,10 +1106,14 @@ class EntryGateRuntime:
             "min_volume_24h_quote": min_volume_24h_quote,
             "observed_open_interest_quote": observed_open_interest_quote,
             "min_open_interest_quote": min_open_interest_quote,
+            "open_interest_evidence_status": open_interest_evidence_status,
             "eligibility_class": eligibility_class,
             "floor": min_open_interest_quote,
             "current_value": observed_open_interest_quote,
-            "targeted_revalidate_required": reason == "perp_open_interest_structural",
+            "targeted_revalidate_required": reason in {
+                "perp_open_interest_structural",
+                "oi_evidence_unavailable",
+            },
             "targeted_revalidate_scope": "entry_candidate",
         }
         if state_record:
@@ -1165,17 +1170,48 @@ class EntryGateRuntime:
             observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
             volume_24h_quote = float(getattr(quote, "volume_24h_quote", 0.0) or 0.0)
             open_interest_quote = float(getattr(quote, "open_interest", 0.0) or 0.0)
+            open_interest_evidence_status = str(
+                getattr(quote, "open_interest_evidence_status", "available")
+                or "available"
+            ).lower()
             volume_floor = self._entry_liquidity_volume_floor_quote(venue)
             open_interest_floor = self._entry_liquidity_open_interest_floor_quote(venue)
             current_class = state.current_class(venue, symbol, now_ms=now_ms)
 
-            if record_result:
+            if record_result and open_interest_evidence_status == "available":
                 state.note_open_interest_observation(
                     venue,
                     symbol,
                     open_interest_quote,
                     observed_at_ms=observed_at_ms,
                 )
+
+            if (
+                open_interest_floor > 0.0
+                and open_interest_evidence_status != "available"
+            ):
+                decisions.append(
+                    self._entry_liquidity_decision_payload(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        fallback_source=fallback_source,
+                        reason="oi_evidence_unavailable",
+                        decision="skip_entry",
+                        event_kind="execution.entry_liquidity_blocked",
+                        eligibility_class=(
+                            EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR.value
+                        ),
+                        observed_volume_24h_quote=volume_24h_quote,
+                        min_volume_24h_quote=volume_floor,
+                        observed_open_interest_quote=open_interest_quote,
+                        min_open_interest_quote=open_interest_floor,
+                        open_interest_evidence_status=open_interest_evidence_status,
+                    )
+                )
+                continue
 
             if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY:
                 if not record_result or not state.should_probe_structural(
@@ -1210,6 +1246,7 @@ class EntryGateRuntime:
                             observed_open_interest_quote=open_interest_quote,
                             min_open_interest_quote=open_interest_floor,
                             state_record=state_record,
+                            open_interest_evidence_status=open_interest_evidence_status,
                         )
                     )
                     continue
@@ -1233,6 +1270,7 @@ class EntryGateRuntime:
                         min_volume_24h_quote=volume_floor,
                         observed_open_interest_quote=open_interest_quote,
                         min_open_interest_quote=open_interest_floor,
+                        open_interest_evidence_status=open_interest_evidence_status,
                     )
                 )
 
@@ -1279,6 +1317,7 @@ class EntryGateRuntime:
                         observed_open_interest_quote=open_interest_quote,
                         min_open_interest_quote=open_interest_floor,
                         state_record=state_record,
+                        open_interest_evidence_status=open_interest_evidence_status,
                     )
                 )
                 continue
@@ -1555,6 +1594,40 @@ class EntryGateRuntime:
                 last_scan.get("top_quote_blocker_buckets", {}) or {}
             ),
         }
+        pipeline_counts = {
+            "raw_candidates": int(
+                last_scan.get(
+                    "raw_candidate_count",
+                    len(getattr(snapshot, "candidates", []) or []),
+                )
+                or 0
+            ),
+            "strategy_passed": int(last_scan.get("strategy_tradeable_count", 0) or 0),
+            "catalog_admission_balance_passed": int(
+                last_scan.get(
+                    "catalog_admission_balance_passed_count",
+                    last_scan.get(
+                        "snapshot_freshness_all_candidate_count",
+                        len(tradeable),
+                    ),
+                )
+                or 0
+            ),
+            "v1_primary_shadow_tracked": int(
+                last_scan.get("snapshot_freshness_candidate_count", 0) or 0
+            ),
+            "quote_oi_truth_must_resolve": int(
+                last_scan.get("quote_truth_must_resolve_count", 0) or 0
+            ),
+            "quote_oi_truth_resolved": int(
+                last_scan.get("quote_truth_resolved_count", 0) or 0
+            ),
+            "quote_oi_truth_failed": int(
+                last_scan.get("quote_truth_failed_count", 0) or 0
+            ),
+            "selected": int(selected_candidate_count),
+            "dispatched": int(dispatched_candidate_count),
+        }
 
         payload = {
             "reason": reason,
@@ -1571,6 +1644,7 @@ class EntryGateRuntime:
             "tradeable_count": len(tradeable),
             "selected_candidate_count": selected_candidate_count,
             "dispatched_candidate_count": dispatched_candidate_count,
+            "pipeline_counts": pipeline_counts,
             "max_concurrent_positions": max_concurrent_positions,
             "open_position_count": open_position_count,
             "remaining_slots": normalized_remaining_slots,

@@ -45,6 +45,7 @@ class ExchangeSource:
             index_price=ft.index_price,
             volume_24h_quote=ft.volume_24h_quote,
             open_interest=ft.open_interest_quote,
+            open_interest_evidence_status=ft.open_interest_evidence_status,
         )
 
     async def fetch_funding_rates(self, symbols: list[str]) -> dict[str, float]:

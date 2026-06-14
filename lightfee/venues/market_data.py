@@ -41,6 +41,7 @@ class FundingTicker:
     funding_timestamp_ms: int = 0
     volume_24h_quote: float = 0.0
     open_interest_quote: float = 0.0
+    open_interest_evidence_status: str = "available"
 
 
 @dataclass(frozen=True)
@@ -72,8 +73,9 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS = 50
-
+# V1 parity: Binance-compatible OI is a per-symbol endpoint, fetched with bounded
+# concurrency and normalized to quote notional via premiumIndex mark price.
+_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY = 16
 # V1 parity: per-symbol OKX funding-rate concurrency limit
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
@@ -415,11 +417,13 @@ class MarketDataClient:
                 if sym in venue_sym_to_canon:
                     vol_map[sym] = _safe_float(item.get("quoteVolume", item.get("volume", 0)))
 
-        # 4. openInterest. Binance-compatible venues expose this per symbol;
-        # failures must not drop otherwise usable quote rows.
+        # 4. openInterest. Binance-compatible venues expose this per symbol.
+        # V1 computes quote-notional OI as openInterest * markPrice. Transient
+        # endpoint failures are evidence-unavailable, not a structural zero.
         oi_map: dict[str, float] = {}
-        if spec.open_interest_path and len(venue_sym_to_canon) <= MAX_PER_SYMBOL_ENRICHMENT_SYMBOLS:
-            sem = asyncio.Semaphore(16)
+        oi_evidence_status: dict[str, str] = {}
+        if spec.open_interest_path:
+            sem = asyncio.Semaphore(_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY)
 
             async def _fetch_oi(venue_sym: str) -> None:
                 async with sem:
@@ -429,12 +433,28 @@ class MarketDataClient:
                             params={"symbol": venue_sym},
                         )
                     except PublicTransportError:
+                        oi_evidence_status[venue_sym] = "unavailable"
                         return
                     item = raw_oi[0] if isinstance(raw_oi, list) and raw_oi else raw_oi
                     if isinstance(item, dict):
-                        oi_map[venue_sym] = _safe_float(item.get("openInterest", 0))
+                        open_interest = _safe_float(item.get("openInterest", 0))
+                        mark_price = _safe_float(
+                            pi_map.get(venue_sym, {}).get("markPrice", 0)
+                        )
+                        if mark_price > 0.0:
+                            oi_map[venue_sym] = open_interest * mark_price
+                            oi_evidence_status[venue_sym] = "available"
+                        else:
+                            oi_evidence_status[venue_sym] = "unavailable"
+                        return
+                    oi_evidence_status[venue_sym] = "unavailable"
 
             await asyncio.gather(*[_fetch_oi(sym) for sym in venue_sym_to_canon])
+        else:
+            oi_evidence_status = {
+                venue_sym: "unsupported"
+                for venue_sym in venue_sym_to_canon
+            }
 
         result: dict[str, FundingTicker] = {}
         for venue_sym, canon in venue_sym_to_canon.items():
@@ -456,6 +476,10 @@ class MarketDataClient:
                 funding_timestamp_ms=int(_safe_float(pi.get("nextFundingTime", 0))),
                 volume_24h_quote=vol_map.get(venue_sym, 0.0),
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
+                open_interest_evidence_status=oi_evidence_status.get(
+                    venue_sym,
+                    "unavailable" if spec.open_interest_path else "unsupported",
+                ),
             )
         return result
 

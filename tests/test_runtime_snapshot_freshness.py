@@ -1131,6 +1131,118 @@ async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_ex
     assert all(payload["age_ms"] is not None for payload in failures)
     assert all(payload["budget_ms"] == 100 for payload in failures)
     assert all(payload["ws_budget_excluded"] is True for payload in failures)
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote(
+    tmp_path,
+    monkeypatch,
+):
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5_000,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.last_scan = {}
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    async def prewarm_without_quotes(candidates, prewarm_now_ms):
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("okx", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = set()
+
+    class ThrottledRefresher:
+        def refresh_quote_result(self, venue: str, symbol: str, *, now_ms: int):
+            return RestTopBookQuoteResult(
+                venue=venue,
+                symbol=symbol,
+                venue_symbol=symbol,
+                outcome="throttled",
+                endpoint="rest_topbook",
+                url=f"https://example.invalid/{venue}/{symbol}",
+                attempt_interval_outcome="min_interval_not_elapsed",
+            )
+
+    runtime.ws_bbo_rest_refresher = ThrottledRefresher()
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        prewarm_without_quotes,
+    )
+    monkeypatch.setattr(runtime, "_entry_quote_lease_max_age_ms", lambda: 0)
+
+    runtime.journal.open()
+    try:
+        overlay, stats = await runtime._entry_quote_revalidate_for_candidates(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+            candidate_scope="v1_primary_shadow",
+        )
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    failures = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_revalidate_failed"
+    ]
+
+    assert overlay == {}
+    assert stats["rest_throttled_count"] == 2
+    assert {payload["outcome"] for payload in failures} == {"rest_attempt_throttled"}
+    assert all(
+        payload["attempt_interval_outcome"] == "min_interval_not_elapsed"
+        for payload in failures
+    )
+    assert "rest_invalid_quote" not in {payload["outcome"] for payload in failures}
     assert all(payload["rest_error"] == "" for payload in failures)
     assert all(payload["endpoint"] == "rest_topbook" for payload in failures)
 
@@ -1490,6 +1602,57 @@ def test_scan_no_entry_diagnostics_compacts_repeated_high_level_reason(tmp_path)
     assert diagnostics[1]["tradeable_count"] == 7
     assert "candidates" not in diagnostics[1]
     assert diagnostics[1]["suppressed_full_payload_count"] == 1
+
+
+def test_scan_no_entry_pipeline_counts_use_catalog_admission_balance_stage(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = SidecarSnapshot(
+        candidates=[_freshness_candidate(f"RAW{idx}USDT") for idx in range(8)]
+    )
+    tradeable = [_freshness_candidate(f"PASSED{idx}USDT") for idx in range(3)]
+    runtime.state.last_scan = {}
+    runtime.state.last_scan.update(
+        {
+            "raw_candidate_count": 8,
+            "strategy_tradeable_count": 5,
+            "catalog_admission_balance_passed_count": 3,
+            "snapshot_freshness_all_candidate_count": 0,
+            "snapshot_freshness_candidate_count": 0,
+        }
+    )
+
+    runtime.journal.open()
+    try:
+        runtime._emit_scan_no_entry_diagnostics(
+            reason="no_tradeable_candidates",
+            snapshot=snapshot,
+            tradeable=tradeable,
+            selected_candidate_count=0,
+            dispatched_candidate_count=0,
+            remaining_slots=1,
+            tradeable_selection_blocker_counts=Counter(),
+            candidate_blockers={},
+            now_ms=70000,
+        )
+    finally:
+        runtime.journal.close()
+
+    diagnostic = next(
+        record["payload"]
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert diagnostic["pipeline_counts"][
+        "catalog_admission_balance_passed"
+    ] == len(tradeable)
 
 
 def test_runtime_snapshot_freshness_status_includes_transfer_domain(tmp_path):
@@ -2476,6 +2639,103 @@ def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_pa
     assert decision["observed_open_interest_quote"] == 900000.0
     assert decision["min_open_interest_quote"] == 1000000.0
     assert decision["eligibility_class"] == "temporary_below_floor"
+
+
+def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="unavailable",
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == []
+    assert runtime.state.entry_liquidity_qualification_records == [
+        {
+            "venue": "bybit",
+            "symbol": "BTCUSDT",
+            "consecutive_failures": 0,
+            "last_failure_at_ms": None,
+            "suppress_until_ms": None,
+            "last_class": "eligible",
+            "last_observed_open_interest_quote": 2000000,
+            "last_observed_open_interest_at_ms": 69000,
+            "last_structural_probe_at_ms": None,
+        }
+    ]
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    decision = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "oi_evidence_unavailable"
+    )
+    assert decision["decision"] == "skip_entry"
+    assert decision["targeted_revalidate_required"] is True
+    assert decision["open_interest_evidence_status"] == "unavailable"
+    assert not any(
+        record["payload"].get("reason") == "perp_open_interest_structural"
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    )
 
 
 def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tmp_path):

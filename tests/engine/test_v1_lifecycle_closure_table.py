@@ -344,6 +344,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.candidate_symbol_skipped",
         "runtime.candidates_tradeable",
         "runtime.tradeable_candidates_catalog_filtered",
+        "scan.strategy_shortlist_ready",
         "scan.shortlist_ready",
         "execution.entry_liquidity_advisory",
         "execution.entry_liquidity_blocked",
