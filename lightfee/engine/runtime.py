@@ -54,6 +54,10 @@ from lightfee.engine.loop_control import (
     maybe_export_current_state_snapshot,
     maybe_export_runtime_metrics,
 )
+from lightfee.engine.order_truth_ledger import (
+    ORDER_TRUTH_LEDGER,
+    OrderTruthFillStatus,
+)
 from lightfee.engine.recovery import (
     recover_from_snapshot,
     build_recovery_dedup_index,
@@ -8394,7 +8398,21 @@ class LiveRuntime:
                 if reconciliation is not None
                 else 0.0
             )
-            if reconciliation is not None and reconciliation_quantity > 0:
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=hedge_venue,
+                symbol=pending.symbol,
+                order_id="",
+                client_order_id=hedge_client_order_id,
+                target_qty=normalized,
+                reconciliation=reconciliation,
+                metadata=(
+                    getattr(reconciliation, "metadata", None)
+                    if reconciliation is not None
+                    else None
+                ),
+            )
+            reconciliation_quantity = truth_decision.reconciled_qty
+            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 fill_qty = reconciliation_quantity
                 pending.hedge_leg_filled += fill_qty
                 pending.consume_hedge_quantity_fifo(fill_qty)
@@ -8430,6 +8448,12 @@ class LiveRuntime:
                     ),
                     "fill_reconciliation_error": reconciliation_error_text,
                     "fill_reconciliation_quantity": reconciliation_quantity,
+                    "order_truth_fill_status": truth_decision.fill_status.value,
+                    "order_truth_evidence_status": truth_decision.evidence_status.value,
+                    "order_truth_decision": truth_decision.decision,
+                    "order_truth_missing_evidence": list(
+                        truth_decision.missing_evidence
+                    ),
                 },
             )
             return False
@@ -8674,7 +8698,21 @@ class LiveRuntime:
                 if reconciliation is not None
                 else 0.0
             )
-            if reconciliation is not None and reconciliation_quantity > 0:
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=hedge_venue,
+                symbol=pending.symbol,
+                order_id="",
+                client_order_id=hedge_cloid,
+                target_qty=normalized,
+                reconciliation=reconciliation,
+                metadata=(
+                    getattr(reconciliation, "metadata", None)
+                    if reconciliation is not None
+                    else None
+                ),
+            )
+            reconciliation_quantity = truth_decision.reconciled_qty
+            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 fill_qty = reconciliation_quantity
                 pending.hedge_leg_filled += fill_qty
                 pending.consume_hedge_quantity_fifo(fill_qty)
@@ -8770,6 +8808,12 @@ class LiveRuntime:
                 ),
                 "fill_reconciliation_client_order_id": hedge_cloid,
                 "fill_reconciliation_quantity": reconciliation_quantity,
+                "order_truth_fill_status": truth_decision.fill_status.value,
+                "order_truth_evidence_status": truth_decision.evidence_status.value,
+                "order_truth_decision": truth_decision.decision,
+                "order_truth_missing_evidence": list(
+                    truth_decision.missing_evidence
+                ),
             }
             error_payload.update(
                 self._order_submit_error_runtime_evidence(
@@ -8850,7 +8894,40 @@ class LiveRuntime:
             if reconciliation is None:
                 return
             reconciliation_by_leg[label] = reconciliation
-            qty = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=venue,
+                symbol=pending.symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                target_qty=float(getattr(reconciliation, "quantity", 0.0) or 0.0),
+                reconciliation=reconciliation,
+                metadata=getattr(reconciliation, "metadata", None),
+            )
+            if truth_decision.fill_status != OrderTruthFillStatus.CONFIRMED_FILL:
+                self.journal.append(
+                    "pending_entry.finalize_fill_truth_gap",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "leg": label,
+                        "venue": venue.value,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "order_truth_fill_status": truth_decision.fill_status.value,
+                        "order_truth_evidence_status": (
+                            truth_decision.evidence_status.value
+                        ),
+                        "order_truth_decision": truth_decision.decision,
+                        "order_truth_missing_evidence": list(
+                            truth_decision.missing_evidence
+                        ),
+                        "reconciliation_metadata": getattr(
+                            reconciliation, "metadata", None
+                        ),
+                    },
+                )
+                return
+            qty = truth_decision.reconciled_qty
             avg_price = float(
                 getattr(reconciliation, "average_price", 0.0)
                 or getattr(reconciliation, "price", 0.0)

@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest unified order truth resolver and lifecycle mapping, 2026-06-15:
+CL-078/CL-079/CL-080 closed the HOME live artifact path, but the order-success
+decision was still too distributed: pending-entry recovery, pending finalize,
+passive close ACK reconciliation, duplicate cleanup, diagnose, and health could
+each interpret ACK, order detail, local reconciliation, fills/executions, and
+live position truth in their own way. The 2026-06-15 fix introduces
+`OrderTruthLedger.resolve_order_success()` as the shared local evidence gate.
+Only positive fill/execution reconciliation can produce `confirmed_fill`;
+OKX detail-only `accFillSz`, Bybit ACK/realtime without executions,
+Binance/Aster `NEW` or zero executed quantity, ambiguous Gate detail, Bitget
+missing side/family, and Hyperliquid account/oid identity gaps become
+`truth_gap` or `unsupported_fail_closed` instead of fake success. Runtime
+pending-entry recovery/finalize and passive-close ACK/error reconciliation now
+consume that resolver, and lifecycle closure maps the newly observed
+order-truth/reconciliation/drift events instead of leaving them unmapped.
+Full evidence is recorded in
+[`daily/2026-06-15.md#cluster-cl-081-unified-order-truth-resolver-and-lifecycle-closure-event-mapping`](daily/2026-06-15.md#cluster-cl-081-unified-order-truth-resolver-and-lifecycle-closure-event-mapping).
+
 Latest HOME owned-conflict cleanup follow-up, 2026-06-14:
 CL-079 proved the historical HOME Bybit short was owned by the positive-fill
 pending conflict, but post-deploy runtime evidence showed it still was not

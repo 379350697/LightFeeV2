@@ -54,7 +54,7 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     is_order_truth_gap,
 )
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
 from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
@@ -2426,7 +2426,21 @@ class PassiveCloseExecutor:
 
                 recon_qty_raw = getattr(reconciliation, "quantity", 0.0) if reconciliation is not None else 0.0
                 recon_qty = float(recon_qty_raw) if isinstance(recon_qty_raw, (int, float)) else 0.0
-                if recon_qty > 1e-12:
+                truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                    venue=hedge_venue,
+                    symbol=position.symbol,
+                    order_id=accepted_order_id,
+                    client_order_id=accepted_client_order_id,
+                    target_qty=normalized_delta,
+                    reconciliation=reconciliation,
+                    metadata=(
+                        getattr(reconciliation, "metadata", None)
+                        if reconciliation is not None
+                        else None
+                    ),
+                )
+                recon_qty = truth_decision.reconciled_qty
+                if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                     fill_reconciliation_result = "filled"
                     recon_price_raw = getattr(reconciliation, "average_price", hedge_price or 0.0)
                     recon_price = float(recon_price_raw) if isinstance(recon_price_raw, (int, float)) else (hedge_price or 0.0)
@@ -2501,6 +2515,14 @@ class PassiveCloseExecutor:
                             "hedge_leg": hedge_leg_label,
                             "client_order_id": hedge_cid,
                             "error": str(e),
+                            "order_truth_fill_status": truth_decision.fill_status.value,
+                            "order_truth_evidence_status": (
+                                truth_decision.evidence_status.value
+                            ),
+                            "order_truth_decision": truth_decision.decision,
+                            "order_truth_missing_evidence": list(
+                                truth_decision.missing_evidence
+                            ),
                         },
                     )
                 elif not fill_reconciliation_result:
@@ -2538,6 +2560,26 @@ class PassiveCloseExecutor:
                     fill_reconciliation_result or "not_attempted"
                 )
                 hedge_error_payload["fill_reconciliation_client_order_id"] = hedge_cid
+                hedge_error_payload["order_truth_fill_status"] = (
+                    truth_decision.fill_status.value
+                    if fill_reconciliation_attempted
+                    else "not_attempted"
+                )
+                hedge_error_payload["order_truth_evidence_status"] = (
+                    truth_decision.evidence_status.value
+                    if fill_reconciliation_attempted
+                    else "unavailable"
+                )
+                hedge_error_payload["order_truth_decision"] = (
+                    truth_decision.decision
+                    if fill_reconciliation_attempted
+                    else "retain_backoff"
+                )
+                hedge_error_payload["order_truth_missing_evidence"] = (
+                    list(truth_decision.missing_evidence)
+                    if fill_reconciliation_attempted
+                    else []
+                )
                 self._register_accepted_order_truth_gap(
                     state,
                     pending,
@@ -2603,7 +2645,21 @@ class PassiveCloseExecutor:
                 if isinstance(recon_qty_raw, (int, float))
                 else 0.0
             )
-            if recon_qty > 1e-12:
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=hedge_venue,
+                symbol=position.symbol,
+                order_id=ack_order_id,
+                client_order_id=ack_client_order_id,
+                target_qty=normalized_delta,
+                reconciliation=reconciliation,
+                metadata=(
+                    getattr(reconciliation, "metadata", None)
+                    if reconciliation is not None
+                    else None
+                ),
+            )
+            recon_qty = truth_decision.reconciled_qty
+            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 recon_price_raw = getattr(
                     reconciliation, "average_price", hedge_price or 0.0,
                 )
@@ -2671,6 +2727,14 @@ class PassiveCloseExecutor:
                         "error" if reconciliation_error else "missing_or_zero_fill"
                     ),
                     "fill_reconciliation_error": reconciliation_error,
+                    "order_truth_fill_status": truth_decision.fill_status.value,
+                    "order_truth_evidence_status": (
+                        truth_decision.evidence_status.value
+                    ),
+                    "order_truth_decision": truth_decision.decision,
+                    "order_truth_missing_evidence": list(
+                        truth_decision.missing_evidence
+                    ),
                     "decision": "retain_pending_without_resubmit",
                 },
             )

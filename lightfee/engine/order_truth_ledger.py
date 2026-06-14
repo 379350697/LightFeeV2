@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
+from typing import Any, Mapping
 
 from lightfee.core.domain import Venue
 from lightfee.core.errors import OrderSubmitError
@@ -37,6 +38,24 @@ PRIVATE_WS_TRUTH_TOPICS: dict[Venue, dict[str, str]] = {
 }
 
 
+class OrderTruthFillStatus(StrEnum):
+    """Explicit exchange-truth result for order success decisions."""
+
+    CONFIRMED_FILL = "confirmed_fill"
+    CONFIRMED_NO_FILL = "confirmed_no_fill"
+    TRUTH_GAP = "truth_gap"
+    LIVE_POSITION_PRESENT = "live_position_present"
+    LIVE_FLAT = "live_flat"
+    UNSUPPORTED_FAIL_CLOSED = "unsupported_fail_closed"
+
+
+class OrderTruthEvidenceStatus(StrEnum):
+    """Whether the fill decision is backed by fresh exchange truth."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class OrderTruthDecision:
     """Owner-neutral next action for uncertain order truth."""
@@ -63,6 +82,35 @@ class OrderTruthDecision:
     @property
     def should_retry_with_new_client_id(self) -> bool:
         return self.decision == "retry_new_client_order_id" and self.retry_qty > 1e-9
+
+
+@dataclass(frozen=True)
+class OrderTruthSuccessDecision:
+    """Order success decision with fill truth separated from weak order evidence."""
+
+    fill_status: OrderTruthFillStatus
+    evidence_status: OrderTruthEvidenceStatus
+    decision: str
+    venue: Venue | None = None
+    symbol: str = ""
+    target_qty: float = 0.0
+    reconciled_qty: float = 0.0
+    live_qty: float = 0.0
+    remaining_qty: float = 0.0
+    order_id: str = ""
+    client_order_id: str = ""
+    average_price: float = 0.0
+    queried_endpoints: tuple[str, ...] = ()
+    missing_evidence: tuple[str, ...] = ()
+    response_classification: str = ""
+    terminal_without_truth: bool = False
+
+    @property
+    def confirmed_fill(self) -> bool:
+        return (
+            self.fill_status == OrderTruthFillStatus.CONFIRMED_FILL
+            and self.reconciled_qty > 1e-9
+        )
 
 
 class OrderTruthLedger:
@@ -203,6 +251,172 @@ class OrderTruthLedger:
             state="unresolved",
             classification=status_text or "truth_gap",
             decision="backoff_recheck",
+        )
+
+    def resolve_order_success(
+        self,
+        *,
+        venue: Venue,
+        symbol: str,
+        order_id: str = "",
+        client_order_id: str = "",
+        target_qty: float = 0.0,
+        reconciliation: Any = None,
+        metadata: Mapping[str, Any] | None = None,
+        live_position: Any = None,
+        open_order_present: bool | None = None,
+    ) -> OrderTruthSuccessDecision:
+        """Resolve order success from fill truth, live truth, and weak evidence.
+
+        ACKs, order-detail status, and positive detail-only counters are not fill
+        proof. A confirmed fill requires a positive reconciliation quantity from
+        an exchange fill/execution path or a venue adapter that has already
+        normalized fill truth into OrderFillReconciliation.
+        """
+
+        reconciliation_metadata = (
+            getattr(reconciliation, "metadata", None)
+            if reconciliation is not None
+            else None
+        )
+        merged_metadata: dict[str, Any] = {}
+        if isinstance(reconciliation_metadata, Mapping):
+            merged_metadata.update(reconciliation_metadata)
+        if isinstance(metadata, Mapping):
+            merged_metadata.update(metadata)
+
+        reconciled_qty = _positive_float(getattr(reconciliation, "quantity", 0.0))
+        target_qty = max(_positive_float(target_qty), 0.0)
+        live_qty = _positive_float(getattr(live_position, "quantity", 0.0))
+        average_price = _positive_float(
+            getattr(
+                reconciliation,
+                "average_price",
+                getattr(reconciliation, "price", 0.0),
+            )
+        )
+        resolved_order_id = str(
+            getattr(reconciliation, "order_id", "") or order_id or ""
+        )
+        resolved_client_order_id = str(
+            getattr(reconciliation, "client_order_id", None)
+            or client_order_id
+            or ""
+        )
+        endpoints = _tuple_texts(merged_metadata.get("queried_endpoints"))
+        classification = str(
+            merged_metadata.get("response_classification")
+            or merged_metadata.get("classification")
+            or merged_metadata.get("raw_exchange_status")
+            or ""
+        )
+        evidence_source = str(merged_metadata.get("evidence_source") or "")
+        raw_status = str(merged_metadata.get("raw_exchange_status") or "")
+        classification_text = " ".join(
+            part.lower()
+            for part in (classification, evidence_source, raw_status)
+            if part
+        )
+
+        if _classification_is_fail_closed(classification_text):
+            return OrderTruthSuccessDecision(
+                fill_status=OrderTruthFillStatus.UNSUPPORTED_FAIL_CLOSED,
+                evidence_status=OrderTruthEvidenceStatus.UNAVAILABLE,
+                decision="retain_fail_closed",
+                venue=venue,
+                symbol=symbol,
+                target_qty=target_qty,
+                live_qty=live_qty,
+                remaining_qty=target_qty,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_order_id,
+                queried_endpoints=endpoints,
+                missing_evidence=("supported_fill_truth",),
+                response_classification=classification,
+                terminal_without_truth=False,
+            )
+
+        if (
+            reconciliation is not None
+            and reconciled_qty > 1e-9
+            and not _classification_is_weak_fill_source(classification_text)
+        ):
+            return OrderTruthSuccessDecision(
+                fill_status=OrderTruthFillStatus.CONFIRMED_FILL,
+                evidence_status=OrderTruthEvidenceStatus.AVAILABLE,
+                decision="terminal_fill",
+                venue=venue,
+                symbol=symbol,
+                target_qty=target_qty,
+                reconciled_qty=reconciled_qty,
+                live_qty=live_qty,
+                remaining_qty=max(target_qty - reconciled_qty, 0.0),
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_order_id,
+                average_price=average_price,
+                queried_endpoints=endpoints,
+                response_classification=classification,
+                terminal_without_truth=False,
+            )
+
+        if live_qty > 1e-9:
+            return OrderTruthSuccessDecision(
+                fill_status=OrderTruthFillStatus.LIVE_POSITION_PRESENT,
+                evidence_status=OrderTruthEvidenceStatus.AVAILABLE,
+                decision="retain_owned_cleanup",
+                venue=venue,
+                symbol=symbol,
+                target_qty=target_qty,
+                live_qty=live_qty,
+                remaining_qty=target_qty,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_order_id,
+                queried_endpoints=endpoints,
+                missing_evidence=("fill_confirmation",),
+                response_classification=classification,
+                terminal_without_truth=False,
+            )
+
+        if "live_flat" in classification_text or (
+            open_order_present is False and "no_open_order" in classification_text
+        ):
+            return OrderTruthSuccessDecision(
+                fill_status=OrderTruthFillStatus.LIVE_FLAT,
+                evidence_status=OrderTruthEvidenceStatus.AVAILABLE,
+                decision="terminal_no_fill",
+                venue=venue,
+                symbol=symbol,
+                target_qty=target_qty,
+                live_qty=live_qty,
+                remaining_qty=target_qty,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_order_id,
+                queried_endpoints=endpoints,
+                missing_evidence=(),
+                response_classification=classification,
+                terminal_without_truth=False,
+            )
+
+        missing_evidence = _missing_order_truth_evidence(
+            venue=venue,
+            classification_text=classification_text,
+            endpoints=endpoints,
+        )
+        return OrderTruthSuccessDecision(
+            fill_status=OrderTruthFillStatus.TRUTH_GAP,
+            evidence_status=OrderTruthEvidenceStatus.UNAVAILABLE,
+            decision="retain_backoff",
+            venue=venue,
+            symbol=symbol,
+            target_qty=target_qty,
+            live_qty=live_qty,
+            remaining_qty=target_qty,
+            order_id=resolved_order_id,
+            client_order_id=resolved_client_order_id,
+            queried_endpoints=endpoints,
+            missing_evidence=missing_evidence,
+            response_classification=classification,
+            terminal_without_truth=False,
         )
 
     def duplicate_reconcile_state(self, *, classification: str, decision: str) -> str:
@@ -494,6 +708,8 @@ class OrderTruthLedger:
 
 
 def _positive_float(value: Any) -> float:
+    if value is None or not isinstance(value, (int, float, str)):
+        return 0.0
     try:
         parsed = float(value or 0.0)
     except (TypeError, ValueError):
@@ -501,6 +717,90 @@ def _positive_float(value: Any) -> float:
     if parsed < 0.0:
         return abs(parsed)
     return parsed
+
+
+def _tuple_texts(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, Mapping):
+        return tuple(str(key) for key in value if str(key))
+    try:
+        return tuple(str(item) for item in value if str(item))
+    except TypeError:
+        text = str(value)
+        return (text,) if text else ()
+
+
+def _classification_is_fail_closed(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "positive_quantity_missing_side",
+            "missing_side",
+            "invalid_side",
+            "family_unresolved",
+            "account_identity_mismatch",
+            "account_mismatch",
+            "account_address_missing",
+            "unsupported_fail_closed",
+            "unsupported",
+        )
+    )
+
+
+def _classification_is_weak_fill_source(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "okx_order_detail",
+            "bybit_order_realtime",
+            "bybit_order_history",
+            "binance_order_status",
+            "aster_order_status",
+            "bitget_order_detail",
+            "gate_order_detail",
+            "detail_found;fills_empty",
+            "fills_empty",
+            "execution_not_found",
+            "accepted_ack_without_execution",
+            "stale_accepted_order",
+            "new",
+            "pending_new",
+        )
+    )
+
+
+def _missing_order_truth_evidence(
+    *,
+    venue: Venue,
+    classification_text: str,
+    endpoints: tuple[str, ...],
+) -> tuple[str, ...]:
+    missing: list[str] = []
+    endpoint_text = " ".join(endpoint.lower() for endpoint in endpoints)
+    if venue == Venue.OKX and "fills" not in endpoint_text:
+        missing.append("okx_fills_or_fills_history")
+    elif venue == Venue.BYBIT and "execution" not in endpoint_text:
+        missing.append("bybit_execution_list")
+    elif venue in {Venue.BINANCE, Venue.ASTER}:
+        missing.extend(("executed_qty_positive", "open_order_or_position_truth"))
+    elif venue == Venue.BITGET:
+        missing.append("bitget_fill_truth_with_side_and_family")
+    elif venue == Venue.GATE:
+        missing.append("gate_order_open_position_truth")
+    elif venue == Venue.HYPERLIQUID:
+        missing.append("hyperliquid_configured_account_order_truth")
+    if "fills_empty" in classification_text or "execution_not_found" in classification_text:
+        missing.append("positive_exchange_fill")
+    if "stale_accepted_order" in classification_text or "new" in classification_text:
+        missing.append("terminal_order_or_live_position_truth")
+    if "accepted_ack" in classification_text or "ack_without_execution" in classification_text:
+        missing.append("post_ack_execution_truth")
+    if not missing:
+        missing.append("fill_confirmation")
+    return tuple(dict.fromkeys(missing))
 
 
 ORDER_TRUTH_LEDGER = OrderTruthLedger()

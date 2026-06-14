@@ -1147,8 +1147,12 @@ _EVENT_KIND_PHASES = {
     "startup.trading_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "entry.opened": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.position_opened": V1LifecycleClosurePhase.OPEN_POSITION.value,
+    "runtime.position_drift_corrected": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "exit.accepted_order_truth_gap_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.pending_close_reconciliation_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.reconciled": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.passive_close_fallback_terminal_flat": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.passive_close_recovery_probe_flat": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.passive_close_hedge_duplicate_client_order_reconciled": (
@@ -1197,6 +1201,9 @@ _EVENT_KIND_PHASES = {
     "entry.cleanup_leg_exposure": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.aborted": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.passive_unfilled": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "reconciliation.entry_abandon_retained_unresolved_maker": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "reconciliation.entry_flat_unresolved_maker_retained": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "review.candidate_shortlisted": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.active_position_tick": V1LifecycleClosurePhase.OPEN_POSITION.value,

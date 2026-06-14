@@ -11,7 +11,12 @@ from lightfee.engine.bybit_duplicate_reconcile import (
     build_order_reconcile_result_payload,
     reconcile_bybit_duplicate_client_order,
 )
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthDecision
+from lightfee.engine.order_truth_ledger import (
+    ORDER_TRUTH_LEDGER,
+    OrderTruthDecision,
+    OrderTruthEvidenceStatus,
+    OrderTruthFillStatus,
+)
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
@@ -102,6 +107,148 @@ def test_hyperliquid_truth_gap_documents_account_address_info_endpoint():
     assert paths["open_order_truth"] == "POST /info openOrders"
     assert paths["live_position_probe"] == "POST /info clearinghouseState"
     assert paths["account_identity"] == "configured_account_address_not_agent_wallet"
+
+
+@pytest.mark.parametrize(
+    ("venue", "metadata", "expected_status", "expected_decision"),
+    [
+        (
+            Venue.OKX,
+            {
+                "evidence_source": "okx_order_detail",
+                "response_classification": "detail_found;fills_empty",
+                "queried_endpoints": ["/api/v5/trade/order", "/api/v5/trade/fills"],
+            },
+            OrderTruthFillStatus.TRUTH_GAP,
+            "retain_backoff",
+        ),
+        (
+            Venue.BYBIT,
+            {
+                "evidence_source": "bybit_order_realtime",
+                "response_classification": "accepted_ack_without_execution",
+                "queried_endpoints": ["/v5/order/realtime"],
+            },
+            OrderTruthFillStatus.TRUTH_GAP,
+            "retain_backoff",
+        ),
+        (
+            Venue.BINANCE,
+            {
+                "raw_exchange_status": "NEW",
+                "response_classification": "stale_accepted_order",
+                "queried_endpoints": ["/fapi/v1/order"],
+            },
+            OrderTruthFillStatus.TRUTH_GAP,
+            "retain_backoff",
+        ),
+        (
+            Venue.BITGET,
+            {
+                "response_classification": "positive_quantity_missing_side",
+                "queried_endpoints": ["/api/v3/trade/order-info"],
+            },
+            OrderTruthFillStatus.UNSUPPORTED_FAIL_CLOSED,
+            "retain_fail_closed",
+        ),
+        (
+            Venue.HYPERLIQUID,
+            {
+                "response_classification": "account_identity_mismatch",
+                "queried_endpoints": ["POST /info orderStatus"],
+            },
+            OrderTruthFillStatus.UNSUPPORTED_FAIL_CLOSED,
+            "retain_fail_closed",
+        ),
+    ],
+)
+def test_order_truth_resolution_keeps_weak_exchange_evidence_out_of_confirmed_fill(
+    venue,
+    metadata,
+    expected_status,
+    expected_decision,
+):
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=venue,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=None,
+        metadata=metadata,
+    )
+
+    assert decision.fill_status is expected_status
+    assert decision.evidence_status is OrderTruthEvidenceStatus.UNAVAILABLE
+    assert decision.decision == expected_decision
+    assert decision.reconciled_qty == 0.0
+    assert decision.terminal_without_truth is False
+
+
+def test_order_truth_resolution_rejects_positive_quantity_from_order_detail_only():
+    from lightfee.core.domain import OrderFillReconciliation, Side
+
+    reconciliation = OrderFillReconciliation(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=1600.0,
+        average_price=0.01,
+        order_id="oid-1",
+        client_order_id="cid-1",
+        metadata={
+            "evidence_source": "okx_order_detail",
+            "response_classification": "detail_found;fills_empty",
+            "queried_endpoints": ["/api/v5/trade/order", "/api/v5/trade/fills"],
+        },
+    )
+
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=reconciliation,
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.TRUTH_GAP
+    assert decision.evidence_status is OrderTruthEvidenceStatus.UNAVAILABLE
+    assert decision.decision == "retain_backoff"
+    assert decision.reconciled_qty == 0.0
+
+
+def test_order_truth_resolution_confirmed_fill_requires_positive_fill_reconciliation():
+    from lightfee.core.domain import OrderFillReconciliation, Side
+
+    reconciliation = OrderFillReconciliation(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=1600.0,
+        average_price=0.01,
+        order_id="oid-1",
+        client_order_id="cid-1",
+        metadata={
+            "evidence_source": "bybit_execution_list",
+            "queried_endpoints": ["/v5/execution/list"],
+        },
+    )
+
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=reconciliation,
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.CONFIRMED_FILL
+    assert decision.evidence_status is OrderTruthEvidenceStatus.AVAILABLE
+    assert decision.decision == "terminal_fill"
+    assert decision.reconciled_qty == pytest.approx(1600.0)
+    assert decision.average_price == pytest.approx(0.01)
 
 
 def test_ack_gap_and_duplicate_reconcile_share_order_truth_ledger():
