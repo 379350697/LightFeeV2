@@ -41,6 +41,16 @@ evidence must map to the matrix before runtime code changes.
   after a `V1RecoveryDecisionCore` clear decision.
 - `orphan_maker_order`
 - `unpaired_live_position`
+- `owned_pending_entry_live_conflict`
+- OKX order detail has positive `accFillSz` / `fillSz`, but
+  `/api/v5/trade/fills` is empty or unavailable.
+- OKX live position is flat while local/pending fill evidence says the OKX leg
+  filled.
+- Bybit market/IOC order ACK has order id/client id but `/v5/execution/list`
+  has no executions.
+- Production health or diagnose reports
+  `okx fill evidence conflicts with okx live flat` or
+  `live position owned by pending conflict`.
 - `ambiguous_exchange_truth`
 - local state is flat while exchange truth has a non-reduce-only open maker
   order.
@@ -117,6 +127,19 @@ entry. If truth is unavailable while local recovery work or a live artifact need
 truth, it remains risk-only/blocking. A live non-reduce order without a proven
 owner becomes blocking `orphan_maker_order`; a live position without a proven
 owner becomes blocking `unpaired_live_position`.
+A live position with a pending-entry positive-fill owner is still a live
+artifact: it becomes `owned_pending_entry_live_conflict`, blocks all new entry
+risk, and must be managed through cleanup/flatten-or-block until fresh account
+position and open-order truth prove flat.
+
+Venue order truth is layered. ACK/order accepted, order detail/status, actual
+fills/executions, and live position truth are different evidence classes. OKX
+order detail `accFillSz/fillSz` cannot by itself terminalize a pending entry;
+V2 must resolve `ordId` and aggregate `/api/v5/trade/fills`, converting
+contracts to base with `ctVal`. Bybit market/IOC ACK cannot count as hedge
+filled without `/v5/execution/list` executions. Binance default `NEW` /
+`executedQty=0` remains uncertain. Bitget positive quantity without a valid
+side is an evidence gap/fail-closed condition, not default buy.
 
 ## V1 / Exchange Semantics
 
@@ -213,6 +236,7 @@ owner becomes blocking `unpaired_live_position`.
 | 2026-06-10 | Terminal no-fill maker open-order owner retention | fixed, deployed, cloud verified | CL-064 closes the `SUSHIUSDT` / `MEUSDT` recurrence where Bybit execution history/no-fill evidence and flat positions were treated as terminal while realtime open-order truth still showed matching maker orders. `_pending_entry_has_unresolved_maker_order()` and abort cleanup now require actual maker fill for the maker-completed fast path, query realtime open-order truth for terminal no-fill progress, retain pending when a matching open order exists or truth is unavailable, and allow flat abandon only when open-order truth explicitly has no match. Local verification passed focused terminal no-fill branches (`6 passed`), recovery core/ledger (`34 passed`), target regression (`609 passed`), compileall, and full pytest `3778 passed`, `9 skipped`, `1 warning`. Runtime commit `66a3688` was deployed and cloud verified: manifest critical files passed, services were active with `NRestarts=0`, verifier returned `ok=true` with no critical/warning issues, since-deploy diagnose returned `healthy` / `risk=low` / `gate_passed=true`, and all configured exchange truth was flat/no-open-orders. No manual order/cancel/runtime-state mutation was used. |
 | 2026-06-10 | PE-14 supervision stale-backlog terminality closure | fixed, deployed, cloud verified | Follow-up root closure for the same CL-064 risk window. The pending-entry terminalizer now owns the V1 supervision stale-clear decision: only zero-fill, no inflight hedge, no cancel requested, resting passive order, progress fetch absent, and live truth proving no open order/position may remove pending. Matching live open order, live position, unavailable truth, any fill, inflight hedge, cancel request, non-resting progress, or existing progress retains pending. RED/GREEN coverage is in `tests/engine/test_pending_entry_terminalizer.py -k supervision_stale_clear` (`4 passed`), the full terminalizer suite reports `11 passed`, final full pytest reports `3782 passed`, `9 skipped`, `1 warning`, and production acceptance for deployed runtime `66a3688` passed with all-account flat/no-open-orders truth. |
 | 2026-06-10 | Hyperliquid exchange-truth account identity false-green | fixed locally, deploy pending | CL-065 closes the root cause where diagnose queried the signer/API-wallet address instead of the configured Hyperliquid account and therefore reported empty `assetPositions` while the configured account had 18 nonzero positions. V2 now preserves explicit account addresses, loads wallet mode in diagnose, treats API/agent wallets as signers for the configured account, fails closed on account-wallet signer/account mismatch, and emits sanitized credential identity so future account/signer drift is visible. Local related diagnose/health gates report `104 passed`, full venue transport reports `401 passed`, and GitNexus detect-changes is low risk with no affected processes. |
+| 2026-06-14 | HOME positive-fill/live-truth conflict and owned single-leg cleanup | fixed locally, deploy pending | CL-078 closes the recurrence where OKX order detail/local fill evidence and Bybit IOC/hedge ACK could disagree with live account truth. OKX now requires `/api/v5/trade/fills` aggregation and `ctVal` conversion before fill truth; empty fills remain `execution_not_found`. Bybit ACK/order ids are reconciled through execution list before counting hedge filled. Bitget positive fill without valid side fails closed. Pending positive-fill live single legs are owned as `owned_pending_entry_live_conflict`, block as live artifacts, project through lifecycle closure, and clear only after fresh account flat plus open-order truth. Local affected suite `852 passed`, full pytest `3939 passed, 9 skipped, 1 warning`, diff-check passed; GitNexus fresh/detect-changes remains blocked by stale index plus unavailable trusted local GitNexus execution. |
 
 ## Recurrences
 

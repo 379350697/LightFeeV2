@@ -2032,6 +2032,60 @@ def test_diagnose_recovery_decision_treats_count_only_pending_as_required_work()
     assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
 
 
+def test_diagnose_pending_entry_live_conflict_summary_lists_home_truth_layers():
+    from scripts.diagnose_live import _build_pending_entry_live_conflict_summary
+
+    summary = _build_pending_entry_live_conflict_summary(
+        {
+            "pending_entries": [
+                {
+                    "pending_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "maker_leg": "long",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "maker_order_id": "okx-maker-order",
+                    "hedge_order_id": "bybit-hedge-order",
+                }
+            ]
+        },
+        {
+            "available": True,
+            "confidence": "high",
+            "positions": {
+                "okx": {},
+                "bybit": {
+                    "HOMEUSDT": {
+                        "venue": "bybit",
+                        "symbol": "HOMEUSDT",
+                        "side": "Side.SELL",
+                        "quantity": 1600.0,
+                    }
+                },
+            },
+            "open_orders": {
+                "okx": {"HOMEUSDT": []},
+                "bybit": {"HOMEUSDT": []},
+            },
+        },
+    )
+
+    assert summary["count"] == 1
+    detail = summary["details"][0]
+    assert detail["pending_id"] == "entry-home"
+    assert detail["maker_leg_filled"] == pytest.approx(1600.0)
+    assert detail["hedge_leg_filled"] == pytest.approx(1600.0)
+    assert "okx fill evidence conflicts with okx live flat" in detail["conflict_reasons"]
+    assert "live position owned by pending conflict" in detail["conflict_reasons"]
+    bybit_leg = [leg for leg in detail["legs"] if leg["venue"] == "bybit"][0]
+    assert bybit_leg["live_quantity"] == pytest.approx(1600.0)
+    assert bybit_leg["owner"] == "pending_entry"
+    assert bybit_leg["live_position_confirmed"] is True
+    assert detail["next_action"] == "owned_pending_entry_live_conflict_cleanup"
+
+
 def test_diagnose_and_runtime_recovery_decision_agree_on_partial_truth_payload(tmp_path):
     from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
     from lightfee.engine.runtime import LiveRuntime

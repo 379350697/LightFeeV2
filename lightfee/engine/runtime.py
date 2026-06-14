@@ -966,7 +966,11 @@ class LiveRuntime:
         ]
         if not blocking_rows:
             return False
-        if reason in {"orphan_maker_order", "unpaired_live_position"}:
+        if reason in {
+            "orphan_maker_order",
+            "unpaired_live_position",
+            "owned_pending_entry_live_conflict",
+        }:
             return True
         phases = {str(row.get("phase") or "") for row in blocking_rows}
         if (
@@ -1041,6 +1045,7 @@ class LiveRuntime:
         if reason in {
             "orphan_maker_order",
             "unpaired_live_position",
+            "owned_pending_entry_live_conflict",
             "owned_recovery_work",
             "pending_residual_repair",
             "pending_passive_close",

@@ -6990,6 +6990,29 @@ class TestBitgetParseOrderStatusRedLight:
         assert result.order_id == "oid-1"
         assert result.client_order_id == "cid-1"
 
+    @pytest.mark.parametrize("side_value", [None, "", "close_long"])
+    def test_bitget_positive_fill_missing_or_invalid_side_fails_closed(self, side_value):
+        from lightfee.venues.transport import VenueTransport, TransportError
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        data = {
+            "orderId": "oid-1",
+            "clientOid": "cid-1",
+            "filledQty": "0.5",
+            "baseVolume": "0.5",
+            "priceAvg": "51000",
+            "uTime": "2000000",
+        }
+        if side_value is not None:
+            data["side"] = side_value
+        raw = {"code": "00000", "msg": "success", "data": data}
+
+        with pytest.raises(TransportError) as exc:
+            transport._parse_order_status_bitget(raw, "BTCUSDT", 2000000)
+
+        assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
+
 class TestVenueSpecificOrderReconciliationEvidence:
     """CL-001-G: venue query paths must expose endpoint-level evidence."""
 
@@ -7137,8 +7160,10 @@ class TestVenueSpecificOrderReconciliationEvidence:
         from lightfee.venues.okx import OkxAdapter
 
         seen_queries: list[dict[str, str]] = []
+        seen_paths: list[str] = []
 
         async def mock_handler(request):
+            seen_paths.append(request.url.path)
             if request.url.path == "/api/v5/trade/order":
                 query = dict(request.url.params)
                 seen_queries.append(query)
@@ -7162,6 +7187,26 @@ class TestVenueSpecificOrderReconciliationEvidence:
                     "msg": "Parameter ordId error",
                     "data": [],
                 })
+            if request.url.path == "/api/v5/trade/fills":
+                query = dict(request.url.params)
+                seen_queries.append(query)
+                if query.get("ordId") == "okx-real-order-1":
+                    return httpx.Response(200, json={
+                        "code": "0",
+                        "data": [
+                            {
+                                "instId": "ME-USDT-SWAP",
+                                "ordId": "okx-real-order-1",
+                                "clOrdId": "okx-recovery-cid",
+                                "side": "sell",
+                                "fillSz": "304",
+                                "fillPx": "0.07895",
+                                "fee": "-0.12",
+                                "ts": "1780411997394",
+                            }
+                        ],
+                    })
+                return httpx.Response(200, json={"code": "0", "data": []})
             return httpx.Response(404, json={"msg": "unexpected"})
 
         adapter = OkxAdapter(
@@ -7184,8 +7229,67 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert result is not None
         assert result.order_id == "okx-real-order-1"
         assert result.client_order_id == "okx-recovery-cid"
-        assert seen_queries[-1]["clOrdId"] == "okx-recovery-cid"
-        assert "ordId" not in seen_queries[-1]
+        assert seen_queries[0]["clOrdId"] == "okx-recovery-cid"
+        assert "ordId" not in seen_queries[0]
+        assert seen_queries[-1]["ordId"] == "okx-real-order-1"
+        assert "/api/v5/trade/fills" in seen_paths
+
+    @pytest.mark.anyio
+    async def test_okx_order_detail_acc_fill_without_trade_fills_is_evidence_gap(self):
+        from lightfee.venues.okx import OkxAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            if request.url.path == "/api/v5/trade/order":
+                return httpx.Response(200, json={
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "HOME-USDT-SWAP",
+                            "ordId": "okx-home-order",
+                            "clOrdId": "okx-home-cid",
+                            "side": "buy",
+                            "accFillSz": "16",
+                            "avgPx": "0.0525",
+                            "state": "filled",
+                        }
+                    ],
+                })
+            if request.url.path == "/api/v5/trade/fills":
+                return httpx.Response(200, json={"code": "0", "data": []})
+            if request.url.path == "/api/v5/trade/orders-history":
+                return httpx.Response(200, json={"code": "0", "data": []})
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+        adapter._transport._okx_contract_size_for_venue_symbol = AsyncMock(return_value=100.0)
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "HOME-USDT-SWAP",
+            order_id="okx-home-order",
+            client_order_id="okx-home-cid",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is None
+        assert seen_paths == ["/api/v5/trade/order", "/api/v5/trade/fills"]
+        query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
+        assert query_payload["queried_endpoints"] == [
+            "/api/v5/trade/order",
+            "/api/v5/trade/fills",
+        ]
+        assert query_payload["response_classification"] == "detail_found;fills_empty"
+        assert query_payload["uncertain_subtype"] == "execution_not_found"
 
     def test_okx_order_status_scales_acc_fill_contracts_to_base_quantity(self):
         from lightfee.venues.transport import VenueTransport
@@ -7219,6 +7323,76 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert result.metadata["quantity_units"] == "contracts_to_base"
         assert result.metadata["contract_qty"] == pytest.approx(3.0)
         assert result.metadata["ct_val"] == pytest.approx(100.0)
+
+    def test_okx_passive_progress_scales_acc_fill_contracts_to_base_quantity(self):
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import okx_spec
+
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        transport.set_symbol_metadata(
+            {
+                "HOME-USDT-SWAP": {
+                    "instId": "HOME-USDT-SWAP",
+                    "ctType": "linear",
+                    "ctVal": "100",
+                }
+            }
+        )
+        raw = {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "HOME-USDT-SWAP",
+                    "ordId": "okx-passive-1",
+                    "clOrdId": "okx-passive-cid",
+                    "side": "buy",
+                    "accFillSz": "16",
+                    "avgPx": "0.0525",
+                    "state": "partially_filled",
+                    "uTime": "1780411997394",
+                }
+            ],
+        }
+
+        result = transport._parse_passive_order_progress(
+            raw,
+            okx_spec(),
+            "HOME-USDT-SWAP",
+            1780411997394,
+        )
+
+        assert result is not None
+        assert result.cumulative_quantity == pytest.approx(1600.0)
+
+    def test_okx_passive_progress_missing_ct_val_is_evidence_gap(self):
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import okx_spec
+
+        transport = VenueTransport(spec=okx_spec(), mode="paper")
+        raw = {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "HOME-USDT-SWAP",
+                    "ordId": "okx-passive-1",
+                    "clOrdId": "okx-passive-cid",
+                    "side": "buy",
+                    "accFillSz": "16",
+                    "avgPx": "0.0525",
+                    "state": "partially_filled",
+                    "uTime": "1780411997394",
+                }
+            ],
+        }
+
+        result = transport._parse_passive_order_progress(
+            raw,
+            okx_spec(),
+            "HOME-USDT-SWAP",
+            1780411997394,
+        )
+
+        assert result is None
 
 
 # ===========================================================================

@@ -90,6 +90,41 @@ def test_live_position_matches_open_position_owner():
     assert owner.confidence == "proven"
 
 
+def test_positive_fill_pending_entry_owns_expected_live_position():
+    index = RecoveryOwnerIndex.from_state(
+        {
+            "pending_entries": [
+                {
+                    "pending_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "maker_leg": "long",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                }
+            ],
+            "open_positions": [],
+        }
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "pending_entry"
+    assert owner.owner_id == "entry-home"
+    assert owner.confidence == "proven"
+    assert owner.evidence["source"] == "local_pending_entry"
+    assert owner.evidence["position_scope"] == "positive_fill_pending_entry"
+
+
 def test_residual_repair_matches_symbol_and_repair_venue():
     index = RecoveryOwnerIndex.from_state(
         {

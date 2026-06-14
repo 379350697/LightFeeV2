@@ -4694,24 +4694,27 @@ class VenueTransport(MarketDataClient):
         open_raw = await self._request(
             "GET", "/api/v5/trade/order", params=params, private=True,
         )
-        contract_size = None
-        if self._okx_order_status_has_fill_quantity(open_raw):
-            contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
-        open_result = self._parse_order_status_okx(
-            open_raw,
-            venue_sym,
-            now_ms,
-            contract_size=contract_size,
-        )
-        if open_result is not None:
-            self._record_order_reconcile_query(
-                symbol=venue_sym,
-                order_id=open_result.order_id,
-                client_order_id=open_result.client_order_id or client_order_id,
-                queried_endpoints=endpoints,
-                response_classification="filled",
-                next_action="clear_uncertain_state",
+        open_row = self._okx_order_status_row(open_raw)
+        if open_row:
+            open_result = await self._fetch_okx_trade_fills_reconciliation(
+                venue_sym=venue_sym,
+                order_row=open_row,
+                fallback_order_id=order_id_text,
+                fallback_client_order_id=client_order_id_text,
+                now_ms=now_ms,
+                endpoints=endpoints,
             )
+            if open_result is not None:
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=open_result.order_id,
+                    client_order_id=open_result.client_order_id or client_order_id,
+                    queried_endpoints=list(
+                        open_result.metadata.get("queried_endpoints", endpoints)
+                    ),
+                    response_classification="filled",
+                    next_action="clear_uncertain_state",
+                )
             return open_result
 
         history_params = dict(params)
@@ -4720,24 +4723,25 @@ class VenueTransport(MarketDataClient):
         history_raw = await self._request(
             "GET", "/api/v5/trade/orders-history", params=history_params, private=True,
         )
-        if contract_size is None and self._okx_order_status_has_fill_quantity(history_raw):
-            contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
-        history_result = self._parse_order_status_okx(
-            history_raw,
-            venue_sym,
-            now_ms,
-            contract_size=contract_size,
-        )
-        if history_result is not None:
-            metadata = dict(history_result.metadata or {})
-            metadata["queried_endpoints"] = list(endpoints)
-            metadata["response_classification"] = "filled"
-            history_result = replace(history_result, metadata=metadata)
+        history_row = self._okx_order_status_row(history_raw)
+        if history_row:
+            history_result = await self._fetch_okx_trade_fills_reconciliation(
+                venue_sym=venue_sym,
+                order_row=history_row,
+                fallback_order_id=order_id_text,
+                fallback_client_order_id=client_order_id_text,
+                now_ms=now_ms,
+                endpoints=endpoints,
+            )
+            if history_result is None:
+                return None
             self._record_order_reconcile_query(
                 symbol=venue_sym,
                 order_id=history_result.order_id,
                 client_order_id=history_result.client_order_id or client_order_id,
-                queried_endpoints=endpoints,
+                queried_endpoints=list(
+                    history_result.metadata.get("queried_endpoints", endpoints)
+                ),
                 response_classification="filled",
                 next_action="clear_uncertain_state",
             )
@@ -4753,6 +4757,91 @@ class VenueTransport(MarketDataClient):
             next_action="check_live_position",
         )
         return None
+
+    @staticmethod
+    def _okx_order_status_row(raw: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            return {}
+        data = raw.get("data", [])
+        if isinstance(data, list):
+            row = data[0] if data else {}
+        elif isinstance(data, dict):
+            row = data
+        else:
+            row = {}
+        return row if isinstance(row, dict) else {}
+
+    async def _fetch_okx_trade_fills_reconciliation(
+        self,
+        *,
+        venue_sym: str,
+        order_row: dict[str, Any],
+        fallback_order_id: str,
+        fallback_client_order_id: str,
+        now_ms: int,
+        endpoints: list[str],
+    ) -> Optional["OrderFillReconciliation"]:
+        resolved_order_id = str(order_row.get("ordId") or fallback_order_id or "").strip()
+        resolved_client_id = str(
+            order_row.get("clOrdId") or fallback_client_order_id or ""
+        ).strip()
+        if not resolved_order_id:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=fallback_order_id,
+                client_order_id=resolved_client_id,
+                queried_endpoints=list(endpoints),
+                response_classification="detail_found;missing_ord_id",
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+            return None
+
+        fill_endpoints = list(endpoints) + ["/api/v5/trade/fills"]
+        fills_raw = await self._request(
+            "GET",
+            "/api/v5/trade/fills",
+            params={
+                "instType": "SWAP",
+                "instId": venue_sym,
+                "ordId": resolved_order_id,
+            },
+            private=True,
+        )
+        if not self._okx_trade_fills_has_quantity(fills_raw):
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_id,
+                queried_endpoints=fill_endpoints,
+                response_classification="detail_found;fills_empty",
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+            return None
+
+        contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
+        result = self._parse_okx_trade_fills(
+            fills_raw,
+            venue_sym=venue_sym,
+            order_id=resolved_order_id,
+            client_order_id=resolved_client_id,
+            now_ms=now_ms,
+            contract_size=contract_size,
+            raw_exchange_status=str(order_row.get("state", "")),
+            queried_endpoints=fill_endpoints,
+        )
+        if result is None:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_id,
+                queried_endpoints=fill_endpoints,
+                response_classification="detail_found;fills_unparseable",
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+        return result
 
     @staticmethod
     def _okx_order_status_has_fill_quantity(raw: dict[str, Any]) -> bool:
@@ -4819,9 +4908,102 @@ class VenueTransport(MarketDataClient):
                 "raw_exchange_status": str(row.get("state", "")),
                 "queried_endpoints": ["/api/v5/trade/order"],
                 "response_classification": "filled",
+                "evidence_source": "okx_order_detail",
                 "quantity_units": "contracts_to_base",
                 "contract_qty": contract_qty,
                 "ct_val": float(contract_size or 0.0),
+            },
+        )
+
+    @staticmethod
+    def _okx_trade_fills_has_quantity(raw: dict[str, Any]) -> bool:
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            return False
+        data = raw.get("data", [])
+        rows = data if isinstance(data, list) else [data]
+        return any(
+            isinstance(row, dict)
+            and _safe_float(row.get("fillSz", row.get("sz", "0"))) > 0.0
+            for row in rows
+        )
+
+    def _parse_okx_trade_fills(
+        self,
+        raw: dict[str, Any],
+        *,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+        contract_size: float,
+        raw_exchange_status: str,
+        queried_endpoints: list[str],
+    ) -> Optional["OrderFillReconciliation"]:
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            return None
+        data = raw.get("data", [])
+        rows = data if isinstance(data, list) else [data]
+        total_qty = 0.0
+        total_contract_qty = 0.0
+        weighted_notional = 0.0
+        total_fee = 0.0
+        latest_fill_ms = 0
+        resolved_side: Side | None = None
+        resolved_client_id = client_order_id
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            contract_qty = _safe_float(row.get("fillSz", row.get("sz", "0")))
+            if contract_qty <= 0.0:
+                continue
+            side_raw = str(row.get("side", "")).lower()
+            if side_raw == "buy":
+                side = Side.BUY
+            elif side_raw == "sell":
+                side = Side.SELL
+            else:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"okx trade fill has invalid/missing side value {side_raw!r}",
+                )
+            if resolved_side is None:
+                resolved_side = side
+            elif resolved_side != side:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "okx trade fills mixed sides for one order",
+                )
+            fill_qty = self._okx_contracts_to_base_quantity(contract_qty, contract_size)
+            fill_price = _safe_float(row.get("fillPx", row.get("px", "0")))
+            total_contract_qty += contract_qty
+            total_qty += fill_qty
+            weighted_notional += fill_qty * fill_price
+            total_fee += abs(_safe_float(row.get("fee", "0")))
+            fill_ms = int(row.get("ts", row.get("fillTime", now_ms)) or now_ms)
+            latest_fill_ms = max(latest_fill_ms, fill_ms)
+            resolved_client_id = str(row.get("clOrdId") or resolved_client_id or "")
+
+        if total_qty <= 0.0 or resolved_side is None:
+            return None
+        return OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol=venue_sym,
+            side=resolved_side,
+            quantity=total_qty,
+            average_price=weighted_notional / total_qty,
+            order_id=order_id,
+            client_order_id=resolved_client_id or None,
+            fee_quote=total_fee if total_fee > 0.0 else None,
+            filled_at_ms=latest_fill_ms if latest_fill_ms > 0 else now_ms,
+            metadata={
+                "evidence_source": "okx_trade_fills",
+                "queried_endpoints": list(queried_endpoints),
+                "raw_exchange_status": raw_exchange_status,
+                "response_classification": "filled",
+                "quantity_units": "contracts_to_base",
+                "contract_qty": total_contract_qty,
+                "ct_val": float(contract_size or 0.0),
+                "live_position_confirmed": False,
             },
         )
 
@@ -5133,13 +5315,21 @@ class VenueTransport(MarketDataClient):
         avg_price = _safe_float(
             data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))
         )
-        side_str = str(data.get("side", "buy")).lower()
-        side = Side.BUY if side_str == "buy" else Side.SELL
         filled_at = int(data.get("uTime", data.get("cTime", data.get("updateTime", data.get("filledTime", now_ms)))))
 
         # V1: quantity <= 0 → None
         if cum_qty <= 0.0:
             return None
+        side_str = str(data.get("side", "") or "").lower()
+        if side_str == "buy":
+            side = Side.BUY
+        elif side_str == "sell":
+            side = Side.SELL
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"bitget order status has invalid/missing side value {side_str!r}",
+            )
 
         # Fee extraction with multi-key fallback (V1: bitget.rs:2934-2938)
         fee_quote = None
@@ -6483,6 +6673,11 @@ class VenueTransport(MarketDataClient):
                       data.get("filledSize", data.get("filledQty",
                       data.get("baseVolume", data.get("filled_total", data.get("accFillSz",
                       data.get("fillSz", data.get("cumExecQty", data.get("size", 0)))))))))))
+        if spec.venue_id == Venue.OKX and cum_qty > 0.0:
+            contract_size = self._okx_cached_contract_size_for_progress(data, venue_sym)
+            if contract_size <= 0.0:
+                return None
+            cum_qty = self._okx_contracts_to_base_quantity(cum_qty, contract_size)
         avg_price = float(data.get("avgPrice", data.get("priceAvg",
                          data.get("fillPriceAvg", data.get("averagePrice",
                          data.get("avgPx", data.get("price", 0)))))))
@@ -6525,6 +6720,33 @@ class VenueTransport(MarketDataClient):
             state=state,
             observed_at_ms=now_ms,
         )
+
+    def _okx_cached_contract_size_for_progress(
+        self,
+        data: dict[str, Any],
+        venue_sym: str,
+    ) -> float:
+        keys = [
+            str(data.get("instId", "") or ""),
+            venue_sym,
+        ]
+        if self._spec.symbol_from_venue is not None:
+            for key in tuple(keys):
+                if not key:
+                    continue
+                try:
+                    keys.append(self._spec.symbol_from_venue(key))
+                except Exception:
+                    pass
+        for key in keys:
+            metadata = self._symbol_metadata.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            for field in ("ct_val", "ctVal", "contract_size", "contractSize"):
+                value = _safe_float(metadata.get(field), default=0.0)
+                if value > 0.0:
+                    return value
+        return 0.0
 
     async def amend_passive_order(
         self, request: "PassiveOrderAmendRequest",

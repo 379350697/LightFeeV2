@@ -96,6 +96,7 @@ class RecoveryOwnerIndex:
                     _get(pending, "hedge_client_order_id", ""),
                 ),
             )
+            self._index_pending_entry_position_keys(owner, pending)
 
         for position in _collection(state, "open_positions"):
             owner = RecoveryOwner(
@@ -173,6 +174,53 @@ class RecoveryOwnerIndex:
             if key:
                 self._orders_by_client_id[key] = owner
 
+    def _index_pending_entry_position_keys(
+        self,
+        owner: RecoveryOwner,
+        pending: Any,
+    ) -> None:
+        symbol = _symbol(pending)
+        if not symbol:
+            return
+        maker_fill = _float(_get(pending, "maker_leg_filled", 0.0))
+        hedge_fill = _float(_get(pending, "hedge_leg_filled", 0.0))
+        if maker_fill <= 0.0 and hedge_fill <= 0.0:
+            return
+        maker_leg = _leg_text(_get(pending, "maker_leg", ""))
+        if maker_leg not in {"long", "short"}:
+            maker_side = _leg_text(_get(pending, "maker_side", ""))
+            if maker_side in {"buy", "long"}:
+                maker_leg = "long"
+            elif maker_side in {"sell", "short"}:
+                maker_leg = "short"
+        if maker_leg not in {"long", "short"}:
+            return
+        long_fill = 0.0
+        short_fill = 0.0
+        if maker_leg == "short":
+            short_fill += maker_fill
+            long_fill += hedge_fill
+        else:
+            long_fill += maker_fill
+            short_fill += hedge_fill
+        position_owner = RecoveryOwner(
+            owner_type=owner.owner_type,
+            owner_id=owner.owner_id,
+            confidence=owner.confidence,
+            evidence={
+                **dict(owner.evidence),
+                "position_scope": "positive_fill_pending_entry",
+            },
+        )
+        if long_fill > 0.0:
+            long_venue = _venue_from_key(pending, "long_venue")
+            if long_venue:
+                self._positions_by_key[(long_venue, symbol)] = position_owner
+        if short_fill > 0.0:
+            short_venue = _venue_from_key(pending, "short_venue")
+            if short_venue:
+                self._positions_by_key[(short_venue, symbol)] = position_owner
+
 
 def _collection(source: Any, key: str) -> list[Any]:
     value = _get(source, key, [])
@@ -207,6 +255,19 @@ def _venue_from_key(obj: Any, key: str) -> str:
 
 
 def _normalize_venue(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    return _text(value).lower()
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _leg_text(value: Any) -> str:
     if hasattr(value, "value"):
         value = value.value
     return _text(value).lower()

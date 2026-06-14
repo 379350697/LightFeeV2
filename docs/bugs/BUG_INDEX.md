@@ -17,6 +17,31 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest HOME positive-fill/live-truth conflict root fix, 2026-06-14:
+production HOME evidence was reclassified from a simple maker/hedge success
+story into a four-layer truth conflict. OKX local/order-detail evidence could
+show positive `accFillSz`, and Bybit IOC/market hedge evidence could look
+accepted, while current live account truth showed OKX flat and a Bybit single
+short. The fix makes ACK, order detail, fills/executions, and live position
+separate evidence layers. OKX reconciliation now resolves `ordId/clOrdId`
+through `/api/v5/trade/order` or order history, then requires
+`/api/v5/trade/fills` to aggregate actual fills; empty fills become
+`detail_found;fills_empty` / `execution_not_found` and cannot terminalize
+`entry.opened`. OKX contract quantities convert to base only with `ctVal`;
+missing `ctVal` is an evidence gap. Bybit remains execution-list authoritative
+for market/IOC fills, and Bitget positive fills without valid side fail closed.
+Pending positive-fill live positions now receive a pending owner and classify
+as `owned_pending_entry_live_conflict`; that kind blocks as a live artifact in
+the recovery decision core, runtime entry gate, startup flat-truth release, and
+V1 lifecycle closure table. Diagnose and production health now list local
+maker/hedge fills, expected legs, live quantities, open orders, owner,
+conflict reasons, and cleanup action. Local verification passed the affected
+suite (`852 passed`), full pytest (`3939 passed, 9 skipped, 1 warning`), and
+diff-check. GitNexus fresh/detect-changes is still blocked because the local
+index is stale and `npx gitnexus analyze` cannot run without network/external
+package execution approval. Full evidence is recorded in
+[`daily/2026-06-14.md#cluster-cl-078-home-positive-filllive-truth-conflict-and-owned-single-leg-cleanup`](daily/2026-06-14.md#cluster-cl-078-home-positive-filllive-truth-conflict-and-owned-single-leg-cleanup).
+
 Latest V1 lifecycle closure-table runtime takeover, 2026-06-13: recent
 WS-BBO, pending-entry, passive-close, residual, and recovery fixes are now
 projected through one pure `V1LifecycleClosureTable` instead of being

@@ -15,6 +15,7 @@ GLOBAL_BLOCKING_KINDS = frozenset(
     {
         "orphan_maker_order",
         "unpaired_live_position",
+        "owned_pending_entry_live_conflict",
     }
 )
 
@@ -234,6 +235,25 @@ class RecoveryLedger:
             live_symbols.add(artifact.symbol)
             owner = _owner_for_position(owner_index, artifact)
             if owner is not None and owner.confidence != "orphan":
+                if owner.owner_type in {"pending_entry", "journal_pending_entry"}:
+                    add_work(
+                        RecoveryWorkItem(
+                            kind="owned_pending_entry_live_conflict",
+                            symbol=artifact.symbol,
+                            venues=frozenset(filter(None, [artifact.venue])),
+                            artifacts=(artifact,),
+                            owner=owner,
+                            decision=RecoveryDecision(
+                                outcome="pending_entry_live_conflict_requires_cleanup",
+                                reason=(
+                                    "exchange_position_owned_by_positive_fill_pending_entry"
+                                ),
+                                blocking=True,
+                            ),
+                            blocking=True,
+                        )
+                    )
+                    continue
                 add_work(
                     RecoveryWorkItem(
                         kind="owned_open_position",
@@ -360,7 +380,12 @@ class RecoveryLedger:
         live_position_scope = {
             item.symbol
             for item in work_items
-            if item.kind in {"unpaired_live_position", "owned_open_position"}
+            if item.kind
+            in {
+                "unpaired_live_position",
+                "owned_open_position",
+                "owned_pending_entry_live_conflict",
+            }
         }
 
         for task in local_residuals:

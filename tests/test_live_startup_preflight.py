@@ -2015,6 +2015,38 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_flat_truth_clears_owned_pending_entry_live_conflict_block(self):
+        """A later account-flat probe releases an owned pending-entry live conflict."""
+
+        class FlatBulkPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["HOMEUSDT"]}
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_unpaired_live_position_uses_account_truth_not_symbol_sweep(self):
         """Old live-artifact blockers clear from unfiltered account truth, not dirty symbols."""
 

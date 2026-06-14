@@ -98,6 +98,64 @@ def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
     )
 
 
+def test_owned_pending_entry_live_conflict_projects_as_live_artifact_row():
+    from lightfee.engine.recovery_ledger import (
+        ExchangeArtifact,
+        RecoveryDecision,
+        RecoveryLedger,
+        RecoveryOwner,
+        RecoveryWorkItem,
+    )
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    ledger = RecoveryLedger(
+        work_items=[
+            RecoveryWorkItem(
+                kind="owned_pending_entry_live_conflict",
+                symbol="HOMEUSDT",
+                venues=frozenset({"bybit"}),
+                artifacts=(
+                    ExchangeArtifact(
+                        kind="position",
+                        symbol="HOMEUSDT",
+                        venue="bybit",
+                        side="sell",
+                        quantity=1600.0,
+                    ),
+                ),
+                owner=RecoveryOwner(
+                    owner_type="pending_entry",
+                    owner_id="entry-home",
+                    confidence="owned",
+                ),
+                decision=RecoveryDecision(
+                    outcome="pending_entry_live_conflict_requires_cleanup",
+                    reason="pending_entry_positive_fill_conflicts_with_live_truth",
+                ),
+                blocking=True,
+            )
+        ]
+    )
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={"pending_entries": {}},
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+        recovery_ledger=ledger,
+    ).to_dict()
+
+    assert table["summary"]["entry_allowed"] is False
+    assert table["summary"]["recovery_block_reason"] == "owned_pending_entry_live_conflict"
+    row = next(
+        row
+        for row in table["rows"]
+        if row["terminality"] == "owned_pending_entry_live_conflict"
+    )
+    assert row["phase"] == "OPEN_POSITION"
+    assert row["entry_policy"] == "block_all_new_risk"
+    assert row["recovery_policy"] == "block_or_flatten_live_artifact"
+
+
 def test_pending_entry_with_live_order_retains_owner_and_blocks_removal():
     from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 

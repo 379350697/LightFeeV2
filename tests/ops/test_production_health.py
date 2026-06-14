@@ -132,6 +132,51 @@ def test_current_state_clean_local_exchange_nonzero_is_critical():
     assert report.details["exchange_truth_mismatches"][0]["symbol"] == "BIOUSDT"
 
 
+def test_current_state_pending_entry_live_conflict_lists_conflict_reasons():
+    state = {
+        "lifecycle": "risk_only",
+        "risk_mode": "fail_closed",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 1,
+        "pending_close_count": 0,
+        "pending_entries": [
+            {
+                "pending_id": "entry-home",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "maker_leg": "long",
+                "maker_leg_filled": 1600.0,
+                "hedge_leg_filled": 1600.0,
+            }
+        ],
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "positions": {
+                "okx": {"HOMEUSDT": {"venue": "okx", "symbol": "HOMEUSDT", "quantity": 0.0}},
+                "bybit": {
+                    "HOMEUSDT": {
+                        "venue": "bybit",
+                        "symbol": "HOMEUSDT",
+                        "side": "sell",
+                        "quantity": 1600.0,
+                    }
+                },
+            },
+            "open_orders": {"okx": {"HOMEUSDT": []}, "bybit": {"HOMEUSDT": []}},
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    detail = report.details["pending_entry_live_conflicts"]["details"][0]
+    assert "okx fill evidence conflicts with okx live flat" in detail["conflict_reasons"]
+    assert "live position owned by pending conflict" in detail["conflict_reasons"]
+
+
 def test_current_state_clean_local_exchange_open_order_is_critical():
     state = {
         "lifecycle": "running",

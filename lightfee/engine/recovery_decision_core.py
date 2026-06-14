@@ -15,6 +15,7 @@ CORE_OWNED_BLOCK_REASONS = frozenset(
         "truth_unavailable_for_required_recovery",
         "orphan_maker_order",
         "unpaired_live_position",
+        "owned_pending_entry_live_conflict",
         "owned_recovery_work",
         "pending_residual_repair",
         "pending_passive_close",
@@ -26,6 +27,7 @@ LIVE_ARTIFACT_BLOCK_REASONS = frozenset(
     {
         "orphan_maker_order",
         "unpaired_live_position",
+        "owned_pending_entry_live_conflict",
     }
 )
 
@@ -227,6 +229,12 @@ class V1RecoveryDecisionCore:
     ) -> str | None:
         local_open_positions = _as_items(snapshot.local_open_positions)
         recovery_work_items = _as_items(snapshot.recovery_work_items)
+        for item in recovery_work_items:
+            kind = str(_get(item, "kind", "") or "")
+            if kind in LIVE_ARTIFACT_BLOCK_REASONS and _bool(
+                _get(item, "blocking", True)
+            ):
+                return kind
         for order in _exchange_open_orders(snapshot.exchange_truth):
             if _quantity(order) <= EPSILON or _bool(_get(order, "reduce_only", False)):
                 continue

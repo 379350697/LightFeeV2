@@ -118,6 +118,32 @@ def test_unpaired_live_position_blocks_as_live_artifact():
     assert decision.management_action == RecoveryManagementAction.FLATTEN_OR_BLOCK_LIVE_ARTIFACT
 
 
+def test_owned_pending_entry_live_conflict_blocks_as_live_artifact_work():
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(),
+        pending_entries=(),
+        residual_repairs=(),
+        passive_closes=(),
+        recovery_work_items=(
+            SimpleNamespace(
+                kind="owned_pending_entry_live_conflict",
+                symbol="HOMEUSDT",
+                venues=("bybit",),
+                blocking=True,
+            ),
+        ),
+        exchange_truth=ExchangeTruthSnapshot(available=True, confidence="high"),
+        prior_recovery_block_reason=None,
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "owned_pending_entry_live_conflict"
+    assert decision.management_action == RecoveryManagementAction.FLATTEN_OR_BLOCK_LIVE_ARTIFACT
+
+
 def test_previous_ambiguous_block_clears_only_through_core():
     snapshot = RecoveryEvidenceSnapshot(
         local_open_positions=(),

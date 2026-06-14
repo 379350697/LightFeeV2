@@ -282,6 +282,105 @@ def _exchange_truth_position_mismatches(
     return mismatches
 
 
+def _pending_entry_live_conflict_summary(
+    state: dict[str, Any],
+    exchange_truth: dict[str, Any],
+) -> dict[str, Any]:
+    live_by_key = {
+        (p["venue"], p["symbol"]): p
+        for p in _live_position_details(exchange_truth)
+    }
+    open_orders = {
+        (o["venue"], o["symbol"]): []
+        for o in _live_open_order_details(exchange_truth)
+    }
+    for order in _live_open_order_details(exchange_truth):
+        open_orders.setdefault((order["venue"], order["symbol"]), []).append(order)
+
+    details: list[dict[str, Any]] = []
+    for pending in state.get("pending_entries", []) or []:
+        if not isinstance(pending, dict):
+            continue
+        symbol = str(pending.get("symbol") or "").upper()
+        maker_fill = _safe_abs_quantity(pending.get("maker_leg_filled"))
+        hedge_fill = _safe_abs_quantity(pending.get("hedge_leg_filled"))
+        if not symbol or (maker_fill <= 1e-9 and hedge_fill <= 1e-9):
+            continue
+        maker_leg = _maker_leg_text(pending.get("maker_leg") or pending.get("maker_side"))
+        if maker_leg not in {"long", "short"}:
+            continue
+        legs = []
+        if maker_leg == "long":
+            long_qty, short_qty = maker_fill, hedge_fill
+        else:
+            long_qty, short_qty = hedge_fill, maker_fill
+        for venue, expected_side, expected_qty in (
+            (str(pending.get("long_venue") or "").lower(), "long", long_qty),
+            (str(pending.get("short_venue") or "").lower(), "short", short_qty),
+        ):
+            if not venue or expected_qty <= 1e-9:
+                continue
+            live = live_by_key.get((venue, symbol), {})
+            live_qty = _safe_abs_quantity(live.get("quantity"))
+            live_side = str(live.get("side") or "").lower()
+            live_matches = (
+                live_qty > 1e-9
+                and abs(live_qty - expected_qty) <= 1e-9
+                and _side_matches(live_side, expected_side)
+            )
+            legs.append({
+                "venue": venue,
+                "symbol": symbol,
+                "expected_side": expected_side,
+                "expected_quantity": expected_qty,
+                "live_quantity": live_qty,
+                "live_side": live_side,
+                "live_position_confirmed": live_matches,
+                "open_orders": open_orders.get((venue, symbol), []),
+                "owner": "pending_entry",
+            })
+        if legs:
+            conflict_reasons: list[str] = []
+            for leg in legs:
+                venue = str(leg.get("venue") or "")
+                if _safe_abs_quantity(leg.get("live_quantity")) <= 1e-9:
+                    conflict_reasons.append(
+                        f"{venue} fill evidence conflicts with {venue} live flat"
+                    )
+                elif not bool(leg.get("live_position_confirmed")):
+                    conflict_reasons.append(
+                        f"{venue} fill evidence conflicts with {venue} live mismatch"
+                    )
+            if any(_safe_abs_quantity(leg.get("live_quantity")) > 1e-9 for leg in legs):
+                conflict_reasons.append("live position owned by pending conflict")
+            details.append({
+                "pending_id": str(
+                    pending.get("pending_id")
+                    or pending.get("position_id")
+                    or symbol
+                ),
+                "symbol": symbol,
+                "maker_leg": str(pending.get("maker_leg") or ""),
+                "maker_leg_filled": maker_fill,
+                "hedge_leg_filled": hedge_fill,
+                "legs": legs,
+                "conflict_reasons": sorted(set(conflict_reasons)),
+                "next_action": "owned_pending_entry_live_conflict_cleanup",
+            })
+    return {"count": len(details), "details": details}
+
+
+def _maker_leg_text(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    text = str(value or "").lower()
+    if text == "buy":
+        return "long"
+    if text == "sell":
+        return "short"
+    return text
+
+
 def _runtime_progress_summary(
     state: dict[str, Any],
     *,
@@ -417,6 +516,11 @@ def analyze_current_state(
     exchange_truth_mismatches: list[dict[str, Any]] = []
     recovery_decision = _recovery_decision_payload(state, exchange_truth)
     v1_lifecycle_closure = _v1_lifecycle_closure_payload(state, exchange_truth, now_ms)
+    pending_entry_live_conflicts = (
+        _pending_entry_live_conflict_summary(state, exchange_truth)
+        if isinstance(exchange_truth, dict)
+        else {"count": 0, "details": []}
+    )
     exchange_truth_available = (
         isinstance(exchange_truth, dict)
         and bool(exchange_truth.get("available"))
@@ -541,6 +645,7 @@ def analyze_current_state(
             "recovery_decision": recovery_decision,
             "v1_lifecycle_closure": v1_lifecycle_closure,
             "exchange_truth_mismatches": exchange_truth_mismatches,
+            "pending_entry_live_conflicts": pending_entry_live_conflicts,
         },
     )
 

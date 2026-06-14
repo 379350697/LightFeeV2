@@ -1413,6 +1413,13 @@ def _safe_abs_quantity(value: Any) -> float:
         return 0.0
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any]]:
     live: list[dict[str, Any]] = []
     for venue, positions in (exchange_truth.get("positions") or {}).items():
@@ -2713,6 +2720,10 @@ def _build_production_acceptance_gate(
     )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
+    pending_live_conflicts = _build_pending_entry_live_conflict_summary(
+        local_state,
+        exchange_truth,
+    )
     recovery_decision = _recovery_decision_payload(local_state, exchange_truth)
     v1_lifecycle_closure = _v1_lifecycle_closure_payload(
         local_state,
@@ -2978,6 +2989,7 @@ def _build_production_acceptance_gate(
         "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        "pending_entry_live_conflicts": pending_live_conflicts,
         "recovery_decision": recovery_decision,
         "v1_lifecycle_closure": v1_lifecycle_closure,
         "runtime_progress": runtime_progress,
@@ -2992,6 +3004,180 @@ def _build_production_acceptance_gate(
         "blocking_reasons": blocking_reasons,
         "gate_passed": not blocking_reasons,
     }
+
+
+def _build_pending_entry_live_conflict_summary(
+    local_state: dict[str, Any],
+    exchange_truth: dict[str, Any] | None,
+) -> dict[str, Any]:
+    exchange_truth = exchange_truth or {}
+    live_positions = _live_position_index(exchange_truth)
+    open_orders = _open_order_index(exchange_truth)
+    details: list[dict[str, Any]] = []
+    for pending in _state_collection_or_count(
+        local_state,
+        "pending_entries",
+        "pending_entry_count",
+    ):
+        if not isinstance(pending, dict):
+            continue
+        symbol = str(pending.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        maker_fill = _safe_float(pending.get("maker_leg_filled"))
+        hedge_fill = _safe_float(pending.get("hedge_leg_filled"))
+        if maker_fill <= 1e-9 and hedge_fill <= 1e-9:
+            continue
+        expected_legs = _pending_expected_legs(pending, maker_fill, hedge_fill)
+        leg_details: list[dict[str, Any]] = []
+        conflict_reasons: list[str] = []
+        for leg in expected_legs:
+            venue = leg["venue"]
+            key = (venue, symbol)
+            live = live_positions.get(key, {})
+            live_qty = _safe_float(live.get("quantity"))
+            expected_qty = _safe_float(leg.get("expected_quantity"))
+            live_side = str(live.get("side") or "").lower()
+            expected_side = str(leg.get("expected_side") or "").lower()
+            live_matches = (
+                live_qty > 1e-9
+                and abs(live_qty - expected_qty) <= 1e-9
+                and _side_matches(live_side, expected_side)
+            )
+            if live_qty <= 1e-9:
+                conflict_reasons.append(
+                    f"{venue} fill evidence conflicts with {venue} live flat"
+                )
+            elif not live_matches:
+                conflict_reasons.append(
+                    f"{venue} fill evidence conflicts with {venue} live mismatch"
+                )
+            leg_details.append(
+                {
+                    **leg,
+                    "live_quantity": live_qty,
+                    "live_side": live_side,
+                    "live_position_confirmed": live_matches,
+                    "open_orders": open_orders.get(key, []),
+                    "owner": "pending_entry",
+                }
+            )
+        if any(leg["live_quantity"] > 1e-9 for leg in leg_details):
+            conflict_reasons.append("live position owned by pending conflict")
+        details.append(
+            {
+                "pending_id": str(
+                    pending.get("pending_id")
+                    or pending.get("position_id")
+                    or symbol
+                ),
+                "symbol": symbol,
+                "maker_leg": str(pending.get("maker_leg") or ""),
+                "maker_leg_filled": maker_fill,
+                "hedge_leg_filled": hedge_fill,
+                "maker_order_id": str(pending.get("maker_order_id") or ""),
+                "maker_client_order_id": str(
+                    pending.get("maker_client_order_id") or ""
+                ),
+                "hedge_order_id": str(pending.get("hedge_order_id") or ""),
+                "hedge_client_order_id": str(
+                    pending.get("hedge_client_order_id") or ""
+                ),
+                "legs": leg_details,
+                "conflict_reasons": sorted(set(conflict_reasons)),
+                "next_action": "owned_pending_entry_live_conflict_cleanup",
+            }
+        )
+    return {
+        "count": len(details),
+        "details": details,
+    }
+
+
+def _pending_expected_legs(
+    pending: dict[str, Any],
+    maker_fill: float,
+    hedge_fill: float,
+) -> list[dict[str, Any]]:
+    symbol = str(pending.get("symbol") or "").upper()
+    long_venue = str(pending.get("long_venue") or "").lower()
+    short_venue = str(pending.get("short_venue") or "").lower()
+    maker_leg = _maker_leg_text(pending.get("maker_leg") or pending.get("maker_side"))
+    if maker_leg not in {"long", "short"}:
+        return []
+    long_qty = maker_fill if maker_leg == "long" else hedge_fill
+    short_qty = hedge_fill if maker_leg == "long" else maker_fill
+    legs: list[dict[str, Any]] = []
+    if long_venue and long_qty > 1e-9:
+        legs.append(
+            {
+                "venue": long_venue,
+                "symbol": symbol,
+                "expected_side": "long",
+                "expected_quantity": long_qty,
+                "source_fill_layer": "maker" if maker_leg == "long" else "hedge",
+            }
+        )
+    if short_venue and short_qty > 1e-9:
+        legs.append(
+            {
+                "venue": short_venue,
+                "symbol": symbol,
+                "expected_side": "short",
+                "expected_quantity": short_qty,
+                "source_fill_layer": "hedge" if maker_leg == "long" else "maker",
+            }
+        )
+    return legs
+
+
+def _maker_leg_text(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    text = str(value or "").lower()
+    if text == "buy":
+        return "long"
+    if text == "sell":
+        return "short"
+    return text
+
+
+def _live_position_index(
+    exchange_truth: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for venue, positions in (exchange_truth.get("positions") or {}).items():
+        if not isinstance(positions, dict):
+            continue
+        for symbol, row in positions.items():
+            if not isinstance(row, dict):
+                continue
+            indexed[
+                (
+                    str(row.get("venue") or venue).lower(),
+                    str(row.get("symbol") or symbol).upper(),
+                )
+            ] = row
+    return indexed
+
+
+def _open_order_index(
+    exchange_truth: dict[str, Any],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    indexed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for venue, orders_by_symbol in (exchange_truth.get("open_orders") or {}).items():
+        if not isinstance(orders_by_symbol, dict):
+            continue
+        for symbol, rows in orders_by_symbol.items():
+            if not isinstance(rows, list):
+                continue
+            indexed[
+                (
+                    str(venue or "").lower(),
+                    str(symbol or "").upper(),
+                )
+            ] = [row for row in rows if isinstance(row, dict)]
+    return indexed
 
 
 def _v1_lifecycle_closure_payload(

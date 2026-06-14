@@ -1145,7 +1145,8 @@ class RecoveryStartupRuntime:
         )
         if (
             recovery_result == "no_live_positions"
-            and self.ctx.state.recovery_blocked_reason == "unpaired_live_position"
+            and self.ctx.state.recovery_blocked_reason
+            in {"unpaired_live_position", "owned_pending_entry_live_conflict"}
             and not self.ctx._has_local_recovery_work()
             and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
         ):

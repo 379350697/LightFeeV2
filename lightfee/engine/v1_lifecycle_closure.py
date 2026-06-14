@@ -447,7 +447,12 @@ def _open_position_rows(local_state: Any, ledger: RecoveryLedger) -> list[V1Life
         )
     for item in ledger.work_items:
         kind = str(_get(item, "kind", "") or "")
-        if kind not in {"orphan_maker_order", "unpaired_live_position", "orphan_reduce_only_order"}:
+        if kind not in {
+            "orphan_maker_order",
+            "unpaired_live_position",
+            "owned_pending_entry_live_conflict",
+            "orphan_reduce_only_order",
+        }:
             continue
         owner = _get(item, "owner", None)
         owner_id = _owner_id(
@@ -484,6 +489,7 @@ def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
         if kind in {
             "orphan_maker_order",
             "unpaired_live_position",
+            "owned_pending_entry_live_conflict",
             "orphan_reduce_only_order",
             "ambiguous_exchange_truth",
             "owned_open_position",

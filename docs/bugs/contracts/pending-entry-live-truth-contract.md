@@ -132,6 +132,15 @@ The minimum semantic surface from V1 is:
    live leg remains unresolved/fail-closed evidence, not open-position
    terminality.
 
+6a. Fill truth is layered by venue.
+   ACK/order accepted, order detail/status, fills/executions, and live position
+   truth are separate evidence classes. OKX order detail `accFillSz/fillSz` is
+   not final fill truth without `/api/v5/trade/fills` aggregation and
+   `ctVal` contract-to-base conversion. Bybit market/IOC ACK is not final fill
+   truth without `/v5/execution/list` executions. Binance default `NEW` /
+   `executedQty=0` is uncertain. Positive Bitget quantity without a valid
+   `buy`/`sell` side fails closed instead of defaulting a side.
+
 7. One-sided fill is not local flat.
    `maker_fill > 0, hedge_fill == 0` or the inverse creates unmatched residual
    cleanup/fail-closed work. It does not create a matched open position, but it
@@ -186,6 +195,7 @@ The minimum semantic surface from V1 is:
 | PE-16 | live exposure is ambiguous, untrusted, single-leg, or cannot be mapped to direction-correct balanced long/short pending exposure | retain/fail-closed with explicit evidence and no new-entry risk | guess healthy/open/flat |
 | PE-17 | unresolved pending entry exists for the same symbol and the new candidate shares either venue | block the new entry with `pending_entry_protection` until the pending entry terminalizes or cleanup proves flat | open a second overlapping pending entry by changing only one venue |
 | PE-18 | `_finalize_pending_entry()` defers because fill details, open-order truth, or live-position truth are incomplete | caller retains pending work, applies backoff, and does not add the entry to resolved/pop paths | treat a deferred finalizer call as terminal completion |
+| PE-19 | venue order detail or ACK suggests positive fill, but fills/executions are empty or live position truth conflicts | retain pending or create owned cleanup/fail-closed work with endpoint-level evidence | terminalize `entry.opened` from ACK or detail-only quantity |
 | RC-01 | residual task, live excess tradeable, open orders empty | submit one reduce-only IOC and complete/backoff from fill truth | use stale local repair quantity blindly |
 | RC-02 | residual task, live excess zero, open orders empty | complete as already flat and release pair gate | keep pair gate forever |
 | RC-03 | residual task, live excess zero, open orders present | pause/backoff with open-order evidence | clear task as already flat |
@@ -196,10 +206,12 @@ The minimum semantic surface from V1 is:
 | RC-08 | duplicate cleanup keeps failing and live remains nonzero | stop new-entry risk and expose deterministic blocker | unbounded retry loop with repeated CIDs |
 | RC-09 | local open/pending/residual/passive work exists and exchange truth is unavailable or partial | risk-only / no new entry until required truth or deterministic cleanup path is available | treat missing truth as clean or open new entry risk |
 | RC-10 | previous core-owned `exchange_truth_recovery_ledger_blocked` exists, but the core classifies the current snapshot as `RUNNING_CLEAN` or `RUNNING_WITH_EVIDENCE_GAP` | clear through the core with explicit clear reason | clear through an independent stale-clean helper that can contradict the core |
+| RC-11 | pending entry has positive fill evidence and current live truth shows one owned single leg | create `owned_pending_entry_live_conflict`, block all new entry risk, route through flatten/block cleanup, and release only after account flat plus open-order truth | downgrade to ordinary owned work, orphan drift, or local flat |
 | DG-01 | local flat, exchange position nonzero | unhealthy / high risk / gate failed | service-health green |
 | DG-02 | local flat, exchange open order present | unhealthy / high risk / gate failed | service-health green |
 | DG-03 | exchange truth unavailable for production high-confidence acceptance | missing evidence / not high-confidence green | assume production flat |
 | DG-04 | local flat, no local recovery work, no live artifact, and only a timeout/unsupported/partial probe gap | runtime `RUNNING_WITH_EVIDENCE_GAP`; normal entry remains governed by normal candidate gates; production acceptance may still be incomplete | create `exchange_truth_recovery_ledger_blocked` or block all normal entry |
+| DG-05 | pending positive fill evidence conflicts with live flat/mismatch, or a live position is owned by a pending conflict | diagnose and production health list local maker/hedge fill, order ids/client ids when present, expected legs, live long/short quantities, open orders, owner, conflict reasons, and next cleanup action | report only a generic open/close error or hide the owner conflict |
 | PC-01 | live passive close flattened both legs and final close-leg fill reconciliation is available from stored order/client ids | rebuild final close accounting from the stored leg snapshot and remove the pending reconciliation | depend on entry reconciliation or require a still-managed open position |
 | PC-02 | final pending-close reconciliation, no managed open position, fill reconciliation unavailable, both close venues prove terminal live size zero | abandon stale final reconciliation and release lifecycle/gate with explicit terminal-flat evidence | retain risk-only forever solely because fill/PnL accounting is unavailable |
 | PC-03 | final pending-close reconciliation, fill reconciliation unavailable, either close venue reports nonzero terminal live size | retain reconciliation as fail-safe risk-only/backoff | abandon or mark healthy while live exposure remains |
@@ -215,6 +227,7 @@ The minimum semantic surface from V1 is:
 |---|---|---|
 | PE-02, PE-05, PE-10, RC-01 through RC-04, DG-01 through DG-03 | `tests/engine/test_recovery_ledger.py`; `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py` | covered for pure recovery-ledger classification of local-flat/live-open-order, local-flat/live-position, positive-fill false-flat, residual repair, ambiguous truth, and proven-flat states |
 | RC-09, RC-10, DG-04 | `tests/engine/test_recovery_decision_core.py`; `tests/engine/test_recovery_ledger.py`; `tests/test_live_startup_preflight.py`; `tests/test_runtime_entry_flow.py`; `tests/test_diagnose_live.py`; `tests/ops/test_production_health.py` | covered for flat/no-local-work evidence gap, local work plus unavailable truth, core-owned clear, runtime block/clear authority, diagnose/health core classification, and review closure for same-symbol-but-unowned live artifacts |
+| PE-19, RC-11, DG-05 | `tests/test_venues_transport.py`; `tests/engine/test_recovery_owner_index.py`; `tests/engine/test_recovery_ledger.py`; `tests/engine/test_recovery_decision_core.py`; `tests/engine/test_v1_lifecycle_closure_table.py`; `tests/test_live_startup_preflight.py`; `tests/test_diagnose_live.py`; `tests/ops/test_production_health.py` | covered locally for OKX detail-with-empty-fills evidence gap, OKX contract-to-base passive progress, missing `ctVal` evidence gap, Bybit execution-list authority, Bitget missing-side fail-closed, pending-owner live single-leg conflict, live-artifact blocking, account-flat/open-order-truth release, lifecycle projection, and diagnose/health conflict reason reporting |
 | PC-01 through PC-05 | `tests/test_pending_entry_v1_semantic_drift.py`; `tests/test_passive_close.py`; `tests/test_supervisor_execution.py` | covered for live-only registration, V1 close-leg snapshots, fill-based terminal accounting, unavailable-fill terminal-flat abandon, nonzero terminal-live retention, background lifecycle with private confirmation, risk-mode preservation, and supervisor venue coverage |
 | PC-06 | `tests/persistence/test_v1_state_snapshot_semantics.py -k "pending_close_reconciliation"` | covered locally for keyed-map restore, single-task dict migration, invalid non-dict evidence retention, canonical serialization, state-owned enqueue/dedupe/cap/remove, and helper normalization before enqueue |
 | PC-07 | `tests/test_passive_close.py -k "live_flat_cleanup"` | covered locally for dict-shaped queue live-flat cleanup, registration failure retention, core-clear failure retention, success journals after registration/state/core clear, and no `runtime.passive_close_tick_error` masking |

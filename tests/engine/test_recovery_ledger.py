@@ -134,6 +134,67 @@ def test_pending_entry_positive_maker_fill_blocks_as_owned_pending_entry():
     assert ledger.is_proven_flat("SEIUSDT") is False
 
 
+def test_pending_entry_owned_live_position_blocks_as_live_conflict_not_orphan():
+    owner_index = RecoveryOwnerIndex.from_state(
+        {
+            "pending_entries": [
+                {
+                    "pending_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "maker_leg": "long",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                }
+            ],
+            "open_positions": [],
+        }
+    )
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "open_positions": [],
+            "pending_entries": [
+                {
+                    "pending_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "maker_leg": "long",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                }
+            ],
+        },
+        exchange_truth={
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": "bybit",
+                    "symbol": "HOMEUSDT",
+                    "side": "sell",
+                    "quantity": 1600.0,
+                }
+            ],
+            "open_orders": [],
+        },
+        owner_index=owner_index,
+    )
+
+    bybit_items = [
+        item
+        for item in ledger.work_items
+        if item.symbol == "HOMEUSDT" and item.venues == frozenset({"bybit"})
+    ]
+
+    assert [item.kind for item in bybit_items] == ["owned_pending_entry_live_conflict"]
+    assert bybit_items[0].owner.owner_type == "pending_entry"
+    assert bybit_items[0].blocking is True
+    assert bybit_items[0].blocks_all_new_entries is True
+    assert bybit_items[0].decision.outcome == "pending_entry_live_conflict_requires_cleanup"
+    assert not any(item.kind == "unpaired_live_position" for item in ledger.work_items)
+
+
 def test_residual_repair_with_live_flat_records_repair_work_and_flat_decision():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={
