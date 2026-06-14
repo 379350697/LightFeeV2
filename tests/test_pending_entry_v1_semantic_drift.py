@@ -498,6 +498,70 @@ async def test_flat_reconcile_with_not_found_maker_retains_pending_entry_like_v1
 
 
 @pytest.mark.asyncio
+async def test_flat_reconcile_not_found_maker_with_zero_fill_and_live_flat_clears_pending(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    maker = _TerminalNoFillClearOpenOrdersFlatPositionAdapter(venue=Venue.BYBIT)
+    hedge = _TerminalNoFillClearOpenOrdersFlatPositionAdapter(venue=Venue.HYPERLIQUID)
+    result = PositionReconciliationResult(
+        position_id="entry-v1-drift",
+        symbol="JTOUSDT",
+        long_status="not_found",
+        short_status="not_found",
+        long_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="JTOUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584326000,
+        ),
+        short_position=PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="JTOUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1780584326000,
+        ),
+        is_flat=True,
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(result)
+    pending = _pending_entry(
+        pending_id="entry-v1-drift",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        created_at_ms=1780584325900,
+        maker_order_id="jto-maker-order",
+        maker_client_order_id="jto-maker-client",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=1780584326000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert maker.open_order_calls == ["JTOUSDT"]
+    assert maker.position_calls == ["JTOUSDT"]
+    assert result.long_position.quantity == 0.0
+    assert result.short_position.quantity == 0.0
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "reconciliation.entry_flat_not_found_terminal_cleared" in kinds
+    assert "reconciliation.entry_flat_unresolved_maker_retained" not in kinds
+    assert "entry.passive_unfilled" in kinds
+
+
+@pytest.mark.asyncio
 async def test_live_flat_reconcile_without_maker_order_reference_retains_pending(
     config, tmp_journal,
 ):

@@ -1718,6 +1718,7 @@ _ORDER_TRUTH_GAP_REGISTERED_KINDS = frozenset({
     "exit.accepted_order_truth_gap_registered",
 })
 _ORDER_TRUTH_GAP_RESOLUTION_KINDS = frozenset({
+    "exit.passive_close_hedge_confirmed_after_ack",
     "exit.passive_close_hedge_reconciled_after_error",
     "exit.passive_close_hedge_duplicate_client_order_reconciled",
     "exit.passive_close_fallback_terminal_flat",
@@ -1830,6 +1831,7 @@ def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
 
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
     if kind in {
+        "exit.passive_close_hedge_confirmed_after_ack",
         "exit.passive_close_hedge_reconciled_after_error",
         "exit.passive_close_hedge_duplicate_client_order_reconciled",
     }:

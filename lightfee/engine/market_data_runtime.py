@@ -1353,10 +1353,21 @@ class MarketDataRuntime:
                 outcome = "ws_timeout"
                 bucket = "quote_revalidate_unavailable"
             stats["top_quote_blocker_buckets"][bucket] += 1
+            age_ms = target.get("age_ms")
+            if age_ms is None:
+                age_ms = target.get("sidecar_age_ms")
+            if age_ms is None:
+                observed_at_ms = int(target.get("observed_at_ms") or 0)
+                age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
             payload = {
                 **target,
                 "outcome": outcome,
                 "source": "entry_quote_truth",
+                "age_ms": age_ms,
+                "budget_ms": self._entry_quote_lease_max_age_ms(),
+                "endpoint": "rest_topbook",
+                "rest_error": str(target.get("rest_error") or ""),
+                "ws_budget_excluded": bool(target.get("ws_budget_excluded")),
                 "ts_ms": now_ms,
             }
             self.ctx.journal.append("runtime.entry_quote_revalidate_failed", payload)

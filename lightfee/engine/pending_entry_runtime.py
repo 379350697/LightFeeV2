@@ -308,6 +308,33 @@ class PendingEntryRuntime:
                 continue
 
             if result.is_flat:
+                maker_status = self.ctx._pending_entry_reconcile_maker_status(
+                    pending, result
+                )
+                if (
+                    maker_status == "not_found"
+                    and self.ctx._pending_entry_has_maker_order_reference(pending)
+                    and float(getattr(pending, "maker_leg_filled", 0.0) or 0.0) <= 1e-9
+                    and float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0) <= 1e-9
+                ):
+                    finalized = await self.ctx._finalize_pending_entry(
+                        pending,
+                        entry_id,
+                        now_ms,
+                    )
+                    if finalized:
+                        resolved_entry_ids.append(entry_id)
+                        self.ctx.journal.append(
+                            "reconciliation.entry_flat_not_found_terminal_cleared",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "maker_status": maker_status,
+                                "reason": "flat_position_zero_fill_not_found_maker_verified",
+                            },
+                        )
+                        continue
+
                 if not self.ctx._pending_entry_flat_clear_has_terminal_maker_evidence(
                     pending, result
                 ):
@@ -316,10 +343,9 @@ class PendingEntryRuntime:
                         {
                             "entry_id": entry_id,
                             "symbol": pending.symbol,
-                            "maker_status": self.ctx._pending_entry_reconcile_maker_status(
-                                pending, result
-                            ),
+                            "maker_status": maker_status,
                             "reason": "flat_position_without_terminal_maker_order_evidence",
+                            "missing_endpoint": "maker_order_terminal_or_live_truth",
                         },
                     )
                     self.ctx._apply_reconcile_backoff(pending, now_ms)

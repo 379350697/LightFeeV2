@@ -2388,9 +2388,28 @@ class PassiveCloseExecutor:
             if should_reconcile:
                 reconciliation = None
                 fill_reconciliation_attempted = True
+                accepted_order_id = ""
+                accepted_client_order_id = hedge_cid
+                accepted_ack_confirmation = False
+                if isinstance(e, OrderSubmitError):
+                    accepted_order_id = str(
+                        getattr(e, "accepted_order_id", "")
+                        or uncertainty_payload.get("accepted_order_id")
+                        or ""
+                    )
+                    accepted_client_order_id = str(
+                        getattr(e, "accepted_client_order_id", "")
+                        or uncertainty_payload.get("accepted_client_order_id")
+                        or hedge_cid
+                    )
+                    accepted_ack_confirmation = (
+                        bool(getattr(e, "order_ack_only", False))
+                        or bool(accepted_order_id)
+                        or bool(uncertainty_payload.get("accepted_order_truth_gap"))
+                    )
                 try:
                     reconciliation = await adapter.fetch_order_fill_reconciliation(
-                        position.symbol, "", hedge_cid,
+                        position.symbol, accepted_order_id, accepted_client_order_id,
                     )
                 except Exception as reconcile_error:
                     fill_reconciliation_result = "error"
@@ -2428,7 +2447,11 @@ class PassiveCloseExecutor:
                     event_kind = (
                         "exit.passive_close_hedge_duplicate_client_order_reconciled"
                         if is_bybit_duplicate
-                        else "exit.passive_close_hedge_reconciled_after_error"
+                        else (
+                            "exit.passive_close_hedge_confirmed_after_ack"
+                            if accepted_ack_confirmation
+                            else "exit.passive_close_hedge_reconciled_after_error"
+                        )
                     )
                     self._journal.append(
                         event_kind,
@@ -2444,7 +2467,11 @@ class PassiveCloseExecutor:
                             "classification": (
                                 "duplicate_client_order_reconciled"
                                 if is_bybit_duplicate
-                                else "uncertain_submit_reconciled"
+                                else (
+                                    "accepted_ack_confirmed"
+                                    if accepted_ack_confirmation
+                                    else "uncertain_submit_reconciled"
+                                )
                             ),
                             "severity": "info",
                             "order_submit_uncertain": isinstance(e, OrderSubmitError),
@@ -2547,6 +2574,106 @@ class PassiveCloseExecutor:
             )
 
         filled_qty = fill.quantity if fill.quantity > 0 else 0.0
+        ack_order_id = str(getattr(fill, "order_id", "") or "")
+        ack_client_order_id = str(getattr(fill, "client_order_id", "") or hedge_cid)
+        if (
+            filled_qty <= 1e-12
+            and hedge_venue == Venue.BYBIT
+            and (ack_order_id or ack_client_order_id)
+            and callable(getattr(adapter, "fetch_order_fill_reconciliation", None))
+        ):
+            reconciliation = None
+            reconciliation_error = ""
+            try:
+                reconciliation = await adapter.fetch_order_fill_reconciliation(
+                    position.symbol,
+                    ack_order_id,
+                    ack_client_order_id,
+                )
+            except Exception as exc:
+                reconciliation_error = str(exc)
+
+            recon_qty_raw = (
+                getattr(reconciliation, "quantity", 0.0)
+                if reconciliation is not None
+                else 0.0
+            )
+            recon_qty = (
+                float(recon_qty_raw)
+                if isinstance(recon_qty_raw, (int, float))
+                else 0.0
+            )
+            if recon_qty > 1e-12:
+                recon_price_raw = getattr(
+                    reconciliation, "average_price", hedge_price or 0.0,
+                )
+                recon_price = (
+                    float(recon_price_raw)
+                    if isinstance(recon_price_raw, (int, float))
+                    else (hedge_price or 0.0)
+                )
+                fill = OrderFill(
+                    venue=hedge_venue,
+                    symbol=position.symbol,
+                    side=getattr(reconciliation, "side", hedge_side) or hedge_side,
+                    quantity=recon_qty,
+                    price=recon_price,
+                    order_id=(
+                        str(getattr(reconciliation, "order_id", "") or "")
+                        or ack_order_id
+                    ),
+                    client_order_id=(
+                        str(getattr(reconciliation, "client_order_id", "") or "")
+                        or ack_client_order_id
+                    ),
+                    fee_quote=getattr(reconciliation, "fee_quote", None),
+                    filled_at_ms=getattr(reconciliation, "filled_at_ms", 0)
+                    or self._now_ms(),
+                )
+                record_hedge_fill(fill)
+                residual = max(delta - fill.quantity, 0.0)
+                success = residual < 1e-12
+                self._journal.append(
+                    "exit.passive_close_hedge_confirmed_after_ack",
+                    {
+                        "position_id": position.position_id,
+                        "hedge_venue": hedge_venue.value,
+                        "hedge_leg": hedge_leg_label,
+                        "client_order_id": ack_client_order_id,
+                        "order_id": fill.order_id,
+                        "requested": delta,
+                        "filled": fill.quantity,
+                        "residual": residual,
+                        "classification": "accepted_ack_confirmed",
+                        "severity": "info",
+                        "order_submit_uncertain": False,
+                        "decision": "accepted_order_reconciled_by_client_id",
+                    },
+                )
+                return HedgeDeltaResult(
+                    requested=delta,
+                    filled=fill.quantity,
+                    residual=residual,
+                    success=success,
+                    error=None if success else "partial_fill",
+                    order_id=fill.order_id,
+                )
+            self._journal.append(
+                "exit.passive_close_hedge_ack_unconfirmed",
+                {
+                    "position_id": position.position_id,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg_label,
+                    "client_order_id": ack_client_order_id,
+                    "order_id": ack_order_id,
+                    "requested": delta,
+                    "fill_reconciliation_result": (
+                        "error" if reconciliation_error else "missing_or_zero_fill"
+                    ),
+                    "fill_reconciliation_error": reconciliation_error,
+                    "decision": "retain_pending_without_resubmit",
+                },
+            )
         residual = max(delta - filled_qty, 0.0)
         success = residual < 1e-12
 

@@ -3287,15 +3287,103 @@ class TestFallbackResidualReal:
         )
 
         assert result.success is True
+        records = journal.read_all()
         payload = [
-            record["payload"] for record in journal.read_all()
-            if record["kind"] == "exit.passive_close_hedge_reconciled_after_error"
+            record["payload"] for record in records
+            if record["kind"] == "exit.passive_close_hedge_confirmed_after_ack"
         ][-1]
-        assert payload["classification"] == "uncertain_submit_reconciled"
+        assert payload["classification"] == "accepted_ack_confirmed"
         assert payload["severity"] == "info"
         assert payload["order_submit_uncertain"] is True
         assert payload["decision"] == "accepted_order_reconciled_by_client_id"
         assert payload["residual"] == pytest.approx(0.0)
+        assert "exit.passive_close_hedge_reconciled_after_error" not in [
+            record["kind"] for record in records
+        ]
+
+    def test_bybit_delta_hedge_ack_without_qty_confirms_via_reconciliation(self):
+        """Bybit create-order ACK may be async and carry no fill quantity."""
+        journal = _open_journal()
+
+        adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        adapter.place_order = AsyncMock(
+            return_value=OrderFill(
+                venue=Venue.BYBIT,
+                symbol="EDENUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                price=0.0,
+                order_id="ack-oid",
+                client_order_id="ack-cid",
+            )
+        )
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="EDENUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.01,
+                order_id="ack-oid",
+                client_order_id="ack-cid",
+                filled_at_ms=1781416809425,
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.99, 1.01))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-passive-bybit-ack",
+            symbol="EDENUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                state,
+                pending,
+                position,
+                10.0,
+                maker_terminal=True,
+            )
+        )
+
+        assert result.success is True
+        adapter.fetch_order_fill_reconciliation.assert_awaited_once_with(
+            "EDENUSDT",
+            "ack-oid",
+            "ack-cid",
+        )
+        records = journal.read_all()
+        payload = [
+            record["payload"] for record in records
+            if record["kind"] == "exit.passive_close_hedge_confirmed_after_ack"
+        ][-1]
+        assert payload["classification"] == "accepted_ack_confirmed"
+        assert payload["order_submit_uncertain"] is False
+        assert payload["residual"] == pytest.approx(0.0)
+        assert "exit.passive_close_hedge_reconciled_after_error" not in [
+            record["kind"] for record in records
+        ]
 
     def test_ack_only_terminal_hedge_live_flat_resolves_without_deadline_fail_closed(self):
         """Bybit ACK-only close is resolved by live-flat truth, not by fail-closed compensation."""

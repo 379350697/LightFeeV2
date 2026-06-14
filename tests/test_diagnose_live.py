@@ -1460,7 +1460,7 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
             },
             {
                 "ts_ms": 1780657202000,
-                "kind": "exit.passive_close_hedge_reconciled_after_error",
+                "kind": "exit.passive_close_hedge_confirmed_after_ack",
                 "payload": {
                     "position_id": "pos-btc-ack",
                     "symbol": "BTCUSDT",
@@ -1469,6 +1469,8 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
                     "client_order_id": "lf-close-1",
                     "filled": 0.01,
                     "residual": 0.0,
+                    "classification": "accepted_ack_confirmed",
+                    "severity": "info",
                 },
             },
             {

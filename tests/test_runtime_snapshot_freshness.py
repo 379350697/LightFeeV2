@@ -1127,6 +1127,12 @@ async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_ex
     assert {payload["outcome"] for payload in failures} == {
         "budget_excluded_rest_unavailable"
     }
+    assert all(payload["source"] == "entry_quote_truth" for payload in failures)
+    assert all(payload["age_ms"] is not None for payload in failures)
+    assert all(payload["budget_ms"] == 100 for payload in failures)
+    assert all(payload["ws_budget_excluded"] is True for payload in failures)
+    assert all(payload["rest_error"] == "" for payload in failures)
+    assert all(payload["endpoint"] == "rest_topbook" for payload in failures)
 
 
 @pytest.mark.asyncio
@@ -3260,7 +3266,7 @@ def test_close_price_hint_uses_fresh_ws_bbo_when_local_l2_missing(tmp_path):
     fallback = [
         record["payload"]
         for record in records
-        if record["kind"] == "runtime.close_price_evidence_fallback"
+        if record["kind"] == "runtime.close_price_evidence_ws_bbo_used"
     ]
     assert fallback[-1]["venue"] == "binance"
     assert fallback[-1]["symbol"] == "BTCUSDT"
@@ -3268,6 +3274,151 @@ def test_close_price_hint_uses_fresh_ws_bbo_when_local_l2_missing(tmp_path):
     assert fallback[-1]["age_ms"] == 1000
     assert fallback[-1]["budget_ms"] == 1500
     assert fallback[-1]["decision"] == "use_price_hint"
+    assert fallback[-1]["outcome"] == "used_fresh_ws_bbo"
+
+
+@pytest.mark.asyncio
+async def test_close_price_hint_rewarms_stale_ws_bbo_with_rest_top_book(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 3_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
+            max_liquidity_snapshot_age_ms=300_000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.ws_bbo_cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=90.0,
+            ask=91.0,
+            observed_at_ms=1_000,
+            received_at_ms=1_001,
+            source="binance_book_ticker",
+        )
+    )
+
+    class RestRefresher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
+            self.calls.append((venue, symbol, now_ms))
+            return TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=now_ms - 25,
+                received_at_ms=now_ms - 25,
+                source=f"{venue}_rest_topbook",
+            )
+
+    refresher = RestRefresher()
+    runtime.ws_bbo_rest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        overlay = await runtime.close_runtime._rewarm_close_price_evidence(
+            [("binance", "BTCUSDT")],
+            now_ms=now_ms,
+        )
+        assert overlay[("binance", "BTCUSDT")].source == "binance_rest_topbook"
+        assert runtime._resolve_local_l2_mid(
+            Venue.BINANCE, "BTCUSDT", now_ms=now_ms,
+        ) == 100.5
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    kinds = [record["kind"] for record in records]
+    assert refresher.calls == [("binance", "BTCUSDT", now_ms)]
+    assert "runtime.close_price_evidence_stale" not in kinds
+    assert "runtime.close_price_evidence_rest_rewarm_succeeded" in kinds
+    used = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.close_price_evidence_ws_bbo_used"
+    ][-1]
+    assert used["source"] == "binance_rest_topbook"
+    assert used["outcome"] == "used_fresh_ws_bbo"
+
+
+@pytest.mark.asyncio
+async def test_close_price_rewarm_failure_reports_stale_quote_evidence(tmp_path):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 3_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        strategy=StrategyConfig(
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1,
+            max_liquidity_snapshot_age_ms=300_000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.ws_bbo_cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=90.0,
+            ask=91.0,
+            observed_at_ms=2_000,
+            received_at_ms=2_001,
+            source="binance_book_ticker",
+        )
+    )
+
+    class EmptyRestRefresher:
+        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
+            return None
+
+    runtime.ws_bbo_rest_refresher = EmptyRestRefresher()
+
+    runtime.journal.open()
+    try:
+        overlay = await runtime.close_runtime._rewarm_close_price_evidence(
+            [("binance", "BTCUSDT")],
+            now_ms=now_ms,
+        )
+    finally:
+        runtime.journal.close()
+
+    assert overlay == {}
+    failures = [
+        record["payload"]
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "runtime.close_price_evidence_rewarm_failed"
+    ]
+    assert failures
+    assert failures[-1]["venue"] == "binance"
+    assert failures[-1]["symbol"] == "BTCUSDT"
+    assert failures[-1]["observed_at_ms"] == 2_000
+    assert failures[-1]["age_ms"] == 1_000
+    assert failures[-1]["budget_ms"] == 1
+    assert failures[-1]["endpoint"] == "rest_topbook"
+    assert failures[-1]["ws_budget_excluded"] is True
+    assert failures[-1]["outcome"] == "rest_topbook_unavailable"
 
 
 def test_ws_bbo_close_price_hint_prefers_ws_bbo_over_hot_local_l2(tmp_path):

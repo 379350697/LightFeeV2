@@ -6,6 +6,7 @@ from LiveRuntime. Keep journal events, payload keys, and close semantics stable.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any
 
@@ -106,6 +107,166 @@ class CloseRuntime:
         if override is not None:
             return override(*args, **kwargs)
         return self._resolve_local_l2_quote(*args, **kwargs)
+
+    async def _rewarm_close_price_evidence(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        now_ms: int,
+    ) -> dict[tuple[str, str], Any]:
+        """Refresh active close WS BBO quotes before passive-close price hints."""
+        overlay: dict[tuple[str, str], Any] = {}
+        if (
+            not keys
+            or not self._entry_readiness_provider_uses_ws_bbo()
+            or self.ctx.config.runtime.mode == "paper"
+        ):
+            return overlay
+
+        budget_ms = self._entry_quote_lease_max_age_ms()
+        if budget_ms <= 0:
+            return overlay
+
+        unique_targets: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for venue, symbol in keys:
+            key = (str(venue or "").lower(), str(symbol or "").upper())
+            if not key[0] or not key[1] or key in seen:
+                continue
+            seen.add(key)
+            unique_targets.append(key)
+
+        unresolved = set(unique_targets)
+
+        def collect_fresh_from_cache(stage: str) -> None:
+            cache = self.ctx.ws_bbo_cache
+            if cache is None or not hasattr(cache, "fresh_quote"):
+                return
+            for key in list(unresolved):
+                quote = cache.fresh_quote(
+                    key[0],
+                    key[1],
+                    now_ms=now_ms,
+                    max_age_ms=budget_ms,
+                )
+                if quote is None:
+                    continue
+                overlay[key] = quote
+                unresolved.discard(key)
+                if stage != "initial":
+                    self.ctx.journal.append(
+                        "runtime.close_price_evidence_ws_rewarm_succeeded",
+                        {
+                            "venue": key[0],
+                            "symbol": key[1],
+                            "source": str(getattr(quote, "source", "") or "ws_bbo_cache"),
+                            "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
+                            "age_ms": max(
+                                now_ms - int(getattr(quote, "observed_at_ms", 0) or 0),
+                                0,
+                            ),
+                            "budget_ms": budget_ms,
+                            "outcome": "ws_bbo_rewarm_succeeded",
+                            "ts_ms": now_ms,
+                        },
+                    )
+
+        def cached_quote_evidence(key: tuple[str, str]) -> dict[str, Any]:
+            cache = self.ctx.ws_bbo_cache
+            quote = None
+            if cache is not None and hasattr(cache, "get_quote"):
+                try:
+                    quote = cache.get_quote(key[0], key[1])
+                except Exception:  # pragma: no cover - defensive telemetry
+                    quote = None
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            ws_budget_excluded = (
+                observed_at_ms <= 0
+                or age_ms is None
+                or age_ms > budget_ms
+                or bid <= 0.0
+                or ask <= bid
+            )
+            return {
+                "observed_at_ms": observed_at_ms,
+                "age_ms": age_ms,
+                "stale_quote_source": str(getattr(quote, "source", "") or ""),
+                "ws_budget_excluded": ws_budget_excluded,
+            }
+
+        collect_fresh_from_cache("initial")
+        wait_budget_ms = min(budget_ms, 750)
+        elapsed_ms = 0
+        while unresolved and elapsed_ms < wait_budget_ms:
+            await asyncio.sleep(0.05)
+            elapsed_ms += 50
+            collect_fresh_from_cache("wait")
+
+        refresher_factory = getattr(self.ctx, "_entry_quote_truth_refresher", None)
+        refresher = refresher_factory() if callable(refresher_factory) else None
+        refresh_quote = getattr(refresher, "refresh_quote", None)
+        accept_quote = getattr(self.ctx, "_entry_quote_truth_accept_quote", None)
+        for key in list(unresolved):
+            rest_error = ""
+            refreshed = None
+            if callable(refresh_quote):
+                try:
+                    refreshed = refresh_quote(key[0], key[1], now_ms=now_ms)
+                except Exception as exc:  # pragma: no cover - defensive telemetry
+                    rest_error = f"{type(exc).__name__}: {exc}"[:240]
+            accepted = (
+                bool(accept_quote(refreshed, now_ms=now_ms))
+                if callable(accept_quote)
+                else False
+            )
+            if accepted:
+                cache = self.ctx.ws_bbo_cache
+                if cache is not None and hasattr(cache, "update_quote"):
+                    cache.update_quote(refreshed)
+                overlay[key] = refreshed
+                unresolved.discard(key)
+                self.ctx.journal.append(
+                    "runtime.close_price_evidence_rest_rewarm_succeeded",
+                    {
+                        "venue": key[0],
+                        "symbol": key[1],
+                        "source": str(getattr(refreshed, "source", "") or "rest_topbook"),
+                        "observed_at_ms": int(getattr(refreshed, "observed_at_ms", 0) or 0),
+                        "age_ms": max(
+                            now_ms - int(getattr(refreshed, "observed_at_ms", 0) or 0),
+                            0,
+                        ),
+                        "budget_ms": budget_ms,
+                        "wait_budget_ms": wait_budget_ms,
+                        "endpoint": "rest_topbook",
+                        "outcome": "rest_topbook_rewarm_succeeded",
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+            self.ctx.journal.append(
+                "runtime.close_price_evidence_rewarm_failed",
+                {
+                    "venue": key[0],
+                    "symbol": key[1],
+                    "source": "ws_bbo_quote_lease",
+                    **cached_quote_evidence(key),
+                    "budget_ms": budget_ms,
+                    "wait_budget_ms": wait_budget_ms,
+                    "endpoint": "rest_topbook",
+                    "rest_error": rest_error,
+                    "outcome": (
+                        "rest_topbook_unavailable"
+                        if callable(refresh_quote)
+                        else "rest_topbook_capability_unavailable"
+                    ),
+                    "ts_ms": now_ms,
+                },
+            )
+        return overlay
 
     @staticmethod
     def _venue_from_close_reconciliation(value: Any) -> Venue | None:
@@ -635,6 +796,23 @@ class CloseRuntime:
             if normal_close_reason_uses_passive_maker_taker(reason_str):
                 # Route to passive close
                 if self.ctx.passive_close_executor is not None:
+                    await self._rewarm_close_price_evidence(
+                        [
+                            (
+                                position.long_venue.value
+                                if hasattr(position.long_venue, "value")
+                                else str(position.long_venue),
+                                position.symbol,
+                            ),
+                            (
+                                position.short_venue.value
+                                if hasattr(position.short_venue, "value")
+                                else str(position.short_venue),
+                                position.symbol,
+                            ),
+                        ],
+                        now_ms=now_ms,
+                    )
                     self.ctx.journal.append(
                         "runtime.normal_close_routing_passive",
                         {
@@ -762,11 +940,12 @@ class CloseRuntime:
 
             mid = (bid + ask) / 2.0
             self.ctx.journal.append(
-                "runtime.close_price_evidence_fallback",
+                "runtime.close_price_evidence_ws_bbo_used",
                 {
                     "venue": venue_value,
                     "symbol": symbol,
                     "domain": "ws_bbo_cache",
+                    "source": str(getattr(quote, "source", "") or "ws_bbo_cache"),
                     "bid": bid,
                     "ask": ask,
                     "mid": mid,
@@ -774,6 +953,7 @@ class CloseRuntime:
                     "age_ms": age_ms,
                     "budget_ms": budget_ms,
                     "decision": "use_price_hint",
+                    "outcome": "used_fresh_ws_bbo",
                     "provider": "ws_bbo_quote_lease",
                     "ts_ms": now_ms,
                 },
