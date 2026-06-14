@@ -17,6 +17,22 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest HOME owned-conflict cleanup follow-up, 2026-06-14:
+CL-079 proved the historical HOME Bybit short was owned by the positive-fill
+pending conflict, but post-deploy runtime evidence showed it still was not
+automatically flattening. The missing edge was execution, not ownership:
+`_finalize_pending_entry()` recorded
+`pending_entry.positive_fill_live_truth_conflict` and deferred, while the
+generic live-position cleanup paths skipped pending entries and managed only
+startup mismatches or existing `open_positions`. The fix adds an owner-scoped
+cleanup driver for current positive-fill/live-truth conflicts: when open-order
+truth is empty and exactly one direction-correct live leg remains, pending-entry
+runtime calls the existing reduce-only IOC `_cleanup_failed_leg_exposure()`,
+then releases the pending entry only after a fresh live-truth scan proves both
+venues flat/no-open-orders. Cleanup failure keeps the pending entry retained and
+does not emit `entry.opened`. Full evidence is recorded in
+[`daily/2026-06-14.md#cluster-cl-080-home-owned-pending-entry-live-conflict-did-not-auto-flatten`](daily/2026-06-14.md#cluster-cl-080-home-owned-pending-entry-live-conflict-did-not-auto-flatten).
+
 Latest HOME historical owner persistence follow-up, 2026-06-14:
 CL-078 was deployed at `6209fac`, then read-only cloud evidence still showed a
 historical Bybit HOME short while local current state had no pending entry and

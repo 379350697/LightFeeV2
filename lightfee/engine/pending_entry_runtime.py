@@ -1584,6 +1584,14 @@ class PendingEntryRuntime:
                         "reason": decision.reason,
                     },
                 )
+                if await self._cleanup_positive_fill_live_truth_conflict(
+                    pending=pending,
+                    entry_id=entry_id,
+                    decision=decision,
+                    live_truth=live_truth,
+                    now_ms=now_ms,
+                ):
+                    return True
             return False
 
         open_maker_fill_quantity = min(
@@ -1803,6 +1811,157 @@ class PendingEntryRuntime:
                     "closure_decision_id": closure_decision_id,
                 },
             )
+
+    async def _cleanup_positive_fill_live_truth_conflict(
+        self,
+        *,
+        pending: Any,
+        entry_id: str,
+        decision: PendingEntryTerminalDecision,
+        live_truth: PendingEntryLiveTruth,
+        now_ms: int,
+    ) -> bool:
+        """Clean an owned single-leg live conflict before releasing pending."""
+
+        if not live_truth.available or live_truth.has_live_open_order:
+            return False
+
+        eps = 1e-9
+        live_long_quantity = max(float(decision.live_long_quantity or 0.0), 0.0)
+        live_short_quantity = max(float(decision.live_short_quantity or 0.0), 0.0)
+        has_live_long = live_long_quantity > eps
+        has_live_short = live_short_quantity > eps
+        if has_live_long == has_live_short:
+            self.ctx.journal.append(
+                "pending_entry.owned_live_conflict_cleanup_skipped",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "live_long_quantity": live_long_quantity,
+                    "live_short_quantity": live_short_quantity,
+                    "reason": (
+                        "ambiguous_live_position_shape"
+                        if has_live_long
+                        else "no_live_single_leg_to_cleanup"
+                    ),
+                },
+            )
+            return False
+
+        cleanup_venue = pending.long_venue if has_live_long else pending.short_venue
+        live_side = Side.BUY if has_live_long else Side.SELL
+        live_quantity = live_long_quantity if has_live_long else live_short_quantity
+        stage = (
+            "owned_pending_entry_live_conflict_long"
+            if has_live_long
+            else "owned_pending_entry_live_conflict_short"
+        )
+        self.ctx.journal.append(
+            "pending_entry.owned_live_conflict_cleanup_attempt",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": cleanup_venue.value,
+                "stage": stage,
+                "live_position_side": live_side.value,
+                "live_position_quantity": live_quantity,
+                "matched_quantity": decision.matched_quantity,
+                "live_long_quantity": live_long_quantity,
+                "live_short_quantity": live_short_quantity,
+                "reason": decision.reason,
+            },
+        )
+
+        cleanup_result = await self.ctx._cleanup_failed_leg_exposure(
+            cleanup_venue,
+            pending.symbol,
+            entry_id,
+            stage,
+        )
+        if cleanup_result is not True:
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 10_000,
+            )
+            self.ctx.journal.append(
+                "pending_entry.owned_live_conflict_cleanup_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": cleanup_venue.value,
+                    "stage": stage,
+                    "live_position_side": live_side.value,
+                    "live_position_quantity": live_quantity,
+                    "result": "adapter_unavailable"
+                    if cleanup_result is None
+                    else "failed",
+                    "reason": "reduce_only_cleanup_failed",
+                },
+            )
+            return False
+
+        fresh_truth = await self.ctx._pending_entry_positive_fill_live_truth(
+            pending,
+            entry_id,
+            now_ms,
+        )
+        post_long = max(float(fresh_truth.live_long_quantity or 0.0), 0.0)
+        post_short = max(float(fresh_truth.live_short_quantity or 0.0), 0.0)
+        post_flat = (
+            fresh_truth.available
+            and not fresh_truth.has_live_open_order
+            and not fresh_truth.has_live_position
+            and post_long <= eps
+            and post_short <= eps
+        )
+        if not post_flat:
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 10_000,
+            )
+            self.ctx.journal.append(
+                "pending_entry.owned_live_conflict_cleanup_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": cleanup_venue.value,
+                    "stage": stage,
+                    "live_position_side": live_side.value,
+                    "live_position_quantity": live_quantity,
+                    "result": "post_cleanup_truth_not_flat"
+                    if fresh_truth.available
+                    else "post_cleanup_truth_unavailable",
+                    "post_cleanup_live_long_quantity": post_long,
+                    "post_cleanup_live_short_quantity": post_short,
+                    "post_cleanup_has_live_open_order": fresh_truth.has_live_open_order,
+                    "post_cleanup_has_live_position": fresh_truth.has_live_position,
+                    "post_cleanup_error": fresh_truth.error,
+                    "reason": "fresh_live_truth_required_before_pending_release",
+                },
+            )
+            return False
+
+        self.ctx.journal.append(
+            "pending_entry.owned_live_conflict_cleanup_succeeded",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": cleanup_venue.value,
+                "stage": stage,
+                "live_position_side": live_side.value,
+                "live_position_quantity": live_quantity,
+                "post_cleanup_live_long_quantity": post_long,
+                "post_cleanup_live_short_quantity": post_short,
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+            },
+        )
+        await self.ctx._complete_pending_entry_terminal_removal(
+            entry_id,
+            reason="owned_live_conflict_cleanup_succeeded",
+            symbol=pending.symbol,
+            now_ms=now_ms,
+        )
+        return True
 
     async def _complete_pending_entry_terminal_removal(
         self,
