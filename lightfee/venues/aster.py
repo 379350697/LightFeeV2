@@ -56,6 +56,7 @@ class AsterAdapter(VenueAdapter):
                 self._private = AsterV3Client(
                     credential=credential,
                     exchange_http_timeout_ms=exchange_http_timeout_ms,
+                    rate_limiter=rate_limiter,
                 )
             else:
                 self._private_disabled_reason = (

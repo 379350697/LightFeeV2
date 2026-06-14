@@ -32,8 +32,11 @@ from lightfee.venues.transport import (
     TransportError,
     TransportErrorCategory,
     _format_decimal,
+    _normalize_host_scope,
+    _normalize_rest_endpoint_key,
     _parse_binance_like_position,
     _parse_optional_float,
+    _parse_venue_retry_after_ms,
     _safe_float,
 )
 
@@ -176,6 +179,7 @@ class AsterV3Client:
         credential: LiveCredential,
         exchange_http_timeout_ms: int = 10000,
         http_client: Optional[httpx.AsyncClient] = None,
+        rate_limiter: Any = None,
     ) -> None:
         private_key = credential.wallet_private_key or credential.api_secret
         private_key = _normalize_private_key(private_key)
@@ -197,6 +201,7 @@ class AsterV3Client:
             timeout=exchange_http_timeout_ms / 1000.0
         )
         self._owns_client = http_client is None
+        self._rate_limiter = rate_limiter
 
     @property
     def signer_address(self) -> str:
@@ -234,6 +239,92 @@ class AsterV3Client:
         query = "?" + urllib.parse.urlencode(signed_params)
         return query, {"Content-Type": "application/x-www-form-urlencoded"}, None
 
+    def _rest_rate_limit_scopes(self, method: str, path: str) -> list[str]:
+        endpoint = _normalize_rest_endpoint_key(method, path)
+        scopes = [
+            endpoint,
+            _normalize_host_scope(ASTER_V3_PRIVATE_BASE_URL),
+            "venue:aster",
+        ]
+
+        from lightfee.rate_limit.config import built_in_defaults
+        from lightfee.rate_limit.engine import global_rate_limit_runtime
+
+        global_rt = global_rate_limit_runtime()
+        if global_rt is not None and global_rt.config_manager is not None:
+            config = global_rt.config_manager.config
+        else:
+            config = built_in_defaults()
+
+        venue_config = config.venues.get("aster") if config else None
+        if venue_config is not None:
+            group_name = (getattr(venue_config, "scopes", {}) or {}).get(endpoint)
+            if group_name:
+                scopes.append(f"group:aster:{group_name}")
+                scopes.append(f"group:{group_name}")
+        return scopes
+
+    def _request_weight_override(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, Any]],
+    ) -> float | None:
+        if (
+            method.upper() == "GET"
+            and path == ASTER_V3_OPEN_ORDERS_PATH
+            and not (params or {}).get("symbol")
+        ):
+            return 40.0
+        return None
+
+    async def _wait_until_rate_limit_ready(
+        self,
+        scopes: list[str],
+        weight_override: float | None,
+    ) -> None:
+        if self._rate_limiter is not None:
+            await self._rate_limiter.wait_until_ready_for_scopes(scopes)
+            await self._rate_limiter.pace_for_scopes(scopes)
+
+        from lightfee.rate_limit.engine import global_rate_limit_runtime
+
+        global_rt = global_rate_limit_runtime()
+        if global_rt is not None:
+            await global_rt.async_wait_until_ready_for_scopes(
+                scopes,
+                weight_override=weight_override,
+            )
+
+    def _record_rate_limit_response(
+        self,
+        scopes: list[str],
+        response: httpx.Response,
+    ) -> None:
+        retry_after_ms = _parse_venue_retry_after_ms(
+            Venue.ASTER,
+            dict(response.headers),
+            int(time.time() * 1000),
+        )
+        if self._rate_limiter is not None:
+            self._rate_limiter.record_rate_limit_for_scopes(
+                scopes,
+                retry_after_ms=retry_after_ms,
+            )
+
+        from lightfee.rate_limit.engine import global_rate_limit_runtime
+
+        global_rt = global_rate_limit_runtime()
+        if global_rt is not None:
+            global_rt.record_rate_limit_for_scopes(
+                scopes,
+                retry_after_ms=retry_after_ms or 0,
+            )
+
+    def _record_success_response(self, scopes: list[str]) -> None:
+        if self._rate_limiter is not None:
+            self._rate_limiter.record_success_for_scopes(scopes)
+
     async def _request(
         self,
         method: str,
@@ -241,11 +332,16 @@ class AsterV3Client:
         *,
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
+        method_upper = method.upper()
+        scopes = self._rest_rate_limit_scopes(method_upper, path)
+        weight_override = self._request_weight_override(method_upper, path, params)
+        await self._wait_until_rate_limit_ready(scopes, weight_override)
+
         query, headers, body = self.build_signed_request(method, path, params=params)
         url = ASTER_V3_PRIVATE_BASE_URL.rstrip("/") + path + query
         try:
             response = await self._client.request(
-                method.upper(),
+                method_upper,
                 url,
                 headers=headers,
                 content=body,
@@ -263,6 +359,8 @@ class AsterV3Client:
 
         text = response.text
         if response.status_code >= 400:
+            if response.status_code in (429, 418):
+                self._record_rate_limit_response(scopes, response)
             category = (
                 TransportErrorCategory.AUTH_FAILURE
                 if response.status_code in (401, 403)
@@ -270,7 +368,7 @@ class AsterV3Client:
             )
             raise TransportError(
                 category,
-                f"aster_v3 {method.upper()} {path} rejected status={response.status_code}",
+                f"aster_v3 {method_upper} {path} rejected status={response.status_code}",
                 status_code=response.status_code,
                 body=text,
                 headers=dict(response.headers),
@@ -282,11 +380,12 @@ class AsterV3Client:
         if isinstance(raw, dict) and str(raw.get("code", "0")) not in ("0", "200"):
             raise TransportError(
                 TransportErrorCategory.REQUEST_REJECTED,
-                f"aster_v3 {method.upper()} {path} rejected code={raw.get('code')} msg={raw.get('msg', '')}",
+                f"aster_v3 {method_upper} {path} rejected code={raw.get('code')} msg={raw.get('msg', '')}",
                 status_code=response.status_code,
                 body=json.dumps(raw, ensure_ascii=False),
                 headers=dict(response.headers),
             )
+        self._record_success_response(scopes)
         return raw
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:

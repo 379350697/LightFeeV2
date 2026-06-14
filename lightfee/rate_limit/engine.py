@@ -490,14 +490,22 @@ class RateLimitRuntime:
         return 30
 
     def wait_until_ready_for_scopes(
-        self, scopes: list[str], timeout_ms: int = 0
+        self,
+        scopes: list[str],
+        timeout_ms: int = 0,
+        *,
+        weight_override: float | None = None,
     ) -> bool:
         """Block until scopes are available (V1: wait_until_ready_for_scopes)."""
         deadline = int(time.time() * 1000) + timeout_ms
         while True:
             now_ms = int(time.time() * 1000)
             try:
-                weight = self._resolve_request_weight(scopes)
+                weight = (
+                    float(weight_override)
+                    if weight_override is not None
+                    else self._resolve_request_weight(scopes)
+                )
                 self.engine.try_consume_scopes(scopes, weight, now_ms)
                 return True
             except RateLimitError as e:
@@ -506,7 +514,11 @@ class RateLimitRuntime:
                 time.sleep(max(0.0, e.retry_in_ms / 1000.0))
 
     async def async_wait_until_ready_for_scopes(
-        self, scopes: list[str], timeout_ms: int = 0
+        self,
+        scopes: list[str],
+        timeout_ms: int = 0,
+        *,
+        weight_override: float | None = None,
     ) -> bool:
         """Async version: block until scopes are available."""
         import asyncio
@@ -515,7 +527,11 @@ class RateLimitRuntime:
         while True:
             now_ms = int(time.time() * 1000)
             try:
-                weight = self._resolve_request_weight(scopes)
+                weight = (
+                    float(weight_override)
+                    if weight_override is not None
+                    else self._resolve_request_weight(scopes)
+                )
                 self.engine.try_consume_scopes(scopes, weight, now_ms)
                 return True
             except RateLimitError as e:

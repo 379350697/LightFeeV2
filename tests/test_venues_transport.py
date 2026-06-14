@@ -27,6 +27,12 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.config.schema import TradeCredentials, VenueConfig
+from lightfee.rate_limit.engine import (
+    RateLimitEngine,
+    RateLimitError,
+    RateLimitRuntime,
+    install_global_rate_limit_runtime,
+)
 from lightfee.venues.common import (
     floor_to_step,
     normalize_order_quantity,
@@ -62,6 +68,7 @@ from lightfee.venues.transport import (
     build_hmac_sha512_hex,
     classify_transport_error,
 )
+from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.aster_v3 import AsterV3Client
 
 
@@ -448,6 +455,22 @@ class TestBinanceAsterPostSigning:
         assert body is None
 
     @pytest.mark.asyncio
+    async def test_aster_adapter_passes_limiter_to_private_v3_client(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        limiter = object()
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+            rate_limiter=limiter,
+        )
+
+        try:
+            assert adapter._private is not None
+            assert adapter._private._rate_limiter is limiter
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.asyncio
     async def test_aster_v3_fetch_position_accepts_list_response(self):
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
@@ -528,6 +551,95 @@ class TestBinanceAsterPostSigning:
         assert snapshot.maintenance_margin_quote == pytest.approx(25.1)
         assert snapshot.available_balance_quote == pytest.approx(74.25)
         assert snapshot.source == "aster_v3_account_with_join_margin"
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_unfiltered_open_orders_consumes_official_weight_40(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/openOrders"
+            assert "symbol" not in dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        engine = RateLimitEngine(default_margin=1.0)
+        engine.register_bucket("venue:aster", budget_per_minute=100.0)
+        runtime = RateLimitRuntime(engine=engine)
+        install_global_rate_limit_runtime(runtime)
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            assert await client.fetch_open_orders(None) == []
+        finally:
+            await client.close()
+            install_global_rate_limit_runtime(None)
+
+        snap = engine.bucket_snapshot("venue:aster")
+        assert snap["tokens"] == pytest.approx(60.0)
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_symbol_open_orders_keeps_official_weight_1(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/openOrders"
+            assert dict(request.url.params)["symbol"] == "ASTERUSDT"
+            return httpx.Response(200, json=[])
+
+        engine = RateLimitEngine(default_margin=1.0)
+        engine.register_bucket("venue:aster", budget_per_minute=100.0)
+        runtime = RateLimitRuntime(engine=engine)
+        install_global_rate_limit_runtime(runtime)
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            assert await client.fetch_open_orders("ASTERUSDT") == []
+        finally:
+            await client.close()
+            install_global_rate_limit_runtime(None)
+
+        snap = engine.bucket_snapshot("venue:aster")
+        assert snap["tokens"] == pytest.approx(99.0)
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_rate_limit_response_records_cooldown(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/positionRisk"
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "2"},
+                json={"code": -1003, "msg": "Too many requests"},
+            )
+
+        engine = RateLimitEngine(default_margin=1.0)
+        engine.register_bucket("venue:aster", budget_per_minute=100.0)
+        runtime = RateLimitRuntime(engine=engine)
+        install_global_rate_limit_runtime(runtime)
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            with pytest.raises(TransportError) as exc:
+                await client.fetch_position("ASTERUSDT")
+            assert exc.value.status_code == 429
+            with pytest.raises(RateLimitError):
+                engine.try_consume_scopes(
+                    ["GET /fapi/v3/positionRisk", "venue:aster"],
+                    weight=5.0,
+                    now_ms=int(time.time() * 1000),
+                )
+        finally:
+            await client.close()
+            install_global_rate_limit_runtime(None)
 
     @pytest.mark.asyncio
     async def test_hyperliquid_account_balance_uses_clearinghouse_withdrawable(self):

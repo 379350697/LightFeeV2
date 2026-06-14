@@ -334,6 +334,38 @@ class TestV1RateLimitDefaults:
                 assert endpoint in v.endpoint_min_interval_ms
                 assert v.endpoint_min_interval_ms[endpoint] == min_interval
 
+    def test_aster_v3_private_endpoint_weights_match_official_contract(self):
+        cfg = built_in_defaults()
+        v = cfg.venues["aster"]
+        expected = {
+            "GET /fapi/v3/order": (1, "account"),
+            "POST /fapi/v3/order": (1, "order"),
+            "DELETE /fapi/v3/order": (1, "order"),
+            "GET /fapi/v3/openOrders": (1, "account"),
+            "GET /fapi/v3/positionRisk": (5, "account"),
+            "GET /fapi/v3/accountWithJoinMargin": (5, "account"),
+            "POST /fapi/v3/leverage": (1, "order"),
+            "GET /fapi/v3/leverageBracket": (1, "account"),
+        }
+
+        for endpoint, (weight, scope) in expected.items():
+            assert v.endpoint_weights[endpoint] == weight
+            assert v.scopes[endpoint] == scope
+            assert v.endpoint_min_interval_ms[endpoint] == 50
+
+    def test_runtime_accepts_weight_override_for_param_sensitive_endpoints(self):
+        eng = RateLimitEngine(default_margin=1.0)
+        eng.register_bucket("venue:aster", budget_per_minute=100.0)
+        rt = RateLimitRuntime(engine=eng)
+
+        assert rt.wait_until_ready_for_scopes(
+            ["GET /fapi/v3/openOrders", "venue:aster"],
+            weight_override=40.0,
+        )
+
+        snap = eng.bucket_snapshot("venue:aster")
+        assert snap["tokens"] == pytest.approx(60.0)
+
     def test_docs_fallback_present(self):
         cfg = built_in_defaults()
         for venue_name in EXPECTED_VENUES:
