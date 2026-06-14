@@ -17,13 +17,13 @@ class ExchangeSource:
     Holds a MarketDataClient per venue. No credential required.
     """
 
-    def __init__(self, spec: VenueSpec) -> None:
-        self._client = MarketDataClient(spec)
+    def __init__(self, spec: VenueSpec, rate_limiter: Optional[object] = None) -> None:
+        self._client = MarketDataClient(spec, rate_limiter=rate_limiter)
         self.venue = spec.venue_id.value
 
     @classmethod
-    def for_venue(cls, venue: Venue) -> ExchangeSource:
-        return cls(get_spec(venue))
+    def for_venue(cls, venue: Venue, rate_limiter: Optional[object] = None) -> ExchangeSource:
+        return cls(get_spec(venue), rate_limiter=rate_limiter)
 
     async def close(self) -> None:
         await self._client.close()

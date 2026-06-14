@@ -86,6 +86,26 @@ class TestImportSmoke:
         assert result.returncode == 0
         assert "lightfee-sidecar" in result.stdout
 
+    def test_sidecar_installs_global_rate_limit_runtime(self, tmp_path):
+        from lightfee.apps.sidecar import _install_sidecar_rate_limit_runtime
+        from lightfee.rate_limit.engine import (
+            global_rate_limit_runtime,
+            install_global_rate_limit_runtime,
+        )
+
+        previous = global_rate_limit_runtime()
+        install_global_rate_limit_runtime(None)
+        try:
+            runtime = asyncio.run(
+                _install_sidecar_rate_limit_runtime(str(tmp_path / "live.toml"))
+            )
+            installed = global_rate_limit_runtime()
+        finally:
+            install_global_rate_limit_runtime(previous)
+
+        assert installed is runtime
+        assert runtime.engine.bucket_snapshot("venue:aster") is not None
+
     def test_ops_imports(self):
         from lightfee.ops import commands
 

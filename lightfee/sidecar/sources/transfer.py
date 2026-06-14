@@ -22,15 +22,29 @@ class TransferSource:
     Currently returns empty results — structurally compatible, not a sentinel.
     """
 
-    def __init__(self, from_spec: VenueSpec, to_spec: VenueSpec) -> None:
-        self._from_client = MarketDataClient(from_spec)
-        self._to_client = MarketDataClient(to_spec)
+    def __init__(
+        self,
+        from_spec: VenueSpec,
+        to_spec: VenueSpec,
+        rate_limiter: Optional[object] = None,
+    ) -> None:
+        self._from_client = MarketDataClient(from_spec, rate_limiter=rate_limiter)
+        self._to_client = MarketDataClient(to_spec, rate_limiter=rate_limiter)
         self.from_venue = from_spec.venue_id.value
         self.to_venue = to_spec.venue_id.value
 
     @classmethod
-    def for_venue_pair(cls, from_venue: Venue, to_venue: Venue) -> TransferSource:
-        return cls(get_spec(from_venue), get_spec(to_venue))
+    def for_venue_pair(
+        cls,
+        from_venue: Venue,
+        to_venue: Venue,
+        rate_limiter: Optional[object] = None,
+    ) -> TransferSource:
+        return cls(
+            get_spec(from_venue),
+            get_spec(to_venue),
+            rate_limiter=rate_limiter,
+        )
 
     async def close(self) -> None:
         await self._from_client.close()

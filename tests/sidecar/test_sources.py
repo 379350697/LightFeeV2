@@ -54,6 +54,14 @@ class TestExchangeSource:
         assert src.venue == "binance"
         # No credential validation should occur
 
+    def test_accepts_shared_public_rate_limiter(self):
+        from lightfee.venues.transport import EndpointRateLimiter
+
+        limiter = EndpointRateLimiter(1000, 8000, 50)
+        src = ExchangeSource(binance_spec(), rate_limiter=limiter)
+
+        assert src._client._rate_limiter is limiter
+
 
 class TestLiquiditySource:
     """LiquiditySource wraps MarketDataClient's fetch_perp_liquidity."""
@@ -61,6 +69,14 @@ class TestLiquiditySource:
     def test_construct(self):
         src = LiquiditySource.for_venue(Venue.OKX)
         assert src.venue == "okx"
+
+    def test_accepts_shared_public_rate_limiter(self):
+        from lightfee.venues.transport import EndpointRateLimiter
+
+        limiter = EndpointRateLimiter(1000, 8000, 50)
+        src = LiquiditySource(okx_spec(), rate_limiter=limiter)
+
+        assert src._client._rate_limiter is limiter
 
     def test_close(self):
         async def _run():
@@ -87,6 +103,31 @@ class TestTransferSource:
             assert results[0].available == 0.0
             await src.close()
         asyncio.run(_run())
+
+
+class TestSidecarServiceRateLimitWiring:
+    def test_service_shares_public_rate_limiter_across_sources(self):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        config = AppConfig(
+            runtime=RuntimeConfig(sidecar_snapshot_path="/tmp/unused-sidecar.json"),
+            venues=[VenueConfig(venue="binance"), VenueConfig(venue="aster")],
+        )
+
+        service = SidecarService(config)
+
+        exchange_limiters = {
+            id(src._client._rate_limiter)
+            for src in service._exchange_sources.values()
+        }
+        liquidity_limiters = {
+            id(src._client._rate_limiter)
+            for src in service._liquidity_sources.values()
+        }
+
+        assert len(exchange_limiters | liquidity_limiters) == 1
+        assert next(iter(service._exchange_sources.values()))._client._rate_limiter is not None
 
     def test_close(self):
         async def _run():

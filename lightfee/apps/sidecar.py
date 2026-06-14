@@ -14,6 +14,23 @@ from lightfee.sidecar.service import SidecarService
 logger = logging.getLogger("lightfee.sidecar")
 
 
+async def _install_sidecar_rate_limit_runtime(config_path: str) -> object:
+    from lightfee.engine.bootstrap import rate_limit_config_path
+    from lightfee.rate_limit.config import RateLimitConfigManager
+    from lightfee.rate_limit.engine import (
+        RateLimitRuntime,
+        install_global_rate_limit_runtime,
+    )
+
+    rate_limit_config_mgr = RateLimitConfigManager(
+        config_path=rate_limit_config_path(config_path)
+    )
+    rate_limit_rt = RateLimitRuntime(config_manager=rate_limit_config_mgr)
+    await rate_limit_rt.refresh()
+    install_global_rate_limit_runtime(rate_limit_rt)
+    return rate_limit_rt
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -31,6 +48,7 @@ def main() -> None:
     service = SidecarService(config)
 
     async def _run() -> None:
+        await _install_sidecar_rate_limit_runtime(args.config)
         if args.once:
             await service.refresh_once()
             return

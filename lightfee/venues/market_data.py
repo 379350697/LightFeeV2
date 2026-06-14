@@ -237,10 +237,18 @@ class MarketDataClient:
                 raise ValueError(f"unsupported method: {method}")
 
             if resp.status_code >= 400:
-                if resp.status_code in (429, 418) and self._rate_limiter is not None:
-                    now_ms = _now_ms()
+                if resp.status_code in (429, 418):
                     retry_after = _parse_retry_after_ms(dict(resp.headers))
-                    self._rate_limiter.record_rate_limit_for_scopes(scopes, retry_after_ms=retry_after)
+                    if self._rate_limiter is not None:
+                        self._rate_limiter.record_rate_limit_for_scopes(
+                            scopes,
+                            retry_after_ms=retry_after,
+                        )
+                    if global_rt is not None:
+                        global_rt.record_rate_limit_for_scopes(
+                            scopes,
+                            retry_after_ms=retry_after,
+                        )
                 raise PublicTransportError(
                     PublicTransportErrorCategory.TRANSPORT_FAILURE,
                     f"HTTP {resp.status_code}: {resp.text[:200]}",

@@ -182,6 +182,45 @@ class TestRateLimitScopesForNewEndpoints:
         scopes = client._public_rate_limit_scopes("GET", "/api/v2/mix/market/tickers")
         assert any("market" in s for s in scopes)
 
+    @pytest.mark.asyncio
+    async def test_public_429_records_global_rate_limit_cooldown(self):
+        import httpx
+
+        from lightfee.rate_limit.config import RateLimitConfigManager
+        from lightfee.rate_limit.engine import (
+            RateLimitRuntime,
+            global_rate_limit_runtime,
+            install_global_rate_limit_runtime,
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "1"},
+                text="too many requests",
+            )
+
+        previous = global_rate_limit_runtime()
+        runtime = RateLimitRuntime(
+            config_manager=RateLimitConfigManager(config_path=None)
+        )
+        install_global_rate_limit_runtime(runtime)
+        client = MarketDataClient(aster_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(PublicTransportError):
+                await client._public_get(
+                    "/fapi/v1/openInterest",
+                    params={"symbol": "XCNUSDT"},
+                )
+            snap = runtime.engine.bucket_snapshot("venue:aster")
+        finally:
+            await client.close()
+            install_global_rate_limit_runtime(previous)
+
+        assert snap is not None
+        assert snap["cooldown_until_ms"] > 0
+
 
 class TestParserFixtures:
     """Parser-level coverage for all 7 venues with fixture-style data."""
