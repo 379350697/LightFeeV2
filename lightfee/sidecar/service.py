@@ -54,18 +54,20 @@ class SidecarService:
         self._transfer_sources: list[TransferSource] = []
         from lightfee.venues.transport import EndpointRateLimiter
 
-        self._public_rate_limiter = EndpointRateLimiter(1000, 8000, 50)
+        self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
         for vc in config.venues:
             venue = Venue.from_str(vc.venue)
             spec = get_spec(venue)
+            rate_limiter = EndpointRateLimiter(1000, 8000, 50)
+            self._public_rate_limiters[vc.venue] = rate_limiter
             self._exchange_sources[vc.venue] = ExchangeSource(
                 spec,
-                rate_limiter=self._public_rate_limiter,
+                rate_limiter=rate_limiter,
             )
             self._liquidity_sources[vc.venue] = LiquiditySource(
                 spec,
-                rate_limiter=self._public_rate_limiter,
+                rate_limiter=rate_limiter,
             )
 
         venue_names = [vc.venue for vc in config.venues]
@@ -77,7 +79,6 @@ class SidecarService:
                     TransferSource.for_venue_pair(
                         from_v,
                         to_v,
-                        rate_limiter=self._public_rate_limiter,
                     )
                 )
 

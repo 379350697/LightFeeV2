@@ -106,7 +106,7 @@ class TestTransferSource:
 
 
 class TestSidecarServiceRateLimitWiring:
-    def test_service_shares_public_rate_limiter_across_sources(self):
+    def test_service_shares_public_rate_limiter_per_venue(self):
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
         from lightfee.sidecar.service import SidecarService
 
@@ -117,17 +117,14 @@ class TestSidecarServiceRateLimitWiring:
 
         service = SidecarService(config)
 
-        exchange_limiters = {
-            id(src._client._rate_limiter)
-            for src in service._exchange_sources.values()
-        }
-        liquidity_limiters = {
-            id(src._client._rate_limiter)
-            for src in service._liquidity_sources.values()
-        }
+        binance_limiter = service._exchange_sources["binance"]._client._rate_limiter
+        aster_limiter = service._exchange_sources["aster"]._client._rate_limiter
 
-        assert len(exchange_limiters | liquidity_limiters) == 1
-        assert next(iter(service._exchange_sources.values()))._client._rate_limiter is not None
+        assert binance_limiter is service._liquidity_sources["binance"]._client._rate_limiter
+        assert aster_limiter is service._liquidity_sources["aster"]._client._rate_limiter
+        assert binance_limiter is not aster_limiter
+        assert binance_limiter is not None
+        assert aster_limiter is not None
 
     def test_close(self):
         async def _run():
