@@ -577,29 +577,75 @@ def _load_venue_credential(venue: str) -> Optional[Any]:
         return None
 
 
-def _create_readonly_adapter(venue: str, credential: Any) -> Optional[Any]:
+def _create_readonly_rate_limiter() -> Any:
+    from lightfee.venues.transport import EndpointRateLimiter
+
+    return EndpointRateLimiter(initial_ms=1000, max_ms=8000, pacing_interval_ms=25)
+
+
+def _install_readonly_exchange_truth_rate_limit_runtime() -> Any:
+    from lightfee.rate_limit.config import RateLimitConfigManager
+    from lightfee.rate_limit.engine import (
+        RateLimitRuntime,
+        global_rate_limit_runtime,
+        install_global_rate_limit_runtime,
+    )
+
+    previous = global_rate_limit_runtime()
+    install_global_rate_limit_runtime(
+        RateLimitRuntime(config_manager=RateLimitConfigManager(config_path=None))
+    )
+    return previous
+
+
+def _restore_readonly_exchange_truth_rate_limit_runtime(previous: Any) -> None:
+    from lightfee.rate_limit.engine import install_global_rate_limit_runtime
+
+    install_global_rate_limit_runtime(previous)
+
+
+def _create_readonly_adapter(
+    venue: str,
+    credential: Any,
+    *,
+    rate_limiter: Any = None,
+) -> Optional[Any]:
     try:
         if venue.lower() == "binance":
             from lightfee.venues.binance import BinanceAdapter
-            return BinanceAdapter(mode="live", credential=credential)
+            return BinanceAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "bybit":
             from lightfee.venues.bybit import BybitAdapter
-            return BybitAdapter(mode="live", credential=credential)
+            return BybitAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "aster":
             from lightfee.venues.aster import AsterAdapter
-            return AsterAdapter(mode="live", credential=credential)
+            return AsterAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "okx":
             from lightfee.venues.okx import OkxAdapter
-            return OkxAdapter(mode="live", credential=credential)
+            return OkxAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "bitget":
             from lightfee.venues.bitget import BitgetAdapter
-            return BitgetAdapter(mode="live", credential=credential)
+            return BitgetAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "gate":
             from lightfee.venues.gate import GateAdapter
-            return GateAdapter(mode="live", credential=credential)
+            return GateAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
         elif venue.lower() == "hyperliquid":
             from lightfee.venues.hyperliquid import HyperliquidAdapter
-            return HyperliquidAdapter(mode="live", credential=credential)
+            return HyperliquidAdapter(
+                mode="live", credential=credential, rate_limiter=rate_limiter
+            )
     except Exception:
         pass
     return None
@@ -1183,6 +1229,25 @@ async def _build_exchange_truth_async(
     runtime_dir: str, symbols: list[str],
     venues: list[str] | None = None,
 ) -> dict[str, Any]:
+    previous_rate_limit_runtime = _install_readonly_exchange_truth_rate_limit_runtime()
+    readonly_rate_limiter = _create_readonly_rate_limiter()
+    try:
+        return await _build_exchange_truth_async_inner(
+            runtime_dir,
+            symbols,
+            venues,
+            readonly_rate_limiter=readonly_rate_limiter,
+        )
+    finally:
+        _restore_readonly_exchange_truth_rate_limit_runtime(previous_rate_limit_runtime)
+
+
+async def _build_exchange_truth_async_inner(
+    runtime_dir: str, symbols: list[str],
+    venues: list[str] | None = None,
+    *,
+    readonly_rate_limiter: Any = None,
+) -> dict[str, Any]:
     errors: list[str] = []
     all_positions: dict[str, dict[str, Any]] = {}
     all_open_orders: dict[str, dict[str, Any]] = {}
@@ -1224,7 +1289,11 @@ async def _build_exchange_truth_async(
         if venue.lower() == "hyperliquid":
             credential_identity[venue] = _hyperliquid_credential_identity(credential)
 
-        adapter = _create_readonly_adapter(venue, credential)
+        adapter = _create_readonly_adapter(
+            venue,
+            credential,
+            rate_limiter=readonly_rate_limiter,
+        )
         if adapter is None:
             errors.append("failed to create {} adapter".format(venue))
             all_position_probe_evidence[venue] = {}

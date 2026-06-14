@@ -2832,8 +2832,9 @@ def test_exchange_truth_targets_aster_for_xcnusdt_pair(monkeypatch):
         async def shutdown(self):
             pass
 
-    def fake_create_adapter(venue, credential):
+    def fake_create_adapter(venue, credential, *, rate_limiter=None):
         assert venue in {"bybit", "aster"}
+        assert rate_limiter is not None
         return FakeAdapter(venue)
 
     monkeypatch.setattr(dl, "_create_readonly_adapter", fake_create_adapter)
@@ -3004,6 +3005,86 @@ def test_exchange_truth_creates_readonly_adapters_for_all_live_perp_venues():
         assert adapter is not None, venue
 
 
+def test_exchange_truth_readonly_context_installs_rate_limit_runtime(monkeypatch):
+    import asyncio
+
+    from lightfee.core.domain import PositionSnapshot, Side, Venue
+    from lightfee.rate_limit.engine import (
+        global_rate_limit_runtime,
+        install_global_rate_limit_runtime,
+    )
+    from scripts import diagnose_live as dl
+
+    monkeypatch.setenv("LIGHTFEE_FAKE_API_KEY", "fk")
+    monkeypatch.setenv("LIGHTFEE_FAKE_API_SECRET", "fs")
+
+    observed = {}
+
+    class FakeAdapter:
+        venue = "fake"
+        _transport = object()
+
+        async def fetch_position(self, symbol):
+            observed["runtime_during_fetch"] = global_rate_limit_runtime()
+            return PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=1700000000000,
+            )
+
+        async def fetch_open_orders(self, symbol=None):
+            return []
+
+        async def shutdown(self):
+            observed["shutdown_called"] = True
+
+    def fake_create_adapter(venue, credential, *, rate_limiter=None):
+        observed["runtime_during_create"] = global_rate_limit_runtime()
+        observed["rate_limiter"] = rate_limiter
+        return FakeAdapter()
+
+    monkeypatch.setattr(dl, "_create_readonly_adapter", fake_create_adapter)
+
+    previous = global_rate_limit_runtime()
+    install_global_rate_limit_runtime(None)
+    try:
+        result = asyncio.run(dl._build_exchange_truth_async(
+            runtime_dir="/unused",
+            symbols=["BTCUSDT"],
+            venues=["fake"],
+        ))
+    finally:
+        restored = global_rate_limit_runtime()
+        install_global_rate_limit_runtime(previous)
+
+    assert result["confidence"] == "high"
+    assert observed["rate_limiter"] is not None
+    assert observed["runtime_during_create"] is not None
+    assert observed["runtime_during_fetch"] is observed["runtime_during_create"]
+    assert observed["shutdown_called"] is True
+    assert restored is None
+
+
+def test_exchange_truth_aster_readonly_adapter_passes_rate_limiter_to_private_client():
+    from scripts import diagnose_live as dl
+    from lightfee.venues.transport import EndpointRateLimiter, LiveCredential
+
+    limiter = EndpointRateLimiter(initial_ms=1000, max_ms=8000, pacing_interval_ms=25)
+    credential = LiveCredential(
+        api_key="key",
+        api_secret="secret",
+        wallet_private_key="0x" + "1" * 64,
+    )
+
+    adapter = dl._create_readonly_adapter("aster", credential, rate_limiter=limiter)
+
+    assert adapter is not None
+    assert getattr(adapter, "_private")._rate_limiter is limiter
+
+
 def test_exchange_truth_loads_hyperliquid_private_key_alias(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -3035,8 +3116,9 @@ def test_exchange_truth_hyperliquid_queries_configured_account_when_signer_diffe
 
     original_create = dl._create_readonly_adapter
 
-    def create_adapter(venue, credential):
-        adapter = original_create(venue, credential)
+    def create_adapter(venue, credential, *, rate_limiter=None):
+        assert rate_limiter is not None
+        adapter = original_create(venue, credential, rate_limiter=rate_limiter)
         assert adapter is not None
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3108,8 +3190,9 @@ def test_exchange_truth_hyperliquid_reports_unified_collateral_available(monkeyp
 
     original_create = dl._create_readonly_adapter
 
-    def create_adapter(venue, credential):
-        adapter = original_create(venue, credential)
+    def create_adapter(venue, credential, *, rate_limiter=None):
+        assert rate_limiter is not None
+        adapter = original_create(venue, credential, rate_limiter=rate_limiter)
         assert adapter is not None
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3242,8 +3325,9 @@ def test_hyperliquid_balance_view_502_is_venue_diagnostic_without_owned_exposure
 
     original_create = dl._create_readonly_adapter
 
-    def create_adapter(venue, credential):
-        adapter = original_create(venue, credential)
+    def create_adapter(venue, credential, *, rate_limiter=None):
+        assert rate_limiter is not None
+        adapter = original_create(venue, credential, rate_limiter=rate_limiter)
         assert adapter is not None
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3311,7 +3395,7 @@ def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
     monkeypatch.setattr(
         dl,
         "_create_readonly_adapter",
-        lambda venue, credential: FakeAdapter(venue),
+        lambda venue, credential, *, rate_limiter=None: FakeAdapter(venue),
     )
 
     result = asyncio.run(dl._build_exchange_truth_async(
