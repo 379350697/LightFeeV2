@@ -30,7 +30,10 @@ truth is empty and exactly one direction-correct live leg remains, pending-entry
 runtime calls the existing reduce-only IOC `_cleanup_failed_leg_exposure()`,
 then releases the pending entry only after a fresh live-truth scan proves both
 venues flat/no-open-orders. Cleanup failure keeps the pending entry retained and
-does not emit `entry.opened`. Full evidence is recorded in
+does not emit `entry.opened`. Cloud verification showed HOME OKX/Bybit flat, no
+open orders, no local pending/open/residual work, cleanup attempt/success events
+present, production health green, and `entry_opened_count=0`. Full evidence is
+recorded in
 [`daily/2026-06-14.md#cluster-cl-080-home-owned-pending-entry-live-conflict-did-not-auto-flatten`](daily/2026-06-14.md#cluster-cl-080-home-owned-pending-entry-live-conflict-did-not-auto-flatten).
 
 Latest HOME historical owner persistence follow-up, 2026-06-14:
