@@ -400,6 +400,16 @@ class LiveRuntime:
                 "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
                 "evidence_gap": False,
             }
+        if venue == Venue.BYBIT and (
+            "30228" in text
+            or "110023" in text
+            or "110042" in text
+            or "110137" in text
+            or "no new positions during delisting" in text
+            or ("delivery" in text and "reduce" in text)
+            or "only reduce-only" in text
+        ):
+            return LiveRuntime._entry_admission_evidence("new_position_not_allowed")
         if venue == Venue.BINANCE and (
             "-2019" in text
             or "margin is insufficient" in text
@@ -452,6 +462,12 @@ class LiveRuntime:
                 "evidence_gap": False,
             }
         if reason == "bybit_trading_terms_required":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason == "new_position_not_allowed":
             return {
                 "reason": reason,
                 "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,

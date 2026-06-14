@@ -5368,6 +5368,180 @@ class TestV1PassiveBusinessFlowParity:
         assert result["response_classification"] == "leverage_admission_blocked"
 
     @pytest.mark.asyncio
+    async def test_binance_entry_leverage_prepare_clamps_to_bracket_and_sets_account_leverage(
+        self,
+    ):
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v2/positionRisk":
+                return [
+                    {
+                        "symbol": "HUSDT",
+                        "positionSide": "LONG",
+                        "positionAmt": "0",
+                        "entryPrice": "0",
+                        "markPrice": "0.57329",
+                        "leverage": "20",
+                    },
+                    {
+                        "symbol": "HUSDT",
+                        "positionSide": "SHORT",
+                        "positionAmt": "0",
+                        "entryPrice": "0",
+                        "markPrice": "0.57329",
+                        "leverage": "20",
+                    },
+                ]
+            if path == "/fapi/v1/leverageBracket":
+                return [
+                    {
+                        "symbol": "HUSDT",
+                        "brackets": [
+                            {
+                                "bracket": 1,
+                                "initialLeverage": 5,
+                                "notionalFloor": 0,
+                                "notionalCap": 20000,
+                            }
+                        ],
+                    }
+                ]
+            if path == "/fapi/v1/leverage":
+                return {
+                    "symbol": "HUSDT",
+                    "leverage": 5,
+                    "maxNotionalValue": "20000",
+                }
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        transport._request = fake_request
+
+        await transport.ensure_entry_leverage("HUSDT", 20, notional_quote=50.0)
+        await transport.ensure_entry_leverage("HUSDT", 20, notional_quote=50.0)
+
+        assert ("/fapi/v1/leverage", {"symbol": "HUSDT", "leverage": 5}) in [
+            (path, params) for _, path, params in calls
+        ]
+        assert [path for _, path, _ in calls].count("/fapi/v1/leverage") == 1
+        diagnostics = [
+            event["payload"]
+            for event in transport.order_diagnostics
+            if event["kind"] == "order.entry_leverage_ready"
+        ]
+        assert len(diagnostics) == 2
+        assert diagnostics[0]["requested_leverage"] == 20
+        assert diagnostics[0]["effective_leverage"] == 5
+        assert diagnostics[0]["outcome"] == "set"
+        assert diagnostics[0]["bracket_initial_leverage"] == 5
+        assert diagnostics[0]["position_risk_leverage"] == 20
+        assert diagnostics[1]["requested_leverage"] == 20
+        assert diagnostics[1]["effective_leverage"] == 5
+        assert diagnostics[1]["outcome"] == "cached_ready"
+
+    @pytest.mark.asyncio
+    async def test_binance_entry_leverage_prepare_skips_when_account_already_ready(self):
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v2/positionRisk":
+                return [{"symbol": "HUSDT", "positionAmt": "0", "leverage": "5"}]
+            if path == "/fapi/v1/leverageBracket":
+                return [
+                    {
+                        "symbol": "HUSDT",
+                        "brackets": [
+                            {
+                                "bracket": 1,
+                                "initialLeverage": 5,
+                                "notionalFloor": 0,
+                                "notionalCap": 20000,
+                            }
+                        ],
+                    }
+                ]
+            if path == "/fapi/v1/leverage":
+                raise AssertionError("should not set leverage when current leverage is ready")
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        transport._request = fake_request
+
+        await transport.ensure_entry_leverage("HUSDT", 5, notional_quote=50.0)
+
+        assert not any(path == "/fapi/v1/leverage" for _, path, _ in calls)
+        assert transport.order_diagnostics[-1]["kind"] == "order.entry_leverage_ready"
+        assert transport.order_diagnostics[-1]["payload"]["outcome"] == "already_ready"
+
+    @pytest.mark.asyncio
+    async def test_bybit_delisting_no_new_position_reject_is_classified_as_admission(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=0.0,
+                    rule_source="test_bybit_rules",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        transport = VenueTransport(
+            bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="bybit-key", api_secret="bybit-secret"),
+        )
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "HTTP 400: bybit retCode=30228 retMsg=No new positions during delisting",
+                status_code=400,
+                body='{"retCode":30228,"retMsg":"No new positions during delisting"}',
+            )
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="TONUSDT",
+            side=Side.BUY,
+            quantity=10.0,
+            price=1.5,
+            post_only=True,
+            client_order_id="bybit-maker-delisting",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.submit_passive_order(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        result = transport.order_diagnostics[-1]["payload"]
+        assert result["response_classification"] == "new_position_not_allowed"
+
+    @pytest.mark.asyncio
     async def test_aster_5018_max_notional_reject_is_classified_as_admission(
         self, monkeypatch,
     ):

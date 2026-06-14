@@ -649,6 +649,16 @@ def _is_post_only_would_take_reject(venue: "Venue", error: Exception) -> bool:
 def _passive_submit_reject_classification(venue: "Venue", error: Exception) -> str:
     message = _transport_error_text(error)
     if venue == Venue.BYBIT and (
+        "30228" in message
+        or "110023" in message
+        or "110042" in message
+        or "110137" in message
+        or "no new positions during delisting" in message
+        or ("delivery" in message and "reduce" in message)
+        or "only reduce-only" in message
+    ):
+        return "new_position_not_allowed"
+    if venue == Venue.BYBIT and (
         "110007" in message
         or "available balance is insufficient" in message
         or "insufficient available balance" in message
@@ -1318,6 +1328,7 @@ class VenueTransport(MarketDataClient):
         self._okx_swap_instruments_loaded = False
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
         self._order_diagnostics: list[dict[str, Any]] = []
+        self._entry_leverage_ready_cache: dict[str, int] = {}
         self._trading_capability_trusted = not (
             mode == "live" and spec.venue_id == Venue.HYPERLIQUID
         )
@@ -5926,6 +5937,185 @@ class VenueTransport(MarketDataClient):
                 "resolved_position_mode": "one_way",
             })
             return False
+
+    def _extract_fapi_leverage_bracket(
+        self,
+        raw: Any,
+        venue_sym: str,
+        notional_quote: float | None,
+    ) -> dict[str, Any]:
+        rows = raw if isinstance(raw, list) else [raw]
+        symbol_row: dict[str, Any] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol", "") or "")
+            if not row_symbol or row_symbol == venue_sym:
+                symbol_row = row
+                break
+        brackets = symbol_row.get("brackets", []) if isinstance(symbol_row, dict) else []
+        if not isinstance(brackets, list) or not brackets:
+            return {
+                "initial_leverage": 0,
+                "notional_floor": 0.0,
+                "notional_cap": 0.0,
+                "raw_symbol": str(symbol_row.get("symbol", venue_sym) if isinstance(symbol_row, dict) else venue_sym),
+            }
+        notional = max(float(notional_quote or 0.0), 0.0)
+        chosen = brackets[-1]
+        for bracket in brackets:
+            if not isinstance(bracket, dict):
+                continue
+            floor = _safe_float(bracket.get("notionalFloor", 0), default=0.0)
+            cap = _safe_float(bracket.get("notionalCap", 0), default=0.0)
+            if cap <= 0 or (notional + 1e-12 >= floor and notional <= cap + 1e-12):
+                chosen = bracket
+                break
+        if not isinstance(chosen, dict):
+            chosen = {}
+        return {
+            "initial_leverage": int(_safe_float(chosen.get("initialLeverage", 0), default=0.0)),
+            "notional_floor": _safe_float(chosen.get("notionalFloor", 0), default=0.0),
+            "notional_cap": _safe_float(chosen.get("notionalCap", 0), default=0.0),
+            "bracket": int(_safe_float(chosen.get("bracket", 0), default=0.0)),
+            "raw_symbol": str(symbol_row.get("symbol", venue_sym) if isinstance(symbol_row, dict) else venue_sym),
+        }
+
+    def _extract_fapi_position_leverage(self, raw: Any, venue_sym: str) -> int:
+        rows = raw if isinstance(raw, list) else [raw]
+        leverages: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol", venue_sym) or venue_sym)
+            if row_symbol != venue_sym:
+                continue
+            lev = int(_safe_float(row.get("leverage", 0), default=0.0))
+            if lev > 0:
+                leverages.add(lev)
+        if len(leverages) == 1:
+            return next(iter(leverages))
+        return 0
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """V1 live-entry parity: prepare Binance-compatible symbol leverage before orders."""
+        if self._spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
+            return
+        target = int(leverage or 0)
+        if target <= 0 or self.mode != "live":
+            return
+
+        venue_sym = self._venue_symbol(symbol)
+        cache_key = f"{venue_sym}:{target}:{round(float(notional_quote or 0.0), 8)}"
+        cached_effective = self._entry_leverage_ready_cache.get(cache_key)
+        if cached_effective is not None:
+            self._record_order_diagnostic(
+                "order.entry_leverage_ready",
+                {
+                    "venue": self._spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "requested_leverage": target,
+                    "effective_leverage": cached_effective,
+                    "outcome": "cached_ready",
+                },
+            )
+            return
+
+        payload: dict[str, Any] = {
+            "venue": self._spec.venue_id.value,
+            "symbol": venue_sym,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "position_endpoint": self._spec.position_path,
+            "bracket_endpoint": "/fapi/v1/leverageBracket",
+            "set_leverage_endpoint": "/fapi/v1/leverage",
+        }
+
+        try:
+            position_raw = await self._request(
+                "GET",
+                self._spec.position_path,
+                params={"symbol": venue_sym},
+                private=True,
+            )
+            current_leverage = self._extract_fapi_position_leverage(position_raw, venue_sym)
+            payload["position_risk_leverage"] = current_leverage
+
+            bracket_raw = await self._request(
+                "GET",
+                "/fapi/v1/leverageBracket",
+                params={"symbol": venue_sym},
+                private=True,
+            )
+            bracket = self._extract_fapi_leverage_bracket(
+                bracket_raw,
+                venue_sym,
+                notional_quote,
+            )
+            bracket_initial = int(bracket.get("initial_leverage", 0) or 0)
+            effective = min(target, bracket_initial) if bracket_initial > 0 else target
+            effective = max(int(effective), 1)
+            payload.update(
+                {
+                    "effective_leverage": effective,
+                    "bracket_initial_leverage": bracket_initial,
+                    "bracket": bracket.get("bracket", 0),
+                    "notional_floor": bracket.get("notional_floor", 0.0),
+                    "notional_cap": bracket.get("notional_cap", 0.0),
+                }
+            )
+
+            if current_leverage == effective:
+                payload["outcome"] = "already_ready"
+                self._entry_leverage_ready_cache[cache_key] = effective
+                self._record_order_diagnostic("order.entry_leverage_ready", payload)
+                return
+
+            response = await self._request(
+                "POST",
+                "/fapi/v1/leverage",
+                params={"symbol": venue_sym, "leverage": effective},
+                private=True,
+            )
+            response_leverage = int(_safe_float(response.get("leverage", 0), default=0.0)) if isinstance(response, dict) else 0
+            payload["response_leverage"] = response_leverage
+            payload["response_max_notional_value"] = (
+                response.get("maxNotionalValue") if isinstance(response, dict) else None
+            )
+            if response_leverage and response_leverage != effective:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "entry leverage prepare returned unexpected leverage "
+                    f"symbol={venue_sym} expected={effective} actual={response_leverage}",
+                )
+            payload["outcome"] = "set"
+            self._entry_leverage_ready_cache[cache_key] = effective
+            self._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except TransportError as exc:
+            payload["outcome"] = "transport_error"
+            payload["error"] = str(exc)[:300]
+            payload["status_code"] = exc.status_code
+            payload["response_body"] = exc.body[:500]
+            self._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"entry leverage prepare failed: {exc} {exc.body[:200]}",
+            ) from exc
+        except Exception as exc:
+            payload["outcome"] = "exception"
+            payload["error"] = str(exc)[:300]
+            self._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
 
     @property
     def _okx_pos_mode(self) -> str:

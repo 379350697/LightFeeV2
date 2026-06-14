@@ -136,7 +136,13 @@ class VenueAdapter(ABC):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
 
-    async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
         pass
 
     @property

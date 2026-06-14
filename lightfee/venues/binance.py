@@ -84,6 +84,19 @@ class BinanceAdapter(VenueAdapter):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        await self._transport.ensure_entry_leverage(
+            symbol,
+            leverage,
+            notional_quote=notional_quote,
+        )
+
     async def fetch_order_fill_reconciliation(
         self,
         symbol: str,

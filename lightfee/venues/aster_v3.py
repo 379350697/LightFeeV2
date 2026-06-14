@@ -48,6 +48,8 @@ ASTER_V3_ORDER_PATH = "/fapi/v3/order"
 ASTER_V3_OPEN_ORDERS_PATH = "/fapi/v3/openOrders"
 ASTER_V3_POSITION_PATH = "/fapi/v3/positionRisk"
 ASTER_V3_ACCOUNT_PATH = "/fapi/v3/accountWithJoinMargin"
+ASTER_V3_LEVERAGE_PATH = "/fapi/v3/leverage"
+ASTER_V3_LEVERAGE_BRACKET_PATH = "/fapi/v3/leverageBracket"
 
 
 def _missing_aster_v3_signing_dependencies() -> list[str]:
@@ -340,6 +342,70 @@ class AsterV3Client:
             data.get("availableBalance")
         )
         return snapshot
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        target = int(leverage or 0)
+        if target <= 0:
+            return
+
+        position_raw = await self._request(
+            "GET",
+            ASTER_V3_POSITION_PATH,
+            params={"symbol": symbol},
+        )
+        current_leverages: set[int] = set()
+        for row in _extract_rows(position_raw):
+            row_symbol = str(row.get("symbol", symbol) or symbol)
+            if row_symbol != symbol:
+                continue
+            lev = int(_safe_float(row.get("leverage"), default=0.0))
+            if lev > 0:
+                current_leverages.add(lev)
+        current = next(iter(current_leverages)) if len(current_leverages) == 1 else 0
+
+        effective = target
+        try:
+            bracket_raw = await self._request(
+                "GET",
+                ASTER_V3_LEVERAGE_BRACKET_PATH,
+                params={"symbol": symbol},
+            )
+            notional = max(float(notional_quote or 0.0), 0.0)
+            matched = False
+            for row in _extract_rows(bracket_raw):
+                brackets = row.get("brackets") if isinstance(row, dict) else None
+                if not isinstance(brackets, list):
+                    continue
+                for bracket in brackets:
+                    if not isinstance(bracket, dict):
+                        continue
+                    floor = _safe_float(bracket.get("notionalFloor"), default=0.0)
+                    cap = _safe_float(bracket.get("notionalCap"), default=0.0)
+                    max_leverage = int(_safe_float(bracket.get("initialLeverage"), default=0.0))
+                    if max_leverage <= 0:
+                        continue
+                    if cap <= 0 or (notional + 1e-12 >= floor and notional <= cap + 1e-12):
+                        effective = min(target, max_leverage)
+                        matched = True
+                        break
+                if matched:
+                    break
+        except TransportError:
+            effective = target
+
+        if current == effective:
+            return
+        await self._request(
+            "POST",
+            ASTER_V3_LEVERAGE_PATH,
+            params={"symbol": symbol, "leverage": effective},
+        )
 
     def _order_params(
         self,

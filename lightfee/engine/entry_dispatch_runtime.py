@@ -6,6 +6,7 @@ Do not change entry dispatch, order admission, or journal payload semantics whil
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any
 
@@ -122,6 +123,122 @@ class EntryDispatchRuntime:
                     source="initial_entry",
                     candidate_pair_id=candidate_pair_id,
                 )
+
+    async def _prepare_live_entry_leverage_for_candidate(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> bool:
+        mode = str(getattr(self.ctx.config.runtime, "mode", "") or "").lower()
+        if mode != "live":
+            return True
+        try:
+            target_leverage = int(
+                getattr(self.ctx.config.strategy, "live_target_leverage", 0) or 0
+            )
+        except (TypeError, ValueError):
+            target_leverage = 0
+        if target_leverage <= 0:
+            return True
+
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        notional_quote = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
+        pair_id = self._candidate_pair_id(candidate)
+        tasks: list[tuple[Venue, Any]] = []
+        for venue in (long_venue, short_venue):
+            if venue not in (Venue.BINANCE, Venue.ASTER):
+                continue
+            adapter = self.ctx.venue_adapters.get(venue)
+            ensure = getattr(adapter, "ensure_entry_leverage", None) if adapter else None
+            if callable(ensure):
+                tasks.append((venue, ensure))
+        if not tasks:
+            return True
+
+        async def _call(venue: Venue, ensure: Any) -> tuple[Venue, BaseException | None]:
+            try:
+                try:
+                    await ensure(symbol, target_leverage, notional_quote=notional_quote)
+                except TypeError as exc:
+                    if "notional_quote" not in str(exc):
+                        raise
+                    await ensure(symbol, target_leverage)
+                return venue, None
+            except Exception as exc:
+                return venue, exc
+
+        results = await asyncio.gather(*[_call(venue, ensure) for venue, ensure in tasks])
+        ok = True
+        for venue, exc in results:
+            if exc is None:
+                self.ctx.journal.append(
+                    "execution.entry_leverage_ready",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "target_leverage": target_leverage,
+                        "entry_notional_quote": notional_quote,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+
+            ok = False
+            error_text = str(exc)
+            metadata = self._entry_admission_reject_metadata(venue, error_text)
+            if metadata:
+                reason = str(metadata["reason"])
+            else:
+                reason = "entry_leverage_unavailable"
+                metadata = {
+                    "reason": reason,
+                    "official_doc_url": "",
+                    "evidence_gap": True,
+                }
+            self._record_symbol_admission_block(
+                venue=venue,
+                symbol=symbol,
+                reason=reason,
+                raw_error=error_text,
+                now_ms=now_ms,
+                evidence=metadata,
+                source="entry_leverage_prepare",
+                candidate_pair_id=pair_id,
+            )
+            self.ctx.journal.append(
+                "execution.entry_leverage_unavailable",
+                {
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "target_leverage": target_leverage,
+                    "entry_notional_quote": notional_quote,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "reason": reason,
+                    "raw_error": error_text[:500],
+                    "official_doc_url": metadata.get("official_doc_url", ""),
+                    "evidence_gap": bool(metadata.get("evidence_gap", True)),
+                    "ts_ms": now_ms,
+                },
+            )
+        if not ok:
+            self.ctx.journal.append(
+                "runtime.entry_blocked_gate",
+                {
+                    "symbol": symbol,
+                    "gate": "entry_leverage_prepare",
+                    "reason": "entry_leverage_unavailable",
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "ts_ms": now_ms,
+                },
+            )
+        return ok
 
     async def _precheck_bybit_entry_admission(
         self,
@@ -1536,6 +1653,14 @@ class EntryDispatchRuntime:
             entry_type=entry_type,
             maker_client_order_id=maker_cid,
             hedge_client_order_id=hedge_cid,
+        ):
+            return False
+
+        if not await self._prepare_live_entry_leverage_for_candidate(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
         ):
             return False
 
