@@ -4546,7 +4546,13 @@ class VenueTransport(MarketDataClient):
                     params=params,
                     private=contract.private,
                 )
-                return self._parse_order_status_bitget(raw, venue_sym, now_ms)
+                return self._parse_order_status_bitget(
+                    raw,
+                    venue_sym,
+                    now_ms,
+                    resolved_account_family=family,
+                    queried_endpoint=contract.path,
+                )
 
         except TransportError as e:
             if e.category == TransportErrorCategory.REQUEST_REJECTED:
@@ -5303,7 +5309,13 @@ class VenueTransport(MarketDataClient):
         )
 
     def _parse_order_status_bitget(
-        self, raw: dict[str, Any], venue_sym: str, now_ms: int,
+        self,
+        raw: dict[str, Any],
+        venue_sym: str,
+        now_ms: int,
+        *,
+        resolved_account_family: object = None,
+        queried_endpoint: str = "",
     ) -> Optional["OrderFillReconciliation"]:
         """Parse Bitget order-status response into OrderFillReconciliation.
 
@@ -5363,6 +5375,21 @@ class VenueTransport(MarketDataClient):
                 if tf is not None:
                     fee_quote = abs(_safe_float(tf))
 
+        family = (
+            getattr(resolved_account_family, "value", None)
+            or resolved_account_family
+            or ""
+        )
+        raw_status = str(
+            data.get(
+                "status",
+                data.get("orderStatus", data.get("state", "")),
+            )
+            or ""
+        ).lower()
+        if raw_status in {"", "full-fill", "full_fill", "filled"}:
+            raw_status = "filled"
+
         return OrderFillReconciliation(
             venue=Venue.BITGET,
             symbol=venue_sym,
@@ -5373,6 +5400,14 @@ class VenueTransport(MarketDataClient):
             client_order_id=client_id,
             fee_quote=fee_quote,
             filled_at_ms=filled_at,
+            metadata={
+                "resolved_account_family": str(family),
+                "side": side_str,
+                "raw_exchange_status": raw_status,
+                "response_classification": "filled",
+                "evidence_source": "bitget_order_fill_truth",
+                "queried_endpoints": [queried_endpoint] if queried_endpoint else [],
+            },
         )
 
     # ------------------------------------------------------------------

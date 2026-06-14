@@ -472,6 +472,43 @@ def _runtime_progress_summary(
     )
 
 
+def _weak_order_truth_events(state: dict[str, Any]) -> list[dict[str, Any]]:
+    weak: list[dict[str, Any]] = []
+    for rec in _state_journal_events(state):
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        fill_status = str(payload.get("order_truth_fill_status") or "").lower()
+        evidence_status = str(payload.get("order_truth_evidence_status") or "").lower()
+        if not fill_status and not evidence_status:
+            continue
+        if (
+            fill_status == "confirmed_fill"
+            and evidence_status == "available"
+            and payload.get("terminal_without_truth") is not True
+        ):
+            continue
+        weak.append({
+            "kind": kind,
+            "position_id": payload.get("position_id"),
+            "symbol": payload.get("symbol"),
+            "venue": payload.get("hedge_venue") or payload.get("venue"),
+            "order_id": payload.get("order_id") or payload.get("accepted_order_id"),
+            "client_order_id": (
+                payload.get("client_order_id")
+                or payload.get("accepted_client_order_id")
+            ),
+            "order_truth_fill_status": fill_status,
+            "order_truth_evidence_status": evidence_status,
+            "order_truth_decision": payload.get("order_truth_decision"),
+            "order_truth_missing_evidence": (
+                payload.get("order_truth_missing_evidence") or []
+            ),
+        })
+    return weak
+
+
 def analyze_current_state(
     state: dict[str, Any],
     *,
@@ -619,6 +656,9 @@ def analyze_current_state(
                     "check": "unexpected_live_open_order",
                     **order,
                 })
+    weak_order_truth_events = _weak_order_truth_events(state)
+    if weak_order_truth_events:
+        fingerprints.append("order_truth_gap_unresolved")
 
     severity = "critical" if any(fp != "last_scan_missing" for fp in fingerprints) else "warning"
     return HealthReport(
@@ -647,6 +687,7 @@ def analyze_current_state(
             "v1_lifecycle_closure": v1_lifecycle_closure,
             "exchange_truth_mismatches": exchange_truth_mismatches,
             "pending_entry_live_conflicts": pending_entry_live_conflicts,
+            "weak_order_truth_events": weak_order_truth_events,
         },
     )
 

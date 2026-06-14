@@ -1904,6 +1904,8 @@ def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
         "exit.passive_close_hedge_reconciled_after_error",
         "exit.passive_close_hedge_duplicate_client_order_reconciled",
     }:
+        if not _payload_order_truth_is_confirmed(payload):
+            return False
         try:
             residual = float(payload.get("residual", 0) or 0)
         except (TypeError, ValueError):
@@ -1924,6 +1926,21 @@ def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
     return True
 
 
+def _payload_order_truth_is_confirmed(payload: dict[str, Any]) -> bool:
+    if (
+        "order_truth_fill_status" not in payload
+        and "order_truth_evidence_status" not in payload
+    ):
+        return True
+    return (
+        str(payload.get("order_truth_fill_status") or "").lower()
+        == "confirmed_fill"
+        and str(payload.get("order_truth_evidence_status") or "").lower()
+        == "available"
+        and payload.get("terminal_without_truth") is not True
+    )
+
+
 def _build_resolved_order_truth_gap_summary(
     events: list[dict[str, Any]],
     exchange_truth: dict[str, Any],
@@ -1933,6 +1950,8 @@ def _build_resolved_order_truth_gap_summary(
         return {
             "count": 0,
             "resolved_identities": [],
+            "unresolved_count": 0,
+            "unresolved_identities": [],
             "current_exchange_truth_clean": False,
         }
 
@@ -1960,6 +1979,7 @@ def _build_resolved_order_truth_gap_summary(
             resolved_identity_sets.append(identities)
 
     resolved: set[str] = set()
+    unresolved: set[str] = set()
     matched_count = 0
     for registered_identities in registered:
         matched_resolution = next(
@@ -1970,6 +1990,7 @@ def _build_resolved_order_truth_gap_summary(
             None,
         )
         if matched_resolution is None:
+            unresolved.update(registered_identities)
             continue
         matched_count += 1
         resolved.update(registered_identities)
@@ -1978,6 +1999,8 @@ def _build_resolved_order_truth_gap_summary(
     return {
         "count": matched_count,
         "resolved_identities": sorted(resolved),
+        "unresolved_count": len(unresolved),
+        "unresolved_identities": sorted(unresolved),
         "current_exchange_truth_clean": True,
     }
 
@@ -2864,9 +2887,16 @@ def _build_production_acceptance_gate(
     resolved_order_truth_gap_count = int(
         resolved_order_truth_gap_summary.get("count", 0) or 0
     )
+    unresolved_order_truth_gap_count = int(
+        resolved_order_truth_gap_summary.get("unresolved_count", 0) or 0
+    )
     if resolved_order_truth_gap_count and current_core_clean:
         exception_conclusions["resolved_order_truth_gap"] = (
             "closed_by_current_exchange_truth"
+        )
+    if unresolved_order_truth_gap_count:
+        exception_conclusions["unresolved_order_truth_gap"] = (
+            "order_truth_gap_unresolved"
         )
     residual_lifecycle_closed_by_recovery = (
         residual_count > 0
@@ -2973,6 +3003,8 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("blocking_required_truth")
     if local_l2_residual_runtime_enabled_count:
         blocking_reasons.append("local_l2_residual_runtime_enabled")
+    if unresolved_order_truth_gap_count:
+        blocking_reasons.append("order_truth_gap_unresolved")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -2991,6 +3023,7 @@ def _build_production_acceptance_gate(
             hyperliquid_unified_collateral_available_count
         ),
         "resolved_order_truth_gap": resolved_order_truth_gap_count,
+        "unresolved_order_truth_gap": unresolved_order_truth_gap_count,
         "blocking_required_truth": (
             required_position_truth_unavailable_count
             if exception_conclusions.get("blocking_required_truth")
@@ -3060,6 +3093,7 @@ def _build_production_acceptance_gate(
         "hyperliquid_balance_view_details": hyperliquid_balance_view_details[:10],
         "hyperliquid_balance_view_advice": hyperliquid_balance_view_advice,
         "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
+        "unresolved_order_truth_gap_count": unresolved_order_truth_gap_count,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "required_position_truth_unavailable_count": (
             required_position_truth_unavailable_count

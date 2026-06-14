@@ -2086,18 +2086,22 @@ class PassiveCloseExecutor:
                     fill_reconciliation_result = "error"
                     fill_reconciliation_error = str(reconcile_error)
 
-            recon_qty_raw = (
-                getattr(reconciliation, "quantity", 0.0)
-                if reconciliation is not None
-                else 0.0
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=hedge_venue,
+                symbol=position.symbol,
+                order_id=accepted_order_id,
+                client_order_id=accepted_client_order_id,
+                target_qty=normalized_delta,
+                reconciliation=reconciliation,
+                metadata=(
+                    getattr(reconciliation, "metadata", None)
+                    if reconciliation is not None
+                    else None
+                ),
             )
-            recon_qty = (
-                float(recon_qty_raw)
-                if isinstance(recon_qty_raw, (int, float))
-                else 0.0
-            )
-            if recon_qty > 1e-12:
+            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 fill_reconciliation_result = "filled"
+                recon_qty = truth_decision.reconciled_qty
                 recon_price_raw = getattr(
                     reconciliation, "average_price", hedge_price or 0.0,
                 )
@@ -2140,6 +2144,17 @@ class PassiveCloseExecutor:
                         "requested": delta,
                         "filled": fill.quantity,
                         "residual": residual,
+                        "order_truth_fill_status": truth_decision.fill_status.value,
+                        "order_truth_evidence_status": (
+                            truth_decision.evidence_status.value
+                        ),
+                        "order_truth_decision": truth_decision.decision,
+                        "order_truth_missing_evidence": list(
+                            truth_decision.missing_evidence
+                        ),
+                        "terminal_without_truth": (
+                            truth_decision.terminal_without_truth
+                        ),
                     },
                 )
                 return HedgeDeltaResult(
@@ -2152,7 +2167,12 @@ class PassiveCloseExecutor:
                 )
 
             if fill_reconciliation_attempted and fill_reconciliation_result == "not_available":
-                fill_reconciliation_result = "missing_or_zero_fill"
+                fill_reconciliation_result = (
+                    "truth_gap"
+                    if reconciliation is not None
+                    and truth_decision.fill_status == OrderTruthFillStatus.TRUTH_GAP
+                    else "missing_or_zero_fill"
+                )
             self._journal.append(
                 "exit.passive_close_hedge_ack_reconcile_in_progress",
                 {
@@ -2165,6 +2185,17 @@ class PassiveCloseExecutor:
                     "fill_reconciliation_attempted": fill_reconciliation_attempted,
                     "fill_reconciliation_result": fill_reconciliation_result,
                     "fill_reconciliation_error": fill_reconciliation_error,
+                    "order_truth_fill_status": truth_decision.fill_status.value,
+                    "order_truth_evidence_status": (
+                        truth_decision.evidence_status.value
+                    ),
+                    "order_truth_decision": truth_decision.decision,
+                    "order_truth_missing_evidence": list(
+                        truth_decision.missing_evidence
+                    ),
+                    "terminal_without_truth": (
+                        truth_decision.terminal_without_truth
+                    ),
                     "decision": "retain_pending_without_resubmit",
                     "next_action": "retry_order_position_open_order_reconciliation",
                 },
@@ -2494,6 +2525,17 @@ class PassiveCloseExecutor:
                                 if is_bybit_duplicate
                                 else "accepted_order_reconciled_by_client_id"
                             ),
+                            "order_truth_fill_status": truth_decision.fill_status.value,
+                            "order_truth_evidence_status": (
+                                truth_decision.evidence_status.value
+                            ),
+                            "order_truth_decision": truth_decision.decision,
+                            "order_truth_missing_evidence": list(
+                                truth_decision.missing_evidence
+                            ),
+                            "terminal_without_truth": (
+                                truth_decision.terminal_without_truth
+                            ),
                             "original_error": str(e),
                         },
                     )
@@ -2704,6 +2746,15 @@ class PassiveCloseExecutor:
                         "severity": "info",
                         "order_submit_uncertain": False,
                         "decision": "accepted_order_reconciled_by_client_id",
+                        "order_truth_fill_status": truth_decision.fill_status.value,
+                        "order_truth_evidence_status": (
+                            truth_decision.evidence_status.value
+                        ),
+                        "order_truth_decision": truth_decision.decision,
+                        "order_truth_missing_evidence": list(
+                            truth_decision.missing_evidence
+                        ),
+                        "terminal_without_truth": truth_decision.terminal_without_truth,
                     },
                 )
                 return HedgeDeltaResult(

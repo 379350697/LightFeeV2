@@ -459,6 +459,53 @@ class TestOrderReconciliation:
         assert isinstance(result, ReconciliationResult)
 
     @pytest.mark.asyncio
+    async def test_unknown_order_positive_reconciliation_without_truth_stays_uncertain(self):
+        weak_reconciliation = OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.5,
+            average_price=50000.0,
+            order_id="weak-order",
+            client_order_id="weak-client",
+            metadata={},
+        )
+        adapter = _EvidenceAdapter(Venue.OKX, reconciliation=weak_reconciliation)
+
+        result = await reconcile_unknown_order(
+            adapter, "BTCUSDT", "weak-order", "weak-client"
+        )
+
+        assert result.status == "truth_gap"
+        assert result.fill is None
+        assert result.reason == "retain_backoff"
+
+    @pytest.mark.asyncio
+    async def test_unknown_order_positive_reconciliation_with_truth_is_filled(self):
+        fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.5,
+            average_price=50000.0,
+            order_id="fill-order",
+            client_order_id="fill-client",
+            metadata={
+                "evidence_source": "okx_fills",
+                "response_classification": "filled",
+                "queried_endpoints": ["/api/v5/trade/fills"],
+            },
+        )
+        adapter = _EvidenceAdapter(Venue.OKX, reconciliation=fill_reconciliation)
+
+        result = await reconcile_unknown_order(
+            adapter, "BTCUSDT", "fill-order", "fill-client"
+        )
+
+        assert result.status == "filled"
+        assert result.fill is fill_reconciliation
+
+    @pytest.mark.asyncio
     async def test_uncertain_order_stays_uncertain(self):
         adapter = FakeVenueAdapter(Venue.OKX)
 
@@ -884,6 +931,11 @@ class TestClientOrderIdReconciliation:
                 side=Side.BUY, quantity=0.3, average_price=60000.0,
                 order_id="resolved-ord", client_order_id=client_order_id or "ack-cid",
                 filled_at_ms=6000,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "filled",
+                },
             )
 
         transport.fetch_order_status = mock_fetch_status
@@ -976,11 +1028,16 @@ class TestClientOrderIdReconciliation:
     @pytest.mark.asyncio
     async def test_hyperliquid_override_uses_wire_cloid_and_official_order_status_shape(self):
         """Hyperliquid reconciliation must hash internal CIDs to 128-bit cloids."""
+        from lightfee.engine.order_truth_ledger import (
+            ORDER_TRUTH_LEDGER,
+            OrderTruthFillStatus,
+        )
         from lightfee.venues.hyperliquid import HyperliquidAdapter
         from lightfee.venues.transport import LiveCredential
         from lightfee.venues.hyperliquid_signing import hyperliquid_cloid_for_client_order
 
         internal_cid = "entry-1779342733376-SAGAUSDT-h1"
+        account_address = "0x0000000000000000000000000000000000000001"
         wire_cloid = hyperliquid_cloid_for_client_order(internal_cid)
         adapter = HyperliquidAdapter(
             mode="live",
@@ -988,7 +1045,7 @@ class TestClientOrderIdReconciliation:
                 wallet_private_key=(
                     "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e"
                 ),
-                account_address="0x0000000000000000000000000000000000000001",
+                account_address=account_address,
             ),
         )
         captured_bodies: list[dict] = []
@@ -1031,6 +1088,18 @@ class TestClientOrderIdReconciliation:
         assert result.quantity == 772.0
         assert result.average_price == 0.03
         assert result.client_order_id == wire_cloid
+        assert result.metadata["configured_account_address"] == account_address
+        assert result.metadata["oid"] == "123"
+        assert result.metadata["cloid"] == wire_cloid
+        decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+            venue=result.venue,
+            symbol=result.symbol,
+            order_id=result.order_id,
+            client_order_id=result.client_order_id or "",
+            target_qty=result.quantity,
+            reconciliation=result,
+        )
+        assert decision.fill_status is OrderTruthFillStatus.CONFIRMED_FILL
 
     @pytest.mark.asyncio
     async def test_vanilla_fetch_order_fill_reconciliation_returns_none_without_override(self):
@@ -1109,6 +1178,78 @@ class TestOrderReconcileUncertainEvidence:
                 "next_action": "reconcile_again_after_backoff",
             },
         }
+
+    @pytest.mark.asyncio
+    async def test_positive_reconciliation_without_fill_truth_remains_uncertain(self):
+        weak_reconciliation = OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.5,
+            average_price=50000.0,
+            order_id="weak-order",
+            client_order_id="weak-client",
+            metadata={},
+        )
+        adapter = _EvidenceAdapter(
+            Venue.OKX,
+            reconciliation=weak_reconciliation,
+            position_qty=0.0,
+        )
+        reconciler = OrderReconciler(adapters={Venue.OKX: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-weak",
+            symbol="BTCUSDT",
+            long_venue=Venue.OKX,
+            long_order_id="weak-order",
+            long_client_order_id="weak-client",
+        )
+
+        assert result.long_status in {"uncertain", "truth_gap"}
+        assert result.long_fill is None
+        events = reconciler.drain_order_diagnostics()
+        result_payload = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "order.reconcile_result"
+        ][-1]
+        assert result_payload["status"] in {"uncertain", "truth_gap"}
+        assert result_payload["fill_qty"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_positive_reconciliation_with_fill_truth_is_filled(self):
+        fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.5,
+            average_price=50000.0,
+            order_id="fill-order",
+            client_order_id="fill-client",
+            metadata={
+                "evidence_source": "okx_fills",
+                "response_classification": "filled",
+                "queried_endpoints": ["/api/v5/trade/fills"],
+            },
+        )
+        adapter = _EvidenceAdapter(
+            Venue.OKX,
+            reconciliation=fill_reconciliation,
+            position_qty=0.0,
+        )
+        reconciler = OrderReconciler(adapters={Venue.OKX: adapter})
+
+        result = await reconciler.reconcile_position(
+            position_id="pos-fill",
+            symbol="BTCUSDT",
+            long_venue=Venue.OKX,
+            long_order_id="fill-order",
+            long_client_order_id="fill-client",
+        )
+
+        assert result.long_status == "filled"
+        assert result.long_fill is fill_reconciliation
 
     @pytest.mark.asyncio
     async def test_bybit_duplicate_emits_resolution_with_endpoint_evidence(self):

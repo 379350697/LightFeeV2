@@ -1507,6 +1507,78 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_weak_order_truth_resolution_does_not_green(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1780657210000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1780657201000,
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "pos-btc-weak",
+                    "symbol": "BTCUSDT",
+                    "venue": "bybit",
+                    "accepted_order_id": "bybit-order-weak",
+                    "accepted_client_order_id": "lf-close-weak",
+                    "truth_required_by": "accepted_order_truth_gap",
+                },
+            },
+            {
+                "ts_ms": 1780657202000,
+                "kind": "exit.passive_close_hedge_confirmed_after_ack",
+                "payload": {
+                    "position_id": "pos-btc-weak",
+                    "symbol": "BTCUSDT",
+                    "hedge_venue": "bybit",
+                    "order_id": "bybit-order-weak",
+                    "client_order_id": "lf-close-weak",
+                    "filled": 0.01,
+                    "residual": 0.0,
+                    "classification": "accepted_ack_confirmed",
+                    "order_truth_fill_status": "truth_gap",
+                    "order_truth_evidence_status": "unavailable",
+                    "order_truth_decision": "retain_backoff",
+                    "order_truth_missing_evidence": ["fill_confirmation"],
+                    "terminal_without_truth": False,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BTCUSDT",
+            venues=["bybit"],
+            now_ms=1780657215000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert "order_truth_gap_unresolved" in gate["blocking_reasons"]
+        assert gate["resolved_order_truth_gap_count"] == 0
+        assert result["conclusion"]["status"] != "healthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_resolves_moveusdt_ack_only_duplicate_after_terminal_flat(monkeypatch):
     from scripts import diagnose_live as dl
 

@@ -218,6 +218,81 @@ def test_order_truth_resolution_rejects_positive_quantity_from_order_detail_only
     assert decision.reconciled_qty == 0.0
 
 
+def test_order_truth_resolution_rejects_positive_quantity_without_metadata():
+    from lightfee.core.domain import OrderFillReconciliation, Side
+
+    reconciliation = OrderFillReconciliation(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=1600.0,
+        average_price=0.01,
+        order_id="oid-1",
+        client_order_id="cid-1",
+        metadata={},
+    )
+
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=reconciliation,
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.TRUTH_GAP
+    assert decision.evidence_status is OrderTruthEvidenceStatus.UNAVAILABLE
+    assert decision.decision == "retain_backoff"
+    assert decision.reconciled_qty == 0.0
+    assert "fill_confirmation" in decision.missing_evidence
+
+
+@pytest.mark.parametrize(
+    ("venue", "source", "endpoint"),
+    [
+        (Venue.BINANCE, "binance_order_status", "/fapi/v1/order"),
+        (Venue.ASTER, "aster_order_status", "/fapi/v3/order"),
+    ],
+)
+def test_order_truth_resolution_accepts_binance_style_filled_order_status(
+    venue,
+    source,
+    endpoint,
+):
+    from lightfee.core.domain import OrderFillReconciliation, Side
+
+    reconciliation = OrderFillReconciliation(
+        venue=venue,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=1600.0,
+        average_price=0.01,
+        order_id="oid-1",
+        client_order_id="cid-1",
+        metadata={
+            "evidence_source": source,
+            "raw_exchange_status": "FILLED",
+            "response_classification": "filled",
+            "queried_endpoints": [endpoint],
+        },
+    )
+
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=venue,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=reconciliation,
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.CONFIRMED_FILL
+    assert decision.evidence_status is OrderTruthEvidenceStatus.AVAILABLE
+    assert decision.decision == "terminal_fill"
+    assert decision.reconciled_qty == pytest.approx(1600.0)
+
+
 def test_order_truth_resolution_confirmed_fill_requires_positive_fill_reconciliation():
     from lightfee.core.domain import OrderFillReconciliation, Side
 

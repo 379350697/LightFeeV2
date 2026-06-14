@@ -9,10 +9,11 @@ Rust references:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +274,20 @@ class OrderReconciler:
         reconciliation: Any,
         position: Optional[PositionSnapshot],
         query_payload: dict[str, Any],
+        *,
+        venue: Optional[Venue] = None,
+        symbol: str = "",
+        order_id: str = "",
+        client_order_id: str = "",
     ) -> tuple[str, str, str, str, list[str], list[dict[str, Any]], str]:
-        meta = _recon_metadata(reconciliation) or {}
+        raw_meta = _recon_metadata(reconciliation)
+        meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        merged_meta: dict[str, Any] = {}
+        if isinstance(meta, Mapping):
+            merged_meta.update(meta)
+        if isinstance(query_payload, Mapping):
+            for key, value in query_payload.items():
+                merged_meta.setdefault(key, value)
         endpoints = _as_list(meta.get("queried_endpoints") or meta.get("reconcile_endpoints"))
         if not endpoints:
             endpoints = _as_list(query_payload.get("queried_endpoints"))
@@ -295,7 +308,33 @@ class OrderReconciler:
         next_action = str(meta.get("next_action") or query_payload.get("next_action") or "")
 
         if reconciliation is not None and getattr(reconciliation, "quantity", 0.0) > 0:
-            raw = str(meta.get("raw_exchange_status") or response_classification or "filled")
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=venue or getattr(reconciliation, "venue", None),
+                symbol=symbol or str(getattr(reconciliation, "symbol", "") or ""),
+                order_id=order_id or str(getattr(reconciliation, "order_id", "") or ""),
+                client_order_id=(
+                    client_order_id
+                    or str(getattr(reconciliation, "client_order_id", "") or "")
+                ),
+                target_qty=float(getattr(reconciliation, "quantity", 0.0) or 0.0),
+                reconciliation=reconciliation,
+                metadata=merged_meta,
+            )
+            raw = str(
+                meta.get("raw_exchange_status")
+                or response_classification
+                or truth_decision.fill_status.value
+            )
+            if truth_decision.fill_status != OrderTruthFillStatus.CONFIRMED_FILL:
+                return (
+                    truth_decision.fill_status.value,
+                    raw,
+                    truth_decision.fill_status.value,
+                    response_classification or truth_decision.fill_status.value,
+                    [str(e) for e in endpoints],
+                    [e for e in endpoint_responses if isinstance(e, dict)],
+                    next_action or truth_decision.decision,
+                )
             if subtype:
                 next_action = "clear_uncertain_state"
             return (
@@ -423,8 +462,16 @@ class OrderReconciler:
                 long_queried_endpoints,
                 long_endpoint_responses,
                 long_next_action,
-            ) = self._status_from_reconciliation(long_recon, pos, long_query_payload)
-            if long_recon is not None and long_recon.quantity > 0:
+            ) = self._status_from_reconciliation(
+                long_recon,
+                pos,
+                long_query_payload,
+                venue=long_venue,
+                symbol=symbol,
+                order_id=long_order_id,
+                client_order_id=long_client_order_id,
+            )
+            if result.long_status == "filled" and long_recon is not None:
                 result.long_fill = long_recon
 
         if short_adapter is not None:
@@ -450,8 +497,16 @@ class OrderReconciler:
                 short_queried_endpoints,
                 short_endpoint_responses,
                 short_next_action,
-            ) = self._status_from_reconciliation(short_recon, pos, short_query_payload)
-            if short_recon is not None and short_recon.quantity > 0:
+            ) = self._status_from_reconciliation(
+                short_recon,
+                pos,
+                short_query_payload,
+                venue=short_venue,
+                symbol=symbol,
+                order_id=short_order_id,
+                client_order_id=short_client_order_id,
+            )
+            if result.short_status == "filled" and short_recon is not None:
                 result.short_fill = short_recon
 
         # Determine if flat
@@ -529,6 +584,25 @@ async def reconcile_unknown_order(
             symbol, order_id, client_order_id
         )
         if fill is not None:
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=getattr(fill, "venue", None) or getattr(adapter, "venue", None),
+                symbol=symbol,
+                order_id=order_id or str(getattr(fill, "order_id", "") or ""),
+                client_order_id=(
+                    client_order_id
+                    or str(getattr(fill, "client_order_id", "") or "")
+                ),
+                target_qty=float(getattr(fill, "quantity", 0.0) or 0.0),
+                reconciliation=fill,
+                metadata=getattr(fill, "metadata", None),
+            )
+            if truth_decision.fill_status != OrderTruthFillStatus.CONFIRMED_FILL:
+                return ReconciliationResult(
+                    status=truth_decision.fill_status.value,
+                    order_id=order_id,
+                    symbol=symbol,
+                    reason=truth_decision.decision,
+                )
             return ReconciliationResult(
                 status="filled",
                 order_id=order_id,

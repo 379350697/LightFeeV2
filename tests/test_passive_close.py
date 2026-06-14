@@ -3079,6 +3079,11 @@ class TestFallbackResidualReal:
                     client_order_id=client_order_id,
                     fee_quote=0.0123,
                     filled_at_ms=2000,
+                    metadata={
+                        "evidence_source": "bybit_execution_list",
+                        "queried_endpoints": ["/v5/execution/list"],
+                        "response_classification": "filled",
+                    },
                 )
 
         binance = FilledMakerAdapter(Venue.BINANCE)
@@ -3246,6 +3251,11 @@ class TestFallbackResidualReal:
                 order_id="ack-oid",
                 client_order_id="ack-cid",
                 filled_at_ms=1781416809425,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "filled",
+                },
             )
         )
         executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
@@ -3301,6 +3311,100 @@ class TestFallbackResidualReal:
             record["kind"] for record in records
         ]
 
+    def test_active_truth_gap_reconciliation_weak_positive_retain_pending(self):
+        """Active accepted-order truth gaps require resolver-confirmed fill truth."""
+        journal = _open_journal()
+
+        adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        adapter.place_order = AsyncMock()
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="EDENUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.01,
+                order_id="ack-oid",
+                client_order_id="ack-cid",
+                metadata={
+                    "evidence_source": "bybit_order_realtime",
+                    "response_classification": "accepted_ack_without_execution",
+                    "queried_endpoints": ["/v5/order/realtime"],
+                },
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.99, 1.01))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-passive-active-gap",
+            symbol="EDENUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.pending_close_reconciliations.append(
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "kind": "accepted_order_truth_gap",
+                "venue": Venue.BYBIT.value,
+                "leg": "short",
+                "original_payload": {
+                    "accepted_order_id": "ack-oid",
+                    "accepted_client_order_id": "ack-cid",
+                },
+                "short_legs": [
+                    {
+                        "venue": Venue.BYBIT.value,
+                        "order_id": "ack-oid",
+                        "client_order_id": "ack-cid",
+                    }
+                ],
+            }
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                state,
+                pending,
+                position,
+                10.0,
+                maker_terminal=True,
+            )
+        )
+
+        assert result.success is False
+        assert result.truth_gap is True
+        assert pending.hedge_fill.quantity == 0.0
+        assert len(state.pending_close_reconciliations) == 1
+        records = journal.read_all()
+        payload = [
+            record["payload"] for record in records
+            if record["kind"] == "exit.passive_close_hedge_ack_reconcile_in_progress"
+        ][-1]
+        assert payload["fill_reconciliation_result"] == "truth_gap"
+        assert payload["order_truth_fill_status"] == "truth_gap"
+        assert payload["order_truth_evidence_status"] == "unavailable"
+        assert payload["terminal_without_truth"] is False
+
     def test_bybit_delta_hedge_ack_without_qty_confirms_via_reconciliation(self):
         """Bybit create-order ACK may be async and carry no fill quantity."""
         journal = _open_journal()
@@ -3327,6 +3431,11 @@ class TestFallbackResidualReal:
                 order_id="ack-oid",
                 client_order_id="ack-cid",
                 filled_at_ms=1781416809425,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "filled",
+                },
             )
         )
         executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
@@ -3667,6 +3776,11 @@ class TestFallbackResidualReal:
                     order_id="partial-oid",
                     client_order_id=client_order_id,
                     filled_at_ms=1600,
+                    metadata={
+                        "evidence_source": "bybit_execution_list",
+                        "queried_endpoints": ["/v5/execution/list"],
+                        "response_classification": "filled",
+                    },
                 )
 
             async def fetch_position(self, symbol):
@@ -3779,6 +3893,11 @@ class TestFallbackResidualReal:
                     order_id="partial-oid",
                     client_order_id=client_order_id,
                     filled_at_ms=1600,
+                    metadata={
+                        "evidence_source": "bybit_execution_list",
+                        "queried_endpoints": ["/v5/execution/list"],
+                        "response_classification": "filled",
+                    },
                 )
 
             async def fetch_position(self, symbol):

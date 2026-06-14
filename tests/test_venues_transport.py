@@ -7276,6 +7276,50 @@ class TestBitgetParseOrderStatusRedLight:
         assert result.order_id == "oid-1"
         assert result.client_order_id == "cid-1"
 
+    def test_bitget_positive_fill_carries_order_truth_metadata(self):
+        """Bitget fill reconciliation must carry the family/side truth ledger needs."""
+        from lightfee.core.domain import OrderFillReconciliation
+        from lightfee.engine.order_truth_ledger import (
+            ORDER_TRUTH_LEDGER,
+            OrderTruthFillStatus,
+        )
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                "filledQty": "0.5", "baseVolume": "0.5",
+                "priceAvg": "51000", "avgPrice": "51000",
+                "side": "buy", "uTime": "2000000",
+                "cTime": "2000000", "fee": "0.1",
+            },
+        }
+
+        result = transport._parse_order_status_bitget(
+            raw,
+            "BTCUSDT",
+            2000000,
+            resolved_account_family="uta",
+            queried_endpoint="/api/v3/trade/order-info",
+        )
+
+        assert isinstance(result, OrderFillReconciliation)
+        assert result.metadata["resolved_account_family"] == "uta"
+        assert result.metadata["side"] == "buy"
+        assert result.metadata["raw_exchange_status"] == "filled"
+        decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+            venue=result.venue,
+            symbol=result.symbol,
+            order_id=result.order_id,
+            client_order_id=result.client_order_id or "",
+            target_qty=result.quantity,
+            reconciliation=result,
+        )
+        assert decision.fill_status is OrderTruthFillStatus.CONFIRMED_FILL
+
     @pytest.mark.parametrize("side_value", [None, "", "close_long"])
     def test_bitget_positive_fill_missing_or_invalid_side_fails_closed(self, side_value):
         from lightfee.venues.transport import VenueTransport, TransportError

@@ -784,6 +784,54 @@ def test_production_gate_does_not_report_clean_when_open_orders_present():
     )
 
 
+def test_current_state_weak_order_truth_gap_is_not_green_even_when_flat():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "last_scan": {"candidate_count": 1, "tradeable_count": 1},
+        "recent_events": [
+            {
+                "kind": "exit.passive_close_hedge_confirmed_after_ack",
+                "payload": {
+                    "position_id": "pos-weak-truth",
+                    "symbol": "BTCUSDT",
+                    "order_truth_fill_status": "truth_gap",
+                    "order_truth_evidence_status": "unavailable",
+                    "order_truth_decision": "retain_backoff",
+                    "order_truth_missing_evidence": ["fill_confirmation"],
+                    "terminal_without_truth": False,
+                },
+            }
+        ],
+        "exchange_truth": {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {"bybit": {}},
+            "open_orders": {"bybit": {}},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert report.severity == "critical"
+    assert "order_truth_gap_unresolved" in report.fingerprints
+    assert report.details["weak_order_truth_events"][0]["symbol"] == "BTCUSDT"
+
+
 def test_verify_production_services_cli_json_failure(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()

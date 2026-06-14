@@ -164,7 +164,12 @@ class HyperliquidAdapter(VenueAdapter):
                     body={"type": "orderStatus", "user": user_addr, "oid": oid},
                     private=False,
                 )
-                result = self._parse_hl_order_status(raw, symbol, now_ms)
+                result = self._parse_hl_order_status(
+                    raw,
+                    symbol,
+                    now_ms,
+                    configured_account_address=user_addr,
+                )
                 if result is not None:
                     return result
             except (ValueError, Exception):
@@ -182,7 +187,12 @@ class HyperliquidAdapter(VenueAdapter):
                     body={"type": "orderStatus", "user": user_addr, "cloid": wire_cloid},
                     private=False,
                 )
-                result = self._parse_hl_order_status(raw, symbol, now_ms)
+                result = self._parse_hl_order_status(
+                    raw,
+                    symbol,
+                    now_ms,
+                    configured_account_address=user_addr,
+                )
                 if result is not None:
                     return result
             except Exception:
@@ -196,7 +206,12 @@ class HyperliquidAdapter(VenueAdapter):
                 private=False,
             )
             return self._parse_hl_historical_orders(
-                raw, symbol, order_id, client_order_id, now_ms,
+                raw,
+                symbol,
+                order_id,
+                client_order_id,
+                now_ms,
+                configured_account_address=user_addr,
             )
         except Exception:
             pass
@@ -205,7 +220,11 @@ class HyperliquidAdapter(VenueAdapter):
 
     @staticmethod
     def _parse_hl_order_status(
-        raw: dict[str, Any], symbol: str, now_ms: int,
+        raw: dict[str, Any],
+        symbol: str,
+        now_ms: int,
+        *,
+        configured_account_address: str = "",
     ) -> Optional[OrderFillReconciliation]:
         """Parse Hyperliquid orderStatus response.
 
@@ -252,6 +271,9 @@ class HyperliquidAdapter(VenueAdapter):
                     "raw_exchange_status": status,
                     "orig_sz": orig_sz,
                     "response_type": "orderStatus",
+                    "configured_account_address": configured_account_address,
+                    "oid": oid,
+                    "cloid": cloid,
                 },
             )
 
@@ -274,6 +296,9 @@ class HyperliquidAdapter(VenueAdapter):
                     "raw_exchange_status": status,
                     "response_type": "orderStatus",
                     "terminal_non_fill": True,
+                    "configured_account_address": configured_account_address,
+                    "oid": oid,
+                    "cloid": cloid,
                 },
             )
 
@@ -291,6 +316,9 @@ class HyperliquidAdapter(VenueAdapter):
                 "raw_exchange_status": status,
                 "response_type": "orderStatus",
                 "orig_sz": orig_sz,
+                "configured_account_address": configured_account_address,
+                "oid": oid,
+                "cloid": cloid,
             },
         )
 
@@ -298,6 +326,8 @@ class HyperliquidAdapter(VenueAdapter):
     def _parse_hl_historical_orders(
         raw: Any, symbol: str, order_id: str,
         client_order_id: Optional[str], now_ms: int,
+        *,
+        configured_account_address: str = "",
     ) -> Optional[OrderFillReconciliation]:
         """Parse Hyperliquid historicalOrders response for a matching order.
 
@@ -351,6 +381,9 @@ class HyperliquidAdapter(VenueAdapter):
                     metadata={
                         "raw_exchange_status": status,
                         "response_type": "historicalOrders",
+                        "configured_account_address": configured_account_address,
+                        "oid": entry_oid,
+                        "cloid": entry_cloid,
                     },
                 )
 
@@ -369,6 +402,9 @@ class HyperliquidAdapter(VenueAdapter):
                         "raw_exchange_status": status,
                         "response_type": "historicalOrders",
                         "terminal_non_fill": True,
+                        "configured_account_address": configured_account_address,
+                        "oid": entry_oid,
+                        "cloid": entry_cloid,
                     },
                 )
 

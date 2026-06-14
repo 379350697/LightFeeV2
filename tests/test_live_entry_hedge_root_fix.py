@@ -2436,6 +2436,11 @@ class TestRealPathAbortCleanupDeadline:
             order_id="hedge-oid-1",
             client_order_id="unused-before-submit",
             filled_at_ms=2000,
+            metadata={
+                "evidence_source": "bybit_execution_list",
+                "queried_endpoints": ["/v5/execution/list"],
+                "response_classification": "filled",
+            },
         )
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
 
@@ -6136,6 +6141,11 @@ class TestZeroFillFinalizeV1ParityGate:
             order_id="hedge-real-oid",
             client_order_id="hedge-cid",
             filled_at_ms=2000,
+            metadata={
+                "evidence_source": "bybit_execution_list",
+                "queried_endpoints": ["/v5/execution/list"],
+                "response_classification": "filled",
+            },
         )
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
 
@@ -6183,6 +6193,11 @@ class TestZeroFillFinalizeV1ParityGate:
             order_id="hedge-real-oid",
             client_order_id="hedge-cid",
             filled_at_ms=2000,
+            metadata={
+                "evidence_source": "bybit_execution_list",
+                "queried_endpoints": ["/v5/execution/list"],
+                "response_classification": "filled",
+            },
         )
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
 
@@ -6300,6 +6315,12 @@ class TestZeroFillFinalizeV1ParityGate:
             order_id="maker-real-oid",
             client_order_id="maker-cid",
             filled_at_ms=2000,
+            metadata={
+                "evidence_source": "binance_order_status",
+                "queried_endpoints": ["/fapi/v1/order"],
+                "raw_exchange_status": "FILLED",
+                "response_classification": "filled",
+            },
         )
         runtime._venue_adapters[Venue.BINANCE] = maker_adapter
 

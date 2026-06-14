@@ -29,7 +29,7 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
 )
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.recovery_decision_core import (
     CORE_CLEARABLE_BLOCK_REASONS,
@@ -1279,14 +1279,46 @@ class ResidualRepairRuntime:
                 payload["ledger_decision"] = decision.decision
                 return "truth_unavailable", None, payload
 
-            recon_qty = self._close_reconciliation_fill_qty(reconciliation)
-            if recon_qty > 1e-12:
+            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                venue=repair_venue,
+                symbol=symbol,
+                order_id=accepted_order_id,
+                client_order_id=accepted_client_order_id,
+                target_qty=self._safe_positive_float(
+                    task.get("repair_quantity")
+                    or task.get("quantity")
+                    or task.get("requested_quantity")
+                    or baseline
+                ),
+                reconciliation=reconciliation,
+                metadata=(
+                    getattr(reconciliation, "metadata", None)
+                    if reconciliation is not None
+                    else None
+                ),
+            )
+            payload.update(
+                {
+                    "order_truth_fill_status": truth_decision.fill_status.value,
+                    "order_truth_evidence_status": (
+                        truth_decision.evidence_status.value
+                    ),
+                    "order_truth_decision": truth_decision.decision,
+                    "order_truth_missing_evidence": list(
+                        truth_decision.missing_evidence
+                    ),
+                    "terminal_without_truth": (
+                        truth_decision.terminal_without_truth
+                    ),
+                }
+            )
+            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 payload["fill_reconciliation_result"] = "filled"
                 fill = OrderFill(
                     venue=repair_venue,
                     symbol=symbol,
                     side=getattr(reconciliation, "side", repair_side) or repair_side,
-                    quantity=recon_qty,
+                    quantity=truth_decision.reconciled_qty,
                     price=_recon_fill_price(reconciliation),
                     order_id=(
                         str(getattr(reconciliation, "order_id", "") or "")
@@ -1306,6 +1338,19 @@ class ResidualRepairRuntime:
                 payload["resolution_state"] = decision.state
                 payload["ledger_decision"] = decision.decision
                 return "filled", fill, payload
+            if (
+                reconciliation is not None
+                and self._close_reconciliation_fill_qty(reconciliation) > 1e-12
+            ):
+                payload["fill_reconciliation_result"] = (
+                    "truth_gap"
+                    if truth_decision.fill_status == OrderTruthFillStatus.TRUTH_GAP
+                    else truth_decision.fill_status.value
+                )
+                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
+                payload["resolution_state"] = decision.state
+                payload["ledger_decision"] = decision.decision
+                return "truth_gap", None, payload
             payload["fill_reconciliation_result"] = "missing_or_zero_fill"
         else:
             payload["fill_reconciliation_result"] = "not_available"

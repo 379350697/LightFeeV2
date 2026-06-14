@@ -339,7 +339,12 @@ class OrderTruthLedger:
         if (
             reconciliation is not None
             and reconciled_qty > 1e-9
-            and not _classification_is_weak_fill_source(classification_text)
+            and _fill_truth_source_is_confirmed(
+                venue,
+                merged_metadata,
+                endpoints,
+                classification_text,
+            )
         ):
             return OrderTruthSuccessDecision(
                 fill_status=OrderTruthFillStatus.CONFIRMED_FILL,
@@ -772,6 +777,117 @@ def _classification_is_weak_fill_source(text: str) -> bool:
     )
 
 
+def _fill_truth_source_is_confirmed(
+    venue: Venue,
+    metadata: Mapping[str, Any],
+    endpoints: tuple[str, ...],
+    classification_text: str,
+) -> bool:
+    if not isinstance(metadata, Mapping) or not metadata:
+        return False
+    text = str(classification_text or "").lower()
+    if _classification_is_fail_closed(text):
+        return False
+    if venue in {Venue.BINANCE, Venue.ASTER} and _classification_is_terminal_fill_truth(
+        venue,
+        metadata,
+        text,
+    ):
+        return True
+    if _classification_is_weak_fill_source(text):
+        return False
+    return _endpoint_is_fill_truth(
+        venue,
+        endpoints,
+    ) or _classification_is_terminal_fill_truth(
+        venue,
+        metadata,
+        text,
+    )
+
+
+def _endpoint_is_fill_truth(venue: Venue, endpoints: tuple[str, ...]) -> bool:
+    endpoint_text = " ".join(str(endpoint or "").lower() for endpoint in endpoints)
+    if venue == Venue.OKX:
+        return "/api/v5/trade/fills" in endpoint_text
+    if venue == Venue.BYBIT:
+        return "/v5/execution/list" in endpoint_text
+    return False
+
+
+def _classification_is_terminal_fill_truth(
+    venue: Venue,
+    metadata: Mapping[str, Any],
+    classification_text: str,
+) -> bool:
+    if not isinstance(metadata, Mapping) or not metadata:
+        return False
+    text = str(classification_text or "").lower()
+    source = str(metadata.get("evidence_source") or "").lower()
+    response = str(
+        metadata.get("response_classification")
+        or metadata.get("classification")
+        or ""
+    ).lower()
+    raw_status = str(metadata.get("raw_exchange_status") or "").lower()
+    explicit_truth = any(
+        bool(metadata.get(key))
+        for key in (
+            "normalized_fill_truth",
+            "normalized_execution_truth",
+            "fill_truth",
+            "execution_truth",
+            "order_fill_truth",
+            "live_fill_truth",
+        )
+    )
+    if explicit_truth:
+        return True
+
+    if venue == Venue.OKX:
+        return source in {"okx_fills", "okx_fills_history", "okx_trade_fills"}
+    if venue == Venue.BYBIT:
+        return source in {"bybit_execution_list", "bybit_private_execution"}
+    if venue in {Venue.BINANCE, Venue.ASTER}:
+        if raw_status == "filled":
+            return True
+        return response.startswith("filled_after_")
+    if venue == Venue.BITGET:
+        family = (
+            metadata.get("resolved_account_family")
+            or metadata.get("account_family")
+            or metadata.get("contract_family")
+            or metadata.get("product_type")
+        )
+        side = str(metadata.get("side") or metadata.get("resolved_side") or "").lower()
+        side_ok = side in {"buy", "sell", "long", "short"}
+        source_ok = any(marker in source for marker in ("fill", "fills", "trade"))
+        status_ok = raw_status == "filled" or response.startswith("filled")
+        return bool(family) and side_ok and (source_ok or status_ok)
+    if venue == Venue.GATE:
+        source_ok = any(
+            marker in source for marker in ("fill", "fills", "trade", "execution")
+        )
+        status_ok = raw_status == "filled" or response.startswith("filled")
+        return source_ok or status_ok
+    if venue == Venue.HYPERLIQUID:
+        account = metadata.get("account") or metadata.get("account_address")
+        configured = (
+            metadata.get("configured_account")
+            or metadata.get("configured_account_address")
+        )
+        oid = metadata.get("oid") or metadata.get("order_id")
+        cloid = metadata.get("cloid") or metadata.get("client_order_id")
+        identity_ok = bool(account or configured) and bool(oid or cloid)
+        status_ok = (
+            raw_status == "filled"
+            or response.startswith("filled")
+            or "filled" in text
+        )
+        return identity_ok and status_ok
+    return False
+
+
 def _missing_order_truth_evidence(
     *,
     venue: Venue,
@@ -798,6 +914,8 @@ def _missing_order_truth_evidence(
         missing.append("terminal_order_or_live_position_truth")
     if "accepted_ack" in classification_text or "ack_without_execution" in classification_text:
         missing.append("post_ack_execution_truth")
+    if not endpoints:
+        missing.append("fill_confirmation")
     if not missing:
         missing.append("fill_confirmation")
     return tuple(dict.fromkeys(missing))

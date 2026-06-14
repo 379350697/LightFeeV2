@@ -293,6 +293,11 @@ async def test_residual_repair_ack_only_reconciled_fill_completes_without_second
         order_id="repair-ack-oid",
         client_order_id="repair-ack-cid",
         filled_at_ms=now_ms + 1,
+        metadata={
+            "evidence_source": "bybit_execution_list",
+            "queried_endpoints": ["/v5/execution/list"],
+            "response_classification": "filled",
+        },
     )
     runtime._venue_adapters = {Venue.BYBIT: bybit}
 
@@ -309,6 +314,71 @@ async def test_residual_repair_ack_only_reconciled_fill_completes_without_second
     ][-1]
     assert completed["result"] == "accepted_order_reconciled"
     assert completed["fill_order_id"] == "repair-ack-oid"
+
+
+@pytest.mark.asyncio
+async def test_residual_repair_weak_positive_accepted_order_truth_gap_retains(tmp_path):
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-residual-weak-positive",
+        "pair_id": "edenusdt:binance->bybit",
+        "symbol": "EDENUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 10.0,
+        "accepted_order_truth_gap": True,
+        "accepted_order_id": "repair-ack-oid",
+        "accepted_client_order_id": "repair-ack-cid",
+        "order_truth_state": "unresolved",
+        "ledger_decision": "backoff_recheck",
+        "created_at_ms": now_ms,
+        "deadline_ms": now_ms + 300_000,
+        "retry_count": 1,
+        "last_attempt_at_ms": now_ms - 60_000,
+        "next_attempt_ms": 0,
+    })
+
+    bybit = IncidentVenueAdapter(Venue.BYBIT)
+    bybit.position = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        entry_price=1.0,
+        observed_at_ms=now_ms,
+    )
+    bybit.order_fill_reconciliation = OrderFillReconciliation(
+        venue=Venue.BYBIT,
+        symbol="EDENUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        average_price=1.0,
+        order_id="repair-ack-oid",
+        client_order_id="repair-ack-cid",
+        filled_at_ms=now_ms + 2,
+        metadata={
+            "evidence_source": "bybit_order_realtime",
+            "response_classification": "accepted_ack_without_execution",
+            "queried_endpoints": ["/v5/order/realtime"],
+        },
+    )
+    runtime._venue_adapters = {Venue.BYBIT: bybit}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    retained = runtime.state.pending_residual_repairs[0]
+    assert retained["accepted_order_id"] == "repair-ack-oid"
+    assert retained["accepted_client_order_id"] == "repair-ack-cid"
+    assert retained["last_error"] == "accepted_order_truth_gap_truth_gap"
+    assert retained["order_truth_state"] == "unresolved"
+    assert retained["ledger_decision"] == "backoff_recheck"
+    assert not [
+        event for event in runtime.journal.read_all()
+        if event["kind"] == "execution.residual_repair_completed"
+    ]
 
 
 @pytest.mark.asyncio
@@ -428,6 +498,11 @@ async def test_residual_repair_ack_only_open_order_retains_then_reconciles_befor
         order_id="repair-ack-oid",
         client_order_id="repair-ack-cid",
         filled_at_ms=now_ms + 2,
+        metadata={
+            "evidence_source": "bybit_execution_list",
+            "queried_endpoints": ["/v5/execution/list"],
+            "response_classification": "filled",
+        },
     )
 
     await runtime._recover_residual_repairs(now_ms + 60_000)
@@ -485,6 +560,11 @@ async def test_residual_repair_partial_accepted_fill_clears_stale_ledger_fields(
         order_id="repair-ack-oid",
         client_order_id="repair-ack-cid",
         filled_at_ms=now_ms + 2,
+        metadata={
+            "evidence_source": "bybit_execution_list",
+            "queried_endpoints": ["/v5/execution/list"],
+            "response_classification": "filled",
+        },
     )
     runtime._venue_adapters = {Venue.BYBIT: bybit}
 
