@@ -1167,6 +1167,9 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_quote_evidence_resolved_by_ws_bbo": (
         V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
     ),
+    "runtime.last_good_revalidated_by_entry_quote_truth": (
+        V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
+    ),
     "runtime.order_quote_stale_skipped": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.quote_stale": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.ws_bbo_dynamic_ws_started": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
@@ -1174,6 +1177,9 @@ _EVENT_KIND_PHASES = {
     "runtime.candidate_symbol_skipped": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.candidates_tradeable": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.tradeable_candidates_catalog_filtered": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.perp_liquidity_stale_advisory": (
         V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
     ),
     "execution.entry_liquidity_advisory": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
