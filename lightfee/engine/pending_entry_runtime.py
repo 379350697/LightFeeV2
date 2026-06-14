@@ -1169,6 +1169,18 @@ class PendingEntryRuntime:
                 has_live_position=False,
             )
 
+        position_side = getattr(position, "side", None)
+        maker_leg = str(getattr(pending, "maker_leg", "") or "").lower()
+        live_long_quantity = (
+            live_qty
+            if maker_leg == "long" and position_side == Side.BUY
+            else 0.0
+        )
+        live_short_quantity = (
+            live_qty
+            if maker_leg == "short" and position_side == Side.SELL
+            else 0.0
+        )
         pending.uncertain_outcome = True
         pending.reconcile_next_attempt_ms = max(
             int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
@@ -1196,6 +1208,9 @@ class PendingEntryRuntime:
             available=True,
             has_live_open_order=False,
             has_live_position=True,
+            live_long_quantity=live_long_quantity,
+            live_short_quantity=live_short_quantity,
+            live_balanced_quantity=0.0,
         )
 
     async def _pending_entry_positive_fill_live_truth(
@@ -1455,6 +1470,9 @@ class PendingEntryRuntime:
                     has_live_open_order=open_order_truth.has_live_open_order,
                     has_live_position=live_position_truth.has_live_position,
                     error=";".join(missing_truth_errors),
+                    live_long_quantity=live_position_truth.live_long_quantity,
+                    live_short_quantity=live_position_truth.live_short_quantity,
+                    live_balanced_quantity=live_position_truth.live_balanced_quantity,
                 )
                 decision = PendingEntryTerminalizer().decide(
                     pending,
@@ -1470,6 +1488,16 @@ class PendingEntryRuntime:
                     ),
                 )
                 if not decision.allows_pending_removal:
+                    if (
+                        decision.outcome == "deferred_live_position"
+                        and await self._cleanup_zero_fill_live_truth_conflict(
+                            pending=pending,
+                            entry_id=entry_id,
+                            live_truth=live_truth,
+                            now_ms=now_ms,
+                        )
+                    ):
+                        return True
                     return False
                 # V1: zero-fill is removable only after terminal no-fill plus
                 # available clear open-order and live-position truth.
@@ -1852,9 +1880,59 @@ class PendingEntryRuntime:
         if not live_truth.available or live_truth.has_live_open_order:
             return False
 
+        return await self._cleanup_owned_single_leg_live_truth_conflict(
+            pending=pending,
+            entry_id=entry_id,
+            live_long_quantity=decision.live_long_quantity,
+            live_short_quantity=decision.live_short_quantity,
+            matched_quantity=decision.matched_quantity,
+            reason=decision.reason,
+            now_ms=now_ms,
+        )
+
+    async def _cleanup_zero_fill_live_truth_conflict(
+        self,
+        *,
+        pending: Any,
+        entry_id: str,
+        live_truth: PendingEntryLiveTruth,
+        now_ms: int,
+    ) -> bool:
+        """Clean an owned zero-fill pending entry once live truth proves exposure."""
+
+        if (
+            not live_truth.available
+            or live_truth.has_live_open_order
+            or not live_truth.has_live_position
+        ):
+            return False
+
+        return await self._cleanup_owned_single_leg_live_truth_conflict(
+            pending=pending,
+            entry_id=entry_id,
+            live_long_quantity=live_truth.live_long_quantity,
+            live_short_quantity=live_truth.live_short_quantity,
+            matched_quantity=0.0,
+            reason="zero_fill_live_position_truth_present",
+            now_ms=now_ms,
+        )
+
+    async def _cleanup_owned_single_leg_live_truth_conflict(
+        self,
+        *,
+        pending: Any,
+        entry_id: str,
+        live_long_quantity: float,
+        live_short_quantity: float,
+        matched_quantity: float,
+        reason: str,
+        now_ms: int,
+    ) -> bool:
+        """Flatten one owned live leg and release pending only after fresh flat truth."""
+
         eps = 1e-9
-        live_long_quantity = max(float(decision.live_long_quantity or 0.0), 0.0)
-        live_short_quantity = max(float(decision.live_short_quantity or 0.0), 0.0)
+        live_long_quantity = max(float(live_long_quantity or 0.0), 0.0)
+        live_short_quantity = max(float(live_short_quantity or 0.0), 0.0)
         has_live_long = live_long_quantity > eps
         has_live_short = live_short_quantity > eps
         if has_live_long == has_live_short:
@@ -1891,10 +1969,10 @@ class PendingEntryRuntime:
                 "stage": stage,
                 "live_position_side": live_side.value,
                 "live_position_quantity": live_quantity,
-                "matched_quantity": decision.matched_quantity,
+                "matched_quantity": matched_quantity,
                 "live_long_quantity": live_long_quantity,
                 "live_short_quantity": live_short_quantity,
-                "reason": decision.reason,
+                "reason": reason,
             },
         )
 

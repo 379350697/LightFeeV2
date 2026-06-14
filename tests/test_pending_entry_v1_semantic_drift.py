@@ -117,6 +117,24 @@ class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
         return []
 
 
+class _ZeroFillOwnedConflictCleanupAdapter(_OwnedConflictCleanupAdapter):
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        return OrderFillReconciliation(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            average_price=0.0,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            metadata={
+                "status": "canceled",
+                "response_classification": "no_open_order;live_position_present",
+                "queried_endpoints": ["/api/v5/trade/order", "/api/v5/trade/fills"],
+            },
+        )
+
+
 class _TerminalNoFillOpenMakerAdapter(_NoFillReconciliationAdapter):
     def __init__(self, *, order_id: str, client_order_id: str):
         self.order_id = order_id
@@ -2086,6 +2104,96 @@ async def test_zero_fill_finalize_retains_when_live_position_truth_is_nonzero(
     assert deferred[-1]["entry_id"] == pending.pending_id
     assert deferred[-1]["live_position_quantity"] == pytest.approx(2429.0)
     assert deferred[-1]["reason"] == "maker_live_position_truth_present"
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    live_long = PositionSnapshot(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=1600.0,
+        entry_price=0.0288,
+        observed_at_ms=1781456020992,
+    )
+    flat_long = PositionSnapshot(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1781456025992,
+    )
+    flat_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1781456025992,
+    )
+    okx = _ZeroFillOwnedConflictCleanupAdapter(Venue.OKX)
+    okx.position_snapshots = [live_long, live_long, flat_long]
+    bybit = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    bybit.position_snapshots = [flat_short]
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: okx,
+            Venue.BYBIT: bybit,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1781455987631-HOMEUSDT",
+        symbol="HOMEUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        target_quantity=1652.5511258004544,
+        maker_leg="long",
+        maker_order_id="3655876122055122944",
+        maker_client_order_id="f435324a30e9a2b43818f9469e7d9317",
+        hedge_order_id="",
+        hedge_client_order_id="60bc2ae587d54be1ab29485651ff9d92a234",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1781456020992,
+    )
+
+    assert finalized is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert okx.place_order_call_count == 1
+    assert okx.last_request is not None
+    assert okx.last_request.reduce_only is True
+    assert okx.last_request.post_only is False
+    assert okx.last_request.time_in_force == TimeInForce.IOC
+    assert okx.last_request.side == Side.SELL
+    assert okx.last_request.quantity == pytest.approx(1600.0)
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "entry.opened" not in kinds
+    assert "entry.passive_unfilled" not in kinds
+    cleanup = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.owned_live_conflict_cleanup_succeeded"
+    ][-1]
+    assert cleanup["entry_id"] == pending.pending_id
+    assert cleanup["venue"] == "okx"
+    assert cleanup["live_position_side"] == "buy"
+    assert cleanup["live_position_quantity"] == pytest.approx(1600.0)
+    assert cleanup["reason"] == "owned_single_leg_flattened_and_fresh_truth_flat"
 
 
 @pytest.mark.asyncio
