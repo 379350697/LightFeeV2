@@ -9010,6 +9010,24 @@ class LiveRuntime:
                     maker_reconciliation,
                 )
             ):
+                open_order_truth = await self._pending_entry_zero_fill_has_live_maker_open_order(
+                    pending,
+                    entry_id,
+                    now_ms,
+                )
+                live_position_truth = await self._pending_entry_zero_fill_has_live_maker_position(
+                    pending,
+                    entry_id,
+                    now_ms,
+                )
+                if (
+                    open_order_truth.available
+                    and live_position_truth.available
+                    and not open_order_truth.has_live_open_order
+                    and live_position_truth.has_live_position
+                ):
+                    return True
+
                 pending.uncertain_outcome = True
                 pending.reconcile_next_attempt_ms = max(
                     int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),

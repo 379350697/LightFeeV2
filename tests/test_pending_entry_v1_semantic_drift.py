@@ -128,8 +128,7 @@ class _ZeroFillOwnedConflictCleanupAdapter(_OwnedConflictCleanupAdapter):
             order_id=order_id,
             client_order_id=client_order_id,
             metadata={
-                "status": "canceled",
-                "response_classification": "no_open_order;live_position_present",
+                "response_classification": "detail_found;fills_empty",
                 "queried_endpoints": ["/api/v5/trade/order", "/api/v5/trade/fills"],
             },
         )
@@ -2136,7 +2135,7 @@ async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
         observed_at_ms=1781456025992,
     )
     okx = _ZeroFillOwnedConflictCleanupAdapter(Venue.OKX)
-    okx.position_snapshots = [live_long, live_long, flat_long]
+    okx.position_snapshots = [live_long, live_long, live_long, flat_long]
     bybit = _OwnedConflictCleanupAdapter(Venue.BYBIT)
     bybit.position_snapshots = [flat_short]
     runtime = LiveRuntime(
