@@ -208,6 +208,13 @@ def _is_nonblocking_bulk_probe(payload: dict[str, Any]) -> bool:
     return not truth_required_by and payload.get("blocking") is not True
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
@@ -706,9 +713,73 @@ def analyze_event_file(
         code_side_reason_counts: Counter[str] = Counter()
         code_side_resolution_counts: Counter[str] = Counter()
         code_side_filtered_counts: Counter[str] = Counter()
+        nonblocking_bulk_probe_by_venue: Counter[str] = Counter()
+        nonblocking_bulk_probe_details: dict[tuple[str, str], dict[str, Any]] = {}
+        candidate_starvation_reasons: Counter[str] = Counter()
+        candidate_starvation_symbols: Counter[str] = Counter()
         incident_conclusions: dict[str, str] = {}
         w_first = 0
         w_last = 0
+
+        def _record_candidate_starvation(
+            reason: Any,
+            count: Any = 1,
+            payload: dict[str, Any] | None = None,
+        ) -> None:
+            reason_key = str(reason or "")
+            if not reason_key:
+                return
+            if (
+                "quote_stale" not in reason_key
+                and "open_interest" not in reason_key
+                and "perp_oi" not in reason_key
+                and not reason_key.startswith("oi_")
+            ):
+                return
+            _add_count(candidate_starvation_reasons, reason_key, count)
+            if payload:
+                symbol = str(payload.get("symbol", "") or "")
+                if symbol:
+                    _add_count(candidate_starvation_symbols, symbol, count)
+
+        def _record_nonblocking_bulk_probe(payload: dict[str, Any], ts_ms: int) -> None:
+            if not _is_nonblocking_bulk_probe(payload):
+                return
+            venue = str(payload.get("venue") or "unknown").lower()
+            endpoint = str(
+                payload.get("endpoint")
+                or payload.get("path")
+                or payload.get("url")
+                or payload.get("request_path")
+                or "unknown"
+            )
+            classification = str(payload.get("classification") or "")
+            detail_key = (venue, endpoint)
+            detail = nonblocking_bulk_probe_details.setdefault(
+                detail_key,
+                {
+                    "venue": venue,
+                    "endpoint": endpoint,
+                    "count": 0,
+                    "timeout_count": 0,
+                    "fallback_planned_count": 0,
+                    "no_fallback_count": 0,
+                    "last_ts_ms": 0,
+                    "diagnostic_scope": str(payload.get("diagnostic_scope") or ""),
+                },
+            )
+            detail["count"] += 1
+            if classification == "timeout":
+                detail["timeout_count"] += 1
+            if payload.get("fallback_planned") is True:
+                detail["fallback_planned_count"] += 1
+            elif payload.get("fallback_planned") is False:
+                detail["no_fallback_count"] += 1
+            detail["last_ts_ms"] = max(int(detail.get("last_ts_ms", 0) or 0), ts_ms)
+            timeout_ms = _int_or_none(payload.get("timeout_ms"))
+            if timeout_ms is not None:
+                detail["timeout_ms"] = timeout_ms
+            nonblocking_bulk_probe_by_venue[venue] += 1
 
         for record in records:
             ts_ms = int(record.get("ts_ms", 0) or 0)
@@ -736,6 +807,8 @@ def analyze_event_file(
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,
             )
+            if kind == "recovery.live_position_bulk_diagnostic_error":
+                _record_nonblocking_bulk_probe(payload, ts_ms)
 
             if kind in {
                 "runtime.entry_blocked_local_l2_selection",
@@ -777,6 +850,15 @@ def analyze_event_file(
                 admission_totals = payload.get("entry_admission_blocker_counts", {}) or {}
                 for reason, count in admission_totals.items():
                     entry_admission_blocker_counts[str(reason)] += int(count or 0)
+                    _record_candidate_starvation(reason, count)
+                for reason, count in (payload.get("top_quote_blocker_buckets", {}) or {}).items():
+                    _record_candidate_starvation(reason, count)
+                for reason, count in (payload.get("open_interest_blocker_counts", {}) or {}).items():
+                    _record_candidate_starvation(reason, count)
+                for reason, count in (payload.get("execution_liquidity_blocked_counts", {}) or {}).items():
+                    _record_candidate_starvation(reason, count)
+                for reason, count in (payload.get("snapshot_freshness_blocked_counts", {}) or {}).items():
+                    _record_candidate_starvation(reason, count)
                 for item in payload.get("entry_local_l2_primary_not_ready_detail_samples", []) or []:
                     if isinstance(item, dict):
                         _inc_symbol_pair(item, top_pairs, top_symbols)
@@ -811,6 +893,24 @@ def analyze_event_file(
                 )
                 if reason and reason not in {"attempt", "ack_accepted", "filled"}:
                     exchange_error_counts[reason] += 1
+
+            if kind in {
+                "runtime.entry_quote_revalidate_failed",
+                "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+                "runtime.quote_stale",
+                "runtime.order_quote_stale_skipped",
+                "runtime.order_quote_stale_health_summary",
+                "execution.entry_liquidity_blocked",
+            }:
+                reason = str(
+                    payload.get("reason")
+                    or payload.get("outcome")
+                    or payload.get("eligibility_class")
+                    or ""
+                )
+                if not reason and "quote_stale" in kind:
+                    reason = "quote_stale"
+                _record_candidate_starvation(reason, 1, payload)
 
             if kind == "passive_maintenance.cancel_try_window":
                 try:
@@ -867,6 +967,35 @@ def analyze_event_file(
         for key, count in pending_entry_counts.items():
             blocker_reason_counts[key] = count
 
+        nonblocking_bulk_probe_total = sum(nonblocking_bulk_probe_by_venue.values())
+        nonblocking_bulk_probe_timeout_count = sum(
+            int(detail.get("timeout_count", 0) or 0)
+            for detail in nonblocking_bulk_probe_details.values()
+        )
+        nonblocking_bulk_probe_fallback_count = sum(
+            int(detail.get("fallback_planned_count", 0) or 0)
+            for detail in nonblocking_bulk_probe_details.values()
+        )
+        nonblocking_bulk_probe_no_fallback_count = sum(
+            int(detail.get("no_fallback_count", 0) or 0)
+            for detail in nonblocking_bulk_probe_details.values()
+        )
+        quote_stale_count = sum(
+            count
+            for reason, count in candidate_starvation_reasons.items()
+            if "quote_stale" in reason
+        )
+        oi_structural_count = sum(
+            count
+            for reason, count in candidate_starvation_reasons.items()
+            if "open_interest" in reason or "perp_oi" in reason or reason.startswith("oi_")
+        )
+        entry_opened_count = event_counts.get("entry.opened", 0) + event_counts.get("runtime.position_opened", 0)
+        candidate_starvation_detected = (
+            entry_opened_count == 0
+            and (quote_stale_count > 0 or oi_structural_count > 0)
+        )
+
         return {
             "event_counts": dict(sorted(event_counts.items())),
             "entry_l2_blocker_counts": dict(sorted(entry_l2_blocker_counts.items())),
@@ -897,6 +1026,32 @@ def analyze_event_file(
                 exclude_liquidity=exclude_liquidity,
             ),
             "blocker_reason_counts": blocker_reason_counts,
+            "nonblocking_bulk_probe_summary": {
+                "total_count": nonblocking_bulk_probe_total,
+                "timeout_count": nonblocking_bulk_probe_timeout_count,
+                "by_venue": dict(sorted(nonblocking_bulk_probe_by_venue.items())),
+                "fallback_planned_count": nonblocking_bulk_probe_fallback_count,
+                "no_fallback_count": nonblocking_bulk_probe_no_fallback_count,
+                "details": sorted(
+                    nonblocking_bulk_probe_details.values(),
+                    key=lambda item: (str(item.get("venue", "")), str(item.get("endpoint", ""))),
+                ),
+            },
+            "candidate_selection_starvation": {
+                "detected": candidate_starvation_detected,
+                "total_blocker_count": sum(candidate_starvation_reasons.values()),
+                "quote_stale_count": quote_stale_count,
+                "open_interest_structural_count": oi_structural_count,
+                "top_reasons": [
+                    {"reason": reason, "count": count}
+                    for reason, count in candidate_starvation_reasons.most_common(10)
+                ],
+                "top_symbols": [
+                    {"symbol": symbol, "count": count}
+                    for symbol, count in candidate_starvation_symbols.most_common(10)
+                ],
+                "action": "rewarm_top_candidates_and_reprobe_open_interest",
+            },
             "first_ts_ms": w_first,
             "last_ts_ms": w_last,
         }

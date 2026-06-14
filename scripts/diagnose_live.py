@@ -2351,6 +2351,27 @@ def _event_symbol(payload: dict[str, Any]) -> str:
 def _is_flat_lifecycle_terminal(kind: str, payload: dict[str, Any]) -> bool:
     if kind == "runtime.position_lifecycle_terminal":
         return str(payload.get("terminal_state", "") or "").lower() == "flat"
+    if kind == "exit.passive_close_resolved":
+        if not payload.get("position_id"):
+            return False
+        long_closed = _optional_float(payload.get("long_closed_qty"))
+        short_closed = _optional_float(payload.get("short_closed_qty"))
+        qty_tolerance = 1e-9
+        has_closed_qty_evidence = (
+            long_closed is not None
+            and short_closed is not None
+            and long_closed > qty_tolerance
+            and short_closed > qty_tolerance
+            and abs(long_closed - short_closed)
+            <= max(qty_tolerance, max(abs(long_closed), abs(short_closed)) * qty_tolerance)
+        )
+        closure_phase = str(payload.get("closure_phase", "") or "").upper()
+        closure_decision_id = str(payload.get("closure_decision_id", "") or "")
+        return (
+            has_closed_qty_evidence
+            or closure_phase == "PASSIVE_CLOSE"
+            or bool(closure_decision_id)
+        )
     if kind in {
         "exit.closed",
         "exit.passive_close_fallback_terminal_flat",
@@ -2785,7 +2806,10 @@ def _build_production_acceptance_gate(
     if (
         (entry_opened_count or position_opened_count)
         and current_core_clean
-        and residual_lifecycle_closed_by_recovery
+        and (
+            residual_lifecycle_closed_by_recovery
+            or recovery_lifecycle["closed_trade_lifecycle_count"] > 0
+        )
     ):
         opened_keys = set(recovery_lifecycle.get("opened_keys", []) or [])
         closed_keys = set(recovery_lifecycle.get("closed_open_keys", []) or [])

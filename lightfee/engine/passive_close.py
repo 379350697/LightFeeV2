@@ -2441,6 +2441,18 @@ class PassiveCloseExecutor:
                             "requested": delta,
                             "filled": fill.quantity,
                             "residual": residual,
+                            "classification": (
+                                "duplicate_client_order_reconciled"
+                                if is_bybit_duplicate
+                                else "uncertain_submit_reconciled"
+                            ),
+                            "severity": "info",
+                            "order_submit_uncertain": isinstance(e, OrderSubmitError),
+                            "decision": (
+                                "duplicate_client_order_reconciled_by_client_id"
+                                if is_bybit_duplicate
+                                else "accepted_order_reconciled_by_client_id"
+                            ),
                             "original_error": str(e),
                         },
                     )

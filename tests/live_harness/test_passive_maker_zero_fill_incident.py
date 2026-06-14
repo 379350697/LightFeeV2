@@ -744,6 +744,50 @@ async def test_maker_progress_records_v1_remainder_slice(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_maker_progress_drives_missing_hedge_in_same_tick(tmp_path):
+    """V1: maker progress wake immediately drives the missing hedge delta."""
+
+    config = make_test_config(str(tmp_path))
+    config.strategy.maker_try_window_ms = 1500
+    config.strategy.maker_min_fill_ratio = 0.25
+    config.strategy.maker_entry_progress_poll_ms = 100
+    config.symbols = ["RIVERUSDT"]
+
+    okx = _ZeroFillMakerAdapter(
+        Venue.OKX,
+        PassiveOrderState.PARTIALLY_FILLED,
+        cumulative_quantity=1300.0,
+        average_price=0.0301,
+        observed_at_ms=1779816047900,
+    )
+    bybit = _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.OPEN)
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
+    await runtime.start()
+    pending = _pending_from_fixture()
+    pending.target_quantity = 1300.0
+    pending.long_quantity = 1300.0
+    pending.short_quantity = 1300.0
+    pending.passive_order.target_quantity = 1300.0
+    pending.passive_order.limit_price = 0.02969
+    pending.repost_count = 0
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._maintain_pending_entry_passive_orders(
+        pending.passive_order.accepted_at_ms + config.strategy.maker_entry_progress_poll_ms
+    )
+
+    assert bybit.place_order_calls, "maker progress should immediately submit the hedge"
+    request = bybit.place_order_calls[-1]
+    assert request.quantity == pytest.approx(1300.0)
+    assert pending.hedge_leg_filled == pytest.approx(1300.0)
+    assert pending.missing_hedge_quantity() == pytest.approx(0.0)
+    kinds = [record["kind"] for record in runtime.journal.read_all()]
+    assert kinds.index("passive_maintenance.maker_progress") < kinds.index(
+        "pending_entry.hedge_submit_attempt"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reposted_maker_progress_uses_v1_fill_checkpoint(tmp_path):
     """V1: progress after repost is fill_checkpoint plus order cumulative fill."""
 

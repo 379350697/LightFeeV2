@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -292,6 +293,90 @@ class TestRuntimeLaneScheduling:
             await run_task
         finally:
             runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_run_loop_maker_event_fast_wake_does_not_accelerate_full_tick(
+        self, tmp_path, monkeypatch
+    ):
+        """V1 parity: maker-event lane wakes before poll without dragging full tick."""
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        import lightfee.engine.runtime as runtime_module
+        from lightfee.engine.runtime import LiveRuntime
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="paper",
+                poll_interval_ms=3000,
+                maker_event_lane_enabled=True,
+                maker_event_lane_min_wake_interval_ms=40,
+                sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+                sidecar_snapshot_max_age_ms=1000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                local_l2_enabled=False,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "live-state.json"),
+            ),
+            venues=[],
+            symbols=["HOMEUSDT"],
+        )
+        runtime = LiveRuntime(config)
+        runtime.state.pending_entries["entry-1"] = SimpleNamespace(entry_type="passive_maker")
+
+        now = {"ms": 0}
+        sleeps: list[float] = []
+        tick_calls: list[int] = []
+        maker_calls: list[int] = []
+        real_sleep = asyncio.sleep
+
+        monkeypatch.setattr(runtime_module, "wall_clock_now_ms", lambda: now["ms"])
+
+        async def fake_sleep(seconds: float):
+            sleeps.append(seconds)
+            now["ms"] += int(seconds * 1000)
+            if len(sleeps) >= 2:
+                runtime._running = False
+            await real_sleep(0)
+
+        async def quiet_heartbeat():
+            while runtime._running:
+                await real_sleep(0.01)
+
+        async def fake_tick():
+            tick_calls.append(now["ms"])
+
+        async def fake_maker_event(now_ms: int):
+            maker_calls.append(now_ms)
+
+        async def noop_lane(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(runtime, "_current_state_heartbeat_loop", quiet_heartbeat)
+        monkeypatch.setattr(runtime_module.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(runtime, "tick", fake_tick)
+        monkeypatch.setattr(runtime, "tick_active_positions", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_reload_rate_limits", noop_lane)
+        monkeypatch.setattr(runtime, "_sync_local_l2_data", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_tick_passive_close", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_process_normal_exits", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_tick_maker_event", fake_maker_event)
+        monkeypatch.setattr(runtime, "_maintain_pending_entry_passive_orders", noop_lane)
+        monkeypatch.setattr(runtime, "_post_tick_housekeeping", noop_lane)
+        monkeypatch.setattr(runtime, "_snapshot_local_l2_state", lambda: None)
+        monkeypatch.setattr(runtime_module, "build_persistent_state_view", lambda state: {})
+        monkeypatch.setattr(runtime.snapshot_store, "write", lambda state: None)
+
+        await runtime.run_loop()
+
+        assert sleeps[0] <= 0.05
+        assert maker_calls[:2] == [0, 40]
+        assert tick_calls == [0]
 
     @pytest.mark.asyncio
     async def test_tick_exports_current_state_before_long_or_early_return_tick(self, tmp_path):

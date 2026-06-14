@@ -4420,6 +4420,42 @@ class LiveRuntime:
             poll_ms = 0
         return max(poll_ms * 4, 60_000)
 
+    def _maker_event_lane_fast_sleep_ms(self) -> int | None:
+        if not self.config.runtime.maker_event_lane_enabled:
+            return None
+        pending_entries = getattr(self.state, "pending_entries", {}) or {}
+        pending_values = (
+            pending_entries.values()
+            if hasattr(pending_entries, "values")
+            else pending_entries
+        )
+        for pending in pending_values:
+            entry_type = str(getattr(pending, "entry_type", "") or "").lower()
+            if "passive" in entry_type:
+                return max(
+                    1,
+                    int(self.config.runtime.maker_event_lane_min_wake_interval_ms or 1),
+                )
+        return None
+
+    def _runtime_loop_sleep_ms(
+        self,
+        poll_ms: int,
+        active_poll_ms: int,
+        now_ms: int,
+        next_full_tick_due_ms: int,
+        next_active_tick_due_ms: int,
+        active_tick_enabled: bool,
+    ) -> int:
+        deadlines = [max(1, int(next_full_tick_due_ms - now_ms))]
+        if active_tick_enabled:
+            deadlines.append(max(1, int(next_active_tick_due_ms - now_ms)))
+        maker_sleep_ms = self._maker_event_lane_fast_sleep_ms()
+        if maker_sleep_ms is not None:
+            deadlines.append(maker_sleep_ms)
+        deadlines.append(max(1, min(int(poll_ms), int(active_poll_ms))))
+        return max(1, min(deadlines))
+
     def _ensure_runtime_progress(self) -> dict[str, Any]:
         progress = getattr(self.state, "runtime_progress", None)
         if not isinstance(progress, dict):
@@ -4483,7 +4519,9 @@ class LiveRuntime:
     async def run_loop(self) -> None:
         """Multi-lane tick loop with backoff, housekeeping, and periodic export."""
         self._running = True
-        poll_ms = self.config.runtime.poll_interval_ms
+        poll_ms = max(1, int(self.config.runtime.poll_interval_ms or 1))
+        next_full_tick_due_ms = 0
+        next_active_tick_due_ms = 0
         heartbeat_task = asyncio.create_task(self._current_state_heartbeat_loop())
 
         try:
@@ -4492,23 +4530,32 @@ class LiveRuntime:
                 self._begin_runtime_loop_iteration(now_ms)
                 try:
                     active_count = len(self.state.open_positions)
+                    active_poll_ms = active_position_poll_interval_ms(
+                        self.state.lifecycle, poll_ms, active_count
+                    )
+                    active_tick_enabled = active_position_poll_enabled(
+                        self.state.lifecycle, poll_ms, active_count
+                    )
+                    full_lane_due = now_ms >= next_full_tick_due_ms
+                    active_lane_due = active_tick_enabled and now_ms >= next_active_tick_due_ms
+                    periodic_lanes_due = full_lane_due or active_lane_due
 
                     # --- Full tick lane (backoff-gated) ---
-                    if full_tick_ready(self._tick_backoff_until_ms, now_ms):
-                        self._begin_runtime_lane("full_tick", wall_clock_now_ms())
-                        try:
-                            await self.tick()
-                            self._tick_backoff_until_ms = None
-                        except Exception as e:
-                            self._apply_tick_backoff(is_active=False)
-                            self.journal.append("runtime.tick_error", {"error": str(e)})
-                        finally:
-                            self._complete_runtime_lane("full_tick", wall_clock_now_ms())
+                    if full_lane_due:
+                        if full_tick_ready(self._tick_backoff_until_ms, now_ms):
+                            self._begin_runtime_lane("full_tick", wall_clock_now_ms())
+                            try:
+                                await self.tick()
+                                self._tick_backoff_until_ms = None
+                            except Exception as e:
+                                self._apply_tick_backoff(is_active=False)
+                                self.journal.append("runtime.tick_error", {"error": str(e)})
+                            finally:
+                                self._complete_runtime_lane("full_tick", wall_clock_now_ms())
+                        next_full_tick_due_ms = wall_clock_now_ms() + poll_ms
 
                     # --- Active-position fast tick lane ---
-                    if active_position_poll_enabled(
-                        self.state.lifecycle, poll_ms, active_count
-                    ):
+                    if active_lane_due:
                         if active_position_tick_ready(
                             self._active_tick_backoff_until_ms, now_ms
                         ):
@@ -4523,34 +4570,36 @@ class LiveRuntime:
                                 )
                             finally:
                                 self._complete_runtime_lane("active_positions", wall_clock_now_ms())
+                        next_active_tick_due_ms = wall_clock_now_ms() + active_poll_ms
 
-                    # --- Rate-limit periodic reload (V1: rate_limit_reload_interval) ---
-                    self._begin_runtime_lane("rate_limit_reload", wall_clock_now_ms())
-                    try:
-                        await self._maybe_reload_rate_limits(now_ms)
-                    finally:
-                        self._complete_runtime_lane("rate_limit_reload", wall_clock_now_ms())
+                    if periodic_lanes_due:
+                        # --- Rate-limit periodic reload (V1: rate_limit_reload_interval) ---
+                        self._begin_runtime_lane("rate_limit_reload", wall_clock_now_ms())
+                        try:
+                            await self._maybe_reload_rate_limits(now_ms)
+                        finally:
+                            self._complete_runtime_lane("rate_limit_reload", wall_clock_now_ms())
 
-                    # --- Local-L2 snapshot refresh (periodic REST bootstrap for books) ---
-                    self._begin_runtime_lane("local_l2_sync", wall_clock_now_ms())
-                    try:
-                        await self._sync_local_l2_data(now_ms)
-                    finally:
-                        self._complete_runtime_lane("local_l2_sync", wall_clock_now_ms())
+                        # --- Local-L2 snapshot refresh (periodic REST bootstrap for books) ---
+                        self._begin_runtime_lane("local_l2_sync", wall_clock_now_ms())
+                        try:
+                            await self._sync_local_l2_data(now_ms)
+                        finally:
+                            self._complete_runtime_lane("local_l2_sync", wall_clock_now_ms())
 
-                    # --- Passive close lane (V1: process_pending_passive_closes) ---
-                    self._begin_runtime_lane("passive_close", wall_clock_now_ms())
-                    try:
-                        await self._maybe_tick_passive_close(now_ms)
-                    finally:
-                        self._complete_runtime_lane("passive_close", wall_clock_now_ms())
+                        # --- Passive close lane (V1: process_pending_passive_closes) ---
+                        self._begin_runtime_lane("passive_close", wall_clock_now_ms())
+                        try:
+                            await self._maybe_tick_passive_close(now_ms)
+                        finally:
+                            self._complete_runtime_lane("passive_close", wall_clock_now_ms())
 
-                    # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
-                    self._begin_runtime_lane("normal_exit", wall_clock_now_ms())
-                    try:
-                        await self._maybe_process_normal_exits(now_ms)
-                    finally:
-                        self._complete_runtime_lane("normal_exit", wall_clock_now_ms())
+                        # --- Normal exit lane (V1: standard_close_reason → passive/aggressive routing) ---
+                        self._begin_runtime_lane("normal_exit", wall_clock_now_ms())
+                        try:
+                            await self._maybe_process_normal_exits(now_ms)
+                        finally:
+                            self._complete_runtime_lane("normal_exit", wall_clock_now_ms())
 
                     # --- Maker-event lane (V1: maker_event_interval, optional, with backoff) ---
                     if full_tick_ready(self._maker_tick_backoff_until_ms, now_ms):
@@ -4566,21 +4615,24 @@ class LiveRuntime:
                         finally:
                             self._complete_runtime_lane("maker_event", wall_clock_now_ms())
 
-                    # --- Passive maker maintenance (V1: maintain_pending_entry_passive_order) ---
-                    # Active tick-level lifecycle for resting maker orders:
-                    # progress query → try_window check → rest_timeout → cancel → abort/finalize
-                    self._begin_runtime_lane("pending_entry_maintenance", wall_clock_now_ms())
-                    try:
-                        await self._maintain_pending_entry_passive_orders(now_ms)
-                    finally:
-                        self._complete_runtime_lane("pending_entry_maintenance", wall_clock_now_ms())
+                    if periodic_lanes_due:
+                        # --- Passive maker maintenance (V1: maintain_pending_entry_passive_order) ---
+                        # Active tick-level lifecycle for resting maker orders:
+                        # progress query → try_window check → rest_timeout → cancel → abort/finalize
+                        self._begin_runtime_lane("pending_entry_maintenance", wall_clock_now_ms())
+                        try:
+                            await self._maintain_pending_entry_passive_orders(now_ms)
+                        finally:
+                            self._complete_runtime_lane(
+                                "pending_entry_maintenance", wall_clock_now_ms()
+                            )
 
-                    # --- Post-tick housekeeping ---
-                    self._begin_runtime_lane("housekeeping", wall_clock_now_ms())
-                    try:
-                        await self._post_tick_housekeeping(now_ms)
-                    finally:
-                        self._complete_runtime_lane("housekeeping", wall_clock_now_ms())
+                        # --- Post-tick housekeeping ---
+                        self._begin_runtime_lane("housekeeping", wall_clock_now_ms())
+                        try:
+                            await self._post_tick_housekeeping(now_ms)
+                        finally:
+                            self._complete_runtime_lane("housekeeping", wall_clock_now_ms())
 
                     # --- Snapshot local-L2 state for persistence ---
                     self._snapshot_local_l2_state()
@@ -4589,14 +4641,18 @@ class LiveRuntime:
                     self._sync_passive_order_manager_states()
                     self.snapshot_store.write(build_persistent_state_view(self.state))
 
-                    # --- Sleep until next poll ---
-                    active_poll_ms = active_position_poll_interval_ms(
-                        self.state.lifecycle, poll_ms, active_count
-                    )
                 finally:
                     self._complete_runtime_loop_iteration(wall_clock_now_ms())
 
-                await asyncio.sleep(min(poll_ms, active_poll_ms) / 1000.0)
+                sleep_ms = self._runtime_loop_sleep_ms(
+                    poll_ms,
+                    active_poll_ms,
+                    wall_clock_now_ms(),
+                    next_full_tick_due_ms,
+                    next_active_tick_due_ms,
+                    active_tick_enabled,
+                )
+                await asyncio.sleep(sleep_ms / 1000.0)
         finally:
             heartbeat_task.cancel()
             try:
@@ -4995,6 +5051,22 @@ class LiveRuntime:
                             "venue": str(maker_venue),
                         },
                     )
+                    if (
+                        pending.missing_hedge_quantity() > 1e-9
+                        and pending.hedge_inflight is None
+                        and not pending.repair_state
+                    ):
+                        hedge_driven = await self._drive_missing_hedge_live(
+                            pending, entry_id, now_ms
+                        )
+                        if (
+                            hedge_driven
+                            and pending.missing_hedge_quantity() <= 1e-9
+                            and pending.maker_completed()
+                        ):
+                            if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                                resolved.append(entry_id)
+                            continue
 
             # --- Step 3: maker_try_window_fill_shortfall ---
             if (

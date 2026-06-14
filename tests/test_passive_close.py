@@ -3221,6 +3221,82 @@ class TestFallbackResidualReal:
         assert len(state.pending_close_reconciliations) == 1
         assert state.pending_close_reconciliations[0]["kind"] == "accepted_order_truth_gap"
 
+    def test_ack_only_delta_hedge_reconciled_after_uncertain_submit_is_classified_info(self):
+        """Accepted taker hedge ACK reconciled by client id is contained evidence, not abnormal close."""
+        journal = _open_journal()
+
+        ack_error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-oid) but fill not confirmed",
+        )
+        ack_error.order_ack_only = True
+        ack_error.accepted_order_id = "ack-oid"
+        ack_error.accepted_client_order_id = "ack-cid"
+        ack_error.fill_confirmation_missing_fields = ["executedQty", "cumQty"]
+
+        adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        adapter.place_order = AsyncMock(side_effect=ack_error)
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="EDENUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.01,
+                order_id="ack-oid",
+                client_order_id="ack-cid",
+                filled_at_ms=1781416809425,
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.99, 1.01))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-passive-ack-reconciled",
+            symbol="EDENUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0, average_price=1.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                state,
+                pending,
+                position,
+                10.0,
+                maker_terminal=True,
+            )
+        )
+
+        assert result.success is True
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_hedge_reconciled_after_error"
+        ][-1]
+        assert payload["classification"] == "uncertain_submit_reconciled"
+        assert payload["severity"] == "info"
+        assert payload["order_submit_uncertain"] is True
+        assert payload["decision"] == "accepted_order_reconciled_by_client_id"
+        assert payload["residual"] == pytest.approx(0.0)
+
     def test_ack_only_terminal_hedge_live_flat_resolves_without_deadline_fail_closed(self):
         """Bybit ACK-only close is resolved by live-flat truth, not by fail-closed compensation."""
         journal = _open_journal()

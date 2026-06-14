@@ -656,6 +656,169 @@ def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_containe
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_acceptance_gate_accepts_passive_close_resolved_lifecycle_when_flat():
+    from scripts import diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1781416492144,
+            "kind": "entry.opened",
+            "payload": {
+                "entry_id": "entry-1781416483009-HOMEUSDT",
+                "position_id": "entry-1781416483009-HOMEUSDT",
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781416492145,
+            "kind": "runtime.position_opened",
+            "payload": {
+                "position_id": "entry-1781416483009-HOMEUSDT",
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781416809427,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-1781416483009-HOMEUSDT",
+                "symbol": "HOMEUSDT",
+                "closure_phase": "PASSIVE_CLOSE",
+                "long_closed_qty": 1300.0,
+                "short_closed_qty": 1300.0,
+                "reason": "first_stage_capture",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {"okx": {}, "bybit": {}},
+        "open_orders": {"okx": {"HOMEUSDT": []}, "bybit": {"HOMEUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["gate_passed"] is True
+    assert gate["unclosed_trade_lifecycle_count"] == 0
+    assert gate["blocking_reasons"] == []
+    assert gate["exception_conclusions"]["entry_opened"] == "closed_by_current_exchange_truth"
+    assert gate["exception_conclusions"]["position_opened"] == "closed_by_current_exchange_truth"
+    assert gate["recovery_lifecycle"]["closed_open_keys"] == ["entry-1781416483009-HOMEUSDT"]
+
+
+def test_acceptance_gate_does_not_accept_passive_close_resolved_when_live_state_not_flat():
+    from scripts import diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1781416492144,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": "entry-1781416483009-HOMEUSDT",
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781416809427,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-1781416483009-HOMEUSDT",
+                "symbol": "HOMEUSDT",
+                "closure_phase": "PASSIVE_CLOSE",
+                "long_closed_qty": 1300.0,
+                "short_closed_qty": 1300.0,
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 1,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": False,
+        "has_open_order": True,
+        "positions": {"okx": {}},
+        "open_orders": {"okx": {"HOMEUSDT": [{"id": "still-open"}]}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["gate_passed"] is False
+    assert "local_pending_entries_or_closes_present" in gate["blocking_reasons"]
+    assert "exchange_truth_open_orders_present" in gate["blocking_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("long_closed_qty", "short_closed_qty"),
+    [
+        (0.0, 0.0),
+        (1300.0, 1.0),
+    ],
+)
+def test_acceptance_gate_rejects_passive_close_resolved_without_sufficient_closure_evidence(
+    long_closed_qty, short_closed_qty
+):
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-1781416483009-HOMEUSDT"
+    events = [
+        {
+            "ts_ms": 1781416492144,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781416809427,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HOMEUSDT",
+                "long_closed_qty": long_closed_qty,
+                "short_closed_qty": short_closed_qty,
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {"okx": {}, "bybit": {}},
+        "open_orders": {"okx": {"HOMEUSDT": []}, "bybit": {"HOMEUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["gate_passed"] is False
+    assert gate["unclosed_trade_lifecycle_count"] == 1
+    assert "entry_or_position_opened_without_fixture_finalized_evidence" in gate["blocking_reasons"]
+
+
 def test_run_diagnose_can_report_code_side_blockers_without_changing_gate(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -2403,6 +2566,133 @@ def test_production_blocker_window_classifies_scoped_snapshot_fallback_as_v1_par
     assert result["windows"]["last_2h"]["incident_conclusions"] == {
         "snapshot_fallback_blocking": "v1_parity",
     }
+
+
+def test_production_blocker_window_reports_nonblocking_bulk_probe_timeout_details(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "window_bulk_probe_timeout.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779811000000,
+            "kind": "recovery.live_position_bulk_diagnostic_error",
+            "payload": {
+                "venue": "bitget",
+                "endpoint": "/api/v2/mix/position/all-position",
+                "classification": "timeout",
+                "timeout_ms": 2000,
+                "diagnostic_scope": "best_effort_bulk_positions",
+                "blocking": False,
+                "truth_required_by": [],
+                "fallback_planned": False,
+            },
+        },
+        {
+            "ts_ms": 1779811001000,
+            "kind": "recovery.live_position_bulk_diagnostic_error",
+            "payload": {
+                "venue": "okx",
+                "endpoint": "/api/v5/account/positions",
+                "classification": "timeout",
+                "timeout_ms": 2000,
+                "diagnostic_scope": "best_effort_bulk_positions",
+                "blocking": False,
+                "truth_required_by": [],
+                "fallback_planned": True,
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h", "run_window"],
+    )
+
+    summary = result["windows"]["last_2h"]["nonblocking_bulk_probe_summary"]
+    assert summary["total_count"] == 2
+    assert summary["timeout_count"] == 2
+    assert summary["by_venue"] == {"bitget": 1, "okx": 1}
+    assert summary["fallback_planned_count"] == 1
+    assert summary["no_fallback_count"] == 1
+    assert {
+        "venue": "bitget",
+        "endpoint": "/api/v2/mix/position/all-position",
+        "count": 1,
+        "timeout_count": 1,
+        "fallback_planned_count": 0,
+        "no_fallback_count": 1,
+        "last_ts_ms": 1779811000000,
+        "diagnostic_scope": "best_effort_bulk_positions",
+        "timeout_ms": 2000,
+    } in summary["details"]
+
+
+def test_production_blocker_window_reports_candidate_selection_starvation(tmp_path):
+    from scripts.analyze_production_blockers import analyze_event_file
+
+    events_path = tmp_path / "window_candidate_starvation.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "ts_ms": 1779811000000,
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "symbol": "HEMIUSDT",
+                "pair_id": "HEMIUSDT:bybit->aster",
+                "source": "top_candidate_quote",
+                "reason": "quote_stale",
+                "age_ms": 65000,
+            },
+        },
+        {
+            "ts_ms": 1779811001000,
+            "kind": "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+            "payload": {
+                "symbol": "HEMIUSDT",
+                "pair_id": "HEMIUSDT:bybit->aster",
+                "reason": "quote_stale",
+                "source": "ws_bbo_quote_lease",
+                "age_ms": 64000,
+            },
+        },
+        {
+            "ts_ms": 1779811002000,
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "symbol": "ESPORTSUSDT",
+                "pair_id": "ESPORTSUSDT:bybit->aster",
+                "reason": "perp_open_interest_structural",
+                "eligibility_class": "structural_ineligibility",
+                "open_interest": 0,
+            },
+        },
+        {
+            "ts_ms": 1779811003000,
+            "kind": "scan.no_entry_diagnostics",
+            "payload": {
+                "top_quote_blocker_buckets": {
+                    "quote_stale": 2,
+                },
+                "open_interest_blocker_counts": {
+                    "perp_open_interest_structural": 1,
+                },
+            },
+        },
+    ])
+
+    result = analyze_event_file(
+        events_path,
+        now_ms=1779812000000,
+        windows=["last_2h", "run_window"],
+    )
+
+    starvation = result["windows"]["last_2h"]["candidate_selection_starvation"]
+    assert starvation["detected"] is True
+    assert starvation["quote_stale_count"] >= 3
+    assert starvation["open_interest_structural_count"] == 2
+    assert starvation["top_reasons"][0]["reason"] == "quote_stale"
+    assert {"symbol": "HEMIUSDT", "count": 2} in starvation["top_symbols"]
+    assert starvation["action"] == "rewarm_top_candidates_and_reprobe_open_interest"
 
 
 def test_production_blocker_window_requires_actual_official_sequence_break(tmp_path):

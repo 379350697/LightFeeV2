@@ -104,8 +104,8 @@ class RuntimeConfig:
     exchange_http_timeout_ms: int = 12000
     transfer_status_cache_ms: int = 15000
     debug_journal_diagnostics_enabled: bool = False
-    maker_event_lane_enabled: bool = False
-    maker_event_lane_min_wake_interval_ms: int = 15000
+    maker_event_lane_enabled: bool = True
+    maker_event_lane_min_wake_interval_ms: int = 40
     shutdown_grace_period_ms: int = 3000
 
 
