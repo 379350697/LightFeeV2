@@ -259,6 +259,44 @@ class TestProductionSidecarParserRegressions:
     """Regression coverage for live sidecar deployment failures."""
 
     @pytest.mark.asyncio
+    async def test_binance_slow_open_interest_does_not_block_quote_return(self):
+        symbols = ["BTCUSDT", "ETHUSDT"]
+
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"},
+                        {"symbol": "ETHUSDT", "bidPrice": "200", "askPrice": "201"},
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"},
+                        {"symbol": "ETHUSDT", "lastFundingRate": "0.0002", "markPrice": "200.5"},
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [
+                        {"symbol": "BTCUSDT", "quoteVolume": "12345"},
+                        {"symbol": "ETHUSDT", "quoteVolume": "23456"},
+                    ]
+                if path == "/fapi/v1/openInterest":
+                    await asyncio.sleep(1.0)
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        result = await asyncio.wait_for(
+            FakeBinanceClient(binance_spec())._fetch_binance_style(symbols),
+            timeout=0.2,
+        )
+
+        assert set(result) == {"binance:BTCUSDT", "binance:ETHUSDT"}
+        for ticker in result.values():
+            assert ticker.bid > 0.0
+            assert ticker.ask > 0.0
+            assert ticker.open_interest_quote == 0.0
+            assert ticker.open_interest_evidence_status == "unavailable"
+
+    @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):
         class FakeBinanceClient(MarketDataClient):
             async def _public_get(self, path, params=None):
@@ -283,6 +321,62 @@ class TestProductionSidecarParserRegressions:
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == 0.0
         assert ticker.open_interest_evidence_status == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_429_does_not_drop_quotes(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "HTTP 429: too many requests",
+                        status_code=429,
+                    )
+                return {}
+
+        result = await FakeBinanceClient(binance_spec())._fetch_binance_style(["BTCUSDT"])
+
+        ticker = result["binance:BTCUSDT"]
+        assert ticker.bid == 100.0
+        assert ticker.ask == 101.0
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_binance_missing_premium_index_still_skips_non_perpetual(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"},
+                        {"symbol": "SPOTONLYUSDT", "bidPrice": "10", "askPrice": "11"},
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [
+                        {"symbol": "BTCUSDT", "quoteVolume": "12345"},
+                        {"symbol": "SPOTONLYUSDT", "quoteVolume": "999"},
+                    ]
+                if path == "/fapi/v1/openInterest":
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "HTTP 429: too many requests",
+                        status_code=429,
+                    )
+                return {}
+
+        result = await FakeBinanceClient(binance_spec())._fetch_binance_style(
+            ["BTCUSDT", "SPOTONLYUSDT"]
+        )
+
+        assert set(result) == {"binance:BTCUSDT"}
 
     @pytest.mark.asyncio
     async def test_binance_large_universe_fetches_bounded_quote_open_interest(self):

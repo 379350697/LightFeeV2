@@ -76,6 +76,7 @@ def _now_ms() -> int:
 # V1 parity: Binance-compatible OI is a per-symbol endpoint, fetched with bounded
 # concurrency and normalized to quote notional via premiumIndex mark price.
 _BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY = 16
+BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
 # V1 parity: per-symbol OKX funding-rate concurrency limit
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
@@ -425,24 +426,27 @@ class MarketDataClient:
                 if sym in venue_sym_to_canon:
                     vol_map[sym] = _safe_float(item.get("quoteVolume", item.get("volume", 0)))
 
-        # 4. openInterest. Binance-compatible venues expose this per symbol.
-        # V1 computes quote-notional OI as openInterest * markPrice. Transient
-        # endpoint failures are evidence-unavailable, not a structural zero.
+        # 4. openInterest enrichment. Binance-compatible venues expose this per
+        # symbol. V1 computes quote-notional OI as openInterest * markPrice.
+        # This endpoint is evidence-only here: slow/error/cooldown OI must not
+        # hold quote coverage hostage.
         oi_map: dict[str, float] = {}
-        oi_evidence_status: dict[str, str] = {}
+        oi_evidence_status: dict[str, str] = {
+            venue_sym: "unavailable" if spec.open_interest_path else "unsupported"
+            for venue_sym in venue_sym_to_canon
+        }
         if spec.open_interest_path:
             sem = asyncio.Semaphore(_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY)
 
-            async def _fetch_oi(venue_sym: str) -> None:
+            async def _fetch_oi(venue_sym: str) -> tuple[str, float, str]:
                 async with sem:
                     try:
                         raw_oi = await self._public_get(
                             spec.open_interest_path,
                             params={"symbol": venue_sym},
                         )
-                    except PublicTransportError:
-                        oi_evidence_status[venue_sym] = "unavailable"
-                        return
+                    except Exception:
+                        return venue_sym, 0.0, "unavailable"
                     item = raw_oi[0] if isinstance(raw_oi, list) and raw_oi else raw_oi
                     if isinstance(item, dict):
                         open_interest = _safe_float(item.get("openInterest", 0))
@@ -450,19 +454,32 @@ class MarketDataClient:
                             pi_map.get(venue_sym, {}).get("markPrice", 0)
                         )
                         if mark_price > 0.0:
-                            oi_map[venue_sym] = open_interest * mark_price
-                            oi_evidence_status[venue_sym] = "available"
-                        else:
-                            oi_evidence_status[venue_sym] = "unavailable"
-                        return
-                    oi_evidence_status[venue_sym] = "unavailable"
+                            return venue_sym, open_interest * mark_price, "available"
+                        return venue_sym, 0.0, "unavailable"
+                    return venue_sym, 0.0, "unavailable"
 
-            await asyncio.gather(*[_fetch_oi(sym) for sym in venue_sym_to_canon])
-        else:
-            oi_evidence_status = {
-                venue_sym: "unsupported"
-                for venue_sym in venue_sym_to_canon
-            }
+            oi_symbols = [sym for sym in venue_sym_to_canon if sym in pi_map]
+            tasks = [
+                asyncio.create_task(_fetch_oi(sym))
+                for sym in oi_symbols
+            ]
+            if tasks:
+                done, pending = await asyncio.wait(
+                    tasks,
+                    timeout=BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
+                )
+                for task in done:
+                    try:
+                        venue_sym, open_interest_quote, status = task.result()
+                    except Exception:
+                        continue
+                    oi_evidence_status[venue_sym] = status
+                    if status == "available":
+                        oi_map[venue_sym] = open_interest_quote
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
 
         result: dict[str, FundingTicker] = {}
         for venue_sym, canon in venue_sym_to_canon.items():

@@ -131,3 +131,54 @@ class TestSidecarServiceRateLimitWiring:
             src = TransferSource.for_venue_pair(Venue.BINANCE, Venue.OKX)
             await src.close()
         asyncio.run(_run())
+
+    @pytest.mark.asyncio
+    async def test_refresh_once_keeps_binance_quotes_when_open_interest_is_slow(self, tmp_path):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+        from lightfee.venues.market_data import MarketDataClient
+
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    await asyncio.sleep(1.0)
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        class FakeLiquiditySource:
+            async def fetch_perp_liquidity(self, symbols):
+                return {}
+
+            async def close(self):
+                return None
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_funding_timeout_s=0.2,
+            ),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"]._client = FakeBinanceClient(binance_spec())
+        service._liquidity_sources["binance"] = FakeLiquiditySource()
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        assert snapshot.degraded_venues == []
+        assert snapshot.acquisition_mode == "fresh_sidecar"
+        quote = snapshot.quotes["binance:BTCUSDT"]
+        assert quote.bid == 100.0
+        assert quote.ask == 101.0
+        assert quote.open_interest == 0.0
+        assert quote.open_interest_evidence_status == "unavailable"
