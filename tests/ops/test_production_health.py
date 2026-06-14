@@ -998,6 +998,77 @@ def test_current_state_tick_stale_is_not_critical_with_bounded_active_lane():
     assert report.details["progress_source"] == "active_bounded_lane"
 
 
+def test_current_state_journal_positive_fill_conflict_owns_historical_live_single_leg():
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "generated_at_ms": 1778786995000,
+        "mode": "live",
+        "lifecycle": "risk_only",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786990000,
+        "last_scan": {"ts_ms": 1778786990000},
+        "open_position_count": 0,
+        "open_positions": [],
+        "pending_entry_count": 0,
+        "pending_entries": [],
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "journal_events": [
+            {
+                "kind": "pending_entry.positive_fill_live_truth_conflict",
+                "payload": {
+                    "entry_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "matched_quantity": 1600.0,
+                    "live_long_quantity": 0.0,
+                    "live_short_quantity": 1600.0,
+                    "live_balanced_quantity": 0.0,
+                },
+            }
+        ],
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {
+                "bybit": {
+                    "HOMEUSDT": {
+                        "venue": "bybit",
+                        "symbol": "HOMEUSDT",
+                        "side": "Side.SELL",
+                        "quantity": 1600.0,
+                    }
+                },
+                "okx": {},
+            },
+            "open_orders": {
+                "bybit": {"HOMEUSDT": []},
+                "okx": {"HOMEUSDT": []},
+            },
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=15_000,
+        require_exchange_truth=True,
+    )
+
+    rows = report.details["v1_lifecycle_closure"]["rows"]
+    assert "nonzero_live_position" in report.fingerprints
+    assert any(
+        row["owner_id"] == "entry-home"
+        and row["terminality"] == "owned_pending_entry_live_conflict"
+        and row["details"].get("kind") == "owned_pending_entry_live_conflict"
+        for row in rows
+    )
+    assert not any("unpaired_live_position" in row["row_key"] for row in rows)
+
+
 def test_current_state_tick_stale_is_critical_when_active_lane_overdue():
     state = {
         "schema": "lightfee.current_state.v1",

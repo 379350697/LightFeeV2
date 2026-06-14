@@ -7,6 +7,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 
 
@@ -658,11 +659,23 @@ def _v1_lifecycle_closure_payload(
     existing = state.get("v1_lifecycle_closure")
     if isinstance(existing, dict) and existing.get("version"):
         return dict(existing)
+    events = _state_journal_events(state)
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(state, events)
     return build_v1_lifecycle_closure_table(
         local_state=state,
         exchange_truth=exchange_truth if isinstance(exchange_truth, dict) else None,
         generated_at_ms=now_ms,
+        events=events,
+        owner_index=owner_index,
     ).to_dict()
+
+
+def _state_journal_events(state: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("journal_events", "events", "recent_events"):
+        events = state.get(key)
+        if isinstance(events, list):
+            return [event for event in events if isinstance(event, dict)]
+    return []
 
 
 def _recovery_decision_payload(

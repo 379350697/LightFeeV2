@@ -1828,6 +1828,12 @@ class LiveRuntime:
     def _has_journal_order_owner_evidence(*args: Any, **kwargs: Any) -> Any:
         return RecoveryStartupRuntime._has_journal_order_owner_evidence(*args, **kwargs)
 
+    @staticmethod
+    def _has_journal_position_owner_evidence(*args: Any, **kwargs: Any) -> Any:
+        return RecoveryStartupRuntime._has_journal_position_owner_evidence(
+            *args, **kwargs
+        )
+
     def _recovery_owner_journal_events(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._recovery_owner_journal_events(*args, **kwargs)
 

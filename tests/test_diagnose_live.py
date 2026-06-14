@@ -2086,6 +2086,94 @@ def test_diagnose_pending_entry_live_conflict_summary_lists_home_truth_layers():
     assert detail["next_action"] == "owned_pending_entry_live_conflict_cleanup"
 
 
+def test_diagnose_journal_positive_fill_conflict_owns_historical_live_single_leg(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    def home_single_leg_exchange_truth(runtime_dir, symbols, venues=None):
+        return {
+            "available": True,
+            "available_venues": ["okx", "bybit"],
+            "confidence": "high",
+            "positions": {
+                "okx": {},
+                "bybit": {
+                    "HOMEUSDT": {
+                        "venue": "bybit",
+                        "symbol": "HOMEUSDT",
+                        "side": "Side.SELL",
+                        "quantity": 1600.0,
+                    }
+                },
+            },
+            "open_orders": {
+                "okx": {"HOMEUSDT": []},
+                "bybit": {"HOMEUSDT": []},
+            },
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "fetch_status": {
+                "okx": {"status": "ok"},
+                "bybit": {"status": "ok"},
+            },
+            "errors": [],
+            "missing_evidence": [],
+        }
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_entries": [],
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "pending_entry.positive_fill_live_truth_conflict",
+                "payload": {
+                    "entry_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "matched_quantity": 1600.0,
+                    "live_long_quantity": 0.0,
+                    "live_short_quantity": 1600.0,
+                    "live_balanced_quantity": 0.0,
+                },
+            }
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", home_single_leg_exchange_truth)
+
+        result = run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["okx", "bybit"],
+            now_ms=1700000005000,
+        )
+
+        rows = result["production_acceptance_gate"]["v1_lifecycle_closure"]["rows"]
+        owned_rows = [
+            row
+            for row in rows
+            if row["owner_id"] == "entry-home"
+            and row["details"].get("kind") == "owned_pending_entry_live_conflict"
+        ]
+
+        assert owned_rows
+        assert not any("unpaired_live_position" in row["row_key"] for row in rows)
+        assert owned_rows[0]["terminality"] == "owned_pending_entry_live_conflict"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_diagnose_and_runtime_recovery_decision_agree_on_partial_truth_payload(tmp_path):
     from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
     from lightfee.engine.runtime import LiveRuntime

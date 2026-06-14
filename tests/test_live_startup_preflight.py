@@ -2798,6 +2798,30 @@ class TestRuntimePreflight:
             ) == ["SEIUSDT", "WLDUSDT"]
             runtime.journal.close()
 
+    def test_startup_recovery_ledger_symbols_include_positive_fill_conflict_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["BTCUSDT", "HOMEUSDT"]
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "pending_entry.positive_fill_live_truth_conflict",
+                {
+                    "entry_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "live_long_quantity": 0.0,
+                    "live_short_quantity": 1600.0,
+                    "live_balanced_quantity": 0.0,
+                },
+            )
+
+            assert runtime._startup_recovery_ledger_symbols(
+                {"resolved_symbols": config.symbols}
+            ) == ["HOMEUSDT"]
+            runtime.journal.close()
+
     def test_recovery_ledger_uses_journal_owner_evidence_for_local_flat_order(self):
         """Journal order evidence should reconstruct ownership after local state is flat."""
         with tempfile.TemporaryDirectory() as td:

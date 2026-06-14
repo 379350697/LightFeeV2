@@ -222,6 +222,73 @@ def test_terminal_journal_event_keeps_submitted_order_owner_fact():
     assert owner.confidence == "probable"
 
 
+def test_positive_fill_live_conflict_journal_owns_matching_live_position():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "pending_entry.positive_fill_live_truth_conflict",
+                "payload": {
+                    "entry_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "matched_quantity": 1600.0,
+                    "live_long_quantity": 0.0,
+                    "live_short_quantity": 1600.0,
+                    "live_balanced_quantity": 0.0,
+                },
+            }
+        ],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "journal_pending_entry"
+    assert owner.owner_id == "entry-home"
+    assert owner.confidence == "probable"
+    assert owner.evidence["position_scope"] == "journal_positive_fill_live_conflict"
+
+
+def test_positive_fill_live_conflict_journal_does_not_own_mismatched_position():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "pending_entry.positive_fill_live_truth_conflict",
+                "payload": {
+                    "entry_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "maker_leg_filled": 1600.0,
+                    "hedge_leg_filled": 1600.0,
+                    "live_short_quantity": 1600.0,
+                },
+            }
+        ],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="buy",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "exchange_position"
+    assert owner.confidence == "orphan"
+
+
 def test_trxusdt_order_without_owner_remains_orphan():
     index = RecoveryOwnerIndex.from_state({"pending_entries": [], "open_positions": []})
 

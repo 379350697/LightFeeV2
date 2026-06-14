@@ -716,7 +716,10 @@ class RecoveryStartupRuntime:
             if not isinstance(payload, dict):
                 continue
             symbol = str(payload.get("symbol") or "").upper()
-            if symbol and self.ctx._has_journal_order_owner_evidence(payload):
+            if symbol and (
+                self.ctx._has_journal_order_owner_evidence(payload)
+                or self.ctx._has_journal_position_owner_evidence(event, payload)
+            ):
                 symbols.add(symbol)
         return sorted(symbols)
 
@@ -733,6 +736,33 @@ class RecoveryStartupRuntime:
             or payload.get("clientOrderId")
         )
         return bool(str(order_id or "") or str(client_order_id or ""))
+
+    @staticmethod
+    def _has_journal_position_owner_evidence(
+        event: Any,
+        payload: dict[str, Any],
+    ) -> bool:
+        if isinstance(event, dict):
+            kind = str(event.get("kind") or "").lower()
+        else:
+            kind = str(getattr(event, "kind", "") or "").lower()
+        if kind not in {
+            "pending_entry.positive_fill_live_truth_conflict",
+            "pending_entry.terminalizer_decision",
+        }:
+            return False
+        if (
+            kind == "pending_entry.terminalizer_decision"
+            and str(payload.get("outcome") or "").lower()
+            != "positive_fill_live_truth_conflict"
+        ):
+            return False
+        try:
+            live_long = float(payload.get("live_long_quantity") or 0.0)
+            live_short = float(payload.get("live_short_quantity") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return live_long > 1e-9 or live_short > 1e-9
 
     def _recovery_owner_journal_events(self) -> list[dict[str, Any]]:
         try:

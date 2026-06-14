@@ -15,6 +15,9 @@ class RecoveryOwnerIndex:
     _positions_by_key: dict[tuple[str, str], RecoveryOwner] = field(default_factory=dict)
     _residuals_by_key: dict[tuple[str, str], RecoveryOwner] = field(default_factory=dict)
     _residuals_by_symbol: dict[str, RecoveryOwner] = field(default_factory=dict)
+    _journal_position_facts: list[tuple[str, str, float, RecoveryOwner]] = field(
+        default_factory=list
+    )
 
     @classmethod
     def from_state(cls, state: Any) -> "RecoveryOwnerIndex":
@@ -40,7 +43,9 @@ class RecoveryOwnerIndex:
             if not isinstance(payload, Mapping):
                 continue
             order_id, client_order_id = _journal_order_identifiers(payload)
-            if not order_id and not client_order_id:
+            if not order_id and not client_order_id and not _journal_position_specs(
+                event, payload
+            ):
                 continue
             active_events.append(event)
         return active_events
@@ -68,6 +73,9 @@ class RecoveryOwnerIndex:
         symbol = key[1]
         if symbol in self._residuals_by_symbol:
             return self._residuals_by_symbol[symbol]
+        journal_owner = self._owner_for_journal_position_fact(artifact)
+        if journal_owner is not None:
+            return journal_owner
         return RecoveryOwner(
             owner_type="exchange_position",
             owner_id=symbol,
@@ -138,7 +146,8 @@ class RecoveryOwnerIndex:
             if not isinstance(payload, Mapping):
                 continue
             order_id, client_order_id = _journal_order_identifiers(payload)
-            if not order_id and not client_order_id:
+            position_specs = _journal_position_specs(event, payload)
+            if not order_id and not client_order_id and not position_specs:
                 continue
             owner_id = _journal_owner_key(payload)
             symbol = _text(payload.get("symbol")).upper()
@@ -157,6 +166,48 @@ class RecoveryOwnerIndex:
                 order_ids=(order_id,),
                 client_order_ids=(client_order_id,),
             )
+            self._index_journal_position_facts(event, payload, owner)
+
+    def _index_journal_position_facts(
+        self,
+        event: Any,
+        payload: Mapping[str, Any],
+        owner: RecoveryOwner,
+    ) -> None:
+        for symbol, side, quantity in _journal_position_specs(event, payload):
+            position_owner = RecoveryOwner(
+                owner_type=owner.owner_type,
+                owner_id=owner.owner_id,
+                confidence=owner.confidence,
+                evidence={
+                    **dict(owner.evidence),
+                    "position_scope": "journal_positive_fill_live_conflict",
+                    "expected_side": side,
+                    "expected_quantity": quantity,
+                },
+            )
+            self._journal_position_facts.append((symbol, side, quantity, position_owner))
+
+    def _owner_for_journal_position_fact(
+        self,
+        artifact: ExchangeArtifact | Any,
+    ) -> RecoveryOwner | None:
+        symbol = _symbol(artifact)
+        side = _side(_get(artifact, "side", ""))
+        quantity = _float(_get(artifact, "quantity", 0.0))
+        if not symbol or not side or quantity <= 0.0:
+            return None
+        for fact_symbol, fact_side, fact_quantity, owner in reversed(
+            self._journal_position_facts
+        ):
+            if fact_symbol != symbol:
+                continue
+            if fact_side != side:
+                continue
+            if abs(fact_quantity - quantity) > 1e-9:
+                continue
+            return owner
+        return None
 
     def _index_order_ids(
         self,
@@ -273,6 +324,19 @@ def _leg_text(value: Any) -> str:
     return _text(value).lower()
 
 
+def _side(value: Any) -> str:
+    text = _leg_text(value)
+    if text in {"buy", "long", "side.buy"}:
+        return "long"
+    if text in {"sell", "short", "side.sell"}:
+        return "short"
+    if text.endswith(".buy"):
+        return "long"
+    if text.endswith(".sell"):
+        return "short"
+    return text
+
+
 def _journal_order_identifiers(payload: Mapping[str, Any]) -> tuple[str, str]:
     order_id = _text(
         payload.get("order_id")
@@ -295,6 +359,35 @@ def _journal_owner_key(payload: Mapping[str, Any]) -> str:
         or payload.get("source_entry_id")
         or payload.get("internal_entry_id")
     )
+
+
+def _journal_position_specs(
+    event: Any,
+    payload: Mapping[str, Any],
+) -> tuple[tuple[str, str, float], ...]:
+    kind = _text(_get(event, "kind", "")).lower()
+    outcome = _text(payload.get("outcome")).lower()
+    if kind not in {
+        "pending_entry.positive_fill_live_truth_conflict",
+        "pending_entry.terminalizer_decision",
+    }:
+        return ()
+    if (
+        kind == "pending_entry.terminalizer_decision"
+        and outcome != "positive_fill_live_truth_conflict"
+    ):
+        return ()
+    symbol = _text(payload.get("symbol")).upper()
+    if not symbol:
+        return ()
+    specs: list[tuple[str, str, float]] = []
+    live_long = _float(payload.get("live_long_quantity"))
+    live_short = _float(payload.get("live_short_quantity"))
+    if live_long > 0.0:
+        specs.append((symbol, "long", live_long))
+    if live_short > 0.0:
+        specs.append((symbol, "short", live_short))
+    return tuple(specs)
 
 
 def _text(value: Any) -> str:

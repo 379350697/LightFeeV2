@@ -38,6 +38,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
 from lightfee.venues.specs import VenueOperation
@@ -3188,10 +3189,12 @@ def _v1_lifecycle_closure_payload(
     existing = local_state.get("v1_lifecycle_closure")
     if isinstance(existing, dict) and existing.get("version"):
         return dict(existing)
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(local_state, events)
     return build_v1_lifecycle_closure_table(
         local_state=local_state,
         exchange_truth=exchange_truth,
         events=events,
+        owner_index=owner_index,
     ).to_dict()
 
 

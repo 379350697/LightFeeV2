@@ -17,6 +17,22 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest HOME historical owner persistence follow-up, 2026-06-14:
+CL-078 was deployed at `6209fac`, then read-only cloud evidence still showed a
+historical Bybit HOME short while local current state had no pending entry and
+OKX was flat. This exposed a second-order owner drift: current pending conflicts
+were ownerized, and journal order facts were retained, but journal position
+facts from `pending_entry.positive_fill_live_truth_conflict` did not survive
+pending removal/restart. The fix persists journal positive-fill/live-conflict
+position owner facts by symbol, normalized side, and live quantity, includes
+those symbols in startup recovery, and passes the same owner index into
+diagnose/production-health closure rebuilds. A historical HOME live short now
+classifies as `owned_pending_entry_live_conflict` with owner
+`journal_pending_entry`, not `unpaired_live_position`; production still remains
+non-green until the live position is flat or reduce-only cleanup is completed.
+Full evidence is recorded in
+[`daily/2026-06-14.md#cluster-cl-079-home-historical-positive-fill-conflict-owner-survives-pending-removal`](daily/2026-06-14.md#cluster-cl-079-home-historical-positive-fill-conflict-owner-survives-pending-removal).
+
 Latest HOME positive-fill/live-truth conflict root fix, 2026-06-14:
 production HOME evidence was reclassified from a simple maker/hedge success
 story into a four-layer truth conflict. OKX local/order-detail evidence could
