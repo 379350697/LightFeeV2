@@ -1193,6 +1193,9 @@ _EVENT_KIND_PHASES = {
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.passive_cycle_zero_fill": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "execution.passive_phase_switched": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "entry.abort_maker_cancel_requested": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "entry.cleanup_leg_exposure": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "entry.aborted": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.passive_unfilled": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_flat_unresolved_maker_retained": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "review.candidate_shortlisted": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
@@ -1210,6 +1213,7 @@ _EVENT_KIND_PHASES = {
     "runtime.position_drift_correction_verified": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_detected": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_flatten_leg": V1LifecycleClosurePhase.OPEN_POSITION.value,
+    "runtime.reconciling_complete": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.current_state_heartbeat_loop_export_error": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
 }
 
