@@ -634,6 +634,49 @@ class TestProductionSidecarParserRegressions:
         assert client.max_active_funding > 1
 
     @pytest.mark.asyncio
+    async def test_okx_slow_funding_enrichment_does_not_block_quote_return(self):
+        symbols = [f"S{i}USDT" for i in range(64)]
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"S{i}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                                "markPx": "10.2",
+                            }
+                            for i in range(64)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    await asyncio.sleep(1.0)
+                    return {
+                        "data": [{
+                            "fundingRate": "0.0003",
+                            "fundingTime": "1700000000000",
+                            "markPrice": "10.5",
+                        }]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        result = await asyncio.wait_for(
+            FakeOkxClient(okx_spec())._fetch_okx_style(symbols),
+            timeout=0.5,
+        )
+
+        assert len(result) == len(symbols)
+        ticker = result["okx:S0USDT"]
+        assert ticker.bid == 10.0
+        assert ticker.ask == 11.0
+        assert ticker.mark_price == 10.2
+        assert ticker.funding_rate_bps == 0.0
+
+    @pytest.mark.asyncio
     async def test_okx_funding_partial_failure_does_not_drop_quotes(self):
         """Individual funding-rate failures must not drop bid/ask/mark for a symbol."""
         symbols = [f"S{i}USDT" for i in range(10)]

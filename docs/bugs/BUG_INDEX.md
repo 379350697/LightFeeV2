@@ -17,6 +17,17 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest OKX sidecar snapshot freshness closure, 2026-06-15:
+Deploy verification for `2eb14b7` found trading state healthy but
+`verify_production_services.py` failed on `sidecar_snapshot` because OKX quotes
+were missing/stale. Root cause was not exchange trading state: OKX ticker data
+is fetched in bulk, but V2 then waited for cold-cache per-symbol
+`public/funding-rate` enrichment before publishing the sidecar snapshot. CL-084
+bounds OKX funding-rate enrichment so bulk ticker quotes publish first and slow
+funding cannot make the sidecar snapshot stale. See
+[daily/2026-06-15.md#cluster-cl-084-okx-funding-enrichment-blocked-sidecar-snapshot-publication](daily/2026-06-15.md#cluster-cl-084-okx-funding-enrichment-blocked-sidecar-snapshot-publication)
+and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
+
 Latest passive-close Bybit terminal-zero semantic closure, 2026-06-15:
 Latest deployed HOMEUSDT lifecycle `entry-1781531687393-HOMEUSDT` ended
 flat/no-open-orders, but the close path showed a submit-time Bybit `110017

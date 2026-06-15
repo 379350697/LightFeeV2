@@ -80,6 +80,7 @@ BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
 # V1 parity: per-symbol OKX funding-rate concurrency limit
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
+OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S = 0.2
 
 # V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
 _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
@@ -602,7 +603,17 @@ class MarketDataClient:
                             if ts_ms > 0:
                                 self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
 
-                await asyncio.gather(*[_fetch_funding(sym) for sym in symbols_to_fetch])
+                tasks = [asyncio.create_task(_fetch_funding(sym)) for sym in symbols_to_fetch]
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks),
+                        timeout=OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S,
+                    )
+                except asyncio.TimeoutError:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
         # 3. open-interest?instType=SWAP
         oi_map: dict[str, float] = {}
