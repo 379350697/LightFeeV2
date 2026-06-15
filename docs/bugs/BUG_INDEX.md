@@ -24,7 +24,9 @@ were missing/stale. Root cause was not exchange trading state: OKX ticker data
 is fetched in bulk, but V2 then waited for cold-cache per-symbol
 `public/funding-rate` enrichment before publishing the sidecar snapshot. CL-084
 bounds OKX funding-rate enrichment so bulk ticker quotes publish first and slow
-funding cannot make the sidecar snapshot stale. See
+funding cannot make the sidecar snapshot stale. Cloud `fd1579d` passed manifest,
+singleton, production verifier, and since-deploy diagnose with all quote venues
+present, flat/no-open-orders exchange truth, and `unmapped_event_kinds=[]`. See
 [daily/2026-06-15.md#cluster-cl-084-okx-funding-enrichment-blocked-sidecar-snapshot-publication](daily/2026-06-15.md#cluster-cl-084-okx-funding-enrichment-blocked-sidecar-snapshot-publication)
 and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
 
@@ -33,13 +35,16 @@ Latest deployed HOMEUSDT lifecycle `entry-1781531687393-HOMEUSDT` ended
 flat/no-open-orders, but the close path showed a submit-time Bybit `110017
 orderQty will be truncated to zero` on a reduce-only passive maker. This is
 not the CL-025 pre-submit maker-flat shape; it is the race where Bybit reports
-zero reducible quantity during order admission. Local CL-083 preserves Bybit
-raw retCode bodies, emits
+zero reducible quantity during order admission. CL-083 preserves Bybit raw
+retCode bodies, emits
 `exit.passive_close_terminal_zero_qty_reduce_only_evidence`, immediately
 routes that evidence through V1 live-truth closure, keeps unresolved truth gaps
 pending, filters only resolved terminal-zero cases out of active diagnose order
 errors, and maps/idempotently emits
-`runtime.passive_close_deadline_fallback_armed` as `PASSIVE_CLOSE`. See
+`runtime.passive_close_deadline_fallback_armed` as `PASSIVE_CLOSE`. It was
+deployed in `2eb14b7` and re-verified under `fd1579d`: current cloud truth is
+flat/no-open-orders, active order-error evidence is empty, and lifecycle closure
+has no unmapped events. See
 [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift).
 
 Latest entry diagnostics lifecycle semantic closure, 2026-06-15:
