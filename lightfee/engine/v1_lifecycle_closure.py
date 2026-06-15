@@ -1201,6 +1201,9 @@ _EVENT_KIND_PHASES = {
     "entry.cleanup_leg_exposure": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.aborted": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.passive_unfilled": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "reconciliation.entry_abandoned_flat": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "reconciliation.entry_abandon_retained_unresolved_maker": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),

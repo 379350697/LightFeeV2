@@ -618,6 +618,20 @@ def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
     assert payload["pipeline_counts"]["dispatched"] == 1
     assert payload["candidate_stage_blocked_counts"]["entry_selection"] == 3
     assert payload["top_quote_blocker_buckets"] == {"quote_stale": 54}
+    assert payload["blocked_candidate_samples"] == [
+        {
+            "pair_id": "hemiusdt:binance->hyperliquid",
+            "selection_blocker": "quote_stale",
+        }
+    ]
+    assert payload["selection_blocked_candidate_samples"] == [
+        {
+            "pair_id": "hemiusdt:binance->hyperliquid",
+            "stage": "entry_selection",
+            "reason_family": "quote",
+            "selection_blocker": "quote_stale",
+        }
+    ]
     assert payload["selected_candidates"] == [
         {
             "rank": 1,

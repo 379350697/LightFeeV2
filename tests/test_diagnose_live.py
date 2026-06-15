@@ -4042,6 +4042,110 @@ def test_run_diagnose_reports_passive_zero_fill_recovered_short_window(monkeypat
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_reports_zero_fill_lifecycle_guard_entry_outcome(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781097000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781096100000,
+                "kind": "execution.entry_selected",
+                "payload": {
+                    "entry_id": "entry-zero-lifecycle",
+                    "symbol": "HOMEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781096100100,
+                "kind": "runtime.entry_dispatched",
+                "payload": {
+                    "entry_id": "entry-zero-lifecycle",
+                    "symbol": "HOMEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781096100200,
+                "kind": "execution.direction_drift_blocked",
+                "payload": {
+                    "entry_id": "entry-zero-lifecycle",
+                    "symbol": "HOMEUSDT",
+                    "reason": "candidate_not_tradeable_after_zero_fill_reprice",
+                    "blocked_reasons": ["lifecycle_risk_only"],
+                    "phase": "high_slippage_maker",
+                },
+            },
+            {
+                "ts_ms": 1781096100300,
+                "kind": "entry.passive_unfilled",
+                "payload": {
+                    "entry_id": "entry-zero-lifecycle",
+                    "symbol": "HOMEUSDT",
+                    "reason": "zero_fill_unfilled_removal",
+                },
+            },
+            {
+                "ts_ms": 1781096100400,
+                "kind": "pending_entry.removed_by_v1_lifecycle_closure",
+                "payload": {
+                    "entry_id": "entry-zero-lifecycle",
+                    "reason": "zero_fill_unfilled_removal",
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1781097000000,
+        )
+
+        outcome = result["production_acceptance_gate"]["entry_outcome_summary"]
+        assert outcome["selected_count"] == 1
+        assert outcome["dispatched_count"] == 1
+        assert outcome["opened_count"] == 0
+        assert outcome["zero_fill_lifecycle_guard_count"] == 1
+        assert outcome["zero_fill_lifecycle_guard_blocker_counts"] == {
+            "lifecycle_risk_only": 1,
+        }
+        assert outcome["zero_fill_lifecycle_guard_entry_ids"] == [
+            "entry-zero-lifecycle"
+        ]
+        assert outcome["reason_counts"][
+            "candidate_not_tradeable_after_zero_fill_reprice"
+        ] == 1
+        assert outcome["passive_unfilled_count"] == 1
+        assert result["production_acceptance_gate"]["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
     from scripts import diagnose_live as dl
 

@@ -1542,6 +1542,13 @@ class EntryGateRuntime:
         )
         open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
+        blocked_candidate_samples = [
+            {
+                "pair_id": pair_id,
+                "selection_blocker": blocker,
+            }
+            for pair_id, blocker in list(sorted(candidate_blockers.items()))[:24]
+        ]
         payload = {
             "reason": str(reason or "entry_opportunity_funnel"),
             "candidate_count": len(getattr(snapshot, "candidates", []) or []),
@@ -1581,18 +1588,37 @@ class EntryGateRuntime:
                 )
                 for rank, candidate in enumerate(list(selected)[:24], start=1)
             ],
-            "blocked_candidate_samples": [
+            "blocked_candidate_samples": blocked_candidate_samples,
+            "selection_blocked_candidate_samples": [
                 {
-                    "pair_id": pair_id,
-                    "selection_blocker": blocker,
+                    **sample,
+                    "stage": "entry_selection",
+                    "reason_family": self._entry_selection_blocker_reason_family(
+                        str(sample["selection_blocker"])
+                    ),
                 }
-                for pair_id, blocker in list(sorted(candidate_blockers.items()))[:24]
+                for sample in blocked_candidate_samples
             ],
             "ts_ms": now_ms,
         }
         if self.ctx.state.last_scan is not None:
             self.ctx.state.last_scan["opportunity_funnel"] = payload
         self.ctx.journal.append("entry.opportunity_funnel", payload)
+
+    @staticmethod
+    def _entry_selection_blocker_reason_family(blocker: str) -> str:
+        text = str(blocker or "").lower()
+        if "quote" in text or "topbook" in text or "bbo" in text:
+            return "quote"
+        if "admission" in text or "terms" in text or "margin" in text:
+            return "entry_admission"
+        if "liquidity" in text or "open_interest" in text or text.startswith("oi_"):
+            return "liquidity"
+        if "lifecycle" in text or "finalization" in text or "pending" in text:
+            return "lifecycle"
+        if "capacity" in text or "slot" in text:
+            return "capacity"
+        return "entry_selection"
 
     def _emit_scan_no_entry_diagnostics(
         self,

@@ -393,6 +393,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "pending_entry.pending_entry_finalized",
         "pending_entry.removed_by_v1_lifecycle_closure",
         "pending_entry.terminalizer_decision",
+        "reconciliation.entry_abandoned_flat",
         "reconciliation.entry_flat_not_found_terminal_cleared",
         "reconciliation.entry_flat_unresolved_maker_retained",
         "entry.opportunity_funnel",

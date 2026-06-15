@@ -2591,6 +2591,85 @@ def _exchange_truth_no_open_orders(exchange_truth: dict[str, Any]) -> bool:
     return True
 
 
+def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    selected_entry_ids: set[str] = set()
+    dispatched_entry_ids: set[str] = set()
+    opened_entry_ids: set[str] = set()
+    passive_unfilled_entry_ids: set[str] = set()
+    zero_fill_lifecycle_guard_entry_ids: set[str] = set()
+    reason_counts: dict[str, int] = {}
+    zero_fill_lifecycle_guard_blocker_counts: dict[str, int] = {}
+    zero_fill_lifecycle_guard_samples: list[dict[str, Any]] = []
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        entry_id = str(
+            payload.get("entry_id")
+            or payload.get("position_id")
+            or payload.get("internal_entry_id")
+            or ""
+        )
+        if kind == "execution.entry_selected" and entry_id:
+            selected_entry_ids.add(entry_id)
+        elif kind == "runtime.entry_dispatched" and entry_id:
+            dispatched_entry_ids.add(entry_id)
+        elif kind == "entry.opened" and entry_id:
+            opened_entry_ids.add(entry_id)
+        elif kind == "runtime.position_opened" and entry_id:
+            opened_entry_ids.add(entry_id)
+        elif kind == "entry.passive_unfilled" and entry_id:
+            passive_unfilled_entry_ids.add(entry_id)
+        elif kind == "execution.direction_drift_blocked":
+            reason = str(payload.get("reason", "") or "")
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            blocked_reasons = [
+                str(reason)
+                for reason in payload.get("blocked_reasons", []) or []
+                if str(reason)
+            ]
+            if (
+                entry_id
+                and reason == "candidate_not_tradeable_after_zero_fill_reprice"
+                and "lifecycle_risk_only" in blocked_reasons
+            ):
+                zero_fill_lifecycle_guard_entry_ids.add(entry_id)
+                for blocker in blocked_reasons:
+                    zero_fill_lifecycle_guard_blocker_counts[blocker] = (
+                        zero_fill_lifecycle_guard_blocker_counts.get(blocker, 0) + 1
+                    )
+                if len(zero_fill_lifecycle_guard_samples) < 24:
+                    zero_fill_lifecycle_guard_samples.append({
+                        "entry_id": entry_id,
+                        "symbol": str(payload.get("symbol", "") or ""),
+                        "reason": reason,
+                        "blocked_reasons": blocked_reasons,
+                        "phase": str(payload.get("phase", "") or ""),
+                    })
+
+    opened_count = len(opened_entry_ids)
+    dispatched_count = len(dispatched_entry_ids)
+    return {
+        "selected_count": len(selected_entry_ids),
+        "dispatched_count": dispatched_count,
+        "opened_count": opened_count,
+        "selected_not_opened_count": max(dispatched_count - opened_count, 0),
+        "passive_unfilled_count": len(passive_unfilled_entry_ids),
+        "zero_fill_lifecycle_guard_count": len(zero_fill_lifecycle_guard_entry_ids),
+        "zero_fill_lifecycle_guard_blocker_counts": dict(
+            sorted(zero_fill_lifecycle_guard_blocker_counts.items())
+        ),
+        "zero_fill_lifecycle_guard_entry_ids": sorted(
+            zero_fill_lifecycle_guard_entry_ids
+        ),
+        "zero_fill_lifecycle_guard_samples": zero_fill_lifecycle_guard_samples,
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
 def _build_production_acceptance_gate(
     events: list[dict[str, Any]],
     local_state: dict[str, Any],
@@ -3032,6 +3111,7 @@ def _build_production_acceptance_gate(
         ),
     }
     entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(events)
+    entry_outcome_summary = _build_entry_outcome_summary(events)
     passive_zero_fill_exhausted_then_recovered_count = _count_passive_zero_fill_exhausted_then_recovered(
         events
     )
@@ -3100,6 +3180,7 @@ def _build_production_acceptance_gate(
         ),
         "entry_opened_count": entry_opened_count,
         "position_opened_count": position_opened_count,
+        "entry_outcome_summary": entry_outcome_summary,
         "open_position_count": open_position_count,
         "max_concurrent_positions": max_concurrent_positions,
         "remaining_position_slots": remaining_position_slots,
