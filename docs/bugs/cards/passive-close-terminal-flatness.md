@@ -6,6 +6,7 @@ residuals, and live-flat cleanup.
 ## Stable Fingerprints
 
 - `exit.passive_close_fallback_terminal_flat`
+- `exit.passive_close_terminal_zero_qty_reduce_only_evidence`
 - `runtime.passive_close_deadline_fallback_armed`
 - `execution.hedge_deadline_breached`
 - `execution.close_deadline_breached`
@@ -16,11 +17,17 @@ residuals, and live-flat cleanup.
 - `entry.cleanup_leg_exposure`
 - `runtime.passive_close_tick_error` with
   `"'dict' object has no attribute 'append'"`
-- Recurrence shape: local pending passive close/open state keeps retrying while exchange truth is already flat or while terminal maker/under-min branches need V1 compensation.
+- Recurrence shape: local pending passive close/open state keeps retrying while exchange truth is already flat, while terminal maker/under-min branches need V1 compensation, or while Bybit reduce-only close admission reports `110017/orderQty will be truncated to zero`.
 
 ## Current Effective Rule
 
 Terminal reduce-only, already-flat, under-min, or price-unavailable close branches can clear only after live exchange truth proves both legs flat. If live truth shows residual exposure and the residual is tradeable, route through V1-style compensation/flattening. If truth is incomplete or cleanup cannot prove flat, retain/fail-closed with structured evidence.
+
+Bybit reduce-only close `110017/orderQty will be truncated to zero` is terminal
+zero-qty evidence for that reduce-only request, not a confirmed close fill and
+not an ordinary maker retry. It must immediately route to live-truth closure:
+maker-flat plus other-leg-live goes to one-sided flatten, both-flat goes to
+flat cleanup, and untrusted truth retains pending close.
 
 Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry
@@ -67,6 +74,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-08 | Pending-entry passive timeout ACK truth-gap evidence | fixed, deployed/cloud verified | CL-052 adds order id/client id, venue, `cancel_ack_terminal=false`, `truth_required_by=pending_entry_passive_reconciliation`, and `next_truth_probe=query_passive_order_progress` to passive maker rest-timeout cancel evidence. This does not change cancel behavior; it preserves the ACK-not-terminal review trail. |
 | 2026-06-08 | Passive close terminality proof gate | fixed, deployed/cloud verified | Maker progress query timeout now keeps zero-fill cycle state; one-sided ACK-only flatten now registers `accepted_order_truth_gap` and waits for exchange truth before terminal lifecycle; clear path now passes full exchange positions/open-orders truth to recovery core. Merged as `74475c5` and included in the latest deployed main line. |
 | 2026-06-10 | MOVEUSDT ACK-only duplicate-client diagnose closure | fixed locally, deploy pending | CL-066 closes the deployed MOVEUSDT evidence-consumption gap where Bybit ACK-only accepted ids plus same-client-id `110072` stayed in active diagnose errors after reconciliation/terminal/current exchange truth proved flat. Diagnose now treats ACK-only `order.uncertain` as implicit truth-gap registration when accepted ids and no-fill evidence are present, binds nested request identities, and resolves matching duplicate-client artifacts only behind flat/no-open-orders truth. Close execution now records duplicate-client live-flat as `exit.close_duplicate_client_order_resolved_live_flat`, not zero-quantity `order.filled`. |
+| 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed locally, deploy pending | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. |
 
 ## Recurrences
 
@@ -81,6 +89,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-04 | `MEUUSDT`, `LDOUSDT`, `SEIUSDT`, `ICPUSDT`, `BSBUSDT` Bybit-related close samples | main push in this session | full pytest `3432 passed`, `9 skipped`, `1 warning`; cloud deploy pending | [daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop](../daily/2026-06-04.md#cluster-cl-046-bybit-entry-passive-close-v1-deadline-loop) |
 | 2026-06-07 | `BABYUSDT` OKX/Bybit plus unowned Bybit `MORPHOUSDT`, `MONUSDT`, `SEIUSDT` live artifacts | working tree | local RED/GREEN coverage complete for `PC-06`/`PC-07`/`PC-08`; deploy and production verification pending | [daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry](../daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry) |
 | 2026-06-08 | ACK-only timeout/order-truth evidence for production issue 10 | `89e2b93` / `74475c5` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
+| 2026-06-15 | `HOMEUSDT` OKX/Bybit | working tree | local RED/GREEN targeted regressions pass; deploy and production verification pending | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 
 ## Regression Harness
 

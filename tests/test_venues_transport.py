@@ -6054,6 +6054,15 @@ class TestVenueSuccessGuards:
         assert exc.value.class_ == SubmitFailureClass.REJECTED
         assert "110003" in str(exc.value)
 
+    def test_require_bybit_success_preserves_exchange_response_body(self):
+        raw = {"retCode": 110017, "retMsg": "orderQty will be truncated to zero."}
+
+        with pytest.raises(OrderSubmitError) as exc:
+            _require_bybit_success(raw, "bybit passive order failed")
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert json.loads(getattr(exc.value, "exchange_response_body", "{}")) == raw
+
     def test_require_bitget_success_passes_on_code_00000(self):
         _require_bitget_success({"code": "00000", "msg": "success"}, "test")
 

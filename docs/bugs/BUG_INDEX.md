@@ -17,6 +17,20 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest passive-close Bybit terminal-zero semantic closure, 2026-06-15:
+Latest deployed HOMEUSDT lifecycle `entry-1781531687393-HOMEUSDT` ended
+flat/no-open-orders, but the close path showed a submit-time Bybit `110017
+orderQty will be truncated to zero` on a reduce-only passive maker. This is
+not the CL-025 pre-submit maker-flat shape; it is the race where Bybit reports
+zero reducible quantity during order admission. Local CL-083 preserves Bybit
+raw retCode bodies, emits
+`exit.passive_close_terminal_zero_qty_reduce_only_evidence`, immediately
+routes that evidence through V1 live-truth closure, keeps unresolved truth gaps
+pending, filters only resolved terminal-zero cases out of active diagnose order
+errors, and maps/idempotently emits
+`runtime.passive_close_deadline_fallback_armed` as `PASSIVE_CLOSE`. See
+[daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift).
+
 Latest entry diagnostics lifecycle semantic closure, 2026-06-15:
 Production after `9e40725` was already operationally flat: no open positions,
 no pending entries/closes/residual repairs, no open orders, and all three

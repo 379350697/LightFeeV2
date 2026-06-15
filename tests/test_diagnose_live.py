@@ -3969,6 +3969,125 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_filters_resolved_bybit_terminal_zero_qty_from_order_errors(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1781531695000,
+        })
+        exchange_error = {
+            "venue": "bybit",
+            "operation": "submit_passive_order",
+            "transport_error_type": "unknown",
+            "raw_body": '{"retCode":110017,"retMsg":"orderQty will be truncated to zero."}',
+            "exchange_code": "110017",
+            "exchange_msg": "orderQty will be truncated to zero.",
+            "evidence_completeness": "complete",
+            "missing_evidence": [],
+            "confidence": "high",
+        }
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781531688000,
+                "kind": "exit.passive_close_maker_submit_error",
+                "payload": {
+                    "position_id": "entry-1781531687393-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "venue": "bybit",
+                    "error": (
+                        "bybit passive order failed: bybit retCode=110017 "
+                        "retMsg=orderQty will be truncated to zero."
+                    ),
+                    "exchange_error": exchange_error,
+                    "request_context": {
+                        "symbol": "HOMEUSDT",
+                        "reduce_only": True,
+                        "quantity": 1800.0,
+                    },
+                    "evidence_completeness": "complete",
+                },
+            },
+            {
+                "ts_ms": 1781531688001,
+                "kind": "exit.passive_close_terminal_zero_qty_reduce_only_evidence",
+                "payload": {
+                    "position_id": "entry-1781531687393-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "venue": "bybit",
+                    "exchange_error": exchange_error,
+                    "request_context": {
+                        "symbol": "HOMEUSDT",
+                        "reduce_only": True,
+                        "quantity": 1800.0,
+                    },
+                    "decision": "probe_live_truth",
+                },
+            },
+            {
+                "ts_ms": 1781531689000,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1781531687393-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "resolution_source": "passive_close_bybit_terminal_zero_qty_reduce_only",
+                    "live_flat_terminal": True,
+                    "problem": False,
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "positions": {
+                "okx": {
+                    "NEWTOKEN-USDT-SWAP": {"quantity": 1.0},
+                },
+            },
+            "open_orders": {},
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1781531700000,
+        )
+
+        assert result["order_error_evidence"] == []
+        resolved_summary = result["resolved_terminal_zero_qty_reduce_only_summary"]
+        assert resolved_summary["current_exchange_truth_clean"] is False
+        assert resolved_summary["resolved_position_ids"] == [
+            "entry-1781531687393-HOMEUSDT"
+        ]
+        summary = result["passive_close_terminal_summary"]
+        assert summary["terminal_zero_qty_reduce_only_count"] == 1
+        assert summary["terminal_zero_qty_reduce_only_resolved_count"] == 1
+        assert summary["terminal_zero_qty_reduce_only_position_ids"] == [
+            "entry-1781531687393-HOMEUSDT"
+        ]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_reports_passive_zero_fill_recovered_short_window(monkeypatch):
     from scripts import diagnose_live as dl
 

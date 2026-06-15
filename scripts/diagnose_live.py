@@ -1898,6 +1898,32 @@ def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
     )
 
 
+def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> bool:
+    exchange_error = _exchange_error_dict(payload)
+    request_context = payload.get("request_context")
+    if not isinstance(request_context, dict):
+        request_context = {}
+    exchange_code = str(
+        payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
+    )
+    exchange_msg = str(
+        payload.get("exchange_msg") or exchange_error.get("exchange_msg") or ""
+    ).lower()
+    reason = str(payload.get("reason") or payload.get("error") or "").lower()
+    venue = str(
+        payload.get("venue") or exchange_error.get("venue") or request_context.get("venue") or ""
+    ).lower()
+    return (
+        venue == "bybit"
+        and exchange_code == "110017"
+        and request_context.get("reduce_only") is True
+        and (
+            "orderqty will be truncated to zero" in exchange_msg
+            or "orderqty will be truncated to zero" in reason
+        )
+    )
+
+
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
     if kind in {
         "exit.passive_close_hedge_confirmed_after_ack",
@@ -2022,10 +2048,74 @@ def _order_error_resolved_by_truth_gap(
     return bool(_truth_gap_identity_values(payload) & resolved)
 
 
+def _build_resolved_terminal_zero_qty_reduce_only_summary(
+    events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any],
+    symbol: str = "",
+) -> dict[str, Any]:
+    terminal_positions: set[str] = set()
+    resolved_positions: set[str] = set()
+    terminal_event_count = 0
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol", "") or "").upper()
+        if symbol and event_symbol and event_symbol != symbol.upper():
+            continue
+        position_id = str(payload.get("position_id") or "")
+        if not position_id:
+            continue
+        if kind == "exit.passive_close_terminal_zero_qty_reduce_only_evidence":
+            terminal_event_count += 1
+            terminal_positions.add(position_id)
+        elif kind == "exit.passive_close_resolved":
+            if payload.get("live_flat_terminal") is not False:
+                resolved_positions.add(position_id)
+        elif kind == "runtime.position_lifecycle_terminal":
+            if str(payload.get("terminal_state", "") or "").lower() == "flat":
+                resolved_positions.add(position_id)
+
+    current_clean = (
+        _exchange_truth_flat(exchange_truth)
+        and _exchange_truth_no_open_orders(exchange_truth)
+    )
+    resolved_terminal_positions = terminal_positions & resolved_positions
+    unresolved_positions = terminal_positions - resolved_terminal_positions
+    return {
+        "count": terminal_event_count,
+        "position_ids": sorted(terminal_positions),
+        "resolved_count": len(resolved_terminal_positions),
+        "resolved_position_ids": sorted(resolved_terminal_positions),
+        "unresolved_count": len(unresolved_positions),
+        "unresolved_position_ids": sorted(unresolved_positions),
+        "current_exchange_truth_clean": current_clean,
+    }
+
+
+def _order_error_resolved_by_terminal_zero_qty(
+    payload: dict[str, Any],
+    resolved_terminal_zero_qty_summary: dict[str, Any] | None,
+) -> bool:
+    if not resolved_terminal_zero_qty_summary:
+        return False
+    if int(resolved_terminal_zero_qty_summary.get("resolved_count", 0) or 0) <= 0:
+        return False
+    if not _payload_is_bybit_terminal_zero_qty_reduce_only(payload):
+        return False
+    position_id = str(payload.get("position_id") or "")
+    resolved = set(
+        resolved_terminal_zero_qty_summary.get("resolved_position_ids", []) or []
+    )
+    return bool(position_id and position_id in resolved)
+
+
 def _build_order_error_evidence(
     events: list[dict[str, Any]],
     symbol: str = "",
     resolved_truth_gap_summary: dict[str, Any] | None = None,
+    resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
 
@@ -2045,6 +2135,11 @@ def _build_order_error_evidence(
         if symbol and event_symbol and event_symbol != symbol:
             continue
         if _order_error_resolved_by_truth_gap(payload, resolved_truth_gap_summary):
+            continue
+        if _order_error_resolved_by_terminal_zero_qty(
+            payload,
+            resolved_terminal_zero_qty_summary,
+        ):
             continue
 
         exchange_error = payload.get("exchange_error", {})
@@ -3818,10 +3913,16 @@ def run_diagnose(
         exchange_truth,
         symbol,
     )
+    resolved_terminal_zero_qty_summary = _build_resolved_terminal_zero_qty_reduce_only_summary(
+        all_events,
+        exchange_truth,
+        symbol,
+    )
     order_errors = _build_order_error_evidence(
         all_events,
         symbol,
         resolved_order_truth_gap_summary,
+        resolved_terminal_zero_qty_summary,
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
@@ -3894,6 +3995,7 @@ def run_diagnose(
         "exchange_truth_env_files_loaded": exchange_truth_env_files_loaded,
         "state_consistency": state_consistency,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
+        "resolved_terminal_zero_qty_reduce_only_summary": resolved_terminal_zero_qty_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,
@@ -4023,9 +4125,11 @@ def _build_passive_close_terminal_summary(events: list[dict[str, Any]]) -> dict[
     single_leg_fast_flatten_count = 0
     passive_owned_drift_blocked_count = 0
     stale_fail_closed_after_flat_count = 0
+    terminal_zero_qty_reduce_only_count = 0
     resolved_positions: set[str] = set()
     problem_positions: set[str] = set()
     single_leg_fast_positions: set[str] = set()
+    terminal_zero_positions: set[str] = set()
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -4049,6 +4153,12 @@ def _build_passive_close_terminal_summary(events: list[dict[str, Any]]) -> dict[
             passive_owned_drift_blocked_count += 1
         elif kind == "runtime.stale_fail_closed_cleared":
             stale_fail_closed_after_flat_count += 1
+        elif kind == "exit.passive_close_terminal_zero_qty_reduce_only_evidence":
+            terminal_zero_qty_reduce_only_count += 1
+            if position_id:
+                terminal_zero_positions.add(position_id)
+
+    terminal_zero_resolved_positions = terminal_zero_positions & resolved_positions
 
     return {
         "passive_close_resolved_count": resolved_count,
@@ -4056,9 +4166,15 @@ def _build_passive_close_terminal_summary(events: list[dict[str, Any]]) -> dict[
         "single_leg_fast_flatten_count": single_leg_fast_flatten_count,
         "passive_owned_drift_blocked_count": passive_owned_drift_blocked_count,
         "stale_fail_closed_after_flat_count": stale_fail_closed_after_flat_count,
+        "terminal_zero_qty_reduce_only_count": terminal_zero_qty_reduce_only_count,
+        "terminal_zero_qty_reduce_only_resolved_count": len(terminal_zero_resolved_positions),
         "resolved_position_ids": sorted(resolved_positions),
         "problem_position_ids": sorted(problem_positions),
         "single_leg_fast_flatten_position_ids": sorted(single_leg_fast_positions),
+        "terminal_zero_qty_reduce_only_position_ids": sorted(terminal_zero_positions),
+        "terminal_zero_qty_reduce_only_resolved_position_ids": sorted(
+            terminal_zero_resolved_positions
+        ),
     }
 
 

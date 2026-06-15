@@ -2962,6 +2962,50 @@ class TestPlannerDispatchIntegration:
         assert "runtime.passive_close_deadline_fallback_armed" in kinds
 
     @pytest.mark.asyncio
+    async def test_overdue_passive_close_fallback_already_dual_taker_is_idempotent(
+        self, config, tmp_journal,
+    ):
+        config.strategy.post_funding_hold_secs = 0
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        funding_ms = 1780167600000
+        position = OpenPosition(
+            position_id="entry-overdue-passive-already-armed",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=50000.0,
+            short_entry_price=50000.0,
+            opened_at_ms=funding_ms - 30_000,
+            matched_quantity=0.01,
+            funding_timestamp_ms=funding_ms,
+            opportunity_type="aligned",
+            funding_captured=True,
+            current_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+        runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+            ),
+            next_retry_at_ms=funding_ms + 8 * 60 * 60 * 1000,
+        )
+
+        now_ms = funding_ms + config.strategy.settlement_force_close_delay_secs * 1000 + 1
+        runtime._arm_overdue_passive_close_fallbacks(now_ms)
+
+        assert runtime.state.pending_passive_closes[position.position_id].next_retry_at_ms == 0
+        kinds = [r["kind"] for r in runtime.journal.read_all()]
+        assert "runtime.passive_close_deadline_fallback_armed" not in kinds
+
+    @pytest.mark.asyncio
     async def test_normal_exit_backfills_recovered_first_stage_exit_semantics(
         self, config, tmp_journal,
     ):

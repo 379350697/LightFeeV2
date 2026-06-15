@@ -127,6 +127,30 @@ def _is_okx_amend_invalid_request_type_error(error: Exception) -> bool:
     )
 
 
+def _is_bybit_terminal_zero_qty_reduce_only_error(
+    error: OrderSubmitError,
+    *,
+    venue: Venue,
+    evidence: ExchangeErrorEvidence,
+    request_context: RequestContext,
+) -> bool:
+    """Bybit reduce-only close reject when live reducible quantity is already zero."""
+    if venue != Venue.BYBIT:
+        return False
+    if request_context.reduce_only is not True:
+        return False
+    code = str(evidence.exchange_code or "")
+    msg = str(evidence.exchange_msg or "").lower()
+    text = str(error).lower()
+    return (
+        code == "110017"
+        and (
+            "orderqty will be truncated to zero" in msg
+            or "orderqty will be truncated to zero" in text
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Passive close manager profile (V1: passive_close_manager_profile)
 # ---------------------------------------------------------------------------
@@ -1631,6 +1655,54 @@ class PassiveCloseExecutor:
                 request_context=req_ctx,
             )
             if e.is_rejected:
+                if _is_bybit_terminal_zero_qty_reduce_only_error(
+                    e,
+                    venue=maker_venue,
+                    evidence=evidence,
+                    request_context=req_ctx,
+                ):
+                    self._journal.append(
+                        "exit.passive_close_terminal_zero_qty_reduce_only_evidence",
+                        {
+                            "position_id": position.position_id,
+                            "symbol": position.symbol,
+                            "venue": maker_venue.value,
+                            "maker_leg": maker_leg_label,
+                            "error": str(e),
+                            "exchange_error": evidence.to_dict(),
+                            "request_context": req_ctx.to_dict(),
+                            "evidence_completeness": evidence.evidence_completeness,
+                            "decision": "probe_live_truth",
+                            "next_action": "v1_live_truth_closure",
+                        },
+                    )
+                    pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                    live_truth_resolution = await self._resolve_flat_maker_leg_from_live_truth(
+                        state,
+                        pending,
+                        position,
+                        maker_leg_label=maker_leg_label,
+                    )
+                    if live_truth_resolution == PassiveCloseLiveTruthResolution.CLEARED:
+                        return True
+                    if live_truth_resolution == PassiveCloseLiveTruthResolution.STOP_RETRY:
+                        return False
+                    pending.next_retry_at_ms = self._now_ms() + 5_000
+                    self._journal.append(
+                        "exit.passive_close_maker_submit_error",
+                        {
+                            "position_id": position.position_id,
+                            "venue": maker_venue.value,
+                            "error": str(e),
+                            "exchange_error": evidence.to_dict(),
+                            "request_context": req_ctx.to_dict(),
+                            "evidence_completeness": evidence.evidence_completeness,
+                            "terminal_zero_qty_reduce_only": True,
+                            "decision": "retain_pending",
+                            "reason": "terminal_zero_qty_live_truth_not_flat",
+                        },
+                    )
+                    return False
                 self._journal.append(
                     "exit.passive_close_maker_submit_error",
                     {

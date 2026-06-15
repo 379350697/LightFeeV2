@@ -10894,10 +10894,7 @@ class LiveRuntime:
                 phase_state.cycle_started_at_ms = now_ms
             pending.next_retry_at_ms = 0
 
-            if (
-                previous_phase != PassiveExecutionPhase.DUAL_TAKER.value
-                or previous_retry_at_ms > now_ms
-            ):
+            if previous_phase != PassiveExecutionPhase.DUAL_TAKER.value:
                 self.journal.append(
                     "runtime.passive_close_deadline_fallback_armed",
                     {

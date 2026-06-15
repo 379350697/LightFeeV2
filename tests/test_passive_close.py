@@ -6041,6 +6041,137 @@ class TestNonTerminalPartialFillHedgeGapClosure:
 class TestPassiveCloseMakerLegLiveTruthPrecheck:
     """Live-truth precheck before first maker submit."""
 
+    def test_bybit_submit_110017_order_qty_truncated_routes_to_live_truth_closure(self):
+        """Bybit 110017 after submit is terminal zero-qty evidence, not generic retry."""
+        journal = _open_journal()
+
+        class SubmitThenFlatAdapter(VenueAdapter):
+            def __init__(self, venue, side, quantities, *, submit_error=None):
+                self._venue = venue
+                self._side = side
+                self._quantities = list(quantities)
+                self.submit_passive_calls = 0
+                self.place_order_calls = []
+                self._submit_error = submit_error
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def fetch_position(self, symbol):
+                quantity = self._quantities.pop(0) if self._quantities else 0.0
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=quantity,
+                    entry_price=0.026 if quantity else 0.0,
+                    observed_at_ms=1781531688000,
+                )
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def submit_passive_order(self, request):
+                self.submit_passive_calls += 1
+                if self._submit_error is not None:
+                    raise self._submit_error
+                return PassiveOrderAck(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    order_id=f"{self._venue.value}-maker",
+                    client_order_id=request.client_order_id,
+                    price=request.price or 0.026,
+                    quantity=request.quantity,
+                    accepted_at_ms=1781531688001,
+                )
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                self._quantities = [0.0, 0.0]
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 0.026,
+                    order_id=f"{self._venue.value}-flatten",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=1781531688002,
+                )
+
+        submit_error = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "bybit passive order failed: bybit retCode=110017 "
+            "retMsg=orderQty will be truncated to zero.",
+        )
+        submit_error.exchange_response_body = (
+            '{"retCode":110017,"retMsg":"orderQty will be truncated to zero."}'
+        )
+
+        long_adapter = SubmitThenFlatAdapter(
+            Venue.OKX,
+            Side.BUY,
+            [1800.0, 1800.0, 1800.0, 0.0, 0.0],
+        )
+        short_adapter = SubmitThenFlatAdapter(
+            Venue.BYBIT,
+            Side.SELL,
+            [1800.0, 0.0, 0.0, 0.0],
+            submit_error=submit_error,
+        )
+        executor = PassiveCloseExecutor(
+            {Venue.OKX: long_adapter, Venue.BYBIT: short_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0265)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.0264, 0.0266))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1781531687393-HOMEUSDT",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=1800.0,
+            short_quantity=1800.0,
+            matched_quantity=1800.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1800.0,
+            chunk_quantities=[1800.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+            next_retry_at_ms=0,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is True
+        assert short_adapter.submit_passive_calls == 1
+        assert len(long_adapter.place_order_calls) == 1
+        assert state.pending_passive_closes == {}
+        assert state.open_positions == {}
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_terminal_zero_qty_reduce_only_evidence" in kinds
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        assert "exit.passive_close_resolved" in kinds
+
     def test_one_sided_flatten_settling_does_not_submit_maker_same_cycle(self):
         """A live flatten action consumes this drive even if flat truth has not settled."""
         journal = _open_journal()

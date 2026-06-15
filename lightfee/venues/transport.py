@@ -345,10 +345,12 @@ def _hyperliquid_spot_usdc_available(raw: Any) -> Optional[tuple[float, float]]:
 def _require_bybit_success(raw: dict[str, Any], context: str) -> None:
     """Raise REJECTED if Bybit retCode is non-zero."""
     if int(raw.get("retCode", 0) or 0) != 0:
-        raise OrderSubmitError(
+        err = OrderSubmitError(
             SubmitFailureClass.REJECTED,
             f"{context}: bybit retCode={raw.get('retCode')} retMsg={raw.get('retMsg', '')}",
         )
+        err.exchange_response_body = json.dumps(raw, separators=(",", ":"))
+        raise err
 
 
 def _require_bitget_success(raw: dict[str, Any], context: str) -> None:

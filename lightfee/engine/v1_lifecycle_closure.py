@@ -1160,6 +1160,7 @@ _EVENT_KIND_PHASES = {
     ),
     "exit.passive_close_hedge_confirmed_after_ack": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.passive_close_hedge_reconciled_after_error": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.passive_close_terminal_zero_qty_reduce_only_evidence": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "execution.entry_residual_dust_tolerated": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "execution.residual_repair_terminal": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "execution.residual_repair_completed": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
@@ -1226,6 +1227,9 @@ _EVENT_KIND_PHASES = {
     "runtime.close_price_evidence_rest_rewarm_succeeded": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_rewarm_failed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_stale": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "runtime.passive_close_deadline_fallback_armed": (
+        V1LifecycleClosurePhase.PASSIVE_CLOSE.value
+    ),
     "runtime.entry_dispatched": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.funding_capture_state_updated": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.normal_close_routing_passive": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
