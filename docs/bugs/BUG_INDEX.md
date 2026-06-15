@@ -17,6 +17,30 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest entry diagnostics lifecycle semantic closure, 2026-06-15:
+Production after `9e40725` was already operationally flat: no open positions,
+no pending entries/closes/residual repairs, no open orders, and all three
+opened lifecycles in the inspected long window were closed. The remaining issue
+was diagnostic drift. `blocked_candidate_samples` described entry-selection
+blockers but looked like a whole-pipeline blocker field;
+`reconciliation.entry_abandoned_flat` was a valid pending-entry flat terminal
+cleanup event but still appeared as unmapped; selected-to-open outcomes did not
+separate zero-fill repricing plus `lifecycle_risk_only` from quote stale,
+liquidity/OI, or finalization-window guards; and the historical window exposed
+`execution.passive_small_fill_buffering` as another pending-entry hedge-delta
+event needing closure-table mapping. Commits `bb16475` and `0009d17` keep the
+legacy field for compatibility, add
+`selection_blocked_candidate_samples(stage="entry_selection", reason_family,
+selection_blocker)`, add diagnose `entry_outcome_summary`, and map
+`reconciliation.entry_abandoned_flat`,
+`execution.passive_small_fill_buffering`, and
+`execution.passive_small_fill_buffer_expired` to `PENDING_ENTRY`. Cloud
+`0009d17` passed manifest, singleton, `verify_production_services.py --json`,
+and `diagnose_live.py --json --since-deploy`: `gate_passed=true`,
+`unmapped_event_kinds=[]`, high-confidence exchange truth flat/no-open-orders,
+and local open/pending/residual state all zero. Full evidence is recorded in
+[`daily/2026-06-15.md#cluster-cl-082-entry-diagnostics-selected-to-open-semantic-closure`](daily/2026-06-15.md#cluster-cl-082-entry-diagnostics-selected-to-open-semantic-closure).
+
 Latest unified order truth resolver and pending auto-repair cloud closure,
 2026-06-15:
 CL-078/CL-079/CL-080 closed the HOME live artifact path, but the order-success
