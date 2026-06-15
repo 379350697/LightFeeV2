@@ -372,6 +372,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "execution.entry_quantity_plan",
         "execution.entry_selected",
         "execution.hedge_deadline_started",
+        "execution.passive_small_fill_buffering",
+        "execution.passive_small_fill_buffer_expired",
         "execution.passive_cycle_zero_fill",
         "execution.passive_phase_switched",
         "order.passive_submitted",

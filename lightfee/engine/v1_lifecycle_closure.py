@@ -1195,6 +1195,12 @@ _EVENT_KIND_PHASES = {
     "execution.entry_quantity_plan": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.entry_selected": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "execution.passive_small_fill_buffering": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
+    "execution.passive_small_fill_buffer_expired": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "execution.passive_cycle_zero_fill": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "execution.passive_phase_switched": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "entry.abort_maker_cancel_requested": V1LifecycleClosurePhase.PENDING_ENTRY.value,
