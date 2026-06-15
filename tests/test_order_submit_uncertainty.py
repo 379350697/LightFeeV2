@@ -248,6 +248,52 @@ def test_order_truth_resolution_rejects_positive_quantity_without_metadata():
     assert "fill_confirmation" in decision.missing_evidence
 
 
+def test_order_truth_resolution_terminal_zero_fill_live_flat_is_terminal_no_fill():
+    from lightfee.core.domain import OrderFillReconciliation, PositionSnapshot, Side
+
+    reconciliation = OrderFillReconciliation(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        average_price=0.0,
+        order_id="oid-1",
+        client_order_id="cid-1",
+        metadata={
+            "evidence_source": "okx_order_detail",
+            "raw_exchange_status": "canceled",
+            "response_classification": "detail_found;fills_empty",
+            "queried_endpoints": ["/api/v5/trade/order", "/api/v5/trade/fills"],
+        },
+    )
+
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.OKX,
+        symbol="HOMEUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1600.0,
+        reconciliation=reconciliation,
+        live_position=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1_000_000,
+        ),
+        open_order_present=False,
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.LIVE_FLAT
+    assert decision.evidence_status is OrderTruthEvidenceStatus.AVAILABLE
+    assert decision.decision == "terminal_no_fill"
+    assert decision.reconciled_qty == 0.0
+    assert decision.live_qty == 0.0
+    assert decision.missing_evidence == ()
+    assert decision.terminal_without_truth is False
+
+
 @pytest.mark.parametrize(
     ("venue", "source", "endpoint"),
     [

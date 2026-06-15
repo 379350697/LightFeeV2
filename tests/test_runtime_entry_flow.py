@@ -545,6 +545,183 @@ def test_scan_no_entry_diagnostics_exposes_capacity_context(config, tmp_journal)
     assert payload["capacity_blocked"] is False
 
 
+def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
+    config,
+    tmp_journal,
+):
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.state.last_scan = {
+        "raw_candidate_count": 4659,
+        "strategy_tradeable_count": 72,
+        "catalog_admission_balance_passed_count": 56,
+        "snapshot_freshness_candidate_count": 10,
+        "quote_revalidate_target_count": 18,
+        "quote_revalidate_resolved_count": 17,
+        "quote_revalidate_failed_count": 1,
+        "quote_revalidate_skipped_untracked_count": 54,
+        "top_quote_blocker_buckets": {"quote_stale": 54},
+    }
+    candidate = CandidateInput(
+        long_venue="okx",
+        short_venue="bybit",
+        symbol="HOMEUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=30.0,
+        first_funding_timestamp_ms=1_300_000,
+        funding_timestamp_ms=1_300_000,
+    )
+
+    runtime._emit_entry_opportunity_funnel(
+        reason="entries_dispatched",
+        snapshot=SimpleNamespace(candidates=[candidate]),
+        tradeable=[candidate],
+        selected=[candidate],
+        dispatched_candidate_count=1,
+        remaining_slots=8,
+        tradeable_selection_blocker_counts=Counter({
+            "entry_waiting_for_finalization_window_too_early": 3,
+        }),
+        candidate_blockers={"hemiusdt:binance->hyperliquid": "quote_stale"},
+        now_ms=1_000_000,
+        admission_blocker_counts=Counter(),
+    )
+
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "entry.opportunity_funnel"
+    )
+
+    assert payload["reason"] == "entries_dispatched"
+    assert payload["pipeline_counts"]["raw_candidates"] == 4659
+    assert payload["pipeline_counts"]["strategy_tradeable"] == 72
+    assert payload["pipeline_counts"]["catalog_admission_balance_passed"] == 56
+    assert payload["pipeline_counts"]["v1_primary_shadow_tracked"] == 10
+    assert payload["pipeline_counts"]["quote_revalidate_target"] == 18
+    assert payload["pipeline_counts"]["quote_revalidate_resolved"] == 17
+    assert payload["pipeline_counts"]["quote_revalidate_failed"] == 1
+    assert payload["pipeline_counts"]["quote_revalidate_skipped_untracked"] == 54
+    assert payload["pipeline_counts"]["selected"] == 1
+    assert payload["pipeline_counts"]["dispatched"] == 1
+    assert payload["candidate_stage_blocked_counts"]["entry_selection"] == 3
+    assert payload["top_quote_blocker_buckets"] == {"quote_stale": 54}
+    assert payload["selected_candidates"] == [
+        {
+            "rank": 1,
+            "pair_id": "homeusdt:okx->bybit",
+            "symbol": "HOMEUSDT",
+            "long_venue": "okx",
+            "short_venue": "bybit",
+            "ranking_edge_bps": 8.0,
+            "entry_notional_quote": 30.0,
+            "remaining_ms": 300000,
+        }
+    ]
+    assert runtime.state.last_scan["opportunity_funnel"]["dispatched_candidate_count"] == 1
+
+
+def test_select_entry_candidates_records_final_selection_skip_reasons(
+    config,
+    tmp_journal,
+):
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.engine.runtime import LiveRuntime
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class ReadinessProvider:
+        def decide(self, candidate, now_ms, *, market_quotes=None):
+            return EntryReadinessDecision.allow()
+
+    def candidate(symbol: str, ranking: float = 8.0) -> CandidateInput:
+        return CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol=symbol,
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=ranking,
+            entry_notional_quote=30.0,
+            first_funding_timestamp_ms=1_300_000,
+            funding_timestamp_ms=1_300_000,
+        )
+
+    config.strategy.entry_window_secs = 600
+    config.strategy.min_scan_minutes_before_funding = 0
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.entry_readiness_provider = ReadinessProvider()
+    runtime.state.open_positions["btc-open"] = OpenPosition(
+        position_id="btc-open",
+        symbol="BTCUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.0,
+        short_quantity=1.0,
+        long_entry_price=1.0,
+        short_entry_price=1.0,
+        opened_at_ms=999_000,
+        matched_quantity=1.0,
+    )
+    runtime.state.pending_entries["eth-pending"] = PendingEntry(
+        pending_id="eth-pending",
+        symbol="ETHUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        target_quantity=1.0,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=999_000,
+    )
+    runtime.state.pending_residual_repairs.append({
+        "pair_id": "xrpusdt:okx->bybit",
+        "symbol": "XRPUSDT",
+    })
+    counts = Counter()
+    blockers = {}
+
+    selected = runtime._select_entry_candidates(
+        [
+            candidate("BTCUSDT", 12.0),
+            candidate("ETHUSDT", 11.0),
+            candidate("XRPUSDT", 10.0),
+            candidate("HOMEUSDT", 9.0),
+            candidate("HOMEUSDT", 8.0),
+        ],
+        now_ms=1_000_000,
+        remaining_slots=8,
+        selection_blocker_counts=counts,
+        candidate_blockers=blockers,
+    )
+
+    assert [item.symbol for item in selected] == ["HOMEUSDT"]
+    assert counts["entry_selection_symbol_has_open_position"] == 1
+    assert counts["entry_selection_symbol_has_pending_entry"] == 1
+    assert counts["entry_selection_pair_has_pending_residual_repair"] == 1
+    assert counts["entry_selection_duplicate_symbol"] == 1
+    assert blockers["btcusdt:okx->bybit"] == "entry_selection_symbol_has_open_position"
+    assert blockers["ethusdt:okx->bybit"] == "entry_selection_symbol_has_pending_entry"
+    assert (
+        blockers["xrpusdt:okx->bybit"]
+        == "entry_selection_pair_has_pending_residual_repair"
+    )
+    assert "homeusdt:okx->bybit" not in blockers
+
+
 @pytest.mark.asyncio
 async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_capacity(
     config, tmp_journal

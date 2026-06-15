@@ -4183,6 +4183,19 @@ class LiveRuntime:
                     if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
                         dispatched += 1
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
+                if dispatched > 0:
+                    self._emit_entry_opportunity_funnel(
+                        reason="entries_dispatched",
+                        snapshot=snapshot,
+                        tradeable=tradeable,
+                        selected=finalists,
+                        dispatched_candidate_count=dispatched,
+                        remaining_slots=remaining_slots,
+                        tradeable_selection_blocker_counts=selection_blocker_counts,
+                        candidate_blockers=candidate_blockers,
+                        now_ms=now_ms,
+                        admission_blocker_counts=admission_blocker_counts,
+                    )
                 if dispatched == 0:
                     reason = (
                         self._v1_tradeable_no_entry_reason(
@@ -10465,6 +10478,33 @@ class LiveRuntime:
             snapshot=snapshot,
             tradeable=tradeable,
             selected_candidate_count=selected_candidate_count,
+            dispatched_candidate_count=dispatched_candidate_count,
+            remaining_slots=remaining_slots,
+            tradeable_selection_blocker_counts=tradeable_selection_blocker_counts,
+            candidate_blockers=candidate_blockers,
+            now_ms=now_ms,
+            admission_blocker_counts=admission_blocker_counts,
+        )
+
+    def _emit_entry_opportunity_funnel(
+        self,
+        *,
+        reason: str,
+        snapshot,
+        tradeable: list,
+        selected: list,
+        dispatched_candidate_count: int,
+        remaining_slots: int,
+        tradeable_selection_blocker_counts: Counter,
+        candidate_blockers: dict[str, str],
+        now_ms: int,
+        admission_blocker_counts: Counter | None = None,
+    ) -> None:
+        return self.entry_gate_runtime._emit_entry_opportunity_funnel(
+            reason=reason,
+            snapshot=snapshot,
+            tradeable=tradeable,
+            selected=selected,
             dispatched_candidate_count=dispatched_candidate_count,
             remaining_slots=remaining_slots,
             tradeable_selection_blocker_counts=tradeable_selection_blocker_counts,

@@ -17,7 +17,8 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest unified order truth resolver and lifecycle mapping, 2026-06-15:
+Latest unified order truth resolver and pending auto-repair cloud closure,
+2026-06-15:
 CL-078/CL-079/CL-080 closed the HOME live artifact path, but the order-success
 decision was still too distributed: pending-entry recovery, pending finalize,
 passive close ACK reconciliation, duplicate cleanup, diagnose, and health could
@@ -32,6 +33,25 @@ missing side/family, and Hyperliquid account/oid identity gaps become
 pending-entry recovery/finalize and passive-close ACK/error reconciliation now
 consume that resolver, and lifecycle closure maps the newly observed
 order-truth/reconciliation/drift events instead of leaving them unmapped.
+The deployed cloud line is now `793d28d911508d6e5791521129190982ea126da9`
+with `.deploy_version=793d28d`, and manifest verification passed.
+Production logs directly prove the positive-fill/live-truth cleanup chain from
+`pending_entry.positive_fill_live_truth_conflict` through
+`pending_entry.owned_live_conflict_cleanup_succeeded` to
+`pending_entry.removed_by_v1_lifecycle_closure`. Zero-fill direct cleanup is
+code/test closed on the deployed line, but the post-deploy window has no fresh
+zero-fill sample that exercised the specialized direct-cleanup event path;
+the stale HOME zero-fill artifact cleared through abort cleanup before recovery
+core returned to `RUNNING_CLEAN`. A fresh docs-backfill recheck then saw a new
+HOME matched open position on the same deployed line: maker filled `1500`, hedge
+filled `1500`, terminalizer opened a balanced position, and pending was removed
+through V1 lifecycle closure. That new active exposure keeps the current
+production acceptance gate non-flat, so it is tracked as cloud watch rather than
+as a pending-entry live-conflict recurrence. The same recheck exposed one
+additional lifecycle mapping gap in deployed code,
+`reconciliation.entry_flat_not_found_terminal_cleared`; local GREEN now maps
+that flat/not-found terminal-clear event to `PENDING_ENTRY`, with cloud
+verification pending deployment of the follow-up.
 Full evidence is recorded in
 [`daily/2026-06-15.md#cluster-cl-081-unified-order-truth-resolver-and-lifecycle-closure-event-mapping`](daily/2026-06-15.md#cluster-cl-081-unified-order-truth-resolver-and-lifecycle-closure-event-mapping).
 

@@ -1381,6 +1381,219 @@ class EntryGateRuntime:
         compact["suppressed_full_payload_count"] = suppressed_full_payload_count
         return compact
 
+    def _entry_opportunity_candidate_sample(
+        self,
+        candidate: Any,
+        *,
+        rank: int,
+        now_ms: int,
+    ) -> dict:
+        from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+
+        pair_id = getattr(candidate, "pair_id", "")
+        if not pair_id:
+            pair_id = make_candidate_pair_id(
+                str(getattr(candidate, "symbol", "")),
+                str(getattr(candidate, "long_venue", "")),
+                str(getattr(candidate, "short_venue", "")),
+            )
+        first_funding_ms = int(getattr(candidate, "first_funding_timestamp_ms", 0) or 0)
+        return {
+            "rank": rank,
+            "pair_id": str(pair_id),
+            "symbol": str(getattr(candidate, "symbol", "")),
+            "long_venue": str(getattr(candidate, "long_venue", "")),
+            "short_venue": str(getattr(candidate, "short_venue", "")),
+            "ranking_edge_bps": float(
+                getattr(candidate, "ranking_edge_bps", 0.0) or 0.0
+            ),
+            "entry_notional_quote": float(
+                getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+            ),
+            "remaining_ms": first_funding_ms - now_ms
+            if first_funding_ms > 0
+            else 0,
+        }
+
+    def _emit_entry_opportunity_funnel(
+        self,
+        *,
+        reason: str,
+        snapshot,
+        tradeable: list,
+        selected: list,
+        dispatched_candidate_count: int,
+        remaining_slots: int,
+        tradeable_selection_blocker_counts: Counter,
+        candidate_blockers: dict[str, str],
+        now_ms: int,
+        admission_blocker_counts: Counter | None = None,
+    ) -> None:
+        if getattr(self.ctx.journal, "_file", None) is None:
+            return
+
+        blocked_reason_counts: Counter[str] = Counter()
+        for candidate in getattr(snapshot, "candidates", []) or []:
+            for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
+                blocked_reason_counts[str(blocked_reason)] += 1
+        catalog_filter_blockers = Counter(
+            getattr(self, "_last_candidate_catalog_filter_blockers", Counter())
+        )
+        snapshot_freshness_blockers = Counter(
+            getattr(self, "_last_snapshot_freshness_filter_blockers", Counter())
+        )
+        entry_admission_filter_blockers = Counter(
+            getattr(self, "_last_entry_admission_filter_blockers", Counter())
+        )
+        admission_counts = (
+            admission_blocker_counts if admission_blocker_counts is not None else {}
+        )
+        entry_admission_blocked = sum(
+            int(v)
+            for k, v in admission_counts.items()
+            if (
+                str(k).endswith("_admission_blocked")
+                or str(k)
+                in {
+                    "bybit_trading_terms_required",
+                    "insufficient_margin_admission_prefiltered",
+                    "hyperliquid_account_balance_unavailable",
+                }
+            )
+        )
+        execution_liquidity_blocked_counts: Counter[str] = Counter()
+        for reason_key, count in blocked_reason_counts.items():
+            if "liquidity" in reason_key or reason_key.startswith("execution_"):
+                execution_liquidity_blocked_counts[str(reason_key)] += int(count)
+
+        last_scan = (
+            self.ctx.state.last_scan
+            if isinstance(self.ctx.state.last_scan, dict)
+            else {}
+        )
+        pipeline_counts = {
+            "raw_candidates": int(
+                last_scan.get(
+                    "raw_candidate_count",
+                    len(getattr(snapshot, "candidates", []) or []),
+                )
+                or 0
+            ),
+            "strategy_tradeable": int(
+                last_scan.get("strategy_tradeable_count", len(tradeable)) or 0
+            ),
+            "catalog_admission_balance_passed": int(
+                last_scan.get(
+                    "catalog_admission_balance_passed_count",
+                    last_scan.get(
+                        "snapshot_freshness_all_candidate_count",
+                        len(tradeable),
+                    ),
+                )
+                or 0
+            ),
+            "v1_primary_shadow_tracked": int(
+                last_scan.get("snapshot_freshness_candidate_count", 0) or 0
+            ),
+            "quote_oi_truth_must_resolve": int(
+                last_scan.get("quote_truth_must_resolve_count", 0) or 0
+            ),
+            "quote_oi_truth_resolved": int(
+                last_scan.get("quote_truth_resolved_count", 0) or 0
+            ),
+            "quote_oi_truth_failed": int(
+                last_scan.get("quote_truth_failed_count", 0) or 0
+            ),
+            "quote_revalidate_target": int(
+                last_scan.get("quote_revalidate_target_count", 0) or 0
+            ),
+            "quote_revalidate_resolved": int(
+                last_scan.get("quote_revalidate_resolved_count", 0) or 0
+            ),
+            "quote_revalidate_failed": int(
+                last_scan.get("quote_revalidate_failed_count", 0) or 0
+            ),
+            "quote_revalidate_skipped_untracked": int(
+                last_scan.get("quote_revalidate_skipped_untracked_count", 0) or 0
+            ),
+            "selected": len(selected),
+            "dispatched": int(dispatched_candidate_count),
+        }
+        candidate_stage_blocked_counts = {
+            "candidate_universe": sum(int(v) for v in blocked_reason_counts.values()),
+            "unsupported_symbol": sum(int(v) for v in catalog_filter_blockers.values()),
+            "entry_admission_venue_degraded": sum(
+                int(v) for v in entry_admission_filter_blockers.values()
+            ),
+            "entry_admission": entry_admission_blocked,
+            "snapshot_quote_or_freshness": sum(
+                int(v) for v in snapshot_freshness_blockers.values()
+            ),
+            "execution_liquidity": sum(
+                int(v) for v in execution_liquidity_blocked_counts.values()
+            ),
+            "entry_selection": sum(
+                int(v) for v in tradeable_selection_blocker_counts.values()
+            ),
+        }
+        max_concurrent_positions = max(
+            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
+            1,
+        )
+        open_position_count = len(self.ctx.state.open_positions)
+        normalized_remaining_slots = max(int(remaining_slots), 0)
+        payload = {
+            "reason": str(reason or "entry_opportunity_funnel"),
+            "candidate_count": len(getattr(snapshot, "candidates", []) or []),
+            "tradeable_count": len(tradeable),
+            "selected_candidate_count": len(selected),
+            "dispatched_candidate_count": int(dispatched_candidate_count),
+            "pipeline_counts": pipeline_counts,
+            "max_concurrent_positions": max_concurrent_positions,
+            "open_position_count": open_position_count,
+            "remaining_slots": normalized_remaining_slots,
+            "capacity_blocked": open_position_count >= max_concurrent_positions
+            and normalized_remaining_slots <= 0,
+            "tradeable_selection_blocker_counts": dict(
+                sorted(
+                    (str(k), int(v))
+                    for k, v in tradeable_selection_blocker_counts.items()
+                )
+            ),
+            "entry_admission_blocker_counts": {
+                str(k): int(v)
+                for k, v in sorted(admission_counts.items())
+                if int(v) > 0
+            },
+            "top_quote_blocker_buckets": dict(
+                last_scan.get("top_quote_blocker_buckets", {}) or {}
+            ),
+            "candidate_stage_blocked_counts": {
+                key: value
+                for key, value in candidate_stage_blocked_counts.items()
+                if value > 0
+            },
+            "selected_candidates": [
+                self._entry_opportunity_candidate_sample(
+                    candidate,
+                    rank=rank,
+                    now_ms=now_ms,
+                )
+                for rank, candidate in enumerate(list(selected)[:24], start=1)
+            ],
+            "blocked_candidate_samples": [
+                {
+                    "pair_id": pair_id,
+                    "selection_blocker": blocker,
+                }
+                for pair_id, blocker in list(sorted(candidate_blockers.items()))[:24]
+            ],
+            "ts_ms": now_ms,
+        }
+        if self.ctx.state.last_scan is not None:
+            self.ctx.state.last_scan["opportunity_funnel"] = payload
+        self.ctx.journal.append("entry.opportunity_funnel", payload)
+
     def _emit_scan_no_entry_diagnostics(
         self,
         *,
@@ -1973,15 +2186,16 @@ class EntryGateRuntime:
             "entry_local_l2_waiting_for_primary_tracking",
         }
 
-        active_symbols = {
+        open_position_symbols = {
             str(getattr(position, "symbol", ""))
             for position in self.ctx.state.open_positions.values()
         }
-        active_symbols.update(
+        pending_entry_symbols = {
             str(getattr(pending, "symbol", ""))
             for pending in self.ctx.state.pending_entries.values()
-        )
+        }
         selected_symbols: set[str] = set()
+        selected_pair_ids: set[str] = set()
         ranked: list = []
         selected: list = []
 
@@ -2137,12 +2351,30 @@ class EntryGateRuntime:
         for candidate in ranked:
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._candidate_pair_id(candidate)
-            if symbol in active_symbols or symbol in selected_symbols:
+            if symbol in selected_symbols:
+                blocker = "entry_selection_duplicate_symbol"
+                selection_blocker_counts[blocker] += 1
+                if pair_id not in selected_pair_ids:
+                    candidate_blockers[pair_id] = blocker
+                continue
+            if symbol in open_position_symbols:
+                blocker = "entry_selection_symbol_has_open_position"
+                selection_blocker_counts[blocker] += 1
+                candidate_blockers[pair_id] = blocker
+                continue
+            if symbol in pending_entry_symbols:
+                blocker = "entry_selection_symbol_has_pending_entry"
+                selection_blocker_counts[blocker] += 1
+                candidate_blockers[pair_id] = blocker
                 continue
             if self._has_pending_residual_pair(pair_id):
+                blocker = "entry_selection_pair_has_pending_residual_repair"
+                selection_blocker_counts[blocker] += 1
+                candidate_blockers[pair_id] = blocker
                 continue
             selected.append(candidate)
             selected_symbols.add(symbol)
+            selected_pair_ids.add(pair_id)
             if len(selected) >= target:
                 break
         return selected

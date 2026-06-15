@@ -382,8 +382,20 @@ class OrderTruthLedger:
                 terminal_without_truth=False,
             )
 
-        if "live_flat" in classification_text or (
-            open_order_present is False and "no_open_order" in classification_text
+        live_flat_truth = live_position is not None and live_qty <= 1e-9
+        no_open_order_truth = open_order_present is False
+        terminal_no_fill_truth = (
+            live_flat_truth
+            and no_open_order_truth
+            and _classification_is_terminal_no_fill_truth(classification_text)
+        )
+        if (
+            "live_flat" in classification_text
+            or (
+                no_open_order_truth
+                and "no_open_order" in classification_text
+            )
+            or terminal_no_fill_truth
         ):
             return OrderTruthSuccessDecision(
                 fill_status=OrderTruthFillStatus.LIVE_FLAT,
@@ -886,6 +898,20 @@ def _classification_is_terminal_fill_truth(
         )
         return identity_ok and status_ok
     return False
+
+
+def _classification_is_terminal_no_fill_truth(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+            "terminal_no_fill",
+        )
+    )
 
 
 def _missing_order_truth_evidence(
