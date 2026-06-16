@@ -309,6 +309,26 @@ class MarketDataClient:
             return await self._fetch_hyperliquid_style(symbols)
         return {}
 
+    async def fetch_entry_open_interest_evidence(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        """Fetch candidate-scoped OI evidence without widening sidecar scope.
+
+        Binance-compatible venues expose OI as a mandatory per-symbol public
+        endpoint. Entry revalidation can therefore refresh only candidate
+        symbols that missed sidecar enrichment, instead of inheriting a
+        full-universe cap/timeout result.
+        """
+        scoped_symbols = [
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ]
+        if not scoped_symbols:
+            return {}
+        return await self.fetch_funding_tickers(list(dict.fromkeys(scoped_symbols)))
+
     # ------------------------------------------------------------------
     # Per-symbol L2 snapshot
     # ------------------------------------------------------------------

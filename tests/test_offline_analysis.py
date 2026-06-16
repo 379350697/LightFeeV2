@@ -1590,18 +1590,30 @@ class TestProductionBlockerAnalyzer:
                         "open_interest_evidence_reason": "http_429",
                     },
                 },
+                {
+                    "kind": "runtime.entry_oi_targeted_refresh_failed",
+                    "payload": {
+                        "open_interest_evidence_status": "timeout",
+                        "open_interest_evidence_reason": "timeout_waiting_for_oi",
+                        "elapsed_ms": 101,
+                    },
+                },
             ],
             enabled=True,
         )
 
         assert view["reason_counts"]["oi_evidence_status:deferred_by_cap"] == 1
         assert view["reason_counts"]["oi_evidence_status:rate_limited"] == 1
+        assert view["reason_counts"]["oi_targeted_status:timeout"] == 1
         assert view["reason_counts"]["oi_evidence_reason:refresh_cap_exceeded"] == 1
         assert view["reason_counts"]["oi_evidence_reason:http_429"] == 1
+        assert view["reason_counts"]["oi_targeted_reason:timeout_waiting_for_oi"] == 1
         assert view["oi_evidence_health_summary"] == {
             "oi_cache_miss_count": 8,
             "oi_deferred_count": 5,
             "oi_refresh_attempt_count": 3,
+            "oi_targeted_failed_count": 1,
+            "oi_targeted_max_elapsed_ms": 101,
         }
 
 

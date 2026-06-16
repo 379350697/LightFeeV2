@@ -17,6 +17,92 @@ from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 
 
+class EntryOpenInterestRefresher:
+    """Candidate-scoped public OI refresher for entry liquidity evidence."""
+
+    SUPPORTED_VENUES = {"binance", "aster"}
+
+    def __init__(self) -> None:
+        self._clients: dict[str, Any] = {}
+
+    async def close(self) -> None:
+        for client in list(self._clients.values()):
+            close = getattr(client, "close", None)
+            if callable(close):
+                await close()
+        self._clients.clear()
+
+    def _client_for_venue(self, venue: str):
+        venue_key = str(venue or "").strip().lower()
+        client = self._clients.get(venue_key)
+        if client is not None:
+            return client
+        from lightfee.venues.market_data import MarketDataClient
+        from lightfee.venues.specs import get_spec
+
+        venue_enum = Venue.from_str(venue_key)
+        client = MarketDataClient(get_spec(venue_enum))
+        self._clients[venue_key] = client
+        return client
+
+    async def refresh_open_interest(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        venue_key = str(venue or "").strip().lower()
+        symbol_key = str(symbol or "").strip().upper()
+        if venue_key not in self.SUPPORTED_VENUES or not symbol_key:
+            return {
+                "open_interest_quote": 0.0,
+                "open_interest_evidence_status": "unsupported",
+                "open_interest_evidence_reason": "unsupported_targeted_refresh",
+            }
+        try:
+            result = await self._client_for_venue(
+                venue_key
+            ).fetch_entry_open_interest_evidence([symbol_key])
+        except Exception as exc:
+            return {
+                "open_interest_quote": 0.0,
+                "open_interest_evidence_status": "timeout",
+                "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+            }
+        ticker = result.get(f"{venue_key}:{symbol_key}")
+        if ticker is None:
+            return {
+                "open_interest_quote": 0.0,
+                "open_interest_evidence_status": "parse_error",
+                "open_interest_evidence_reason": "missing_targeted_ticker",
+            }
+        return {
+            "open_interest_quote": float(
+                getattr(ticker, "open_interest_quote", 0.0) or 0.0
+            ),
+            "open_interest_evidence_status": str(
+                getattr(ticker, "open_interest_evidence_status", "") or "unavailable"
+            ),
+            "open_interest_evidence_reason": str(
+                getattr(ticker, "open_interest_evidence_reason", "")
+                or "targeted_refresh"
+            ),
+            "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
+            "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
+            "oi_cache_miss_count": int(getattr(ticker, "oi_cache_miss_count", 0) or 0),
+            "oi_refresh_attempt_count": int(
+                getattr(ticker, "oi_refresh_attempt_count", 0) or 0
+            ),
+            "oi_refresh_cap": int(getattr(ticker, "oi_refresh_cap", 0) or 0),
+            "oi_deferred_count": int(getattr(ticker, "oi_deferred_count", 0) or 0),
+            "oi_timeout_count": int(getattr(ticker, "oi_timeout_count", 0) or 0),
+            "oi_refresh_elapsed_ms": int(
+                getattr(ticker, "oi_refresh_elapsed_ms", 0) or 0
+            ),
+        }
+
+
 class MarketDataRuntime:
     def __init__(self, ctx: MarketDataRuntimeContext) -> None:
         self.ctx = ctx
@@ -28,6 +114,14 @@ class MarketDataRuntime:
     @ws_bbo_rest_refresher.setter
     def ws_bbo_rest_refresher(self, value) -> None:
         setattr(self.ctx, "ws_bbo_rest_refresher", value)
+
+    @property
+    def entry_open_interest_refresher(self):
+        return getattr(self.ctx, "entry_open_interest_refresher", None)
+
+    @entry_open_interest_refresher.setter
+    def entry_open_interest_refresher(self, value) -> None:
+        setattr(self.ctx, "entry_open_interest_refresher", value)
 
     @property
     def _entry_bbo_subscription_budgeted_keys(self) -> set[tuple[str, str]]:
@@ -757,6 +851,25 @@ class MarketDataRuntime:
         needed: dict[str, list[str]] = {}
         seen_by_venue: dict[str, set[str]] = {}
         tracked_keys: set[tuple[str, str]] = set()
+        sticky_warm_until_ms: dict[tuple[str, str], int] = dict(
+            getattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", {}) or {}
+        )
+        sticky_ttl_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "entry_ws_bbo_sticky_warm_ms",
+                    120_000,
+                )
+                or 120_000
+            ),
+            self._entry_quote_lease_max_age_ms(),
+        )
+        retained_sticky_keys = {
+            key: expires_at
+            for key, expires_at in sticky_warm_until_ms.items()
+            if int(expires_at or 0) > now_ms
+        }
         for candidate in list(candidates or []):
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
             if not symbol:
@@ -773,6 +886,21 @@ class MarketDataRuntime:
                     needed.setdefault(venue, []).append(symbol)
                     seen.add(symbol)
                 tracked_keys.add((venue, symbol))
+        current_tracked_keys = set(tracked_keys)
+        for venue, symbol in sorted(retained_sticky_keys):
+            seen = seen_by_venue.setdefault(venue, set())
+            if symbol not in seen:
+                needed.setdefault(venue, []).append(symbol)
+                seen.add(symbol)
+            tracked_keys.add((venue, symbol))
+        sticky_warm_until_ms = {
+            **retained_sticky_keys,
+            **{
+                key: now_ms + sticky_ttl_ms
+                for key in current_tracked_keys
+            },
+        }
+        setattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", sticky_warm_until_ms)
 
         if not needed:
             self._entry_bbo_subscription_budgeted_keys = set()
@@ -2083,6 +2211,197 @@ class MarketDataRuntime:
         )
 
         return decisions
+
+    def _entry_open_interest_refresher(self) -> Any:
+        refresher = getattr(self, "entry_open_interest_refresher", None)
+        if refresher is not None:
+            return refresher
+        refresher = EntryOpenInterestRefresher()
+        setattr(self, "entry_open_interest_refresher", refresher)
+        return refresher
+
+    async def _refresh_entry_candidate_open_interest_evidence(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        stats = {
+            "candidate_count": len(candidates or []),
+            "target_count": 0,
+            "attempt_count": 0,
+            "resolved_count": 0,
+            "failed_count": 0,
+            "unsupported_count": 0,
+            "timeout_count": 0,
+            "blocked_after_targeted_refresh_count": 0,
+            "targets": [],
+        }
+        if (
+            not candidates
+            or snapshot is None
+            or str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live"
+            or not bool(getattr(self.ctx.config.strategy, "execution_liquidity_enabled", True))
+        ):
+            return stats
+        if getattr(self.ctx.state, "last_scan", None) is None:
+            self.ctx.state.last_scan = {}
+
+        quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
+        targets: list[tuple[str, str, Any, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in list(candidates or []):
+            symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+            if not symbol:
+                continue
+            for venue_attr in ("long_venue", "short_venue"):
+                venue = str(getattr(candidate, venue_attr, "") or "").strip().lower()
+                if venue not in EntryOpenInterestRefresher.SUPPORTED_VENUES:
+                    continue
+                floor_getter = getattr(
+                    self.ctx,
+                    "_entry_liquidity_open_interest_floor_quote",
+                    None,
+                )
+                if callable(floor_getter) and floor_getter(venue) <= 0.0:
+                    continue
+                key = (venue, symbol)
+                if key in seen:
+                    continue
+                quote = quote_lookup.get(key)
+                if quote is None:
+                    continue
+                evidence_status = str(
+                    getattr(quote, "open_interest_evidence_status", "available")
+                    or "available"
+                ).lower()
+                if evidence_status == "available":
+                    continue
+                seen.add(key)
+                targets.append((venue, symbol, quote, evidence_status))
+
+        stats["target_count"] = len(targets)
+        stats["targets"] = [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "open_interest_evidence_status": status,
+            }
+            for venue, symbol, _quote, status in targets[:24]
+        ]
+        if not targets:
+            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
+            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
+            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
+            return stats
+
+        refresher = self._entry_open_interest_refresher()
+        refresh = getattr(refresher, "refresh_open_interest", None)
+        if not callable(refresh):
+            return stats
+
+        self.ctx.journal.append(
+            "runtime.entry_oi_targeted_refresh_started",
+            {
+                "target_count": len(targets),
+                "targets": stats["targets"],
+                "ts_ms": now_ms,
+            },
+        )
+        for venue, symbol, quote, previous_status in targets:
+            stats["attempt_count"] += 1
+            started_ms = wall_clock_now_ms()
+            try:
+                result = await refresh(venue, symbol, now_ms=now_ms)
+            except Exception as exc:  # pragma: no cover - defensive telemetry
+                result = {
+                    "open_interest_quote": 0.0,
+                    "open_interest_evidence_status": "timeout",
+                    "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                }
+            elapsed_ms = int(
+                (result or {}).get(
+                    "oi_targeted_refresh_elapsed_ms",
+                    max(wall_clock_now_ms() - started_ms, 0),
+                )
+                or 0
+            )
+            status = str(
+                (result or {}).get("open_interest_evidence_status")
+                or "unavailable"
+            ).lower()
+            reason = str(
+                (result or {}).get("open_interest_evidence_reason")
+                or status
+            )
+            open_interest_quote = float(
+                (result or {}).get("open_interest_quote", 0.0) or 0.0
+            )
+            payload = {
+                "venue": venue,
+                "symbol": symbol,
+                "previous_open_interest_evidence_status": previous_status,
+                "open_interest_evidence_status": status,
+                "open_interest_evidence_reason": reason,
+                "open_interest_quote": open_interest_quote,
+                "elapsed_ms": elapsed_ms,
+                "ts_ms": now_ms,
+            }
+            if status == "available":
+                quote.open_interest = open_interest_quote
+                quote.open_interest_evidence_status = "available"
+                quote.open_interest_evidence_reason = reason or "targeted_refresh"
+                for field in (
+                    "oi_candidate_count",
+                    "oi_cache_hit_count",
+                    "oi_cache_miss_count",
+                    "oi_refresh_attempt_count",
+                    "oi_refresh_cap",
+                    "oi_deferred_count",
+                    "oi_timeout_count",
+                    "oi_refresh_elapsed_ms",
+                ):
+                    if field in (result or {}):
+                        setattr(quote, field, int((result or {}).get(field) or 0))
+                stats["resolved_count"] += 1
+                self.ctx.journal.append(
+                    "runtime.entry_oi_targeted_refresh_resolved",
+                    payload,
+                )
+            else:
+                quote.open_interest_evidence_status = status
+                quote.open_interest_evidence_reason = reason
+                stats["failed_count"] += 1
+                stats["blocked_after_targeted_refresh_count"] += 1
+                if status == "timeout":
+                    stats["timeout_count"] += 1
+                if status == "unsupported":
+                    stats["unsupported_count"] += 1
+                self.ctx.journal.append(
+                    "runtime.entry_oi_targeted_refresh_failed",
+                    payload,
+                )
+
+        self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
+            "attempt_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
+            "resolved_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
+            "failed_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
+            "timeout_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
+            "unsupported_count"
+        ]
+        self.ctx.state.last_scan[
+            "entry_blocked_after_targeted_refresh_count"
+        ] = stats["blocked_after_targeted_refresh_count"]
+        return stats
 
     @staticmethod
     def _snapshot_quote_evidence(

@@ -279,6 +279,7 @@ class LiveRuntime:
         self._entry_bbo_subscription_budgeted_keys: set[tuple[str, str]] = set()
         self._entry_bbo_subscription_budget_excluded_keys: set[tuple[str, str]] = set()
         self._entry_bbo_subscription_per_venue_budget: int = 0
+        self._entry_bbo_sticky_warm_until_ms: dict[tuple[str, str], int] = {}
 
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
@@ -3223,6 +3224,9 @@ class LiveRuntime:
     async def _entry_quote_revalidate_for_candidates(self, candidates: list, *, snapshot, now_ms: int, candidate_scope: str='', skipped_untracked_count: int=0):
         return await self.market_data_runtime._entry_quote_revalidate_for_candidates(candidates, snapshot=snapshot, now_ms=now_ms, candidate_scope=candidate_scope, skipped_untracked_count=skipped_untracked_count)
 
+    async def _refresh_entry_candidate_open_interest_evidence(self, candidates: list, *, snapshot, now_ms: int):
+        return await self.market_data_runtime._refresh_entry_candidate_open_interest_evidence(candidates, snapshot=snapshot, now_ms=now_ms)
+
     def _clear_local_l2_runtime_state(self) -> None:
         """Drop Local-L2 runtime and persisted snapshots for non-Local-L2 profiles."""
         self.state.retained_local_l2_books = []
@@ -3535,6 +3539,21 @@ class LiveRuntime:
                     ws_bbo_data_plane,
                     _remaining_shutdown_timeout_s(),
                 ),
+            )
+
+        entry_open_interest_refresher = getattr(
+            self,
+            "entry_open_interest_refresher",
+            None,
+        )
+        if entry_open_interest_refresher is not None and hasattr(
+            entry_open_interest_refresher,
+            "close",
+        ):
+            await _await_shutdown_task(
+                "close_network",
+                "entry_open_interest_refresher.close",
+                entry_open_interest_refresher.close(),
             )
 
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
@@ -4025,6 +4044,11 @@ class LiveRuntime:
             ] = max(
                 len(l2_tracking_tradeable) - len(entry_freshness_filter_candidates),
                 0,
+            )
+            await self._refresh_entry_candidate_open_interest_evidence(
+                entry_freshness_filter_candidates,
+                snapshot=snapshot,
+                now_ms=now_ms,
             )
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 entry_freshness_filter_candidates,

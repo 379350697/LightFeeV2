@@ -4306,6 +4306,28 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "open_interest_evidence_status": "rate_limited",
             },
         },
+        {
+            "kind": "runtime.entry_oi_targeted_refresh_resolved",
+            "payload": {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+                "previous_open_interest_evidence_status": "deferred_by_cap",
+                "open_interest_evidence_status": "available",
+                "open_interest_evidence_reason": "targeted_refresh",
+                "elapsed_ms": 9,
+            },
+        },
+        {
+            "kind": "runtime.entry_oi_targeted_refresh_failed",
+            "payload": {
+                "venue": "aster",
+                "symbol": "BSBUSDT",
+                "previous_open_interest_evidence_status": "timeout",
+                "open_interest_evidence_status": "timeout",
+                "open_interest_evidence_reason": "timeout_waiting_for_oi",
+                "elapsed_ms": 101,
+            },
+        },
     ]
 
     summary = _build_entry_outcome_summary(events)
@@ -4324,6 +4346,23 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
     }
     assert summary["oi_liquidity_evidence_reason_counts"] == {
         "unknown": 2,
+    }
+    assert summary["oi_targeted_refresh_summary"] == {
+        "attempt_count": 2,
+        "resolved_count": 1,
+        "failed_count": 1,
+        "timeout_count": 1,
+        "unsupported_count": 0,
+        "entry_blocked_after_targeted_refresh_count": 1,
+        "max_elapsed_ms": 101,
+        "status_counts": {
+            "available": 1,
+            "timeout": 1,
+        },
+        "previous_status_counts": {
+            "deferred_by_cap": 1,
+            "timeout": 1,
+        },
     }
 
 

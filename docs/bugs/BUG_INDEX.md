@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Quote freshness and candidate-scoped OI evidence hard-constraint fix,
+2026-06-16:
+CL-086 deployment proved the account was flat/no-open-orders with no current
+order errors and no lifecycle unmapped drift, but no-entry attribution still
+showed actionable code-path pressure: WS-BBO final-entry targets could cold
+start between scans, and Binance/Aster OI evidence could inherit full-universe
+sidecar `deferred_by_cap` or `timeout` even when a finalist only needed two
+venue+symbol facts. CL-087 keeps the hard constraints explicit: no quote stale
+TTL is relaxed, no stale quote can authorize entry, no OI floor or liquidity
+threshold is lowered, and the global OI cap is not raised. The fix adds a
+sticky WS-BBO warm set for recent V1 primary/shadow/current finalist targets,
+adds candidate-scoped public OI refresh via the existing venue data paths, and
+runs that refresh before the unchanged entry liquidity gate. Targeted success
+only supplies evidence; the original OI floor still decides. Timeout,
+unsupported, or missing evidence remains fail-closed and is now diagnosed
+separately from sidecar cap pressure. See
+[daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh](daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh)
+and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
+
 Latest Quote/OI evidence diagnostic closure, 2026-06-16:
 Production after CL-085 was flat/no-open-orders with no current order errors
 and no lifecycle unmapped events, but no-entry attribution still had two

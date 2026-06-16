@@ -2708,6 +2708,17 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "max_refresh_cap": 0,
         "max_refresh_elapsed_ms": 0,
     }
+    oi_targeted_refresh_summary = {
+        "attempt_count": 0,
+        "resolved_count": 0,
+        "failed_count": 0,
+        "timeout_count": 0,
+        "unsupported_count": 0,
+        "entry_blocked_after_targeted_refresh_count": 0,
+        "max_elapsed_ms": 0,
+        "status_counts": {},
+        "previous_status_counts": {},
+    }
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -2783,6 +2794,38 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
                 oi_liquidity_health_summary["max_refresh_elapsed_ms"],
                 int(payload.get("oi_refresh_elapsed_ms") or 0),
             )
+        elif kind in {
+            "runtime.entry_oi_targeted_refresh_resolved",
+            "runtime.entry_oi_targeted_refresh_failed",
+        }:
+            oi_targeted_refresh_summary["attempt_count"] += 1
+            status = str(payload.get("open_interest_evidence_status") or "unknown")
+            previous_status = str(
+                payload.get("previous_open_interest_evidence_status") or "unknown"
+            )
+            status_counts = oi_targeted_refresh_summary["status_counts"]
+            status_counts[status] = status_counts.get(status, 0) + 1
+            previous_status_counts = oi_targeted_refresh_summary[
+                "previous_status_counts"
+            ]
+            previous_status_counts[previous_status] = (
+                previous_status_counts.get(previous_status, 0) + 1
+            )
+            oi_targeted_refresh_summary["max_elapsed_ms"] = max(
+                oi_targeted_refresh_summary["max_elapsed_ms"],
+                int(payload.get("elapsed_ms") or 0),
+            )
+            if kind == "runtime.entry_oi_targeted_refresh_resolved":
+                oi_targeted_refresh_summary["resolved_count"] += 1
+            else:
+                oi_targeted_refresh_summary["failed_count"] += 1
+                oi_targeted_refresh_summary[
+                    "entry_blocked_after_targeted_refresh_count"
+                ] += 1
+            if status == "timeout":
+                oi_targeted_refresh_summary["timeout_count"] += 1
+            if status == "unsupported":
+                oi_targeted_refresh_summary["unsupported_count"] += 1
         elif kind == "execution.direction_drift_blocked":
             reason = str(payload.get("reason", "") or "")
             if reason:
@@ -2838,6 +2881,15 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             sorted(oi_liquidity_evidence_reason_counts.items())
         ),
         "oi_liquidity_health_summary": oi_liquidity_health_summary,
+        "oi_targeted_refresh_summary": {
+            **oi_targeted_refresh_summary,
+            "status_counts": dict(
+                sorted(oi_targeted_refresh_summary["status_counts"].items())
+            ),
+            "previous_status_counts": dict(
+                sorted(oi_targeted_refresh_summary["previous_status_counts"].items())
+            ),
+        },
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 

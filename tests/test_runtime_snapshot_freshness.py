@@ -511,6 +511,60 @@ async def test_runtime_entry_quote_revalidate_prewarm_resolves_stale_top_candida
 
 
 @pytest.mark.asyncio
+async def test_runtime_entry_ws_bbo_sticky_warm_set_retains_previous_target(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_ws_bbo_per_venue_budget=4,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    started: list[tuple[str, tuple[str, ...]]] = []
+    pruned: list[set[tuple[str, str]]] = []
+
+    def start_ws_streams(venue, symbols, adapter=None):
+        started.append((venue, tuple(symbols)))
+        return len(symbols)
+
+    async def connect_ws_streams():
+        return 0
+
+    def prune_untracked_quotes(tracked_keys, now_ms, retained_max_age_ms):
+        pruned.append(set(tracked_keys))
+
+    monkeypatch.setattr(runtime.ws_bbo_data_plane, "start_ws_streams", start_ws_streams)
+    monkeypatch.setattr(runtime.ws_bbo_data_plane, "connect_ws_streams", connect_ws_streams)
+    monkeypatch.setattr(runtime.ws_bbo_data_plane, "prune_untracked_quotes", prune_untracked_quotes)
+
+    first = _freshness_candidate("BTCUSDT")
+    second = _freshness_candidate("ETHUSDT")
+
+    runtime.journal.open()
+    try:
+        await runtime._ensure_entry_bbo_active_for_candidates([first], 100_000)
+        started.clear()
+        await runtime._ensure_entry_bbo_active_for_candidates([second], 110_000)
+    finally:
+        runtime.journal.close()
+
+    started_by_venue = {venue: symbols for venue, symbols in started}
+    assert started_by_venue["okx"] == ("ETHUSDT", "BTCUSDT")
+    assert started_by_venue["bybit"] == ("ETHUSDT", "BTCUSDT")
+    assert ("okx", "BTCUSDT") in pruned[-1]
+    assert ("bybit", "BTCUSDT") in pruned[-1]
+    assert ("okx", "ETHUSDT") in runtime._entry_bbo_subscription_budgeted_keys
+
+
+@pytest.mark.asyncio
 async def test_runtime_last_good_top_candidate_requires_entry_quote_truth(
     tmp_path,
     monkeypatch,
@@ -2870,6 +2924,217 @@ def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(t
         for record in records
         if record["kind"] == "runtime.snapshot_freshness_decision"
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_gate(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.long_venue = "binance"
+    candidate.short_venue = "aster"
+
+    class FakeOiRefresher:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
+            self.calls.append((venue, symbol))
+            if venue == "binance" and symbol == "BTCUSDT":
+                return {
+                    "open_interest_quote": 2_500_000.0,
+                    "open_interest_evidence_status": "available",
+                    "open_interest_evidence_reason": "targeted_refresh",
+                    "oi_targeted_refresh_elapsed_ms": 7,
+                }
+            return None
+
+    refresher = FakeOiRefresher()
+    runtime.entry_open_interest_refresher = refresher
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="deferred_by_cap",
+                open_interest_evidence_reason="refresh_cap_exceeded",
+            ),
+            "aster:BTCUSDT": _quote_with_liquidity(
+                "aster",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="binance",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="aster",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+        )
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert refresher.calls == [("binance", "BTCUSDT")]
+    assert stats["attempt_count"] == 1
+    assert stats["resolved_count"] == 1
+    assert filtered == [candidate]
+    refreshed_quote = snapshot.quotes["binance:BTCUSDT"]
+    assert refreshed_quote.open_interest == 2_500_000.0
+    assert refreshed_quote.open_interest_evidence_status == "available"
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert "runtime.entry_oi_targeted_refresh_resolved" in [
+        record["kind"] for record in records
+    ]
+    assert not any(
+        record["payload"].get("reason") == "oi_evidence_unavailable"
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.long_venue = "binance"
+    candidate.short_venue = "aster"
+
+    class TimeoutOiRefresher:
+        async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
+            return {
+                "open_interest_quote": 0.0,
+                "open_interest_evidence_status": "timeout",
+                "open_interest_evidence_reason": "timeout_waiting_for_oi",
+            }
+
+    runtime.entry_open_interest_refresher = TimeoutOiRefresher()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="timeout",
+                open_interest_evidence_reason="timeout_waiting_for_oi",
+            ),
+            "aster:BTCUSDT": _quote_with_liquidity(
+                "aster",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="binance",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="aster",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+        )
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert stats["failed_count"] == 1
+    assert filtered == []
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert "runtime.entry_oi_targeted_refresh_failed" in [
+        record["kind"] for record in records
+    ]
+    decision = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+        and record["payload"]["reason"] == "oi_evidence_unavailable"
+    )
+    assert decision["open_interest_evidence_status"] == "timeout"
 
 
 def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tmp_path):

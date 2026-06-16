@@ -519,6 +519,54 @@ class TestProductionSidecarParserRegressions:
         )
 
     @pytest.mark.asyncio
+    async def test_binance_entry_open_interest_refresh_scopes_single_deferred_candidate(self):
+        symbols = [f"S{i}USDT" for i in range(8)]
+
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls: list[str] = []
+                self.binance_style_open_interest_refresh_cap = 1
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": symbol, "bidPrice": "100", "askPrice": "101"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {
+                            "symbol": symbol,
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                        }
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [
+                        {"symbol": symbol, "quoteVolume": "12345"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls.append(params["symbol"])
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+        full = await client._fetch_binance_style(symbols)
+        assert full["binance:S7USDT"].open_interest_evidence_status == "deferred_by_cap"
+
+        refreshed = await client.fetch_entry_open_interest_evidence(["S7USDT"])
+
+        assert client.oi_calls == ["S0USDT", "S7USDT"]
+        ticker = refreshed["binance:S7USDT"]
+        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert ticker.oi_candidate_count == 1
+        assert ticker.oi_deferred_count == 0
+
+    @pytest.mark.asyncio
     async def test_binance_open_interest_requires_mark_price_evidence(self):
         class FakeBinanceClient(MarketDataClient):
             async def _public_get(self, path, params=None):

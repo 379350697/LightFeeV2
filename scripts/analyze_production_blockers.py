@@ -554,6 +554,29 @@ def _record_code_side_blocker(
             if value:
                 _add_count(oi_evidence_health_summary, field, value)
 
+    if kind in {
+        "runtime.entry_oi_targeted_refresh_resolved",
+        "runtime.entry_oi_targeted_refresh_failed",
+    }:
+        if exclude_liquidity:
+            _add_count(filtered_out_counts, "liquidity")
+            return
+        _add_count(category_counts, "liquidity_evidence")
+        status = str(payload.get("open_interest_evidence_status") or "unknown")
+        reason = str(payload.get("open_interest_evidence_reason") or "unknown")
+        _add_count(reason_counts, f"oi_targeted_status:{status}")
+        _add_count(reason_counts, f"oi_targeted_reason:{reason}")
+        if kind == "runtime.entry_oi_targeted_refresh_resolved":
+            _add_count(oi_evidence_health_summary, "oi_targeted_resolved_count")
+        else:
+            _add_count(oi_evidence_health_summary, "oi_targeted_failed_count")
+        elapsed_ms = int(payload.get("elapsed_ms") or 0)
+        if elapsed_ms:
+            oi_evidence_health_summary["oi_targeted_max_elapsed_ms"] = max(
+                int(oi_evidence_health_summary.get("oi_targeted_max_elapsed_ms", 0)),
+                elapsed_ms,
+            )
+
 
 def build_code_side_blocker_view(
     records: list[dict[str, Any]],
