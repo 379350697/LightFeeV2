@@ -22,8 +22,15 @@ class EntryOpenInterestRefresher:
 
     SUPPORTED_VENUES = {"binance", "aster"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, targeted_budget_s: float | None = None) -> None:
         self._clients: dict[str, Any] = {}
+        if targeted_budget_s is None:
+            from lightfee.venues.market_data import (
+                BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
+            )
+
+            targeted_budget_s = BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S
+        self._targeted_budget_s = max(float(targeted_budget_s or 0.0), 0.0)
 
     async def close(self) -> None:
         for client in list(self._clients.values()):
@@ -42,6 +49,7 @@ class EntryOpenInterestRefresher:
 
         venue_enum = Venue.from_str(venue_key)
         client = MarketDataClient(get_spec(venue_enum))
+        client.binance_style_open_interest_enrichment_budget_s = self._targeted_budget_s
         self._clients[venue_key] = client
         return client
 

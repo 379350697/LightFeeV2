@@ -86,6 +86,7 @@ def _now_ms() -> int:
 # concurrency and normalized to quote notional via premiumIndex mark price.
 _BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY = 16
 BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
+BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S = 2.0
 BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000
 BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
 # V1 parity: per-symbol OKX funding-rate concurrency limit
@@ -600,9 +601,17 @@ class MarketDataClient:
             ]
             if tasks:
                 refresh_started_ms = _now_ms()
+                oi_budget_s = float(
+                    getattr(
+                        self,
+                        "binance_style_open_interest_enrichment_budget_s",
+                        BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
+                    )
+                    or 0.0
+                )
                 done, pending = await asyncio.wait(
                     tasks,
-                    timeout=BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
+                    timeout=max(oi_budget_s, 0.0),
                 )
                 oi_refresh_elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
                 for task in done:

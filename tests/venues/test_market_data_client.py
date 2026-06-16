@@ -8,6 +8,7 @@ import pytest
 
 from lightfee.core.domain import Venue
 from lightfee.venues.market_data import (
+    BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
     FundingTicker,
     MarketDataClient,
     PerpLiquidity,
@@ -300,6 +301,37 @@ class TestProductionSidecarParserRegressions:
             assert ticker.oi_refresh_attempt_count == 2
             assert ticker.oi_timeout_count == 2
             assert ticker.oi_refresh_elapsed_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_binance_entry_open_interest_budget_can_resolve_realistic_latency(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    await asyncio.sleep(0.2)
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient(binance_spec())
+        client.binance_style_open_interest_enrichment_budget_s = (
+            BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S
+        )
+
+        result = await asyncio.wait_for(
+            client.fetch_entry_open_interest_evidence(["BTCUSDT"]),
+            timeout=1.0,
+        )
+
+        ticker = result["binance:BTCUSDT"]
+        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert ticker.oi_timeout_count == 0
+        assert ticker.oi_refresh_attempt_count == 1
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):

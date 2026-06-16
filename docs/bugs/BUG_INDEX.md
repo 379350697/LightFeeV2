@@ -32,7 +32,10 @@ adds candidate-scoped public OI refresh via the existing venue data paths, and
 runs that refresh before the unchanged entry liquidity gate. Targeted success
 only supplies evidence; the original OI floor still decides. Timeout,
 unsupported, or missing evidence remains fail-closed and is now diagnosed
-separately from sidecar cap pressure. See
+separately from sidecar cap pressure. The candidate refresh does not reuse the
+sidecar 100ms enrichment budget: real public smoke showed Binance/Aster BTC/ETH
+OI resolves in about 354-368ms under the separate bounded entry budget, with
+valid bid/ask, positive volume, and positive OI quote. See
 [daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh](daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh)
 and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
 

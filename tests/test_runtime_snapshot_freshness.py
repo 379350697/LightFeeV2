@@ -7,6 +7,7 @@ import pytest
 
 from lightfee.core.domain import Venue
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
 from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
@@ -3035,6 +3036,19 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
         for record in records
         if record["kind"] == "runtime.snapshot_freshness_decision"
     )
+
+
+def test_entry_open_interest_refresher_uses_targeted_public_budget():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.25)
+    client = refresher._client_for_venue("binance")
+
+    assert client.binance_style_open_interest_enrichment_budget_s == pytest.approx(
+        1.25
+    )
+
+    import asyncio
+
+    asyncio.run(refresher.close())
 
 
 @pytest.mark.asyncio
