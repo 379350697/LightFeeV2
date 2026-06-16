@@ -38,6 +38,16 @@ OI resolves in about 354-368ms under the separate bounded entry budget, with
 valid bid/ask, positive volume, and positive OI quote. The new targeted OI
 runtime events are mapped as diagnostic-only entry-liquidity evidence in the V1
 lifecycle closure table so observability does not create fresh unmapped drift.
+Cloud `eb2bde2` then proved the OI/liquidity path is deploy-usable:
+targeted OI refresh resolved `38/38`, with zero failed, timeout, unsupported,
+or entry-blocked-after-targeted-refresh outcomes, and
+`full_universe_hot_path_detected=false`; sidecar-level `deferred_by_cap` and
+`timeout` evidence no longer directly kills finalists after candidate-scoped
+refresh. This is not a blanket green claim for the whole production window:
+the same since-deploy review found separate non-OI close/order follow-up
+evidence, including Binance `-5022` post-only maker rejects, `-2022`
+reduce-only rejects, and newly observed close/runtime lifecycle events that
+need their own mapping/diagnostic closure.
 See
 [daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh](daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh)
 and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
