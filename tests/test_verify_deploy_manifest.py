@@ -58,12 +58,30 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
     )
 
     assert 'REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"' in script
-    assert 'REMOTE_PYTHONPATH="PYTHONPATH=$REMOTE_PATH"' in script
-    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check /opt/lightfee-v2" in script
-    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict" in script
-    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --json" in script
-    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy" in script
+    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"' in script
+    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict' in script
+    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json' in script
+    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy' in script
+    assert "env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json" in script
     assert "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
+
+
+def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execution(tmp_path, monkeypatch):
+    _stub_manifest_generation(monkeypatch)
+
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+
+    assert f'LOCAL="{tmp_path}"' not in script
+    assert 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' in script
+    assert 'LOCAL="${LIGHTFEE_DEPLOY_LOCAL:-$DEFAULT_LOCAL}"' in script
+    assert 'if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then' in script
+    assert 'echo "=== Remote-local deploy mode: skipping rsync/scp ==="' in script
+    assert 'systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service' in script
 
 
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):

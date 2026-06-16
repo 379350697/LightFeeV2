@@ -261,14 +261,40 @@ set -euo pipefail
 REMOTE="{remote_host}:{remote_path}"
 REMOTE_HOST="{remote_host}"
 REMOTE_PATH="{remote_path}"
-LOCAL="{root}"
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+DEFAULT_LOCAL="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOCAL="${{LIGHTFEE_DEPLOY_LOCAL:-$DEFAULT_LOCAL}}"
 REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
-REMOTE_PYTHONPATH="PYTHONPATH=$REMOTE_PATH"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 
 echo "=== Generating deploy manifest ==="
 python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
+
+if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
+  echo "=== Remote-local deploy mode: skipping rsync/scp ==="
+  echo "=== Writing .deploy_version ==="
+  echo "{head}" > "$REMOTE_PATH/.deploy_version"
+
+  echo "=== Verifying deployment integrity on remote ==="
+  cd "$REMOTE_PATH"
+  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"
+
+  echo "=== Restarting production services ==="
+  systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service
+
+  echo "=== Verifying production health ==="
+  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict
+  if ! env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json; then
+    echo "=== Production health failed; collecting diagnose evidence ==="
+    env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy
+    exit 1
+  fi
+  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy
+
+  echo "=== Deploy complete: {head} ==="
+  exit 0
+fi
 
 echo "=== Syncing files to $REMOTE ==="
 rsync -avz --delete {' '.join(exclude_args)} -e "ssh $SSH_OPTS" "$LOCAL/" "$REMOTE/"
@@ -280,19 +306,19 @@ echo "=== Writing .deploy_version ==="
 echo "{head}" | ssh $SSH_OPTS {remote_host} "cat > {remote_path}/.deploy_version"
 
 echo "=== Verifying deployment integrity on remote ==="
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Restarting production services ==="
 ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service"
 
 echo "=== Verifying production health ==="
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
-if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
+if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
   echo "=== Production health failed; collecting diagnose evidence ==="
-  ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
+  ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
   exit 1
 fi
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
 
 echo "=== Deploy complete: {head} ==="
 """
