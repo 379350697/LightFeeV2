@@ -372,6 +372,62 @@ def test_diagnose_state_consistency_flags_local_open_live_leg_quantity_mismatch(
     assert "unexpected_live_position" in checks
 
 
+def test_state_consistency_accepts_exchange_side_enum_labels_for_local_open_legs():
+    local_state = {
+        "open_position_count": 1,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "positions": [{
+            "position_id": "pos-home",
+            "symbol": "HOMEUSDT",
+            "long_venue": "binance",
+            "short_venue": "bybit",
+            "quantity": 12.0,
+        }],
+    }
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": True,
+        "positions": {
+            "binance": {
+                "HOMEUSDT": {
+                    "venue": "binance",
+                    "symbol": "HOMEUSDT",
+                    "side": "Side.BUY",
+                    "quantity": 12.0,
+                },
+            },
+            "bybit": {
+                "HOMEUSDT": {
+                    "venue": "bybit",
+                    "symbol": "HOMEUSDT",
+                    "side": "Side.SELL",
+                    "quantity": 12.0,
+                },
+            },
+        },
+        "fetch_status": {
+            "binance": {"status": "ok", "positions_failed": []},
+            "bybit": {"status": "ok", "positions_failed": []},
+        },
+    }
+
+    consistency = _build_state_consistency(local_state, exchange_truth)
+    report = analyze_current_state(
+        {
+            **local_state,
+            "exchange_truth": exchange_truth,
+            "last_tick_ms": 1781531700000,
+        },
+        now_ms=1781531700100,
+        max_tick_age_ms=1_000,
+    )
+
+    assert "local_exchange_position_mismatch" not in consistency["fingerprints"]
+    assert "local_exchange_position_mismatch" not in report.fingerprints
+
+
 def test_resolver_requires_okx_capable_priority():
     text = "nameserver 42.116.255.180\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n"
     report = analyze_resolver_config(text)

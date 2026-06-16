@@ -37,6 +37,7 @@ from lightfee.engine.close_executor import (
     split_close_fill_residual,
     build_exit_pnl_attribution,
 )
+from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.residual import ResidualOrigin
 from lightfee.engine.state import OpenPosition
@@ -83,6 +84,106 @@ def _make_uncertain_error(reason: str = "order timeout") -> OrderSubmitError:
 
 def _make_rejected_error(reason: str = "order rejected") -> OrderSubmitError:
     return OrderSubmitError(SubmitFailureClass.REJECTED, reason)
+
+
+def test_exit_reconciled_payload_suppresses_duplicate_close_leg_fills():
+    runtime = CloseRuntime(ctx=None)  # payload builder is pure for this test
+    reconciliation = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "position_snapshot": {
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+        },
+    }
+    duplicate_long = OrderFill(
+        venue=Venue.BINANCE,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        price=1.1,
+        order_id="binance-close-1",
+        client_order_id="client-close-1",
+        fee_quote=0.01,
+        filled_at_ms=1781531700000,
+    )
+    short_fill = OrderFill(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        price=1.0,
+        order_id="bybit-close-1",
+        client_order_id="client-close-2",
+        fee_quote=0.01,
+        filled_at_ms=1781531700100,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation,
+        [duplicate_long, duplicate_long],
+        [short_fill],
+        now_ms=1781531700200,
+    )
+
+    assert payload["long_closed_qty"] == pytest.approx(10.0)
+    assert payload["short_closed_qty"] == pytest.approx(10.0)
+    assert payload["duplicate_close_leg_suppressed_count"] == 1
+    assert payload["duplicate_close_leg_suppressed_samples"] == [
+        {
+            "leg": "long",
+            "venue": "binance",
+            "order_id": "binance-close-1",
+            "client_order_id": "client-close-1",
+            "quantity": 10.0,
+            "average_price": 1.1,
+            "filled_at_ms": 1781531700000,
+        }
+    ]
+
+
+def test_exit_reconciled_payload_does_not_dedupe_unidentified_close_fills():
+    runtime = CloseRuntime(ctx=None)
+    reconciliation = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "position_snapshot": {
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+        },
+    }
+    unidentified_fill = OrderFill(
+        venue=Venue.BINANCE,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=5.0,
+        price=1.1,
+        order_id="",
+        client_order_id=None,
+        fee_quote=0.01,
+        filled_at_ms=1781531700000,
+    )
+    short_fill = OrderFill(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        price=1.0,
+        order_id="bybit-close-1",
+        client_order_id="client-close-2",
+        fee_quote=0.01,
+        filled_at_ms=1781531700100,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation,
+        [unidentified_fill, unidentified_fill],
+        [short_fill],
+        now_ms=1781531700200,
+    )
+
+    assert payload["long_closed_qty"] == pytest.approx(10.0)
+    assert payload["duplicate_close_leg_suppressed_count"] == 0
 
 
 # ---------------------------------------------------------------------------

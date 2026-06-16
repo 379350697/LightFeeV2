@@ -4390,6 +4390,198 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
     }
 
 
+def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1000,
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+                "reason_bucket": "rest_resolved_but_stale",
+            },
+        },
+        {
+            "ts_ms": 1001,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+                "reason_bucket": "rest_resolved_but_stale",
+            },
+        },
+        {
+            "ts_ms": 1200,
+            "kind": "runtime.entry_quote_revalidate_resolved",
+            "payload": {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 2000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {
+                "venue": "aster",
+                "symbol": "BSBUSDT",
+            },
+        },
+        {
+            "ts_ms": 2200,
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "aster",
+                "symbol": "BSBUSDT",
+                "reason_bucket": "rest_resolved_but_stale",
+            },
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+
+    assert summary["quote_rewarm_after_rest_stale_summary"] == {
+        "scheduled_count": 2,
+        "resolved_count": 1,
+        "still_stale_count": 1,
+        "timeout_count": 0,
+        "samples": [
+            {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+                "status": "resolved",
+                "scheduled_at_ms": 1001,
+                "resolved_at_ms": 1200,
+            },
+            {
+                "venue": "aster",
+                "symbol": "BSBUSDT",
+                "status": "still_stale",
+                "scheduled_at_ms": 2000,
+                "still_stale_at_ms": 2200,
+            },
+        ],
+    }
+
+
+def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnings():
+    from scripts.diagnose_live import _build_entry_quantity_terminal_summary
+
+    events = [
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-balanced-flat",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 9.0,
+                "full_target_quantity": 10.0,
+                "quantity_plan_reason": "planner_quantity_adjustment",
+            },
+        },
+        {
+            "kind": "entry.opened",
+            "payload": {
+                "entry_id": "entry-balanced-flat",
+                "position_id": "entry-balanced-flat",
+                "symbol": "HOMEUSDT",
+                "long_quantity": 9.0,
+                "short_quantity": 9.0,
+                "matched_quantity": 9.0,
+            },
+        },
+        {
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "entry-balanced-flat",
+                "symbol": "HOMEUSDT",
+                "long_closed_qty": 9.0,
+                "short_closed_qty": 9.0,
+            },
+        },
+        {
+            "kind": "pending_entry.hedge_quantity_undercut",
+            "payload": {
+                "entry_id": "entry-rounding-flat",
+                "symbol": "BSBUSDT",
+                "reason_family": "exchange_step_rounding",
+                "missing_hedge_quantity": 0.003,
+                "normalized_quantity": 0.002,
+            },
+        },
+        {
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-rounding-flat",
+                "symbol": "BSBUSDT",
+                "terminal_state": "flat",
+            },
+        },
+        {
+            "kind": "pending_entry.hedge_quantity_undercut",
+            "payload": {
+                "entry_id": "entry-active-warning",
+                "symbol": "MOVEUSDT",
+                "reason_family": "exchange_step_rounding",
+                "missing_hedge_quantity": 0.003,
+                "normalized_quantity": 0.002,
+            },
+        },
+        {
+            "kind": "pending_entry.hedge_quantity_undercut",
+            "payload": {
+                "entry_id": "entry-symbol-residual-complete",
+                "symbol": "SYMBOLUSDT",
+                "reason_family": "exchange_step_rounding",
+                "missing_hedge_quantity": 0.003,
+                "normalized_quantity": 0.002,
+            },
+        },
+        {
+            "kind": "execution.residual_repair_completed",
+            "payload": {
+                "symbol": "SYMBOLUSDT",
+            },
+        },
+    ]
+
+    summary = _build_entry_quantity_terminal_summary(events)
+
+    assert summary["common_quantity_mismatch_warning_entry_ids"] == []
+    assert summary["hedge_quantity_undercut_warning_entry_ids"] == [
+        "entry-active-warning"
+    ]
+    assert summary["resolved_quantity_adjustment_summary"] == {
+        "planner_quantity_adjustment_count": 1,
+        "hedge_exchange_step_rounding_count": 2,
+        "entry_ids": [
+            "entry-balanced-flat",
+            "entry-rounding-flat",
+            "entry-symbol-residual-complete",
+        ],
+        "samples": [
+            {
+                "entry_id": "entry-balanced-flat",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "planner_quantity_adjustment",
+                "symbol": "HOMEUSDT",
+            },
+            {
+                "entry_id": "entry-rounding-flat",
+                "kind": "hedge_quantity_undercut",
+                "reason_family": "exchange_step_rounding",
+                "symbol": "BSBUSDT",
+            },
+            {
+                "entry_id": "entry-symbol-residual-complete",
+                "kind": "hedge_quantity_undercut",
+                "reason_family": "exchange_step_rounding",
+                "symbol": "SYMBOLUSDT",
+            },
+        ],
+    }
+
+
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
     from scripts import diagnose_live as dl
 

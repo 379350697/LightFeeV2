@@ -482,6 +482,60 @@ class CloseRuntime:
             ) or "",
             "legs": leg_payloads,
         }
+
+    @staticmethod
+    def _close_leg_identity(position_id: str, leg: str, fill: Any) -> tuple[str, ...]:
+        quantity = CloseRuntime._close_reconciliation_fill_qty(fill)
+        price = _recon_fill_price(fill)
+        venue = getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", ""))
+        return (
+            str(position_id or ""),
+            str(leg or ""),
+            str(venue or "").lower(),
+            str(getattr(fill, "order_id", "") or ""),
+            str(getattr(fill, "client_order_id", None) or ""),
+            f"{quantity:.12g}",
+            f"{price:.12g}",
+            str(int(getattr(fill, "filled_at_ms", 0) or 0)),
+        )
+
+    @staticmethod
+    def _close_leg_duplicate_sample(leg: str, fill: Any) -> dict[str, Any]:
+        venue = getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", ""))
+        return {
+            "leg": str(leg or ""),
+            "venue": str(venue or "").lower(),
+            "order_id": str(getattr(fill, "order_id", "") or ""),
+            "client_order_id": str(getattr(fill, "client_order_id", None) or ""),
+            "quantity": CloseRuntime._close_reconciliation_fill_qty(fill),
+            "average_price": _recon_fill_price(fill),
+            "filled_at_ms": int(getattr(fill, "filled_at_ms", 0) or 0),
+        }
+
+    @staticmethod
+    def _deduplicate_close_leg_fills(
+        position_id: str,
+        leg: str,
+        fills: list[Any],
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        seen: set[tuple[str, ...]] = set()
+        retained: list[Any] = []
+        duplicates: list[dict[str, Any]] = []
+        for fill in fills:
+            order_id = str(getattr(fill, "order_id", "") or "")
+            client_order_id = str(getattr(fill, "client_order_id", None) or "")
+            if not order_id and not client_order_id:
+                retained.append(fill)
+                continue
+            key = CloseRuntime._close_leg_identity(position_id, leg, fill)
+            if key in seen:
+                if len(duplicates) < 12:
+                    duplicates.append(CloseRuntime._close_leg_duplicate_sample(leg, fill))
+                continue
+            seen.add(key)
+            retained.append(fill)
+        return retained, duplicates
+
     def _apply_pending_close_reconciliation_backoff(
         self,
         reconciliation: dict[str, Any],
@@ -505,6 +559,18 @@ class CloseRuntime:
         if not isinstance(snapshot, dict):
             snapshot = {}
 
+        position_id = str(reconciliation.get("position_id") or "")
+        long_fills, long_duplicates = self._deduplicate_close_leg_fills(
+            position_id,
+            "long",
+            long_fills,
+        )
+        short_fills, short_duplicates = self._deduplicate_close_leg_fills(
+            position_id,
+            "short",
+            short_fills,
+        )
+        duplicate_samples = long_duplicates + short_duplicates
         long = self._aggregate_close_reconciliation_fills(long_fills)
         short = self._aggregate_close_reconciliation_fills(short_fills)
         long_qty = float(long["quantity"])
@@ -542,6 +608,9 @@ class CloseRuntime:
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
             "venue_statement_reconciled": complete,
             "evidence_gap": not complete,
+            "duplicate_close_leg_suppressed_count": len(long_duplicates)
+            + len(short_duplicates),
+            "duplicate_close_leg_suppressed_samples": duplicate_samples[:12],
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:

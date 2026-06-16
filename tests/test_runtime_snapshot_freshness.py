@@ -1434,6 +1434,19 @@ async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucke
     assert all(payload["rest_quote_age_ms"] == 250 for payload in failures)
     assert all(payload["rest_quote_bid"] == pytest.approx(100.0) for payload in failures)
     assert all(payload["rest_quote_ask"] == pytest.approx(101.0) for payload in failures)
+    scheduled = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
+    ]
+    assert {(payload["venue"], payload["symbol"]) for payload in scheduled} == {
+        ("okx", "BTCUSDT"),
+        ("bybit", "BTCUSDT"),
+    }
+    assert set(runtime._entry_bbo_sticky_warm_until_ms) >= {
+        ("okx", "BTCUSDT"),
+        ("bybit", "BTCUSDT"),
+    }
 
 
 @pytest.mark.asyncio

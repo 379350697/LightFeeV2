@@ -41,6 +41,7 @@ from lightfee.engine.recovery_decision_core import (
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
+from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
 
 # Schema version — bump when output shape changes
@@ -1542,14 +1543,7 @@ def _local_expected_legs(local_state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _side_matches(actual: str, expected: str) -> bool:
-    actual = str(actual or "").strip().lower()
-    if "." in actual:
-        actual = actual.rsplit(".", 1)[-1]
-    if expected == "long":
-        return actual in ("buy", "long")
-    if expected == "short":
-        return actual in ("sell", "short")
-    return False
+    return side_matches_business_leg(actual, expected)
 
 
 def _exchange_truth_position_mismatches(
@@ -3041,6 +3035,9 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
 
     opened_count = len(opened_entry_ids)
     dispatched_count = len(dispatched_entry_ids)
+    quote_rewarm_after_rest_stale_summary = (
+        _build_quote_rewarm_after_rest_stale_summary(events)
+    )
     return {
         "selected_count": len(selected_entry_ids),
         "dispatched_count": dispatched_count,
@@ -3075,7 +3072,132 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
                 sorted(oi_targeted_refresh_summary["previous_status_counts"].items())
             ),
         },
+        "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _event_venue_symbol_key(payload: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(payload.get("venue") or "").strip().lower(),
+        str(payload.get("symbol") or "").strip().upper(),
+    )
+
+
+def _build_quote_rewarm_after_rest_stale_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    scheduled: list[tuple[int, tuple[str, str], dict[str, Any]]] = []
+    followups: list[tuple[int, str, tuple[str, str], dict[str, Any]]] = []
+    resolved_kinds = {
+        "runtime.entry_quote_revalidate_resolved",
+        "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
+    }
+    failure_kinds = {
+        "runtime.entry_quote_revalidate_failed",
+        "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+    }
+    for rec in events:
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        ts_ms = int(rec.get("ts_ms") or payload.get("ts_ms") or 0)
+        kind = str(rec.get("kind") or "")
+        key = _event_venue_symbol_key(payload)
+        if not key[0] or not key[1]:
+            continue
+        if kind == "runtime.entry_quote_rewarm_scheduled_after_rest_stale":
+            scheduled.append((ts_ms, key, payload))
+        elif kind in resolved_kinds or kind in failure_kinds:
+            followups.append((ts_ms, kind, key, payload))
+
+    resolved_count = 0
+    still_stale_count = 0
+    timeout_count = 0
+    samples: list[dict[str, Any]] = []
+    for scheduled_at_ms, key, _payload in scheduled:
+        status = "timeout"
+        matched_at_ms = 0
+        matched_field = "timeout_at_ms"
+        for ts_ms, kind, event_key, payload in followups:
+            if event_key != key or ts_ms < scheduled_at_ms:
+                continue
+            if kind in resolved_kinds:
+                status = "resolved"
+                matched_at_ms = ts_ms
+                matched_field = "resolved_at_ms"
+                break
+            reason_bucket = str(payload.get("reason_bucket") or "")
+            if kind in failure_kinds and reason_bucket == "rest_resolved_but_stale":
+                status = "still_stale"
+                matched_at_ms = ts_ms
+                matched_field = "still_stale_at_ms"
+                break
+        if status == "resolved":
+            resolved_count += 1
+        elif status == "still_stale":
+            still_stale_count += 1
+        else:
+            timeout_count += 1
+        if len(samples) < 12:
+            sample = {
+                "venue": key[0],
+                "symbol": key[1],
+                "status": status,
+                "scheduled_at_ms": scheduled_at_ms,
+            }
+            if matched_at_ms:
+                sample[matched_field] = matched_at_ms
+            samples.append(sample)
+
+    return {
+        "scheduled_count": len(scheduled),
+        "resolved_count": resolved_count,
+        "still_stale_count": still_stale_count,
+        "timeout_count": timeout_count,
+        "samples": samples,
+    }
+
+
+def _build_duplicate_close_leg_suppressed_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    total = 0
+    positions: set[str] = set()
+    samples: list[dict[str, Any]] = []
+    for rec in events:
+        if str(rec.get("kind") or "") != "exit.reconciled":
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        count = int(payload.get("duplicate_close_leg_suppressed_count") or 0)
+        if count <= 0:
+            continue
+        total += count
+        position_id = str(payload.get("position_id") or "")
+        if position_id:
+            positions.add(position_id)
+        for sample in payload.get("duplicate_close_leg_suppressed_samples") or []:
+            if not isinstance(sample, dict):
+                continue
+            if len(samples) >= 12:
+                break
+            samples.append({
+                "position_id": position_id,
+                "symbol": str(payload.get("symbol") or ""),
+                "leg": str(sample.get("leg") or ""),
+                "venue": str(sample.get("venue") or ""),
+                "order_id": str(sample.get("order_id") or ""),
+                "client_order_id": str(sample.get("client_order_id") or ""),
+                "quantity": _safe_float(sample.get("quantity")),
+                "average_price": _safe_float(sample.get("average_price")),
+                "filled_at_ms": int(sample.get("filled_at_ms") or 0),
+            })
+    return {
+        "duplicate_close_leg_suppressed_count": total,
+        "position_ids": sorted(positions),
+        "samples": samples,
     }
 
 
@@ -4237,6 +4359,9 @@ def run_diagnose(
         exchange_truth,
         symbol,
     )
+    duplicate_close_leg_suppressed_summary = (
+        _build_duplicate_close_leg_suppressed_summary(all_events)
+    )
     order_errors = _build_order_error_evidence(
         all_events,
         symbol,
@@ -4271,6 +4396,16 @@ def run_diagnose(
     entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
         all_events,
         production_acceptance_gate,
+    )
+    resolved_quantity_adjustment_summary = entry_quantity_terminal_summary.get(
+        "resolved_quantity_adjustment_summary",
+        {},
+    )
+    quote_rewarm_after_rest_stale_summary = (
+        production_acceptance_gate.get("entry_outcome_summary", {}).get(
+            "quote_rewarm_after_rest_stale_summary",
+            {},
+        )
     )
     if code_side_blockers or exclude_strategy or exclude_liquidity:
         from scripts.analyze_production_blockers import build_code_side_blocker_view
@@ -4317,12 +4452,15 @@ def run_diagnose(
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "resolved_terminal_zero_qty_reduce_only_summary": resolved_terminal_zero_qty_summary,
         "resolved_post_only_reject_summary": resolved_post_only_reject_summary,
+        "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
+        "resolved_quantity_adjustment_summary": resolved_quantity_adjustment_summary,
+        "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "code_side_blocker_view": code_side_blocker_view,
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,
@@ -4348,6 +4486,57 @@ def _build_entry_quantity_terminal_summary(
     quantity_mismatch_warning_entries: set[str] = set()
     quantity_warning_reason_counts: dict[str, int] = {}
     quantity_warning_samples: list[dict[str, Any]] = []
+    balanced_opened_entries: set[str] = set()
+    terminal_flat_entries: set[str] = set()
+    residual_repair_completed_entries: set[str] = set()
+    residual_repair_completed_symbols: set[str] = set()
+    resolved_quantity_adjustment_entries: set[str] = set()
+    resolved_quantity_adjustment_samples: list[dict[str, Any]] = []
+    resolved_planner_quantity_adjustment_count = 0
+    resolved_hedge_exchange_step_rounding_count = 0
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        entry_id = str(payload.get("entry_id") or payload.get("position_id") or "")
+        if kind == "execution.residual_repair_completed":
+            if entry_id:
+                residual_repair_completed_entries.add(entry_id)
+            symbol = str(payload.get("symbol") or "").upper()
+            if symbol:
+                residual_repair_completed_symbols.add(symbol)
+            continue
+        if not entry_id:
+            continue
+        if kind in {"entry.opened", "runtime.position_opened"}:
+            long_qty = _safe_float(payload.get("long_quantity"))
+            short_qty = _safe_float(payload.get("short_quantity"))
+            matched_qty = _safe_float(
+                payload.get("matched_quantity") or payload.get("quantity")
+            )
+            if (
+                long_qty > 0.0
+                and short_qty > 0.0
+                and abs(long_qty - short_qty) <= 1e-9
+                and (matched_qty <= 0.0 or abs(matched_qty - long_qty) <= 1e-9)
+            ):
+                balanced_opened_entries.add(entry_id)
+        elif kind == "exit.reconciled":
+            long_closed = _safe_float(payload.get("long_closed_qty"))
+            short_closed = _safe_float(payload.get("short_closed_qty"))
+            if (
+                long_closed > 0.0
+                and short_closed > 0.0
+                and abs(long_closed - short_closed) <= 1e-9
+            ):
+                terminal_flat_entries.add(entry_id)
+        elif kind == "runtime.position_lifecycle_terminal":
+            terminal_state = str(payload.get("terminal_state") or "").lower()
+            reason = str(payload.get("reason") or "").lower()
+            if "flat" in terminal_state or "flat" in reason:
+                terminal_flat_entries.add(entry_id)
 
     def add_warning_reason(kind_name: str, payload: dict[str, Any]) -> None:
         reason_family = str(
@@ -4428,7 +4617,27 @@ def _build_entry_quantity_terminal_summary(
             entry_id = str(payload.get("entry_id") or payload.get("position_id") or "")
             if entry_id:
                 hedge_undercut_entries.add(entry_id)
-                if entry_id not in tolerated_dust_entry_ids:
+                reason_family = str(payload.get("reason_family") or "unknown")
+                resolved_rounding = (
+                    reason_family == "exchange_step_rounding"
+                    and (
+                        entry_id in terminal_flat_entries
+                        or entry_id in residual_repair_completed_entries
+                        or str(payload.get("symbol") or "").upper()
+                        in residual_repair_completed_symbols
+                    )
+                )
+                if resolved_rounding:
+                    resolved_hedge_exchange_step_rounding_count += 1
+                    resolved_quantity_adjustment_entries.add(entry_id)
+                    if len(resolved_quantity_adjustment_samples) < 12:
+                        resolved_quantity_adjustment_samples.append({
+                            "entry_id": entry_id,
+                            "kind": "hedge_quantity_undercut",
+                            "reason_family": reason_family,
+                            "symbol": str(payload.get("symbol") or ""),
+                        })
+                elif entry_id not in tolerated_dust_entry_ids:
                     hedge_undercut_warning_entries.add(entry_id)
                     add_warning_reason("hedge_quantity_undercut", payload)
         elif kind == "execution.entry_quantity_plan":
@@ -4444,7 +4653,27 @@ def _build_entry_quantity_terminal_summary(
                 entry_id = str(payload.get("entry_id") or "")
                 if entry_id:
                     quantity_mismatch_entries.add(entry_id)
-                    if entry_id not in tolerated_dust_entry_ids:
+                    reason_family = str(
+                        payload.get("quantity_plan_reason")
+                        or payload.get("reason_family")
+                        or "unknown"
+                    )
+                    resolved_planner_adjustment = (
+                        reason_family == "planner_quantity_adjustment"
+                        and entry_id in balanced_opened_entries
+                        and entry_id in terminal_flat_entries
+                    )
+                    if resolved_planner_adjustment:
+                        resolved_planner_quantity_adjustment_count += 1
+                        resolved_quantity_adjustment_entries.add(entry_id)
+                        if len(resolved_quantity_adjustment_samples) < 12:
+                            resolved_quantity_adjustment_samples.append({
+                                "entry_id": entry_id,
+                                "kind": "common_quantity_mismatch",
+                                "reason_family": reason_family,
+                                "symbol": str(payload.get("symbol") or ""),
+                            })
+                    elif entry_id not in tolerated_dust_entry_ids:
                         quantity_mismatch_warning_entries.add(entry_id)
                         add_warning_reason("common_quantity_mismatch", payload)
 
@@ -4481,6 +4710,22 @@ def _build_entry_quantity_terminal_summary(
                 str(item.get("entry_id") or ""),
             ),
         )[:10],
+        "resolved_quantity_adjustment_summary": {
+            "planner_quantity_adjustment_count": (
+                resolved_planner_quantity_adjustment_count
+            ),
+            "hedge_exchange_step_rounding_count": (
+                resolved_hedge_exchange_step_rounding_count
+            ),
+            "entry_ids": sorted(resolved_quantity_adjustment_entries),
+            "samples": sorted(
+                resolved_quantity_adjustment_samples,
+                key=lambda item: (
+                    str(item.get("kind") or ""),
+                    str(item.get("entry_id") or ""),
+                ),
+            )[:10],
+        },
     }
 
 

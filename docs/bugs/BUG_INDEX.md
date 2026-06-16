@@ -17,6 +17,22 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest side semantics / close-leg / quantity / quote rewarm closure, 2026-06-16:
+Post-CL-089 production truth was healthy, but remaining diagnostic drift could
+still confuse future reviews: `production_health` and `diagnose_live` had
+separate side normalization, close reconciliation could double-count the same
+terminal close leg, terminal balanced planner/rounding quantity warnings stayed
+unresolved, and `rest_resolved_but_stale` did not record next-round WS-BBO
+rewarm evidence. CL-090 fixes those as diagnostic/evidence closure only. It
+adds shared side semantics for `long/short`, `buy/sell`, and enum-style
+`Side.BUY`/`Side.SELL`; de-duplicates close legs before reconciliation sums;
+moves terminal clean planner/rounding cases into
+`resolved_quantity_adjustment_summary`; and schedules/diagnoses sticky WS-BBO
+rewarm after stale REST fallback. Stale quotes remain fail-closed, and no quote
+TTL, OI floor, liquidity gate, admission, sizing, order, close, recovery, or
+lifecycle guard is loosened. See
+[daily/2026-06-16.md#cluster-cl-090-side-semantics-close-leg-dedupe-quantity-resolution-and-quote-rewarm-evidence](daily/2026-06-16.md#cluster-cl-090-side-semantics-close-leg-dedupe-quantity-resolution-and-quote-rewarm-evidence).
+
 Latest post-CL-088 lifecycle drift closure, 2026-06-16:
 After pulling `main` on cloud, manifest/service health and exchange truth were
 healthy, but the longer `diagnose_live.py --json --since-deploy` window exposed

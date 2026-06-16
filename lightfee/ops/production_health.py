@@ -9,6 +9,7 @@ from lightfee.engine.recovery_decision_core import (
 )
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+from lightfee.ops.position_side_semantics import side_matches_business_leg
 
 
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
@@ -234,12 +235,7 @@ def _local_expected_legs(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _side_matches(actual: str, expected: str) -> bool:
-    actual = str(actual or "").lower()
-    if expected == "long":
-        return actual in ("buy", "long")
-    if expected == "short":
-        return actual in ("sell", "short")
-    return False
+    return side_matches_business_leg(actual, expected)
 
 
 def _exchange_truth_position_mismatches(

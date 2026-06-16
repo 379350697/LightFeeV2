@@ -1290,6 +1290,56 @@ class MarketDataRuntime:
     ) -> bool:
         return self._entry_quote_truth_reject_reason(quote, now_ms=now_ms) == ""
 
+    def _schedule_entry_quote_rewarm_after_rest_stale(
+        self,
+        target: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        venue = str(target.get("venue") or "").strip().lower()
+        symbol = str(target.get("symbol") or "").strip().upper()
+        if not venue or not symbol:
+            return None
+        sticky_ttl_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "entry_ws_bbo_sticky_warm_ms",
+                    120_000,
+                )
+                or 120_000
+            ),
+            self._entry_quote_lease_max_age_ms(),
+        )
+        sticky_warm_until_ms: dict[tuple[str, str], int] = dict(
+            getattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", {}) or {}
+        )
+        expires_at_ms = now_ms + sticky_ttl_ms
+        sticky_warm_until_ms[(venue, symbol)] = expires_at_ms
+        setattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", sticky_warm_until_ms)
+        payload = {
+            "venue": venue,
+            "symbol": symbol,
+            "pair_id": str(target.get("pair_id") or ""),
+            "candidate_rank": int(target.get("candidate_rank") or 0),
+            "reason_bucket": "rest_resolved_but_stale",
+            "reason_family": "rest_invalid_quote",
+            "sticky_warm_until_ms": expires_at_ms,
+            "sticky_ttl_ms": sticky_ttl_ms,
+            "rest_quote_observed_at_ms": target.get("rest_quote_observed_at_ms"),
+            "rest_quote_age_ms": target.get("rest_quote_age_ms"),
+            "quote_validation_reject_reason": str(
+                target.get("quote_validation_reject_reason") or ""
+            ),
+            "source": "entry_quote_truth",
+            "ts_ms": now_ms,
+        }
+        self.ctx.journal.append(
+            "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            payload,
+        )
+        return payload
+
     def _entry_quote_truth_reject_reason(
         self,
         quote: Any,
@@ -1672,6 +1722,11 @@ class MarketDataRuntime:
                 "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
                 payload,
             )
+            if reason_bucket == "rest_resolved_but_stale":
+                self._schedule_entry_quote_rewarm_after_rest_stale(
+                    payload,
+                    now_ms=now_ms,
+                )
 
         self._entry_quote_truth_record_last_scan(stats)
         self._emit_entry_quote_revalidate_probe(
