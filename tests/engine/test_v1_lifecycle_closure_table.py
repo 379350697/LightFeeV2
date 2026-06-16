@@ -430,10 +430,18 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.entry_post_only_reject_cooldown",
         "runtime.maker_event_no_ws_bbo_quote",
         "runtime.position_drift_skipped_passive_close_owner",
+        "execution.hedge_deadline_breached",
+        "exit.compensated",
+        "runtime.risk_mode_changed",
+        "runtime.stale_fail_closed_cleared",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
     assert unmapped == []
+    assert map_lifecycle_event_kind("execution.hedge_deadline_breached") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("exit.compensated") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

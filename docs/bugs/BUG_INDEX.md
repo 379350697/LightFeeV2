@@ -17,6 +17,19 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest post-CL-088 lifecycle drift closure, 2026-06-16:
+After pulling `main` on cloud, manifest/service health and exchange truth were
+healthy, but the longer `diagnose_live.py --json --since-deploy` window exposed
+four second-order unmapped lifecycle events:
+`execution.hedge_deadline_breached`, `exit.compensated`,
+`runtime.risk_mode_changed`, and `runtime.stale_fail_closed_cleared`. CL-089
+keeps the no-drift lifecycle contract without changing trading behavior: close
+deadline/compensation evidence maps to `PASSIVE_CLOSE`, and stale fail-closed
+risk-mode recovery evidence maps to `RECOVERY_TRUTH`. No quote stale TTL, OI
+floor, liquidity gate, admission, sizing, order, close, or recovery guard is
+loosened. See
+[daily/2026-06-16.md#cluster-cl-089-post-cl-088-lifecycle-second-order-unmapped-drift](daily/2026-06-16.md#cluster-cl-089-post-cl-088-lifecycle-second-order-unmapped-drift).
+
 Latest Binance post-only and lifecycle diagnostic closure, 2026-06-16:
 CL-087 proved the OI/liquidity targeted refresh path is deploy-usable, but the
 same production window exposed a separate non-OI diagnostic drift. The account
