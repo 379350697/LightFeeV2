@@ -27,12 +27,15 @@ diagnostic event `runtime.entry_quote_rewarm_scheduled_after_rest_stale` was
 not yet mapped in the V1 lifecycle closure table, so
 `diagnose_live.py --json --since-deploy` still reported one unmapped event.
 CL-092 maps that event to `ENTRY_QUOTE_LEASE` and adds RED/GREEN regression
-coverage. The quote rewarm watch remains separate: the same cloud window showed
-`scheduled=28`, `resolved=1`, `still_stale=27`, mainly sampled on tail
-candidates such as Aster `XCNUSDT`, Aster `EDENUSDT`, and Binance
-`STABLEUSDT`. Stale quotes remain fail-closed; no quote TTL, OI floor,
-liquidity gate, admission, sizing, order, close, recovery, or lifecycle guard
-is loosened. See
+coverage. Cloud `279039c` passed manifest, singleton, production services, and
+since-deploy diagnose with `gate_passed=true`, `order_error_evidence=[]`,
+`top_exchange_errors=[]`, high-confidence exchange flat/no-open-orders, and
+`v1_lifecycle_closure.unmapped_event_kinds=[]`. The quote rewarm watch remains
+separate: the pre-fix cloud window showed `scheduled=28`, `resolved=1`,
+`still_stale=27`, mainly sampled on tail candidates such as Aster `XCNUSDT`,
+Aster `EDENUSDT`, and Binance `STABLEUSDT`. Stale quotes remain fail-closed;
+no quote TTL, OI floor, liquidity gate, admission, sizing, order, close,
+recovery, or lifecycle guard is loosened. See
 [daily/2026-06-16.md#cluster-cl-092-entry-quote-rewarm-lifecycle-unmapped-drift](daily/2026-06-16.md#cluster-cl-092-entry-quote-rewarm-lifecycle-unmapped-drift).
 
 Latest passive close terminal-truth diagnostic closure, 2026-06-16:
