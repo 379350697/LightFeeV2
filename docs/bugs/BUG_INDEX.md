@@ -34,6 +34,14 @@ guard is loosened. The fix maps the new lifecycle events, adds
 truth, and adds quantity warning reason buckets plus source payload evidence.
 Missing cooldown or unclean truth remains active `order_error_evidence`. See
 [daily/2026-06-16.md#cluster-cl-088-binance-post-only-boundary-reject-lifecycle-drift-and-quantity-evidence](daily/2026-06-16.md#cluster-cl-088-binance-post-only-boundary-reject-lifecycle-drift-and-quantity-evidence).
+Cloud `241505d` was then verified with matching `.deploy_version`, manifest
+integrity, active singleton services, `verify_production_services.py --json`
+green, high-confidence flat/no-open-orders exchange truth, no abnormal
+positions, no single-leg/open-order residue, `order_error_evidence=[]`,
+`top_exchange_errors=[]`, and
+`v1_lifecycle_closure.unmapped_event_kinds=[]`. The same short since-deploy
+window kept OI/liquidity targeted refresh usable (`12/12` resolved, zero
+failed/timeout/unsupported/entry-blocked).
 
 Latest Quote freshness and candidate-scoped OI evidence hard-constraint fix,
 2026-06-16:
