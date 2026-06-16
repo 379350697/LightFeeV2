@@ -17,7 +17,7 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest Aster/Binance quote lease and OI evidence local closure, 2026-06-15:
+Latest Aster/Binance quote lease and OI evidence closure, 2026-06-15:
 The current follow-up does not loosen entry risk. It closes a diagnostic and
 market-truth semantic gap left by replacing V1 local L2 with V2 WS-BBO: quote
 stale now separates untracked/disconnected/subscribed-no-message/stale-WS and
@@ -28,8 +28,10 @@ Aster has bookTicker paths but no confirmed bulk V3 OI path in the referenced
 docs. CL-085 therefore follows the official exchange data paths while preserving
 the V1 business contract: entry requires fresh top-book truth and fail-closed
 liquidity/OI evidence, but slow enrichment must not block quote/funding
-publication. Local verification is still in progress, so this remains deploy
-pending. See
+publication. Cloud `2306922` passed manifest, remote compileall, singleton,
+production verifier, and since-deploy diagnose with exchange truth
+flat/no-open-orders, no active order errors, `unmapped_event_kinds=[]`, and
+`gate_passed=true`. See
 [daily/2026-06-15.md#cluster-cl-085-asterbinance-ws-bbo-quote-lease-and-oi-evidence-closure](daily/2026-06-15.md#cluster-cl-085-asterbinance-ws-bbo-quote-lease-and-oi-evidence-closure)
 and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
 
