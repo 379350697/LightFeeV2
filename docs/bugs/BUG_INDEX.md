@@ -29,6 +29,10 @@ risk-mode recovery evidence maps to `RECOVERY_TRUTH`. No quote stale TTL, OI
 floor, liquidity gate, admission, sizing, order, close, or recovery guard is
 loosened. See
 [daily/2026-06-16.md#cluster-cl-089-post-cl-088-lifecycle-second-order-unmapped-drift](daily/2026-06-16.md#cluster-cl-089-post-cl-088-lifecycle-second-order-unmapped-drift).
+Cloud `42a71a9` passed manifest, singleton, production verifier, and
+`diagnose_live.py --json --since-deploy` with high-confidence
+flat/no-open-orders exchange truth, `order_error_evidence=[]`,
+`gate_passed=true`, and `v1_lifecycle_closure.unmapped_event_kinds=[]`.
 
 Latest Binance post-only and lifecycle diagnostic closure, 2026-06-16:
 CL-087 proved the OI/liquidity targeted refresh path is deploy-usable, but the
