@@ -432,6 +432,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.position_drift_skipped_passive_close_owner",
         "execution.hedge_deadline_breached",
         "exit.compensated",
+        "exit.retry_wait",
+        "exit.close_chunk_submitted",
+        "exit.close_residual_detected",
+        "exit.closed",
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
     ]
@@ -440,6 +444,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert unmapped == []
     assert map_lifecycle_event_kind("execution.hedge_deadline_breached") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.compensated") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("exit.retry_wait") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("exit.close_chunk_submitted") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("exit.close_residual_detected") == "RESIDUAL_REPAIR"
+    assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
 

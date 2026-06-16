@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest passive close terminal-truth diagnostic closure, 2026-06-16:
+Post-CL-090 cloud review found production truth healthy
+(flat/no-open-orders, no abnormal position, no single-leg exposure, no
+open-order residue), but HOMEUSDT passive close diagnostics still scattered
+terminal close artifacts into unresolved order errors. The same lifecycle had
+terminal flat truth, yet Binance reduce-only post-only maker close `-5022`,
+Binance reduce-only `-2022`, and zero-fill evidence still appeared under
+`order_error_evidence`; the same window also exposed unmapped close events:
+`exit.retry_wait`, `exit.close_chunk_submitted`,
+`exit.close_residual_detected`, and `exit.closed`. CL-091 adds explicit V1
+lifecycle mappings, introduces `resolved_close_order_error_summary` for
+reduce-only close errors proven by terminal flat truth and clean exchange
+truth, and lets residual lifecycle completion match both position and symbol
+keys. Entry post-only `-5022` remains a separate semantic bucket and still
+requires entry cooldown/reprice evidence. No quote stale TTL, OI floor,
+liquidity gate, admission, sizing, order, close, recovery, or lifecycle guard
+is loosened. See
+[daily/2026-06-16.md#cluster-cl-091-passive-close-terminal-truth-order-error-and-lifecycle-drift](daily/2026-06-16.md#cluster-cl-091-passive-close-terminal-truth-order-error-and-lifecycle-drift).
+
 Latest side semantics / close-leg / quantity / quote rewarm closure, 2026-06-16:
 Post-CL-089 production truth was healthy, but remaining diagnostic drift could
 still confuse future reviews: `production_health` and `diagnose_live` had

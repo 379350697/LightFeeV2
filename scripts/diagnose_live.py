@@ -1846,6 +1846,14 @@ def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
     return values
 
 
+def _strong_order_identity_values(payload: dict[str, Any]) -> set[str]:
+    return {
+        value
+        for value in _truth_gap_identity_values(payload)
+        if not value.startswith(("symbol:", "venue_symbol:"))
+    }
+
+
 def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:
     exchange_error = payload.get("exchange_error")
     return exchange_error if isinstance(exchange_error, dict) else {}
@@ -2105,6 +2113,15 @@ def _order_error_resolved_by_terminal_zero_qty(
     return bool(position_id and position_id in resolved)
 
 
+def _payload_request_context(payload: dict[str, Any]) -> dict[str, Any]:
+    request_context = payload.get("request_context")
+    if isinstance(request_context, dict):
+        return request_context
+    exchange_error = _exchange_error_dict(payload)
+    request_context = exchange_error.get("request_context")
+    return request_context if isinstance(request_context, dict) else {}
+
+
 def _boolish(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -2112,6 +2129,266 @@ def _boolish(value: Any) -> bool:
         return value != 0
     text = str(value or "").strip().lower()
     return text in {"1", "true", "yes", "y", "on"}
+
+
+def _payload_is_binance_close_post_only_boundary_reject(payload: dict[str, Any]) -> bool:
+    exchange_error = _exchange_error_dict(payload)
+    request_context = _payload_request_context(payload)
+    venue = str(
+        payload.get("venue")
+        or payload.get("maker_venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).lower()
+    if venue != "binance":
+        return False
+    code = str(
+        payload.get("exchange_code")
+        or exchange_error.get("exchange_code")
+        or ""
+    )
+    reason_text = " ".join(
+        str(part or "")
+        for part in (
+            payload.get("reason"),
+            payload.get("error"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    ).lower()
+    if code != "-5022" and not any(
+        token in reason_text
+        for token in (
+            "-5022",
+            "gtx_order_reject",
+            "could not be executed as maker",
+            "post only order will be rejected",
+        )
+    ):
+        return False
+    return (
+        _boolish(request_context.get("post_only"))
+        and _boolish(request_context.get("reduce_only"))
+    )
+
+
+def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> bool:
+    request_context = _payload_request_context(payload)
+    if not _boolish(request_context.get("reduce_only")):
+        return False
+    exchange_error = _exchange_error_dict(payload)
+    code = str(
+        payload.get("exchange_code")
+        or exchange_error.get("exchange_code")
+        or ""
+    )
+    reason_text = " ".join(
+        str(part or "")
+        for part in (
+            payload.get("reason"),
+            payload.get("error"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    ).lower()
+    return (
+        code == "-2022"
+        or "reduceonly order is rejected" in reason_text
+        or "reduce only order is rejected" in reason_text
+        or "reduce-only order is rejected" in reason_text
+    )
+
+
+def _payload_is_zero_fill_terminal_flat(payload: dict[str, Any]) -> bool:
+    reason = str(payload.get("reason") or payload.get("error") or "").lower()
+    return "zero fill" in reason
+
+
+def _build_resolved_close_order_error_summary(
+    events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any],
+    symbol: str = "",
+) -> dict[str, Any]:
+    current_clean = (
+        _exchange_truth_flat(exchange_truth)
+        and _exchange_truth_no_open_orders(exchange_truth)
+    )
+    target_symbol = symbol.upper()
+    terminal_positions: set[str] = set()
+    terminal_identity_values: set[str] = set()
+    post_only_resolved: list[dict[str, Any]] = []
+    reduce_only_resolved: list[dict[str, Any]] = []
+    zero_fill_resolved: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol") or "").upper()
+        if target_symbol and event_symbol and event_symbol != target_symbol:
+            continue
+        position_id = str(payload.get("position_id") or "")
+        if not position_id:
+            continue
+        terminal = False
+        if kind == "exit.passive_close_resolved":
+            terminal = (
+                payload.get("live_flat_terminal") is not False
+                and payload.get("problem") is not True
+            )
+        elif kind == "runtime.position_lifecycle_terminal":
+            terminal = (
+                str(payload.get("terminal_state") or "").lower() == "flat"
+                and payload.get("problem") is not True
+            )
+        elif kind == "execution.residual_repair_completed":
+            terminal = str(payload.get("result") or "").lower() in {
+                "already_flat",
+                "completed",
+                "flat",
+            }
+        elif kind in {"order.filled", "exit.close_chunk_submitted", "exit.closed"}:
+            terminal = True
+        if terminal:
+            terminal_positions.add(position_id)
+            terminal_identity_values.update(_strong_order_identity_values(payload))
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        if kind not in ORDER_ERROR_KINDS:
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol") or "").upper()
+        if target_symbol and event_symbol and event_symbol != target_symbol:
+            continue
+        position_id = str(payload.get("position_id") or "")
+        if not position_id or position_id not in terminal_positions:
+            continue
+        identities = _strong_order_identity_values(payload)
+        position_terminal_match = (
+            f"position_id:{position_id.lower()}" in terminal_identity_values
+        )
+        order_identities = {
+            value for value in identities
+            if not value.startswith("position_id:")
+        }
+        order_terminal_match = bool(order_identities & terminal_identity_values)
+        is_post_only_close_reject = _payload_is_binance_close_post_only_boundary_reject(
+            payload
+        )
+        is_reduce_only_terminal_reject = _payload_is_reduce_only_terminal_flat_reject(
+            payload
+        )
+        is_zero_fill_terminal = (
+            kind == "order.uncertain"
+            and _payload_is_zero_fill_terminal_flat(payload)
+        )
+        if not current_clean:
+            continue
+        if is_post_only_close_reject:
+            if not position_terminal_match:
+                continue
+        elif is_reduce_only_terminal_reject or is_zero_fill_terminal:
+            if not (
+                order_terminal_match
+                or (not order_identities and position_terminal_match)
+            ):
+                continue
+        else:
+            continue
+
+        exchange_error = _exchange_error_dict(payload)
+        sample = {
+            "kind": kind,
+            "position_id": position_id,
+            "symbol": event_symbol or str(_payload_request_context(payload).get("symbol") or "").upper(),
+            "venue": str(
+                payload.get("venue")
+                or exchange_error.get("venue")
+                or _payload_request_context(payload).get("venue")
+                or ""
+            ).lower(),
+            "exchange_code": str(
+                payload.get("exchange_code")
+                or exchange_error.get("exchange_code")
+                or ""
+            ),
+            "reason": str(
+                payload.get("reason")
+                or payload.get("error")
+                or exchange_error.get("exchange_msg")
+                or ""
+            )[:300],
+            "ts_ms": rec.get("ts_ms", 0),
+        }
+        if is_post_only_close_reject:
+            post_only_resolved.append(sample)
+        elif is_reduce_only_terminal_reject:
+            reduce_only_resolved.append(sample)
+        elif is_zero_fill_terminal:
+            zero_fill_resolved.append(sample)
+        else:
+            continue
+        if len(samples) < 10:
+            samples.append(sample)
+
+    resolved_identities = set(terminal_identity_values)
+    resolved_identities.update(f"position_id:{position_id.lower()}" for position_id in terminal_positions)
+    resolved_positions = {
+        sample["position_id"]
+        for sample in post_only_resolved + reduce_only_resolved + zero_fill_resolved
+        if sample.get("position_id")
+    }
+    return {
+        "count": len(post_only_resolved) + len(reduce_only_resolved) + len(zero_fill_resolved),
+        "post_only_boundary_reject_count": len(post_only_resolved),
+        "reduce_only_terminal_flat_count": len(reduce_only_resolved),
+        "zero_fill_terminal_flat_count": len(zero_fill_resolved),
+        "position_ids": sorted(resolved_positions),
+        "resolved_identities": sorted(resolved_identities),
+        "current_exchange_truth_clean": current_clean,
+        "samples": samples,
+    }
+
+
+def _order_error_resolved_by_close_terminal_truth(
+    payload: dict[str, Any],
+    resolved_close_summary: dict[str, Any] | None,
+) -> bool:
+    if not resolved_close_summary:
+        return False
+    if int(resolved_close_summary.get("count", 0) or 0) <= 0:
+        return False
+    if resolved_close_summary.get("current_exchange_truth_clean") is not True:
+        return False
+    resolved = set(resolved_close_summary.get("resolved_identities", []) or [])
+    identities = _strong_order_identity_values(payload)
+    position_id = str(payload.get("position_id") or "")
+    position_terminal_match = bool(
+        position_id
+        and f"position_id:{position_id.lower()}" in resolved
+    )
+    order_identities = {
+        value for value in identities
+        if not value.startswith("position_id:")
+    }
+    order_terminal_match = bool(order_identities & resolved)
+    if _payload_is_binance_close_post_only_boundary_reject(payload):
+        return position_terminal_match
+    if (
+        _payload_is_reduce_only_terminal_flat_reject(payload)
+        or _payload_is_zero_fill_terminal_flat(payload)
+    ):
+        return bool(
+            order_terminal_match
+            or (not order_identities and position_terminal_match)
+        )
+    return False
 
 
 def _payload_is_binance_post_only_boundary_reject(payload: dict[str, Any]) -> bool:
@@ -2290,6 +2567,7 @@ def _build_order_error_evidence(
     resolved_truth_gap_summary: dict[str, Any] | None = None,
     resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
     resolved_post_only_summary: dict[str, Any] | None = None,
+    resolved_close_order_error_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
 
@@ -2318,6 +2596,11 @@ def _build_order_error_evidence(
         if _order_error_resolved_by_post_only_boundary_reject(
             payload,
             resolved_post_only_summary,
+        ):
+            continue
+        if _order_error_resolved_by_close_terminal_truth(
+            payload,
+            resolved_close_order_error_summary,
         ):
             continue
 
@@ -2799,9 +3082,9 @@ def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str,
                 all_residuals_completed = True
 
         if _is_residual_completion(kind, payload):
-            residual_key = symbol or key
-            if residual_key:
-                residual_completed_keys.add(residual_key)
+            residual_candidates = {value for value in (key, symbol) if value}
+            if residual_candidates:
+                residual_completed_keys.update(residual_candidates)
             else:
                 all_residuals_completed = True
 
@@ -4359,6 +4642,11 @@ def run_diagnose(
         exchange_truth,
         symbol,
     )
+    resolved_close_order_error_summary = _build_resolved_close_order_error_summary(
+        all_events,
+        exchange_truth,
+        symbol,
+    )
     duplicate_close_leg_suppressed_summary = (
         _build_duplicate_close_leg_suppressed_summary(all_events)
     )
@@ -4368,6 +4656,7 @@ def run_diagnose(
         resolved_order_truth_gap_summary,
         resolved_terminal_zero_qty_summary,
         resolved_post_only_reject_summary,
+        resolved_close_order_error_summary,
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
@@ -4452,6 +4741,7 @@ def run_diagnose(
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "resolved_terminal_zero_qty_reduce_only_summary": resolved_terminal_zero_qty_summary,
         "resolved_post_only_reject_summary": resolved_post_only_reject_summary,
+        "resolved_close_order_error_summary": resolved_close_order_error_summary,
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,

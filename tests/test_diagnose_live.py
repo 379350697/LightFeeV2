@@ -5011,6 +5011,276 @@ def test_run_diagnose_keeps_binance_post_only_reject_without_cooldown(monkeypatc
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_resolves_home_passive_close_order_errors_by_terminal_truth(monkeypatch):
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1781615110000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+        events = [
+            {
+                "ts_ms": 1781615103784,
+                "kind": "exit.passive_close_maker_submit_error",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "venue": "binance",
+                    "error": "HTTP 400: {\"code\":-5022,\"msg\":\"Post Only order will be rejected\"}",
+                    "exchange_error": {
+                        "venue": "binance",
+                        "operation": "submit_passive_order",
+                        "http_status": 400,
+                        "raw_body": '{"code":-5022,"msg":"Post Only order will be rejected"}',
+                        "exchange_code": "-5022",
+                        "exchange_msg": "Post Only order will be rejected",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                        "request_context": {
+                            "symbol": "HOMEUSDT",
+                            "side": "sell",
+                            "quantity": 830.0,
+                            "reduce_only": True,
+                            "post_only": True,
+                            "client_order_id": "lfexade7189709dfb9ea",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "HOMEUSDT",
+                        "side": "sell",
+                        "quantity": 830.0,
+                        "reduce_only": True,
+                        "post_only": True,
+                        "client_order_id": "lfexade7189709dfb9ea",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781615104321,
+                "kind": "exit.passive_close_dual_taker_drive",
+                "payload": {"position_id": "entry-1781614327885-HOMEUSDT"},
+            },
+            {
+                "ts_ms": 1781615104673,
+                "kind": "order.uncertain",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "leg": "short",
+                    "reason": "order accepted but fill not confirmed",
+                    "client_order_id": "lfxs91799175d6b1dae6",
+                    "exchange_error": {
+                        "venue": "bybit",
+                        "operation": "place_order",
+                        "exchange_code": "0",
+                        "exchange_msg": "OK",
+                        "evidence_completeness": "partial",
+                        "missing_evidence": ["fill_confirmation"],
+                        "request_context": {
+                            "symbol": "HOMEUSDT",
+                            "side": "buy",
+                            "quantity": 830.0,
+                            "reduce_only": True,
+                            "client_order_id": "lfxs91799175d6b1dae6",
+                        },
+                        "extra": {
+                            "order_ack_only": True,
+                            "accepted_order_id": "25ca666a-d038-4d34-9123-7551a3bb153c",
+                            "accepted_client_order_id": "lfxs91799175d6b1dae6",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "HOMEUSDT",
+                        "side": "buy",
+                        "quantity": 830.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfxs91799175d6b1dae6",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781615105952,
+                "kind": "order.reconcile_result",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "venue": "bybit",
+                    "symbol": "HOMEUSDT",
+                    "order_id": "25ca666a-d038-4d34-9123-7551a3bb153c",
+                    "client_order_id": "lfxs91799175d6b1dae6",
+                    "status": "full",
+                    "reason": "duplicate_client_id",
+                    "target_qty": 830.0,
+                    "reconciled_qty": 830.0,
+                    "live_qty": 0.0,
+                    "next_action": "clear_live_flat",
+                },
+            },
+            {
+                "ts_ms": 1781615106060,
+                "kind": "order.uncertain",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "leg": "long",
+                    "reason": "zero fill",
+                    "client_order_id": "lfxl2d990a62d66df2f9",
+                },
+            },
+            {
+                "ts_ms": 1781615107164,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "leg": "long",
+                    "reason": "HTTP 400: {\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}",
+                    "client_order_id": "lfxl2d990a62d66df2f9",
+                    "exchange_error": {
+                        "venue": "binance",
+                        "operation": "place_order",
+                        "http_status": 400,
+                        "raw_body": '{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+                        "exchange_code": "-2022",
+                        "exchange_msg": "ReduceOnly Order is rejected.",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                        "request_context": {
+                            "symbol": "HOMEUSDT",
+                            "side": "sell",
+                            "quantity": 830.0,
+                            "reduce_only": True,
+                            "post_only": False,
+                            "client_order_id": "lfxl2d990a62d66df2f9",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "HOMEUSDT",
+                        "side": "sell",
+                        "quantity": 830.0,
+                        "reduce_only": True,
+                        "post_only": False,
+                        "client_order_id": "lfxl2d990a62d66df2f9",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781615107314,
+                "kind": "order.filled",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "leg": "long",
+                    "reason": "terminal_reduce_only",
+                    "exchange_verified_flat": True,
+                    "client_order_id": "lfxl2d990a62d66df2f9",
+                },
+            },
+            {
+                "ts_ms": 1781615107314,
+                "kind": "exit.close_chunk_submitted",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "short_client_order_id": "lfxs91799175d6b1dae6",
+                    "long_client_order_id": "lfxl2d990a62d66df2f9",
+                    "short_outcome": "filled",
+                    "long_outcome": "filled",
+                },
+            },
+            {
+                "ts_ms": 1781615107314,
+                "kind": "exit.close_residual_detected",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "exposure_quantity": 830.0,
+                    "exposure_venue": "binance",
+                    "close_id": "close-entry-1781614327885-HOMEUSDT-1781615104525",
+                },
+            },
+            {
+                "ts_ms": 1781615104525,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "reason": "funding_capture",
+                    "long_closed_qty": 0.0,
+                    "short_closed_qty": 830.0,
+                    "close_id": "close-entry-1781614327885-HOMEUSDT-1781615104525",
+                    "long_client_order_id": "lfxl2d990a62d66df2f9",
+                    "short_client_order_id": "lfxs91799175d6b1dae6",
+                },
+            },
+            {
+                "ts_ms": 1781615108091,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "resolution_source": "fallback_live_balanced_matched_close_flat_probe",
+                    "terminal_close_execution": True,
+                    "live_flat_terminal": True,
+                    "problem": False,
+                    "long_closed_qty": 830.0,
+                    "short_closed_qty": 830.0,
+                },
+            },
+            {
+                "ts_ms": 1781615108092,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "fallback_live_balanced_matched_close_flat_probe",
+                    "problem": False,
+                },
+            },
+            {
+                "ts_ms": 1781615108467,
+                "kind": "execution.residual_repair_completed",
+                "payload": {
+                    "position_id": "entry-1781614327885-HOMEUSDT",
+                    "symbol": "HOMEUSDT",
+                    "origin": "close_residual",
+                    "result": "already_flat",
+                    "live_excess_quantity": 0.0,
+                },
+            },
+        ]
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["binance", "bybit"],
+            now_ms=1781615115000,
+        )
+
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        summary = result["resolved_close_order_error_summary"]
+        assert summary["current_exchange_truth_clean"] is True
+        assert summary["post_only_boundary_reject_count"] == 1
+        assert summary["reduce_only_terminal_flat_count"] == 1
+        assert summary["zero_fill_terminal_flat_count"] == 1
+        assert summary["position_ids"] == ["entry-1781614327885-HOMEUSDT"]
+        gate = result["production_acceptance_gate"]
+        assert gate["v1_lifecycle_closure"]["unmapped_event_kinds"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Local open position + exchange flat -> state_mismatch=true
 # ---------------------------------------------------------------------------
