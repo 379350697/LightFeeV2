@@ -294,7 +294,7 @@ class TestProductionSidecarParserRegressions:
             assert ticker.bid > 0.0
             assert ticker.ask > 0.0
             assert ticker.open_interest_quote == 0.0
-            assert ticker.open_interest_evidence_status == "unavailable"
+            assert ticker.open_interest_evidence_status == "timeout"
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):
@@ -320,7 +320,7 @@ class TestProductionSidecarParserRegressions:
         assert ticker.bid == 100.0
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == 0.0
-        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_evidence_status == "http_error"
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_429_does_not_drop_quotes(self):
@@ -346,7 +346,7 @@ class TestProductionSidecarParserRegressions:
         assert ticker.bid == 100.0
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == 0.0
-        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_evidence_status == "rate_limited"
 
     @pytest.mark.asyncio
     async def test_binance_missing_premium_index_still_skips_non_perpetual(self):
@@ -430,6 +430,75 @@ class TestProductionSidecarParserRegressions:
         assert ticker.open_interest_evidence_status == "available"
 
     @pytest.mark.asyncio
+    async def test_binance_open_interest_cache_hit_avoids_repeated_per_symbol_request(self):
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls += 1
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+
+        first = await client._fetch_binance_style(["BTCUSDT"])
+        second = await client._fetch_binance_style(["BTCUSDT"])
+
+        assert client.oi_calls == 1
+        assert first["binance:BTCUSDT"].open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert first["binance:BTCUSDT"].open_interest_evidence_status == "available"
+        assert second["binance:BTCUSDT"].open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert second["binance:BTCUSDT"].open_interest_evidence_status == "available"
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_refresh_is_capped_and_deferred_symbols_are_explicit(self):
+        symbols = [f"S{i}USDT" for i in range(8)]
+
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls: list[str] = []
+                self.binance_style_open_interest_refresh_cap = 3
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": symbol, "bidPrice": "100", "askPrice": "101"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {"symbol": symbol, "lastFundingRate": "0.0001", "markPrice": "100.5"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": symbol, "quoteVolume": "12345"} for symbol in symbols]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls.append(params["symbol"])
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+        result = await client._fetch_binance_style(symbols)
+
+        assert len(client.oi_calls) == 3
+        statuses = {
+            ticker.symbol: ticker.open_interest_evidence_status
+            for ticker in result.values()
+        }
+        assert list(statuses.values()).count("available") == 3
+        assert list(statuses.values()).count("deferred_by_cap") == 5
+
+    @pytest.mark.asyncio
     async def test_binance_open_interest_requires_mark_price_evidence(self):
         class FakeBinanceClient(MarketDataClient):
             async def _public_get(self, path, params=None):
@@ -466,9 +535,9 @@ class TestProductionSidecarParserRegressions:
         zero_mark = result["binance:ZEROMARKUSDT"]
         missing_mark = result["binance:MISSINGMARKUSDT"]
         assert zero_mark.open_interest_quote == 0.0
-        assert zero_mark.open_interest_evidence_status == "unavailable"
+        assert zero_mark.open_interest_evidence_status == "missing_mark_price"
         assert missing_mark.open_interest_quote == 0.0
-        assert missing_mark.open_interest_evidence_status == "unavailable"
+        assert missing_mark.open_interest_evidence_status == "missing_mark_price"
 
     @pytest.mark.asyncio
     async def test_okx_funding_rate_requests_are_concurrent(self):

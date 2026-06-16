@@ -1369,6 +1369,7 @@ class EntryGateRuntime:
             "budget_excluded_without_rest_count",
             "quote_revalidate_sources",
             "top_quote_blocker_buckets",
+            "quote_lease_failure_counts",
             "selection_bucket_counts",
             "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
@@ -1574,6 +1575,9 @@ class EntryGateRuntime:
             },
             "top_quote_blocker_buckets": dict(
                 last_scan.get("top_quote_blocker_buckets", {}) or {}
+            ),
+            "quote_lease_failure_counts": dict(
+                last_scan.get("quote_lease_failure_counts", {}) or {}
             ),
             "candidate_stage_blocked_counts": {
                 key: value
@@ -1831,6 +1835,9 @@ class EntryGateRuntime:
             ),
             "top_quote_blocker_buckets": dict(
                 last_scan.get("top_quote_blocker_buckets", {}) or {}
+            ),
+            "quote_lease_failure_counts": dict(
+                last_scan.get("quote_lease_failure_counts", {}) or {}
             ),
         }
         pipeline_counts = {

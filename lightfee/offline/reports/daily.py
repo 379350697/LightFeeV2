@@ -86,6 +86,9 @@ def generate_daily_snapshot(
         "local_l2_sequence_gap_by_reason": dict(report.local_l2_sequence_gap_by_reason),
         "local_l2_sync_failed_by_category": dict(report.local_l2_sync_failed_by_category),
         "entry_liquidity_blocked_by_reason": dict(report.entry_liquidity_blocked_by_reason),
+        "entry_liquidity_blocked_by_open_interest_evidence_status": dict(
+            report.entry_liquidity_blocked_by_open_interest_evidence_status
+        ),
         "fail_closed_reason_counts": dict(report.fail_closed_reason_counts),
     }
 

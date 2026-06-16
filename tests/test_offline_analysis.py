@@ -1565,6 +1565,32 @@ class TestProductionBlockerAnalyzer:
             "strategy": 3,
         }
 
+    def test_code_side_view_exposes_open_interest_evidence_status(self):
+        from scripts.analyze_production_blockers import build_code_side_blocker_view
+
+        view = build_code_side_blocker_view(
+            [
+                {
+                    "kind": "execution.entry_liquidity_blocked",
+                    "payload": {
+                        "reason": "open_interest_unavailable",
+                        "open_interest_evidence_status": "deferred_by_cap",
+                    },
+                },
+                {
+                    "kind": "execution.entry_liquidity_blocked",
+                    "payload": {
+                        "reason": "open_interest_unavailable",
+                        "open_interest_evidence_status": "rate_limited",
+                    },
+                },
+            ],
+            enabled=True,
+        )
+
+        assert view["reason_counts"]["oi_evidence_status:deferred_by_cap"] == 1
+        assert view["reason_counts"]["oi_evidence_status:rate_limited"] == 1
+
 
 def _code_side_blocker_incident_records():
     return [

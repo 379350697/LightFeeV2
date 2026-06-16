@@ -257,6 +257,46 @@ def test_rest_top_book_refresher_fetches_aster_bookticker_official_path():
     )
 
 
+def test_bbo_stream_state_reports_quote_lease_readiness_buckets():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache, VenueBboDataPlane
+
+    cache = VenueBboCache()
+    plane = VenueBboDataPlane(cache)
+
+    missing = plane.stream_state("binance", "BTCUSDT", now_ms=10_000, max_age_ms=1_000)
+    assert missing["lease_state"] == "not_tracked"
+    assert missing["reason_bucket"] == "not_tracked"
+    assert missing["last_quote_age_ms"] is None
+
+    plane.start_ws_streams("binance", ["BTCUSDT"])
+    tracked = plane.stream_state("binance", "BTCUSDT", now_ms=10_000, max_age_ms=1_000)
+    assert tracked["tracked"] is True
+    assert tracked["connected"] is False
+    assert tracked["lease_state"] == "not_connected"
+    assert tracked["reason_bucket"] == "not_connected"
+
+    client = plane._clients[("binance", "BTCUSDT")]
+    client._connected = True
+    client._ws = object()
+    no_message = plane.stream_state("binance", "BTCUSDT", now_ms=10_000, max_age_ms=1_000)
+    assert no_message["lease_state"] == "subscribed_no_message"
+    assert no_message["reason_bucket"] == "subscribed_no_message"
+
+    cache.update_quote(TopBookQuote(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        observed_at_ms=8_000,
+        received_at_ms=8_000,
+        source="binance_book_ticker",
+    ))
+    stale = plane.stream_state("binance", "BTCUSDT", now_ms=10_000, max_age_ms=1_000)
+    assert stale["last_quote_age_ms"] == 2_000
+    assert stale["lease_state"] == "stale_ws_quote"
+    assert stale["reason_bucket"] == "stale_ws_quote"
+
+
 def test_rest_top_book_refresher_fetches_bybit_linear_ticker():
     import httpx
     from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher

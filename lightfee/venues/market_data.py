@@ -42,6 +42,7 @@ class FundingTicker:
     volume_24h_quote: float = 0.0
     open_interest_quote: float = 0.0
     open_interest_evidence_status: str = "available"
+    open_interest_evidence_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,8 @@ def _now_ms() -> int:
 # concurrency and normalized to quote notional via premiumIndex mark price.
 _BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY = 16
 BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
+BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000
+BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
 # V1 parity: per-symbol OKX funding-rate concurrency limit
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
@@ -135,6 +138,11 @@ class MarketDataClient:
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
         self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
         self._funding_cache_observed_at_ms: int = 0
+        # V1-style evidence cache for Binance-compatible per-symbol OI.
+        # key -> (open_interest_quote, mark_price, observed_at_ms, status, reason)
+        self._binance_style_open_interest_cache: dict[
+            str, tuple[float, float, int, str, str]
+        ] = {}
 
     @property
     def venue(self) -> Venue:
@@ -387,9 +395,63 @@ class MarketDataClient:
 
     # -- Binance / Aster (shared parser) ---------------------------------
 
+    @staticmethod
+    def _binance_style_oi_status_from_error(exc: Exception) -> str:
+        status_code = int(getattr(exc, "status_code", 0) or 0)
+        message = str(exc).lower()
+        if status_code in (429, 418) or "429" in message or "too many" in message:
+            return "rate_limited"
+        if status_code in (400, 404) and (
+            "invalid symbol" in message
+            or "unknown symbol" in message
+            or "symbol not found" in message
+            or "-1121" in message
+        ):
+            return "unsupported"
+        return "http_error"
+
+    def _binance_style_oi_cache_key(self, venue_sym: str) -> str:
+        return f"{self._spec.venue_id.value}:{venue_sym}"
+
+    def _binance_style_cached_open_interest(
+        self,
+        venue_sym: str,
+        *,
+        mark_price: float,
+        now_ms: int,
+    ) -> tuple[float, str, str] | None:
+        entry = self._binance_style_open_interest_cache.get(
+            self._binance_style_oi_cache_key(venue_sym)
+        )
+        if entry is None:
+            return None
+        open_interest_quote, cached_mark_price, observed_at_ms, status, reason = entry
+        if now_ms - int(observed_at_ms or 0) > BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS:
+            return None
+        if mark_price <= 0.0 or cached_mark_price <= 0.0:
+            return None
+        return open_interest_quote, status, reason
+
+    def _binance_style_store_open_interest(
+        self,
+        venue_sym: str,
+        *,
+        open_interest_quote: float,
+        mark_price: float,
+        observed_at_ms: int,
+        status: str,
+        reason: str,
+    ) -> None:
+        if status != "available" or open_interest_quote <= 0.0 or mark_price <= 0.0:
+            return
+        self._binance_style_open_interest_cache[
+            self._binance_style_oi_cache_key(venue_sym)
+        ] = (open_interest_quote, mark_price, observed_at_ms, status, reason)
+
     async def _fetch_binance_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
+        now_ms = _now_ms()
         canonical_symbols = {s.upper() for s in symbols}
         venue_sym_to_canon: dict[str, str] = {}
         for s in symbols:
@@ -436,6 +498,10 @@ class MarketDataClient:
             venue_sym: "unavailable" if spec.open_interest_path else "unsupported"
             for venue_sym in venue_sym_to_canon
         }
+        oi_evidence_reason: dict[str, str] = {
+            venue_sym: "not_refreshed" if spec.open_interest_path else "unsupported"
+            for venue_sym in venue_sym_to_canon
+        }
         if spec.open_interest_path:
             sem = asyncio.Semaphore(_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY)
 
@@ -446,8 +512,8 @@ class MarketDataClient:
                             spec.open_interest_path,
                             params={"symbol": venue_sym},
                         )
-                    except Exception:
-                        return venue_sym, 0.0, "unavailable"
+                    except Exception as exc:
+                        return venue_sym, 0.0, self._binance_style_oi_status_from_error(exc)
                     item = raw_oi[0] if isinstance(raw_oi, list) and raw_oi else raw_oi
                     if isinstance(item, dict):
                         open_interest = _safe_float(item.get("openInterest", 0))
@@ -456,13 +522,41 @@ class MarketDataClient:
                         )
                         if mark_price > 0.0:
                             return venue_sym, open_interest * mark_price, "available"
-                        return venue_sym, 0.0, "unavailable"
-                    return venue_sym, 0.0, "unavailable"
+                        return venue_sym, 0.0, "missing_mark_price"
+                    return venue_sym, 0.0, "parse_error"
 
-            oi_symbols = [sym for sym in venue_sym_to_canon if sym in pi_map]
+            oi_symbols: list[str] = []
+            for sym in venue_sym_to_canon:
+                if sym not in pi_map:
+                    continue
+                mark_price = _safe_float(pi_map.get(sym, {}).get("markPrice", 0))
+                cached = self._binance_style_cached_open_interest(
+                    sym,
+                    mark_price=mark_price,
+                    now_ms=now_ms,
+                )
+                if cached is not None:
+                    oi_value, status, reason = cached
+                    oi_map[sym] = oi_value
+                    oi_evidence_status[sym] = status
+                    oi_evidence_reason[sym] = reason or "cache_hit"
+                    continue
+                oi_symbols.append(sym)
+            refresh_cap = int(
+                getattr(
+                    self,
+                    "binance_style_open_interest_refresh_cap",
+                    BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP,
+                )
+                or BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP
+            )
+            refresh_symbols = oi_symbols[:max(refresh_cap, 0)]
+            for deferred_sym in oi_symbols[len(refresh_symbols):]:
+                oi_evidence_status[deferred_sym] = "deferred_by_cap"
+                oi_evidence_reason[deferred_sym] = "refresh_cap_exceeded"
             tasks = [
-                asyncio.create_task(_fetch_oi(sym))
-                for sym in oi_symbols
+                asyncio.create_task(_fetch_oi(sym), name=sym)
+                for sym in refresh_symbols
             ]
             if tasks:
                 done, pending = await asyncio.wait(
@@ -475,10 +569,30 @@ class MarketDataClient:
                     except Exception:
                         continue
                     oi_evidence_status[venue_sym] = status
+                    oi_evidence_reason[venue_sym] = status
                     if status == "available":
                         oi_map[venue_sym] = open_interest_quote
+                        mark_price = _safe_float(
+                            pi_map.get(venue_sym, {}).get("markPrice", 0)
+                        )
+                        self._binance_style_store_open_interest(
+                            venue_sym,
+                            open_interest_quote=open_interest_quote,
+                            mark_price=mark_price,
+                            observed_at_ms=now_ms,
+                            status=status,
+                            reason="fresh_refresh",
+                        )
                 for task in pending:
                     task.cancel()
+                for task in pending:
+                    try:
+                        venue_sym = task.get_name()
+                    except Exception:
+                        venue_sym = ""
+                    if venue_sym:
+                        oi_evidence_status[venue_sym] = "timeout"
+                        oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
 
@@ -506,6 +620,7 @@ class MarketDataClient:
                     venue_sym,
                     "unavailable" if spec.open_interest_path else "unsupported",
                 ),
+                open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
             )
         return result
 

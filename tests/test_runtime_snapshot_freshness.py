@@ -1238,6 +1238,7 @@ async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote
     assert overlay == {}
     assert stats["rest_throttled_count"] == 2
     assert {payload["outcome"] for payload in failures} == {"rest_attempt_throttled"}
+    assert {payload["reason_bucket"] for payload in failures} == {"rest_throttled"}
     assert all(
         payload["attempt_interval_outcome"] == "min_interval_not_elapsed"
         for payload in failures

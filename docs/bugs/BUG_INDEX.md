@@ -17,6 +17,22 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Aster/Binance quote lease and OI evidence local closure, 2026-06-15:
+The current follow-up does not loosen entry risk. It closes a diagnostic and
+market-truth semantic gap left by replacing V1 local L2 with V2 WS-BBO: quote
+stale now separates untracked/disconnected/subscribed-no-message/stale-WS and
+REST fallback buckets, while Binance/Aster-style OI is cache/cap enrichment
+rather than full-universe per-symbol hot-path work. Binance's official shape
+keeps mark/funding on bulk `premiumIndex` and OI on per-symbol `openInterest`;
+Aster has bookTicker paths but no confirmed bulk V3 OI path in the referenced
+docs. CL-085 therefore follows the official exchange data paths while preserving
+the V1 business contract: entry requires fresh top-book truth and fail-closed
+liquidity/OI evidence, but slow enrichment must not block quote/funding
+publication. Local verification is still in progress, so this remains deploy
+pending. See
+[daily/2026-06-15.md#cluster-cl-085-asterbinance-ws-bbo-quote-lease-and-oi-evidence-closure](daily/2026-06-15.md#cluster-cl-085-asterbinance-ws-bbo-quote-lease-and-oi-evidence-closure)
+and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
+
 Latest OKX sidecar snapshot freshness closure, 2026-06-15:
 Deploy verification for `2eb14b7` found trading state healthy but
 `verify_production_services.py` failed on `sidecar_snapshot` because OKX quotes

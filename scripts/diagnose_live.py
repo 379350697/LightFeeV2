@@ -2695,6 +2695,8 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     reason_counts: dict[str, int] = {}
     zero_fill_lifecycle_guard_blocker_counts: dict[str, int] = {}
     zero_fill_lifecycle_guard_samples: list[dict[str, Any]] = []
+    quote_lease_failure_counts: dict[str, int] = {}
+    oi_liquidity_evidence_counts: dict[str, int] = {}
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -2717,6 +2719,28 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             opened_entry_ids.add(entry_id)
         elif kind == "entry.passive_unfilled" and entry_id:
             passive_unfilled_entry_ids.add(entry_id)
+        elif kind in {
+            "runtime.entry_quote_revalidate_failed",
+            "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+        }:
+            bucket = str(
+                payload.get("reason_bucket")
+                or payload.get("outcome")
+                or payload.get("reason")
+                or "quote_revalidate_failed"
+            )
+            quote_lease_failure_counts[bucket] = (
+                quote_lease_failure_counts.get(bucket, 0) + 1
+            )
+        elif kind == "execution.entry_liquidity_blocked":
+            status = str(
+                payload.get("open_interest_evidence_status")
+                or payload.get("reason")
+                or "unknown"
+            )
+            oi_liquidity_evidence_counts[status] = (
+                oi_liquidity_evidence_counts.get(status, 0) + 1
+            )
         elif kind == "execution.direction_drift_blocked":
             reason = str(payload.get("reason", "") or "")
             if reason:
@@ -2761,6 +2785,10 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             zero_fill_lifecycle_guard_entry_ids
         ),
         "zero_fill_lifecycle_guard_samples": zero_fill_lifecycle_guard_samples,
+        "quote_lease_failure_counts": dict(sorted(quote_lease_failure_counts.items())),
+        "oi_liquidity_evidence_counts": dict(
+            sorted(oi_liquidity_evidence_counts.items())
+        ),
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 

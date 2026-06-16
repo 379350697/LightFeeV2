@@ -4265,6 +4265,60 @@ def test_run_diagnose_reports_zero_fill_lifecycle_guard_entry_outcome(monkeypatc
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "aster",
+                "symbol": "HOMEUSDT",
+                "outcome": "ws_timeout",
+                "reason_bucket": "subscribed_no_message",
+            },
+        },
+        {
+            "kind": "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+            "payload": {
+                "venue": "binance",
+                "symbol": "HOMEUSDT",
+                "outcome": "rest_attempt_throttled",
+                "reason_bucket": "rest_throttled",
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "HOMEUSDT",
+                "reason": "oi_evidence_unavailable",
+                "open_interest_evidence_status": "deferred_by_cap",
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "binance",
+                "symbol": "BSBUSDT",
+                "reason": "oi_evidence_unavailable",
+                "open_interest_evidence_status": "rate_limited",
+            },
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+
+    assert summary["quote_lease_failure_counts"] == {
+        "rest_throttled": 1,
+        "subscribed_no_message": 1,
+    }
+    assert summary["oi_liquidity_evidence_counts"] == {
+        "deferred_by_cap": 1,
+        "rate_limited": 1,
+    }
+
+
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
     from scripts import diagnose_live as dl
 

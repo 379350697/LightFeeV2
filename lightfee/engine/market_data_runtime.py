@@ -886,6 +886,7 @@ class MarketDataRuntime:
             "failed_count": 0,
             "sources": Counter(),
             "top_quote_blocker_buckets": Counter(),
+            "quote_lease_failure_counts": Counter(),
         }
 
     def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]) -> None:
@@ -938,6 +939,10 @@ class MarketDataRuntime:
         buckets = stats.get("top_quote_blocker_buckets", Counter())
         self.ctx.state.last_scan["top_quote_blocker_buckets"] = dict(
             sorted((str(k), int(v)) for k, v in buckets.items())
+        )
+        lease_buckets = stats.get("quote_lease_failure_counts", Counter())
+        self.ctx.state.last_scan["quote_lease_failure_counts"] = dict(
+            sorted((str(k), int(v)) for k, v in lease_buckets.items())
         )
 
     def _entry_quote_probe_diagnostics_enabled(self) -> bool:
@@ -1358,6 +1363,9 @@ class MarketDataRuntime:
             payload = {
                 **target,
                 "source": source,
+                "reason_bucket": "rest_resolved"
+                if str(target.get("rest_outcome") or "")
+                else "fresh_ws_quote",
                 "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
                 "age_ms": max(
                     now_ms - int(getattr(quote, "observed_at_ms", 0) or 0),
@@ -1377,33 +1385,63 @@ class MarketDataRuntime:
         for target in unresolved.values():
             stats["failed_count"] += 1
             rest_outcome = str(target.get("rest_outcome") or "")
+            stream_state: dict[str, Any] = {}
+            data_plane = getattr(self.ctx, "ws_bbo_data_plane", None)
+            if data_plane is not None and hasattr(data_plane, "stream_state"):
+                try:
+                    stream_state = data_plane.stream_state(
+                        target["venue"],
+                        target["symbol"],
+                        now_ms=now_ms,
+                        max_age_ms=self._entry_quote_lease_max_age_ms(),
+                    )
+                except TypeError:
+                    stream_state = data_plane.stream_state(
+                        target["venue"],
+                        target["symbol"],
+                    )
+                except Exception:
+                    stream_state = {}
             if bool(target.get("ws_budget_excluded")) and not (
                 callable(refresh_quote_result) or callable(refresh_quote)
             ):
                 outcome = "budget_excluded_rest_unavailable"
                 bucket = "budget_excluded_without_rest"
+                reason_bucket = "budget_excluded_without_rest"
             elif rest_outcome == "throttled":
                 outcome = "rest_attempt_throttled"
                 bucket = "rest_topbook_attempt_throttled"
+                reason_bucket = "rest_throttled"
             elif rest_outcome == "unsupported_symbol":
                 outcome = "rest_unsupported_symbol"
                 bucket = "rest_topbook_unsupported_symbol"
+                reason_bucket = "rest_invalid_quote"
             elif rest_outcome in {"http_error", "parse_error"}:
                 outcome = f"rest_{rest_outcome}"
                 bucket = "rest_topbook_revalidate_failed"
+                reason_bucket = "rest_invalid_quote"
             elif rest_outcome == "invalid_quote":
                 outcome = "rest_invalid_quote"
                 bucket = "rest_topbook_revalidate_failed"
+                reason_bucket = "rest_invalid_quote"
             elif target.get("rest_error"):
                 outcome = "rest_timeout"
                 bucket = "rest_topbook_revalidate_failed"
+                reason_bucket = "rest_invalid_quote"
             elif stats.get("rest_attempt_count", 0):
                 outcome = "rest_invalid_quote"
                 bucket = "rest_topbook_revalidate_failed"
+                reason_bucket = "rest_invalid_quote"
             else:
                 outcome = "ws_timeout"
                 bucket = "quote_revalidate_unavailable"
+                reason_bucket = str(
+                    stream_state.get("reason_bucket")
+                    or stream_state.get("lease_state")
+                    or "not_tracked"
+                )
             stats["top_quote_blocker_buckets"][bucket] += 1
+            stats["quote_lease_failure_counts"][reason_bucket] += 1
             age_ms = target.get("age_ms")
             if age_ms is None:
                 age_ms = target.get("sidecar_age_ms")
@@ -1413,9 +1451,17 @@ class MarketDataRuntime:
             payload = {
                 **target,
                 "outcome": outcome,
+                "reason_bucket": reason_bucket,
                 "source": "entry_quote_truth",
                 "age_ms": age_ms,
                 "budget_ms": self._entry_quote_lease_max_age_ms(),
+                "lease_state": str(stream_state.get("lease_state") or ""),
+                "stream_tracked": bool(stream_state.get("tracked")),
+                "stream_subscribed": bool(stream_state.get("subscribed")),
+                "stream_connected": bool(stream_state.get("connected")),
+                "stream_message_count": int(stream_state.get("message_count") or 0),
+                "last_quote_age_ms": stream_state.get("last_quote_age_ms"),
+                "last_error": str(stream_state.get("last_error") or ""),
                 "endpoint": str(target.get("endpoint") or "rest_topbook"),
                 "venue_symbol": str(target.get("venue_symbol") or ""),
                 "url": str(target.get("url") or ""),

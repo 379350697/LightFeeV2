@@ -573,15 +573,40 @@ class BboWsClient(ABC):
     def message_count(self) -> int:
         return self._message_count
 
-    def state_snapshot(self) -> dict[str, Any]:
+    def state_snapshot(
+        self,
+        *,
+        quote: TopBookQuote | None = None,
+        now_ms: int = 0,
+        max_age_ms: int = 0,
+    ) -> dict[str, Any]:
+        last_quote_age_ms: int | None = None
+        if quote is not None and now_ms > 0 and int(quote.observed_at_ms or 0) > 0:
+            last_quote_age_ms = max(now_ms - int(quote.observed_at_ms or 0), 0)
+        subscribed = bool(self._subscribed or self.build_subscribe_message() is None)
+        if quote is not None and max_age_ms > 0 and last_quote_age_ms is not None:
+            if last_quote_age_ms <= max_age_ms:
+                lease_state = "fresh"
+            else:
+                lease_state = "stale_ws_quote"
+        elif not self.is_connected:
+            lease_state = "not_connected"
+        elif subscribed:
+            lease_state = "subscribed_no_message"
+        else:
+            lease_state = "not_subscribed"
         return {
             "venue": str(self.venue),
             "symbol": str(self.symbol).upper(),
             "wire_symbol": str(self.wire_symbol),
             "tracked": True,
             "connected": bool(self.is_connected),
-            "subscribed": bool(self._subscribed),
+            "subscribed": subscribed,
             "message_count": int(self._message_count),
+            "last_quote_age_ms": last_quote_age_ms,
+            "last_quote_source": str(getattr(quote, "source", "") or ""),
+            "lease_state": lease_state,
+            "reason_bucket": lease_state,
             "last_error": str(self._last_error or ""),
             "last_control_message": str(self._last_control_message or ""),
         }
@@ -1095,7 +1120,14 @@ class VenueBboDataPlane:
     def get_quote(self, venue: str, symbol: str) -> TopBookQuote | None:
         return self._cache.get_quote(venue, symbol)
 
-    def stream_state(self, venue: str, symbol: str) -> dict[str, Any]:
+    def stream_state(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int = 0,
+        max_age_ms: int = 0,
+    ) -> dict[str, Any]:
         key = self._key(venue, symbol)
         client = self._clients.get(key)
         if client is None:
@@ -1104,10 +1136,19 @@ class VenueBboDataPlane:
                 "symbol": key[1],
                 "tracked": False,
                 "connected": False,
+                "subscribed": False,
                 "message_count": 0,
+                "last_quote_age_ms": None,
+                "last_quote_source": "",
+                "lease_state": "not_tracked",
+                "reason_bucket": "not_tracked",
                 "last_error": "",
             }
-        return client.state_snapshot()
+        return client.state_snapshot(
+            quote=self._cache.get_quote(key[0], key[1]),
+            now_ms=now_ms,
+            max_age_ms=max_age_ms,
+        )
 
     def stream_states(self) -> list[dict[str, Any]]:
         return [

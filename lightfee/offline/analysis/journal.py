@@ -68,6 +68,9 @@ class JournalAnalysisReport:
     local_l2_sequence_gap_by_reason: dict[str, int] = field(default_factory=dict)
     local_l2_sync_failed_by_category: dict[str, int] = field(default_factory=dict)
     entry_liquidity_blocked_by_reason: dict[str, int] = field(default_factory=dict)
+    entry_liquidity_blocked_by_open_interest_evidence_status: dict[str, int] = (
+        field(default_factory=dict)
+    )
 
     # Execution diagnostic classifications (V1: entry_liquidity_blocked_by_eligibility_class)
     execution_liquidity_blocked_by_class: dict[str, int] = field(default_factory=dict)
@@ -280,6 +283,12 @@ def analyze_journal_records(
             report.entry_liquidity_blocked_by_reason[reason] = (
                 report.entry_liquidity_blocked_by_reason.get(reason, 0) + 1
             )
+            oi_status = str(
+                payload.get("open_interest_evidence_status") or ""
+            )
+            if oi_status:
+                counts = report.entry_liquidity_blocked_by_open_interest_evidence_status
+                counts[oi_status] = counts.get(oi_status, 0) + 1
             eligibility = payload.get("eligibility_class", "")
             if eligibility:
                 report.execution_liquidity_blocked_by_class[eligibility] = (

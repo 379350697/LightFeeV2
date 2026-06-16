@@ -517,8 +517,16 @@ def _record_code_side_blocker(
         _add_count(category_counts, "order_truth_gap")
         _add_count(reason_counts, "accepted_order_truth_gap")
 
-    if exclude_liquidity and kind == "execution.entry_liquidity_blocked":
-        _add_count(filtered_out_counts, "liquidity")
+    if kind == "execution.entry_liquidity_blocked":
+        if exclude_liquidity:
+            _add_count(filtered_out_counts, "liquidity")
+            return
+        _add_count(category_counts, "liquidity")
+        reason = str(payload.get("reason") or "entry_liquidity_blocked")
+        _add_count(reason_counts, reason)
+        oi_status = str(payload.get("open_interest_evidence_status") or "")
+        if oi_status:
+            _add_count(reason_counts, f"oi_evidence_status:{oi_status}")
 
 
 def build_code_side_blocker_view(

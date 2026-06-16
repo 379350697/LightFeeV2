@@ -334,6 +334,36 @@ class TestExecutionDiagnostics:
         report = analyze_journal_records(records)
         assert report.execution_liquidity_blocked_by_class["aggressive"] == 2
 
+    def test_entry_liquidity_blocked_by_open_interest_evidence_status(self):
+        records = [
+            make_record(
+                "execution.entry_liquidity_blocked",
+                {
+                    "reason": "open_interest_unavailable",
+                    "open_interest_evidence_status": "deferred_by_cap",
+                },
+            ),
+            make_record(
+                "execution.entry_liquidity_blocked",
+                {
+                    "reason": "open_interest_unavailable",
+                    "open_interest_evidence_status": "rate_limited",
+                },
+            ),
+            make_record(
+                "execution.entry_liquidity_blocked",
+                {
+                    "reason": "open_interest_unavailable",
+                    "open_interest_evidence_status": "rate_limited",
+                },
+            ),
+        ]
+        report = analyze_journal_records(records)
+        assert report.entry_liquidity_blocked_by_open_interest_evidence_status == {
+            "deferred_by_cap": 1,
+            "rate_limited": 2,
+        }
+
 
 # ── Local-L2 Health ─────────────────────────────────────────────────────────
 
