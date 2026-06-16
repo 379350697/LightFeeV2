@@ -1188,6 +1188,15 @@ _EVENT_KIND_PHASES = {
     "runtime.perp_liquidity_stale_advisory": (
         V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
     ),
+    "runtime.entry_oi_targeted_refresh_started": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.entry_oi_targeted_refresh_resolved": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.entry_oi_targeted_refresh_failed": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
     "execution.entry_liquidity_advisory": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "execution.entry_liquidity_blocked": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "execution.entry_leverage_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,

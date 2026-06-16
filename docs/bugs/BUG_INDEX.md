@@ -35,7 +35,10 @@ unsupported, or missing evidence remains fail-closed and is now diagnosed
 separately from sidecar cap pressure. The candidate refresh does not reuse the
 sidecar 100ms enrichment budget: real public smoke showed Binance/Aster BTC/ETH
 OI resolves in about 354-368ms under the separate bounded entry budget, with
-valid bid/ask, positive volume, and positive OI quote. See
+valid bid/ask, positive volume, and positive OI quote. The new targeted OI
+runtime events are mapped as diagnostic-only entry-liquidity evidence in the V1
+lifecycle closure table so observability does not create fresh unmapped drift.
+See
 [daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh](daily/2026-06-16.md#cluster-cl-087-ws-bbo-sticky-warm-and-candidate-scoped-oi-targeted-refresh)
 and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
 
