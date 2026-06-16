@@ -438,6 +438,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "exit.closed",
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
+        "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -450,6 +451,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
+    assert (
+        map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
+        == "ENTRY_QUOTE_LEASE"
+    )
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest entry quote rewarm lifecycle mapping closure, 2026-06-16:
+Latest `ebafc6a` cloud verification showed the trading state was clean:
+local open/pending/close/residual counts were zero, all venues were
+high-confidence flat/no-open-orders, `order_error_evidence=[]`,
+`top_exchange_errors=[]`, and the three opened lifecycles in the since-deploy
+window completed close. The remaining acceptance drift was that CL-090's new
+diagnostic event `runtime.entry_quote_rewarm_scheduled_after_rest_stale` was
+not yet mapped in the V1 lifecycle closure table, so
+`diagnose_live.py --json --since-deploy` still reported one unmapped event.
+CL-092 maps that event to `ENTRY_QUOTE_LEASE` and adds RED/GREEN regression
+coverage. The quote rewarm watch remains separate: the same cloud window showed
+`scheduled=28`, `resolved=1`, `still_stale=27`, mainly sampled on tail
+candidates such as Aster `XCNUSDT`, Aster `EDENUSDT`, and Binance
+`STABLEUSDT`. Stale quotes remain fail-closed; no quote TTL, OI floor,
+liquidity gate, admission, sizing, order, close, recovery, or lifecycle guard
+is loosened. See
+[daily/2026-06-16.md#cluster-cl-092-entry-quote-rewarm-lifecycle-unmapped-drift](daily/2026-06-16.md#cluster-cl-092-entry-quote-rewarm-lifecycle-unmapped-drift).
+
 Latest passive close terminal-truth diagnostic closure, 2026-06-16:
 Post-CL-090 cloud review found production truth healthy
 (flat/no-open-orders, no abnormal position, no single-leg exposure, no
