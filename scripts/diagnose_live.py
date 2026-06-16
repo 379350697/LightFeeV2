@@ -2111,11 +2111,191 @@ def _order_error_resolved_by_terminal_zero_qty(
     return bool(position_id and position_id in resolved)
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _payload_is_binance_post_only_boundary_reject(payload: dict[str, Any]) -> bool:
+    venue = str(payload.get("venue") or payload.get("maker_venue") or "").lower()
+    if venue != "binance":
+        return False
+    exchange_error = payload.get("exchange_error", {})
+    if not isinstance(exchange_error, dict):
+        exchange_error = {}
+    code = str(exchange_error.get("exchange_code") or "")
+    reason_text = " ".join(
+        str(part or "")
+        for part in (
+            payload.get("reason"),
+            payload.get("error"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    ).lower()
+    if code != "-5022" and not any(
+        token in reason_text
+        for token in (
+            "-5022",
+            "gtx_order_reject",
+            "could not be executed as maker",
+            "post only order will be rejected",
+        )
+    ):
+        return False
+    request_context = payload.get("request_context", {})
+    if not isinstance(request_context, dict):
+        return False
+    return (
+        _boolish(request_context.get("post_only"))
+        and not _boolish(request_context.get("reduce_only"))
+    )
+
+
+def _post_only_boundary_identity(payload: dict[str, Any]) -> tuple[str, str]:
+    symbol = str(payload.get("symbol") or "").upper()
+    venue = str(payload.get("venue") or payload.get("maker_venue") or "").lower()
+    request_context = payload.get("request_context", {})
+    if isinstance(request_context, dict):
+        symbol = symbol or str(request_context.get("symbol") or "").upper()
+        venue = venue or str(request_context.get("venue") or "").lower()
+    return symbol, venue
+
+
+def _build_resolved_post_only_reject_summary(
+    events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any],
+    symbol: str = "",
+) -> dict[str, Any]:
+    current_clean = (
+        _exchange_truth_flat(exchange_truth)
+        and _exchange_truth_no_open_orders(exchange_truth)
+    )
+    reject_keys: set[tuple[str, str]] = set()
+    cooldown_keys: set[tuple[str, str]] = set()
+    reprice_keys: set[tuple[str, str]] = set()
+    samples: list[dict[str, Any]] = []
+    target_symbol = symbol.upper()
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol") or "").upper()
+        if target_symbol and event_symbol and event_symbol != target_symbol:
+            continue
+        if _payload_is_binance_post_only_boundary_reject(payload):
+            key = _post_only_boundary_identity(payload)
+            if not key[0] or not key[1]:
+                continue
+            reject_keys.add(key)
+            if len(samples) < 10:
+                exchange_error = payload.get("exchange_error", {})
+                if not isinstance(exchange_error, dict):
+                    exchange_error = {}
+                samples.append(
+                    {
+                        "symbol": key[0],
+                        "venue": key[1],
+                        "exchange_code": str(
+                            exchange_error.get("exchange_code") or ""
+                        ),
+                        "exchange_msg": str(
+                            exchange_error.get("exchange_msg")
+                            or payload.get("reason")
+                            or ""
+                        )[:300],
+                        "ts_ms": rec.get("ts_ms", 0),
+                    }
+                )
+            continue
+        if kind in {
+            "runtime.entry_post_only_reject_cooldown",
+            "runtime.entry_post_only_bbo_repriced",
+        }:
+            event_venue = str(payload.get("venue") or payload.get("maker_venue") or "").lower()
+            key = (event_symbol, event_venue)
+            if not key[0] or not key[1]:
+                continue
+            if target_symbol and key[0] != target_symbol:
+                continue
+            reason = str(payload.get("reason") or payload.get("raw_error") or "").lower()
+            if kind == "runtime.entry_post_only_reject_cooldown" and (
+                "post_only_would_take" in reason
+                or "gtx_order_reject" in reason
+                or "-5022" in reason
+                or "could not be executed as maker" in reason
+            ):
+                cooldown_keys.add(key)
+            elif (
+                kind == "runtime.entry_post_only_bbo_repriced"
+                and "post_only_would_cross" in reason
+            ):
+                reprice_keys.add(key)
+
+    resolved_keys = reject_keys & cooldown_keys if current_clean else set()
+    unresolved_keys = reject_keys - resolved_keys
+    return {
+        "count": len(reject_keys),
+        "resolved_count": len(resolved_keys),
+        "unresolved_count": len(unresolved_keys),
+        "symbols": sorted({key[0] for key in reject_keys}),
+        "resolved_symbols": sorted({key[0] for key in resolved_keys}),
+        "unresolved_symbols": sorted({key[0] for key in unresolved_keys}),
+        "resolved_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(resolved_keys)
+        ],
+        "unresolved_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(unresolved_keys)
+        ],
+        "cooldown_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(cooldown_keys)
+        ],
+        "reprice_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(reprice_keys)
+        ],
+        "current_exchange_truth_clean": current_clean,
+        "samples": samples,
+    }
+
+
+def _order_error_resolved_by_post_only_boundary_reject(
+    payload: dict[str, Any],
+    resolved_post_only_summary: dict[str, Any] | None,
+) -> bool:
+    if not resolved_post_only_summary:
+        return False
+    if int(resolved_post_only_summary.get("resolved_count", 0) or 0) <= 0:
+        return False
+    if not _payload_is_binance_post_only_boundary_reject(payload):
+        return False
+    key = _post_only_boundary_identity(payload)
+    resolved = {
+        (
+            str(item.get("symbol") or "").upper(),
+            str(item.get("venue") or "").lower(),
+        )
+        for item in (resolved_post_only_summary.get("resolved_identities", []) or [])
+        if isinstance(item, dict)
+    }
+    return key in resolved
+
+
 def _build_order_error_evidence(
     events: list[dict[str, Any]],
     symbol: str = "",
     resolved_truth_gap_summary: dict[str, Any] | None = None,
     resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
+    resolved_post_only_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
 
@@ -2139,6 +2319,11 @@ def _build_order_error_evidence(
         if _order_error_resolved_by_terminal_zero_qty(
             payload,
             resolved_terminal_zero_qty_summary,
+        ):
+            continue
+        if _order_error_resolved_by_post_only_boundary_reject(
+            payload,
+            resolved_post_only_summary,
         ):
             continue
 
@@ -4047,11 +4232,17 @@ def run_diagnose(
         exchange_truth,
         symbol,
     )
+    resolved_post_only_reject_summary = _build_resolved_post_only_reject_summary(
+        all_events,
+        exchange_truth,
+        symbol,
+    )
     order_errors = _build_order_error_evidence(
         all_events,
         symbol,
         resolved_order_truth_gap_summary,
         resolved_terminal_zero_qty_summary,
+        resolved_post_only_reject_summary,
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
@@ -4125,6 +4316,7 @@ def run_diagnose(
         "state_consistency": state_consistency,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "resolved_terminal_zero_qty_reduce_only_summary": resolved_terminal_zero_qty_summary,
+        "resolved_post_only_reject_summary": resolved_post_only_reject_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
         "event_counts": event_counts,
@@ -4154,6 +4346,49 @@ def _build_entry_quantity_terminal_summary(
     quantity_mismatch_entries: set[str] = set()
     hedge_undercut_warning_entries: set[str] = set()
     quantity_mismatch_warning_entries: set[str] = set()
+    quantity_warning_reason_counts: dict[str, int] = {}
+    quantity_warning_samples: list[dict[str, Any]] = []
+
+    def add_warning_reason(kind_name: str, payload: dict[str, Any]) -> None:
+        reason_family = str(
+            payload.get("reason_family")
+            or payload.get("quantity_plan_reason")
+            or "unknown"
+        )
+        key = f"{kind_name}:{reason_family}"
+        quantity_warning_reason_counts[key] = (
+            quantity_warning_reason_counts.get(key, 0) + 1
+        )
+        entry_id = str(payload.get("entry_id") or payload.get("position_id") or "")
+        sample: dict[str, Any] = {
+            "entry_id": entry_id,
+            "kind": kind_name,
+            "reason_family": reason_family,
+            "symbol": str(payload.get("symbol") or ""),
+        }
+        if kind_name == "hedge_quantity_undercut":
+            missing = _safe_float(payload.get("missing_hedge_quantity"))
+            normalized = _safe_float(payload.get("normalized_quantity"))
+            undercut = _safe_float(payload.get("undercut_quantity"))
+            if undercut <= 0.0:
+                undercut = max(missing - normalized, 0.0)
+            sample.update(
+                {
+                    "missing_hedge_quantity": missing,
+                    "normalized_quantity": normalized,
+                    "undercut_quantity": undercut,
+                }
+            )
+        else:
+            sample.update(
+                {
+                    "common_quantity": _safe_float(payload.get("common_quantity")),
+                    "full_target_quantity": _safe_float(
+                        payload.get("full_target_quantity")
+                    ),
+                }
+            )
+        quantity_warning_samples.append(sample)
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -4195,6 +4430,7 @@ def _build_entry_quantity_terminal_summary(
                 hedge_undercut_entries.add(entry_id)
                 if entry_id not in tolerated_dust_entry_ids:
                     hedge_undercut_warning_entries.add(entry_id)
+                    add_warning_reason("hedge_quantity_undercut", payload)
         elif kind == "execution.entry_quantity_plan":
             try:
                 common_quantity = float(payload.get("common_quantity", 0.0) or 0.0)
@@ -4210,6 +4446,7 @@ def _build_entry_quantity_terminal_summary(
                     quantity_mismatch_entries.add(entry_id)
                     if entry_id not in tolerated_dust_entry_ids:
                         quantity_mismatch_warning_entries.add(entry_id)
+                        add_warning_reason("common_quantity_mismatch", payload)
 
     fingerprints = []
     if production_acceptance_gate:
@@ -4234,6 +4471,16 @@ def _build_entry_quantity_terminal_summary(
         "common_quantity_mismatch_warning_entry_ids": sorted(
             quantity_mismatch_warning_entries
         ),
+        "quantity_warning_reason_counts": dict(
+            sorted(quantity_warning_reason_counts.items())
+        ),
+        "quantity_warning_samples": sorted(
+            quantity_warning_samples,
+            key=lambda item: (
+                str(item.get("kind") or ""),
+                str(item.get("entry_id") or ""),
+            ),
+        )[:10],
     }
 
 

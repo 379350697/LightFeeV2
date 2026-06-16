@@ -424,6 +424,12 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "exit.reconciled",
         "runtime.position_drift_corrected",
         "reconciliation.entry_abandon_retained_unresolved_maker",
+        "reconciliation.entry_resolved",
+        "review.candidate_rejected",
+        "runtime.entry_post_only_bbo_repriced",
+        "runtime.entry_post_only_reject_cooldown",
+        "runtime.maker_event_no_ws_bbo_quote",
+        "runtime.position_drift_skipped_passive_close_owner",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]

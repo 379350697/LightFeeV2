@@ -3860,6 +3860,7 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
                     "symbol": "HOMEUSDT",
                     "missing_hedge_quantity": 700.0,
                     "normalized_quantity": 690.0,
+                    "reason_family": "exchange_step_rounding",
                 },
             },
             {
@@ -3951,6 +3952,29 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
         ]
         assert entry_summary["common_quantity_mismatch_warning_entry_ids"] == [
             "entry-mismatch"
+        ]
+        assert entry_summary["quantity_warning_reason_counts"] == {
+            "common_quantity_mismatch:unknown": 1,
+            "hedge_quantity_undercut:exchange_step_rounding": 1,
+        }
+        assert entry_summary["quantity_warning_samples"] == [
+            {
+                "entry_id": "entry-mismatch",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "unknown",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 700.0,
+                "full_target_quantity": 690.0,
+            },
+            {
+                "entry_id": "entry-undercut",
+                "kind": "hedge_quantity_undercut",
+                "reason_family": "exchange_step_rounding",
+                "symbol": "HOMEUSDT",
+                "missing_hedge_quantity": 700.0,
+                "normalized_quantity": 690.0,
+                "undercut_quantity": 10.0,
+            },
         ]
         gate = result["production_acceptance_gate"]
         assert gate["short_window_warning_count"] == 2
@@ -4594,6 +4618,202 @@ def test_body_with_exchange_code_is_complete():
         # Overall may be "partial" due to missing exchange_truth (unavailable in read-only mode)
         assert ec["overall"] in ("complete", "partial")
         assert ec["confidence"] in ("high", "medium")
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_filters_resolved_binance_post_only_boundary_reject(monkeypatch):
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+
+        events = [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "runtime.entry_post_only_bbo_repriced",
+                "payload": {
+                    "symbol": "STGUSDT",
+                    "venue": "binance",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "side": "buy",
+                    "price": 0.2267,
+                    "best_bid": 0.2267,
+                    "best_ask": 0.2268,
+                    "book_age_ms": 0,
+                    "reason": "post_only_would_cross_repriced",
+                },
+            },
+            {
+                "ts_ms": 1700000002000,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-stg",
+                    "venue": "binance",
+                    "symbol": "STGUSDT",
+                    "reason": (
+                        "Binance -5022 GTX_ORDER_REJECT: Due to the order could "
+                        "not be executed as maker, the Post Only order will be rejected"
+                    ),
+                    "exchange_error": {
+                        "venue": "binance",
+                        "operation": "place_order",
+                        "transport_error_type": "exchange_retcode",
+                        "http_status": 400,
+                        "raw_body": (
+                            '{"code":-5022,"msg":"Due to the order could not be '
+                            'executed as maker, the Post Only order will be rejected."}'
+                        ),
+                        "exchange_code": "-5022",
+                        "exchange_msg": (
+                            "Due to the order could not be executed as maker, "
+                            "the Post Only order will be rejected."
+                        ),
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                    },
+                    "request_context": {
+                        "symbol": "STGUSDT",
+                        "side": "buy",
+                        "price": 0.2267,
+                        "quantity": 105.39953009376165,
+                        "reduce_only": False,
+                        "post_only": True,
+                    },
+                    "evidence_completeness": "complete",
+                },
+            },
+            {
+                "ts_ms": 1700000002100,
+                "kind": "runtime.entry_post_only_reject_cooldown",
+                "payload": {
+                    "symbol": "STGUSDT",
+                    "venue": "binance",
+                    "reason": "post_only_would_take",
+                    "raw_error": "-5022 GTX_ORDER_REJECT",
+                    "side": "buy",
+                    "price": 0.2267,
+                    "best_bid": 0.2267,
+                    "best_ask": 0.2268,
+                    "book_age_ms": 0,
+                    "cooldown_until_ms": 1700000032100,
+                },
+            },
+        ]
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        assert result["order_error_evidence"] == []
+        summary = result["resolved_post_only_reject_summary"]
+        assert summary["count"] == 1
+        assert summary["resolved_count"] == 1
+        assert summary["unresolved_count"] == 0
+        assert summary["current_exchange_truth_clean"] is True
+        assert summary["resolved_symbols"] == ["STGUSDT"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_keeps_binance_post_only_reject_without_cooldown(monkeypatch):
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000002000,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-stg",
+                    "venue": "binance",
+                    "symbol": "STGUSDT",
+                    "reason": "-5022 GTX_ORDER_REJECT",
+                    "exchange_error": {
+                        "venue": "binance",
+                        "operation": "place_order",
+                        "http_status": 400,
+                        "raw_body": '{"code":-5022,"msg":"GTX_ORDER_REJECT"}',
+                        "exchange_code": "-5022",
+                        "exchange_msg": "GTX_ORDER_REJECT",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                    },
+                    "request_context": {
+                        "symbol": "STGUSDT",
+                        "post_only": True,
+                        "reduce_only": False,
+                    },
+                },
+            }
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        assert result["resolved_post_only_reject_summary"]["resolved_count"] == 0
+        assert len(result["order_error_evidence"]) == 1
+        assert result["order_error_evidence"][0]["exchange_code"] == "-5022"
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

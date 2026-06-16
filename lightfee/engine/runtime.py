@@ -1405,15 +1405,34 @@ class LiveRuntime:
         missing = float(quantity_evidence.get("missing_hedge_quantity", 0.0) or 0.0)
         if normalized_quantity + 1e-9 >= missing:
             return
+        min_notional_gap = quantity_evidence.get("full_missing_min_notional_violation")
+        if min_notional_gap:
+            reason_family = "min_notional_buffer"
+        elif str(quantity_evidence.get("quantity_source") or ""):
+            reason_family = "exchange_step_rounding"
+        else:
+            reason_family = "unexpected_undercut"
+        hedge_price_hint = float(
+            getattr(pending, "hedge_fill_price", 0.0)
+            or getattr(pending, "maker_price", 0.0)
+            or getattr(pending, "maker_fill_price", 0.0)
+            or 0.0
+        )
         self.journal.append(
             "pending_entry.hedge_quantity_undercut",
             {
                 "entry_id": entry_id,
                 "symbol": pending.symbol,
                 "hedge_venue": hedge_venue.value,
+                "reason_family": reason_family,
                 "missing_hedge_quantity": missing,
                 "normalized_quantity": normalized_quantity,
                 "undercut_quantity": max(missing - normalized_quantity, 0.0),
+                "hedge_price_hint": hedge_price_hint,
+                "hedge_min_notional_quote": self._venue_min_notional(
+                    hedge_venue,
+                    pending.symbol,
+                ),
                 **dict(quantity_evidence),
             },
         )
@@ -9765,8 +9784,11 @@ class LiveRuntime:
             {
                 "symbol": pair_key[0],
                 "venue": venue,
+                "operation": "entry_post_only_submit",
                 "reason": "post_only_would_take",
                 "raw_error": reason[:500],
+                "post_only": True,
+                "reduce_only": False,
                 "blocked_until_ms": until_ms,
                 "ttl_ms": cooldown_ms,
                 "official_doc_url": evidence["official_doc_url"],

@@ -1620,6 +1620,9 @@ class TestPlannerDispatchIntegration:
         assert payload["best_ask"] == 50010.0
         assert payload["freshness"] == "fresh"
         assert payload["cooldown_until_ms"] == payload["cooldown_until"]
+        assert payload["operation"] == "entry_post_only_submit"
+        assert payload["post_only"] is True
+        assert payload["reduce_only"] is False
 
     @pytest.mark.asyncio
     async def test_fresh_bbo_allows_post_only_maker_submit(self, config, tmp_journal):
@@ -2413,8 +2416,11 @@ class TestPlannerDispatchIntegration:
         assert payload["common_quantity"] == pytest.approx(700.0)
         assert payload["full_target_quantity"] == pytest.approx(700.0)
         assert payload["initial_maker_target_quantity"] == pytest.approx(700.0)
+        assert payload["quantity_plan_reason"] == "exchange_step_rounding"
         assert payload["venue_quantity_steps"]["okx"] == pytest.approx(100.0)
         assert payload["venue_quantity_steps"]["bybit"] == pytest.approx(0.001)
+        assert payload["venue_quantity_metadata"]["okx"]["quantity_step"] == pytest.approx(100.0)
+        assert payload["venue_quantity_metadata"]["bybit"]["quantity_step"] == pytest.approx(0.001)
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_skips_when_non_okx_quantity_metadata_missing(

@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Binance post-only and lifecycle diagnostic closure, 2026-06-16:
+CL-087 proved the OI/liquidity targeted refresh path is deploy-usable, but the
+same production window exposed a separate non-OI diagnostic drift. The account
+was flat/no-open-orders with no abnormal position or single-leg exposure, yet
+Binance entry `-5022 GTX_ORDER_REJECT` Post Only boundary rejects could still
+appear as unresolved order errors after the runtime had already armed a
+post-only cooldown and current exchange truth was clean. Since-deploy lifecycle
+diagnostics also had six unmapped event kinds, and entry quantity mismatch /
+hedge undercut warnings lacked reason evidence. CL-088 keeps all hard trading
+constraints intact: no quote stale TTL is relaxed, no stale quote can authorize
+entry, no OI floor or liquidity threshold is lowered, and no sizing/order/close
+guard is loosened. The fix maps the new lifecycle events, adds
+`resolved_post_only_reject_summary`, filters only Binance `post_only=true` /
+`reduce_only=false` `-5022` rejects with matching cooldown and clean exchange
+truth, and adds quantity warning reason buckets plus source payload evidence.
+Missing cooldown or unclean truth remains active `order_error_evidence`. See
+[daily/2026-06-16.md#cluster-cl-088-binance-post-only-boundary-reject-lifecycle-drift-and-quantity-evidence](daily/2026-06-16.md#cluster-cl-088-binance-post-only-boundary-reject-lifecycle-drift-and-quantity-evidence).
+
 Latest Quote freshness and candidate-scoped OI evidence hard-constraint fix,
 2026-06-16:
 CL-086 deployment proved the account was flat/no-open-orders with no current

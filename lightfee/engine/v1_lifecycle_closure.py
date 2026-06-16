@@ -1148,6 +1148,9 @@ _EVENT_KIND_PHASES = {
     "entry.opened": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.position_opened": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_corrected": V1LifecycleClosurePhase.OPEN_POSITION.value,
+    "runtime.position_drift_skipped_passive_close_owner": (
+        V1LifecycleClosurePhase.PASSIVE_CLOSE.value
+    ),
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "exit.accepted_order_truth_gap_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
@@ -1169,6 +1172,7 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_quote_revalidate_targeted": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_quote_revalidate_failed": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_quote_revalidate_resolved": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.maker_event_no_ws_bbo_quote": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_blocked_gate": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.entry_quote_evidence_resolved_by_ws_bbo": (
         V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
@@ -1205,6 +1209,8 @@ _EVENT_KIND_PHASES = {
     "execution.entry_quantity_plan": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.entry_selected": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_post_only_bbo_repriced": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_post_only_reject_cooldown": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.passive_small_fill_buffering": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),
@@ -1220,6 +1226,7 @@ _EVENT_KIND_PHASES = {
     "reconciliation.entry_abandoned_flat": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),
+    "reconciliation.entry_resolved": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_abandon_retained_unresolved_maker": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),
@@ -1228,6 +1235,7 @@ _EVENT_KIND_PHASES = {
     ),
     "reconciliation.entry_flat_unresolved_maker_retained": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.opportunity_funnel": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "review.candidate_rejected": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "review.candidate_shortlisted": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.active_position_tick": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.close_price_evidence_fallback": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

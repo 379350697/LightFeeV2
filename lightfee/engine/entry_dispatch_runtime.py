@@ -499,6 +499,84 @@ class EntryDispatchRuntime:
                 return None, ["metadata"]
         return None, ["metadata"]
 
+    async def _entry_venue_quantity_metadata_evidence(
+        self,
+        venue: Venue,
+        symbol: str,
+        quantity_step: float | None,
+        missing_fields: list[str] | None = None,
+    ) -> dict:
+        evidence = {
+            "quantity_step": float(quantity_step or 0.0),
+            "min_quantity": 0.0,
+            "min_notional": 0.0,
+            "missing_fields": list(missing_fields or []),
+            "source": "entry_venue_quantity_metadata",
+        }
+        okx_step = await self._okx_entry_base_quantity_step(venue, symbol)
+        if okx_step and okx_step > 0:
+            evidence["quantity_step"] = float(okx_step)
+            evidence["source"] = "okx_contract_step"
+            return evidence
+        adapter = self.get_venue_adapter(venue)
+        passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
+        if not callable(passive_metadata):
+            if "metadata" not in evidence["missing_fields"]:
+                evidence["missing_fields"].append("metadata")
+            return evidence
+        try:
+            metadata = passive_metadata(symbol) or {}
+        except Exception:
+            if "metadata" not in evidence["missing_fields"]:
+                evidence["missing_fields"].append("metadata")
+            return evidence
+        if not isinstance(metadata, dict) or not metadata:
+            if "metadata" not in evidence["missing_fields"]:
+                evidence["missing_fields"].append("metadata")
+            return evidence
+        evidence["quantity_step"] = float(
+            self._safe_positive_float(
+                metadata.get("quantity_step")
+                or metadata.get("step_size")
+                or metadata.get("qtyStep")
+            )
+            or evidence["quantity_step"]
+        )
+        evidence["min_quantity"] = float(
+            self._safe_positive_float(
+                metadata.get("min_quantity")
+                or metadata.get("min_qty")
+                or metadata.get("minOrderQty")
+            )
+        )
+        try:
+            min_notional = float(
+                metadata.get("min_notional")
+                or metadata.get("min_notional_quote")
+                or metadata.get("minNotionalValue")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            min_notional = 0.0
+        evidence["min_notional"] = min_notional if math.isfinite(min_notional) else 0.0
+        return evidence
+
+    @staticmethod
+    def _entry_quantity_plan_reason(
+        *,
+        raw_quantity: float,
+        common_quantity: float,
+        full_target_quantity: float,
+        initial_maker_target_quantity: float,
+    ) -> str:
+        if abs(common_quantity - raw_quantity) > 1e-9:
+            return "exchange_step_rounding"
+        if abs(common_quantity - full_target_quantity) > 1e-9:
+            return "planner_quantity_adjustment"
+        if abs(initial_maker_target_quantity - full_target_quantity) > 1e-9:
+            return "passive_initial_slice"
+        return "full_target_quantity"
+
     def _entry_quote_lease_execution_check(
         self,
         candidate,
@@ -1579,6 +1657,24 @@ class EntryDispatchRuntime:
         hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
         maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
         hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
+        venue_quantity_metadata = {
+            long_venue.value: await self._entry_venue_quantity_metadata_evidence(
+                long_venue,
+                candidate.symbol,
+                long_quantity_step,
+            ),
+            short_venue.value: await self._entry_venue_quantity_metadata_evidence(
+                short_venue,
+                candidate.symbol,
+                short_quantity_step,
+            ),
+        }
+        quantity_plan_reason = self._entry_quantity_plan_reason(
+            raw_quantity=raw_quantity,
+            common_quantity=quantity,
+            full_target_quantity=plan.full_target_quantity,
+            initial_maker_target_quantity=plan.initial_maker_target_quantity,
+        )
         self.ctx.journal.append(
             "execution.entry_quantity_plan",
             {
@@ -1591,6 +1687,7 @@ class EntryDispatchRuntime:
                 "full_target_quantity": plan.full_target_quantity,
                 "initial_maker_target_quantity": plan.initial_maker_target_quantity,
                 "effective_quantity": effective_quantity,
+                "quantity_plan_reason": quantity_plan_reason,
                 "route": route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                 "min_hedgeable_chunk": min_hedgeable_chunk,
@@ -1599,6 +1696,7 @@ class EntryDispatchRuntime:
                     long_venue.value: long_quantity_step or 0.0,
                     short_venue.value: short_quantity_step or 0.0,
                 },
+                "venue_quantity_metadata": venue_quantity_metadata,
                 "ts_ms": now_ms,
             },
         )
