@@ -1107,6 +1107,21 @@ class EntryGateRuntime:
             "observed_open_interest_quote": observed_open_interest_quote,
             "min_open_interest_quote": min_open_interest_quote,
             "open_interest_evidence_status": open_interest_evidence_status,
+            "open_interest_evidence_reason": str(
+                getattr(quote, "open_interest_evidence_reason", "") or ""
+            ),
+            "oi_candidate_count": int(getattr(quote, "oi_candidate_count", 0) or 0),
+            "oi_cache_hit_count": int(getattr(quote, "oi_cache_hit_count", 0) or 0),
+            "oi_cache_miss_count": int(getattr(quote, "oi_cache_miss_count", 0) or 0),
+            "oi_refresh_attempt_count": int(
+                getattr(quote, "oi_refresh_attempt_count", 0) or 0
+            ),
+            "oi_refresh_cap": int(getattr(quote, "oi_refresh_cap", 0) or 0),
+            "oi_deferred_count": int(getattr(quote, "oi_deferred_count", 0) or 0),
+            "oi_timeout_count": int(getattr(quote, "oi_timeout_count", 0) or 0),
+            "oi_refresh_elapsed_ms": int(
+                getattr(quote, "oi_refresh_elapsed_ms", 0) or 0
+            ),
             "eligibility_class": eligibility_class,
             "floor": min_open_interest_quote,
             "current_value": observed_open_interest_quote,

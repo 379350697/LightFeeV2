@@ -1527,6 +1527,7 @@ class TestProductionBlockerAnalyzer:
         assert view["category_counts"] == {}
         assert view["reason_counts"] == {}
         assert view["resolution_counts"] == {}
+        assert view["oi_evidence_health_summary"] == {}
         assert view["filtered_out_counts"] == {}
         assert result["windows"]["run_window"]["entry_ws_bbo_blocker_counts"] == {
             "entry_ws_bbo_quote_lease_budget_exhausted": 8,
@@ -1575,6 +1576,10 @@ class TestProductionBlockerAnalyzer:
                     "payload": {
                         "reason": "open_interest_unavailable",
                         "open_interest_evidence_status": "deferred_by_cap",
+                        "open_interest_evidence_reason": "refresh_cap_exceeded",
+                        "oi_cache_miss_count": 8,
+                        "oi_refresh_attempt_count": 3,
+                        "oi_deferred_count": 5,
                     },
                 },
                 {
@@ -1582,6 +1587,7 @@ class TestProductionBlockerAnalyzer:
                     "payload": {
                         "reason": "open_interest_unavailable",
                         "open_interest_evidence_status": "rate_limited",
+                        "open_interest_evidence_reason": "http_429",
                     },
                 },
             ],
@@ -1590,6 +1596,13 @@ class TestProductionBlockerAnalyzer:
 
         assert view["reason_counts"]["oi_evidence_status:deferred_by_cap"] == 1
         assert view["reason_counts"]["oi_evidence_status:rate_limited"] == 1
+        assert view["reason_counts"]["oi_evidence_reason:refresh_cap_exceeded"] == 1
+        assert view["reason_counts"]["oi_evidence_reason:http_429"] == 1
+        assert view["oi_evidence_health_summary"] == {
+            "oi_cache_miss_count": 8,
+            "oi_deferred_count": 5,
+            "oi_refresh_attempt_count": 3,
+        }
 
 
 def _code_side_blocker_incident_records():

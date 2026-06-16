@@ -43,6 +43,14 @@ class FundingTicker:
     open_interest_quote: float = 0.0
     open_interest_evidence_status: str = "available"
     open_interest_evidence_reason: str = ""
+    oi_candidate_count: int = 0
+    oi_cache_hit_count: int = 0
+    oi_cache_miss_count: int = 0
+    oi_refresh_attempt_count: int = 0
+    oi_refresh_cap: int = 0
+    oi_deferred_count: int = 0
+    oi_timeout_count: int = 0
+    oi_refresh_elapsed_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -504,6 +512,13 @@ class MarketDataClient:
         }
         if spec.open_interest_path:
             sem = asyncio.Semaphore(_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY)
+            oi_candidate_count = 0
+            oi_cache_hit_count = 0
+            oi_cache_miss_count = 0
+            oi_refresh_attempt_count = 0
+            oi_deferred_count = 0
+            oi_timeout_count = 0
+            oi_refresh_elapsed_ms = 0
 
             async def _fetch_oi(venue_sym: str) -> tuple[str, float, str]:
                 async with sem:
@@ -529,6 +544,7 @@ class MarketDataClient:
             for sym in venue_sym_to_canon:
                 if sym not in pi_map:
                     continue
+                oi_candidate_count += 1
                 mark_price = _safe_float(pi_map.get(sym, {}).get("markPrice", 0))
                 cached = self._binance_style_cached_open_interest(
                     sym,
@@ -536,11 +552,13 @@ class MarketDataClient:
                     now_ms=now_ms,
                 )
                 if cached is not None:
+                    oi_cache_hit_count += 1
                     oi_value, status, reason = cached
                     oi_map[sym] = oi_value
                     oi_evidence_status[sym] = status
                     oi_evidence_reason[sym] = reason or "cache_hit"
                     continue
+                oi_cache_miss_count += 1
                 oi_symbols.append(sym)
             refresh_cap = int(
                 getattr(
@@ -551,18 +569,22 @@ class MarketDataClient:
                 or BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP
             )
             refresh_symbols = oi_symbols[:max(refresh_cap, 0)]
+            oi_refresh_attempt_count = len(refresh_symbols)
             for deferred_sym in oi_symbols[len(refresh_symbols):]:
                 oi_evidence_status[deferred_sym] = "deferred_by_cap"
                 oi_evidence_reason[deferred_sym] = "refresh_cap_exceeded"
+            oi_deferred_count = max(len(oi_symbols) - len(refresh_symbols), 0)
             tasks = [
                 asyncio.create_task(_fetch_oi(sym), name=sym)
                 for sym in refresh_symbols
             ]
             if tasks:
+                refresh_started_ms = _now_ms()
                 done, pending = await asyncio.wait(
                     tasks,
                     timeout=BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
                 )
+                oi_refresh_elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
                 for task in done:
                     try:
                         venue_sym, open_interest_quote, status = task.result()
@@ -593,8 +615,18 @@ class MarketDataClient:
                     if venue_sym:
                         oi_evidence_status[venue_sym] = "timeout"
                         oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
+                oi_timeout_count = len(pending)
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            oi_candidate_count = 0
+            oi_cache_hit_count = 0
+            oi_cache_miss_count = 0
+            oi_refresh_attempt_count = 0
+            refresh_cap = 0
+            oi_deferred_count = 0
+            oi_timeout_count = 0
+            oi_refresh_elapsed_ms = 0
 
         result: dict[str, FundingTicker] = {}
         for venue_sym, canon in venue_sym_to_canon.items():
@@ -621,6 +653,14 @@ class MarketDataClient:
                     "unavailable" if spec.open_interest_path else "unsupported",
                 ),
                 open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
+                oi_candidate_count=oi_candidate_count,
+                oi_cache_hit_count=oi_cache_hit_count,
+                oi_cache_miss_count=oi_cache_miss_count,
+                oi_refresh_attempt_count=oi_refresh_attempt_count,
+                oi_refresh_cap=refresh_cap,
+                oi_deferred_count=oi_deferred_count,
+                oi_timeout_count=oi_timeout_count,
+                oi_refresh_elapsed_ms=oi_refresh_elapsed_ms,
             )
         return result
 

@@ -1249,6 +1249,139 @@ async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote
 
 
 @pytest.mark.asyncio
+async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucket(
+    tmp_path,
+    monkeypatch,
+):
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult, TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5_000,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=100,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.last_scan = {}
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    async def prewarm_without_quotes(candidates, prewarm_now_ms):
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("okx", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = set()
+
+    class StaleRestRefresher:
+        def refresh_quote_result(self, venue: str, symbol: str, *, now_ms: int):
+            quote = TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=now_ms - 250,
+                received_at_ms=now_ms,
+                source="rest_topbook",
+            )
+            return RestTopBookQuoteResult(
+                venue=venue,
+                symbol=symbol,
+                venue_symbol=symbol,
+                outcome="resolved",
+                quote=quote,
+                endpoint="rest_topbook",
+                url=f"https://example.invalid/{venue}/{symbol}",
+                bid=quote.bid,
+                ask=quote.ask,
+                observed_at_ms=quote.observed_at_ms,
+            )
+
+    runtime.ws_bbo_rest_refresher = StaleRestRefresher()
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        prewarm_without_quotes,
+    )
+
+    runtime.journal.open()
+    try:
+        overlay, stats = await runtime._entry_quote_revalidate_for_candidates(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+            candidate_scope="v1_primary_shadow",
+        )
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    failures = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_quote_revalidate_failed"
+    ]
+
+    assert overlay == {}
+    assert stats["quote_lease_failure_counts"] == Counter({
+        "rest_resolved_but_stale": 2,
+    })
+    assert {payload["reason_bucket"] for payload in failures} == {
+        "rest_resolved_but_stale"
+    }
+    assert {payload["reason_family"] for payload in failures} == {
+        "rest_invalid_quote"
+    }
+    assert {payload["quote_validation_reject_reason"] for payload in failures} == {
+        "stale"
+    }
+    assert all(payload["rest_quote_observed_at_ms"] == now_ms - 250 for payload in failures)
+    assert all(payload["rest_quote_age_ms"] == 250 for payload in failures)
+    assert all(payload["rest_quote_bid"] == pytest.approx(100.0) for payload in failures)
+    assert all(payload["rest_quote_ask"] == pytest.approx(101.0) for payload in failures)
+
+
+@pytest.mark.asyncio
 async def test_runtime_entry_quote_probe_diagnostics_are_disabled_by_default(
     tmp_path,
     monkeypatch,

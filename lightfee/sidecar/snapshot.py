@@ -94,6 +94,15 @@ class QuoteSnapshot:
     volume_24h_quote: float = 0.0
     open_interest: float = 0.0
     open_interest_evidence_status: str = "available"
+    open_interest_evidence_reason: str = ""
+    oi_candidate_count: int = 0
+    oi_cache_hit_count: int = 0
+    oi_cache_miss_count: int = 0
+    oi_refresh_attempt_count: int = 0
+    oi_refresh_cap: int = 0
+    oi_deferred_count: int = 0
+    oi_timeout_count: int = 0
+    oi_refresh_elapsed_ms: int = 0
 
 
 @dataclass

@@ -98,6 +98,15 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "volume_24h_quote": q.volume_24h_quote,
                 "open_interest": q.open_interest,
                 "open_interest_evidence_status": q.open_interest_evidence_status,
+                "open_interest_evidence_reason": q.open_interest_evidence_reason,
+                "oi_candidate_count": q.oi_candidate_count,
+                "oi_cache_hit_count": q.oi_cache_hit_count,
+                "oi_cache_miss_count": q.oi_cache_miss_count,
+                "oi_refresh_attempt_count": q.oi_refresh_attempt_count,
+                "oi_refresh_cap": q.oi_refresh_cap,
+                "oi_deferred_count": q.oi_deferred_count,
+                "oi_timeout_count": q.oi_timeout_count,
+                "oi_refresh_elapsed_ms": q.oi_refresh_elapsed_ms,
             }
             for k, q in s.quotes.items()
         },

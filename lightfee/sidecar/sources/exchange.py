@@ -46,6 +46,15 @@ class ExchangeSource:
             volume_24h_quote=ft.volume_24h_quote,
             open_interest=ft.open_interest_quote,
             open_interest_evidence_status=ft.open_interest_evidence_status,
+            open_interest_evidence_reason=ft.open_interest_evidence_reason,
+            oi_candidate_count=ft.oi_candidate_count,
+            oi_cache_hit_count=ft.oi_cache_hit_count,
+            oi_cache_miss_count=ft.oi_cache_miss_count,
+            oi_refresh_attempt_count=ft.oi_refresh_attempt_count,
+            oi_refresh_cap=ft.oi_refresh_cap,
+            oi_deferred_count=ft.oi_deferred_count,
+            oi_timeout_count=ft.oi_timeout_count,
+            oi_refresh_elapsed_ms=ft.oi_refresh_elapsed_ms,
         )
 
     async def fetch_funding_rates(self, symbols: list[str]) -> dict[str, float]:

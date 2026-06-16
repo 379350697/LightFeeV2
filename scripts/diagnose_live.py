@@ -2696,7 +2696,18 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     zero_fill_lifecycle_guard_blocker_counts: dict[str, int] = {}
     zero_fill_lifecycle_guard_samples: list[dict[str, Any]] = []
     quote_lease_failure_counts: dict[str, int] = {}
+    quote_lease_failure_family_counts: dict[str, int] = {}
     oi_liquidity_evidence_counts: dict[str, int] = {}
+    oi_liquidity_evidence_reason_counts: dict[str, int] = {}
+    oi_liquidity_health_summary = {
+        "cache_hit_count": 0,
+        "cache_miss_count": 0,
+        "refresh_attempt_count": 0,
+        "deferred_count": 0,
+        "timeout_count": 0,
+        "max_refresh_cap": 0,
+        "max_refresh_elapsed_ms": 0,
+    }
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -2732,6 +2743,10 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             quote_lease_failure_counts[bucket] = (
                 quote_lease_failure_counts.get(bucket, 0) + 1
             )
+            family = str(payload.get("reason_family") or bucket)
+            quote_lease_failure_family_counts[family] = (
+                quote_lease_failure_family_counts.get(family, 0) + 1
+            )
         elif kind == "execution.entry_liquidity_blocked":
             status = str(
                 payload.get("open_interest_evidence_status")
@@ -2740,6 +2755,33 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             )
             oi_liquidity_evidence_counts[status] = (
                 oi_liquidity_evidence_counts.get(status, 0) + 1
+            )
+            reason = str(payload.get("open_interest_evidence_reason") or "unknown")
+            oi_liquidity_evidence_reason_counts[reason] = (
+                oi_liquidity_evidence_reason_counts.get(reason, 0) + 1
+            )
+            oi_liquidity_health_summary["cache_hit_count"] += int(
+                payload.get("oi_cache_hit_count") or 0
+            )
+            oi_liquidity_health_summary["cache_miss_count"] += int(
+                payload.get("oi_cache_miss_count") or 0
+            )
+            oi_liquidity_health_summary["refresh_attempt_count"] += int(
+                payload.get("oi_refresh_attempt_count") or 0
+            )
+            oi_liquidity_health_summary["deferred_count"] += int(
+                payload.get("oi_deferred_count") or 0
+            )
+            oi_liquidity_health_summary["timeout_count"] += int(
+                payload.get("oi_timeout_count") or 0
+            )
+            oi_liquidity_health_summary["max_refresh_cap"] = max(
+                oi_liquidity_health_summary["max_refresh_cap"],
+                int(payload.get("oi_refresh_cap") or 0),
+            )
+            oi_liquidity_health_summary["max_refresh_elapsed_ms"] = max(
+                oi_liquidity_health_summary["max_refresh_elapsed_ms"],
+                int(payload.get("oi_refresh_elapsed_ms") or 0),
             )
         elif kind == "execution.direction_drift_blocked":
             reason = str(payload.get("reason", "") or "")
@@ -2786,9 +2828,16 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         ),
         "zero_fill_lifecycle_guard_samples": zero_fill_lifecycle_guard_samples,
         "quote_lease_failure_counts": dict(sorted(quote_lease_failure_counts.items())),
+        "quote_lease_failure_family_counts": dict(
+            sorted(quote_lease_failure_family_counts.items())
+        ),
         "oi_liquidity_evidence_counts": dict(
             sorted(oi_liquidity_evidence_counts.items())
         ),
+        "oi_liquidity_evidence_reason_counts": dict(
+            sorted(oi_liquidity_evidence_reason_counts.items())
+        ),
+        "oi_liquidity_health_summary": oi_liquidity_health_summary,
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 

@@ -268,6 +268,7 @@ def _code_side_view(
     category_counts: Counter[str],
     reason_counts: Counter[str],
     resolution_counts: Counter[str] | None = None,
+    oi_evidence_health_summary: Counter[str] | None = None,
     filtered_out_counts: Counter[str],
     exclude_strategy: bool,
     exclude_liquidity: bool,
@@ -281,9 +282,11 @@ def _code_side_view(
             "category_counts": {},
             "reason_counts": {},
             "resolution_counts": {},
+            "oi_evidence_health_summary": {},
             "filtered_out_counts": {},
         }
     resolution_counts = resolution_counts or Counter()
+    oi_evidence_health_summary = oi_evidence_health_summary or Counter()
     return {
         "enabled": True,
         "excluded_filters": [
@@ -298,6 +301,9 @@ def _code_side_view(
         "category_counts": dict(sorted(category_counts.items())),
         "reason_counts": dict(sorted(reason_counts.items())),
         "resolution_counts": dict(sorted(resolution_counts.items())),
+        "oi_evidence_health_summary": dict(
+            sorted(oi_evidence_health_summary.items())
+        ),
         "filtered_out_counts": dict(sorted(filtered_out_counts.items())),
     }
 
@@ -309,6 +315,7 @@ def _record_code_side_blocker(
     category_counts: Counter[str],
     reason_counts: Counter[str],
     resolution_counts: Counter[str],
+    oi_evidence_health_summary: Counter[str],
     filtered_out_counts: Counter[str],
     exclude_strategy: bool,
     exclude_liquidity: bool,
@@ -470,11 +477,15 @@ def _record_code_side_blocker(
     if kind == "runtime.entry_quote_revalidate_failed":
         _add_count(category_counts, "code_data_freshness")
         outcome = str(
-            payload.get("outcome")
+            payload.get("reason_bucket")
+            or payload.get("outcome")
             or payload.get("reason")
             or "quote_revalidate_failed"
         )
         _add_count(reason_counts, outcome)
+        family = str(payload.get("reason_family") or "")
+        if family:
+            _add_count(reason_counts, f"quote_family:{family}")
         _add_count(resolution_counts, "quote_revalidate_failed")
 
     if kind == "runtime.live_scan_revalidate_required":
@@ -527,6 +538,21 @@ def _record_code_side_blocker(
         oi_status = str(payload.get("open_interest_evidence_status") or "")
         if oi_status:
             _add_count(reason_counts, f"oi_evidence_status:{oi_status}")
+        oi_reason = str(payload.get("open_interest_evidence_reason") or "")
+        if oi_reason:
+            _add_count(reason_counts, f"oi_evidence_reason:{oi_reason}")
+        for field in (
+            "oi_cache_hit_count",
+            "oi_cache_miss_count",
+            "oi_refresh_attempt_count",
+            "oi_deferred_count",
+            "oi_timeout_count",
+            "oi_refresh_cap",
+            "oi_refresh_elapsed_ms",
+        ):
+            value = int(payload.get(field) or 0)
+            if value:
+                _add_count(oi_evidence_health_summary, field, value)
 
 
 def build_code_side_blocker_view(
@@ -539,6 +565,7 @@ def build_code_side_blocker_view(
     category_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
     resolution_counts: Counter[str] = Counter()
+    oi_evidence_health_summary: Counter[str] = Counter()
     filtered_out_counts: Counter[str] = Counter()
     for record in records:
         payload = _payload(record)
@@ -548,6 +575,7 @@ def build_code_side_blocker_view(
             category_counts=category_counts,
             reason_counts=reason_counts,
             resolution_counts=resolution_counts,
+            oi_evidence_health_summary=oi_evidence_health_summary,
             filtered_out_counts=filtered_out_counts,
             exclude_strategy=exclude_strategy,
             exclude_liquidity=exclude_liquidity,
@@ -556,6 +584,7 @@ def build_code_side_blocker_view(
         category_counts=category_counts,
         reason_counts=reason_counts,
         resolution_counts=resolution_counts,
+        oi_evidence_health_summary=oi_evidence_health_summary,
         filtered_out_counts=filtered_out_counts,
         exclude_strategy=exclude_strategy,
         exclude_liquidity=exclude_liquidity,
@@ -720,6 +749,7 @@ def analyze_event_file(
         code_side_category_counts: Counter[str] = Counter()
         code_side_reason_counts: Counter[str] = Counter()
         code_side_resolution_counts: Counter[str] = Counter()
+        code_side_oi_evidence_health_summary: Counter[str] = Counter()
         code_side_filtered_counts: Counter[str] = Counter()
         nonblocking_bulk_probe_by_venue: Counter[str] = Counter()
         nonblocking_bulk_probe_details: dict[tuple[str, str], dict[str, Any]] = {}
@@ -811,6 +841,7 @@ def analyze_event_file(
                 category_counts=code_side_category_counts,
                 reason_counts=code_side_reason_counts,
                 resolution_counts=code_side_resolution_counts,
+                oi_evidence_health_summary=code_side_oi_evidence_health_summary,
                 filtered_out_counts=code_side_filtered_counts,
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,
@@ -1029,6 +1060,7 @@ def analyze_event_file(
                 category_counts=code_side_category_counts,
                 reason_counts=code_side_reason_counts,
                 resolution_counts=code_side_resolution_counts,
+                oi_evidence_health_summary=code_side_oi_evidence_health_summary,
                 filtered_out_counts=code_side_filtered_counts,
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,

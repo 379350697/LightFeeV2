@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Quote/OI evidence diagnostic closure, 2026-06-16:
+Production after CL-085 was flat/no-open-orders with no current order errors
+and no lifecycle unmapped events, but no-entry attribution still had two
+evidence gaps. REST top-book fallback failures collapsed stale REST quotes,
+missing timestamps, invalid bid/ask, unsupported symbols, HTTP/parse failures,
+and timeout/exception cases into generic `rest_invalid_quote`. Binance/Aster OI
+blockers exposed `deferred_by_cap` or `timeout` but not enough cache/cap/elapsed
+evidence to decide whether a later throughput optimization was justified.
+CL-086 splits REST quote failure buckets while retaining
+`reason_family=rest_invalid_quote` for compatibility, carries REST quote
+observed-at/age/bid/ask evidence, and propagates OI cache hit/miss, refresh cap,
+attempt, deferred, timeout, and elapsed evidence through funding tickers,
+sidecar quotes, entry liquidity blockers, `diagnose_live`, and offline blocker
+analysis. No quote stale, OI/liquidity, admission, sizing, order, close,
+recovery, or lifecycle guard is loosened, and no full-universe per-symbol OI hot
+path is introduced. See
+[daily/2026-06-16.md#cluster-cl-086-quote-rest-invalid-quote-diagnostics-and-oi-captimeout-evidence](daily/2026-06-16.md#cluster-cl-086-quote-rest-invalid-quote-diagnostics-and-oi-captimeout-evidence)
+and [cards/market-data-snapshot-freshness.md](cards/market-data-snapshot-freshness.md).
+
 Latest Aster/Binance quote lease and OI evidence closure, 2026-06-15:
 The current follow-up does not loosen entry risk. It closes a diagnostic and
 market-truth semantic gap left by replacing V1 local L2 with V2 WS-BBO: quote
@@ -1552,6 +1571,22 @@ services restarted active. Post-deploy live stayed `risk_only` / `fail_closed`
 because an older `ARIAUSDT` pending-entry/live-truth mismatch remained from
 before this deployment, so fresh production entry counters are blocked until
 that separate pending-entry family is resolved.
+
+Latest Quote/OI evidence closure, 2026-06-16: production after CL-085 was
+flat/no-open-orders with no current order errors and no lifecycle unmapped
+events, but no-entry attribution still had two evidence gaps. REST top-book
+fallback failures collapsed stale REST quotes, missing timestamps, invalid
+bid/ask, unsupported symbols, HTTP/parse failures, and timeout/exception cases
+into generic `rest_invalid_quote`. Binance/Aster OI blockers exposed
+`deferred_by_cap` or `timeout` but not enough cache/cap/elapsed evidence to
+decide whether a later throughput optimization was justified. CL-086 splits
+REST quote failure buckets while retaining `reason_family=rest_invalid_quote`
+for compatibility, carries REST quote observed-at/age/bid/ask evidence, and
+propagates OI cache hit/miss, refresh cap, attempt, deferred, timeout, and
+elapsed evidence through funding tickers, sidecar quotes, entry liquidity
+blockers, `diagnose_live`, and offline blocker analysis. No quote stale,
+OI/liquidity, admission, sizing, order, close, recovery, or lifecycle guard was
+loosened, and no full-universe per-symbol OI hot path was introduced.
 
 Latest targeted local closure, 2026-05-31: post-`ae4bd9c` production stayed
 healthy with zero local open/pending/residual state, empty warning logs, and

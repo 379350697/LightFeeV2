@@ -295,6 +295,11 @@ class TestProductionSidecarParserRegressions:
             assert ticker.ask > 0.0
             assert ticker.open_interest_quote == 0.0
             assert ticker.open_interest_evidence_status == "timeout"
+            assert ticker.open_interest_evidence_reason == "timeout_waiting_for_oi"
+            assert ticker.oi_refresh_cap == 128
+            assert ticker.oi_refresh_attempt_count == 2
+            assert ticker.oi_timeout_count == 2
+            assert ticker.oi_refresh_elapsed_ms >= 0
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):
@@ -497,6 +502,21 @@ class TestProductionSidecarParserRegressions:
         }
         assert list(statuses.values()).count("available") == 3
         assert list(statuses.values()).count("deferred_by_cap") == 5
+        for ticker in result.values():
+            assert ticker.oi_candidate_count == 8
+            assert ticker.oi_refresh_cap == 3
+            assert ticker.oi_refresh_attempt_count == 3
+            assert ticker.oi_deferred_count == 5
+            assert ticker.oi_cache_miss_count == 8
+        deferred = [
+            ticker
+            for ticker in result.values()
+            if ticker.open_interest_evidence_status == "deferred_by_cap"
+        ]
+        assert all(
+            ticker.open_interest_evidence_reason == "refresh_cap_exceeded"
+            for ticker in deferred
+        )
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_requires_mark_price_evidence(self):

@@ -4274,8 +4274,9 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "payload": {
                 "venue": "aster",
                 "symbol": "HOMEUSDT",
-                "outcome": "ws_timeout",
-                "reason_bucket": "subscribed_no_message",
+                "outcome": "rest_invalid_quote",
+                "reason_bucket": "rest_resolved_but_stale",
+                "reason_family": "rest_invalid_quote",
             },
         },
         {
@@ -4310,12 +4311,19 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
     summary = _build_entry_outcome_summary(events)
 
     assert summary["quote_lease_failure_counts"] == {
+        "rest_resolved_but_stale": 1,
         "rest_throttled": 1,
-        "subscribed_no_message": 1,
+    }
+    assert summary["quote_lease_failure_family_counts"] == {
+        "rest_invalid_quote": 1,
+        "rest_throttled": 1,
     }
     assert summary["oi_liquidity_evidence_counts"] == {
         "deferred_by_cap": 1,
         "rate_limited": 1,
+    }
+    assert summary["oi_liquidity_evidence_reason_counts"] == {
+        "unknown": 2,
     }
 
 

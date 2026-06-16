@@ -1152,18 +1152,27 @@ class MarketDataRuntime:
         *,
         now_ms: int,
     ) -> bool:
+        return self._entry_quote_truth_reject_reason(quote, now_ms=now_ms) == ""
+
+    def _entry_quote_truth_reject_reason(
+        self,
+        quote: Any,
+        *,
+        now_ms: int,
+    ) -> str:
         if quote is None:
-            return False
+            return "missing_quote"
         observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
         age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
         bid = float(getattr(quote, "bid", 0.0) or 0.0)
         ask = float(getattr(quote, "ask", 0.0) or 0.0)
-        return (
-            observed_at_ms > 0
-            and age_ms <= self._entry_quote_lease_max_age_ms()
-            and bid > 0.0
-            and ask > bid
-        )
+        if observed_at_ms <= 0:
+            return "missing_observed_at"
+        if age_ms > self._entry_quote_lease_max_age_ms():
+            return "stale"
+        if bid <= 0.0 or ask <= bid:
+            return "invalid_bid_ask"
+        return ""
 
     async def _entry_quote_revalidate_for_candidates(
         self,
@@ -1338,7 +1347,26 @@ class MarketDataRuntime:
                     target["rest_error"] = f"{type(exc).__name__}: {exc}"[:240]
                     target["rest_outcome"] = "http_error"
                     refreshed = None
-                if not self._entry_quote_truth_accept_quote(refreshed, now_ms=now_ms):
+                reject_reason = self._entry_quote_truth_reject_reason(
+                    refreshed,
+                    now_ms=now_ms,
+                )
+                if refreshed is not None:
+                    observed_at_ms = int(getattr(refreshed, "observed_at_ms", 0) or 0)
+                    target["rest_quote_observed_at_ms"] = observed_at_ms
+                    target["rest_quote_age_ms"] = (
+                        max(now_ms - observed_at_ms, 0)
+                        if observed_at_ms > 0
+                        else None
+                    )
+                    target["rest_quote_bid"] = float(
+                        getattr(refreshed, "bid", 0.0) or 0.0
+                    )
+                    target["rest_quote_ask"] = float(
+                        getattr(refreshed, "ask", 0.0) or 0.0
+                    )
+                target["quote_validation_reject_reason"] = reject_reason
+                if reject_reason:
                     stats["rest_failed_count"] += 1
                     continue
                 cache = self.ctx.ws_bbo_cache
@@ -1408,30 +1436,50 @@ class MarketDataRuntime:
                 outcome = "budget_excluded_rest_unavailable"
                 bucket = "budget_excluded_without_rest"
                 reason_bucket = "budget_excluded_without_rest"
+                reason_family = reason_bucket
             elif rest_outcome == "throttled":
                 outcome = "rest_attempt_throttled"
                 bucket = "rest_topbook_attempt_throttled"
                 reason_bucket = "rest_throttled"
+                reason_family = reason_bucket
             elif rest_outcome == "unsupported_symbol":
                 outcome = "rest_unsupported_symbol"
                 bucket = "rest_topbook_unsupported_symbol"
-                reason_bucket = "rest_invalid_quote"
+                reason_bucket = "rest_unsupported_symbol"
+                reason_family = "rest_invalid_quote"
             elif rest_outcome in {"http_error", "parse_error"}:
                 outcome = f"rest_{rest_outcome}"
                 bucket = "rest_topbook_revalidate_failed"
-                reason_bucket = "rest_invalid_quote"
+                reason_bucket = f"rest_{rest_outcome}"
+                reason_family = "rest_invalid_quote"
             elif rest_outcome == "invalid_quote":
                 outcome = "rest_invalid_quote"
                 bucket = "rest_topbook_revalidate_failed"
-                reason_bucket = "rest_invalid_quote"
+                reason_bucket = "rest_resolved_invalid_bid_ask"
+                reason_family = "rest_invalid_quote"
             elif target.get("rest_error"):
                 outcome = "rest_timeout"
                 bucket = "rest_topbook_revalidate_failed"
-                reason_bucket = "rest_invalid_quote"
+                reason_bucket = "rest_timeout_or_exception"
+                reason_family = "rest_invalid_quote"
+            elif rest_outcome == "resolved":
+                outcome = "rest_invalid_quote"
+                bucket = "rest_topbook_revalidate_failed"
+                reject_reason = str(
+                    target.get("quote_validation_reject_reason") or ""
+                )
+                if reject_reason == "stale":
+                    reason_bucket = "rest_resolved_but_stale"
+                elif reject_reason == "missing_observed_at":
+                    reason_bucket = "rest_resolved_missing_observed_at"
+                else:
+                    reason_bucket = "rest_resolved_invalid_bid_ask"
+                reason_family = "rest_invalid_quote"
             elif stats.get("rest_attempt_count", 0):
                 outcome = "rest_invalid_quote"
                 bucket = "rest_topbook_revalidate_failed"
-                reason_bucket = "rest_invalid_quote"
+                reason_bucket = "rest_timeout_or_exception"
+                reason_family = "rest_invalid_quote"
             else:
                 outcome = "ws_timeout"
                 bucket = "quote_revalidate_unavailable"
@@ -1440,6 +1488,7 @@ class MarketDataRuntime:
                     or stream_state.get("lease_state")
                     or "not_tracked"
                 )
+                reason_family = reason_bucket
             stats["top_quote_blocker_buckets"][bucket] += 1
             stats["quote_lease_failure_counts"][reason_bucket] += 1
             age_ms = target.get("age_ms")
@@ -1452,6 +1501,14 @@ class MarketDataRuntime:
                 **target,
                 "outcome": outcome,
                 "reason_bucket": reason_bucket,
+                "reason_family": reason_family,
+                "quote_validation_reject_reason": str(
+                    target.get("quote_validation_reject_reason") or ""
+                ),
+                "rest_quote_observed_at_ms": target.get("rest_quote_observed_at_ms"),
+                "rest_quote_age_ms": target.get("rest_quote_age_ms"),
+                "rest_quote_bid": float(target.get("rest_quote_bid") or 0.0),
+                "rest_quote_ask": float(target.get("rest_quote_ask") or 0.0),
                 "source": "entry_quote_truth",
                 "age_ms": age_ms,
                 "budget_ms": self._entry_quote_lease_max_age_ms(),
