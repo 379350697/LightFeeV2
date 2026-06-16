@@ -428,6 +428,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "review.candidate_rejected",
         "runtime.entry_post_only_bbo_repriced",
         "runtime.entry_post_only_reject_cooldown",
+        "runtime.entry_admission_blocked",
+        "runtime.entry_blocked_admission_selection",
         "runtime.maker_event_no_ws_bbo_quote",
         "runtime.position_drift_skipped_passive_close_owner",
         "execution.hedge_deadline_breached",

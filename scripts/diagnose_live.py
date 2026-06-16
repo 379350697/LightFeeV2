@@ -2561,6 +2561,190 @@ def _order_error_resolved_by_post_only_boundary_reject(
     return key in resolved
 
 
+def _payload_is_entry_insufficient_balance_admission_reject(payload: dict[str, Any]) -> bool:
+    exchange_error = _exchange_error_dict(payload)
+    request_context = _payload_request_context(payload)
+    venue = str(
+        payload.get("venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).lower()
+    if venue != "bybit":
+        return False
+    if _boolish(request_context.get("reduce_only")):
+        return False
+
+    exchange_code = str(
+        payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
+    )
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            payload.get("reason"),
+            payload.get("error"),
+            payload.get("response_classification"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    )
+    return (
+        exchange_code == "110007"
+        or "110007" in text
+        or "insufficient_balance_admission_blocked" in text
+        or "insufficient_margin_admission_blocked" in text
+        or "not enough for new order" in text
+        or "available balance is insufficient" in text
+        or "insufficient available balance" in text
+    )
+
+
+def _contained_entry_admission_identity(payload: dict[str, Any]) -> tuple[str, str]:
+    request_context = _payload_request_context(payload)
+    exchange_error = _exchange_error_dict(payload)
+    symbol = str(
+        payload.get("symbol")
+        or exchange_error.get("symbol")
+        or request_context.get("symbol")
+        or ""
+    ).upper()
+    venue = str(
+        payload.get("venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).lower()
+    return symbol, venue
+
+
+def _build_resolved_contained_entry_admission_summary(
+    events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any],
+    symbol: str = "",
+) -> dict[str, Any]:
+    current_clean = (
+        _exchange_truth_flat(exchange_truth)
+        and _exchange_truth_no_open_orders(exchange_truth)
+    )
+    target_symbol = symbol.upper()
+    reject_keys: set[tuple[str, str]] = set()
+    block_keys: set[tuple[str, str]] = set()
+    samples: list[dict[str, Any]] = []
+
+    for rec in events:
+        kind = str(rec.get("kind", "") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        event_symbol = str(payload.get("symbol") or "").upper()
+        if target_symbol and event_symbol and event_symbol != target_symbol:
+            continue
+
+        if (
+            kind in ORDER_ERROR_KINDS
+            and _payload_is_entry_insufficient_balance_admission_reject(payload)
+        ):
+            key = _contained_entry_admission_identity(payload)
+            if key[0] and key[1]:
+                reject_keys.add(key)
+            continue
+
+        if kind not in {
+            "runtime.entry_admission_blocked",
+            "runtime.entry_admission_venue_degraded",
+        }:
+            continue
+        if payload.get("evidence_gap") is not False:
+            continue
+        reason_text = " ".join(
+            str(value or "").lower()
+            for value in (
+                payload.get("reason"),
+                payload.get("source"),
+                payload.get("raw_error"),
+            )
+        )
+        if not (
+            "admission" in reason_text
+            or "insufficient_balance" in reason_text
+            or "insufficient_margin" in reason_text
+            or "110007" in reason_text
+        ):
+            continue
+        if str(payload.get("block_scope") or "").lower() not in {"symbol", "venue"}:
+            continue
+        key = _contained_entry_admission_identity(payload)
+        if not key[0] or not key[1]:
+            continue
+        block_keys.add(key)
+        if len(samples) < 10:
+            samples.append(
+                {
+                    "symbol": key[0],
+                    "venue": key[1],
+                    "reason": str(payload.get("reason") or "")[:300],
+                    "source": str(payload.get("source") or "")[:120],
+                    "block_scope": str(payload.get("block_scope") or ""),
+                    "ts_ms": rec.get("ts_ms", 0),
+                }
+            )
+
+    resolved_keys = reject_keys & block_keys if current_clean else set()
+    unresolved_keys = reject_keys - resolved_keys
+    return {
+        "count": len(reject_keys),
+        "resolved_count": len(resolved_keys),
+        "unresolved_count": len(unresolved_keys),
+        "symbols": sorted({key[0] for key in reject_keys}),
+        "resolved_symbols": sorted({key[0] for key in resolved_keys}),
+        "unresolved_symbols": sorted({key[0] for key in unresolved_keys}),
+        "resolved_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(resolved_keys)
+        ],
+        "unresolved_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(unresolved_keys)
+        ],
+        "block_identities": [
+            {"symbol": sym, "venue": venue}
+            for sym, venue in sorted(block_keys)
+        ],
+        "current_exchange_truth_clean": current_clean,
+        "samples": samples,
+    }
+
+
+def _order_error_resolved_by_contained_entry_admission(
+    payload: dict[str, Any],
+    resolved_contained_admission_summary: dict[str, Any] | None,
+) -> bool:
+    if not resolved_contained_admission_summary:
+        return False
+    if (
+        resolved_contained_admission_summary.get("current_exchange_truth_clean")
+        is not True
+    ):
+        return False
+    if int(resolved_contained_admission_summary.get("resolved_count", 0) or 0) <= 0:
+        return False
+    if not _payload_is_entry_insufficient_balance_admission_reject(payload):
+        return False
+    key = _contained_entry_admission_identity(payload)
+    resolved = {
+        (
+            str(item.get("symbol") or "").upper(),
+            str(item.get("venue") or "").lower(),
+        )
+        for item in (
+            resolved_contained_admission_summary.get("resolved_identities", [])
+            or []
+        )
+        if isinstance(item, dict)
+    }
+    return key in resolved
+
+
 def _build_order_error_evidence(
     events: list[dict[str, Any]],
     symbol: str = "",
@@ -2568,6 +2752,7 @@ def _build_order_error_evidence(
     resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
     resolved_post_only_summary: dict[str, Any] | None = None,
     resolved_close_order_error_summary: dict[str, Any] | None = None,
+    resolved_contained_admission_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
 
@@ -2601,6 +2786,11 @@ def _build_order_error_evidence(
         if _order_error_resolved_by_close_terminal_truth(
             payload,
             resolved_close_order_error_summary,
+        ):
+            continue
+        if _order_error_resolved_by_contained_entry_admission(
+            payload,
+            resolved_contained_admission_summary,
         ):
             continue
 
@@ -3574,14 +3764,19 @@ def _build_production_acceptance_gate(
                     "blocking_required_truth"
                 )
 
-        if kind == "runtime.entry_admission_venue_degraded":
+        if kind in {
+            "runtime.entry_admission_blocked",
+            "runtime.entry_admission_venue_degraded",
+        }:
             reason_text = f"{reason} {payload.get('source', '')}".lower()
             if (
-                payload.get("block_scope") == "venue"
+                payload.get("block_scope") in {"symbol", "venue"}
                 and payload.get("evidence_gap") is False
                 and (
                     "admission" in reason_text
+                    or "insufficient_balance" in reason_text
                     or "insufficient_margin" in reason_text
+                    or "110007" in reason_text
                 )
             ):
                 contained_admission_count += 1
@@ -4647,6 +4842,13 @@ def run_diagnose(
         exchange_truth,
         symbol,
     )
+    resolved_contained_entry_admission_summary = (
+        _build_resolved_contained_entry_admission_summary(
+            all_events,
+            exchange_truth,
+            symbol,
+        )
+    )
     duplicate_close_leg_suppressed_summary = (
         _build_duplicate_close_leg_suppressed_summary(all_events)
     )
@@ -4657,6 +4859,7 @@ def run_diagnose(
         resolved_terminal_zero_qty_summary,
         resolved_post_only_reject_summary,
         resolved_close_order_error_summary,
+        resolved_contained_entry_admission_summary,
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
     l2_evidence = _build_l2_evidence(all_events)
@@ -4742,6 +4945,9 @@ def run_diagnose(
         "resolved_terminal_zero_qty_reduce_only_summary": resolved_terminal_zero_qty_summary,
         "resolved_post_only_reject_summary": resolved_post_only_reject_summary,
         "resolved_close_order_error_summary": resolved_close_order_error_summary,
+        "resolved_contained_entry_admission_summary": (
+            resolved_contained_entry_admission_summary
+        ),
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,

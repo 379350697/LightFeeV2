@@ -656,6 +656,89 @@ def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_containe
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_resolves_bybit_insufficient_balance_entry_reject_when_admission_blocked(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1781665908000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781665905361,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1781665905100-SOONUSDT",
+                    "symbol": "SOONUSDT",
+                    "venue": "bybit",
+                    "reason": (
+                        "bybit passive order failed: bybit retCode=110007 "
+                        "retMsg=ab not enough for new order"
+                    ),
+                    "exchange_error": {
+                        "http_status": 200,
+                        "exchange_code": "110007",
+                        "exchange_msg": "ab not enough for new order",
+                        "evidence_completeness": "complete",
+                        "confidence": "high",
+                        "raw_body": '{"retCode":110007,"retMsg":"ab not enough for new order"}',
+                    },
+                    "request_context": {
+                        "venue": "bybit",
+                        "symbol": "SOONUSDT",
+                        "post_only": True,
+                        "reduce_only": False,
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781665905362,
+                "kind": "runtime.entry_admission_blocked",
+                "payload": {
+                    "venue": "bybit",
+                    "symbol": "SOONUSDT",
+                    "reason": "insufficient_balance_admission_blocked",
+                    "source": "initial_entry",
+                    "block_scope": "symbol",
+                    "evidence_gap": False,
+                    "cooldown_active": True,
+                    "raw_error": (
+                        "bybit passive order failed: bybit retCode=110007 "
+                        "retMsg=ab not enough for new order"
+                    ),
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="SOONUSDT",
+            venues=["bybit", "binance"],
+            now_ms=1781665910000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        assert gate["contained_admission_count"] == 1
+        assert gate["exception_conclusions"]["contained_admission"] == "contained_admission"
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_accepts_passive_close_resolved_lifecycle_when_flat():
     from scripts import diagnose_live as dl
 

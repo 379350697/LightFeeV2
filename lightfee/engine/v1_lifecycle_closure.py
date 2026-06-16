@@ -1216,6 +1216,10 @@ _EVENT_KIND_PHASES = {
     "execution.entry_leverage_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "execution.entry_leverage_unavailable": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "execution.direction_drift_blocked": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "runtime.entry_admission_blocked": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "runtime.entry_blocked_admission_selection": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
     "execution.entry_quantity_plan": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.entry_selected": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
