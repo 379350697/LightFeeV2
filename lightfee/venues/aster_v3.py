@@ -533,8 +533,6 @@ class AsterV3Client:
                 if passive or request.post_only or request.time_in_force == TimeInForce.POST_ONLY
                 else "GTC"
             )
-        elif request.time_in_force == TimeInForce.IOC:
-            params["timeInForce"] = "IOC"
         if request.reduce_only:
             params["reduceOnly"] = "true"
         if request.client_order_id:

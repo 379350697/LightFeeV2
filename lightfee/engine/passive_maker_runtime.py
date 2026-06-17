@@ -40,6 +40,46 @@ class PassiveMakerRuntime:
     def _entry_quote_lease_max_age_ms(self) -> int:
         return self.ctx._entry_quote_lease_max_age_ms()
 
+    @staticmethod
+    def _maker_event_reprice_reject_reason(error: Exception) -> str:
+        text = str(error or "").lower()
+        if (
+            "110007" in text
+            or "available balance is insufficient" in text
+            or "insufficient available balance" in text
+            or "insufficient_balance_admission_blocked" in text
+        ):
+            return "insufficient_balance_admission_blocked"
+        return ""
+
+    def _terminally_block_maker_event_reprice(
+        self,
+        entry_id: str,
+        pending,
+        *,
+        stored_price: float,
+        now_ms: int,
+        reason: str,
+    ) -> None:
+        max_failures = int(
+            getattr(self.ctx.config.strategy, "passive_max_consecutive_failures", 5)
+            or 5
+        )
+        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
+        self._maker_event_state[entry_id] = {
+            "maker_price": stored_price,
+            "last_reprice_ms": now_ms,
+            "consecutive_failures": max_failures,
+            "terminal_reject_reason": reason,
+            "venue": (
+                maker_venue.value
+                if hasattr(maker_venue, "value")
+                else str(maker_venue)
+            ),
+            "symbol": pending.symbol,
+        }
+
     def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
         self.ctx._refresh_entry_l2_session_readiness(now_ms)
 
@@ -227,6 +267,8 @@ class PassiveMakerRuntime:
             )
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
             stored = self._maker_event_state.get(entry_id)
+            if isinstance(stored, dict) and stored.get("terminal_reject_reason"):
+                continue
             if isinstance(stored, tuple) and len(stored) == 2:
                 manager, stored_price = stored
             else:
@@ -317,10 +359,25 @@ class PassiveMakerRuntime:
                 woke_positions += 1
             except Exception as e:
                 manager.note_failure(now_ms)
-                self._maker_event_state[entry_id] = (manager, stored_price)
+                reject_reason = self._maker_event_reprice_reject_reason(e)
+                if reject_reason:
+                    self._terminally_block_maker_event_reprice(
+                        entry_id,
+                        pending,
+                        stored_price=stored_price,
+                        now_ms=now_ms,
+                        reason=reject_reason,
+                    )
+                else:
+                    self._maker_event_state[entry_id] = (manager, stored_price)
                 self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
-                    {"entry_id": entry_id, "action": action, "error": str(e)},
+                    {
+                        "entry_id": entry_id,
+                        "action": action,
+                        "error": str(e),
+                        "response_classification": reject_reason,
+                    },
                 )
 
         self._last_maker_event_ms = now_ms
@@ -411,6 +468,8 @@ class PassiveMakerRuntime:
 
             mid = (bid + ask) / 2.0
             stored = self._maker_event_state.get(entry_id)
+            if isinstance(stored, dict) and stored.get("terminal_reject_reason"):
+                continue
             if isinstance(stored, tuple) and len(stored) == 2:
                 manager, stored_price = stored
             else:
@@ -484,7 +543,17 @@ class PassiveMakerRuntime:
                     max_quote_age_ms = max(max_quote_age_ms, age_ms)
             except Exception as e:
                 manager.note_failure(now_ms)
-                self._maker_event_state[entry_id] = (manager, stored_price)
+                reject_reason = self._maker_event_reprice_reject_reason(e)
+                if reject_reason:
+                    self._terminally_block_maker_event_reprice(
+                        entry_id,
+                        pending,
+                        stored_price=stored_price,
+                        now_ms=now_ms,
+                        reason=reject_reason,
+                    )
+                else:
+                    self._maker_event_state[entry_id] = (manager, stored_price)
                 self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
                     {
@@ -492,6 +561,7 @@ class PassiveMakerRuntime:
                         "action": action,
                         "error": str(e),
                         "source": "ws_bbo_quote_lease",
+                        "response_classification": reject_reason,
                     },
                 )
 
@@ -559,6 +629,8 @@ class PassiveMakerRuntime:
                 continue
 
             failures = est.get("consecutive_failures", 0)
+            if est.get("terminal_reject_reason"):
+                continue
             if failures >= max_failures:
                 continue
 
@@ -594,14 +666,29 @@ class PassiveMakerRuntime:
                 }
                 woke_positions += 1
             except Exception as e:
-                self._maker_event_state[entry_id] = {
-                    "maker_price": stored_price,
-                    "last_reprice_ms": now_ms,
-                    "consecutive_failures": failures + 1,
-                }
+                reject_reason = self._maker_event_reprice_reject_reason(e)
+                if reject_reason:
+                    self._terminally_block_maker_event_reprice(
+                        entry_id,
+                        pending,
+                        stored_price=stored_price,
+                        now_ms=now_ms,
+                        reason=reject_reason,
+                    )
+                else:
+                    self._maker_event_state[entry_id] = {
+                        "maker_price": stored_price,
+                        "last_reprice_ms": now_ms,
+                        "consecutive_failures": failures + 1,
+                    }
                 self.ctx.journal.append(
                     "runtime.maker_event_reprice_error",
-                    {"entry_id": entry_id, "action": action, "error": str(e)},
+                    {
+                        "entry_id": entry_id,
+                        "action": action,
+                        "error": str(e),
+                        "response_classification": reject_reason,
+                    },
                 )
 
         self._last_maker_event_ms = now_ms

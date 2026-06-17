@@ -450,6 +450,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+        "entry.hedge_drive_cancel_replace",
+        "runtime.maker_event_lane_wake",
+        "runtime.maker_event_reprice",
+        "runtime.maker_event_reprice_error",
         "pending_entry.long_lived_pending_entry",
         "runtime.entry_selected_submit_deadline_exceeded",
         "runtime.entry_selected_submit_deadline_waiting_on_order_truth",
@@ -469,6 +473,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
         == "ENTRY_QUOTE_LEASE"
     )
+    assert map_lifecycle_event_kind("entry.hedge_drive_cancel_replace") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.maker_event_reprice") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.maker_event_reprice_error") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.maker_event_lane_wake") == "RUNTIME_PROGRESS"
     assert map_lifecycle_event_kind("pending_entry.long_lived_pending_entry") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_exceeded") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_waiting_on_order_truth") == "PENDING_ENTRY"

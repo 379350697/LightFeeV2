@@ -4025,6 +4025,18 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             "action_evidence_kind": kind,
         }
 
+    def default_action_evidence_kind(phase: str) -> str:
+        return {
+            "quote_rewarm": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "candidate_lease": "review.candidate_shortlisted",
+            "selected_pre_submit": "runtime.entry_selected_submit_deadline_exceeded",
+            "entry_selected_terminal": "pending_entry.long_lived_pending_entry",
+            "pending_entry": "pending_entry.long_lived_pending_entry",
+            "maker_resting": "passive_maintenance.cancel_issued",
+            "close_terminal": "runtime.passive_close_deadline_fallback_armed",
+            "recovery_terminal": "recovery.blocked",
+        }.get(phase, "")
+
     entry_terminal_kinds = {
         "entry.aborted",
         "entry.opened",
@@ -4190,6 +4202,11 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             if isinstance(artifact.get("observed_actions", {}), dict)
             else {}
         )
+        action_taken = str(observed_action.get("action_taken") or "")
+        action_evidence_kind = str(observed_action.get("action_evidence_kind") or "")
+        if status == "hard_over_budget" and not action_taken:
+            action_taken = budget.action
+            action_evidence_kind = default_action_evidence_kind(phase)
         records.append({
             "phase": phase,
             "artifact_id": str(artifact["artifact_id"]),
@@ -4200,10 +4217,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             "hard_ms": budget.hard_ms,
             "status": status,
             "configured_action": budget.action,
-            "action_taken": str(observed_action.get("action_taken") or ""),
-            "action_evidence_kind": str(
-                observed_action.get("action_evidence_kind") or ""
-            ),
+            "action_taken": action_taken,
+            "action_evidence_kind": action_evidence_kind,
             "truth_source": budget.truth_source,
         })
 
@@ -5597,6 +5612,12 @@ def run_diagnose(
             {},
         )
     )
+    phase_duration_summary = (
+        production_acceptance_gate.get("entry_outcome_summary", {}).get(
+            "phase_duration_summary",
+            {},
+        )
+    )
     if code_side_blockers or exclude_strategy or exclude_liquidity:
         from scripts.analyze_production_blockers import build_code_side_blocker_view
 
@@ -5659,6 +5680,7 @@ def run_diagnose(
         ),
         "resolved_quantity_adjustment_summary": resolved_quantity_adjustment_summary,
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
+        "phase_duration_summary": phase_duration_summary,
         "code_side_blocker_view": code_side_blocker_view,
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,

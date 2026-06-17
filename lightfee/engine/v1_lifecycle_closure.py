@@ -1235,6 +1235,10 @@ _EVENT_KIND_PHASES = {
     "execution.hedge_deadline_breached": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.entry_post_only_bbo_repriced": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.entry_post_only_reject_cooldown": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "entry.hedge_drive_cancel_replace": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.maker_event_reprice": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.maker_event_reprice_error": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.maker_event_lane_wake": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "execution.passive_small_fill_buffering": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),

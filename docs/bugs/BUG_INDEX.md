@@ -17,6 +17,22 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest ZECUSDT entry route semantic closure, 2026-06-18:
+Latest `94487e4` cloud review ended with safe final trading truth, but the
+since-deploy window exposed a module-level entry closure gap. ZECUSDT pending
+entries lived about 208-214 seconds, beyond the V1 120 second pending hard
+ceiling; Aster V3 rejected hedge MARKET/IOC orders with `-1106` because the
+adapter sent `timeInForce=IOC`; Bybit maker reprice emitted repeated `110007`
+available-balance rejects; and diagnostics/lifecycle mapping still had empty
+hard-over-budget actions plus unmapped maker-event events. CL-094 removes the
+invalid Aster MARKET/IOC TIF, makes Bybit `110007` terminal for the opening
+maker-event reprice route, removes the post-hard-ceiling local retention
+extension, exposes top-level `phase_duration_summary`, fills hard-over-budget
+action evidence, and maps the maker-event/hedge-drive events. It does not
+loosen quote freshness, admission thresholds, sizing, close truth, recovery, or
+reduce-only cleanup semantics. See
+[daily/2026-06-18.md#cluster-cl-094---zecusdt-entry-route-semantic-closure-after-latest-deploy](daily/2026-06-18.md#cluster-cl-094---zecusdt-entry-route-semantic-closure-after-latest-deploy).
+
 Latest long-lived pending-entry SLA and duration diagnostics closure, 2026-06-17:
 Post-deploy review found final trading truth safe, but the event window exposed
 a timing bug: `BRUSDT` took about 759 seconds from `execution.entry_selected`

@@ -905,6 +905,113 @@ class TestMakerEventLane:
             assert est.get("consecutive_failures") == 1
 
     @pytest.mark.asyncio
+    async def test_bybit_balance_reject_terminally_blocks_maker_reprice(self):
+        """Bybit 110007 is an admission block, not a repeatable reprice error."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.maker_event_lane_enabled = True
+            config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
+            config.strategy.passive_reprice_threshold_bps = 1.0
+            config.strategy.passive_max_consecutive_failures = 5
+            config.strategy.maker_leg_default = "buy"
+
+            sidecar_path = Path(td) / "sidecar.json"
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["BTCUSDT"], 51000.0)))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            runtime.state.pending_entries["pe-1"] = _mk_passive_pending(
+                "pe-1", "BTCUSDT", Venue.BYBIT, Venue.OKX
+            )
+            runtime._last_maker_event_ms = 0
+            runtime._maker_event_state["pe-1"] = {
+                "maker_price": 50000.0,
+                "last_reprice_ms": 0,
+                "consecutive_failures": 0,
+            }
+
+            class _BalanceRejectExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise RuntimeError(
+                        "bybit passive order failed: bybit retCode=110007 "
+                        "retMsg=Available balance is insufficient"
+                    )
+
+            executor = _BalanceRejectExecutor()
+            runtime.entry_executor = executor
+
+            await runtime._maybe_tick_maker_event(5000)
+
+            est = runtime._maker_event_state.get("pe-1", {})
+            assert est.get("terminal_reject_reason") == (
+                "insufficient_balance_admission_blocked"
+            )
+            assert est.get("consecutive_failures") == 5
+            error_events = [
+                event for event in runtime.journal.read_all()
+                if event["kind"] == "runtime.maker_event_reprice_error"
+            ]
+            assert error_events[-1]["payload"]["response_classification"] == (
+                "insufficient_balance_admission_blocked"
+            )
+
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["BTCUSDT"], 52000.0)))
+            runtime._last_maker_event_ms = 0
+
+            await runtime._maybe_tick_maker_event(10_000)
+
+            assert executor.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_bybit_balance_reject_records_short_venue_for_sell_maker(self):
+        """Terminal admission diagnostics must identify the actual maker venue."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.maker_event_lane_enabled = True
+            config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
+            config.strategy.passive_reprice_threshold_bps = 1.0
+            config.strategy.maker_leg_default = "sell"
+
+            sidecar_path = Path(td) / "sidecar.json"
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["BTCUSDT"], 51000.0)))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            runtime.state.pending_entries["pe-sell-maker"] = _mk_passive_pending(
+                "pe-sell-maker", "BTCUSDT", Venue.OKX, Venue.BYBIT
+            )
+            runtime._last_maker_event_ms = 0
+            runtime._maker_event_state["pe-sell-maker"] = {
+                "maker_price": 50000.0,
+                "last_reprice_ms": 0,
+                "consecutive_failures": 0,
+            }
+
+            class _BalanceRejectExecutor:
+                async def execute(self, ctx):
+                    raise RuntimeError(
+                        "bybit passive order failed: bybit retCode=110007 "
+                        "retMsg=Available balance is insufficient"
+                    )
+
+            runtime.entry_executor = _BalanceRejectExecutor()
+
+            await runtime._maybe_tick_maker_event(5000)
+
+            est = runtime._maker_event_state.get("pe-sell-maker", {})
+            assert est.get("terminal_reject_reason") == (
+                "insufficient_balance_admission_blocked"
+            )
+            assert est.get("venue") == "bybit"
+
+    @pytest.mark.asyncio
     async def test_no_entry_executor_skips_reprice(self):
         """entry_executor is None → repricing is skipped for that entry."""
         with tempfile.TemporaryDirectory() as td:

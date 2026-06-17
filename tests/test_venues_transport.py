@@ -5134,6 +5134,50 @@ class TestV1PassiveBusinessFlowParity:
         await adapter.shutdown()
 
     @pytest.mark.asyncio
+    async def test_aster_v3_ioc_hedge_omits_time_in_force(self):
+        from lightfee.venues.aster import AsterAdapter
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        calls = []
+
+        async def fake_request(method, path, *, params=None):
+            calls.append((method, path, dict(params or {})))
+            return {
+                "orderId": "aster-hedge-oid-1",
+                "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                "status": "FILLED",
+                "avgPrice": "493.22",
+                "executedQty": (params or {}).get("quantity", "0"),
+            }
+
+        adapter._private._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="ZECUSDT",
+            side=Side.SELL,
+            quantity=0.04,
+            price=493.22,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="aster-hedge-zec-1",
+        )
+
+        fill = await adapter.place_order(req)
+
+        order_call = [call for call in calls if call[1] == "/fapi/v3/order"][0]
+        assert order_call[2]["type"] == "MARKET"
+        assert "timeInForce" not in order_call[2]
+        assert fill.order_id == "aster-hedge-oid-1"
+        assert fill.quantity == 0.04
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
     async def test_aster_v3_passive_submit_reject_raises_order_submit_error(self):
         from lightfee.venues.aster import AsterAdapter
 

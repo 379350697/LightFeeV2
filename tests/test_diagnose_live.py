@@ -5043,7 +5043,12 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
     assert samples_by_phase["quote_rewarm"]["configured_action"] == (
         "skip_candidate_after_hard_rewarm"
     )
-    assert samples_by_phase["quote_rewarm"]["action_taken"] == ""
+    assert samples_by_phase["quote_rewarm"]["action_taken"] == (
+        "skip_candidate_after_hard_rewarm"
+    )
+    assert samples_by_phase["quote_rewarm"]["action_evidence_kind"] == (
+        "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
+    )
     assert samples_by_phase["candidate_lease"]["hard_ms"] == 60000
     assert samples_by_phase["candidate_lease"]["truth_source"] == (
         "fresh_scan_shortlist_candidate"
@@ -5058,8 +5063,8 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
         "hard_ms": 15000,
         "status": "hard_over_budget",
         "configured_action": "cancel_selection_and_rescan",
-        "action_taken": "",
-        "action_evidence_kind": "",
+        "action_taken": "cancel_selection_and_rescan",
+        "action_evidence_kind": "runtime.entry_selected_submit_deadline_exceeded",
         "truth_source": "execution.entry_selected_without_submit_or_order_id",
     }
     assert samples_by_phase["entry_selected_terminal"]["status"] == "hard_over_budget"
@@ -5101,6 +5106,58 @@ def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
     assert phase_summary["artifact_count"] == 0
     assert phase_summary["over_budget_count"] == 0
     assert phase_summary["samples"] == []
+
+
+def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1_000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1_000,
+                "kind": "execution.entry_selected",
+                "payload": {"entry_id": "entry-no-submit", "symbol": "NOSUBUSDT"},
+            },
+            {
+                "ts_ms": 25_000,
+                "kind": "runtime.entry_selected_submit_deadline_exceeded",
+                "payload": {
+                    "entry_id": "entry-no-submit",
+                    "symbol": "NOSUBUSDT",
+                    "reason": "selected_submit_deadline_exceeded",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="NOSUBUSDT",
+            venues=["binance", "bybit"],
+            now_ms=25_000,
+        )
+
+        nested = result["production_acceptance_gate"]["entry_outcome_summary"][
+            "phase_duration_summary"
+        ]
+        assert result["phase_duration_summary"] == nested
+        assert result["phase_duration_summary"]["hard_over_budget_count"] >= 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnings():

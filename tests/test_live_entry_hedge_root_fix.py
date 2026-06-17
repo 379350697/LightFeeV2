@@ -5806,10 +5806,9 @@ class TestStartupZeroFillNoDirectPop:
         assert len(fake_long._place_order_calls) >= 1
 
     @pytest.mark.asyncio
-    async def test_has_fill_past_hard_ceiling_gets_reconcile_extension_retained(self, tmp_path):
-        """When a pending entry has fills, is past the hard ceiling by less than
-        reconcile_extension_ms, it is not aborted immediately, but gets a
-        reconcile extension and is retained.
+    async def test_has_fill_past_hard_ceiling_terminalizes_without_extension_drift(self, tmp_path):
+        """V1 hard ceiling is terminal: positive fills get live-truth handling
+        without a 30s extension that can drift into multi-minute pending.
         """
         from lightfee.engine.runtime import LiveRuntime
 
@@ -5845,18 +5844,17 @@ class TestStartupZeroFillNoDirectPop:
         )
         runtime.state.pending_entries["entry-extension-retained"] = pending
 
-        # Run reconcile
         await runtime._reconcile_pending_state(now_ms)
 
-        # Assertion: it gets reconcile extension, so it is retained in state
-        assert "entry-extension-retained" in runtime.state.pending_entries
-        # reconcile_attempt must be incremented
-        assert pending.reconcile_attempt >= 1
-
-        # Check journal events
+        assert "entry-extension-retained" not in runtime.state.pending_entries
         events = runtime.journal.read_all()
         kinds = [e["kind"] for e in events]
         assert "pending_entry.hard_ceiling_reconcile_before_abort" in kinds
+        event = [
+            e for e in events
+            if e["kind"] == "pending_entry.hard_ceiling_reconcile_before_abort"
+        ][-1]
+        assert event["payload"]["action_taken"] == "abort_after_single_truth_pass"
 
     @pytest.mark.asyncio
     async def test_has_fill_past_hard_ceiling_extension_exhausted_aborts(self, tmp_path):

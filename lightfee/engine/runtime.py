@@ -6999,35 +6999,27 @@ class LiveRuntime:
                     return True
 
             # P6: if there are actual fills (not repair-state), give
-            # reconcile a chance before abort. This prevents discarding
-            # fill evidence. Zero-fill or repair-state entries abort directly.
+            # exactly one terminal truth checkpoint before abort. Hard ceiling
+            # must not drift into a multi-minute pending retention loop.
             if hard_ceiling_reached and pending.has_any_fill() and not pending.repair_state:
                 hard_ceiling_ms = getattr(
                     self.config.strategy, "pending_entry_hard_ceiling_ms", 120000
                 )
-                reconcile_extension_ms = getattr(
-                    self.config.strategy,
-                    "pending_entry_reconcile_extension_ms",
-                    30000,
-                )
                 extension_budget = budget["lifetime_ms"] - hard_ceiling_ms
-                if extension_budget < reconcile_extension_ms:
-                    self.journal.append(
-                        "pending_entry.hard_ceiling_reconcile_before_abort",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "has_fill": True,
-                            "maker_leg_filled": pending.maker_leg_filled,
-                            "hedge_leg_filled": pending.hedge_leg_filled,
-                            "extension_budget_ms": extension_budget,
-                            "reconcile_extension_ms": reconcile_extension_ms,
-                            "reason": final_reason,
-                        },
-                    )
-                    pending.reconcile_attempt += 1
-                    self._apply_reconcile_backoff(pending, now_ms)
-                    return True
+                self.journal.append(
+                    "pending_entry.hard_ceiling_reconcile_before_abort",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "has_fill": True,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "extension_budget_ms": extension_budget,
+                        "reconcile_extension_ms": 0,
+                        "reason": final_reason,
+                        "action_taken": "abort_after_single_truth_pass",
+                    },
+                )
 
             await self._abort_pending_entry(pending, entry_id, final_reason)
             return True
