@@ -4596,6 +4596,23 @@ class VenueTransport(MarketDataClient):
             params["orderId"] = order_id_text
         elif client_order_id_text:
             params["origClientOrderId"] = client_order_id_text
+        elif (
+            order_id_text
+            and (
+                len(order_id_text) > 36
+                or "-recovery-" in order_id_text.lower()
+            )
+        ):
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=["/fapi/v1/order"],
+                response_classification="invalid_local_order_identifier",
+                uncertain_subtype="invalid_local_order_identifier",
+                next_action="check_live_position",
+            )
+            return None
         else:
             params["origClientOrderId"] = order_id_text
         raw = await self._request("GET", "/fapi/v1/order", params=params, private=True)

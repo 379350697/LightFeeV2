@@ -739,6 +739,68 @@ def test_run_diagnose_resolves_bybit_insufficient_balance_entry_reject_when_admi
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_diagnose_exposes_local_order_identifier_reconcile_summary(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "RUNNING",
+            "risk_mode": "normal",
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+            "pending_residual_repairs": [],
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781675723066,
+                "kind": "order.reconcile_query",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "order_id": "entry-1781671924167-esportsusdt-recovery-short",
+                    "client_order_id": "",
+                    "queried_endpoints": ["/fapi/v1/order"],
+                    "response_classification": "invalid_local_order_identifier",
+                    "uncertain_subtype": "invalid_local_order_identifier",
+                    "next_action": "check_live_position",
+                },
+            },
+            {
+                "ts_ms": 1781675723067,
+                "kind": "reconciliation.entry_reconcile_error",
+                "payload": {
+                    "entry_id": "entry-1781671924167-ESPORTSUSDT",
+                    "error": (
+                        'HTTP 400: {"code":-4015,'
+                        '"msg":"Client order id length should be less than 36 chars"}'
+                    ),
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ESPORTSUSDT",
+            venues=["binance", "bybit"],
+            now_ms=1781675730000,
+        )
+
+        summary = result["order_reconcile_identifier_summary"]
+        assert summary["invalid_local_order_identifier_count"] == 1
+        assert summary["placeholder_order_id_blocked_count"] == 1
+        assert summary["binance_invalid_client_order_id_error_count"] == 1
+        assert summary["samples"][0]["symbol"] == "ESPORTSUSDT"
+        assert result["event_counts"]["order.reconcile_query"] == 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_accepts_passive_close_resolved_lifecycle_when_flat():
     from scripts import diagnose_live as dl
 

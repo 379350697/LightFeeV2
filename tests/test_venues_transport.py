@@ -7452,6 +7452,43 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert query_payload["client_order_id"] == "bn-recovery-cid"
 
     @pytest.mark.anyio
+    async def test_binance_recovery_placeholder_without_client_id_is_not_queried(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            return httpx.Response(400, json={
+                "code": -4015,
+                "msg": "Client order id length should be less than 36 chars",
+            })
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "ESPORTSUSDT",
+            order_id="entry-1781671924167-esportsusdt-recovery-short",
+            client_order_id="",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is None
+        assert seen_paths == []
+        query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
+        assert query_payload["response_classification"] == "invalid_local_order_identifier"
+        assert query_payload["uncertain_subtype"] == "invalid_local_order_identifier"
+        assert query_payload["next_action"] == "check_live_position"
+
+    @pytest.mark.anyio
     async def test_okx_order_not_found_queries_open_and_history(self):
         from lightfee.venues.okx import OkxAdapter
 

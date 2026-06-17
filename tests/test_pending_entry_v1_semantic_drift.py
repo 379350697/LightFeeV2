@@ -1479,6 +1479,57 @@ async def test_pending_entry_does_not_query_planned_hedge_cid_before_submit(
 
 
 @pytest.mark.asyncio
+async def test_pending_entry_reconcile_uses_stored_hedge_cid_when_recovery_placeholder_exists(
+    config, tmp_journal,
+):
+    result = PositionReconciliationResult(
+        position_id="entry-v1-drift",
+        symbol="BEATUSDT",
+        long_status="uncertain",
+        short_status="uncertain",
+        long_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=296.0,
+            entry_price=0.08084,
+            observed_at_ms=1100,
+        ),
+        short_position=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=296.0,
+            entry_price=0.08067,
+            observed_at_ms=1100,
+        ),
+        is_flat=False,
+    )
+    reconciler = _CapturingReconciler(result)
+    runtime = _runtime(config, tmp_journal, reconciler)
+    pending = _pending_entry(
+        pending_id="entry-1781671924167-ESPORTSUSDT",
+        symbol="ESPORTSUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_order_id="56d57705-6106-4a45-9687-3b8c2b5dca43",
+        maker_client_order_id="299561add0ef7b2872584c65656167a864f7",
+        hedge_order_id="entry-1781671924167-esportsusdt-recovery-short",
+        hedge_client_order_id="b9f510bc61d65d84bd0ddbfad62e1db0b501",
+        maker_leg="long",
+        maker_leg_filled=296.0,
+        hedge_leg_filled=296.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=2000)
+
+    call = reconciler.calls[-1]
+    assert call["short_order_id"] == "entry-1781671924167-esportsusdt-recovery-short"
+    assert call["short_client_order_id"] == "b9f510bc61d65d84bd0ddbfad62e1db0b501"
+
+
+@pytest.mark.asyncio
 async def test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists(
     config, tmp_journal,
 ):

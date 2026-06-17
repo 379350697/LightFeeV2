@@ -3065,6 +3065,57 @@ def _build_top_exchange_errors(
     return sorted(by_key.values(), key=lambda g: g["count"], reverse=True)
 
 
+def _build_order_reconcile_identifier_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    invalid_local_order_identifier_count = 0
+    placeholder_order_id_blocked_count = 0
+    binance_invalid_client_order_id_error_count = 0
+    samples: list[dict[str, Any]] = []
+
+    for rec in events:
+        kind = str(rec.get("kind", ""))
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+
+        if kind == "order.reconcile_query":
+            classification = str(payload.get("response_classification", ""))
+            subtype = str(payload.get("uncertain_subtype", ""))
+            order_id = str(payload.get("order_id", "") or "")
+            if (
+                classification == "invalid_local_order_identifier"
+                or subtype == "invalid_local_order_identifier"
+            ):
+                invalid_local_order_identifier_count += 1
+                if "-recovery-" in order_id.lower() or len(order_id) > 36:
+                    placeholder_order_id_blocked_count += 1
+                if len(samples) < 5:
+                    samples.append({
+                        "ts_ms": rec.get("ts_ms", 0),
+                        "venue": payload.get("venue", ""),
+                        "symbol": payload.get("symbol", ""),
+                        "order_id": order_id,
+                        "client_order_id": payload.get("client_order_id", ""),
+                        "response_classification": classification,
+                        "next_action": payload.get("next_action", ""),
+                    })
+
+        if kind == "reconciliation.entry_reconcile_error":
+            error = str(payload.get("error", ""))
+            if "-4015" in error or "Client order id length" in error:
+                binance_invalid_client_order_id_error_count += 1
+
+    return {
+        "invalid_local_order_identifier_count": invalid_local_order_identifier_count,
+        "placeholder_order_id_blocked_count": placeholder_order_id_blocked_count,
+        "binance_invalid_client_order_id_error_count": (
+            binance_invalid_client_order_id_error_count
+        ),
+        "samples": samples,
+    }
+
+
 # ---------------------------------------------------------------------------
 # production acceptance gate
 # ---------------------------------------------------------------------------
@@ -4862,6 +4913,9 @@ def run_diagnose(
         resolved_contained_entry_admission_summary,
     )
     top_exchange_errors = _build_top_exchange_errors(order_errors)
+    order_reconcile_identifier_summary = (
+        _build_order_reconcile_identifier_summary(all_events)
+    )
     l2_evidence = _build_l2_evidence(all_events)
     snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
@@ -4951,6 +5005,7 @@ def run_diagnose(
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
+        "order_reconcile_identifier_summary": order_reconcile_identifier_summary,
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,

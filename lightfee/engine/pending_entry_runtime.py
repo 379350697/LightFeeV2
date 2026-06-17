@@ -104,7 +104,14 @@ class PendingEntryRuntime:
                 hedge_lookup_cid = (
                     pending.hedge_inflight.client_order_id
                     if pending.hedge_inflight
-                    else ""
+                    else (
+                        pending.hedge_client_order_id
+                        if (
+                            pending.hedge_order_id
+                            or pending.hedge_leg_filled > 0
+                        )
+                        else ""
+                    )
                 )
                 maker_order_id, maker_client_order_id = (
                     self.ctx._pending_entry_maker_order_identifiers(pending)

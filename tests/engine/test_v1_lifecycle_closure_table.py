@@ -384,6 +384,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "order.reconcile_query",
         "order.reconcile_resolution",
         "order.reconcile_result",
+        "reconciliation.entry_reconcile_error",
         "order.submit_attempt",
         "order.submit_result",
         "order.submitted",
