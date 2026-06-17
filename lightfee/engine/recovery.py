@@ -51,6 +51,9 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.unpaired_live_position_recovery import (
+    active_unpaired_live_position_recovery_records,
+)
 
 
 LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS = LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
@@ -162,8 +165,15 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
     has_closes = len(state.pending_closes) > 0
     has_passive_closes = len(state.pending_passive_closes) > 0
     has_residual_repairs = len(getattr(state, "pending_residual_repairs", []) or []) > 0
+    has_unpaired_recoveries = (
+        len(active_unpaired_live_position_recovery_records(state)) > 0
+    )
 
-    ambiguous = (has_opens and state.lifecycle == EngineLifecycle.BOOTING) or has_residual_repairs
+    ambiguous = (
+        (has_opens and state.lifecycle == EngineLifecycle.BOOTING)
+        or has_residual_repairs
+        or has_unpaired_recoveries
+    )
 
     return RecoveryWorkSnapshot(
         has_open_positions=has_opens,
@@ -171,6 +181,7 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
         has_pending_closes=has_closes,
         has_pending_passive_closes=has_passive_closes,
         has_pending_residual_repairs=has_residual_repairs,
+        has_unpaired_live_position_recoveries=has_unpaired_recoveries,
         ambiguous_state=ambiguous,
         lifecycle=state.lifecycle,
     )
@@ -482,6 +493,10 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.recovery_blocked_at_ms = int(snap.get("recovery_blocked_at_ms", 0))
     state.pending_residual_repairs = snap.get("pending_residual_repairs", [])
     state.live_recovery_reduce_only_pairs = snap.get("live_recovery_reduce_only_pairs", [])
+    state.unpaired_live_position_recoveries = snap.get(
+        "unpaired_live_position_recoveries",
+        [],
+    )
     state.venue_entry_cooldowns = snap.get("venue_entry_cooldowns", {})
     state.venue_market_data_degradations = snap.get("venue_market_data_degradations", {})
     state.transfer_truth = snap.get("transfer_truth", {})
@@ -1138,6 +1153,9 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     view["recovery_blocked_at_ms"] = state.recovery_blocked_at_ms
     view["pending_residual_repairs"] = state.pending_residual_repairs
     view["live_recovery_reduce_only_pairs"] = state.live_recovery_reduce_only_pairs
+    view["unpaired_live_position_recoveries"] = (
+        state.unpaired_live_position_recoveries
+    )
     view["venue_entry_cooldowns"] = state.venue_entry_cooldowns
     view["venue_market_data_degradations"] = state.venue_market_data_degradations
     view["transfer_truth"] = state.transfer_truth
@@ -1378,7 +1396,14 @@ def classify_startup_recovery_state(state: EngineState) -> str:
     """
     snap = build_recovery_snapshot(state)
 
-    if not snap.has_open_positions and not snap.has_pending_entries and not snap.has_pending_closes and not snap.has_pending_passive_closes:
+    if (
+        not snap.has_open_positions
+        and not snap.has_pending_entries
+        and not snap.has_pending_closes
+        and not snap.has_pending_passive_closes
+        and not snap.has_pending_residual_repairs
+        and not snap.has_unpaired_live_position_recoveries
+    ):
         return "clean"
 
     if snap.ambiguous_state:
@@ -1405,6 +1430,7 @@ def needs_reconciliation(state: EngineState) -> bool:
         or snap.has_pending_closes
         or snap.has_pending_passive_closes
         or snap.has_pending_residual_repairs
+        or snap.has_unpaired_live_position_recoveries
     )
 
 
@@ -1540,7 +1566,12 @@ def has_lifecycle_blocking_work(state: EngineState) -> bool:
     Rust V1: EngineRecoveryWorkSnapshot.has_lifecycle_blocking_work()
     """
     snap = build_recovery_snapshot(state)
-    return snap.has_open_positions or snap.has_pending_entries or snap.has_pending_passive_closes
+    return (
+        snap.has_open_positions
+        or snap.has_pending_entries
+        or snap.has_pending_passive_closes
+        or snap.has_unpaired_live_position_recoveries
+    )
 
 
 def normalize_engine_state(state: EngineState) -> None:

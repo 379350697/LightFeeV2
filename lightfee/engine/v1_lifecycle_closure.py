@@ -1142,6 +1142,14 @@ _EVENT_KIND_PHASES = {
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.risk_mode_changed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.stale_fail_closed_cleared": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_detected": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_owner_excluded": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_cleanup_skipped": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_cleanup_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_cleanup_submitted": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_cleanup_succeeded": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_cleanup_failed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_terminal_flat": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "scan.no_entry_diagnostics": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "scan.strategy_shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
@@ -1264,8 +1272,15 @@ _EVENT_KIND_PHASES = {
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
     ),
     "runtime.entry_dispatched": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_selected_submit_deadline_exceeded": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
+    "runtime.entry_selected_submit_deadline_waiting_on_order_truth": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "runtime.funding_capture_state_updated": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.normal_close_routing_passive": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "pending_entry.long_lived_pending_entry": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.pending_entry_registered": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.position_drift_correction_verified": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_detected": V1LifecycleClosurePhase.OPEN_POSITION.value,

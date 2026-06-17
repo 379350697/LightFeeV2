@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -269,6 +268,258 @@ def test_run_diagnose_active_balanced_position_is_not_high_risk(monkeypatch):
         assert "local_open_positions_present" not in gate["blocking_reasons"]
         assert "exchange_truth_nonzero_position" not in gate["blocking_reasons"]
         assert result["conclusion"]["risk"] != "high"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_reports_unpaired_live_position_recovery_route(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "fail_closed",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "unpaired_live_position_recoveries": [
+                {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "quantity": 592.0,
+                    "notional_quote": 11.84,
+                    "first_seen_ms": 1770000000000,
+                    "attempt_count": 1,
+                    "next_attempt_ms": 1770000030000,
+                    "last_error": "position_still_nonzero",
+                    "terminal_status": "",
+                    "owner_excluded": True,
+                    "open_order_truth_available": True,
+                    "cap_quote": 30.0,
+                    "cap_ok": True,
+                }
+            ],
+            "last_tick_ms": 1770000001000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1770000000000,
+                "kind": "recovery.unpaired_live_position_detected",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                },
+            },
+            {
+                "ts_ms": 1770000001000,
+                "kind": "recovery.unpaired_live_position_cleanup_skipped",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "auto_enabled": False,
+                    "reason": "auto_disabled",
+                },
+            },
+        ])
+        monkeypatch.setattr(
+            dl,
+            "_build_exchange_truth",
+            lambda *args, **kwargs: {
+                "flat": False,
+                "no_open_orders": True,
+                "positions": [],
+                "open_orders": [],
+                "venues": {},
+                "errors": [],
+                "missing_evidence": [],
+            },
+        )
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ESPORTSUSDT",
+            venues=["binance"],
+            now_ms=1770000005000,
+        )
+
+        summary = result["unpaired_live_position_recovery_summary"]
+        assert summary["current_work_count"] == 1
+        assert summary["active_work_count"] == 1
+        assert summary["terminal_flat_count"] == 0
+        assert summary["auto_enabled"] is False
+        assert summary["event_counts"][
+            "recovery.unpaired_live_position_cleanup_skipped"
+        ] == 1
+        detail = summary["details"][0]
+        assert detail["venue"] == "binance"
+        assert detail["symbol"] == "ESPORTSUSDT"
+        assert detail["owner_excluded"] is True
+        assert detail["open_order_truth_available"] is True
+        assert detail["cap_ok"] is True
+        assert detail["latest_event"]["reason"] == "auto_disabled"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_counts_only_active_unpaired_recovery_as_current_work(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "unpaired_live_position_recoveries": [
+                {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "quantity": 0.0,
+                    "notional_quote": 0.0,
+                    "first_seen_ms": 1770000000000,
+                    "attempt_count": 1,
+                    "next_attempt_ms": 1770000001000,
+                    "last_error": "",
+                    "terminal_status": "flat",
+                    "owner_excluded": True,
+                    "open_order_truth_available": True,
+                    "cap_quote": 30.0,
+                    "cap_ok": True,
+                }
+            ],
+            "last_tick_ms": 1770000001000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1770000001000,
+                "kind": "recovery.unpaired_live_position_terminal_flat",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "reason": "cleanup_succeeded",
+                },
+            }
+        ])
+        monkeypatch.setattr(
+            dl,
+            "_build_exchange_truth",
+            lambda *args, **kwargs: {
+                "flat": True,
+                "no_open_orders": True,
+                "positions": [],
+                "open_orders": [],
+                "venues": {},
+                "errors": [],
+                "missing_evidence": [],
+            },
+        )
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ESPORTSUSDT",
+            venues=["binance"],
+            now_ms=1770000005000,
+        )
+
+        summary = result["unpaired_live_position_recovery_summary"]
+        assert summary["current_work_count"] == 0
+        assert summary["active_work_count"] == 0
+        assert summary["terminal_flat_count"] == 1
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_reports_manual_required_unpaired_recovery(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "risk_only",
+            "risk_mode": "fail_closed",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "unpaired_live_position_recoveries": [
+                {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "quantity": 592.0,
+                    "notional_quote": 11.84,
+                    "first_seen_ms": 1770000000000,
+                    "attempt_count": 3,
+                    "next_attempt_ms": 1770000001000,
+                    "last_error": "max_attempts_exceeded",
+                    "terminal_status": "manual_required",
+                    "owner_excluded": True,
+                    "open_order_truth_available": True,
+                    "cap_quote": 30.0,
+                    "cap_ok": True,
+                }
+            ],
+            "last_tick_ms": 1770000001000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1770000001000,
+                "kind": "recovery.unpaired_live_position_cleanup_failed",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "reason": "max_attempts_exceeded",
+                },
+            }
+        ])
+        monkeypatch.setattr(
+            dl,
+            "_build_exchange_truth",
+            lambda *args, **kwargs: {
+                "flat": False,
+                "no_open_orders": True,
+                "positions": [],
+                "open_orders": [],
+                "venues": {},
+                "errors": [],
+                "missing_evidence": [],
+            },
+        )
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ESPORTSUSDT",
+            venues=["binance"],
+            now_ms=1770000005000,
+        )
+
+        summary = result["unpaired_live_position_recovery_summary"]
+        assert summary["active_work_count"] == 1
+        assert summary["manual_required_count"] == 1
+        assert summary["details"][0]["terminal_status"] == "manual_required"
+        assert summary["details"][0]["latest_event"]["reason"] == (
+            "max_attempts_exceeded"
+        )
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -4591,6 +4842,8 @@ def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
         "resolved_count": 1,
         "still_stale_count": 1,
         "timeout_count": 0,
+        "still_stale_by_venue_symbol": {"aster:BSBUSDT": 1},
+        "timeout_by_venue_symbol": {},
         "samples": [
             {
                 "venue": "binance",
@@ -4608,6 +4861,246 @@ def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
             },
         ],
     }
+
+
+def test_entry_outcome_summary_exposes_long_lived_artifact_durations():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-long-br", "symbol": "BRUSDT"},
+        },
+        {
+            "ts_ms": 11_000,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {"entry_id": "entry-long-br", "symbol": "BRUSDT"},
+        },
+        {
+            "ts_ms": 761_000,
+            "kind": "pending_entry.long_lived_pending_entry",
+            "payload": {
+                "entry_id": "entry-long-br",
+                "symbol": "BRUSDT",
+                "selected_lifetime_ms": 760_000,
+                "pending_lifetime_ms": 10_000,
+                "sla_ms": 300_000,
+                "reason": "long_lived_pending_entry",
+            },
+        },
+        {
+            "ts_ms": 761_200,
+            "kind": "entry.aborted",
+            "payload": {
+                "entry_id": "entry-long-br",
+                "symbol": "BRUSDT",
+                "reason": "long_lived_pending_entry",
+            },
+        },
+        {
+            "ts_ms": 800_000,
+            "kind": "entry.opened",
+            "payload": {"entry_id": "entry-close-xvg", "symbol": "XVGUSDT"},
+        },
+        {
+            "ts_ms": 1_000_000,
+            "kind": "exit.passive_close_created",
+            "payload": {"position_id": "entry-close-xvg", "symbol": "XVGUSDT"},
+        },
+        {
+            "ts_ms": 1_041_000,
+            "kind": "exit.passive_close_missing_l2_or_tick",
+            "payload": {
+                "position_id": "entry-close-xvg",
+                "symbol": "XVGUSDT",
+                "reason": "cannot submit post-only maker without valid L2 mid and tick size",
+            },
+        },
+        {
+            "ts_ms": 1_047_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {"position_id": "entry-close-xvg", "symbol": "XVGUSDT"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    durations = summary["artifact_duration_summary"]
+
+    assert durations["long_lived_pending_entry_count"] == 1
+    assert durations["close_data_quality_warning_count"] == 1
+    assert durations["max_selected_to_terminal_ms"] == 760_200
+    assert durations["max_close_created_to_terminal_ms"] == 47_000
+    assert durations["samples"][0] == {
+        "entry_id": "entry-long-br",
+        "symbol": "BRUSDT",
+        "status": "aborted",
+        "selected_to_terminal_ms": 760_200,
+        "pending_created_to_terminal_ms": 750_200,
+        "close_created_to_terminal_ms": 0,
+        "long_lived": True,
+        "close_data_quality_warning": False,
+        "terminal_kind": "entry.aborted",
+        "terminal_reason": "long_lived_pending_entry",
+    }
+
+
+def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-no-submit", "symbol": "NOSUBUSDT"},
+        },
+        {
+            "ts_ms": 10_000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {"venue": "aster", "symbol": "DATASUSDT"},
+        },
+        {
+            "ts_ms": 20_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {"candidate_id": "candidate-slow", "symbol": "CANDUSDT"},
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-long-br", "symbol": "BRUSDT"},
+        },
+        {
+            "ts_ms": 111_000,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {
+                "entry_id": "entry-long-br",
+                "symbol": "BRUSDT",
+                "maker_order_id": "maker-long",
+                "outcome": "maker_resting",
+            },
+        },
+        {
+            "ts_ms": 861_000,
+            "kind": "pending_entry.long_lived_pending_entry",
+            "payload": {
+                "entry_id": "entry-long-br",
+                "symbol": "BRUSDT",
+                "selected_lifetime_ms": 761_000,
+                "pending_lifetime_ms": 750_000,
+                "sla_ms": 300_000,
+                "reason": "long_lived_pending_entry",
+            },
+        },
+        {
+            "ts_ms": 861_200,
+            "kind": "entry.aborted",
+            "payload": {
+                "entry_id": "entry-long-br",
+                "symbol": "BRUSDT",
+                "reason": "long_lived_pending_entry",
+            },
+        },
+        {
+            "ts_ms": 900_000,
+            "kind": "exit.passive_close_created",
+            "payload": {"position_id": "close-slow", "symbol": "XVGUSDT"},
+        },
+        {
+            "ts_ms": 1_210_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {"position_id": "close-slow", "symbol": "XVGUSDT"},
+        },
+        {
+            "ts_ms": 1_300_000,
+            "kind": "recovery.blocked",
+            "payload": {
+                "position_id": "recover-slow",
+                "symbol": "RECUSDT",
+                "reason": "unpaired_live_position",
+            },
+        },
+        {
+            "ts_ms": 1_610_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+    samples_by_phase = {
+        sample["phase"]: sample for sample in phase_summary["samples"]
+    }
+
+    assert phase_summary["over_budget_count"] >= 5
+    assert phase_summary["hard_over_budget_count"] >= 5
+    assert phase_summary["budget_defaults_ms"]["selected_pre_submit"]["hard_ms"] == 15000
+    assert phase_summary["budget_defaults_ms"]["pending_entry"]["hard_ms"] == 120000
+    assert phase_summary["budget_defaults_ms"]["close_terminal"]["hard_ms"] == 300000
+    assert phase_summary["budget_defaults_ms"]["recovery_terminal"]["hard_ms"] == 300000
+
+    assert samples_by_phase["quote_rewarm"]["hard_ms"] == 30000
+    assert samples_by_phase["quote_rewarm"]["configured_action"] == (
+        "skip_candidate_after_hard_rewarm"
+    )
+    assert samples_by_phase["quote_rewarm"]["action_taken"] == ""
+    assert samples_by_phase["candidate_lease"]["hard_ms"] == 60000
+    assert samples_by_phase["candidate_lease"]["truth_source"] == (
+        "fresh_scan_shortlist_candidate"
+    )
+    assert samples_by_phase["selected_pre_submit"] == {
+        "phase": "selected_pre_submit",
+        "artifact_id": "entry-no-submit",
+        "symbol": "NOSUBUSDT",
+        "venue": "",
+        "age_ms": 1_609_000,
+        "soft_ms": 0,
+        "hard_ms": 15000,
+        "status": "hard_over_budget",
+        "configured_action": "cancel_selection_and_rescan",
+        "action_taken": "",
+        "action_evidence_kind": "",
+        "truth_source": "execution.entry_selected_without_submit_or_order_id",
+    }
+    assert samples_by_phase["entry_selected_terminal"]["status"] == "hard_over_budget"
+    assert samples_by_phase["entry_selected_terminal"]["hard_ms"] == 300000
+    assert samples_by_phase["pending_entry"]["truth_source"] == (
+        "pending_entry_terminality_from_order_fill_position_truth"
+    )
+    assert samples_by_phase["maker_resting"]["action_taken"] == (
+        "cancel_then_reconcile_open_orders_trades_positions"
+    )
+    assert samples_by_phase["maker_resting"]["action_evidence_kind"] == (
+        "pending_entry.long_lived_pending_entry"
+    )
+    assert samples_by_phase["close_terminal"]["age_ms"] == 310_000
+    assert samples_by_phase["recovery_terminal"]["action_taken"] == (
+        "block_new_risk_and_escalate_recovery"
+    )
+
+
+def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {"venue": "aster", "symbol": "FLOATUSDT"},
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+
+    assert phase_summary["artifact_count"] == 0
+    assert phase_summary["over_budget_count"] == 0
+    assert phase_summary["samples"] == []
 
 
 def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnings():

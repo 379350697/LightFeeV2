@@ -211,6 +211,17 @@ class StrategyConfig:
     pending_entry_phase_zero_fill_budget: int = 2
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
+    candidate_lease_ms: int = 60000
+    selected_submit_deadline_ms: int = 15000
+    maker_resting_soft_ms: int = 30000
+    maker_resting_hard_ms: int = 60000
+    entry_selected_warning_ms: int = 120000
+    entry_selected_terminal_sla_ms: int = 300000
+    close_terminal_soft_ms: int = 60000
+    close_terminal_hard_ms: int = 300000
+    recovery_terminal_hard_ms: int = 300000
+    unpaired_live_position_auto_recovery_enabled: bool = False
+    unpaired_live_position_max_notional_quote: float = 0.0
     pending_entry_zero_fill_terminal_cooldown_ms: int = 30000  # V1 default (CONTRACT RECOVERY-004)
     # Entry book readiness uses entry_local_l2_book_stale_after_ms first, then
     # local_l2_quiet_book_grace_ms/local_l2_max_age_ms when explicitly set,

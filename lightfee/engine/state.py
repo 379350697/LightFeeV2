@@ -924,6 +924,7 @@ class RecoveryWorkSnapshot:
     has_pending_closes: bool = False
     has_pending_passive_closes: bool = False
     has_pending_residual_repairs: bool = False
+    has_unpaired_live_position_recoveries: bool = False
     ambiguous_state: bool = False
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
 
@@ -1004,6 +1005,8 @@ class EngineState:
     pending_residual_repairs: list = field(default_factory=list)
     # --- Live recovery reduce-only pairs (V1 live_recovery_reduce_only_pairs) ---
     live_recovery_reduce_only_pairs: list = field(default_factory=list)
+    # --- Independent no-owner live-position recovery work ---
+    unpaired_live_position_recoveries: list = field(default_factory=list)
     # --- Venue entry cooldowns (V1 venue_entry_cooldowns) ---
     venue_entry_cooldowns: dict = field(default_factory=dict)
     # --- Venue market data degradations (V1 venue_market_data_degradations) ---
@@ -1085,6 +1088,7 @@ class EngineState:
             "recovery_blocked_at_ms": self.recovery_blocked_at_ms,
             "pending_residual_repairs": self.pending_residual_repairs,
             "live_recovery_reduce_only_pairs": self.live_recovery_reduce_only_pairs,
+            "unpaired_live_position_recoveries": self.unpaired_live_position_recoveries,
             "venue_entry_cooldowns": self.venue_entry_cooldowns,
             "venue_market_data_degradations": self.venue_market_data_degradations,
             "transfer_truth": self.transfer_truth,

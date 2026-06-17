@@ -69,6 +69,19 @@ class TestV1ConfigDefaultsParity:
         assert cfg.pending_entry_force_terminal_after_ms == 60000
         assert cfg.pending_entry_hard_ceiling_ms == 120000
 
+    def test_lightweight_lifecycle_sla_defaults(self):
+        """Lightweight lifecycle budgets keep long artifacts bounded."""
+        cfg = StrategyConfig()
+        assert cfg.candidate_lease_ms == 60000
+        assert cfg.selected_submit_deadline_ms == 15000
+        assert cfg.maker_resting_soft_ms == 30000
+        assert cfg.maker_resting_hard_ms == 60000
+        assert cfg.entry_selected_warning_ms == 120000
+        assert cfg.entry_selected_terminal_sla_ms == 300000
+        assert cfg.close_terminal_soft_ms == 60000
+        assert cfg.close_terminal_hard_ms == 300000
+        assert cfg.recovery_terminal_hard_ms == 300000
+
     def test_local_l2_resource_budget_defaults(self):
         """V1 local-L2 book budget defaults."""
         cfg = StrategyConfig()

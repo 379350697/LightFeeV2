@@ -4655,6 +4655,101 @@ class TestRealPathAbortCleanupDeadline:
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "entry.abort_retained_maker_open_order" in kinds
 
+    @pytest.mark.asyncio
+    async def test_long_lived_selected_pending_entry_forces_abort_even_before_pending_hard_ceiling(self, tmp_path):
+        """Entry-selected lifetime is a separate SLA from PendingEntry.created_at_ms."""
+        runtime = _make_open_runtime(
+            tmp_path,
+            entry_selected_terminal_sla_ms=300_000,
+        )
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = None
+        hedge.position = None
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+
+        now_ms = 1_000_000
+        pending = PendingEntry(
+            pending_id="entry-long-lived-maker",
+            symbol="BRUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=116.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 10_000,
+            maker_leg="long",
+            maker_order_id="maker-long-lived",
+            maker_client_order_id="maker-long-lived-cid",
+            metadata={"entry_selected_at_ms": now_ms - 760_000},
+            passive_order=PendingPassiveOrder(
+                order_id="maker-long-lived",
+                client_order_id="maker-long-lived-cid",
+                target_quantity=116.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
+            pending,
+            pending.pending_id,
+            now_ms,
+        )
+
+        assert handled is True
+        assert pending.pending_id not in runtime.state.pending_entries
+        records = runtime.journal.read_all()
+        long_lived = [
+            record for record in records
+            if record["kind"] == "pending_entry.long_lived_pending_entry"
+        ]
+        assert long_lived
+        assert long_lived[-1]["payload"]["entry_id"] == pending.pending_id
+        assert long_lived[-1]["payload"]["selected_lifetime_ms"] == 760_000
+        assert long_lived[-1]["payload"]["pending_lifetime_ms"] == 10_000
+        assert long_lived[-1]["payload"]["sla_ms"] == 300_000
+        assert maker._cancel_passive_order_calls == [
+            ("BRUSDT", "maker-long-lived", "maker-long-lived-cid")
+        ]
+        aborted = [
+            record for record in records
+            if record["kind"] == "entry.aborted"
+        ]
+        assert aborted[-1]["payload"]["reason"] == "long_lived_pending_entry"
+
+    def test_recent_selected_pending_entry_keeps_existing_hedge_inflight_budget(self, tmp_path):
+        runtime = _make_open_runtime(
+            tmp_path,
+            entry_selected_terminal_sla_ms=300_000,
+            pending_entry_hard_ceiling_ms=120_000,
+        )
+        now_ms = 1_000_000
+        pending = PendingEntry(
+            pending_id="entry-recent-inflight",
+            symbol="BRUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=116.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 100_000,
+            maker_leg="long",
+            maker_leg_filled=116.0,
+            hedge_leg_filled=0.0,
+            metadata={"entry_selected_at_ms": now_ms - 100_000},
+            hedge_inflight=HedgeInflight(
+                client_order_id="hedge-inflight",
+                venue=Venue.HYPERLIQUID,
+                side=Side.SELL,
+                quantity=116.0,
+                submitted_at_ms=now_ms - 10_000,
+            ),
+        )
+
+        assert runtime._pending_entry_terminalization_budget(pending, now_ms) is None
+
     # ── Bug 3/5: _reconcile_pending_state deadline breach + cleanup failure ──
 
     @pytest.mark.asyncio

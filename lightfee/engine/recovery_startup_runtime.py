@@ -20,6 +20,9 @@ from lightfee.engine.recovery_decision_core import (
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.unpaired_live_position_recovery import (
+    active_unpaired_live_position_recovery_records,
+)
 from lightfee.engine.v1_lifecycle_closure import closure_event_fields
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.specs import VenueOperation
@@ -47,6 +50,13 @@ class RecoveryStartupRuntime:
         )
         self.ctx.recovery_ledger = ledger
         self.ctx._last_recovery_exchange_truth = dict(exchange_truth or {})
+        register_unpaired = getattr(
+            self.ctx,
+            "_register_unpaired_live_position_recoveries_from_ledger",
+            None,
+        )
+        if callable(register_unpaired):
+            register_unpaired(ledger, now_ms=now_ms)
         core_decision = V1RecoveryDecisionCore().decide(
             RecoveryEvidenceSnapshot(
                 local_open_positions=tuple(
@@ -778,6 +788,7 @@ class RecoveryStartupRuntime:
                 self.ctx.state.pending_closes,
                 self.ctx.state.pending_passive_closes,
                 getattr(self.ctx.state, "pending_residual_repairs", []) or [],
+                active_unpaired_live_position_recovery_records(self.ctx.state),
             )
         )
 
@@ -820,6 +831,11 @@ class RecoveryStartupRuntime:
             if isinstance(repair, dict):
                 add_symbol(repair.get("symbol", ""))
         for item in getattr(self.ctx.state, "live_recovery_reduce_only_pairs", []) or []:
+            if isinstance(item, dict):
+                add_symbol(item.get("symbol", ""))
+        for item in (
+            getattr(self.ctx.state, "unpaired_live_position_recoveries", []) or []
+        ):
             if isinstance(item, dict):
                 add_symbol(item.get("symbol", ""))
         if isinstance(symbol_info, dict):

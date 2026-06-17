@@ -331,6 +331,14 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.private_ws_stopped",
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
+        "recovery.unpaired_live_position_detected",
+        "recovery.unpaired_live_position_owner_excluded",
+        "recovery.unpaired_live_position_cleanup_skipped",
+        "recovery.unpaired_live_position_cleanup_attempt",
+        "recovery.unpaired_live_position_cleanup_submitted",
+        "recovery.unpaired_live_position_cleanup_succeeded",
+        "recovery.unpaired_live_position_cleanup_failed",
+        "recovery.unpaired_live_position_terminal_flat",
         "scan.no_entry_diagnostics",
         "startup.order_path_preflight",
         "startup.trading_preflight",
@@ -442,6 +450,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+        "pending_entry.long_lived_pending_entry",
+        "runtime.entry_selected_submit_deadline_exceeded",
+        "runtime.entry_selected_submit_deadline_waiting_on_order_truth",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -458,6 +469,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
         == "ENTRY_QUOTE_LEASE"
     )
+    assert map_lifecycle_event_kind("pending_entry.long_lived_pending_entry") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_exceeded") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_waiting_on_order_truth") == "PENDING_ENTRY"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

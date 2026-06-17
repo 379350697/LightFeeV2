@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest long-lived pending-entry SLA and duration diagnostics closure, 2026-06-17:
+Post-deploy review found final trading truth safe, but the event window exposed
+a timing bug: `BRUSDT` took about 759 seconds from `execution.entry_selected`
+to `entry.aborted`. The root cause was that pending-entry hard ceiling used
+`PendingEntry.created_at_ms`, while the broader selected-to-terminal lifecycle
+could already be hundreds of seconds old. CL-093 stores
+`entry_selected_at_ms` on pending entries, adds an independent
+`entry_selected_terminal_sla_ms` defaulting to 300 seconds, emits
+`pending_entry.long_lived_pending_entry`, and routes over-SLA pending work
+through the existing abort/finalize/cleanup path without weakening maker
+open-order truth or stale-quote gates. Diagnose now reports
+`artifact_duration_summary`, lightweight `phase_duration_summary`, and quote
+rewarm `still_stale/timeout` by `venue:symbol`, so future since-deploy reviews
+can distinguish final flatness from slow terminality. The final SLA table keeps
+candidate lease, selected-before-submit, maker resting, pending-entry,
+selected-to-terminal, close, and recovery work bounded without changing
+strategy admission, sizing, quote TTL, or terminal-truth semantics. See
+[daily/2026-06-17.md#cluster-cl-093---entry-selected-total-lifecycle-sla-and-artifact-duration-diagnostics](daily/2026-06-17.md#cluster-cl-093---entry-selected-total-lifecycle-sla-and-artifact-duration-diagnostics).
+
 Latest entry quote rewarm lifecycle mapping closure, 2026-06-16:
 Latest `ebafc6a` cloud verification showed the trading state was clean:
 local open/pending/close/residual counts were zero, all venues were

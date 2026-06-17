@@ -11,7 +11,7 @@ import asyncio
 import json
 from collections import Counter
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,7 +31,6 @@ from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliati
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
-    EngineState,
     OpenPosition,
     PendingPassiveOrder,
     PassiveExecutionPhase,
@@ -819,6 +818,135 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
     assert not blocked_gates
 
 
+@pytest.mark.asyncio
+async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
+    config, tmp_journal
+):
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class SlowNoSubmitExecutor:
+        ctx = None
+        cancelled = False
+
+        async def execute(self, ctx):
+            self.ctx = ctx
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return EntryExecutionResult(
+                route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                state=EntryState.COMPLETED,
+            )
+
+    config.strategy.max_concurrent_positions = 8
+    config.strategy.min_scan_minutes_before_funding = 0
+    config.strategy.selected_submit_deadline_ms = 1
+    binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+    bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+    adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.journal = tmp_journal
+    executor = SlowNoSubmitExecutor()
+    runtime.entry_executor = executor
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="NOSUBUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=500.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+
+    dispatched = await runtime._dispatch_entry(
+        candidate, now_ms, price_hint=1.0
+    )
+
+    records = runtime.journal.read_all()
+    kinds = [record["kind"] for record in records]
+    assert dispatched is False
+    assert executor.cancelled is True
+    assert "runtime.entry_selected_submit_deadline_exceeded" in kinds
+    assert "runtime.entry_dispatched" not in kinds
+    rejected = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "review.candidate_rejected"
+    ]
+    assert rejected[-1]["rejected_stage"] == "selected_pre_submit_deadline"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_entry_keeps_order_truth_path_when_submit_evidence_exists(
+    config, tmp_journal
+):
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class SlowSubmittedExecutor:
+        async def execute(self, ctx):
+            tmp_journal.append(
+                "order.submitted",
+                {
+                    "entry_id": ctx.entry_id,
+                    "symbol": ctx.symbol,
+                    "client_order_id": f"{ctx.entry_id}-m",
+                },
+            )
+            await asyncio.sleep(0.02)
+            return EntryExecutionResult(
+                route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                state=EntryState.COMPLETED,
+            )
+
+    config.strategy.max_concurrent_positions = 8
+    config.strategy.min_scan_minutes_before_funding = 0
+    config.strategy.selected_submit_deadline_ms = 1
+    binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+    bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+    adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.journal = tmp_journal
+    runtime.entry_executor = SlowSubmittedExecutor()
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="SUBUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=500.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+
+    dispatched = await runtime._dispatch_entry(
+        candidate, now_ms, price_hint=1.0
+    )
+
+    records = runtime.journal.read_all()
+    kinds = [record["kind"] for record in records]
+    assert dispatched is True
+    assert "order.submitted" in kinds
+    assert "runtime.entry_dispatched" in kinds
+    assert "runtime.entry_selected_submit_deadline_exceeded" not in kinds
+
+
 def test_scan_no_entry_diagnostics_includes_entry_admission_prefilter_stage(
     config, tmp_journal
 ):
@@ -952,7 +1080,7 @@ class TestEntrySyncJournalIntegration:
             journal=tmp_journal,
         )
 
-        from lightfee.engine.entry import EntryContext, EntryState, EntryType
+        from lightfee.engine.entry import EntryContext, EntryType
         ctx = EntryContext(
             entry_id="je1",
             symbol="BTCUSDT",
@@ -986,7 +1114,7 @@ class TestEntrySyncJournalIntegration:
             journal=tmp_journal,
         )
 
-        from lightfee.engine.entry import EntryContext, EntryState, EntryType
+        from lightfee.engine.entry import EntryContext, EntryType
         ctx = EntryContext(
             entry_id="rej2",
             symbol="ETHUSDT",

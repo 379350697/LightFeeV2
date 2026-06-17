@@ -531,6 +531,7 @@ class EntrySyncExecutor:
             maker_leg_filled=maker_filled_total,
             hedge_leg_filled=hedge_filled_total,
             uncertain_outcome=(outcome not in {"filled", "rejected"}),
+            metadata={"entry_selected_at_ms": ctx.created_at_ms},
             entry_type=ctx.entry_type.value,
             maker_price=maker_req.price or 0.0,
             long_quantity=ctx.long_quantity,

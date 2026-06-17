@@ -34,6 +34,11 @@ from lightfee.engine.exchange_truth import (
     normalize_exchange_truth_payload,
     request_venue_operation,
 )
+from lightfee.engine.lifecycle_sla import (
+    LifecyclePhaseBudget,
+    classify_phase_age,
+    phase_budgets_from_strategy,
+)
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
@@ -3562,6 +3567,8 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     quote_rewarm_after_rest_stale_summary = (
         _build_quote_rewarm_after_rest_stale_summary(events)
     )
+    artifact_duration_summary = _build_artifact_duration_summary(events)
+    phase_duration_summary = _build_phase_duration_summary(events)
     return {
         "selected_count": len(selected_entry_ids),
         "dispatched_count": dispatched_count,
@@ -3597,6 +3604,8 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             ),
         },
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
+        "artifact_duration_summary": artifact_duration_summary,
+        "phase_duration_summary": phase_duration_summary,
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 
@@ -3606,6 +3615,104 @@ def _event_venue_symbol_key(payload: dict[str, Any]) -> tuple[str, str]:
         str(payload.get("venue") or "").strip().lower(),
         str(payload.get("symbol") or "").strip().upper(),
     )
+
+
+UNPAIRED_LIVE_POSITION_RECOVERY_EVENTS = {
+    "recovery.unpaired_live_position_detected",
+    "recovery.unpaired_live_position_owner_excluded",
+    "recovery.unpaired_live_position_cleanup_skipped",
+    "recovery.unpaired_live_position_cleanup_attempt",
+    "recovery.unpaired_live_position_cleanup_submitted",
+    "recovery.unpaired_live_position_cleanup_succeeded",
+    "recovery.unpaired_live_position_cleanup_failed",
+    "recovery.unpaired_live_position_terminal_flat",
+}
+
+
+def _diagnose_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_unpaired_live_position_recovery_summary(
+    state: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    raw_records = state.get("unpaired_live_position_recoveries", []) or []
+    records = [dict(item) for item in raw_records if isinstance(item, dict)]
+    event_counts: dict[str, int] = {}
+    last_auto_enabled: bool | None = None
+    latest_event_by_work: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for event in events:
+        kind = str(event.get("kind") or "")
+        if kind not in UNPAIRED_LIVE_POSITION_RECOVERY_EVENTS:
+            continue
+        event_counts[kind] = event_counts.get(kind, 0) + 1
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if "auto_enabled" in payload:
+            last_auto_enabled = bool(payload.get("auto_enabled"))
+        key = (
+            str(payload.get("venue") or "").lower(),
+            str(payload.get("symbol") or "").upper(),
+            str(payload.get("side") or "").lower(),
+        )
+        latest_event_by_work[key] = {
+            "kind": kind,
+            "ts_ms": int(event.get("ts_ms") or 0),
+            "reason": str(payload.get("reason") or payload.get("last_error") or ""),
+        }
+
+    details: list[dict[str, Any]] = []
+    terminal_count = 0
+    active_count = 0
+    manual_required_count = 0
+    for record in records:
+        terminal_status = str(record.get("terminal_status") or "")
+        if terminal_status == "flat":
+            terminal_count += 1
+        else:
+            active_count += 1
+        if terminal_status == "manual_required":
+            manual_required_count += 1
+        key = (
+            str(record.get("venue") or "").lower(),
+            str(record.get("symbol") or "").upper(),
+            str(record.get("side") or "").lower(),
+        )
+        latest_event = latest_event_by_work.get(key, {})
+        details.append(
+            {
+                "venue": key[0],
+                "symbol": key[1],
+                "side": key[2],
+                "quantity": _diagnose_float(record.get("quantity")),
+                "notional_quote": _diagnose_float(record.get("notional_quote")),
+                "first_seen_ms": int(record.get("first_seen_ms") or 0),
+                "attempt_count": int(record.get("attempt_count") or 0),
+                "next_attempt_ms": int(record.get("next_attempt_ms") or 0),
+                "last_error": str(record.get("last_error") or ""),
+                "terminal_status": terminal_status,
+                "owner_excluded": bool(record.get("owner_excluded")),
+                "open_order_truth_available": bool(
+                    record.get("open_order_truth_available")
+                ),
+                "cap_quote": _diagnose_float(record.get("cap_quote")),
+                "cap_ok": bool(record.get("cap_ok")),
+                "latest_event": latest_event,
+            }
+        )
+
+    return {
+        "current_work_count": active_count,
+        "active_work_count": active_count,
+        "terminal_flat_count": terminal_count,
+        "manual_required_count": manual_required_count,
+        "auto_enabled": last_auto_enabled,
+        "event_counts": dict(sorted(event_counts.items())),
+        "details": details,
+    }
 
 
 def _build_quote_rewarm_after_rest_stale_summary(
@@ -3638,6 +3745,8 @@ def _build_quote_rewarm_after_rest_stale_summary(
     resolved_count = 0
     still_stale_count = 0
     timeout_count = 0
+    still_stale_by_venue_symbol: dict[str, int] = {}
+    timeout_by_venue_symbol: dict[str, int] = {}
     samples: list[dict[str, Any]] = []
     for scheduled_at_ms, key, _payload in scheduled:
         status = "timeout"
@@ -3661,8 +3770,16 @@ def _build_quote_rewarm_after_rest_stale_summary(
             resolved_count += 1
         elif status == "still_stale":
             still_stale_count += 1
+            bucket = f"{key[0]}:{key[1]}"
+            still_stale_by_venue_symbol[bucket] = (
+                still_stale_by_venue_symbol.get(bucket, 0) + 1
+            )
         else:
             timeout_count += 1
+            bucket = f"{key[0]}:{key[1]}"
+            timeout_by_venue_symbol[bucket] = (
+                timeout_by_venue_symbol.get(bucket, 0) + 1
+            )
         if len(samples) < 12:
             sample = {
                 "venue": key[0],
@@ -3679,7 +3796,531 @@ def _build_quote_rewarm_after_rest_stale_summary(
         "resolved_count": resolved_count,
         "still_stale_count": still_stale_count,
         "timeout_count": timeout_count,
+        "still_stale_by_venue_symbol": dict(sorted(still_stale_by_venue_symbol.items())),
+        "timeout_by_venue_symbol": dict(sorted(timeout_by_venue_symbol.items())),
         "samples": samples,
+    }
+
+
+def _entry_artifact_id(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("entry_id")
+        or payload.get("pending_id")
+        or payload.get("position_id")
+        or payload.get("internal_entry_id")
+        or ""
+    )
+
+
+def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    artifacts: dict[str, dict[str, Any]] = {}
+
+    def artifact_for(entry_id: str) -> dict[str, Any]:
+        return artifacts.setdefault(
+            entry_id,
+            {
+                "entry_id": entry_id,
+                "symbol": "",
+                "selected_at_ms": 0,
+                "pending_created_at_ms": 0,
+                "opened_at_ms": 0,
+                "close_created_at_ms": 0,
+                "terminal_at_ms": 0,
+                "terminal_kind": "",
+                "terminal_reason": "",
+                "long_lived": False,
+                "missing_l2_or_tick_count": 0,
+            },
+        )
+
+    terminal_kinds = {
+        "entry.aborted",
+        "entry.passive_unfilled",
+        "runtime.position_lifecycle_terminal",
+        "exit.passive_close_resolved",
+        "exit.reconciled",
+    }
+    for rec in events:
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        entry_id = _entry_artifact_id(payload)
+        if not entry_id:
+            continue
+        ts_ms = int(rec.get("ts_ms") or payload.get("ts_ms") or 0)
+        kind = str(rec.get("kind") or "")
+        artifact = artifact_for(entry_id)
+        symbol = str(payload.get("symbol") or "")
+        if symbol and not artifact["symbol"]:
+            artifact["symbol"] = symbol
+        if kind == "execution.entry_selected":
+            artifact["selected_at_ms"] = ts_ms
+        elif kind == "runtime.pending_entry_registered":
+            artifact["pending_created_at_ms"] = ts_ms
+        elif kind == "entry.opened":
+            artifact["opened_at_ms"] = ts_ms
+        elif kind == "exit.passive_close_created":
+            artifact["close_created_at_ms"] = ts_ms
+        elif kind == "pending_entry.long_lived_pending_entry":
+            artifact["long_lived"] = True
+        elif kind == "exit.passive_close_missing_l2_or_tick":
+            artifact["missing_l2_or_tick_count"] += 1
+
+        if kind in terminal_kinds:
+            artifact["terminal_at_ms"] = ts_ms
+            artifact["terminal_kind"] = kind
+            artifact["terminal_reason"] = str(payload.get("reason") or "")
+
+    samples: list[dict[str, Any]] = []
+    max_selected_to_terminal_ms = 0
+    max_pending_created_to_terminal_ms = 0
+    max_close_created_to_terminal_ms = 0
+    long_lived_pending_entry_count = 0
+    close_data_quality_warning_count = 0
+    for artifact in artifacts.values():
+        terminal_at_ms = int(artifact["terminal_at_ms"] or 0)
+        selected_at_ms = int(artifact["selected_at_ms"] or 0)
+        pending_created_at_ms = int(artifact["pending_created_at_ms"] or 0)
+        close_created_at_ms = int(artifact["close_created_at_ms"] or 0)
+        selected_to_terminal_ms = (
+            max(0, terminal_at_ms - selected_at_ms)
+            if selected_at_ms > 0 and terminal_at_ms > 0
+            else 0
+        )
+        pending_created_to_terminal_ms = (
+            max(0, terminal_at_ms - pending_created_at_ms)
+            if pending_created_at_ms > 0 and terminal_at_ms > 0
+            else 0
+        )
+        close_created_to_terminal_ms = (
+            max(0, terminal_at_ms - close_created_at_ms)
+            if close_created_at_ms > 0 and terminal_at_ms > 0
+            else 0
+        )
+        max_selected_to_terminal_ms = max(
+            max_selected_to_terminal_ms, selected_to_terminal_ms
+        )
+        max_pending_created_to_terminal_ms = max(
+            max_pending_created_to_terminal_ms, pending_created_to_terminal_ms
+        )
+        max_close_created_to_terminal_ms = max(
+            max_close_created_to_terminal_ms, close_created_to_terminal_ms
+        )
+        long_lived = bool(artifact["long_lived"])
+        close_warning = int(artifact["missing_l2_or_tick_count"] or 0) > 0
+        if long_lived:
+            long_lived_pending_entry_count += 1
+        if close_warning:
+            close_data_quality_warning_count += 1
+        if selected_to_terminal_ms or pending_created_to_terminal_ms or close_created_to_terminal_ms or long_lived or close_warning:
+            status = "terminal"
+            if artifact["terminal_kind"] == "entry.aborted":
+                status = "aborted"
+            elif artifact["terminal_kind"] in {
+                "runtime.position_lifecycle_terminal",
+                "exit.passive_close_resolved",
+                "exit.reconciled",
+            }:
+                status = "closed"
+            samples.append({
+                "entry_id": artifact["entry_id"],
+                "symbol": artifact["symbol"],
+                "status": status,
+                "selected_to_terminal_ms": selected_to_terminal_ms,
+                "pending_created_to_terminal_ms": pending_created_to_terminal_ms,
+                "close_created_to_terminal_ms": close_created_to_terminal_ms,
+                "long_lived": long_lived,
+                "close_data_quality_warning": close_warning,
+                "terminal_kind": artifact["terminal_kind"],
+                "terminal_reason": artifact["terminal_reason"],
+            })
+
+    samples.sort(
+        key=lambda sample: (
+            not sample["long_lived"],
+            -int(sample["selected_to_terminal_ms"] or 0),
+            -int(sample["close_created_to_terminal_ms"] or 0),
+            sample["entry_id"],
+        )
+    )
+    return {
+        "artifact_count": len(artifacts),
+        "long_lived_pending_entry_count": long_lived_pending_entry_count,
+        "close_data_quality_warning_count": close_data_quality_warning_count,
+        "max_selected_to_terminal_ms": max_selected_to_terminal_ms,
+        "max_pending_created_to_terminal_ms": max_pending_created_to_terminal_ms,
+        "max_close_created_to_terminal_ms": max_close_created_to_terminal_ms,
+        "samples": samples[:12],
+    }
+
+
+def _event_ts_ms(rec: dict[str, Any], payload: dict[str, Any]) -> int:
+    return int(rec.get("ts_ms") or payload.get("ts_ms") or 0)
+
+
+def _phase_artifact_id(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("entry_id")
+        or payload.get("pending_id")
+        or payload.get("position_id")
+        or payload.get("internal_entry_id")
+        or payload.get("candidate_id")
+        or payload.get("candidate_pair_id")
+        or payload.get("pair_id")
+        or payload.get("recovery_id")
+        or ""
+    )
+
+
+def _budget_defaults_payload(
+    budgets: dict[str, LifecyclePhaseBudget],
+) -> dict[str, dict[str, int]]:
+    return {
+        phase: {"soft_ms": budget.soft_ms, "hard_ms": budget.hard_ms}
+        for phase, budget in sorted(budgets.items())
+    }
+
+
+def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    budgets = phase_budgets_from_strategy()
+    horizon_ms = 0
+    artifacts: dict[str, dict[str, Any]] = {}
+    quote_rewarm_scheduled: list[tuple[int, tuple[str, str], dict[str, Any]]] = []
+    quote_rewarm_followups: list[tuple[int, str, tuple[str, str], dict[str, Any]]] = []
+
+    def artifact_for(artifact_id: str) -> dict[str, Any]:
+        return artifacts.setdefault(
+            artifact_id,
+            {
+                "artifact_id": artifact_id,
+                "symbol": "",
+                "venue": "",
+                "selected_at_ms": 0,
+                "submitted_at_ms": 0,
+                "pending_created_at_ms": 0,
+                "entry_terminal_at_ms": 0,
+                "close_created_at_ms": 0,
+                "close_terminal_at_ms": 0,
+                "recovery_created_at_ms": 0,
+                "recovery_terminal_at_ms": 0,
+                "candidate_created_at_ms": 0,
+                "candidate_terminal_at_ms": 0,
+                "maker_resting": False,
+                "observed_actions": {},
+            },
+        )
+
+    def note_observed_action(
+        artifact: dict[str, Any],
+        phase: str,
+        kind: str,
+    ) -> None:
+        if phase not in budgets:
+            return
+        observed_actions = artifact.setdefault("observed_actions", {})
+        if phase in observed_actions:
+            return
+        observed_actions[phase] = {
+            "action_taken": budgets[phase].action,
+            "action_evidence_kind": kind,
+        }
+
+    entry_terminal_kinds = {
+        "entry.aborted",
+        "entry.opened",
+        "entry.passive_unfilled",
+        "runtime.position_opened",
+    }
+    close_terminal_kinds = {
+        "runtime.position_lifecycle_terminal",
+        "exit.passive_close_resolved",
+        "exit.reconciled",
+        "exit.closed",
+    }
+    submit_or_order_kinds = {
+        "runtime.entry_dispatched",
+        "runtime.pending_entry_registered",
+        "execution.entry_order_submitted",
+        "order.submitted",
+    }
+    candidate_start_kinds = {
+        "review.candidate_shortlisted",
+        "runtime.candidate_symbol_skipped",
+    }
+    candidate_terminal_kinds = {
+        "execution.entry_selected",
+        "review.candidate_rejected",
+        "runtime.entry_blocked_gate",
+    }
+    quote_rewarm_terminal_kinds = {
+        "runtime.entry_quote_revalidate_resolved",
+        "runtime.entry_quote_revalidate_failed",
+        "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
+        "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+    }
+    recovery_start_kinds = {
+        "recovery.blocked",
+        "recovery.live_detected",
+        "recovery.mismatch_detected",
+        "recovery.required_position_truth_unavailable",
+        "execution.residual_repair_queued",
+        "exit.passive_close_residual_detected",
+    }
+    recovery_terminal_kinds = {
+        "recovery.flat",
+        "recovery.mismatch_flattened",
+        "recovery.residual_repairs_complete",
+        "execution.residual_repair_completed",
+        "execution.residual_repair_terminal",
+    }
+
+    for rec in events:
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        ts_ms = _event_ts_ms(rec, payload)
+        horizon_ms = max(horizon_ms, ts_ms)
+        kind = str(rec.get("kind") or "")
+        venue_symbol_key = _event_venue_symbol_key(payload)
+        if (
+            kind == "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
+            and venue_symbol_key[0]
+            and venue_symbol_key[1]
+        ):
+            quote_rewarm_scheduled.append((ts_ms, venue_symbol_key, payload))
+        elif (
+            kind in quote_rewarm_terminal_kinds
+            and venue_symbol_key[0]
+            and venue_symbol_key[1]
+        ):
+            quote_rewarm_followups.append((ts_ms, kind, venue_symbol_key, payload))
+        artifact_id = _phase_artifact_id(payload)
+        if not artifact_id:
+            continue
+        artifact = artifact_for(artifact_id)
+        symbol = str(payload.get("symbol") or "").upper()
+        if symbol and not artifact["symbol"]:
+            artifact["symbol"] = symbol
+        venue = str(
+            payload.get("venue")
+            or payload.get("maker_venue")
+            or payload.get("hedge_venue")
+            or ""
+        ).lower()
+        if venue and not artifact["venue"]:
+            artifact["venue"] = venue
+
+        if kind == "execution.entry_selected":
+            artifact["selected_at_ms"] = ts_ms
+        elif kind in submit_or_order_kinds:
+            current = int(artifact["submitted_at_ms"] or 0)
+            artifact["submitted_at_ms"] = min(current or ts_ms, ts_ms)
+        if kind in candidate_start_kinds:
+            current = int(artifact["candidate_created_at_ms"] or 0)
+            artifact["candidate_created_at_ms"] = min(current or ts_ms, ts_ms)
+        elif (
+            kind in candidate_terminal_kinds
+            and int(artifact["candidate_created_at_ms"] or 0)
+        ):
+            current = int(artifact["candidate_terminal_at_ms"] or 0)
+            artifact["candidate_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+        if kind == "runtime.pending_entry_registered":
+            artifact["pending_created_at_ms"] = ts_ms
+            outcome = str(payload.get("outcome") or "")
+            if outcome == "maker_resting" or payload.get("maker_order_id"):
+                artifact["maker_resting"] = True
+        elif kind == "pending_entry.long_lived_pending_entry":
+            artifact["maker_resting"] = True
+        elif kind == "runtime.entry_selected_submit_deadline_exceeded":
+            current = int(artifact["entry_terminal_at_ms"] or 0)
+            artifact["entry_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+        elif kind in entry_terminal_kinds:
+            current = int(artifact["entry_terminal_at_ms"] or 0)
+            artifact["entry_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+        elif kind == "exit.passive_close_created":
+            artifact["close_created_at_ms"] = ts_ms
+        elif kind in close_terminal_kinds:
+            current = int(artifact["close_terminal_at_ms"] or 0)
+            artifact["close_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+        elif kind in recovery_start_kinds:
+            current = int(artifact["recovery_created_at_ms"] or 0)
+            artifact["recovery_created_at_ms"] = min(current or ts_ms, ts_ms)
+        elif kind in recovery_terminal_kinds:
+            current = int(artifact["recovery_terminal_at_ms"] or 0)
+            artifact["recovery_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+
+        if kind == "pending_entry.long_lived_pending_entry":
+            note_observed_action(artifact, "entry_selected_terminal", kind)
+            note_observed_action(artifact, "pending_entry", kind)
+            note_observed_action(artifact, "maker_resting", kind)
+        if kind == "runtime.entry_selected_submit_deadline_exceeded":
+            note_observed_action(artifact, "selected_pre_submit", kind)
+        if kind in {
+            "passive_maintenance.cancel_rest_timeout",
+            "passive_maintenance.cancel_try_window",
+            "passive_maintenance.cancel_issued",
+        }:
+            note_observed_action(artifact, "maker_resting", kind)
+        if kind == "runtime.passive_close_deadline_fallback_armed":
+            note_observed_action(artifact, "close_terminal", kind)
+        if kind in {
+            "recovery.blocked",
+            "execution.residual_repair_paused",
+            "execution.residual_repair_terminal",
+            "execution.residual_repair_completed",
+            "recovery.residual_repairs_complete",
+        }:
+            note_observed_action(artifact, "recovery_terminal", kind)
+
+    records: list[dict[str, Any]] = []
+
+    def add_record(
+        artifact: dict[str, Any],
+        phase: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> None:
+        if start_ms <= 0:
+            return
+        budget = budgets[phase]
+        age_ms = max(0, (end_ms or horizon_ms) - start_ms)
+        status = classify_phase_age(age_ms, budget)
+        observed_action = (
+            artifact.get("observed_actions", {}).get(phase, {})
+            if isinstance(artifact.get("observed_actions", {}), dict)
+            else {}
+        )
+        records.append({
+            "phase": phase,
+            "artifact_id": str(artifact["artifact_id"]),
+            "symbol": str(artifact["symbol"]),
+            "venue": str(artifact["venue"]),
+            "age_ms": age_ms,
+            "soft_ms": budget.soft_ms,
+            "hard_ms": budget.hard_ms,
+            "status": status,
+            "configured_action": budget.action,
+            "action_taken": str(observed_action.get("action_taken") or ""),
+            "action_evidence_kind": str(
+                observed_action.get("action_evidence_kind") or ""
+            ),
+            "truth_source": budget.truth_source,
+        })
+
+    for artifact in artifacts.values():
+        selected_at_ms = int(artifact["selected_at_ms"] or 0)
+        submitted_at_ms = int(artifact["submitted_at_ms"] or 0)
+        pending_created_at_ms = int(artifact["pending_created_at_ms"] or 0)
+        entry_terminal_at_ms = int(artifact["entry_terminal_at_ms"] or 0)
+        close_created_at_ms = int(artifact["close_created_at_ms"] or 0)
+        close_terminal_at_ms = int(artifact["close_terminal_at_ms"] or 0)
+        recovery_created_at_ms = int(artifact["recovery_created_at_ms"] or 0)
+        recovery_terminal_at_ms = int(artifact["recovery_terminal_at_ms"] or 0)
+        candidate_created_at_ms = int(artifact["candidate_created_at_ms"] or 0)
+        candidate_terminal_at_ms = int(artifact["candidate_terminal_at_ms"] or 0)
+
+        add_record(
+            artifact,
+            "candidate_lease",
+            candidate_created_at_ms,
+            candidate_terminal_at_ms,
+        )
+        selected_pre_submit_end_ms = min(
+            (
+                value
+                for value in [
+                    submitted_at_ms,
+                    pending_created_at_ms,
+                    entry_terminal_at_ms,
+                ]
+                if value > 0
+            ),
+            default=0,
+        )
+        add_record(
+            artifact,
+            "selected_pre_submit",
+            selected_at_ms,
+            selected_pre_submit_end_ms,
+        )
+        add_record(
+            artifact,
+            "entry_selected_terminal",
+            selected_at_ms,
+            entry_terminal_at_ms,
+        )
+        add_record(
+            artifact,
+            "pending_entry",
+            pending_created_at_ms,
+            entry_terminal_at_ms,
+        )
+        if bool(artifact["maker_resting"]):
+            add_record(
+                artifact,
+                "maker_resting",
+                pending_created_at_ms,
+                entry_terminal_at_ms,
+            )
+        add_record(
+            artifact,
+            "close_terminal",
+            close_created_at_ms,
+            close_terminal_at_ms,
+        )
+        add_record(
+            artifact,
+            "recovery_terminal",
+            recovery_created_at_ms,
+            recovery_terminal_at_ms,
+        )
+
+    for scheduled_at_ms, key, _payload in quote_rewarm_scheduled:
+        terminal_at_ms = 0
+        for ts_ms, _kind, event_key, _followup_payload in quote_rewarm_followups:
+            if event_key == key and ts_ms >= scheduled_at_ms:
+                terminal_at_ms = ts_ms
+                break
+        add_record(
+            {
+                "artifact_id": f"quote_rewarm:{key[0]}:{key[1]}:{scheduled_at_ms}",
+                "symbol": key[1],
+                "venue": key[0],
+            },
+            "quote_rewarm",
+            scheduled_at_ms,
+            terminal_at_ms,
+        )
+
+    over_budget_records = [
+        record for record in records if record["status"] != "ok"
+    ]
+    hard_over_budget_records = [
+        record for record in records if record["status"] == "hard_over_budget"
+    ]
+    max_age_by_phase: dict[str, int] = {}
+    for record in records:
+        phase = str(record["phase"])
+        max_age_by_phase[phase] = max(
+            max_age_by_phase.get(phase, 0), int(record["age_ms"] or 0)
+        )
+
+    over_budget_records.sort(
+        key=lambda record: (
+            0 if record["status"] == "hard_over_budget" else 1,
+            -int(record["age_ms"] or 0),
+            str(record["phase"]),
+            str(record["artifact_id"]),
+        )
+    )
+    return {
+        "budget_defaults_ms": _budget_defaults_payload(budgets),
+        "artifact_count": len(artifacts),
+        "phase_record_count": len(records),
+        "over_budget_count": len(over_budget_records),
+        "hard_over_budget_count": len(hard_over_budget_records),
+        "max_age_by_phase": dict(sorted(max_age_by_phase.items())),
+        "samples": over_budget_records[:24],
     }
 
 
@@ -4943,6 +5584,9 @@ def run_diagnose(
         all_events,
         production_acceptance_gate,
     )
+    unpaired_live_position_recovery_summary = (
+        _build_unpaired_live_position_recovery_summary(state, all_events)
+    )
     resolved_quantity_adjustment_summary = entry_quantity_terminal_summary.get(
         "resolved_quantity_adjustment_summary",
         {},
@@ -5010,6 +5654,9 @@ def run_diagnose(
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
+        "unpaired_live_position_recovery_summary": (
+            unpaired_live_position_recovery_summary
+        ),
         "resolved_quantity_adjustment_summary": resolved_quantity_adjustment_summary,
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "code_side_blocker_view": code_side_blocker_view,

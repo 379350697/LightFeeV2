@@ -75,6 +75,9 @@ from lightfee.engine.market_data_runtime import MarketDataRuntime
 from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
 from lightfee.engine.pending_entry_runtime import PendingEntryRuntime
 from lightfee.engine.residual_repair_runtime import ResidualRepairRuntime
+from lightfee.engine.unpaired_live_position_recovery import (
+    UnpairedLivePositionRecoveryRuntime,
+)
 from lightfee.engine.v1_lifecycle_closure import (
     build_v1_lifecycle_closure_table,
     closure_event_fields,
@@ -215,6 +218,9 @@ class LiveRuntime:
         self.residual_repair_runtime = ResidualRepairRuntime(self)
         self.pending_entry_runtime = PendingEntryRuntime(self)
         self.recovery_startup_runtime = RecoveryStartupRuntime(self)
+        self.unpaired_live_position_recovery_runtime = (
+            UnpairedLivePositionRecoveryRuntime(self)
+        )
 
         # Tick-failure backoff deadlines (ms since epoch). None = no backoff active.
         self._tick_backoff_until_ms: Optional[int] = None
@@ -1886,6 +1892,26 @@ class LiveRuntime:
 
     def _startup_position_probe_symbols(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._startup_position_probe_symbols(*args, **kwargs)
+
+    def _register_unpaired_live_position_recoveries_from_ledger(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return self.unpaired_live_position_recovery_runtime.register_from_ledger(
+            *args,
+            **kwargs,
+        )
+
+    async def _drive_unpaired_live_position_recoveries(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return await self.unpaired_live_position_recovery_runtime.drive(
+            *args,
+            **kwargs,
+        )
 
     def _truth_required_recovery_probe_symbol_sources(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._truth_required_recovery_probe_symbol_sources(*args, **kwargs)
@@ -6796,35 +6822,68 @@ class LiveRuntime:
         strategy = self.config.strategy
         hard_ceiling_ms = getattr(strategy, "pending_entry_hard_ceiling_ms", 120000)
         force_terminal_after_ms = getattr(strategy, "pending_entry_force_terminal_after_ms", 60000)
+        selected_terminal_sla_ms = int(
+            getattr(strategy, "entry_selected_terminal_sla_ms", 300000) or 0
+        )
 
         lifetime_ms = pending.compute_lifetime_ms(now_ms)
+        selected_at_ms = self._pending_entry_selected_at_ms(pending)
+        selected_lifetime_ms = (
+            max(0, now_ms - selected_at_ms) if selected_at_ms > 0 else lifetime_ms
+        )
 
         hard_ceiling_reached = lifetime_ms >= hard_ceiling_ms
+        selected_sla_reached = (
+            selected_terminal_sla_ms > 0
+            and selected_at_ms > 0
+            and selected_lifetime_ms >= selected_terminal_sla_ms
+        )
         force_terminal_reached = (
             lifetime_ms >= force_terminal_after_ms
             and (not pending.has_any_fill() or pending.missing_hedge_quantity() <= 1e-9)
         )
 
         has_inflight = pending.hedge_inflight is not None
-        if has_inflight and not hard_ceiling_reached:
+        if has_inflight and not hard_ceiling_reached and not selected_sla_reached:
             # V1: inflight hedge blocks terminalization until hard ceiling
             return None
 
-        if not hard_ceiling_reached and not force_terminal_reached:
+        if not hard_ceiling_reached and not force_terminal_reached and not selected_sla_reached:
             return None
 
         final_reason = (
             "pending_entry_max_lifetime_exhausted"
             if hard_ceiling_reached
-            else "pending_entry_zero_fill_lifetime_exhausted"
+            else (
+                "long_lived_pending_entry"
+                if selected_sla_reached
+                else "pending_entry_zero_fill_lifetime_exhausted"
+            )
         )
 
         return {
             "hard_ceiling_reached": hard_ceiling_reached,
+            "selected_sla_reached": selected_sla_reached,
             "force_terminal_reached": force_terminal_reached,
             "final_reason": final_reason,
             "lifetime_ms": lifetime_ms,
+            "selected_at_ms": selected_at_ms,
+            "selected_lifetime_ms": selected_lifetime_ms,
+            "selected_terminal_sla_ms": selected_terminal_sla_ms,
         }
+
+    @staticmethod
+    def _pending_entry_selected_at_ms(pending) -> int:
+        metadata = getattr(pending, "metadata", None)
+        if isinstance(metadata, dict):
+            for key in ("entry_selected_at_ms", "selected_at_ms"):
+                try:
+                    value = int(metadata.get(key) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    return value
+        return int(getattr(pending, "created_at_ms", 0) or 0)
 
     async def _force_terminalize_pending_entry_if_budget_exhausted(
         self, pending, entry_id: str, now_ms: int
@@ -6844,8 +6903,28 @@ class LiveRuntime:
             return False
 
         hard_ceiling_reached = bool(budget.get("hard_ceiling_reached"))
+        selected_sla_reached = bool(budget.get("selected_sla_reached"))
         force_terminal_reached = bool(budget.get("force_terminal_reached"))
         final_reason = str(budget["final_reason"])
+        terminal_deadline_reached = hard_ceiling_reached or selected_sla_reached
+
+        if selected_sla_reached:
+            self.journal.append(
+                "pending_entry.long_lived_pending_entry",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": final_reason,
+                    "selected_at_ms": int(budget.get("selected_at_ms") or 0),
+                    "selected_lifetime_ms": int(
+                        budget.get("selected_lifetime_ms") or 0
+                    ),
+                    "pending_lifetime_ms": int(budget.get("lifetime_ms") or 0),
+                    "sla_ms": int(budget.get("selected_terminal_sla_ms") or 0),
+                    "hard_ceiling_reached": hard_ceiling_reached,
+                    "force_terminal_reached": force_terminal_reached,
+                },
+            )
 
         if hard_ceiling_reached and pending.repair_state:
             self.journal.append(
@@ -6866,7 +6945,7 @@ class LiveRuntime:
                     pending, entry_id, final_reason
                 )
 
-            if hard_ceiling_reached:
+            if terminal_deadline_reached:
                 if pending.has_any_fill() and pending.missing_hedge_quantity() <= 1e-9:
                     if await self._finalize_pending_entry(pending, entry_id, now_ms):
                         await self._complete_pending_entry_terminal_removal(
@@ -6897,7 +6976,7 @@ class LiveRuntime:
 
             return False
 
-        if hard_ceiling_reached:
+        if terminal_deadline_reached:
             if not pending.has_any_fill():
                 if getattr(
                     self.config.strategy,
@@ -6922,7 +7001,7 @@ class LiveRuntime:
             # P6: if there are actual fills (not repair-state), give
             # reconcile a chance before abort. This prevents discarding
             # fill evidence. Zero-fill or repair-state entries abort directly.
-            if pending.has_any_fill() and not pending.repair_state:
+            if hard_ceiling_reached and pending.has_any_fill() and not pending.repair_state:
                 hard_ceiling_ms = getattr(
                     self.config.strategy, "pending_entry_hard_ceiling_ms", 120000
                 )
@@ -9704,6 +9783,9 @@ class LiveRuntime:
 
         # Detect false-clean state where exchanges hold positions but V2 missed them.
         await self._maybe_recover_clean_live_positions(now_ms)
+
+        # Independent no-owner live-position recovery route.
+        await self._drive_unpaired_live_position_recoveries(now_ms=now_ms)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(

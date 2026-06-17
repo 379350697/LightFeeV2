@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from contextlib import suppress
 from typing import Any
 
 from lightfee.core.domain import OrderRequest, Side, TimeInForce, Venue
@@ -1331,11 +1332,15 @@ class EntryDispatchRuntime:
             blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
             exit_after_first_stage=exit_after_first_stage,
         )
+        candidate_pair_id = self._candidate_pair_id(candidate)
 
         # V1: review.candidate_shortlisted — candidate passed all gates, entered shortlist
         self.ctx.journal.append(
             "review.candidate_shortlisted",
             {
+                "entry_id": entry_id,
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
                 "symbol": candidate.symbol,
                 "long_venue": long_venue.value,
                 "short_venue": short_venue.value,
@@ -1359,6 +1364,126 @@ class EntryDispatchRuntime:
         )
         return ctx
 
+    def _selected_submit_deadline_ms(self) -> int:
+        try:
+            value = int(
+                getattr(self.ctx.config.strategy, "selected_submit_deadline_ms", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
+
+    @staticmethod
+    def _payload_matches_entry(payload: dict[str, Any], entry_id: str) -> bool:
+        for key in ("entry_id", "position_id", "internal_entry_id", "pending_id"):
+            if str(payload.get(key) or "") == entry_id:
+                return True
+        return False
+
+    def _entry_submit_or_terminal_evidence_seen(
+        self,
+        entry_id: str,
+        *,
+        after_seq: int,
+    ) -> tuple[bool, str]:
+        evidence_kinds = {
+            "order.submitted",
+            "execution.entry_order_submitted",
+            "runtime.pending_entry_registered",
+            "runtime.entry_dispatched",
+            "entry.opened",
+            "entry.aborted",
+            "entry.passive_unfilled",
+            "runtime.position_opened",
+        }
+        for record in self.ctx.journal.read_all():
+            try:
+                seq = int(record.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            if seq <= after_seq:
+                continue
+            kind = str(record.get("kind") or "")
+            if kind not in evidence_kinds:
+                continue
+            payload = record.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if self._payload_matches_entry(payload, entry_id):
+                return True, kind
+        return False, ""
+
+    async def _execute_entry_with_selected_deadline(
+        self,
+        *,
+        ctx: EntryContext,
+        candidate,
+        selected_seq: int,
+        selected_at_ms: int,
+    ):
+        deadline_ms = self._selected_submit_deadline_ms()
+        if deadline_ms <= 0:
+            return await self.ctx.entry_executor.execute(ctx)
+
+        task = asyncio.create_task(self.ctx.entry_executor.execute(ctx))
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=deadline_ms / 1000.0,
+        )
+        if done:
+            return task.result()
+
+        has_evidence, evidence_kind = self._entry_submit_or_terminal_evidence_seen(
+            ctx.entry_id,
+            after_seq=selected_seq,
+        )
+        if has_evidence:
+            self.ctx.journal.append(
+                "runtime.entry_selected_submit_deadline_waiting_on_order_truth",
+                {
+                    "entry_id": ctx.entry_id,
+                    "symbol": candidate.symbol,
+                    "deadline_ms": deadline_ms,
+                    "evidence_kind": evidence_kind,
+                    "reason": "submit_or_terminal_evidence_seen",
+                    "ts_ms": selected_at_ms + deadline_ms,
+                },
+            )
+            return await task
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        candidate_pair_id = self._candidate_pair_id(candidate)
+        self.ctx.journal.append(
+            "runtime.entry_selected_submit_deadline_exceeded",
+            {
+                "entry_id": ctx.entry_id,
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
+                "symbol": candidate.symbol,
+                "deadline_ms": deadline_ms,
+                "reason": "no_submit_or_order_evidence",
+                "ts_ms": selected_at_ms + deadline_ms,
+            },
+        )
+        self.ctx.journal.append(
+            "review.candidate_rejected",
+            {
+                "entry_id": ctx.entry_id,
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
+                "symbol": candidate.symbol,
+                "long_venue": ctx.long_venue.value,
+                "short_venue": ctx.short_venue.value,
+                "rejected_stage": "selected_pre_submit_deadline",
+                "rejected_reason": "no_submit_or_order_evidence",
+                "ts_ms": selected_at_ms + deadline_ms,
+            },
+        )
+        return None
+
     async def _execute_entry_context(
         self,
         *,
@@ -1374,11 +1499,14 @@ class EntryDispatchRuntime:
     ) -> bool:
         try:
             # V1: execution.entry_selected — engine decided to open this candidate
-            self.ctx.journal.append(
+            candidate_pair_id = self._candidate_pair_id(candidate)
+            selected_seq = self.ctx.journal.append(
                 "execution.entry_selected",
                 {
                     "symbol": candidate.symbol,
                     "entry_id": ctx.entry_id,
+                    "candidate_pair_id": candidate_pair_id,
+                    "pair_id": candidate_pair_id,
                     "long_venue": ctx.long_venue.value,
                     "short_venue": ctx.short_venue.value,
                     "quantity": effective_quantity,
@@ -1399,11 +1527,20 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            result = await self.ctx.entry_executor.execute(ctx)
+            result = await self._execute_entry_with_selected_deadline(
+                ctx=ctx,
+                candidate=candidate,
+                selected_seq=selected_seq,
+                selected_at_ms=now_ms,
+            )
+            if result is None:
+                return False
             self.ctx.journal.append(
                 "runtime.entry_dispatched",
                 {
                     "entry_id": ctx.entry_id,
+                    "candidate_pair_id": candidate_pair_id,
+                    "pair_id": candidate_pair_id,
                     "symbol": candidate.symbol,
                     "route": result.route.value,
                     "state": result.state.value,

@@ -14,9 +14,11 @@ from lightfee.engine.lifecycle import (
     set_lifecycle,
 )
 from lightfee.engine.recovery import (
+    build_persistent_state_view,
     build_recovery_snapshot,
     clear_stale_fail_closed_if_recovery_clean,
     clear_legacy_recovery_block_via_core,
+    needs_reconciliation,
     normalize_engine_state,
     recover_from_snapshot,
 )
@@ -326,6 +328,33 @@ class TestRecovery:
 
         assert rs.ambiguous_state
         assert getattr(rs, "has_pending_residual_repairs") is True
+
+    def test_unpaired_live_position_recovery_persists_as_recovery_work(self):
+        state = EngineState(lifecycle=EngineLifecycle.RECONCILING)
+        state.unpaired_live_position_recoveries.append(
+            {
+                "venue": "binance",
+                "symbol": "ESPORTSUSDT",
+                "side": "sell",
+                "quantity": 592.0,
+                "notional_quote": 11.84,
+                "first_seen_ms": 1_000,
+                "attempt_count": 0,
+                "next_attempt_ms": 1_000,
+                "last_error": "",
+                "terminal_status": "",
+            }
+        )
+
+        rs = build_recovery_snapshot(state)
+        view = build_persistent_state_view(state)
+
+        assert rs.has_unpaired_live_position_recoveries is True
+        assert rs.ambiguous_state is True
+        assert needs_reconciliation(state) is True
+        assert view["unpaired_live_position_recoveries"] == (
+            state.unpaired_live_position_recoveries
+        )
 
     def test_normalize_retains_invalid_pending_entry_with_exchange_evidence(self):
         """Bad local shape with fill/order evidence must not bypass live-truth recovery."""
