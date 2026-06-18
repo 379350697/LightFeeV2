@@ -19,7 +19,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
-from lightfee.core.errors import OrderSubmitError
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.aster_v3 import AsterV3Client
 from lightfee.venues.specs import aster_spec
 from lightfee.venues.transport import (
@@ -29,6 +29,8 @@ from lightfee.venues.transport import (
     VenueTransport,
 )
 from lightfee.venues import transport as transport_mod
+
+_ASTER_TRUSTED_SYMBOL_RULE_SOURCES = {"exchangeinfo"}
 
 
 class AsterAdapter(VenueAdapter):
@@ -122,14 +124,42 @@ class AsterAdapter(VenueAdapter):
         """Apply Binance-style Aster symbol filters before private V3 submit."""
         venue_symbol = self._transport._venue_symbol(request.symbol)
         symbol_rule = None
+        rule_source = "unavailable"
         try:
             symbol_rule = await transport_mod.get_symbol_rules_cache().get(
                 self._transport,
                 Venue.ASTER,
                 venue_symbol,
             )
+            rule_source = str(getattr(symbol_rule, "rule_source", "") or "unknown")
         except Exception:
             symbol_rule = None
+        if (
+            not request.reduce_only
+            and rule_source.lower() not in _ASTER_TRUSTED_SYMBOL_RULE_SOURCES
+        ):
+            payload = {
+                "venue": Venue.ASTER.value,
+                "symbol": request.symbol,
+                "venue_symbol": venue_symbol,
+                "endpoint": self._transport._spec.order_path,
+                "product_type": self._transport._product_type(),
+                "client_order_id": request.client_order_id or "",
+                "order_id": request.order_id or "",
+                "raw_price": request.price,
+                "raw_qty": request.quantity,
+                "rule_source": rule_source,
+                "response_classification": "precision_rule_unavailable",
+                "reason": "aster_trusted_symbol_rule_unavailable",
+            }
+            self._transport._record_order_diagnostic(
+                "order_error.precision_rule_unavailable_before_submit",
+                payload,
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster_trusted_symbol_rule_unavailable",
+            )
         try:
             preflight = self._transport.preflight_order_request(
                 request,

@@ -631,13 +631,18 @@ def test_current_state_export_includes_v1_lifecycle_closure(tmp_path):
     assert closure["rows"]
 
 
-def test_diagnose_gate_exposes_existing_v1_lifecycle_closure_payload():
+def test_diagnose_gate_preserves_existing_v1_lifecycle_closure_without_current_truth():
     closure = {
         "version": "v1.lifecycle_closure.v1",
         "summary": {"entry_allowed": True},
         "rows": [],
         "unmapped_event_kinds": [],
         "performance_scope": {},
+    }
+    unavailable_truth = {
+        "available": False,
+        "truth_available": False,
+        "confidence": "low",
     }
     gate = _build_production_acceptance_gate(
         [],
@@ -650,17 +655,95 @@ def test_diagnose_gate_exposes_existing_v1_lifecycle_closure_payload():
             "pending_residual_repair_count": 0,
             "v1_lifecycle_closure": closure,
         },
-        _clean_exchange_truth(),
+        unavailable_truth,
     )
 
     assert gate["v1_lifecycle_closure"] == closure
 
 
-def test_production_health_exposes_existing_v1_lifecycle_closure_payload():
+def test_diagnose_gate_recomputes_embedded_closure_with_current_clean_truth():
+    stale_closure = {
+        "version": "v1.lifecycle_closure.v1",
+        "summary": {
+            "entry_allowed": True,
+            "recovery_decision_kind": "RUNNING_WITH_EVIDENCE_GAP",
+        },
+        "rows": [
+            {
+                "phase": "RECOVERY_TRUTH",
+                "evidence_class": "partial_evidence_gap",
+            }
+        ],
+        "unmapped_event_kinds": [],
+        "performance_scope": {},
+    }
+    gate = _build_production_acceptance_gate(
+        [],
+        {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "v1_lifecycle_closure": stale_closure,
+        },
+        _clean_exchange_truth(),
+    )
+
+    closure = gate["v1_lifecycle_closure"]
+    assert closure != stale_closure
+    assert closure["summary"]["recovery_decision_kind"] == "RUNNING_CLEAN"
+
+
+def test_production_health_preserves_existing_v1_lifecycle_closure_without_current_truth():
     closure = {
         "version": "v1.lifecycle_closure.v1",
         "summary": {"entry_allowed": True},
         "rows": [],
+        "unmapped_event_kinds": [],
+        "performance_scope": {},
+    }
+    unavailable_truth = {
+        "available": False,
+        "truth_available": False,
+        "confidence": "low",
+    }
+    report = analyze_current_state(
+        {
+            "schema": "lightfee.current_state.v1",
+            "generated_at_ms": 1770000000000,
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "last_tick_ms": 1770000000000,
+            "last_scan": {"ts_ms": 1770000000000},
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "exchange_truth": unavailable_truth,
+            "v1_lifecycle_closure": closure,
+        },
+        now_ms=1770000001000,
+        max_tick_age_ms=10_000,
+    )
+
+    assert report.details["v1_lifecycle_closure"] == closure
+
+
+def test_production_health_recomputes_embedded_closure_with_current_clean_truth():
+    stale_closure = {
+        "version": "v1.lifecycle_closure.v1",
+        "summary": {
+            "entry_allowed": True,
+            "recovery_decision_kind": "RUNNING_WITH_EVIDENCE_GAP",
+        },
+        "rows": [
+            {
+                "phase": "RECOVERY_TRUTH",
+                "evidence_class": "partial_evidence_gap",
+            }
+        ],
         "unmapped_event_kinds": [],
         "performance_scope": {},
     }
@@ -677,13 +760,15 @@ def test_production_health_exposes_existing_v1_lifecycle_closure_payload():
             "pending_close_count": 0,
             "pending_residual_repair_count": 0,
             "exchange_truth": _clean_exchange_truth(),
-            "v1_lifecycle_closure": closure,
+            "v1_lifecycle_closure": stale_closure,
         },
         now_ms=1770000001000,
         max_tick_age_ms=10_000,
     )
 
-    assert report.details["v1_lifecycle_closure"] == closure
+    closure = report.details["v1_lifecycle_closure"]
+    assert closure != stale_closure
+    assert closure["summary"]["recovery_decision_kind"] == "RUNNING_CLEAN"
 
 
 def test_static_runtime_snapshot_refreshes_closure_before_export():

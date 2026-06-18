@@ -706,7 +706,11 @@ def _v1_lifecycle_closure_payload(
     now_ms: int,
 ) -> dict[str, Any]:
     existing = state.get("v1_lifecycle_closure")
-    if isinstance(existing, dict) and existing.get("version"):
+    if (
+        isinstance(existing, dict)
+        and existing.get("version")
+        and not _exchange_truth_high_confidence(exchange_truth)
+    ):
         return dict(existing)
     events = _state_journal_events(state)
     owner_index = RecoveryOwnerIndex.from_state_and_journal(state, events)
@@ -717,6 +721,14 @@ def _v1_lifecycle_closure_payload(
         events=events,
         owner_index=owner_index,
     ).to_dict()
+
+
+def _exchange_truth_high_confidence(exchange_truth: Any) -> bool:
+    if not isinstance(exchange_truth, dict):
+        return False
+    available = bool(exchange_truth.get("available", exchange_truth.get("truth_available")))
+    confidence = str(exchange_truth.get("confidence") or "").lower()
+    return available and confidence == "high"
 
 
 def _state_journal_events(state: dict[str, Any]) -> list[dict[str, Any]]:

@@ -474,7 +474,23 @@ class TestAsterOrderRequestShape:
     """Verify Aster POST order uses Pro API V3 signer params, not Binance HMAC."""
 
     @pytest.mark.asyncio
-    async def test_post_order_has_signer_nonce_and_signature_in_url(self):
+    async def test_post_order_has_signer_nonce_and_signature_in_url(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
         fixture = _load_fixture("aster", "place_order_success")
         captured_url = []
 
@@ -636,6 +652,70 @@ class TestAsterOrderRequestShape:
         assert any(
             event["kind"] == "order_error.precision_rejected_before_submit"
             and event["payload"]["response_classification"] == "precision_rejected"
+            for event in diagnostics
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_private_v3_order_rejects_missing_trusted_symbol_rule_before_submit(
+        self, monkeypatch
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="spec_fallback",
+                )
+
+        class FakePrivate:
+            submitted = False
+
+            async def place_order(self, request: OrderRequest) -> OrderFill:
+                self.submitted = True
+                raise AssertionError("Aster order without trusted rules must not submit")
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        cred = LiveCredential(
+            api_secret=ASTER_FIXTURE_PRIVATE_KEY,
+            account_address=ASTER_FIXTURE_ACCOUNT_ADDRESS,
+        )
+        adapter = AsterAdapter(mode="live", credential=cred)
+        private = FakePrivate()
+        adapter._private = private
+
+        try:
+            with pytest.raises(OrderSubmitError) as exc:
+                await adapter.place_order(
+                    OrderRequest(
+                        venue=Venue.ASTER,
+                        symbol="NEWLISTEDUSDT",
+                        side=Side.BUY,
+                        quantity=12.345,
+                        price=1.23,
+                        time_in_force=TimeInForce.GTC,
+                    )
+                )
+        finally:
+            await adapter.shutdown()
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert private.submitted is False
+        diagnostics = adapter._transport.drain_order_diagnostics()
+        assert any(
+            event["kind"] == "order_error.precision_rule_unavailable_before_submit"
+            and event["payload"]["response_classification"]
+            == "precision_rule_unavailable"
+            and event["payload"]["rule_source"] == "spec_fallback"
             for event in diagnostics
         )
 
