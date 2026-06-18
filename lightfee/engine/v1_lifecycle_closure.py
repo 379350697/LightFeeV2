@@ -1142,6 +1142,13 @@ _EVENT_KIND_PHASES = {
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.risk_mode_changed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.stale_fail_closed_cleared": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.stale_risk_state_alignment_started": (
+        V1LifecycleClosurePhase.RECOVERY_TRUTH.value
+    ),
+    "runtime.stale_risk_state_aligned": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.stale_risk_state_alignment_blocked": (
+        V1LifecycleClosurePhase.RECOVERY_TRUTH.value
+    ),
     "recovery.unpaired_live_position_detected": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.unpaired_live_position_owner_excluded": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.unpaired_live_position_cleanup_skipped": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
@@ -1272,6 +1279,7 @@ _EVENT_KIND_PHASES = {
     "runtime.close_price_evidence_rest_rewarm_succeeded": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_rewarm_failed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_stale": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "runtime.close_price_evidence_missing": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.passive_close_deadline_fallback_armed": (
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
     ),

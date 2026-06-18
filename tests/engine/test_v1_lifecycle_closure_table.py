@@ -415,6 +415,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "review.candidate_shortlisted",
         "runtime.active_position_tick",
         "runtime.close_price_evidence_fallback",
+        "runtime.close_price_evidence_missing",
         "runtime.close_price_evidence_rewarm_failed",
         "runtime.close_price_evidence_rest_rewarm_succeeded",
         "runtime.close_price_evidence_stale",
@@ -449,6 +450,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "exit.closed",
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
+        "runtime.stale_risk_state_alignment_started",
+        "runtime.stale_risk_state_aligned",
+        "runtime.stale_risk_state_alignment_blocked",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
         "entry.hedge_drive_cancel_replace",
         "runtime.maker_event_lane_wake",
@@ -469,6 +473,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.stale_risk_state_alignment_started") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.stale_risk_state_aligned") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.stale_risk_state_alignment_blocked") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.close_price_evidence_missing") == "PASSIVE_CLOSE"
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
         == "ENTRY_QUOTE_LEASE"
