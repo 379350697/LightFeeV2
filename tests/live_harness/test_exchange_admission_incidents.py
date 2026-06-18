@@ -10,8 +10,9 @@ from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
-from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, Venue
+from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.risk.modes import EngineLifecycle
 from tests.test_live_startup_preflight import make_test_config
 
 
@@ -77,6 +78,16 @@ class RejectingExecutor:
             state=EntryState.FAILED,
             reject_reason=self.reject_reason,
         )
+
+
+class RejectingBybitPrecheckAdapter(TrustedVenueAdapter):
+    def __init__(self, reject_reason: str):
+        self.reject_reason = reject_reason
+        self.precheck_calls = 0
+
+    async def precheck_order_admission(self, request):
+        self.precheck_calls += 1
+        raise OrderSubmitError(SubmitFailureClass.REJECTED, self.reject_reason)
 
 
 @pytest.mark.asyncio
@@ -229,6 +240,73 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         runtime.journal.close()
 
 
+@pytest.mark.asyncio
+async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_wide():
+    with tempfile.TemporaryDirectory() as td:
+        bybit = RejectingBybitPrecheckAdapter(
+            "bybit order precheck failed: bybit retCode=33004 retMsg=Your api key has expired"
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={
+                Venue.BINANCE: TrustedVenueAdapter(),
+                Venue.BYBIT: bybit,
+            },
+        )
+        runtime.journal.open()
+
+        class CountingExecutor:
+            calls = 0
+
+            async def execute(self, ctx):
+                self.calls += 1
+                return EntryExecutionResult(
+                    route=ExecutionRoute.REJECTED,
+                    state=EntryState.FAILED,
+                    reject_reason="executor must not receive Bybit-auth-invalid candidate",
+                )
+
+        executor = CountingExecutor()
+        runtime.entry_executor = executor
+        bybit_candidate = _candidate("AUTHUSDT", "binance", "bybit")
+        clean_candidate = _candidate("CLEANUSDT", "binance", "aster")
+
+        first = await runtime._dispatch_entry(
+            bybit_candidate,
+            1778787000000,
+            price_hint=1.0,
+        )
+        filtered = runtime._filter_candidates_by_entry_admission(
+            [bybit_candidate, clean_candidate],
+            now_ms=1778787001000,
+            stage="shortlist",
+        )
+
+        assert first is False
+        assert bybit.precheck_calls == 1
+        assert executor.calls == 0
+        assert [candidate.symbol for candidate in filtered] == ["CLEANUSDT"]
+        venue_cooldown = runtime.state.venue_entry_cooldowns["bybit:*"]
+        assert venue_cooldown["reason"] == "venue_auth_invalid"
+        assert venue_cooldown["source"] == "venue_private_health_precheck"
+        assert venue_cooldown["block_scope"] == "venue"
+        assert venue_cooldown["cooldown_scope"] == "venue"
+        assert venue_cooldown["reduce_only"] is False
+        assert venue_cooldown["venue_private_health_status"] == "auth_invalid"
+        payload = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_blocked"
+            and record["payload"].get("venue") == "bybit"
+        ][-1]
+        assert payload["reason"] == "venue_auth_invalid"
+        assert payload["source"] == "venue_private_health_precheck"
+        assert payload["cooldown_scope"] == "venue"
+        assert payload["reduce_only"] is False
+        assert payload["raw_error"] == bybit.reject_reason[:500]
+        runtime.journal.close()
+
+
 @pytest.mark.parametrize(
     "reject_status",
     ["perpMarginRejected", "insufficientSpotBalanceRejected"],
@@ -287,6 +365,105 @@ class RejectingHedgeAdapter(FlatAdapter):
             quantity=0.0,
             entry_price=0.0,
             observed_at_ms=0,
+        )
+
+
+class AuthInvalidHedgeAdapter(FlatAdapter):
+    def __init__(self, message: str, venue: Venue):
+        self.message = message
+        self.venue = venue
+        self.place_order_calls = 0
+
+    async def place_order(self, request):
+        self.place_order_calls += 1
+        raise OrderSubmitError(SubmitFailureClass.REJECTED, self.message)
+
+    async def fetch_order_fill_reconciliation(self, symbol: str, order_id: str, client_order_id: str):
+        return None
+
+    async def fetch_position(self, symbol: str):
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1778787001000,
+        )
+
+    async def fetch_open_orders(self, symbol: str):
+        return []
+
+
+class LiveSingleLegCleanupAdapter(FlatAdapter):
+    def __init__(self, venue: Venue, side: Side, quantity: float):
+        self.venue = venue
+        self.side = side
+        self.quantity = quantity
+        self.fetch_position_calls = 0
+        self.place_order_calls = 0
+        self.last_request = None
+
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_calls += 1
+        qty = self.quantity if self.fetch_position_calls <= 2 else 0.0
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=self.side,
+            quantity=qty,
+            entry_price=1.0 if qty > 0 else 0.0,
+            observed_at_ms=1778787001000,
+        )
+
+    async def fetch_open_orders(self, symbol: str):
+        return []
+
+    async def place_order(self, request):
+        self.place_order_calls += 1
+        self.last_request = request
+        return SimpleNamespace(
+            order_id=f"{self.venue.value}-cleanup-order",
+            quantity=float(request.quantity or 0.0),
+            price=1.0,
+        )
+
+
+class TruthUnavailableSingleLegCleanupAdapter(LiveSingleLegCleanupAdapter):
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_calls += 1
+        raise RuntimeError("position truth unavailable")
+
+
+class OpenOrderSingleLegCleanupAdapter(LiveSingleLegCleanupAdapter):
+    async def fetch_open_orders(self, symbol: str):
+        return [
+            {
+                "symbol": symbol,
+                "orderId": "maker-order-open",
+                "clientOrderId": "maker-cid-open",
+            }
+        ]
+
+
+class FailingSingleLegCleanupAdapter(LiveSingleLegCleanupAdapter):
+    async def fetch_position(self, symbol: str):
+        self.fetch_position_calls += 1
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=self.side,
+            quantity=self.quantity,
+            entry_price=1.0,
+            observed_at_ms=1778787001000,
+        )
+
+    async def place_order(self, request):
+        self.place_order_calls += 1
+        self.last_request = request
+        raise OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "binance reduce-only cleanup rejected",
         )
 
 
@@ -355,6 +532,196 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
             record for record in records
             if record["kind"] == "entry.aborted"
         ][-1]["payload"]["reason"] == "hedge_admission_blocked:bybit_trading_terms_required"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_bybit_auth_invalid_recovers_owned_single_leg_on_maker_venue():
+    with tempfile.TemporaryDirectory() as td:
+        binance = LiveSingleLegCleanupAdapter(Venue.BINANCE, Side.BUY, 4.0)
+        bybit = AuthInvalidHedgeAdapter(
+            "bybit order failed: bybit retCode=33004 retMsg=Your api key has expired",
+            Venue.BYBIT,
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-auth-single-leg",
+            symbol="AUTHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            1778787001000,
+        )
+
+        assert driven is False
+        assert bybit.place_order_calls == 1
+        assert binance.place_order_calls == 1
+        assert binance.last_request is not None
+        assert binance.last_request.reduce_only is True
+        assert binance.last_request.post_only is False
+        assert binance.last_request.time_in_force == TimeInForce.IOC
+        assert binance.last_request.side == Side.SELL
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == "single_leg_exposure_recovery:venue_auth_invalid"
+        records = runtime.journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "entry.aborted" not in kinds
+        assert "pending_entry.single_leg_flatten_submitted" in kinds
+        assert "pending_entry.single_leg_flatten_succeeded" in kinds
+        assert "pending_entry.terminalized_after_single_leg_recovery" in kinds
+        started = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "pending_entry.single_leg_exposure_recovery_started"
+        ][-1]
+        assert started["entry_id"] == pending.pending_id
+        assert started["failed_hedge_venue"] == "bybit"
+        assert started["cleanup_venue"] == "binance"
+        assert started["reason"] == "venue_auth_invalid"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_truth_unavailable():
+    with tempfile.TemporaryDirectory() as td:
+        binance = TruthUnavailableSingleLegCleanupAdapter(Venue.BINANCE, Side.BUY, 4.0)
+        bybit = AuthInvalidHedgeAdapter(
+            "bybit order failed: bybit retCode=33004 retMsg=Your api key has expired",
+            Venue.BYBIT,
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-auth-truth-unavailable",
+            symbol="AUTHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            1778787001000,
+        )
+
+        assert driven is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert pending.repair_state == "single_leg_exposure_recovery:venue_auth_invalid"
+        assert pending.reconcile_next_attempt_ms > 1778787001000
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.recovery_blocked_reason == "single_leg_exposure_recovery"
+        records = runtime.journal.read_all()
+        failures = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "pending_entry.single_leg_flatten_failed"
+        ]
+        assert failures[-1]["reason"] == "single_leg_truth_unavailable"
+        assert "pending_entry.terminalized_after_single_leg_recovery" not in [
+            record["kind"] for record in records
+        ]
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_maker_order_open():
+    with tempfile.TemporaryDirectory() as td:
+        binance = OpenOrderSingleLegCleanupAdapter(Venue.BINANCE, Side.BUY, 4.0)
+        bybit = AuthInvalidHedgeAdapter(
+            "bybit order failed: bybit retCode=33004 retMsg=Your api key has expired",
+            Venue.BYBIT,
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-auth-open-order",
+            symbol="AUTHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            maker_leg="long",
+        )
+        pending.maker_order_id = "maker-order-open"
+        pending.maker_client_order_id = "maker-cid-open"
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            1778787001000,
+        )
+
+        assert driven is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert pending.repair_state == "single_leg_exposure_recovery:venue_auth_invalid"
+        assert pending.reconcile_next_attempt_ms > 1778787001000
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        records = runtime.journal.read_all()
+        failures = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "pending_entry.single_leg_flatten_failed"
+        ]
+        assert failures[-1]["reason"] == "single_leg_open_order_truth_present"
+        assert binance.place_order_calls == 0
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_reduce_only_fails():
+    with tempfile.TemporaryDirectory() as td:
+        binance = FailingSingleLegCleanupAdapter(Venue.BINANCE, Side.BUY, 4.0)
+        bybit = AuthInvalidHedgeAdapter(
+            "bybit order failed: bybit retCode=33004 retMsg=Your api key has expired",
+            Venue.BYBIT,
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-auth-cleanup-fails",
+            symbol="AUTHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            1778787001000,
+        )
+
+        assert driven is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert pending.repair_state == "single_leg_exposure_recovery:venue_auth_invalid"
+        assert pending.reconcile_next_attempt_ms > 1778787001000
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert binance.place_order_calls >= 1
+        records = runtime.journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "pending_entry.single_leg_flatten_failed" in kinds
+        assert "pending_entry.terminalized_after_single_leg_recovery" not in kinds
         runtime.journal.close()
 
 

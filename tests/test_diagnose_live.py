@@ -6039,6 +6039,232 @@ def test_run_diagnose_keeps_binance_post_only_reject_without_cooldown(monkeypatc
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_contains_bybit_auth_invalid_admission_when_truth_clean(monkeypatch):
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1700000000000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000002000,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-auth",
+                    "venue": "bybit",
+                    "symbol": "AUTHUSDT",
+                    "reason": "bybit retCode=33004 retMsg=Your api key has expired",
+                    "exchange_error": {
+                        "venue": "bybit",
+                        "operation": "place_order",
+                        "http_status": 400,
+                        "raw_body": '{"retCode":33004,"retMsg":"Your api key has expired"}',
+                        "exchange_code": "33004",
+                        "exchange_msg": "Your api key has expired",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                    },
+                    "request_context": {
+                        "symbol": "AUTHUSDT",
+                        "post_only": False,
+                        "reduce_only": False,
+                    },
+                },
+            },
+            {
+                "ts_ms": 1700000002100,
+                "kind": "runtime.entry_admission_blocked",
+                "payload": {
+                    "venue": "bybit",
+                    "symbol": "AUTHUSDT",
+                    "reason": "venue_auth_invalid",
+                    "source": "venue_private_health_precheck",
+                    "block_scope": "venue",
+                    "cooldown_scope": "venue",
+                    "venue_private_health_status": "auth_invalid",
+                    "reduce_only": False,
+                    "evidence_gap": False,
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        assert result["order_error_evidence"] == []
+        assert result["resolved_contained_entry_admission_summary"]["resolved_count"] == 1
+        private_summary = result["venue_private_health_summary"]
+        assert private_summary["count"] == 1
+        assert private_summary["status_counts"] == {"auth_invalid": 1}
+        assert private_summary["venue_counts"] == {"bybit": 1}
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_exposes_single_leg_recovery_and_cleanup_blocker_summary():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000001000,
+            "kind": "pending_entry.single_leg_exposure_recovery_started",
+            "payload": {
+                "entry_id": "entry-auth",
+                "symbol": "AUTHUSDT",
+                "failed_hedge_venue": "bybit",
+                "cleanup_venue": "binance",
+                "reason": "venue_auth_invalid",
+            },
+        },
+        {
+            "ts_ms": 1700000001100,
+            "kind": "pending_entry.single_leg_flatten_submitted",
+            "payload": {
+                "entry_id": "entry-auth",
+                "symbol": "AUTHUSDT",
+                "venue": "binance",
+                "reason": "single_leg_exposure_recovery",
+            },
+        },
+        {
+            "ts_ms": 1700000001200,
+            "kind": "pending_entry.single_leg_flatten_succeeded",
+            "payload": {
+                "entry_id": "entry-auth",
+                "symbol": "AUTHUSDT",
+                "venue": "binance",
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+            },
+        },
+        {
+            "ts_ms": 1700000001300,
+            "kind": "pending_entry.terminalized_after_single_leg_recovery",
+            "payload": {
+                "entry_id": "entry-auth",
+                "symbol": "AUTHUSDT",
+                "venue": "binance",
+                "reason": "owned_live_conflict_cleanup_succeeded",
+            },
+        },
+        {
+            "ts_ms": 1700000001400,
+            "kind": "cleanup_blocked_by_venue_auth_invalid",
+            "payload": {
+                "severity": "critical",
+                "entry_id": "entry-auth-cleanup",
+                "symbol": "AUTHUSDT",
+                "venue": "bybit",
+                "reason": "cleanup_blocked_by_venue_auth_invalid",
+                "action": "reduce_only_flatten",
+                "reduce_only": True,
+            },
+        },
+    ]
+
+    single_leg = dl._build_single_leg_exposure_recovery_summary(events)
+    cleanup = dl._build_cleanup_blocker_summary(events)
+
+    assert single_leg["started_count"] == 1
+    assert single_leg["submitted_count"] == 1
+    assert single_leg["succeeded_count"] == 1
+    assert single_leg["terminalized_count"] == 1
+    assert single_leg["unresolved_count"] == 0
+    assert cleanup["count"] == 1
+    assert cleanup["critical_count"] == 1
+    assert cleanup["venue_counts"] == {"bybit": 1}
+
+
+def test_single_leg_recovery_summary_marks_started_without_terminal_unresolved():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000001000,
+            "kind": "pending_entry.single_leg_exposure_recovery_started",
+            "payload": {
+                "entry_id": "entry-auth-stuck",
+                "symbol": "AUTHUSDT",
+                "failed_hedge_venue": "bybit",
+                "cleanup_venue": "binance",
+                "reason": "venue_auth_invalid",
+            },
+        },
+        {
+            "ts_ms": 1700000001100,
+            "kind": "pending_entry.single_leg_flatten_submitted",
+            "payload": {
+                "entry_id": "entry-auth-stuck",
+                "symbol": "AUTHUSDT",
+                "venue": "binance",
+                "reason": "single_leg_exposure_recovery",
+            },
+        },
+    ]
+
+    summary = dl._build_single_leg_exposure_recovery_summary(events)
+
+    assert summary["started_count"] == 1
+    assert summary["terminalized_count"] == 0
+    assert summary["unresolved_count"] == 1
+    assert summary["unresolved_entry_ids"] == ["entry-auth-stuck"]
+
+
+def test_venue_private_health_summary_deduplicates_block_and_cooldown_event():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000001000,
+            "kind": "runtime.entry_admission_blocked",
+            "payload": {
+                "venue": "bybit",
+                "symbol": "AUTHUSDT",
+                "reason": "venue_auth_invalid",
+                "source": "venue_private_health_precheck",
+                "venue_private_health_status": "auth_invalid",
+                "candidate_pair_id": "pair-auth",
+            },
+        },
+        {
+            "ts_ms": 1700000001000,
+            "kind": "runtime.venue_cooldown_started",
+            "payload": {
+                "venue": "bybit",
+                "symbol": "AUTHUSDT",
+                "reason": "venue_auth_invalid",
+                "source": "venue_private_health_precheck",
+                "venue_private_health_status": "auth_invalid",
+                "candidate_pair_id": "pair-auth",
+            },
+        },
+    ]
+
+    summary = dl._build_venue_private_health_summary(events)
+
+    assert summary["count"] == 1
+    assert summary["event_count"] == 2
+    assert summary["status_counts"] == {"auth_invalid": 1}
+    assert summary["venue_counts"] == {"bybit": 1}
+
+
 def test_run_diagnose_resolves_home_passive_close_order_errors_by_terminal_truth(monkeypatch):
     import scripts.diagnose_live as dl
 

@@ -23,6 +23,9 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
 )
 from lightfee.engine.runtime_context import EntryDispatchRuntimeContext
+from lightfee.engine.venue_private_health import (
+    private_health_status_for_admission_reason,
+)
 from lightfee.engine.v1_lifecycle import V1TradingLifecycle
 from lightfee.venues.cid import generate_exchange_cid
 
@@ -297,6 +300,21 @@ class EntryDispatchRuntime:
             metadata = self._entry_admission_reject_metadata(Venue.BYBIT, error_text)
             if metadata:
                 reason = str(metadata["reason"])
+                private_health_status = private_health_status_for_admission_reason(
+                    reason
+                )
+                source = "pre_entry_bybit_precheck"
+                extra_payload: dict[str, Any] = {}
+                if private_health_status:
+                    source = "venue_private_health_precheck"
+                    extra_payload.update(
+                        {
+                            "venue_private_health_status": private_health_status,
+                            "cooldown_scope": "venue",
+                            "reduce_only": False,
+                            "order_role": "maker" if bybit_is_maker else "hedge",
+                        }
+                    )
                 self._record_symbol_admission_block(
                     venue=Venue.BYBIT,
                     symbol=symbol,
@@ -304,8 +322,9 @@ class EntryDispatchRuntime:
                     raw_error=error_text,
                     now_ms=now_ms,
                     evidence=metadata,
-                    source="pre_entry_bybit_precheck",
+                    source=source,
                     candidate_pair_id=pair_id,
+                    extra_payload=extra_payload,
                 )
                 return False
             self.ctx.journal.append(

@@ -656,7 +656,12 @@ class EntryGateRuntime:
                     )
                 except (TypeError, ValueError):
                     candidate_until_ms = 0
-                if candidate_until_ms > state_until_ms:
+                prefer_venue_scope_tie = (
+                    candidate_until_ms == state_until_ms
+                    and state_key.endswith(":*")
+                    and not payload_state_key.endswith(":*")
+                )
+                if candidate_until_ms > state_until_ms or prefer_venue_scope_tie:
                     state_until_ms = candidate_until_ms
                     payload = candidate_payload
                     payload_state_key = state_key

@@ -1982,6 +1982,24 @@ class PendingEntryRuntime:
                 "reason": reason,
             },
         )
+        self.ctx.journal.append(
+            "pending_entry.single_leg_flatten_submitted",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": cleanup_venue.value,
+                "stage": stage,
+                "live_position_side": live_side.value,
+                "cleanup_side": live_side.opposite().value,
+                "live_position_quantity": live_quantity,
+                "matched_quantity": matched_quantity,
+                "live_long_quantity": live_long_quantity,
+                "live_short_quantity": live_short_quantity,
+                "reason": reason,
+                "source": "owned_pending_entry_live_conflict",
+                "ts_ms": now_ms,
+            },
+        )
 
         cleanup_result = await self.ctx._cleanup_failed_leg_exposure(
             cleanup_venue,
@@ -2007,6 +2025,23 @@ class PendingEntryRuntime:
                     if cleanup_result is None
                     else "failed",
                     "reason": "reduce_only_cleanup_failed",
+                },
+            )
+            self.ctx.journal.append(
+                "pending_entry.single_leg_flatten_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": cleanup_venue.value,
+                    "stage": stage,
+                    "live_position_side": live_side.value,
+                    "live_position_quantity": live_quantity,
+                    "result": "adapter_unavailable"
+                    if cleanup_result is None
+                    else "failed",
+                    "reason": "reduce_only_cleanup_failed",
+                    "source": "owned_pending_entry_live_conflict",
+                    "ts_ms": now_ms,
                 },
             )
             return False
@@ -2050,6 +2085,28 @@ class PendingEntryRuntime:
                     "reason": "fresh_live_truth_required_before_pending_release",
                 },
             )
+            self.ctx.journal.append(
+                "pending_entry.single_leg_flatten_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "venue": cleanup_venue.value,
+                    "stage": stage,
+                    "live_position_side": live_side.value,
+                    "live_position_quantity": live_quantity,
+                    "result": "post_cleanup_truth_not_flat"
+                    if fresh_truth.available
+                    else "post_cleanup_truth_unavailable",
+                    "post_cleanup_live_long_quantity": post_long,
+                    "post_cleanup_live_short_quantity": post_short,
+                    "post_cleanup_has_live_open_order": fresh_truth.has_live_open_order,
+                    "post_cleanup_has_live_position": fresh_truth.has_live_position,
+                    "post_cleanup_error": fresh_truth.error,
+                    "reason": "fresh_live_truth_required_before_pending_release",
+                    "source": "owned_pending_entry_live_conflict",
+                    "ts_ms": now_ms,
+                },
+            )
             return False
 
         self.ctx.journal.append(
@@ -2066,11 +2123,39 @@ class PendingEntryRuntime:
                 "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
             },
         )
+        self.ctx.journal.append(
+            "pending_entry.single_leg_flatten_succeeded",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": cleanup_venue.value,
+                "stage": stage,
+                "live_position_side": live_side.value,
+                "live_position_quantity": live_quantity,
+                "post_cleanup_live_long_quantity": post_long,
+                "post_cleanup_live_short_quantity": post_short,
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+                "source": "owned_pending_entry_live_conflict",
+                "ts_ms": now_ms,
+            },
+        )
         await self.ctx._complete_pending_entry_terminal_removal(
             entry_id,
             reason="owned_live_conflict_cleanup_succeeded",
             symbol=pending.symbol,
             now_ms=now_ms,
+        )
+        self.ctx.journal.append(
+            "pending_entry.terminalized_after_single_leg_recovery",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "venue": cleanup_venue.value,
+                "stage": stage,
+                "reason": "owned_live_conflict_cleanup_succeeded",
+                "source": "owned_pending_entry_live_conflict",
+                "ts_ms": now_ms,
+            },
         )
         return True
 

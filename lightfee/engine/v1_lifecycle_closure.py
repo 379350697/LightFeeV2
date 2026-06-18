@@ -1300,6 +1300,9 @@ _EVENT_KIND_PHASES = {
     "runtime.position_drift_correction_verified": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_detected": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_flatten_leg": V1LifecycleClosurePhase.OPEN_POSITION.value,
+    "cleanup_blocked_by_venue_auth_invalid": (
+        V1LifecycleClosurePhase.RECOVERY_TRUTH.value
+    ),
     "runtime.reconciling_complete": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.current_state_heartbeat_loop_export_error": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
 }

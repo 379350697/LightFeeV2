@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest venue private auth admission and single-leg recovery closure,
+2026-06-19:
+After Aster 5018 and phase terminality fixes, the remaining production family
+was a module-level paired-entry closure gap: Bybit private auth failures such as
+`33004 api key expired` could be discovered only during order submit instead of
+venue private admission, and a maker-filled/hedge-auth-failed entry could fall
+toward generic unpaired recovery without owner-bound single-leg cleanup
+evidence. CL-098 adds a shared venue private health classifier, makes Bybit auth
+invalid a venue-wide new-risk cooldown (`runtime.entry_admission_blocked
+reason=venue_auth_invalid source=venue_private_health_precheck`), keeps
+reduce-only cleanup outside normal admission gates, and emits a critical
+`cleanup_blocked_by_venue_auth_invalid` blocker if credentials also prevent
+cleanup. Pending hedge auth-invalid now stays bound to the original pending
+entry, enters `single_leg_exposure_recovery`, flattens the maker venue
+reduce-only when high-confidence truth proves a single live leg/no open orders,
+and emits submitted/succeeded/failed/terminalized runtime evidence for
+diagnostics. See
+[daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure](daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure).
+
 Latest Aster 5018 pre-submit headroom and phase terminality closure,
 2026-06-18:
 After CL-096 fixed Aster V3 symbol precision and stale risk alignment,

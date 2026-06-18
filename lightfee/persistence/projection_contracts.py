@@ -153,6 +153,7 @@ ALL_PROJECTED_KINDS: frozenset[str] = (
 # ---------------------------------------------------------------------------
 
 JOURNAL_ONLY_RECOVERY_KINDS: frozenset[str] = frozenset({
+    "cleanup_blocked_by_venue_auth_invalid",
     "recovery.blocked",
     "recovery.flat",
     "recovery.live_detected",
@@ -162,6 +163,11 @@ JOURNAL_ONLY_RECOVERY_KINDS: frozenset[str] = frozenset({
 })
 
 JOURNAL_ONLY_LIFECYCLE_KINDS: frozenset[str] = frozenset({
+    "pending_entry.single_leg_exposure_recovery_started",
+    "pending_entry.single_leg_flatten_failed",
+    "pending_entry.single_leg_flatten_submitted",
+    "pending_entry.single_leg_flatten_succeeded",
+    "pending_entry.terminalized_after_single_leg_recovery",
     "pending_entry.viability_blocked",
     "runtime.entry_blocked_lifecycle",
     "runtime.entry_blocked_lifecycle_selection",

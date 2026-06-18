@@ -78,6 +78,11 @@ from lightfee.engine.residual_repair_runtime import ResidualRepairRuntime
 from lightfee.engine.unpaired_live_position_recovery import (
     UnpairedLivePositionRecoveryRuntime,
 )
+from lightfee.engine.venue_private_health import (
+    classify_private_health_error,
+    is_private_health_admission_reason,
+    private_health_status_for_admission_reason,
+)
 from lightfee.engine.v1_lifecycle_closure import (
     build_v1_lifecycle_closure_table,
     closure_event_fields,
@@ -388,6 +393,10 @@ class LiveRuntime:
     @staticmethod
     def _entry_admission_reject_metadata(venue: Venue, reason: str) -> dict | None:
         text = str(reason or "").lower()
+        private_health = classify_private_health_error(venue, reason)
+        if private_health is not None:
+            private_health_reason, _status = private_health
+            return LiveRuntime._entry_admission_evidence(private_health_reason)
         if venue == Venue.BYBIT and (
             "110007" in text
             or "available balance is insufficient" in text
@@ -486,6 +495,21 @@ class LiveRuntime:
                 "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
                 "evidence_gap": False,
             }
+        if reason in ("venue_auth_invalid", "venue_permission_denied"):
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
+        if reason in (
+            "venue_private_truth_unavailable",
+            "venue_order_permission_unavailable",
+        ):
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._BYBIT_ERROR_DOC_URL,
+                "evidence_gap": True,
+            }
         if reason in ("insufficient_margin_admission_blocked", "post_only_would_take"):
             return {
                 "reason": reason,
@@ -527,6 +551,10 @@ class LiveRuntime:
     @staticmethod
     def _entry_admission_block_state_keys(venue: Venue, symbol: str, reason: str) -> list[str]:
         keys = [f"{venue.value}:{symbol}"]
+        if is_private_health_admission_reason(reason):
+            if symbol == "*":
+                return [f"{venue.value}:*"]
+            keys.append(f"{venue.value}:*")
         if venue == Venue.ASTER and reason in {
             "max_notional_admission_blocked",
             "aster_headroom_unavailable",
@@ -712,6 +740,10 @@ class LiveRuntime:
         key = (venue.value, symbol)
         evidence = dict(evidence or self._entry_admission_evidence(reason))
         extra_payload = dict(extra_payload or {})
+        state_keys = self._entry_admission_block_state_keys(venue, symbol, reason)
+        is_venue_scope = f"{venue.value}:*" in state_keys
+        if is_venue_scope:
+            extra_payload.setdefault("cooldown_scope", "venue")
         self._symbol_admission_blocked_until_ms[key] = until_ms
         base_payload = {
             "venue": venue.value,
@@ -728,7 +760,7 @@ class LiveRuntime:
             base_payload["candidate_pair_id"] = candidate_pair_id
             base_payload["pair_id"] = candidate_pair_id
         base_payload.update(extra_payload)
-        for state_key in self._entry_admission_block_state_keys(venue, symbol, reason):
+        for state_key in state_keys:
             payload = dict(base_payload)
             if state_key.endswith(":*"):
                 payload["symbol"] = "*"
@@ -741,15 +773,11 @@ class LiveRuntime:
             "runtime.entry_admission_blocked",
             {
                 **base_payload,
-                "block_scope": (
-                    "venue"
-                    if f"{venue.value}:*" in self._entry_admission_block_state_keys(venue, symbol, reason)
-                    else "symbol"
-                ),
+                "block_scope": "venue" if is_venue_scope else "symbol",
                 "ts_ms": now_ms,
             },
         )
-        if f"{venue.value}:*" in self._entry_admission_block_state_keys(venue, symbol, reason):
+        if is_venue_scope:
             self.journal.append(
                 "runtime.venue_cooldown_started",
                 {
@@ -774,6 +802,119 @@ class LiveRuntime:
             )
         return None
 
+    async def _recover_pending_hedge_private_health_single_leg(
+        self,
+        *,
+        pending,
+        entry_id: str,
+        hedge_venue: Venue,
+        reason: str,
+        error_text: str,
+        now_ms: int,
+    ) -> bool:
+        pending.hedge_inflight = None
+        pending.repair_state = f"single_leg_exposure_recovery:{reason}"
+        set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+        self.state.recovery_blocked_reason = "single_leg_exposure_recovery"
+        self.state.recovery_blocked_at_ms = now_ms
+
+        live_truth = await self._pending_entry_positive_fill_live_truth(
+            pending,
+            entry_id,
+            now_ms,
+        )
+        cleanup_venue = ""
+        eps = 1e-9
+        if max(float(live_truth.live_long_quantity or 0.0), 0.0) > eps:
+            cleanup_venue = pending.long_venue.value
+        elif max(float(live_truth.live_short_quantity or 0.0), 0.0) > eps:
+            cleanup_venue = pending.short_venue.value
+
+        self.journal.append(
+            "pending_entry.single_leg_exposure_recovery_started",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "failed_hedge_venue": hedge_venue.value,
+                "cleanup_venue": cleanup_venue,
+                "reason": reason,
+                "source": "pending_hedge",
+                "raw_error": error_text[:500],
+                "live_truth_available": live_truth.available,
+                "has_live_open_order": live_truth.has_live_open_order,
+                "has_live_position": live_truth.has_live_position,
+                "live_long_quantity": live_truth.live_long_quantity,
+                "live_short_quantity": live_truth.live_short_quantity,
+                "ts_ms": now_ms,
+            },
+        )
+
+        if not live_truth.available:
+            self.journal.append(
+                "pending_entry.single_leg_flatten_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "failed_hedge_venue": hedge_venue.value,
+                    "cleanup_venue": cleanup_venue,
+                    "reason": "single_leg_truth_unavailable",
+                    "source": "pending_hedge",
+                    "raw_error": live_truth.error or error_text[:500],
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+        if live_truth.has_live_open_order:
+            self.journal.append(
+                "pending_entry.single_leg_flatten_failed",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "failed_hedge_venue": hedge_venue.value,
+                    "cleanup_venue": cleanup_venue,
+                    "reason": "single_leg_open_order_truth_present",
+                    "source": "pending_hedge",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+        if not live_truth.has_live_position:
+            await self._complete_pending_entry_terminal_removal(
+                entry_id,
+                reason="single_leg_exposure_recovery_already_flat",
+                symbol=pending.symbol,
+                now_ms=now_ms,
+            )
+            self.journal.append(
+                "pending_entry.terminalized_after_single_leg_recovery",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "failed_hedge_venue": hedge_venue.value,
+                    "cleanup_venue": cleanup_venue,
+                    "reason": "already_flat",
+                    "ts_ms": now_ms,
+                },
+            )
+            return True
+
+        recovered = await self.pending_entry_runtime._cleanup_owned_single_leg_live_truth_conflict(
+            pending=pending,
+            entry_id=entry_id,
+            live_long_quantity=live_truth.live_long_quantity,
+            live_short_quantity=live_truth.live_short_quantity,
+            matched_quantity=min(
+                float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
+                float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0),
+            ),
+            reason="single_leg_exposure_recovery",
+            now_ms=now_ms,
+        )
+        if not recovered:
+            self.state.recovery_blocked_reason = "single_leg_exposure_recovery"
+            self.state.recovery_blocked_at_ms = now_ms
+        return recovered
+
     async def _handle_pending_hedge_admission_reject(
         self,
         *,
@@ -790,6 +931,7 @@ class LiveRuntime:
             return False
 
         reason = str(metadata["reason"])
+        private_health_status = private_health_status_for_admission_reason(reason)
         candidate_pair_id = self._pending_entry_pair_id(pending)
         block_scope = (
             "venue"
@@ -800,6 +942,18 @@ class LiveRuntime:
             )
             else "symbol"
         )
+        source = "pending_hedge"
+        extra_payload: dict[str, Any] = {}
+        if private_health_status:
+            extra_payload.update(
+                {
+                    "venue_private_health_status": private_health_status,
+                    "cooldown_scope": "venue",
+                    "reduce_only": False,
+                    "order_role": "hedge",
+                    "cleanup_action": "single_leg_exposure_recovery",
+                }
+            )
         blocked_until_ms = now_ms + self._SYMBOL_ADMISSION_BLOCK_TTL_MS
         self._record_symbol_admission_block(
             venue=hedge_venue,
@@ -808,11 +962,16 @@ class LiveRuntime:
             raw_error=error_text,
             now_ms=now_ms,
             evidence=metadata,
-            source="pending_hedge",
+            source=source,
             candidate_pair_id=candidate_pair_id,
+            extra_payload=extra_payload,
         )
         pending.hedge_inflight = None
-        pending.repair_state = f"hedge_admission_blocked:{reason}"
+        pending.repair_state = (
+            f"single_leg_exposure_recovery:{reason}"
+            if private_health_status
+            else f"hedge_admission_blocked:{reason}"
+        )
         self.journal.append(
             "pending_entry.hedge_admission_blocked",
             {
@@ -823,7 +982,7 @@ class LiveRuntime:
                 "hedge_client_order_id": hedge_client_order_id,
                 "hedge_attempt": hedge_attempt,
                 "reason": reason,
-                "source": "pending_hedge",
+                "source": source,
                 "block_scope": block_scope,
                 "blocked_until_ms": blocked_until_ms,
                 "ttl_ms": self._SYMBOL_ADMISSION_BLOCK_TTL_MS,
@@ -832,9 +991,20 @@ class LiveRuntime:
                 "raw_error": error_text[:500],
                 "official_doc_url": metadata["official_doc_url"],
                 "evidence_gap": metadata["evidence_gap"],
+                **extra_payload,
                 "ts_ms": now_ms,
             },
         )
+        if private_health_status:
+            await self._recover_pending_hedge_private_health_single_leg(
+                pending=pending,
+                entry_id=entry_id,
+                hedge_venue=hedge_venue,
+                reason=reason,
+                error_text=error_text,
+                now_ms=now_ms,
+            )
+            return True
         await self._abort_pending_entry(
             pending,
             entry_id,
@@ -7240,7 +7410,25 @@ class LiveRuntime:
             cleanup_client_order_id = cleanup_client_order_id_for_attempt(attempt)
             try:
                 pos = await adapter.fetch_position(symbol)
-            except Exception:
+            except Exception as e:
+                private_health = classify_private_health_error(venue, str(e))
+                if private_health is not None:
+                    _reason, status = private_health
+                    self.journal.append(
+                        "cleanup_blocked_by_venue_auth_invalid",
+                        {
+                            "severity": "critical",
+                            "entry_id": entry_id,
+                            "stage": stage,
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "reason": "cleanup_blocked_by_venue_auth_invalid",
+                            "venue_private_health_status": status,
+                            "action": "fetch_position_truth",
+                            "reduce_only": True,
+                            "raw_error": str(e)[:500],
+                        },
+                    )
                 return False  # can't verify — assume position exists
 
             if pos is None or abs(pos.quantity) <= 1e-9:
@@ -7312,6 +7500,31 @@ class LiveRuntime:
                     pass
             except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
+                private_health = classify_private_health_error(venue, str(e))
+                if private_health is not None:
+                    _reason, status = private_health
+                    self.journal.append(
+                        "cleanup_blocked_by_venue_auth_invalid",
+                        {
+                            "severity": "critical",
+                            "entry_id": entry_id,
+                            "stage": stage,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "reason": "cleanup_blocked_by_venue_auth_invalid",
+                            "venue_private_health_status": status,
+                            "action": "reduce_only_flatten",
+                            "reduce_only": True,
+                            "target_qty": cleanup_quantity,
+                            "cleanup_side": cleanup_side.value,
+                            "cleanup_client_order_id": cleanup_client_order_id,
+                            "client_order_id": cleanup_client_order_id,
+                            "raw_error": str(e)[:500],
+                        },
+                    )
+                    return False
                 is_bybit_duplicate = (
                     venue == Venue.BYBIT
                     and _is_bybit_duplicate_order_link_id(str(e))

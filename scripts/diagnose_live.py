@@ -44,6 +44,10 @@ from lightfee.engine.recovery_decision_core import (
     V1RecoveryDecisionCore,
 )
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+from lightfee.engine.venue_private_health import (
+    is_private_health_admission_reason,
+    private_health_status_for_admission_reason,
+)
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
@@ -2620,10 +2624,11 @@ def _payload_is_contained_entry_admission_reject(payload: dict[str, Any]) -> boo
         return True
     exchange_error = _exchange_error_dict(payload)
     exchange_code = str(exchange_error.get("exchange_code") or "")
+    reason = str(payload.get("reason") or "")
     text = " ".join(
         str(value or "").lower()
         for value in (
-            payload.get("reason"),
+            reason,
             payload.get("error"),
             payload.get("response_classification"),
             exchange_error.get("exchange_msg"),
@@ -2632,7 +2637,12 @@ def _payload_is_contained_entry_admission_reject(payload: dict[str, Any]) -> boo
     )
     return (
         exchange_code == "-5018"
+        or exchange_code == "33004"
         or "-5018" in text
+        or "33004" in text
+        or is_private_health_admission_reason(reason)
+        or "venue_auth_invalid" in text
+        or "venue_permission_denied" in text
         or "max_notional_admission_blocked" in text
         or "maximum notional value limit" in text
     )
@@ -2712,7 +2722,10 @@ def _build_resolved_contained_entry_admission_summary(
             "admission" in reason_text
             or "insufficient_balance" in reason_text
             or "insufficient_margin" in reason_text
+            or "venue_auth_invalid" in reason_text
+            or "venue_permission_denied" in reason_text
             or "110007" in reason_text
+            or "33004" in reason_text
             or is_aster_max_notional
         ):
             continue
@@ -4609,6 +4622,236 @@ def _build_entry_admission_cooldown_summary(
     }
 
 
+def _build_venue_private_health_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    venue_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    event_count = 0
+    incident_keys: set[tuple[str, ...]] = set()
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if kind not in {
+            "runtime.entry_admission_blocked",
+            "runtime.venue_cooldown_started",
+            "cleanup_blocked_by_venue_auth_invalid",
+        }:
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        reason = str(payload.get("reason") or "")
+        status = str(
+            payload.get("venue_private_health_status")
+            or private_health_status_for_admission_reason(reason)
+            or ""
+        )
+        if not status and "33004" in str(payload.get("raw_error") or ""):
+            status = "auth_invalid"
+        if not status:
+            continue
+        event_count += 1
+        venue = str(payload.get("venue") or "").lower()
+        reason = reason or "venue_private_health_degraded"
+        symbol = str(
+            payload.get("symbol")
+            or payload.get("blocked_symbol")
+            or ""
+        ).upper()
+        incident_id = str(
+            payload.get("candidate_pair_id")
+            or payload.get("pair_id")
+            or payload.get("entry_id")
+            or payload.get("position_id")
+            or ""
+        )
+        incident_key = (
+            incident_id,
+            venue,
+            symbol,
+            reason,
+            str(payload.get("source") or ""),
+            str(payload.get("blocked_until_ms") or ""),
+            str(rec.get("ts_ms", 0) or ""),
+        )
+        if incident_key not in incident_keys:
+            incident_keys.add(incident_key)
+            status_counts[status] = status_counts.get(status, 0) + 1
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if venue:
+                venue_counts[venue] = venue_counts.get(venue, 0) + 1
+        if len(samples) < 12:
+            samples.append(
+                {
+                    "ts_ms": rec.get("ts_ms", 0),
+                    "kind": kind,
+                    "venue": venue,
+                    "symbol": symbol,
+                    "reason": reason,
+                    "status": status,
+                    "source": str(payload.get("source") or "")[:120],
+                    "cooldown_scope": str(
+                        payload.get("cooldown_scope")
+                        or payload.get("block_scope")
+                        or ""
+                    ),
+                    "reduce_only": payload.get("reduce_only"),
+                    "action": str(payload.get("action") or ""),
+                }
+            )
+    return {
+        "count": len(incident_keys),
+        "event_count": event_count,
+        "status_counts": dict(sorted(status_counts.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "venue_counts": dict(sorted(venue_counts.items())),
+        "samples": samples,
+    }
+
+
+def _build_single_leg_exposure_recovery_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    kind_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    venue_counts: dict[str, int] = {}
+    entry_ids: set[str] = set()
+    terminal_entry_ids: set[str] = set()
+    recovery_entry_ids: set[str] = set()
+    samples: list[dict[str, Any]] = []
+    target_kinds = {
+        "pending_entry.single_leg_exposure_recovery_started",
+        "pending_entry.single_leg_flatten_submitted",
+        "pending_entry.single_leg_flatten_succeeded",
+        "pending_entry.single_leg_flatten_failed",
+        "pending_entry.terminalized_after_single_leg_recovery",
+    }
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if kind not in target_kinds:
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        reason = str(payload.get("reason") or "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        venue = str(
+            payload.get("cleanup_venue")
+            or payload.get("venue")
+            or ""
+        ).lower()
+        if venue:
+            venue_counts[venue] = venue_counts.get(venue, 0) + 1
+        entry_id = str(payload.get("entry_id") or "")
+        if entry_id:
+            entry_ids.add(entry_id)
+            if kind == "pending_entry.terminalized_after_single_leg_recovery":
+                terminal_entry_ids.add(entry_id)
+            elif kind in {
+                "pending_entry.single_leg_exposure_recovery_started",
+                "pending_entry.single_leg_flatten_submitted",
+                "pending_entry.single_leg_flatten_succeeded",
+                "pending_entry.single_leg_flatten_failed",
+            }:
+                recovery_entry_ids.add(entry_id)
+        if len(samples) < 12:
+            samples.append(
+                {
+                    "ts_ms": rec.get("ts_ms", 0),
+                    "kind": kind,
+                    "entry_id": entry_id,
+                    "symbol": str(payload.get("symbol") or "").upper(),
+                    "venue": venue,
+                    "failed_hedge_venue": str(
+                        payload.get("failed_hedge_venue") or ""
+                    ).lower(),
+                    "reason": reason,
+                }
+            )
+    failed = int(kind_counts.get("pending_entry.single_leg_flatten_failed", 0) or 0)
+    terminalized = int(
+        kind_counts.get("pending_entry.terminalized_after_single_leg_recovery", 0)
+        or 0
+    )
+    unresolved_entry_ids = sorted(recovery_entry_ids - terminal_entry_ids)
+    return {
+        "count": sum(kind_counts.values()),
+        "entry_count": len(entry_ids),
+        "started_count": int(
+            kind_counts.get("pending_entry.single_leg_exposure_recovery_started", 0)
+            or 0
+        ),
+        "submitted_count": int(
+            kind_counts.get("pending_entry.single_leg_flatten_submitted", 0) or 0
+        ),
+        "succeeded_count": int(
+            kind_counts.get("pending_entry.single_leg_flatten_succeeded", 0) or 0
+        ),
+        "failed_count": failed,
+        "terminalized_count": terminalized,
+        "unresolved_count": len(unresolved_entry_ids),
+        "unresolved_entry_ids": unresolved_entry_ids[:50],
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "venue_counts": dict(sorted(venue_counts.items())),
+        "entry_ids": sorted(entry_ids)[:50],
+        "samples": samples,
+    }
+
+
+def _build_cleanup_blocker_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    reason_counts: dict[str, int] = {}
+    venue_counts: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    total = 0
+    critical_count = 0
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if kind not in {
+            "cleanup_blocked_by_venue_auth_invalid",
+            "recovery_action_blocked",
+        }:
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        total += 1
+        if str(payload.get("severity") or "").lower() == "critical":
+            critical_count += 1
+        reason = str(payload.get("reason") or kind)
+        venue = str(payload.get("venue") or "").lower()
+        action = str(payload.get("action") or "").lower()
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if venue:
+            venue_counts[venue] = venue_counts.get(venue, 0) + 1
+        if action:
+            action_counts[action] = action_counts.get(action, 0) + 1
+        if len(samples) < 12:
+            samples.append(
+                {
+                    "ts_ms": rec.get("ts_ms", 0),
+                    "kind": kind,
+                    "severity": str(payload.get("severity") or ""),
+                    "entry_id": str(payload.get("entry_id") or ""),
+                    "symbol": str(payload.get("symbol") or "").upper(),
+                    "venue": venue,
+                    "reason": reason,
+                    "action": action,
+                    "reduce_only": payload.get("reduce_only"),
+                }
+            )
+    return {
+        "count": total,
+        "critical_count": critical_count,
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "venue_counts": dict(sorted(venue_counts.items())),
+        "action_counts": dict(sorted(action_counts.items())),
+        "samples": samples,
+    }
+
+
 def _build_production_acceptance_gate(
     events: list[dict[str, Any]],
     local_state: dict[str, Any],
@@ -5809,6 +6052,11 @@ def run_diagnose(
     entry_admission_cooldown_summary = _build_entry_admission_cooldown_summary(
         all_events
     )
+    venue_private_health_summary = _build_venue_private_health_summary(all_events)
+    single_leg_exposure_recovery_summary = (
+        _build_single_leg_exposure_recovery_summary(all_events)
+    )
+    cleanup_blocker_summary = _build_cleanup_blocker_summary(all_events)
     order_errors = _build_order_error_evidence(
         all_events,
         symbol,
@@ -5927,6 +6175,11 @@ def run_diagnose(
             resolved_contained_entry_admission_summary
         ),
         "entry_admission_cooldown_summary": entry_admission_cooldown_summary,
+        "venue_private_health_summary": venue_private_health_summary,
+        "single_leg_exposure_recovery_summary": (
+            single_leg_exposure_recovery_summary
+        ),
+        "cleanup_blocker_summary": cleanup_blocker_summary,
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,
