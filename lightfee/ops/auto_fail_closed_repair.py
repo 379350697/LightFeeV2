@@ -16,6 +16,7 @@ _CLEARABLE_STALE_BLOCKERS = {
     "startup_recovery_pending_work_without_open_positions",
     "startup_recovery_pending_work_without_open_position",
     "startup_recovery_clean_stale_fail_closed",
+    "unpaired_live_position",
     "unpaired_live_position_terminal_flat",
     "unpaired_live_position_recovered_flat",
 }
@@ -176,7 +177,12 @@ def classify_auto_fail_closed_latch(
 ) -> dict[str, Any]:
     """Classify whether a stale fail-closed operator latch can be repaired."""
     reasons: list[str] = []
-    if _has_operator_fail_closed_evidence(journal_events):
+    operator_requested_mode = _operator_requested_mode(state)
+    has_operator_fail_closed_evidence = _has_operator_fail_closed_evidence(journal_events)
+    if (
+        operator_requested_mode == GlobalRiskMode.FAIL_CLOSED.value
+        and has_operator_fail_closed_evidence
+    ):
         return _classification_result(
             PRESERVE_OPERATOR_LATCH,
             reasons=["operator_fail_closed_evidence"],
@@ -185,7 +191,7 @@ def classify_auto_fail_closed_latch(
             exchange_truth=exchange_truth,
         )
 
-    if _operator_requested_mode(state) != GlobalRiskMode.FAIL_CLOSED.value:
+    if operator_requested_mode not in {None, GlobalRiskMode.FAIL_CLOSED.value}:
         reasons.append("operator_latch_not_fail_closed")
     if _enum_value(_mapping_or_attr(state, "risk_mode")) != GlobalRiskMode.FAIL_CLOSED.value:
         reasons.append("risk_mode_not_fail_closed")

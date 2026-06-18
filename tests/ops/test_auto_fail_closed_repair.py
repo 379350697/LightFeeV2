@@ -42,6 +42,16 @@ def _state_with_stale_auto_latch() -> EngineState:
     return state
 
 
+def _state_with_stale_auto_fail_closed_without_operator() -> EngineState:
+    state = EngineState(
+        lifecycle=EngineLifecycle.RISK_ONLY,
+        risk_mode=GlobalRiskMode.FAIL_CLOSED,
+    )
+    state.operator.requested_mode = None
+    state.recovery_blocked_reason = "unpaired_live_position"
+    return state
+
+
 def test_classifies_auto_latch_as_safe_when_truth_flat_and_no_ops_fail_closed():
     state = _state_with_stale_auto_latch()
 
@@ -61,6 +71,38 @@ def test_classifies_auto_latch_as_safe_when_truth_flat_and_no_ops_fail_closed():
     assert result["has_operator_fail_closed_evidence"] is False
 
 
+def test_classifies_current_auto_fail_closed_safe_despite_historical_ops_fail_closed():
+    state = _state_with_stale_auto_fail_closed_without_operator()
+
+    result = classify_auto_fail_closed_latch(
+        state,
+        journal_events=[
+            {
+                "kind": "ops.command_applied",
+                "payload": {
+                    "command": "fail_closed",
+                    "new_risk": "fail_closed",
+                    "new_lifecycle": "risk_only",
+                },
+            },
+            {
+                "kind": "ops.command_applied",
+                "payload": {
+                    "command": "resume_if_safe",
+                    "new_risk": "running",
+                    "new_lifecycle": "running",
+                },
+            },
+        ],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == "safe_to_repair_auto_latch"
+    assert result["apply_allowed"] is True
+    assert result["operator_requested_mode"] is None
+    assert result["has_operator_fail_closed_evidence"] is True
+
+
 def test_preserves_latch_when_journal_has_real_operator_fail_closed():
     state = _state_with_stale_auto_latch()
 
@@ -78,6 +120,28 @@ def test_preserves_latch_when_journal_has_real_operator_fail_closed():
     assert result["classification"] == "operator_latch_must_preserve"
     assert result["apply_allowed"] is False
     assert "operator_fail_closed_evidence" in result["reasons"]
+
+
+def test_apply_repairs_auto_fail_closed_without_operator_latch():
+    state = _state_with_stale_auto_fail_closed_without_operator()
+    journal = _CaptureJournal()
+
+    result = repair_auto_fail_closed_latch(
+        state,
+        journal_events=[],
+        exchange_truth=_flat_exchange_truth(),
+        apply=True,
+        journal=journal,
+        ts_ms=1234,
+    )
+
+    assert result["classification"] == "safe_to_repair_auto_latch"
+    assert result["applied"] is True
+    assert state.operator.requested_mode is None
+    assert state.recovery_blocked_reason is None
+    assert state.risk_mode == GlobalRiskMode.RUNNING
+    assert state.lifecycle == EngineLifecycle.RUNNING
+    assert journal.critical_records[-1]["kind"] == "runtime.auto_fail_closed_recovered"
 
 
 def test_refuses_repair_when_exchange_truth_is_not_high_confidence_flat():
