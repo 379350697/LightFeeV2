@@ -252,3 +252,52 @@ def test_ops_repair_apply_persists_running_and_critical_journal(tmp_path, monkey
     ]
     assert recovered
     assert recovered[-1]["payload"]["source"] == "repair_auto_fail_closed_latch"
+
+
+def test_ops_repair_apply_accepts_explicit_production_paths(tmp_path, monkeypatch, capsys):
+    from lightfee.apps import ops
+    from lightfee.engine.recovery import (
+        _restore_state_from_snapshot_dict,
+        build_persistent_state_view,
+    )
+    from lightfee.persistence.journal import Journal
+    from lightfee.persistence.snapshot_store import SnapshotStore
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    snapshot_path = runtime_dir / "live-state.json"
+    journal_path = runtime_dir / "live-events.jsonl"
+    state = _state_with_stale_auto_fail_closed_without_operator()
+    SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
+    truth_path = tmp_path / "exchange_truth.json"
+    truth_path.write_text(json.dumps(_flat_exchange_truth()), encoding="utf-8")
+
+    monkeypatch.delenv("LIGHTFEE_DATA_DIR", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "repair-auto-fail-closed-latch",
+            "--snapshot-path",
+            str(snapshot_path),
+            "--journal-path",
+            str(journal_path),
+            "--exchange-truth",
+            str(truth_path),
+            "--apply",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ops.main()
+
+    assert exc.value.code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["applied"] is True
+    repaired = _restore_state_from_snapshot_dict(SnapshotStore(snapshot_path).read())
+    assert repaired.risk_mode == GlobalRiskMode.RUNNING
+    assert repaired.lifecycle == EngineLifecycle.RUNNING
+
+    records = Journal(journal_path).read_all()
+    assert records[-1]["kind"] == "runtime.auto_fail_closed_recovered"

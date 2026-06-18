@@ -18,13 +18,17 @@ from pathlib import Path
 from lightfee.risk.operator import OperatorCommand
 
 
-def _resolve_paths() -> tuple[Path, Path]:
+def _resolve_paths(
+    *,
+    journal_path: str | None = None,
+    snapshot_path: str | None = None,
+) -> tuple[Path, Path]:
     """Resolve journal and snapshot paths from environment or defaults."""
     data_dir = os.environ.get("LIGHTFEE_DATA_DIR", "data")
     base = Path(data_dir)
-    journal_path = base / "journal.jsonl"
-    snapshot_path = base / "snapshot.json"
-    return journal_path, snapshot_path
+    resolved_journal_path = Path(journal_path) if journal_path else base / "journal.jsonl"
+    resolved_snapshot_path = Path(snapshot_path) if snapshot_path else base / "snapshot.json"
+    return resolved_journal_path, resolved_snapshot_path
 
 
 def _load_json_file(path: str | None) -> dict | None:
@@ -59,13 +63,24 @@ def main() -> None:
         "--exchange-truth",
         help="Path to high-confidence exchange truth JSON; defaults to snapshot exchange_truth",
     )
+    repair.add_argument(
+        "--journal-path",
+        help="Explicit journal path for production repairs; defaults to LIGHTFEE_DATA_DIR/journal.jsonl",
+    )
+    repair.add_argument(
+        "--snapshot-path",
+        help="Explicit snapshot path for production repairs; defaults to LIGHTFEE_DATA_DIR/snapshot.json",
+    )
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    journal_path, snapshot_path = _resolve_paths()
+    journal_path, snapshot_path = _resolve_paths(
+        journal_path=getattr(args, "journal_path", None),
+        snapshot_path=getattr(args, "snapshot_path", None),
+    )
 
     # Load persisted state from snapshot for both operator commands and repairs.
     from lightfee.engine.recovery import _restore_state_from_snapshot_dict
