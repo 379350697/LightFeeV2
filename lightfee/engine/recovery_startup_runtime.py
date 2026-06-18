@@ -792,6 +792,163 @@ class RecoveryStartupRuntime:
             )
         )
 
+    def _only_active_unpaired_live_position_recovery_work(self) -> bool:
+        """True when stale unpaired records are the only local recovery work.
+
+        Active unpaired records are recovery work for normal admission, but they
+        must not prevent the account-truth refresh that can prove those same
+        records are terminal flat.
+        """
+        active_unpaired = active_unpaired_live_position_recovery_records(
+            self.ctx.state
+        )
+        if not active_unpaired:
+            return False
+        return not any(
+            (
+                self.ctx.state.open_positions,
+                self.ctx.state.pending_entries,
+                self.ctx.state.pending_closes,
+                self.ctx.state.pending_passive_closes,
+                getattr(self.ctx.state, "pending_residual_repairs", []) or [],
+            )
+        )
+
+    def _stale_risk_alignment_payload(
+        self,
+        *,
+        now_ms: int,
+        reason: str,
+        source: str,
+        previous_lifecycle: str,
+        previous_risk_mode: str,
+        previous_blocker: str | None,
+        before_active_count: int,
+    ) -> dict[str, Any]:
+        records = [
+            record
+            for record in (
+                getattr(self.ctx.state, "unpaired_live_position_recoveries", []) or []
+            )
+            if isinstance(record, dict)
+        ]
+        active_after = active_unpaired_live_position_recovery_records(self.ctx.state)
+        terminalized = max(0, int(before_active_count) - len(active_after))
+        symbols = sorted({
+            str(record.get("symbol") or "")
+            for record in records
+            if str(record.get("symbol") or "")
+        })
+        venues = sorted({
+            str(record.get("venue") or "")
+            for record in records
+            if str(record.get("venue") or "")
+        })
+        residual_blockers: list[str] = []
+        if self.ctx.state.recovery_blocked_reason:
+            residual_blockers.append(str(self.ctx.state.recovery_blocked_reason))
+        if active_after:
+            residual_blockers.append("active_unpaired_live_position_recoveries")
+        exchange_truth = getattr(self.ctx, "_last_recovery_exchange_truth", {}) or {}
+        return {
+            "reason": reason,
+            "source": source,
+            "symbols": symbols,
+            "venues": venues,
+            "cleanup_actions": [
+                "refresh_account_exchange_truth",
+                "terminalize_stale_unpaired_recovery_records",
+                "v1_recovery_decision_core_recompute",
+            ],
+            "exchange_truth_summary": {
+                "truth_available": bool(exchange_truth.get("truth_available", False)),
+                "positions_flat": self.ctx._recovery_exchange_truth_flat(exchange_truth)
+                if isinstance(exchange_truth, dict)
+                else False,
+                "open_orders_absent": (
+                    self.ctx._recovery_exchange_truth_open_orders_empty(exchange_truth)
+                    if isinstance(exchange_truth, dict)
+                    else False
+                ),
+                "errors": list(exchange_truth.get("errors") or [])
+                if isinstance(exchange_truth, dict)
+                else [],
+            },
+            "previous_lifecycle": previous_lifecycle,
+            "new_lifecycle": self.ctx.state.lifecycle.value,
+            "previous_risk_mode": previous_risk_mode,
+            "new_risk_mode": self.ctx.state.risk_mode.value,
+            "previous_blocker": previous_blocker,
+            "residual_blockers": residual_blockers,
+            "terminalized_records": terminalized,
+            "active_unpaired_recovery_count": len(active_after),
+            "ts_ms": now_ms,
+        }
+
+    async def _align_stale_unpaired_risk_state_from_account_truth(
+        self,
+        *,
+        now_ms: int,
+        reason: str,
+        source: str,
+    ) -> bool:
+        active_before = active_unpaired_live_position_recovery_records(self.ctx.state)
+        if not active_before:
+            return False
+        previous_lifecycle = self.ctx.state.lifecycle.value
+        previous_risk_mode = self.ctx.state.risk_mode.value
+        previous_blocker = self.ctx.state.recovery_blocked_reason
+        self.ctx.journal.append_critical(
+            now_ms,
+            "runtime.stale_risk_state_alignment_started",
+            {
+                "reason": reason,
+                "source": source,
+                "symbols": sorted({
+                    str(record.get("symbol") or "")
+                    for record in active_before
+                    if str(record.get("symbol") or "")
+                }),
+                "venues": sorted({
+                    str(record.get("venue") or "")
+                    for record in active_before
+                    if str(record.get("venue") or "")
+                }),
+                "previous_lifecycle": previous_lifecycle,
+                "previous_risk_mode": previous_risk_mode,
+                "previous_blocker": previous_blocker,
+                "active_unpaired_recovery_count": len(active_before),
+                "ts_ms": now_ms,
+            },
+        )
+        await self.ctx._refresh_recovery_ledger_from_account_truth(
+            now_ms,
+            lifecycle_clear_reason=reason,
+        )
+        aligned = (
+            self.ctx.state.lifecycle == EngineLifecycle.RUNNING
+            and self.ctx.state.risk_mode == GlobalRiskMode.RUNNING
+            and self.ctx.state.recovery_blocked_reason is None
+            and not active_unpaired_live_position_recovery_records(self.ctx.state)
+        )
+        payload = self._stale_risk_alignment_payload(
+            now_ms=now_ms,
+            reason=reason,
+            source=source,
+            previous_lifecycle=previous_lifecycle,
+            previous_risk_mode=previous_risk_mode,
+            previous_blocker=previous_blocker,
+            before_active_count=len(active_before),
+        )
+        self.ctx.journal.append_critical(
+            now_ms,
+            "runtime.stale_risk_state_aligned"
+            if aligned
+            else "runtime.stale_risk_state_alignment_blocked",
+            payload,
+        )
+        return aligned
+
     @staticmethod
     def _recovery_ledger_work_item_payload(item) -> dict[str, Any]:
         return {
@@ -1193,13 +1350,23 @@ class RecoveryStartupRuntime:
             recovery_result == "no_live_positions"
             and self.ctx.state.recovery_blocked_reason
             in {"unpaired_live_position", "owned_pending_entry_live_conflict"}
-            and not self.ctx._has_local_recovery_work()
+            and (
+                not self.ctx._has_local_recovery_work()
+                or self.ctx._only_active_unpaired_live_position_recovery_work()
+            )
             and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
         ):
-            await self.ctx._refresh_recovery_ledger_from_account_truth(
-                now_ms,
-                lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
-            )
+            if self.ctx._only_active_unpaired_live_position_recovery_work():
+                await self.ctx._align_stale_unpaired_risk_state_from_account_truth(
+                    now_ms=now_ms,
+                    reason="runtime_flat_truth_current_state_clean",
+                    source="runtime_live_position_probe",
+                )
+            else:
+                await self.ctx._refresh_recovery_ledger_from_account_truth(
+                    now_ms,
+                    lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
+                )
         elif (
             recovery_result == "no_live_positions"
             and self.ctx.state.lifecycle == EngineLifecycle.RISK_ONLY

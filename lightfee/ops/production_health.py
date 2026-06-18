@@ -658,6 +658,11 @@ def analyze_current_state(
     auto_fail_closed_summary = state.get("auto_fail_closed_summary")
     if not isinstance(auto_fail_closed_summary, dict):
         auto_fail_closed_summary = {}
+    stale_risk_state_alignment_summary = state.get(
+        "stale_risk_state_alignment_summary"
+    )
+    if not isinstance(stale_risk_state_alignment_summary, dict):
+        stale_risk_state_alignment_summary = {}
 
     severity = "critical" if any(fp != "last_scan_missing" for fp in fingerprints) else "warning"
     return HealthReport(
@@ -688,6 +693,9 @@ def analyze_current_state(
             "pending_entry_live_conflicts": pending_entry_live_conflicts,
             "weak_order_truth_events": weak_order_truth_events,
             "auto_fail_closed_summary": auto_fail_closed_summary,
+            "stale_risk_state_alignment_summary": (
+                stale_risk_state_alignment_summary
+            ),
         },
     )
 

@@ -1886,6 +1886,12 @@ class LiveRuntime:
     def _has_local_recovery_work(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._has_local_recovery_work(*args, **kwargs)
 
+    def _only_active_unpaired_live_position_recovery_work(self, *args: Any, **kwargs: Any) -> Any:
+        return self.recovery_startup_runtime._only_active_unpaired_live_position_recovery_work(*args, **kwargs)
+
+    async def _align_stale_unpaired_risk_state_from_account_truth(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.recovery_startup_runtime._align_stale_unpaired_risk_state_from_account_truth(*args, **kwargs)
+
     @staticmethod
     def _recovery_ledger_work_item_payload(*args: Any, **kwargs: Any) -> Any:
         return RecoveryStartupRuntime._recovery_ledger_work_item_payload(*args, **kwargs)

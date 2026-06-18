@@ -2216,6 +2216,77 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_flat_account_truth_terminalizes_active_unpaired_records_before_clear(self):
+        """Current production shape: stale active records must not block clean truth."""
+
+        class AccountFlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.account_open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                if symbol is None:
+                    self.account_open_order_calls += 1
+                    return []
+                raise AssertionError("stale risk alignment must use account order truth")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = AccountFlatTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["HOMEUSDT"]}
+            runtime.state.unpaired_live_position_recoveries = [
+                {
+                    "venue": "bybit",
+                    "symbol": "HOMEUSDT",
+                    "side": "buy",
+                    "quantity": 5780.0,
+                    "notional_quote": 23.99,
+                    "first_seen_ms": 1700000000000,
+                    "attempt_count": 0,
+                    "next_attempt_ms": 1700000000000,
+                    "last_error": "auto_disabled",
+                    "terminal_status": "",
+                    "owner_excluded": True,
+                    "open_order_truth_available": False,
+                    "cap_quote": 50.0,
+                    "cap_ok": True,
+                }
+            ]
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert bybit.account_open_order_calls == 1
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert (
+                runtime.state.unpaired_live_position_recoveries[0]["terminal_status"]
+                == "flat"
+            )
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "runtime.stale_risk_state_alignment_started"
+                for event in events
+            )
+            assert any(
+                event["kind"] == "runtime.stale_risk_state_aligned"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_account_truth_prefers_aster_v3_adapter_open_orders(self):
         """Aster private truth is V3 adapter-owned, not the public FAPI transport."""
 

@@ -17,6 +17,23 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest stale risk-state alignment and order-error closure, 2026-06-18:
+After CL-095 split automatic fail-closed from true operator fail-closed, the
+next production shape showed a second recovery-latching problem:
+`risk_mode=running` could coexist with `lifecycle=risk_only`,
+`recovery_blocked_reason=unpaired_live_position`, and active stale unpaired
+records even when exchange truth was high-confidence flat/no-open-orders.
+CL-096 adds truth-gated active alignment: if the only remaining local blocker is
+stale unpaired recovery work and account truth is clean, runtime terminalizes
+those records, clears the blocker, and lets `V1RecoveryDecisionCore` derive
+`running`; incomplete truth, live exposure, open orders, or real operator
+fail-closed remain blocked. The same closure adds default-dry-run
+`repair-stale-risk-state`, diagnostic/health visibility through
+`stale_risk_state_alignment_summary`, Aster private V3 symbol-rule preflight for
+`-1111 BAD_PRECISION`, and explicit resolved-truth classification for Binance
+entry `-5022` post-only rejects. See
+[daily/2026-06-18.md#cluster-cl-096---active-stale-risk-state-alignment-and-order-error-closure](daily/2026-06-18.md#cluster-cl-096---active-stale-risk-state-alignment-and-order-error-closure).
+
 Latest auto fail-closed operator latch and cleanup visibility closure,
 2026-06-18: V2 automatic pending-entry abort incorrectly wrote
 `operator.requested_mode=fail_closed`, making a system accident behave like an

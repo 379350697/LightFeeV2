@@ -7,8 +7,11 @@ import pytest
 
 from lightfee.engine.state import EngineState
 from lightfee.ops.auto_fail_closed_repair import (
+    SAFE_TO_ALIGN_STALE_RISK_STATE,
     classify_auto_fail_closed_latch,
+    classify_stale_risk_state_alignment,
     repair_auto_fail_closed_latch,
+    repair_stale_risk_state_alignment,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -49,6 +52,30 @@ def _state_with_stale_auto_fail_closed_without_operator() -> EngineState:
     )
     state.operator.requested_mode = None
     state.recovery_blocked_reason = "unpaired_live_position"
+    return state
+
+
+def _state_with_stale_active_unpaired_record() -> EngineState:
+    state = EngineState(
+        lifecycle=EngineLifecycle.RISK_ONLY,
+        risk_mode=GlobalRiskMode.RUNNING,
+    )
+    state.operator.requested_mode = None
+    state.recovery_blocked_reason = "unpaired_live_position"
+    state.recovery_blocked_at_ms = 1234
+    state.unpaired_live_position_recoveries = [
+        {
+            "venue": "okx",
+            "symbol": "HOME-USDT-SWAP",
+            "side": "sell",
+            "quantity": 1300.0,
+            "notional_quote": 44.733,
+            "last_error": "auto_disabled",
+            "terminal_status": "",
+            "owner_excluded": True,
+            "open_order_truth_available": False,
+        }
+    ]
     return state
 
 
@@ -163,6 +190,75 @@ def test_refuses_repair_when_exchange_truth_is_not_high_confidence_flat():
     assert "exchange_truth_not_high_confidence_flat" in result["reasons"]
 
 
+def test_classifies_current_stale_risk_state_as_safe_to_align():
+    state = _state_with_stale_active_unpaired_record()
+
+    result = classify_stale_risk_state_alignment(
+        state,
+        journal_events=[],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == SAFE_TO_ALIGN_STALE_RISK_STATE
+    assert result["apply_allowed"] is True
+    assert result["active_unpaired_recovery_count"] == 1
+
+
+def test_stale_risk_alignment_preserves_real_operator_fail_closed():
+    state = _state_with_stale_active_unpaired_record()
+    state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+
+    result = classify_stale_risk_state_alignment(
+        state,
+        journal_events=[
+            {"kind": "ops.command_applied", "payload": {"command": "fail_closed"}}
+        ],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == "operator_latch_must_preserve"
+    assert result["apply_allowed"] is False
+    assert "operator_fail_closed_evidence" in result["reasons"]
+
+
+def test_historical_fail_closed_journal_without_current_latch_does_not_block_alignment():
+    state = _state_with_stale_active_unpaired_record()
+    state.operator.requested_mode = None
+
+    result = classify_stale_risk_state_alignment(
+        state,
+        journal_events=[
+            {"kind": "ops.command_applied", "payload": {"command": "fail_closed"}}
+        ],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == SAFE_TO_ALIGN_STALE_RISK_STATE
+    assert result["apply_allowed"] is True
+
+
+def test_apply_stale_risk_alignment_terminalizes_records_and_recomputes_running():
+    state = _state_with_stale_active_unpaired_record()
+    journal = _CaptureJournal()
+
+    result = repair_stale_risk_state_alignment(
+        state,
+        journal_events=[],
+        exchange_truth=_flat_exchange_truth(),
+        apply=True,
+        journal=journal,
+        ts_ms=1234,
+    )
+
+    assert result["classification"] == SAFE_TO_ALIGN_STALE_RISK_STATE
+    assert result["applied"] is True
+    assert state.risk_mode == GlobalRiskMode.RUNNING
+    assert state.lifecycle == EngineLifecycle.RUNNING
+    assert state.recovery_blocked_reason is None
+    assert state.unpaired_live_position_recoveries[0]["terminal_status"] == "flat"
+    assert journal.critical_records[-1]["kind"] == "runtime.stale_risk_state_aligned"
+
+
 class _CaptureJournal:
     def __init__(self) -> None:
         self.critical_records: list[dict] = []
@@ -252,6 +348,61 @@ def test_ops_repair_apply_persists_running_and_critical_journal(tmp_path, monkey
     ]
     assert recovered
     assert recovered[-1]["payload"]["source"] == "repair_auto_fail_closed_latch"
+
+
+def test_ops_stale_risk_apply_persists_aligned_state_and_journal(tmp_path, monkeypatch, capsys):
+    from lightfee.apps import ops
+    from lightfee.engine.recovery import (
+        _restore_state_from_snapshot_dict,
+        build_persistent_state_view,
+    )
+    from lightfee.persistence.journal import Journal
+    from lightfee.persistence.snapshot_store import SnapshotStore
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    state = _state_with_stale_active_unpaired_record()
+    SnapshotStore(data_dir / "snapshot.json").write(build_persistent_state_view(state))
+    truth_path = tmp_path / "exchange_truth.json"
+    truth_path.write_text(json.dumps(_flat_exchange_truth()), encoding="utf-8")
+
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "repair-stale-risk-state",
+            "--exchange-truth",
+            str(truth_path),
+            "--apply",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ops.main()
+
+    assert exc.value.code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["classification"] == SAFE_TO_ALIGN_STALE_RISK_STATE
+    assert output["applied"] is True
+    assert output["new_lifecycle"] == "running"
+
+    repaired = _restore_state_from_snapshot_dict(
+        SnapshotStore(data_dir / "snapshot.json").read()
+    )
+    assert repaired.risk_mode == GlobalRiskMode.RUNNING
+    assert repaired.lifecycle == EngineLifecycle.RUNNING
+    assert repaired.recovery_blocked_reason is None
+    assert repaired.unpaired_live_position_recoveries[0]["terminal_status"] == "flat"
+
+    records = Journal(data_dir / "journal.jsonl").read_all()
+    aligned = [
+        record for record in records
+        if record["kind"] == "runtime.stale_risk_state_aligned"
+    ]
+    assert aligned
+    assert aligned[-1]["payload"]["source"] == "repair_stale_risk_state"
 
 
 def test_ops_repair_apply_accepts_explicit_production_paths(tmp_path, monkeypatch, capsys):

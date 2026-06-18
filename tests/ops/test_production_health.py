@@ -133,6 +133,45 @@ def test_current_state_preserves_recent_auto_fail_closed_recovery_as_detail_only
     assert report.details["auto_fail_closed_summary"]["latest_event"]["final_status"] == "recovered"
 
 
+def test_current_state_preserves_recent_stale_risk_alignment_as_detail_only():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        },
+        "stale_risk_state_alignment_summary": {
+            "recent_incident": True,
+            "aligned_count": 1,
+            "blocked_count": 0,
+            "latest_event": {
+                "kind": "runtime.stale_risk_state_aligned",
+                "symbols": ["HOMEUSDT"],
+                "venues": ["aster"],
+                "new_lifecycle": "running",
+                "new_risk_mode": "running",
+            },
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    assert report.ok
+    assert report.fingerprints == []
+    summary = report.details["stale_risk_state_alignment_summary"]
+    assert summary["recent_incident"] is True
+    assert summary["latest_event"]["new_lifecycle"] == "running"
+
+
 def test_current_state_clean_local_exchange_nonzero_is_critical():
     state = {
         "lifecycle": "running",
@@ -754,6 +793,43 @@ def test_verify_production_services_attaches_auto_fail_closed_summary(tmp_path):
     assert summary["recent_incident"] is True
     assert summary["recovered_count"] == 1
     assert summary["latest_event"]["symbols"] == ["LINKUSDT"]
+
+
+def test_verify_production_services_attaches_stale_risk_state_alignment_summary(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    state = {"generated_at_ms": 1778787000000}
+    current_state.write_text(json.dumps(state))
+    (runtime_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "ts_ms": 1778786998000,
+                "kind": "runtime.stale_risk_state_aligned",
+                "payload": {
+                    "source": "repair_stale_risk_state",
+                    "symbols": ["HOMEUSDT"],
+                    "venues": ["aster"],
+                    "previous_lifecycle": "risk_only",
+                    "previous_risk_mode": "running",
+                    "new_lifecycle": "running",
+                    "new_risk_mode": "running",
+                    "terminalized_records": ["rec-1"],
+                },
+            }
+        )
+        + "\n"
+    )
+
+    enriched = vps._attach_stale_risk_state_alignment_summary_if_missing(
+        state,
+        current_state_path=current_state,
+    )
+
+    summary = enriched["stale_risk_state_alignment_summary"]
+    assert summary["recent_incident"] is True
+    assert summary["aligned_count"] == 1
+    assert summary["latest_event"]["symbols"] == ["HOMEUSDT"]
 
 
 def test_verify_production_services_ignores_old_or_unrelated_jsonl_events(tmp_path):

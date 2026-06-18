@@ -2521,6 +2521,16 @@ def _build_resolved_post_only_reject_summary(
         "count": len(reject_keys),
         "resolved_count": len(resolved_keys),
         "unresolved_count": len(unresolved_keys),
+        "resolved_event_kind": "order_error.resolved_post_only_reject",
+        "resolved_events": [
+            {
+                "kind": "order_error.resolved_post_only_reject",
+                "symbol": sym,
+                "venue": venue,
+                "reason": "post_only_reject_resolved_by_cooldown_and_clean_truth",
+            }
+            for sym, venue in sorted(resolved_keys)
+        ],
         "symbols": sorted({key[0] for key in reject_keys}),
         "resolved_symbols": sorted({key[0] for key in resolved_keys}),
         "unresolved_symbols": sorted({key[0] for key in unresolved_keys}),
@@ -3628,6 +3638,88 @@ UNPAIRED_LIVE_POSITION_RECOVERY_EVENTS = {
     "recovery.unpaired_live_position_cleanup_failed",
     "recovery.unpaired_live_position_terminal_flat",
 }
+
+
+STALE_RISK_STATE_ALIGNMENT_EVENTS = {
+    "runtime.stale_risk_state_alignment_started",
+    "runtime.stale_risk_state_aligned",
+    "runtime.stale_risk_state_alignment_blocked",
+}
+
+
+def _build_stale_risk_state_alignment_summary(
+    events: list[dict[str, Any]],
+    *,
+    since_ms: int = 0,
+) -> dict[str, Any]:
+    counts = {
+        "started_count": 0,
+        "aligned_count": 0,
+        "blocked_count": 0,
+    }
+    latest: dict[str, Any] | None = None
+    symbols: set[str] = set()
+    venues: set[str] = set()
+    for event in events:
+        kind = str(event.get("kind") or "")
+        if kind not in STALE_RISK_STATE_ALIGNMENT_EVENTS:
+            continue
+        ts_ms = int(event.get("ts_ms") or 0)
+        if since_ms and ts_ms < since_ms:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if kind == "runtime.stale_risk_state_alignment_started":
+            counts["started_count"] += 1
+        elif kind == "runtime.stale_risk_state_aligned":
+            counts["aligned_count"] += 1
+        elif kind == "runtime.stale_risk_state_alignment_blocked":
+            counts["blocked_count"] += 1
+        for symbol in payload.get("symbols") or []:
+            if str(symbol):
+                symbols.add(str(symbol))
+        for venue in payload.get("venues") or []:
+            if str(venue):
+                venues.add(str(venue))
+        terminalized_records_raw = payload.get("terminalized_records")
+        if isinstance(terminalized_records_raw, list):
+            terminalized_record_ids = [
+                str(item)
+                for item in terminalized_records_raw
+                if str(item)
+            ]
+            terminalized_records = len(terminalized_record_ids)
+        else:
+            terminalized_record_ids = []
+            try:
+                terminalized_records = int(terminalized_records_raw or 0)
+            except (TypeError, ValueError):
+                terminalized_records = 0
+        sample = {
+            "kind": kind,
+            "ts_ms": ts_ms,
+            "source": str(payload.get("source") or ""),
+            "reason": str(payload.get("reason") or ""),
+            "symbols": list(payload.get("symbols") or []),
+            "venues": list(payload.get("venues") or []),
+            "previous_risk_mode": str(payload.get("previous_risk_mode") or ""),
+            "new_risk_mode": str(payload.get("new_risk_mode") or ""),
+            "previous_lifecycle": str(payload.get("previous_lifecycle") or ""),
+            "new_lifecycle": str(payload.get("new_lifecycle") or ""),
+            "terminalized_records": terminalized_records,
+            "terminalized_record_ids": terminalized_record_ids,
+            "residual_blockers": list(payload.get("residual_blockers") or []),
+        }
+        if latest is None or ts_ms >= int(latest.get("ts_ms") or 0):
+            latest = sample
+    total = sum(counts.values())
+    return {
+        **counts,
+        "count": total,
+        "recent_incident": total > 0,
+        "symbols": sorted(symbols),
+        "venues": sorted(venues),
+        "latest_event": latest or {},
+    }
 
 
 def _diagnose_float(value: Any) -> float:
@@ -5606,6 +5698,10 @@ def run_diagnose(
         recent_events,
         since_ms=max(0, generated_at_ms - 24 * 3600 * 1000),
     )
+    stale_risk_state_alignment_summary = _build_stale_risk_state_alignment_summary(
+        recent_events,
+        since_ms=max(0, generated_at_ms - 24 * 3600 * 1000),
+    )
     entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
         all_events,
         production_acceptance_gate,
@@ -5687,6 +5783,9 @@ def run_diagnose(
         "passive_close_terminal_summary": passive_close_terminal_summary,
         "auto_fail_closed_summary": auto_fail_closed_summary,
         "auto_fail_closed_window_summary": auto_fail_closed_window_summary,
+        "stale_risk_state_alignment_summary": (
+            stale_risk_state_alignment_summary
+        ),
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
         "unpaired_live_position_recovery_summary": (
             unpaired_live_position_recovery_summary

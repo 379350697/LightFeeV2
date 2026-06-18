@@ -259,6 +259,66 @@ def test_run_diagnose_reports_recent_auto_fail_closed_before_since_deploy_window
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_reports_recent_stale_risk_state_alignment(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "unpaired_live_position_recoveries": [
+                {
+                    "venue": "okx",
+                    "symbol": "HOME-USDT-SWAP",
+                    "side": "sell",
+                    "terminal_status": "flat",
+                }
+            ],
+            "last_tick_ms": 1700000005000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000004900,
+                "kind": "runtime.stale_risk_state_aligned",
+                "payload": {
+                    "source": "runtime_live_position_probe",
+                    "reason": "runtime_flat_truth_current_state_clean",
+                    "symbols": ["HOME-USDT-SWAP"],
+                    "venues": ["okx"],
+                    "terminalized_records": 1,
+                    "previous_lifecycle": "risk_only",
+                    "new_lifecycle": "running",
+                    "previous_risk_mode": "running",
+                    "new_risk_mode": "running",
+                    "residual_blockers": [],
+                },
+            }
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000006000,
+        )
+
+        summary = result["stale_risk_state_alignment_summary"]
+        assert summary["recent_incident"] is True
+        assert summary["aligned_count"] == 1
+        assert summary["blocked_count"] == 0
+        assert summary["latest_event"]["kind"] == "runtime.stale_risk_state_aligned"
+        assert summary["latest_event"]["symbols"] == ["HOME-USDT-SWAP"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     venues = venues or []
     return {

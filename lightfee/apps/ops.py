@@ -71,6 +71,27 @@ def main() -> None:
         "--snapshot-path",
         help="Explicit snapshot path for production repairs; defaults to LIGHTFEE_DATA_DIR/snapshot.json",
     )
+    align = sub.add_parser(
+        "repair-stale-risk-state",
+        help="Dry-run or align stale risk_only lifecycle from clean exchange truth",
+    )
+    align.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply only when classified as safe_to_align_stale_risk_state",
+    )
+    align.add_argument(
+        "--exchange-truth",
+        help="Path to high-confidence exchange truth JSON; defaults to snapshot exchange_truth",
+    )
+    align.add_argument(
+        "--journal-path",
+        help="Explicit journal path for production repairs; defaults to LIGHTFEE_DATA_DIR/journal.jsonl",
+    )
+    align.add_argument(
+        "--snapshot-path",
+        help="Explicit snapshot path for production repairs; defaults to LIGHTFEE_DATA_DIR/snapshot.json",
+    )
 
     args = parser.parse_args()
     if not args.command:
@@ -112,6 +133,41 @@ def main() -> None:
             if args.apply:
                 journal.open()
             result = repair_auto_fail_closed_latch(
+                state,
+                journal_events=events,
+                exchange_truth=exchange_truth,
+                apply=bool(args.apply),
+                journal=journal if args.apply else None,
+                ts_ms=wall_clock_now_ms() if args.apply else None,
+            )
+            if result.get("applied"):
+                store.write(build_persistent_state_view(state))
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            sys.exit(0 if (not args.apply or result.get("applied")) else 2)
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            journal.close()
+
+    if args.command == "repair-stale-risk-state":
+        from lightfee.engine.bootstrap import wall_clock_now_ms
+        from lightfee.engine.recovery import build_persistent_state_view
+        from lightfee.ops.auto_fail_closed_repair import repair_stale_risk_state_alignment
+        from lightfee.persistence.journal import Journal
+
+        exchange_truth = _load_json_file(args.exchange_truth) if args.exchange_truth else None
+        if exchange_truth is None and isinstance(snap, dict):
+            maybe_truth = snap.get("exchange_truth")
+            exchange_truth = maybe_truth if isinstance(maybe_truth, dict) else None
+
+        journal_reader = Journal(journal_path)
+        events = journal_reader.read_all()
+        journal = Journal(journal_path)
+        try:
+            if args.apply:
+                journal.open()
+            result = repair_stale_risk_state_alignment(
                 state,
                 journal_events=events,
                 exchange_truth=exchange_truth,

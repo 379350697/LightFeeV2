@@ -28,6 +28,7 @@ from lightfee.ops.production_health import (
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+from scripts.diagnose_live import _build_stale_risk_state_alignment_summary
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
@@ -113,6 +114,32 @@ def _attach_auto_fail_closed_summary_if_missing(
         return state
     enriched = dict(state)
     enriched["auto_fail_closed_summary"] = summary
+    return enriched
+
+
+def _attach_stale_risk_state_alignment_summary_if_missing(
+    state: dict,
+    *,
+    current_state_path: Path,
+) -> dict:
+    if isinstance(state.get("stale_risk_state_alignment_summary"), dict):
+        return state
+
+    events: list[dict] = []
+    for path in _runtime_event_files(Path(current_state_path).resolve().parent):
+        events.extend(_read_jsonl_tail(path))
+        if len(events) >= 1000:
+            events = events[-1000:]
+            break
+
+    summary = _build_stale_risk_state_alignment_summary(
+        events,
+        since_ms=_auto_fail_closed_since_ms(state),
+    )
+    if not summary.get("recent_incident"):
+        return state
+    enriched = dict(state)
+    enriched["stale_risk_state_alignment_summary"] = summary
     return enriched
 
 
@@ -308,6 +335,10 @@ def main() -> None:
     if Path(args.current_state).exists():
         current_state = _read_json(args.current_state)
         current_state = _attach_auto_fail_closed_summary_if_missing(
+            current_state,
+            current_state_path=Path(args.current_state),
+        )
+        current_state = _attach_stale_risk_state_alignment_summary_if_missing(
             current_state,
             current_state_path=Path(args.current_state),
         )

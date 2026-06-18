@@ -6,6 +6,7 @@ Aster Pro API V3 and do not share Binance HMAC signing.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
@@ -18,6 +19,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.core.errors import OrderSubmitError
 from lightfee.venues.aster_v3 import AsterV3Client
 from lightfee.venues.specs import aster_spec
 from lightfee.venues.transport import (
@@ -26,6 +28,7 @@ from lightfee.venues.transport import (
     TransportErrorCategory,
     VenueTransport,
 )
+from lightfee.venues import transport as transport_mod
 
 
 class AsterAdapter(VenueAdapter):
@@ -112,8 +115,60 @@ class AsterAdapter(VenueAdapter):
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
+    async def _preflight_private_order_request(
+        self,
+        request: OrderRequest,
+    ) -> OrderRequest:
+        """Apply Binance-style Aster symbol filters before private V3 submit."""
+        venue_symbol = self._transport._venue_symbol(request.symbol)
+        symbol_rule = None
+        try:
+            symbol_rule = await transport_mod.get_symbol_rules_cache().get(
+                self._transport,
+                Venue.ASTER,
+                venue_symbol,
+            )
+        except Exception:
+            symbol_rule = None
+        try:
+            preflight = self._transport.preflight_order_request(
+                request,
+                symbol_rule=symbol_rule,
+            )
+        except OrderSubmitError:
+            for event in reversed(self._transport.order_diagnostics):
+                payload = event.get("payload", {})
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("response_classification") == "precision_rejected"
+                ):
+                    self._transport._record_order_diagnostic(
+                        "order_error.precision_rejected_before_submit",
+                        payload,
+                    )
+                    break
+            raise
+        quantized_request = replace(
+            request,
+            quantity=float(preflight["quantized_qty"]),
+            price=(
+                None
+                if preflight["quantized_price"] is None
+                else float(preflight["quantized_price"])
+            ),
+        )
+        attempt_payload = dict(preflight)
+        attempt_payload["response_classification"] = "attempt"
+        attempt_payload["private_api"] = "aster_v3"
+        self._transport._record_order_diagnostic(
+            "order.submit_attempt",
+            attempt_payload,
+        )
+        return quantized_request
+
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._private is not None:
+            request = await self._preflight_private_order_request(request)
             return await self._private.place_order(request)
         if self._mode == "live":
             raise self._private_unavailable()
@@ -170,6 +225,7 @@ class AsterAdapter(VenueAdapter):
 
     async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
         if self._private is not None:
+            request = await self._preflight_private_order_request(request)
             return await self._private.submit_passive_order(request)
         if self._mode == "live":
             raise self._private_unavailable()

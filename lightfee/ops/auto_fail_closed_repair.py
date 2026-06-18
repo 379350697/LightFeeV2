@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
 from lightfee.engine.recovery import clear_stale_fail_closed_if_recovery_clean
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 SAFE_TO_REPAIR = "safe_to_repair_auto_latch"
+SAFE_TO_ALIGN_STALE_RISK_STATE = "safe_to_align_stale_risk_state"
 PRESERVE_OPERATOR_LATCH = "operator_latch_must_preserve"
 UNSAFE_TRUTH_OR_CLEANUP = "unsafe_truth_or_cleanup_required"
 
-_FLAT_TERMINAL_STATUSES = {"flat", "already_flat", "resolved_flat"}
+_FLAT_TERMINAL_STATUSES = {"flat", "terminal_flat", "already_flat", "resolved_flat"}
 _CLEARABLE_STALE_BLOCKERS = {
     "startup_recovery_pending_work_without_open_positions",
     "startup_recovery_pending_work_without_open_position",
@@ -67,6 +73,25 @@ def _all_unpaired_recoveries_terminal_flat(recoveries: Any) -> bool:
         if status not in _FLAT_TERMINAL_STATUSES:
             return False
     return True
+
+
+def _active_unpaired_recoveries(recoveries: Any) -> list[dict[str, Any]]:
+    if isinstance(recoveries, dict):
+        items = recoveries.values()
+    elif isinstance(recoveries, list):
+        items = recoveries
+    else:
+        return []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if (
+            str(item.get("terminal_status") or "").strip().lower()
+            not in _FLAT_TERMINAL_STATUSES
+        ):
+            result.append(item)
+    return result
 
 
 def _has_operator_fail_closed_evidence(journal_events: list[dict[str, Any]]) -> bool:
@@ -143,6 +168,38 @@ def _local_state_has_cleanup_work(state: Any) -> bool:
     return any(_has_any(_mapping_or_attr(state, field)) for field in work_fields)
 
 
+def _alignment_classification_result(
+    classification: str,
+    *,
+    reasons: list[str],
+    state: Any,
+    journal_events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any] | None,
+) -> dict[str, Any]:
+    recoveries = _mapping_or_attr(state, "unpaired_live_position_recoveries", [])
+    active = _active_unpaired_recoveries(recoveries)
+    result = _classification_result(
+        classification,
+        reasons=reasons,
+        state=state,
+        journal_events=journal_events,
+        exchange_truth=exchange_truth,
+    )
+    result["apply_allowed"] = classification == SAFE_TO_ALIGN_STALE_RISK_STATE
+    result["active_unpaired_recovery_count"] = len(active)
+    result["active_unpaired_recovery_symbols"] = sorted({
+        str(record.get("symbol") or "")
+        for record in active
+        if str(record.get("symbol") or "")
+    })
+    result["active_unpaired_recovery_venues"] = sorted({
+        str(record.get("venue") or "")
+        for record in active
+        if str(record.get("venue") or "")
+    })
+    return result
+
+
 def _classification_result(
     classification: str,
     *,
@@ -167,6 +224,64 @@ def _classification_result(
             "has_open_order": _truth_has_open_order(exchange_truth) if isinstance(exchange_truth, dict) else None,
         },
     }
+
+
+def classify_stale_risk_state_alignment(
+    state: Any,
+    *,
+    journal_events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify whether stale risk/lifecycle state can align to clean truth."""
+    operator_requested_mode = _operator_requested_mode(state)
+    has_operator_fail_closed_evidence = _has_operator_fail_closed_evidence(journal_events)
+    if operator_requested_mode == GlobalRiskMode.FAIL_CLOSED.value:
+        return _alignment_classification_result(
+            PRESERVE_OPERATOR_LATCH,
+            reasons=["operator_fail_closed_evidence"]
+            if has_operator_fail_closed_evidence
+            else ["operator_fail_closed_latch_present"],
+            state=state,
+            journal_events=journal_events,
+            exchange_truth=exchange_truth,
+        )
+
+    reasons: list[str] = []
+    risk_mode = _enum_value(_mapping_or_attr(state, "risk_mode"))
+    lifecycle = _enum_value(_mapping_or_attr(state, "lifecycle"))
+    if risk_mode not in {GlobalRiskMode.RUNNING.value, GlobalRiskMode.FAIL_CLOSED.value}:
+        reasons.append("risk_mode_not_alignable")
+    if lifecycle != EngineLifecycle.RISK_ONLY.value:
+        reasons.append("lifecycle_not_risk_only")
+    if not _exchange_truth_high_confidence_flat(exchange_truth):
+        reasons.append("exchange_truth_not_high_confidence_flat")
+    if _local_state_has_cleanup_work(state):
+        reasons.append("local_cleanup_work_present")
+
+    recoveries = _mapping_or_attr(state, "unpaired_live_position_recoveries", [])
+    active = _active_unpaired_recoveries(recoveries)
+    blocker = _mapping_or_attr(state, "recovery_blocked_reason")
+    if not active and not blocker:
+        reasons.append("no_stale_recovery_state_present")
+    if blocker and str(blocker) not in _CLEARABLE_STALE_BLOCKERS:
+        reasons.append("recovery_blocker_not_clearable")
+
+    if reasons:
+        return _alignment_classification_result(
+            UNSAFE_TRUTH_OR_CLEANUP,
+            reasons=reasons,
+            state=state,
+            journal_events=journal_events,
+            exchange_truth=exchange_truth,
+        )
+
+    return _alignment_classification_result(
+        SAFE_TO_ALIGN_STALE_RISK_STATE,
+        reasons=[],
+        state=state,
+        journal_events=journal_events,
+        exchange_truth=exchange_truth,
+    )
 
 
 def classify_auto_fail_closed_latch(
@@ -223,6 +338,133 @@ def classify_auto_fail_closed_latch(
         journal_events=journal_events,
         exchange_truth=exchange_truth,
     )
+
+
+def _core_exchange_truth(exchange_truth: dict[str, Any] | None) -> dict[str, Any]:
+    truth = dict(exchange_truth or {})
+    truth["truth_available"] = bool(
+        truth.get("truth_available", truth.get("available", False))
+    )
+    truth.setdefault("positions", [])
+    truth.setdefault("open_orders", [])
+    truth.setdefault("errors", [])
+    return truth
+
+
+def _terminalize_active_unpaired_recoveries(
+    state: Any,
+    *,
+    ts_ms: int | None,
+) -> list[dict[str, Any]]:
+    terminalized: list[dict[str, Any]] = []
+    recoveries = _mapping_or_attr(state, "unpaired_live_position_recoveries", [])
+    for record in _active_unpaired_recoveries(recoveries):
+        record["terminal_status"] = "flat"
+        record["terminal_reason"] = "exchange_truth_flat_no_open_orders"
+        record["terminal_at_ms"] = int(ts_ms or 0)
+        record["last_error"] = ""
+        record["open_order_truth_available"] = True
+        record["quantity"] = 0.0
+        terminalized.append(dict(record))
+    return terminalized
+
+
+def repair_stale_risk_state_alignment(
+    state: Any,
+    *,
+    journal_events: list[dict[str, Any]],
+    exchange_truth: dict[str, Any] | None,
+    apply: bool = False,
+    journal: Any = None,
+    ts_ms: int | None = None,
+) -> dict[str, Any]:
+    """Dry-run or apply stale risk/lifecycle alignment from clean truth."""
+    result = classify_stale_risk_state_alignment(
+        state,
+        journal_events=journal_events,
+        exchange_truth=exchange_truth,
+    )
+    result["dry_run"] = not apply
+    result["applied"] = False
+    if not apply:
+        return result
+    if not result["apply_allowed"]:
+        result["refused"] = True
+        return result
+
+    previous_risk_mode = _enum_value(_mapping_or_attr(state, "risk_mode"))
+    previous_lifecycle = _enum_value(_mapping_or_attr(state, "lifecycle"))
+    previous_blocker = _mapping_or_attr(state, "recovery_blocked_reason")
+    terminalized = _terminalize_active_unpaired_recoveries(state, ts_ms=ts_ms)
+    if previous_blocker:
+        state.recovery_blocked_reason = None
+        state.recovery_blocked_at_ms = 0
+
+    core_decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            local_open_positions=(),
+            pending_entries=(),
+            residual_repairs=(),
+            passive_closes=(),
+            exchange_truth=_core_exchange_truth(exchange_truth),
+            prior_recovery_block_reason=previous_blocker,
+            operator_fail_closed=False,
+            recovery_work_items=(),
+        )
+    )
+    cleared = clear_risk_mode_for_recovery(state, core_decision)
+    residual_blockers: list[str] = []
+    if not cleared:
+        residual_blockers.append("recovery_core_did_not_clear")
+    if _mapping_or_attr(state, "recovery_blocked_reason"):
+        residual_blockers.append(str(_mapping_or_attr(state, "recovery_blocked_reason")))
+    if _active_unpaired_recoveries(
+        _mapping_or_attr(state, "unpaired_live_position_recoveries", [])
+    ):
+        residual_blockers.append("active_unpaired_live_position_recoveries")
+
+    result.update(
+        {
+            "applied": True,
+            "previous_risk_mode": previous_risk_mode,
+            "new_risk_mode": _enum_value(_mapping_or_attr(state, "risk_mode")),
+            "previous_lifecycle": previous_lifecycle,
+            "new_lifecycle": _enum_value(_mapping_or_attr(state, "lifecycle")),
+            "previous_blocker": previous_blocker,
+            "terminalized_records": len(terminalized),
+            "residual_blockers": residual_blockers,
+            "core_decision": getattr(getattr(core_decision, "kind", ""), "value", ""),
+        }
+    )
+    if journal is not None and ts_ms is not None:
+        event_kind = (
+            "runtime.stale_risk_state_aligned"
+            if not residual_blockers
+            else "runtime.stale_risk_state_alignment_blocked"
+        )
+        journal.append_critical(
+            ts_ms,
+            event_kind,
+            {
+                "reason": "stale_risk_state_aligned_from_exchange_truth",
+                "source": "repair_stale_risk_state",
+                "symbols": result["active_unpaired_recovery_symbols"],
+                "venues": result["active_unpaired_recovery_venues"],
+                "cleanup_actions": [
+                    "terminalize_stale_unpaired_recovery_records",
+                    "v1_recovery_decision_core_recompute",
+                ],
+                "exchange_truth_summary": result["exchange_truth_summary"],
+                "previous_risk_mode": previous_risk_mode,
+                "new_risk_mode": result["new_risk_mode"],
+                "previous_lifecycle": previous_lifecycle,
+                "new_lifecycle": result["new_lifecycle"],
+                "previous_blocker": previous_blocker,
+                "terminalized_records": len(terminalized),
+                "residual_blockers": residual_blockers,
+            },
+        )
+    return result
 
 
 def repair_auto_fail_closed_latch(

@@ -19,6 +19,7 @@ from lightfee.core.domain import (
     OrderRequest,
     PositionSnapshot,
     Side,
+    TimeInForce,
     Venue,
     VenueMarketSnapshot,
 )
@@ -506,6 +507,137 @@ class TestAsterOrderRequestShape:
             assert "X-MBX-APIKEY" not in url
         finally:
             await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_live_private_v3_order_is_preflight_quantized_before_submit(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.ASTER
+                assert venue_symbol == "HUSDT"
+                return SymbolRule(
+                    tick_size=0.0001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        class FakePrivate:
+            def __init__(self):
+                self.request: OrderRequest | None = None
+
+            async def place_order(self, request: OrderRequest) -> OrderFill:
+                self.request = request
+                return OrderFill(
+                    venue=Venue.ASTER,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 0.0,
+                    order_id="aster-v3-fill",
+                    client_order_id=request.client_order_id or "",
+                    filled_at_ms=1700000000000,
+                )
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        cred = LiveCredential(
+            api_secret=ASTER_FIXTURE_PRIVATE_KEY,
+            account_address=ASTER_FIXTURE_ACCOUNT_ADDRESS,
+        )
+        adapter = AsterAdapter(mode="live", credential=cred)
+        private = FakePrivate()
+        adapter._private = private
+
+        try:
+            req = OrderRequest(
+                venue=Venue.ASTER,
+                symbol="HUSDT",
+                side=Side.BUY,
+                quantity=95.8619587793577,
+                price=0.1456789,
+                time_in_force=TimeInForce.GTC,
+            )
+            await adapter.place_order(req)
+        finally:
+            await adapter.shutdown()
+
+        assert private.request is not None
+        assert private.request.quantity == pytest.approx(95.0)
+        assert private.request.price == pytest.approx(0.1456)
+        diagnostics = adapter._transport.drain_order_diagnostics()
+        assert any(
+            event["kind"] == "order.submit_attempt"
+            and event["payload"]["quantized_qty"] == pytest.approx(95.0)
+            and event["payload"]["quantized_price"] == pytest.approx(0.1456)
+            for event in diagnostics
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_private_v3_order_rejects_precision_before_submit(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.0001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        class FakePrivate:
+            submitted = False
+
+            async def place_order(self, request: OrderRequest) -> OrderFill:
+                self.submitted = True
+                raise AssertionError("precision-rejected Aster order must not submit")
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        cred = LiveCredential(
+            api_secret=ASTER_FIXTURE_PRIVATE_KEY,
+            account_address=ASTER_FIXTURE_ACCOUNT_ADDRESS,
+        )
+        adapter = AsterAdapter(mode="live", credential=cred)
+        private = FakePrivate()
+        adapter._private = private
+
+        try:
+            with pytest.raises(OrderSubmitError):
+                await adapter.place_order(
+                    OrderRequest(
+                        venue=Venue.ASTER,
+                        symbol="ESPORTSUSDT",
+                        side=Side.SELL,
+                        quantity=0.41,
+                        price=0.009,
+                        time_in_force=TimeInForce.GTC,
+                    )
+                )
+        finally:
+            await adapter.shutdown()
+
+        assert private.submitted is False
+        diagnostics = adapter._transport.drain_order_diagnostics()
+        assert any(
+            event["kind"] == "order_error.precision_rejected_before_submit"
+            and event["payload"]["response_classification"] == "precision_rejected"
+            for event in diagnostics
+        )
 
 
 class TestHyperliquidLiveOrderNowSupported:
