@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import json
+import sys
+
+import pytest
+
+from lightfee.engine.state import EngineState
+from lightfee.ops.auto_fail_closed_repair import (
+    classify_auto_fail_closed_latch,
+    repair_auto_fail_closed_latch,
+)
+from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+
+def _flat_exchange_truth() -> dict:
+    return {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {},
+        "open_orders": {},
+    }
+
+
+def _state_with_stale_auto_latch() -> EngineState:
+    state = EngineState(
+        lifecycle=EngineLifecycle.RISK_ONLY,
+        risk_mode=GlobalRiskMode.FAIL_CLOSED,
+    )
+    state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+    state.recovery_blocked_reason = "startup_recovery_pending_work_without_open_positions"
+    state.unpaired_live_position_recoveries = [
+        {
+            "venue": "bybit",
+            "symbol": "HOMEUSDT",
+            "terminal_status": "flat",
+            "quantity": 0.0,
+        }
+    ]
+    return state
+
+
+def test_classifies_auto_latch_as_safe_when_truth_flat_and_no_ops_fail_closed():
+    state = _state_with_stale_auto_latch()
+
+    result = classify_auto_fail_closed_latch(
+        state,
+        journal_events=[
+            {
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {"source": "auto_pending_entry_abort"},
+            }
+        ],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == "safe_to_repair_auto_latch"
+    assert result["apply_allowed"] is True
+    assert result["has_operator_fail_closed_evidence"] is False
+
+
+def test_preserves_latch_when_journal_has_real_operator_fail_closed():
+    state = _state_with_stale_auto_latch()
+
+    result = classify_auto_fail_closed_latch(
+        state,
+        journal_events=[
+            {
+                "kind": "ops.command_applied",
+                "payload": {"command": "fail_closed"},
+            }
+        ],
+        exchange_truth=_flat_exchange_truth(),
+    )
+
+    assert result["classification"] == "operator_latch_must_preserve"
+    assert result["apply_allowed"] is False
+    assert "operator_fail_closed_evidence" in result["reasons"]
+
+
+def test_refuses_repair_when_exchange_truth_is_not_high_confidence_flat():
+    state = _state_with_stale_auto_latch()
+
+    result = classify_auto_fail_closed_latch(
+        state,
+        journal_events=[],
+        exchange_truth={
+            "available": True,
+            "confidence": "low",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        },
+    )
+
+    assert result["classification"] == "unsafe_truth_or_cleanup_required"
+    assert result["apply_allowed"] is False
+    assert "exchange_truth_not_high_confidence_flat" in result["reasons"]
+
+
+class _CaptureJournal:
+    def __init__(self) -> None:
+        self.critical_records: list[dict] = []
+
+    def append_critical(self, ts_ms, kind, payload):
+        self.critical_records.append({
+            "ts_ms": ts_ms,
+            "kind": kind,
+            "payload": payload,
+        })
+        return len(self.critical_records)
+
+
+def test_apply_clears_pseudo_latch_and_recomputes_running_via_recovery_core():
+    state = _state_with_stale_auto_latch()
+    journal = _CaptureJournal()
+
+    result = repair_auto_fail_closed_latch(
+        state,
+        journal_events=[],
+        exchange_truth=_flat_exchange_truth(),
+        apply=True,
+        journal=journal,
+        ts_ms=1234,
+    )
+
+    assert result["classification"] == "safe_to_repair_auto_latch"
+    assert result["applied"] is True
+    assert state.operator.requested_mode is None
+    assert state.recovery_blocked_reason is None
+    assert state.risk_mode == GlobalRiskMode.RUNNING
+    assert state.lifecycle == EngineLifecycle.RUNNING
+    assert result["previous_risk_mode"] == "fail_closed"
+    assert result["new_risk_mode"] == "running"
+    assert journal.critical_records[-1]["kind"] == "runtime.auto_fail_closed_recovered"
+    assert journal.critical_records[-1]["payload"]["new_risk_mode"] == "running"
+
+
+def test_ops_repair_apply_persists_running_and_critical_journal(tmp_path, monkeypatch, capsys):
+    from lightfee.apps import ops
+    from lightfee.engine.recovery import (
+        _restore_state_from_snapshot_dict,
+        build_persistent_state_view,
+    )
+    from lightfee.persistence.journal import Journal
+    from lightfee.persistence.snapshot_store import SnapshotStore
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    state = _state_with_stale_auto_latch()
+    SnapshotStore(data_dir / "snapshot.json").write(build_persistent_state_view(state))
+    truth_path = tmp_path / "exchange_truth.json"
+    truth_path.write_text(json.dumps(_flat_exchange_truth()), encoding="utf-8")
+
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "repair-auto-fail-closed-latch",
+            "--exchange-truth",
+            str(truth_path),
+            "--apply",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ops.main()
+
+    assert exc.value.code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["applied"] is True
+    assert output["new_risk_mode"] == "running"
+
+    repaired = _restore_state_from_snapshot_dict(
+        SnapshotStore(data_dir / "snapshot.json").read()
+    )
+    assert repaired.operator.requested_mode is None
+    assert repaired.risk_mode == GlobalRiskMode.RUNNING
+    assert repaired.lifecycle == EngineLifecycle.RUNNING
+
+    records = Journal(data_dir / "journal.jsonl").read_all()
+    recovered = [
+        record for record in records
+        if record["kind"] == "runtime.auto_fail_closed_recovered"
+    ]
+    assert recovered
+    assert recovered[-1]["payload"]["source"] == "repair_auto_fail_closed_latch"

@@ -7,6 +7,7 @@ import os
 import shlex
 import sys
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,8 +27,10 @@ from lightfee.ops.production_health import (
     summarize_reports,
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
+AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 
 
 def _read_json(path: str) -> dict:
@@ -36,6 +39,81 @@ def _read_json(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root must be object: {path}")
     return data
+
+
+def _read_jsonl_tail(path: Path, max_records: int = 1000) -> list[dict]:
+    if not path.exists():
+        return []
+    records: deque[dict] = deque(maxlen=max_records)
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    return list(records)
+
+
+def _runtime_event_files(runtime_dir: Path) -> list[Path]:
+    if not runtime_dir.exists():
+        return []
+    candidates: list[Path] = []
+    for pattern in ("live-events*.jsonl", "events*.jsonl", "journal.jsonl"):
+        for path in sorted(runtime_dir.glob(pattern)):
+            if path not in candidates:
+                candidates.append(path)
+    return candidates
+
+
+def _auto_fail_closed_since_ms(state: dict) -> int:
+    window = state.get("window")
+    if isinstance(window, dict):
+        try:
+            since_ms = int(window.get("since_ms") or 0)
+        except (TypeError, ValueError):
+            since_ms = 0
+        if since_ms > 0:
+            return since_ms
+
+    for key in ("generated_at_ms", "ts_ms", "timestamp_ms", "last_tick_ms"):
+        try:
+            anchor_ms = int(state.get(key) or 0)
+        except (TypeError, ValueError):
+            anchor_ms = 0
+        if anchor_ms > 0:
+            return max(0, anchor_ms - AUTO_FAIL_CLOSED_RECENT_WINDOW_MS)
+    return max(0, int(time.time() * 1000) - AUTO_FAIL_CLOSED_RECENT_WINDOW_MS)
+
+
+def _attach_auto_fail_closed_summary_if_missing(
+    state: dict,
+    *,
+    current_state_path: Path,
+) -> dict:
+    if isinstance(state.get("auto_fail_closed_summary"), dict):
+        return state
+
+    events: list[dict] = []
+    for path in _runtime_event_files(Path(current_state_path).resolve().parent):
+        events.extend(_read_jsonl_tail(path))
+        if len(events) >= 1000:
+            events = events[-1000:]
+            break
+
+    summary = build_auto_fail_closed_summary(
+        events,
+        since_ms=_auto_fail_closed_since_ms(state),
+    )
+    if not summary.get("recent_incident"):
+        return state
+    enriched = dict(state)
+    enriched["auto_fail_closed_summary"] = summary
+    return enriched
 
 
 def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
@@ -229,6 +307,10 @@ def main() -> None:
         ))
     if Path(args.current_state).exists():
         current_state = _read_json(args.current_state)
+        current_state = _attach_auto_fail_closed_summary_if_missing(
+            current_state,
+            current_state_path=Path(args.current_state),
+        )
         should_probe_exchange_truth = (
             args.probe_exchange_truth
             if args.probe_exchange_truth is not None

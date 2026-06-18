@@ -7054,9 +7054,60 @@ class LiveRuntime:
 
         Returns True if pending was removed, False if retained (cleanup failed).
         """
+        previous_risk_mode = self.state.risk_mode.value
         enter_fail_closed(self.state)
-        self.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
-        return await self._abort_pending_entry(pending, entry_id, reason)
+        long_venue = getattr(pending, "long_venue", None)
+        short_venue = getattr(pending, "short_venue", None)
+        event_payload = {
+            "source": "auto_pending_entry_abort",
+            "reason": reason,
+            "entry_id": entry_id,
+            "symbol": getattr(pending, "symbol", ""),
+            "symbols": [getattr(pending, "symbol", "")],
+            "venues": [
+                getattr(long_venue, "value", str(long_venue or "")),
+                getattr(short_venue, "value", str(short_venue or "")),
+            ],
+            "cleanup_actions": ["abort_pending_entry"],
+            "previous_risk_mode": previous_risk_mode,
+            "new_risk_mode": self.state.risk_mode.value,
+            "ts_ms": wall_clock_now_ms(),
+        }
+        self.journal.append(
+            "runtime.auto_fail_closed_entered",
+            event_payload,
+        )
+        removed = await self._abort_pending_entry(pending, entry_id, reason)
+        residual_blockers = []
+        if self.state.recovery_blocked_reason:
+            residual_blockers.append(self.state.recovery_blocked_reason)
+        if self.state.pending_entries.get(entry_id) is not None:
+            residual_blockers.append("pending_entry_retained")
+        outcome_payload = {
+            **event_payload,
+            "cleanup_actions": ["abort_pending_entry_cleanup_succeeded"]
+            if removed
+            else ["abort_pending_entry_cleanup_failed"],
+            "exchange_truth_summary": {
+                "source": "abort_pending_entry_cleanup",
+                "confidence": "high" if removed else "incomplete",
+                "positions_flat": removed,
+                "open_orders_absent": removed,
+                "venues": event_payload["venues"],
+                "symbol": event_payload["symbol"],
+            },
+            "new_risk_mode": self.state.risk_mode.value,
+            "residual_blockers": residual_blockers,
+            "ts_ms": wall_clock_now_ms(),
+        }
+        self.journal.append_critical(
+            outcome_payload["ts_ms"],
+            "runtime.auto_fail_closed_recovered"
+            if removed and not residual_blockers
+            else "runtime.auto_fail_closed_cleanup_failed",
+            outcome_payload,
+        )
+        return removed
 
     async def _abort_pending_entry(
         self, pending, entry_id: str, reason: str

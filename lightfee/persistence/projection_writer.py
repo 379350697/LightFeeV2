@@ -98,6 +98,9 @@ _JOURNAL_ONLY_KINDS = frozenset({
     "runtime.booting",
     "runtime.running",
     "runtime.stopped",
+    "runtime.auto_fail_closed_entered",
+    "runtime.auto_fail_closed_recovered",
+    "runtime.auto_fail_closed_cleanup_failed",
 })
 
 PROJECTED_KINDS = (

@@ -46,6 +46,7 @@ from lightfee.engine.recovery_decision_core import (
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
+from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
 
@@ -5595,6 +5596,7 @@ def run_diagnose(
         event_counts[kind] = event_counts.get(kind, 0) + 1
     quick_flat_summary = summarize_quick_flat_events(all_events)
     passive_close_terminal_summary = _build_passive_close_terminal_summary(all_events)
+    auto_fail_closed_summary = build_auto_fail_closed_summary(all_events)
     entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
         all_events,
         production_acceptance_gate,
@@ -5674,6 +5676,7 @@ def run_diagnose(
         "event_counts": event_counts,
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
+        "auto_fail_closed_summary": auto_fail_closed_summary,
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
         "unpaired_live_position_recovery_summary": (
             unpaired_live_position_recovery_summary
@@ -6017,6 +6020,10 @@ def _build_passive_close_terminal_summary(events: list[dict[str, Any]]) -> dict[
             terminal_zero_resolved_positions
         ),
     }
+
+
+def _build_auto_fail_closed_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    return build_auto_fail_closed_summary(events)
 
 
 def _event_scope_venues(payload: dict[str, Any]) -> set[str]:

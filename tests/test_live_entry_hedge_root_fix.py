@@ -3514,6 +3514,14 @@ class TestRealPathAbortCleanupDeadline:
             maker_leg="long",
         )
         runtime.state.pending_entries["entry-bug1"] = pending
+        critical_kinds: list[str] = []
+        original_append_critical = runtime.journal.append_critical
+
+        def record_append_critical(ts_ms, kind, payload):
+            critical_kinds.append(kind)
+            return original_append_critical(ts_ms, kind, payload)
+
+        runtime.journal.append_critical = record_append_critical
 
         removed = await runtime._abort_pending_entry_fail_closed(
             pending, "entry-bug1", "test bug1 deadline breach"
@@ -3522,10 +3530,18 @@ class TestRealPathAbortCleanupDeadline:
         # Must have entered fail_closed
         assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
         assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.operator.requested_mode is None
         # No adapters → cleanup returns None (uncertain) → treated as failure
         # Pending entry correctly retained (cannot verify exposure absent)
         assert removed is False
         assert "entry-bug1" in runtime.state.pending_entries
+        failed = [
+            record for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.auto_fail_closed_cleanup_failed"
+        ]
+        assert failed
+        assert failed[-1]["payload"]["residual_blockers"] == ["pending_entry_retained"]
+        assert "runtime.auto_fail_closed_cleanup_failed" in critical_kinds
 
     # ── Bug 2: _cleanup_failed_leg_exposure uses quantity/side, reduce_only ──
 
@@ -5004,10 +5020,10 @@ class TestRealPathAbortCleanupDeadline:
     # ── _abort_pending_entry_fail_closed enters fail_closed THEN aborts ──
 
     @pytest.mark.asyncio
-    async def test_abort_fail_closed_order_enters_fail_closed_first(self, tmp_path):
+    async def test_abort_fail_closed_order_recovers_after_cleanup_success(self, tmp_path):
         """V1: abort_pending_entry_fail_closed enters fail_closed BEFORE calling
-        abort_pending_entry — not after. The fail_closed state persists even
-        if abort succeeds."""
+        abort_pending_entry. V2 should not keep auto fail_closed latched after
+        cleanup proves both legs are flat."""
         from lightfee.engine.runtime import LiveRuntime
         from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -5035,10 +5051,67 @@ class TestRealPathAbortCleanupDeadline:
         )
 
         assert removed is True
-        # Fail-closed was entered FIRST, persists even though abort succeeded
-        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+        assert runtime.state.operator.requested_mode is None
         assert "entry-fail-closed-order" not in runtime.state.pending_entries
+        kinds = [record["kind"] for record in runtime.journal.read_all()]
+        assert "runtime.auto_fail_closed_entered" in kinds
+        assert "runtime.auto_fail_closed_recovered" in kinds
+
+    @pytest.mark.asyncio
+    async def test_auto_abort_fail_closed_cleanup_success_restores_running(self, tmp_path):
+        """Automatic fail-closed is not an operator command or sticky latch."""
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        for ven in (Venue.BINANCE, Venue.OKX):
+            fake = _FakeVenueAdapter(ven)
+            fake.position = None
+            runtime._venue_adapters[ven] = fake
+
+        pending = PendingEntry(
+            pending_id="entry-auto-fail-closed",
+            symbol="LINK-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        critical_kinds: list[str] = []
+        original_append_critical = runtime.journal.append_critical
+
+        def record_append_critical(ts_ms, kind, payload):
+            critical_kinds.append(kind)
+            return original_append_critical(ts_ms, kind, payload)
+
+        runtime.journal.append_critical = record_append_critical
+
+        removed = await runtime._abort_pending_entry_fail_closed(
+            pending,
+            pending.pending_id,
+            "deadline breach",
+        )
+
+        assert removed is True
+        assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+        assert runtime.state.operator.requested_mode is None
+        records = runtime.journal.read_all()
+        recovered = [
+            record for record in records
+            if record["kind"] == "runtime.auto_fail_closed_recovered"
+        ]
+        assert recovered
+        payload = recovered[-1]["payload"]
+        assert payload["source"] == "auto_pending_entry_abort"
+        assert payload["reason"] == "deadline breach"
+        assert payload["residual_blockers"] == []
+        assert "runtime.auto_fail_closed_recovered" in critical_kinds
 
 
 # ═══════════════════════════════════════════════════════════════════════════

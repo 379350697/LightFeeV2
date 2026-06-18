@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest auto fail-closed operator latch and cleanup visibility closure,
+2026-06-18: V2 automatic pending-entry abort incorrectly wrote
+`operator.requested_mode=fail_closed`, making a system accident behave like an
+ops `fail-closed` command. Since stale cleanup correctly preserves real
+operator fail-closed, the false latch could keep terminal-flat stale blockers
+latched and make recovered incidents disappear from current health output.
+CL-095 restores the split: automatic fail-closed blocks new risk but does not
+set the operator latch; true ops fail-closed still persists through
+`ops.command_applied` and replay. The runtime now emits
+`runtime.auto_fail_closed_entered`, `runtime.auto_fail_closed_recovered`, and
+`runtime.auto_fail_closed_cleanup_failed`; diagnose and production verifier
+surface recent recovered incidents as details/warnings rather than false
+criticals. A dry-run-first `repair-auto-fail-closed-latch` ops command can
+clear only pseudo operator latches after high-confidence exchange flat/no-order
+truth and no real ops fail-closed evidence, without directly forcing
+`running`. See
+[daily/2026-06-18.md#cluster-cl-095---auto-fail-closed-operator-latch-and-cleanup-visibility](daily/2026-06-18.md#cluster-cl-095---auto-fail-closed-operator-latch-and-cleanup-visibility).
+
 Latest ZECUSDT entry route semantic closure, 2026-06-18:
 Latest `94487e4` cloud review ended with safe final trading truth, but the
 since-deploy window exposed a module-level entry closure gap. ZECUSDT pending

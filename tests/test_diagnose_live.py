@@ -133,6 +133,73 @@ def test_snapshot_stale_and_degraded_are_reported_outside_l2_evidence():
     assert snapshot["blocking_scope_count"] == 1
 
 
+def test_auto_fail_closed_summary_reports_recent_recovery_incident():
+    from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+
+    summary = build_auto_fail_closed_summary([
+        {
+            "ts_ms": 1000,
+            "kind": "runtime.auto_fail_closed_cleanup_failed",
+            "payload": {
+                "source": "auto_pending_entry_abort",
+                "reason": "deadline breach",
+                "symbols": ["LINKUSDT"],
+                "venues": ["binance", "okx"],
+                "new_risk_mode": "fail_closed",
+                "residual_blockers": ["pending_entry_retained"],
+            },
+        },
+        {
+            "ts_ms": 2000,
+            "kind": "runtime.auto_fail_closed_recovered",
+            "payload": {
+                "source": "auto_pending_entry_abort",
+                "reason": "deadline breach",
+                "symbols": ["LINKUSDT"],
+                "venues": ["binance", "okx"],
+                "new_risk_mode": "running",
+                "residual_blockers": [],
+            },
+        },
+    ])
+
+    assert summary["recovered_count"] == 1
+    assert summary["cleanup_failed_count"] == 1
+    assert summary["recent_incident"] is True
+    assert summary["latest_event"]["kind"] == "runtime.auto_fail_closed_recovered"
+    assert summary["latest_event"]["final_status"] == "recovered"
+
+
+def test_auto_fail_closed_summary_ignores_events_before_window():
+    from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+
+    summary = build_auto_fail_closed_summary(
+        [
+            {
+                "ts_ms": 1000,
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {"source": "auto_pending_entry_abort"},
+            },
+            {
+                "ts_ms": 3000,
+                "kind": "runtime.auto_fail_closed_cleanup_failed",
+                "payload": {
+                    "source": "auto_pending_entry_abort",
+                    "symbols": ["LINKUSDT"],
+                    "residual_blockers": ["pending_entry_retained"],
+                },
+            },
+        ],
+        since_ms=2000,
+    )
+
+    assert summary["recovered_count"] == 0
+    assert summary["cleanup_failed_count"] == 1
+    assert summary["recent_incident"] is True
+    assert summary["latest_event"]["kind"] == "runtime.auto_fail_closed_cleanup_failed"
+    assert summary["latest_event"]["symbols"] == ["LINKUSDT"]
+
+
 def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     venues = venues or []
     return {

@@ -96,6 +96,43 @@ def test_current_state_flags_stale_fail_closed_clean_state():
     assert "stale_fail_closed_clean_state" in report.fingerprints
 
 
+def test_current_state_preserves_recent_auto_fail_closed_recovery_as_detail_only():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        },
+        "auto_fail_closed_summary": {
+            "recent_incident": True,
+            "recovered_count": 1,
+            "cleanup_failed_count": 0,
+            "latest_event": {
+                "kind": "runtime.auto_fail_closed_recovered",
+                "final_status": "recovered",
+                "symbols": ["LINKUSDT"],
+                "venues": ["bybit"],
+            },
+        },
+    }
+
+    report = analyze_current_state(state, now_ms=1778787000000, max_tick_age_ms=10_000)
+
+    assert report.ok
+    assert report.fingerprints == []
+    assert report.details["auto_fail_closed_summary"]["recent_incident"] is True
+    assert report.details["auto_fail_closed_summary"]["latest_event"]["final_status"] == "recovered"
+
+
 def test_current_state_clean_local_exchange_nonzero_is_critical():
     state = {
         "lifecycle": "running",
@@ -682,6 +719,87 @@ def test_verify_production_services_attaches_exchange_truth_from_systemd_env_fil
     assert seen["symbols"] == []
     assert seen["venues"] is None
     assert seen["api_key"] == "key-from-file"
+
+
+def test_verify_production_services_attaches_auto_fail_closed_summary(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    state = {"generated_at_ms": 1778787000000}
+    current_state.write_text(json.dumps(state))
+    (runtime_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "ts_ms": 1778786998000,
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {
+                    "source": "auto_pending_entry_abort",
+                    "reason": "deadline breach",
+                    "symbols": ["LINKUSDT"],
+                    "venues": ["bybit"],
+                    "new_risk_mode": "running",
+                    "residual_blockers": [],
+                },
+            }
+        )
+        + "\n"
+    )
+
+    enriched = vps._attach_auto_fail_closed_summary_if_missing(
+        state,
+        current_state_path=current_state,
+    )
+
+    summary = enriched["auto_fail_closed_summary"]
+    assert summary["recent_incident"] is True
+    assert summary["recovered_count"] == 1
+    assert summary["latest_event"]["symbols"] == ["LINKUSDT"]
+
+
+def test_verify_production_services_ignores_old_or_unrelated_jsonl_events(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    current_state = runtime_dir / "live-state-current.json"
+    state = {"generated_at_ms": 1778787000000}
+    current_state.write_text(json.dumps(state))
+    old_ts = 1778787000000 - (25 * 3600 * 1000)
+    (runtime_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "ts_ms": old_ts,
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {
+                    "source": "auto_pending_entry_abort",
+                    "symbols": ["OLDUSDT"],
+                    "new_risk_mode": "running",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (runtime_dir / "unrelated.jsonl").write_text(
+        json.dumps(
+            {
+                "ts_ms": 1778786999000,
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {
+                    "source": "auto_pending_entry_abort",
+                    "symbols": ["NOISEUSDT"],
+                    "new_risk_mode": "running",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    enriched = vps._attach_auto_fail_closed_summary_if_missing(
+        state,
+        current_state_path=current_state,
+    )
+
+    assert "auto_fail_closed_summary" not in enriched
 
 
 def test_verify_production_services_exchange_truth_probe_times_out(

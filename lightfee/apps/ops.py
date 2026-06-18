@@ -10,6 +10,7 @@ Rust references:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,16 @@ def _resolve_paths() -> tuple[Path, Path]:
     return journal_path, snapshot_path
 
 
+def _load_json_file(path: str | None) -> dict | None:
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object at {path}")
+    return data
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="lightfee-ops: Operator controls")
     sub = parser.add_subparsers(dest="command")
@@ -35,24 +46,28 @@ def main() -> None:
     sub.add_parser("fail-closed", help="Enter fail-closed mode")
     sub.add_parser("reconcile-now", help="Trigger immediate reconciliation")
     sub.add_parser("resume-if-safe", help="Resume if no blocking recovery work")
+    repair = sub.add_parser(
+        "repair-auto-fail-closed-latch",
+        help="Dry-run or repair a stale auto fail-closed operator latch",
+    )
+    repair.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply only when classified as safe_to_repair_auto_latch",
+    )
+    repair.add_argument(
+        "--exchange-truth",
+        help="Path to high-confidence exchange truth JSON; defaults to snapshot exchange_truth",
+    )
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    commands = {
-        "pause-entry": OperatorCommand.PAUSE_ENTRY,
-        "reduce-only": OperatorCommand.REDUCE_ONLY,
-        "fail-closed": OperatorCommand.FAIL_CLOSED,
-        "reconcile-now": OperatorCommand.RECONCILE_NOW,
-        "resume-if-safe": OperatorCommand.RESUME_IF_SAFE,
-    }
-    cmd = commands[args.command]
-
     journal_path, snapshot_path = _resolve_paths()
 
-    # 1. Load persisted state from snapshot (lifecycle + risk_mode)
+    # Load persisted state from snapshot for both operator commands and repairs.
     from lightfee.engine.recovery import _restore_state_from_snapshot_dict
     from lightfee.persistence.snapshot_store import SnapshotStore
 
@@ -63,6 +78,50 @@ def main() -> None:
     else:
         from lightfee.engine.state import EngineState
         state = EngineState()
+
+    if args.command == "repair-auto-fail-closed-latch":
+        from lightfee.engine.bootstrap import wall_clock_now_ms
+        from lightfee.engine.recovery import build_persistent_state_view
+        from lightfee.ops.auto_fail_closed_repair import repair_auto_fail_closed_latch
+        from lightfee.persistence.journal import Journal
+
+        exchange_truth = _load_json_file(args.exchange_truth) if args.exchange_truth else None
+        if exchange_truth is None and isinstance(snap, dict):
+            maybe_truth = snap.get("exchange_truth")
+            exchange_truth = maybe_truth if isinstance(maybe_truth, dict) else None
+
+        journal_reader = Journal(journal_path)
+        events = journal_reader.read_all()
+        journal = Journal(journal_path)
+        try:
+            if args.apply:
+                journal.open()
+            result = repair_auto_fail_closed_latch(
+                state,
+                journal_events=events,
+                exchange_truth=exchange_truth,
+                apply=bool(args.apply),
+                journal=journal if args.apply else None,
+                ts_ms=wall_clock_now_ms() if args.apply else None,
+            )
+            if result.get("applied"):
+                store.write(build_persistent_state_view(state))
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            sys.exit(0 if (not args.apply or result.get("applied")) else 2)
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            journal.close()
+
+    commands = {
+        "pause-entry": OperatorCommand.PAUSE_ENTRY,
+        "reduce-only": OperatorCommand.REDUCE_ONLY,
+        "fail-closed": OperatorCommand.FAIL_CLOSED,
+        "reconcile-now": OperatorCommand.RECONCILE_NOW,
+        "resume-if-safe": OperatorCommand.RESUME_IF_SAFE,
+    }
+    cmd = commands[args.command]
 
     # 2. Open journal for critical append
     from lightfee.persistence.journal import Journal
