@@ -462,6 +462,8 @@ class LiveRuntime:
             or "max notional" in text
         ):
             return LiveRuntime._entry_admission_evidence("max_notional_admission_blocked")
+        if venue == Venue.ASTER and "aster_headroom_unavailable" in text:
+            return LiveRuntime._entry_admission_evidence("aster_headroom_unavailable")
         return None
 
     @staticmethod
@@ -514,12 +516,21 @@ class LiveRuntime:
                 "official_doc_url": LiveRuntime._ASTER_OPENABLE_NOTIONAL_DOC_URL,
                 "evidence_gap": False,
             }
+        if reason == "aster_headroom_unavailable":
+            return {
+                "reason": reason,
+                "official_doc_url": LiveRuntime._ASTER_OPENABLE_NOTIONAL_DOC_URL,
+                "evidence_gap": True,
+            }
         return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
 
     @staticmethod
     def _entry_admission_block_state_keys(venue: Venue, symbol: str, reason: str) -> list[str]:
         keys = [f"{venue.value}:{symbol}"]
-        if venue == Venue.ASTER and reason == "max_notional_admission_blocked":
+        if venue == Venue.ASTER and reason in {
+            "max_notional_admission_blocked",
+            "aster_headroom_unavailable",
+        }:
             keys.append(f"{venue.value}:*")
         if venue == Venue.HYPERLIQUID and reason in {
             "insufficient_margin_admission_blocked",

@@ -20,7 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -5434,14 +5434,16 @@ class VenueTransport(MarketDataClient):
     # ------------------------------------------------------------------
 
     async def _fetch_aster_remaining_openable_notional(
-        self, venue_sym: str,
+        self,
+        venue_sym: str,
+        leverage: int = ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
     ) -> Optional[float]:
         raw = await self._request(
             "GET",
             "/fapi/v1/remainingOpenableNotionalValue",
             params={
                 "symbol": venue_sym,
-                "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+                "leverage": int(leverage or ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE),
             },
             private=True,
         )
@@ -5457,8 +5459,6 @@ class VenueTransport(MarketDataClient):
         venue_sym: str,
         quantized_qty: float,
         quantized_price: Any,
-        qty_step: float,
-        min_qty: float,
     ) -> tuple[float, dict[str, Any]]:
         payload: dict[str, Any] = {}
         if self._spec.venue_id != Venue.ASTER or request.reduce_only:
@@ -5469,36 +5469,155 @@ class VenueTransport(MarketDataClient):
         if price <= 0.0:
             return quantized_qty, payload
 
+        payload = await self._aster_reject_new_risk_without_headroom(
+            request,
+            venue_sym,
+            quantized_qty,
+            price,
+            order_role="maker",
+            source="aster_headroom_precheck",
+        )
+        return quantized_qty, payload
+
+    async def _aster_reject_new_risk_without_headroom(
+        self,
+        request: OrderRequest,
+        venue_sym: str,
+        quantized_qty: float,
+        quantized_price: Any,
+        *,
+        order_role: str,
+        source: str,
+        remaining_openable_provider: Callable[[str, int], Awaitable[Optional[float]]] | None = None,
+    ) -> dict[str, Any]:
+        """Block Aster new-risk orders before submit when headroom is unsafe."""
+        payload: dict[str, Any] = {}
+        if self._spec.venue_id != Venue.ASTER or request.reduce_only:
+            return payload
+        if quantized_qty <= 0.0:
+            return payload
+        price = _safe_float(quantized_price, default=0.0)
+        if price <= 0.0:
+            return payload
+        requested_notional = float(quantized_qty) * price
         try:
-            remaining = await self._fetch_aster_remaining_openable_notional(venue_sym)
+            provider = remaining_openable_provider or self._fetch_aster_remaining_openable_notional
+            remaining = await provider(
+                venue_sym,
+                ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+            )
         except Exception as exc:
-            payload["aster_headroom_error"] = str(exc)[:200]
-            return quantized_qty, payload
+            classification = _passive_submit_reject_classification(Venue.ASTER, exc)
+            if classification != "rejected":
+                if classification == "max_notional_admission_blocked":
+                    self._record_aster_headroom_admission_block(
+                        request=request,
+                        venue_sym=venue_sym,
+                        requested_notional=requested_notional,
+                        remaining_openable_notional=None,
+                        order_role=order_role,
+                        source="exchange_5018_fallback",
+                        reason=classification,
+                        evidence_gap=False,
+                        error=str(exc)[:200],
+                    )
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"{classification}: {_transport_error_text(exc)[:200]}",
+                ) from exc
+            self._record_aster_headroom_admission_block(
+                request=request,
+                venue_sym=venue_sym,
+                requested_notional=requested_notional,
+                remaining_openable_notional=None,
+                order_role=order_role,
+                source=source,
+                reason="aster_headroom_unavailable",
+                evidence_gap=True,
+                error=str(exc)[:200],
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster_headroom_unavailable",
+            )
 
         if remaining is None:
-            return quantized_qty, payload
+            self._record_aster_headroom_admission_block(
+                request=request,
+                venue_sym=venue_sym,
+                requested_notional=requested_notional,
+                remaining_openable_notional=None,
+                order_role=order_role,
+                source=source,
+                reason="aster_headroom_unavailable",
+                evidence_gap=True,
+                error="remaining_openable_notional_missing",
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster_headroom_unavailable",
+            )
 
-        max_qty = max(remaining / price, 0.0)
-        adjusted_qty = min(quantized_qty, max_qty)
-        if qty_step > 0:
-            adjusted_qty = _floor_to_step(adjusted_qty, qty_step)
         payload.update({
             "aster_headroom_source": "remaining_openable_notional",
             "aster_remaining_openable_notional": remaining,
             "aster_requested_qty": quantized_qty,
-            "aster_max_qty": max_qty,
+            "aster_requested_notional": requested_notional,
+            "aster_headroom_blocked": False,
         })
-        if adjusted_qty + 1e-12 < quantized_qty:
-            if adjusted_qty + 1e-12 < max(min_qty, 0.0):
-                raise OrderSubmitError(
-                    SubmitFailureClass.REJECTED,
-                    "aster entry notional headroom exhausted: "
-                    f"remaining_openable_notional={remaining} price={price}",
-                )
-            payload["aster_headroom_clamped"] = True
-            return adjusted_qty, payload
-        payload["aster_headroom_clamped"] = False
-        return quantized_qty, payload
+        if requested_notional > float(remaining) + 1e-9:
+            payload["aster_headroom_blocked"] = True
+            self._record_aster_headroom_admission_block(
+                request=request,
+                venue_sym=venue_sym,
+                requested_notional=requested_notional,
+                remaining_openable_notional=remaining,
+                order_role=order_role,
+                source=source,
+                reason="max_notional_admission_blocked",
+                evidence_gap=False,
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "max_notional_admission_blocked: "
+                f"requested_notional={requested_notional} "
+                f"remaining_openable_notional={remaining}",
+            )
+        return payload
+
+    def _record_aster_headroom_admission_block(
+        self,
+        *,
+        request: OrderRequest,
+        venue_sym: str,
+        requested_notional: float,
+        remaining_openable_notional: float | None,
+        order_role: str,
+        source: str,
+        reason: str,
+        evidence_gap: bool,
+        error: str = "",
+    ) -> None:
+        payload: dict[str, Any] = {
+            "venue": Venue.ASTER.value,
+            "symbol": venue_sym,
+            "reason": reason,
+            "source": source,
+            "requested_notional": requested_notional,
+            "remaining_openable_notional": remaining_openable_notional,
+            "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+            "order_role": order_role,
+            "cooldown_scope": "symbol_and_venue",
+            "block_scope": "symbol_and_venue",
+            "reduce_only": bool(request.reduce_only),
+            "post_only": bool(request.post_only),
+            "client_order_id": request.client_order_id or "",
+            "response_classification": reason,
+            "evidence_gap": evidence_gap,
+        }
+        if error:
+            payload["headroom_error"] = error
+        self._record_order_diagnostic("runtime.entry_admission_blocked", payload)
 
     async def submit_passive_order(self, request: OrderRequest) -> "PassiveOrderAck":
         """Submit a GTC post-only maker order. Returns ack, not fill.
@@ -5615,8 +5734,6 @@ class VenueTransport(MarketDataClient):
                         venue_sym,
                         quantized_qty,
                         quantized_price,
-                        qty_step,
-                        min_qty,
                     )
                 )
             ct_val_sz = float(getattr(symbol_rule, 'ct_val', 0)) if symbol_rule else 0.0
@@ -5716,36 +5833,21 @@ class VenueTransport(MarketDataClient):
             try:
                 raw = await _send_passive_order(body)
             except TransportError as first_error:
-                if spec.venue_id != Venue.ASTER or not _is_aster_max_notional_error(first_error):
-                    raise
-                retry_qty, retry_payload = await self._aster_apply_remaining_openable_headroom(
-                    request,
-                    venue_sym,
-                    quantized_qty,
-                    quantized_price,
-                    qty_step,
-                    min_qty,
-                )
-                if retry_qty + 1e-12 >= quantized_qty:
-                    raise
-                quantized_qty = retry_qty
-                contract_qty = retry_qty
-                body = self._build_passive_order_body(
-                    request, venue_sym, contract_qty, quantized_price, cid,
-                )
-                if retry_payload:
-                    self._record_order_diagnostic(
-                        "order.submit_attempt",
-                        {
-                            **attempt_payload,
-                            **retry_payload,
-                            "normalized_qty": quantized_qty,
-                            "body_field_names": sorted(body.keys()),
-                            "aster_retry_after_max_notional": True,
-                        },
+                if spec.venue_id == Venue.ASTER and _is_aster_max_notional_error(first_error):
+                    self._record_aster_headroom_admission_block(
+                        request=request,
+                        venue_sym=venue_sym,
+                        requested_notional=float(quantized_qty)
+                        * _safe_float(quantized_price, default=0.0),
+                        remaining_openable_notional=None,
+                        order_role="maker",
+                        source="exchange_5018_fallback",
+                        reason="max_notional_admission_blocked",
+                        evidence_gap=False,
+                        error=str(first_error)[:200],
                     )
-                aster_retry_after_max_notional = True
-                raw = await _send_passive_order(body)
+                    raise
+                raise
 
             # --- Venue-specific success guard ---
             if spec.venue_id == Venue.BYBIT:

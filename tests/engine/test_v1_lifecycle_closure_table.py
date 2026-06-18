@@ -454,6 +454,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.stale_risk_state_aligned",
         "runtime.stale_risk_state_alignment_blocked",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+        "runtime.entry_quote_rewarm_terminal_stale",
         "entry.hedge_drive_cancel_replace",
         "runtime.maker_event_lane_wake",
         "runtime.maker_event_reprice",
@@ -479,6 +480,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("runtime.close_price_evidence_missing") == "PASSIVE_CLOSE"
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
+        == "ENTRY_QUOTE_LEASE"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_quote_rewarm_terminal_stale")
         == "ENTRY_QUOTE_LEASE"
     )
     assert map_lifecycle_event_kind("entry.hedge_drive_cancel_replace") == "PENDING_ENTRY"

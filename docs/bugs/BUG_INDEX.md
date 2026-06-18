@@ -17,6 +17,26 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Aster 5018 pre-submit headroom and phase terminality closure,
+2026-06-18:
+After CL-096 fixed Aster V3 symbol precision and stale risk alignment,
+production still showed repeated Aster `-5018` max-notional rejects. The root
+was not order-error classification; V3 private submits lacked a pre-submit
+account headroom gate from `remainingOpenableNotionalValue`, while the older
+transport fallback could shrink quantity after a reject and risk asymmetric
+paired entry legs. CL-097 adds a shared Aster new-risk admission helper, with
+V3 headroom sourced through the dedicated Aster V3 signer client rather than the
+generic Binance-HMAC private transport: insufficient or unavailable headroom
+blocks the candidate locally, emits `runtime.entry_admission_blocked`, starts
+symbol-and-venue containment, keeps reduce-only cleanup open, and never resizes
+one side of the trade. Exchange-race `-5018` responses now enter the same
+contained admission bucket without retry. The same closure adds runtime terminal
+evidence for hard-expired quote rewarm, root diagnostic counters for blank
+actions and terminalized quote/candidate phases. Candidate leases are not counted
+terminalized without selected/rejected/blocked evidence. V1 lifecycle/projection
+mapping for `runtime.entry_quote_rewarm_terminal_stale`. See
+[daily/2026-06-18.md#cluster-cl-097---aster-5018-pre-submit-headroom-gate-and-phase-terminality](daily/2026-06-18.md#cluster-cl-097---aster-5018-pre-submit-headroom-gate-and-phase-terminality).
+
 Latest stale risk-state alignment and order-error closure, 2026-06-18:
 After CL-095 split automatic fail-closed from true operator fail-closed, the
 next production shape showed a second recovery-latching problem:

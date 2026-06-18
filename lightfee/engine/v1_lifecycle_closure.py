@@ -1198,6 +1198,9 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_quote_rewarm_scheduled_after_rest_stale": (
         V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
     ),
+    "runtime.entry_quote_rewarm_terminal_stale": (
+        V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
+    ),
     "runtime.maker_event_no_ws_bbo_quote": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_blocked_gate": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.entry_quote_evidence_resolved_by_ws_bbo": (

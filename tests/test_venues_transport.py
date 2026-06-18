@@ -5090,8 +5090,26 @@ class TestAckOnlyResponses:
 
 class TestV1PassiveBusinessFlowParity:
     @pytest.mark.asyncio
-    async def test_aster_passive_submit_uses_v3_order_without_legacy_headroom(self):
+    async def test_aster_v3_passive_submit_blocks_before_submit_when_headroom_insufficient(
+        self, monkeypatch,
+    ):
         from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
 
         adapter = AsterAdapter(
             mode="live",
@@ -5101,10 +5119,212 @@ class TestV1PassiveBusinessFlowParity:
             ),
         )
         assert adapter._private is not None
-        calls = []
+        private_calls = []
+
+        async def fake_transport_request(method, path, *, params=None, **kwargs):
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise AssertionError(
+                    "Aster V3 headroom must use the V3 signer client, not generic transport"
+                )
+            raise AssertionError(f"unexpected transport request: {method} {path}")
+
+        async def fake_private_request(method, path, *, params=None):
+            private_calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "10"}
+            raise AssertionError("Aster V3 max-notional-blocked order must not submit")
+
+        adapter._transport._request = fake_transport_request
+        adapter._private._request = fake_private_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=15.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-lab-1",
+        )
+
+        try:
+            with pytest.raises(OrderSubmitError) as exc:
+                await adapter.submit_passive_order(req)
+        finally:
+            await adapter.shutdown()
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "max_notional_admission_blocked" in str(exc.value)
+        assert private_calls == [
+            (
+                "GET",
+                "/fapi/v1/remainingOpenableNotionalValue",
+                {"symbol": "LABUSDT", "leverage": 4},
+            )
+        ]
+        diagnostics = adapter._transport.drain_order_diagnostics()
+        blocked = [
+            event for event in diagnostics
+            if event["kind"] == "runtime.entry_admission_blocked"
+        ]
+        assert blocked
+        payload = blocked[-1]["payload"]
+        assert payload["venue"] == "aster"
+        assert payload["symbol"] == "LABUSDT"
+        assert payload["reason"] == "max_notional_admission_blocked"
+        assert payload["source"] == "aster_headroom_precheck"
+        assert payload["requested_notional"] == 30.0
+        assert payload["remaining_openable_notional"] == 10.0
+        assert payload["cooldown_scope"] == "symbol_and_venue"
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_headroom_unavailable_blocks_new_risk_but_not_reduce_only(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        private_calls = []
+
+        async def fake_transport_request(method, path, *, params=None, **kwargs):
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise RuntimeError("aster headroom endpoint unavailable")
+            raise AssertionError(f"unexpected transport request: {method} {path}")
+
+        async def fake_private_request(method, path, *, params=None):
+            private_calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise RuntimeError("aster v3 headroom endpoint unavailable")
+            return {
+                "orderId": "reduce-only-ok",
+                "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                "status": "NEW",
+                "price": (params or {}).get("price", "0"),
+                "origQty": (params or {}).get("quantity", "0"),
+            }
+
+        adapter._transport._request = fake_transport_request
+        adapter._private._request = fake_private_request
+
+        new_risk = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=15.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-maker-lab-2",
+        )
+        reduce_only = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="LABUSDT",
+            side=Side.SELL,
+            quantity=15.0,
+            price=2.0,
+            post_only=True,
+            reduce_only=True,
+            client_order_id="aster-close-lab-1",
+        )
+
+        try:
+            with pytest.raises(OrderSubmitError) as exc:
+                await adapter.submit_passive_order(new_risk)
+            ack = await adapter.submit_passive_order(reduce_only)
+        finally:
+            await adapter.shutdown()
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "aster_headroom_unavailable" in str(exc.value)
+        assert ack.order_id == "reduce-only-ok"
+        assert private_calls == [
+            (
+                "GET",
+                "/fapi/v1/remainingOpenableNotionalValue",
+                {"symbol": "LABUSDT", "leverage": 4},
+            ),
+            (
+                "POST",
+                "/fapi/v3/order",
+                {
+                    "symbol": "LABUSDT",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "quantity": "15",
+                    "price": "2",
+                    "timeInForce": "GTX",
+                    "newClientOrderId": "aster-close-lab-1",
+                    "reduceOnly": "true",
+                },
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_aster_passive_submit_uses_v3_order_after_headroom_precheck(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        private_calls = []
+        transport_calls = []
+
+        async def fake_transport_request(method, path, *, params=None, **kwargs):
+            transport_calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise AssertionError(
+                    "Aster V3 headroom must use the V3 signer client"
+                )
+            raise AssertionError(f"unexpected transport request: {method} {path}")
 
         async def fake_request(method, path, *, params=None):
-            calls.append((method, path, dict(params or {})))
+            private_calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "100"}
             return {
                 "orderId": "aster-oid-1",
                 "clientOrderId": (params or {}).get("newClientOrderId", ""),
@@ -5113,6 +5333,7 @@ class TestV1PassiveBusinessFlowParity:
                 "origQty": (params or {}).get("quantity", "0"),
             }
 
+        adapter._transport._request = fake_transport_request
         adapter._private._request = fake_request
         req = OrderRequest(
             venue=Venue.ASTER,
@@ -5126,16 +5347,50 @@ class TestV1PassiveBusinessFlowParity:
 
         ack = await adapter.submit_passive_order(req)
 
-        order_call = [call for call in calls if call[1] == "/fapi/v3/order"][0]
+        order_call = [call for call in private_calls if call[1] == "/fapi/v3/order"][0]
         assert order_call[2]["quantity"] == "15"
         assert order_call[2]["timeInForce"] == "GTX"
         assert ack.quantity == 15.0
-        assert not any(call[1] == "/fapi/v1/remainingOpenableNotionalValue" for call in calls)
+        assert transport_calls == []
+        assert private_calls[0] == (
+            "GET",
+            "/fapi/v1/remainingOpenableNotionalValue",
+            {"symbol": "GUAUSDT", "leverage": 4},
+        )
+        assert private_calls[1] == (
+            "POST",
+            "/fapi/v3/order",
+            {
+                "symbol": "GUAUSDT",
+                "side": "BUY",
+                "type": "LIMIT",
+                "quantity": "15",
+                "price": "2",
+                "timeInForce": "GTX",
+                "newClientOrderId": "aster-maker-1",
+            },
+        )
         await adapter.shutdown()
 
     @pytest.mark.asyncio
-    async def test_aster_v3_ioc_hedge_omits_time_in_force(self):
+    async def test_aster_v3_ioc_hedge_omits_time_in_force(self, monkeypatch):
         from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=0.01,
+                    min_qty=0.01,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
 
         adapter = AsterAdapter(
             mode="live",
@@ -5147,8 +5402,17 @@ class TestV1PassiveBusinessFlowParity:
         assert adapter._private is not None
         calls = []
 
+        async def fake_transport_request(method, path, *, params=None, **kwargs):
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise AssertionError(
+                    "Aster V3 headroom must use the V3 signer client"
+                )
+            raise AssertionError(f"unexpected transport request: {method} {path}")
+
         async def fake_request(method, path, *, params=None):
             calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "100"}
             return {
                 "orderId": "aster-hedge-oid-1",
                 "clientOrderId": (params or {}).get("newClientOrderId", ""),
@@ -5157,6 +5421,7 @@ class TestV1PassiveBusinessFlowParity:
                 "executedQty": (params or {}).get("quantity", "0"),
             }
 
+        adapter._transport._request = fake_transport_request
         adapter._private._request = fake_request
         req = OrderRequest(
             venue=Venue.ASTER,
@@ -5171,6 +5436,11 @@ class TestV1PassiveBusinessFlowParity:
         fill = await adapter.place_order(req)
 
         order_call = [call for call in calls if call[1] == "/fapi/v3/order"][0]
+        assert calls[0] == (
+            "GET",
+            "/fapi/v1/remainingOpenableNotionalValue",
+            {"symbol": "ZECUSDT", "leverage": 4},
+        )
         assert order_call[2]["type"] == "MARKET"
         assert "timeInForce" not in order_call[2]
         assert fill.order_id == "aster-hedge-oid-1"
@@ -5178,8 +5448,26 @@ class TestV1PassiveBusinessFlowParity:
         await adapter.shutdown()
 
     @pytest.mark.asyncio
-    async def test_aster_v3_passive_submit_reject_raises_order_submit_error(self):
+    async def test_aster_v3_passive_submit_reject_raises_order_submit_error(
+        self, monkeypatch,
+    ):
         from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
 
         adapter = AsterAdapter(
             mode="live",
@@ -5191,8 +5479,17 @@ class TestV1PassiveBusinessFlowParity:
         assert adapter._private is not None
         order_attempts = []
 
+        async def fake_transport_request(method, path, *, params=None, **kwargs):
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                raise AssertionError(
+                    "Aster V3 headroom must use the V3 signer client"
+                )
+            raise AssertionError(f"unexpected transport request: {method} {path}")
+
         async def fake_request(method, path, *, params=None):
             order_attempts.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "100"}
             raise TransportError(
                 TransportErrorCategory.REQUEST_REJECTED,
                 "HTTP 400: max notional",
@@ -5200,6 +5497,7 @@ class TestV1PassiveBusinessFlowParity:
                 body='{"code":-5018,"msg":"maximum notional value limit"}',
             )
 
+        adapter._transport._request = fake_transport_request
         adapter._private._request = fake_request
         req = OrderRequest(
             venue=Venue.ASTER,
@@ -5216,6 +5514,11 @@ class TestV1PassiveBusinessFlowParity:
 
         assert exc.value.class_ == SubmitFailureClass.REJECTED
         assert order_attempts == [
+            (
+                "GET",
+                "/fapi/v1/remainingOpenableNotionalValue",
+                {"symbol": "GUAUSDT", "leverage": 4},
+            ),
             (
                 "POST",
                 "/fapi/v3/order",

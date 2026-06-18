@@ -157,6 +157,14 @@ class RejectingExecutor:
             "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
             False,
         ),
+        (
+            "aster",
+            "LABUSDT",
+            "aster_headroom_unavailable",
+            "aster_headroom_unavailable",
+            "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+            True,
+        ),
     ],
 )
 async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_payload(
@@ -724,6 +732,45 @@ async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
             record for record in records
             if record["kind"] == "runtime.venue_cooldown_started"
         ][-1]["payload"]["reason"] == "aster_max_notional_limit"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_aster_headroom_unavailable_arms_venue_cooldown():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingHedgeAdapter("aster_headroom_unavailable")
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-lab-headroom-gap",
+            symbol="LABUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert aster.place_order_calls == 1
+        assert runtime.state.venue_entry_cooldowns["aster:LABUSDT"]["block_scope"] == "symbol"
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == "venue"
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["evidence_gap"] is True
+        assert runtime._candidate_admission_block(
+            _candidate("OTHERUSDT", "aster", "binance"),
+            1778787002000,
+        )["reason"] == "aster_headroom_unavailable"
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "runtime.venue_cooldown_started"
+        ][-1]["payload"]["reason"] == "aster_headroom_unavailable"
         runtime.journal.close()
 
 

@@ -2615,6 +2615,29 @@ def _payload_is_entry_insufficient_balance_admission_reject(payload: dict[str, A
     )
 
 
+def _payload_is_contained_entry_admission_reject(payload: dict[str, Any]) -> bool:
+    if _payload_is_entry_insufficient_balance_admission_reject(payload):
+        return True
+    exchange_error = _exchange_error_dict(payload)
+    exchange_code = str(exchange_error.get("exchange_code") or "")
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            payload.get("reason"),
+            payload.get("error"),
+            payload.get("response_classification"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    )
+    return (
+        exchange_code == "-5018"
+        or "-5018" in text
+        or "max_notional_admission_blocked" in text
+        or "maximum notional value limit" in text
+    )
+
+
 def _contained_entry_admission_identity(payload: dict[str, Any]) -> tuple[str, str]:
     request_context = _payload_request_context(payload)
     exchange_error = _exchange_error_dict(payload)
@@ -2645,6 +2668,7 @@ def _build_resolved_contained_entry_admission_summary(
     target_symbol = symbol.upper()
     reject_keys: set[tuple[str, str]] = set()
     block_keys: set[tuple[str, str]] = set()
+    aster_max_notional_blocked = 0
     samples: list[dict[str, Any]] = []
 
     for rec in events:
@@ -2658,7 +2682,7 @@ def _build_resolved_contained_entry_admission_summary(
 
         if (
             kind in ORDER_ERROR_KINDS
-            and _payload_is_entry_insufficient_balance_admission_reject(payload)
+            and _payload_is_contained_entry_admission_reject(payload)
         ):
             key = _contained_entry_admission_identity(payload)
             if key[0] and key[1]:
@@ -2680,19 +2704,30 @@ def _build_resolved_contained_entry_admission_summary(
                 payload.get("raw_error"),
             )
         )
+        is_aster_max_notional = (
+            str(payload.get("venue") or "").lower() == "aster"
+            and "max_notional_admission_blocked" in reason_text
+        )
         if not (
             "admission" in reason_text
             or "insufficient_balance" in reason_text
             or "insufficient_margin" in reason_text
             or "110007" in reason_text
+            or is_aster_max_notional
         ):
             continue
-        if str(payload.get("block_scope") or "").lower() not in {"symbol", "venue"}:
+        if str(payload.get("block_scope") or "").lower() not in {
+            "symbol",
+            "venue",
+            "symbol_and_venue",
+        }:
             continue
         key = _contained_entry_admission_identity(payload)
         if not key[0] or not key[1]:
             continue
         block_keys.add(key)
+        if is_aster_max_notional:
+            aster_max_notional_blocked += 1
         if len(samples) < 10:
             samples.append(
                 {
@@ -2722,6 +2757,7 @@ def _build_resolved_contained_entry_admission_summary(
             {"symbol": sym, "venue": venue}
             for sym, venue in sorted(unresolved_keys)
         ],
+        "aster_max_notional_blocked": aster_max_notional_blocked,
         "block_identities": [
             {"symbol": sym, "venue": venue}
             for sym, venue in sorted(block_keys)
@@ -2744,7 +2780,7 @@ def _order_error_resolved_by_contained_entry_admission(
         return False
     if int(resolved_contained_admission_summary.get("resolved_count", 0) or 0) <= 0:
         return False
-    if not _payload_is_entry_insufficient_balance_admission_reject(payload):
+    if not _payload_is_contained_entry_admission_reject(payload):
         return False
     key = _contained_entry_admission_identity(payload)
     resolved = {
@@ -4120,8 +4156,6 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
 
     def default_action_evidence_kind(phase: str) -> str:
         return {
-            "quote_rewarm": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
-            "candidate_lease": "review.candidate_shortlisted",
             "selected_pre_submit": "runtime.entry_selected_submit_deadline_exceeded",
             "entry_selected_terminal": "pending_entry.long_lived_pending_entry",
             "pending_entry": "pending_entry.long_lived_pending_entry",
@@ -4162,6 +4196,7 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "runtime.entry_quote_revalidate_failed",
         "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
         "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+        "runtime.entry_quote_rewarm_terminal_stale",
     }
     recovery_start_kinds = {
         "recovery.blocked",
@@ -4297,9 +4332,21 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         )
         action_taken = str(observed_action.get("action_taken") or "")
         action_evidence_kind = str(observed_action.get("action_evidence_kind") or "")
-        if status == "hard_over_budget" and not action_taken:
+        allow_configured_fallback = phase not in {"candidate_lease", "quote_rewarm"}
+        if (
+            not action_taken
+            and allow_configured_fallback
+            and (
+                status == "hard_over_budget"
+                or (phase == "entry_selected_terminal" and status == "soft_over_budget")
+            )
+        ):
             action_taken = budget.action
-            action_evidence_kind = default_action_evidence_kind(phase)
+            action_evidence_kind = (
+                "runtime.entry_selected_terminal_soft_budget_exceeded"
+                if phase == "entry_selected_terminal" and status == "soft_over_budget"
+                else default_action_evidence_kind(phase)
+            )
         records.append({
             "phase": phase,
             "artifact_id": str(artifact["artifact_id"]),
@@ -4385,16 +4432,26 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
 
     for scheduled_at_ms, key, _payload in quote_rewarm_scheduled:
         terminal_at_ms = 0
+        terminal_kind = ""
         for ts_ms, _kind, event_key, _followup_payload in quote_rewarm_followups:
             if event_key == key and ts_ms >= scheduled_at_ms:
                 terminal_at_ms = ts_ms
+                terminal_kind = _kind
                 break
+        artifact = {
+            "artifact_id": f"quote_rewarm:{key[0]}:{key[1]}:{scheduled_at_ms}",
+            "symbol": key[1],
+            "venue": key[0],
+        }
+        if terminal_kind:
+            artifact["observed_actions"] = {
+                "quote_rewarm": {
+                    "action_taken": budgets["quote_rewarm"].action,
+                    "action_evidence_kind": terminal_kind,
+                }
+            }
         add_record(
-            {
-                "artifact_id": f"quote_rewarm:{key[0]}:{key[1]}:{scheduled_at_ms}",
-                "symbol": key[1],
-                "venue": key[0],
-            },
+            artifact,
             "quote_rewarm",
             scheduled_at_ms,
             terminal_at_ms,
@@ -4406,6 +4463,23 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     hard_over_budget_records = [
         record for record in records if record["status"] == "hard_over_budget"
     ]
+    blank_action_count = sum(
+        1
+        for record in over_budget_records
+        if not str(record.get("action_taken") or "")
+    )
+    terminalized_candidate_lease_count = sum(
+        1
+        for record in over_budget_records
+        if record.get("phase") == "candidate_lease"
+        and str(record.get("action_taken") or "")
+    )
+    terminalized_quote_rewarm_count = sum(
+        1
+        for record in over_budget_records
+        if record.get("phase") == "quote_rewarm"
+        and str(record.get("action_taken") or "")
+    )
     max_age_by_phase: dict[str, int] = {}
     for record in records:
         phase = str(record["phase"])
@@ -4427,6 +4501,9 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "phase_record_count": len(records),
         "over_budget_count": len(over_budget_records),
         "hard_over_budget_count": len(hard_over_budget_records),
+        "blank_action_count": blank_action_count,
+        "terminalized_candidate_lease_count": terminalized_candidate_lease_count,
+        "terminalized_quote_rewarm_count": terminalized_quote_rewarm_count,
         "max_age_by_phase": dict(sorted(max_age_by_phase.items())),
         "samples": over_budget_records[:24],
     }
@@ -4470,6 +4547,64 @@ def _build_duplicate_close_leg_suppressed_summary(
     return {
         "duplicate_close_leg_suppressed_count": total,
         "position_ids": sorted(positions),
+        "samples": samples,
+    }
+
+
+def _build_entry_admission_cooldown_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reason_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    scope_counts: dict[str, int] = {}
+    venue_symbol_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    total = 0
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if kind not in {
+            "runtime.entry_admission_blocked",
+            "runtime.entry_admission_venue_degraded",
+            "runtime.venue_cooldown_started",
+        }:
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        total += 1
+        reason = str(payload.get("reason") or "unknown")
+        source = str(payload.get("source") or "unknown")
+        scope = str(
+            payload.get("cooldown_scope")
+            or payload.get("block_scope")
+            or "unknown"
+        )
+        venue = str(payload.get("venue") or "").lower()
+        symbol = str(payload.get("symbol") or payload.get("blocked_symbol") or "").upper()
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        scope_counts[scope] = scope_counts.get(scope, 0) + 1
+        if venue or symbol:
+            key = f"{venue}:{symbol}" if symbol else f"{venue}:*"
+            venue_symbol_counts[key] = venue_symbol_counts.get(key, 0) + 1
+        if len(samples) < 12:
+            samples.append({
+                "ts_ms": rec.get("ts_ms", 0),
+                "kind": kind,
+                "venue": venue,
+                "symbol": symbol,
+                "reason": reason,
+                "source": source,
+                "cooldown_scope": scope,
+                "blocked_until_ms": int(payload.get("blocked_until_ms") or 0),
+                "evidence_gap": payload.get("evidence_gap"),
+            })
+    return {
+        "count": total,
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "source_counts": dict(sorted(source_counts.items())),
+        "scope_counts": dict(sorted(scope_counts.items())),
+        "venue_symbol_counts": dict(sorted(venue_symbol_counts.items())),
         "samples": samples,
     }
 
@@ -4570,13 +4705,15 @@ def _build_production_acceptance_gate(
         }:
             reason_text = f"{reason} {payload.get('source', '')}".lower()
             if (
-                payload.get("block_scope") in {"symbol", "venue"}
+                str(payload.get("block_scope") or "").lower()
+                in {"symbol", "venue", "symbol_and_venue"}
                 and payload.get("evidence_gap") is False
                 and (
                     "admission" in reason_text
                     or "insufficient_balance" in reason_text
                     or "insufficient_margin" in reason_text
                     or "110007" in reason_text
+                    or "max_notional_admission_blocked" in reason_text
                 )
             ):
                 contained_admission_count += 1
@@ -5669,6 +5806,9 @@ def run_diagnose(
     duplicate_close_leg_suppressed_summary = (
         _build_duplicate_close_leg_suppressed_summary(all_events)
     )
+    entry_admission_cooldown_summary = _build_entry_admission_cooldown_summary(
+        all_events
+    )
     order_errors = _build_order_error_evidence(
         all_events,
         symbol,
@@ -5786,6 +5926,7 @@ def run_diagnose(
         "resolved_contained_entry_admission_summary": (
             resolved_contained_entry_admission_summary
         ),
+        "entry_admission_cooldown_summary": entry_admission_cooldown_summary,
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,
         "order_error_evidence": order_errors,
         "top_exchange_errors": top_exchange_errors,

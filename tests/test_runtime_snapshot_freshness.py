@@ -1449,6 +1449,63 @@ async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucke
     }
 
 
+def test_runtime_entry_quote_rewarm_hard_expiry_terminalizes_and_cools_down(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            entry_quote_lease_ttl_ms=200,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal.open()
+    try:
+        first = runtime.market_data_runtime._schedule_entry_quote_rewarm_after_rest_stale(
+            {
+                "venue": "aster",
+                "symbol": "CHZUSDT",
+                "pair_id": "chz-aster-binance",
+                "candidate_rank": 1,
+            },
+            now_ms=1_000,
+        )
+        terminal = runtime.market_data_runtime._schedule_entry_quote_rewarm_after_rest_stale(
+            {
+                "venue": "aster",
+                "symbol": "CHZUSDT",
+                "pair_id": "chz-aster-binance",
+                "candidate_rank": 1,
+            },
+            now_ms=31_000,
+        )
+        suppressed = runtime.market_data_runtime._schedule_entry_quote_rewarm_after_rest_stale(
+            {
+                "venue": "aster",
+                "symbol": "CHZUSDT",
+                "pair_id": "chz-aster-binance",
+                "candidate_rank": 1,
+            },
+            now_ms=32_000,
+        )
+    finally:
+        runtime.journal.close()
+
+    assert first is not None
+    assert first["sticky_warm_until_ms"] == 121_000
+    assert terminal is not None
+    assert terminal["action_taken"] == "skip_candidate_after_hard_rewarm"
+    assert terminal["age_ms"] == 30_000
+    assert suppressed is None
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    kinds = [record["kind"] for record in records]
+    assert kinds.count("runtime.entry_quote_rewarm_scheduled_after_rest_stale") == 1
+    assert kinds.count("runtime.entry_quote_rewarm_terminal_stale") == 1
+    assert runtime._entry_quote_rewarm_cooldown_until_ms[("aster", "CHZUSDT")] > 32_000
+
+
 @pytest.mark.asyncio
 async def test_runtime_entry_quote_probe_diagnostics_are_disabled_by_default(
     tmp_path,

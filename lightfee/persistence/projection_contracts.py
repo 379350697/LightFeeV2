@@ -195,6 +195,7 @@ JOURNAL_ONLY_DIAGNOSTIC_KINDS: frozenset[str] = frozenset({
     "runtime.entry_skipped_existing_pending",
     "runtime.entry_skipped_no_quote",
     "runtime.entry_skipped_planner_rejected",
+    "runtime.entry_quote_rewarm_terminal_stale",
     "runtime.maker_event_lane_wake",
     "runtime.maker_event_reprice",
     "runtime.maker_event_reprice_error",

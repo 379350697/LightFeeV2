@@ -13,6 +13,7 @@ from typing import Any
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 
@@ -1300,6 +1301,67 @@ class MarketDataRuntime:
         symbol = str(target.get("symbol") or "").strip().upper()
         if not venue or not symbol:
             return None
+        key = (venue, symbol)
+        budgets = phase_budgets_from_strategy(self.ctx.config.strategy)
+        hard_ms = int(budgets["quote_rewarm"].hard_ms or 0)
+        cooldown_until_ms: dict[tuple[str, str], int] = dict(
+            getattr(self.ctx, "_entry_quote_rewarm_cooldown_until_ms", {}) or {}
+        )
+        if int(cooldown_until_ms.get(key, 0) or 0) > now_ms:
+            return None
+        scheduled_at_ms: dict[tuple[str, str], int] = dict(
+            getattr(self.ctx, "_entry_quote_rewarm_scheduled_at_ms", {}) or {}
+        )
+        first_scheduled_at_ms = int(scheduled_at_ms.get(key, 0) or 0)
+        if first_scheduled_at_ms > 0 and hard_ms > 0:
+            age_ms = max(now_ms - first_scheduled_at_ms, 0)
+            if age_ms >= hard_ms:
+                cooldown_ttl_ms = max(
+                    int(
+                        getattr(
+                            self.ctx.config.strategy,
+                            "entry_ws_bbo_sticky_warm_ms",
+                            120_000,
+                        )
+                        or 120_000
+                    ),
+                    self._entry_quote_lease_max_age_ms(),
+                    hard_ms,
+                )
+                blocked_until_ms = now_ms + cooldown_ttl_ms
+                cooldown_until_ms[key] = blocked_until_ms
+                scheduled_at_ms.pop(key, None)
+                setattr(
+                    self.ctx,
+                    "_entry_quote_rewarm_cooldown_until_ms",
+                    cooldown_until_ms,
+                )
+                setattr(
+                    self.ctx,
+                    "_entry_quote_rewarm_scheduled_at_ms",
+                    scheduled_at_ms,
+                )
+                payload = {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "pair_id": str(target.get("pair_id") or ""),
+                    "candidate_rank": int(target.get("candidate_rank") or 0),
+                    "reason_bucket": "rest_resolved_but_stale",
+                    "reason_family": "rest_invalid_quote",
+                    "scheduled_at_ms": first_scheduled_at_ms,
+                    "age_ms": age_ms,
+                    "hard_ms": hard_ms,
+                    "blocked_until_ms": blocked_until_ms,
+                    "cooldown_ttl_ms": cooldown_ttl_ms,
+                    "action_taken": budgets["quote_rewarm"].action,
+                    "source": "entry_quote_truth",
+                    "ts_ms": now_ms,
+                }
+                self.ctx.journal.append(
+                    "runtime.entry_quote_rewarm_terminal_stale",
+                    payload,
+                )
+                return payload
         sticky_ttl_ms = max(
             int(
                 getattr(
@@ -1317,6 +1379,8 @@ class MarketDataRuntime:
         expires_at_ms = now_ms + sticky_ttl_ms
         sticky_warm_until_ms[(venue, symbol)] = expires_at_ms
         setattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", sticky_warm_until_ms)
+        scheduled_at_ms.setdefault(key, now_ms)
+        setattr(self.ctx, "_entry_quote_rewarm_scheduled_at_ms", scheduled_at_ms)
         payload = {
             "venue": venue,
             "symbol": symbol,

@@ -187,9 +187,31 @@ class AsterAdapter(VenueAdapter):
                 else float(preflight["quantized_price"])
             ),
         )
+        headroom_price = (
+            preflight["quantized_price"]
+            if preflight["quantized_price"] is not None
+            else request.price
+        )
+        aster_headroom_payload = (
+            await self._transport._aster_reject_new_risk_without_headroom(
+                request,
+                venue_symbol,
+                float(preflight["quantized_qty"]),
+                headroom_price,
+                order_role="maker" if request.post_only else "hedge",
+                source="aster_headroom_precheck",
+                remaining_openable_provider=(
+                    self._private.fetch_remaining_openable_notional
+                    if self._private is not None
+                    else None
+                ),
+            )
+        )
         attempt_payload = dict(preflight)
         attempt_payload["response_classification"] = "attempt"
         attempt_payload["private_api"] = "aster_v3"
+        if aster_headroom_payload:
+            attempt_payload.update(aster_headroom_payload)
         self._transport._record_order_diagnostic(
             "order.submit_attempt",
             attempt_payload,

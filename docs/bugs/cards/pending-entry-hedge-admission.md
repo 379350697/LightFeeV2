@@ -36,6 +36,16 @@ Deterministic hedge admission reject must:
 ## V1 / Exchange Semantics
 
 - Aster `-5018`: V1 detects max-notional submit reject and starts venue entry cooldown with reason `aster_max_notional_limit`. V2 should keep symbol evidence and also create venue-scope cooldown for this family.
+- Aster V2 private V3 must now do better than V1's post-submit detection:
+  non-`reduce_only` new-risk orders precheck
+  `remainingOpenableNotionalValue` before submitting. If requested notional is
+  above the remaining headroom, block the whole candidate with
+  `max_notional_admission_blocked`; do not shrink one leg and submit a smaller
+  one-sided order. Reduce-only close/flatten remains allowed even if headroom
+  truth is unavailable. The V3 adapter must source this precheck through the
+  Aster V3 signer client, not generic Binance-HMAC private transport; if truth
+  is unavailable, runtime must still arm symbol + venue admission cooldown with
+  `evidence_gap=true`.
 - Aster Pro API V3 credentials are API-wallet/Web3 credentials, not Binance
   HMAC credentials. Aster public market data can keep Binance-compatible FAPI
   paths, but private account/order/open-order probes must use Aster V3
@@ -63,6 +73,7 @@ Deterministic hedge admission reject must:
 | 2026-06-08 | Aster Pro API V3 private transport isolation | fixed, deployed through main | Aster private account/order/open-order probes are no longer routed through shared Binance HMAC transport. V2 now keeps public Aster FAPI market data separate from a dedicated V3 Web3 signer client, so V3 API-wallet credentials do not produce false `Signature for this request is not valid` private-truth failures. Review closure also pins `accountWithJoinMargin`, Aster V3 capability truth, and REST V3 order-truth probe paths. Follow-up startup safety and host fixes are in main (`9d037f5`, `6054c47`) and the deployed manifest line. |
 | 2026-06-08 | Production issues 3-7 admission evidence audit | fixed, deployed/cloud verified | Existing admission classifier and venue-scope downgrade coverage stayed authoritative. CL-052 did not add another admission branch; it records that deployment review should verify the already-covered `runtime.entry_admission_blocked`, `runtime.entry_admission_venue_degraded`, `pending_entry.hedge_admission_blocked`, and `entry.aborted` payload fields across the same source/scope/venue/symbol/pair/action/cooldown contract. |
 | 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure now uses `/v5/order/pre-check-order` before maker dispatch when the adapter supports it. `110125/110126/110123` records `runtime.entry_admission_blocked` with `source=pre_entry_bybit_precheck` and prevents maker submit; pending hedge admission handling remains the fallback. |
+| 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | local green, deploy pending | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
 
 ## Recurrences
 
@@ -90,7 +101,13 @@ Deterministic hedge admission reject must:
    before any maker `order.submit_attempt`.
 3. If the reject was only discovered after maker fill, check whether `pending_entry.hedge_admission_blocked` appears after the hedge reject.
 4. Check `runtime.entry_admission_blocked` and `state.venue_entry_cooldowns`.
-5. For Aster `-5018`, check `runtime.venue_cooldown_started` reason `aster_max_notional_limit`.
+5. For Aster `-5018`, first check whether `runtime.entry_admission_blocked`
+   appeared before HTTP order submit with
+   `reason=max_notional_admission_blocked`,
+   `source=aster_headroom_precheck`, and
+   `cooldown_scope=symbol_and_venue`. If the exchange returned `-5018` first,
+   check fallback source `exchange_5018_fallback`; it must not retry with a
+   shrunken one-sided quantity.
 6. For Hyperliquid insufficient margin, check the symbol and venue cooldown events carry `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false`.
 7. If `hyperliquid:*` venue cooldown is active, confirm
    `runtime.entry_admission_venue_degraded` prunes Hyperliquid candidates before

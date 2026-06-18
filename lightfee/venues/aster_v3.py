@@ -53,6 +53,7 @@ ASTER_V3_POSITION_PATH = "/fapi/v3/positionRisk"
 ASTER_V3_ACCOUNT_PATH = "/fapi/v3/accountWithJoinMargin"
 ASTER_V3_LEVERAGE_PATH = "/fapi/v3/leverage"
 ASTER_V3_LEVERAGE_BRACKET_PATH = "/fapi/v3/leverageBracket"
+ASTER_REMAINING_OPENABLE_NOTIONAL_PATH = "/fapi/v1/remainingOpenableNotionalValue"
 
 
 def _missing_aster_v3_signing_dependencies() -> list[str]:
@@ -441,6 +442,22 @@ class AsterV3Client:
             data.get("availableBalance")
         )
         return snapshot
+
+    async def fetch_remaining_openable_notional(
+        self,
+        symbol: str,
+        leverage: int,
+    ) -> float | None:
+        raw = await self._request(
+            "GET",
+            ASTER_REMAINING_OPENABLE_NOTIONAL_PATH,
+            params={"symbol": symbol, "leverage": int(leverage or 0)},
+        )
+        value = raw.get("remainingOpenableNotionalValue") if isinstance(raw, dict) else None
+        remaining = _safe_float(value, default=-1.0)
+        if remaining >= 0.0:
+            return remaining
+        return None
 
     async def ensure_entry_leverage(
         self,

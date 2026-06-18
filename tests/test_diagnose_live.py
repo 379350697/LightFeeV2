@@ -1176,6 +1176,98 @@ def test_run_diagnose_resolves_bybit_insufficient_balance_entry_reject_when_admi
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_resolves_aster_5018_when_headroom_admission_blocked(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1781665908000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781665905361,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1781665905100-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "reason": (
+                        "HTTP 400: You've reached the maximum notional value "
+                        "limit for this symbol."
+                    ),
+                    "exchange_error": {
+                        "http_status": 400,
+                        "exchange_code": "-5018",
+                        "exchange_msg": (
+                            "You've reached the maximum notional value limit "
+                            "for this symbol."
+                        ),
+                        "evidence_completeness": "complete",
+                        "confidence": "high",
+                        "raw_body": (
+                            '{"code":-5018,"msg":"You have reached the maximum '
+                            'notional value limit for this symbol."}'
+                        ),
+                    },
+                    "request_context": {
+                        "venue": "aster",
+                        "symbol": "LABUSDT",
+                        "post_only": True,
+                        "reduce_only": False,
+                    },
+                },
+            },
+            {
+                "ts_ms": 1781665905362,
+                "kind": "runtime.entry_admission_blocked",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "LABUSDT",
+                    "reason": "max_notional_admission_blocked",
+                    "source": "aster_headroom_precheck",
+                    "block_scope": "symbol_and_venue",
+                    "cooldown_scope": "symbol_and_venue",
+                    "evidence_gap": False,
+                    "requested_notional": 30.0,
+                    "remaining_openable_notional": 10.0,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LABUSDT",
+            venues=["aster", "binance"],
+            now_ms=1781665910000,
+        )
+
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        summary = result["resolved_contained_entry_admission_summary"]
+        assert summary["resolved_count"] == 1
+        assert summary["aster_max_notional_blocked"] == 1
+        assert summary["resolved_symbols"] == ["LABUSDT"]
+        cooldown_summary = result["entry_admission_cooldown_summary"]
+        assert cooldown_summary["reason_counts"] == {
+            "max_notional_admission_blocked": 1
+        }
+        assert cooldown_summary["scope_counts"] == {"symbol_and_venue": 1}
+        assert result["production_acceptance_gate"]["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_diagnose_exposes_local_order_identifier_reconcile_summary(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -5146,6 +5238,15 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
             "payload": {"venue": "aster", "symbol": "DATASUSDT"},
         },
         {
+            "ts_ms": 50_000,
+            "kind": "runtime.entry_quote_rewarm_terminal_stale",
+            "payload": {
+                "venue": "aster",
+                "symbol": "DATASUSDT",
+                "action_taken": "skip_candidate_after_hard_rewarm",
+            },
+        },
+        {
             "ts_ms": 20_000,
             "kind": "review.candidate_shortlisted",
             "payload": {"candidate_id": "candidate-slow", "symbol": "CANDUSDT"},
@@ -5220,6 +5321,9 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
 
     assert phase_summary["over_budget_count"] >= 5
     assert phase_summary["hard_over_budget_count"] >= 5
+    assert phase_summary["blank_action_count"] == 1
+    assert phase_summary["terminalized_candidate_lease_count"] == 0
+    assert phase_summary["terminalized_quote_rewarm_count"] == 1
     assert phase_summary["budget_defaults_ms"]["selected_pre_submit"]["hard_ms"] == 15000
     assert phase_summary["budget_defaults_ms"]["pending_entry"]["hard_ms"] == 120000
     assert phase_summary["budget_defaults_ms"]["close_terminal"]["hard_ms"] == 300000
@@ -5233,12 +5337,14 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
         "skip_candidate_after_hard_rewarm"
     )
     assert samples_by_phase["quote_rewarm"]["action_evidence_kind"] == (
-        "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
+        "runtime.entry_quote_rewarm_terminal_stale"
     )
     assert samples_by_phase["candidate_lease"]["hard_ms"] == 60000
     assert samples_by_phase["candidate_lease"]["truth_source"] == (
         "fresh_scan_shortlist_candidate"
     )
+    assert samples_by_phase["candidate_lease"]["action_taken"] == ""
+    assert samples_by_phase["candidate_lease"]["action_evidence_kind"] == ""
     assert samples_by_phase["selected_pre_submit"] == {
         "phase": "selected_pre_submit",
         "artifact_id": "entry-no-submit",
@@ -5255,6 +5361,12 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
     }
     assert samples_by_phase["entry_selected_terminal"]["status"] == "hard_over_budget"
     assert samples_by_phase["entry_selected_terminal"]["hard_ms"] == 300000
+    assert samples_by_phase["entry_selected_terminal"]["action_taken"] == (
+        "cancel_or_abort_entry_and_reconcile"
+    )
+    assert samples_by_phase["entry_selected_terminal"]["action_evidence_kind"] == (
+        "pending_entry.long_lived_pending_entry"
+    )
     assert samples_by_phase["pending_entry"]["truth_source"] == (
         "pending_entry_terminality_from_order_fill_position_truth"
     )
@@ -5291,7 +5403,42 @@ def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
 
     assert phase_summary["artifact_count"] == 0
     assert phase_summary["over_budget_count"] == 0
+    assert phase_summary["blank_action_count"] == 0
+    assert phase_summary["terminalized_candidate_lease_count"] == 0
+    assert phase_summary["terminalized_quote_rewarm_count"] == 0
     assert phase_summary["samples"] == []
+
+
+def test_phase_duration_summary_gives_soft_over_budget_selected_terminal_action():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-soft-terminal", "symbol": "SOFTUSDT"},
+        },
+        {
+            "ts_ms": 181_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+    samples_by_phase = {
+        sample["phase"]: sample for sample in phase_summary["samples"]
+    }
+
+    assert samples_by_phase["entry_selected_terminal"]["status"] == "soft_over_budget"
+    assert samples_by_phase["entry_selected_terminal"]["action_taken"] == (
+        "cancel_or_abort_entry_and_reconcile"
+    )
+    assert samples_by_phase["entry_selected_terminal"]["action_evidence_kind"] == (
+        "runtime.entry_selected_terminal_soft_budget_exceeded"
+    )
+    assert phase_summary["blank_action_count"] == 0
 
 
 def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):

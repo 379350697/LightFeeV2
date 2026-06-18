@@ -1,7 +1,7 @@
 """Lightweight lifecycle SLA budget table for live diagnostics.
 
 The table is intentionally small: it names the phase budget, the minimal
-fail-closed action, and the truth source expected for terminality. Runtime code
+containment action, and the truth source expected for terminality. Runtime code
 can keep using the existing pending/close/recovery flows.
 """
 
@@ -68,7 +68,7 @@ DEFAULT_PHASE_BUDGETS: dict[str, LifecyclePhaseBudget] = {
         phase="entry_selected_terminal",
         soft_ms=120000,
         hard_ms=300000,
-        action="abort_reconcile_cleanup_fail_closed",
+        action="cancel_or_abort_entry_and_reconcile",
         truth_source="selected_to_terminal_runtime_lifecycle",
     ),
     "open_position_due_close": LifecyclePhaseBudget(
