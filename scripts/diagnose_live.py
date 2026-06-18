@@ -5495,6 +5495,7 @@ def run_diagnose(
         all_events.extend(_read_jsonl_tail(ef, max_events))
         if len(all_events) >= max_events:
             break
+    recent_events = list(all_events)
 
     window = _compute_window(
         since_deploy, generated_at_ms, deploy_status, service_status, all_events,
@@ -5506,6 +5507,10 @@ def run_diagnose(
 
     if symbol or venues:
         all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
+        recent_events = [
+            e for e in recent_events
+            if _event_matches_scope(e, symbol, venues)
+        ]
 
     health = _build_health(state, service_status)
     local_state = _build_local_state(state, all_events)
@@ -5596,7 +5601,11 @@ def run_diagnose(
         event_counts[kind] = event_counts.get(kind, 0) + 1
     quick_flat_summary = summarize_quick_flat_events(all_events)
     passive_close_terminal_summary = _build_passive_close_terminal_summary(all_events)
-    auto_fail_closed_summary = build_auto_fail_closed_summary(all_events)
+    auto_fail_closed_window_summary = build_auto_fail_closed_summary(all_events)
+    auto_fail_closed_summary = build_auto_fail_closed_summary(
+        recent_events,
+        since_ms=max(0, generated_at_ms - 24 * 3600 * 1000),
+    )
     entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
         all_events,
         production_acceptance_gate,
@@ -5677,6 +5686,7 @@ def run_diagnose(
         "quick_flat_summary": quick_flat_summary,
         "passive_close_terminal_summary": passive_close_terminal_summary,
         "auto_fail_closed_summary": auto_fail_closed_summary,
+        "auto_fail_closed_window_summary": auto_fail_closed_window_summary,
         "entry_quantity_terminal_summary": entry_quantity_terminal_summary,
         "unpaired_live_position_recovery_summary": (
             unpaired_live_position_recovery_summary

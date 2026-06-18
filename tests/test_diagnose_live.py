@@ -200,6 +200,65 @@ def test_auto_fail_closed_summary_ignores_events_before_window():
     assert summary["latest_event"]["symbols"] == ["LINKUSDT"]
 
 
+def test_run_diagnose_reports_recent_auto_fail_closed_before_since_deploy_window(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000005000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000004900,
+                "kind": "runtime.auto_fail_closed_recovered",
+                "payload": {
+                    "source": "repair_auto_fail_closed_latch",
+                    "reason": "stale_auto_fail_closed_operator_latch_repaired",
+                    "new_risk_mode": "running",
+                    "residual_blockers": [],
+                },
+            },
+            {
+                "ts_ms": 1700000005000,
+                "kind": "runtime.started",
+                "payload": {},
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_service_status", lambda unit_dir: {
+            "lightfee-live": {
+                "active": "active",
+                "unit_exists": True,
+                "n_restarts": 0,
+                "started_at_ms": 1700000005000,
+            }
+        })
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000006000,
+            since_deploy=True,
+        )
+
+        assert result["health"]["ok"] is True
+        assert result["auto_fail_closed_summary"]["recovered_count"] == 1
+        assert result["auto_fail_closed_summary"]["recent_incident"] is True
+        assert result["auto_fail_closed_window_summary"]["recovered_count"] == 0
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     venues = venues or []
     return {
