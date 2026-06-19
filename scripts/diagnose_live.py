@@ -4862,6 +4862,7 @@ def _build_single_leg_exposure_recovery_summary(
 
 def _build_business_progression_quality_summary(
     events: list[dict[str, Any]],
+    production_acceptance_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     phase_duration_summary = _build_phase_duration_summary(events)
     phase_handoff_quality = phase_duration_summary.get(
@@ -4888,6 +4889,28 @@ def _build_business_progression_quality_summary(
     adopted_reduce_only_order_count = 0
     duplicate_reduce_only_submit_blocked_count = 0
     deterministic_reject_after_submit_count = 0
+    passive_close_resolved_without_terminal_truth_entries: set[str] = set()
+    passive_close_terminal_truth_entries: set[str] = set()
+
+    def gate_currently_green() -> bool:
+        if not isinstance(production_acceptance_gate, dict):
+            return False
+        if production_acceptance_gate.get("gate_passed") is not True:
+            return False
+        if production_acceptance_gate.get("exchange_truth_flat") is not True:
+            return False
+        if production_acceptance_gate.get("exchange_truth_no_open_orders") is not True:
+            return False
+        if production_acceptance_gate.get("blocking_reasons"):
+            return False
+        lifecycle = production_acceptance_gate.get("v1_lifecycle_summary", {})
+        if isinstance(lifecycle, dict):
+            try:
+                if int(lifecycle.get("blocking_row_count") or 0) > 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
 
     def event_ts(rec: dict[str, Any]) -> int:
         payload = rec.get("payload", {})
@@ -4911,6 +4934,44 @@ def _build_business_progression_quality_summary(
 
     def venue_value(payload: dict[str, Any], key: str) -> str:
         return str(payload.get(key) or "").lower()
+
+    def passive_close_has_terminal_truth(payload: dict[str, Any]) -> bool:
+        truth = payload.get("exchange_truth")
+        if not isinstance(truth, dict):
+            return False
+        if truth.get("truth_available") is False:
+            return False
+        positions_flat = (
+            truth.get("positions_flat")
+            if isinstance(truth.get("positions_flat"), bool)
+            else None
+        )
+        if positions_flat is None:
+            positions = truth.get("positions")
+            if isinstance(positions, list):
+                position_items = [
+                    item for item in positions if isinstance(item, dict)
+                ]
+                positions_flat = bool(position_items) and all(
+                    abs(float((item or {}).get("quantity") or 0.0)) <= 1e-9
+                    for item in position_items
+                )
+        open_orders_flat = (
+            truth.get("open_orders_flat")
+            if isinstance(truth.get("open_orders_flat"), bool)
+            else None
+        )
+        if open_orders_flat is None:
+            open_order_truth = truth.get("open_order_truth")
+            if isinstance(open_order_truth, list):
+                open_order_items = [
+                    item for item in open_order_truth if isinstance(item, dict)
+                ]
+                open_orders_flat = bool(open_order_items) and all(
+                    bool((item or {}).get("open_orders_empty"))
+                    for item in open_order_items
+                )
+        return bool(positions_flat) and bool(open_orders_flat)
 
     def route_venues(payload: dict[str, Any]) -> list[str]:
         venues: list[str] = []
@@ -5013,6 +5074,23 @@ def _build_business_progression_quality_summary(
             text = json.dumps(payload, sort_keys=True).lower()
             if code == "110007" or "110007" in text or "ab not enough" in text:
                 deterministic_reject_after_submit_count += 1
+        elif kind == "exit.passive_close_resolved":
+            resolved_position_id = entry_id(payload)
+            if resolved_position_id:
+                if passive_close_has_terminal_truth(payload):
+                    passive_close_terminal_truth_entries.add(resolved_position_id)
+                else:
+                    passive_close_resolved_without_terminal_truth_entries.add(
+                        resolved_position_id
+                    )
+        elif kind in {
+            "exit.passive_close_fallback_terminal_flat",
+            "runtime.position_lifecycle_terminal",
+            "exit.reconciled",
+        }:
+            terminal_position_id = entry_id(payload)
+            if terminal_position_id and passive_close_has_terminal_truth(payload):
+                passive_close_terminal_truth_entries.add(terminal_position_id)
 
         if kind in {
             "runtime.entry_admission_blocked",
@@ -5092,19 +5170,45 @@ def _build_business_progression_quality_summary(
         phase_duration_summary.get("terminalized_quote_rewarm_count", 0)
         or 0
     )
-    active_stuck_count = max(
-        int(phase_duration_summary.get("hard_over_budget_count", 0) or 0)
-        - int(
-            phase_duration_summary.get("hard_terminalized_candidate_lease_count", 0)
-            or 0
-        )
-        - int(
-            phase_duration_summary.get("hard_terminalized_quote_rewarm_count", 0)
-            or 0
-        )
-        - len(recovered_but_counted_entries),
-        0,
+    passive_close_truth_lag_resolved_entries = (
+        passive_close_resolved_without_terminal_truth_entries
+        & passive_close_terminal_truth_entries
     )
+    recovered_but_counted_entries.update(passive_close_truth_lag_resolved_entries)
+    historical_hard_over_budget_recovered_count = 0
+    if gate_currently_green():
+        historical_hard_over_budget_recovered_count = int(
+            phase_duration_summary.get("hard_over_budget_count", 0) or 0
+        )
+        for sample in phase_duration_summary.get("samples", []) or []:
+            if not isinstance(sample, dict):
+                continue
+            if str(sample.get("status") or "") != "hard_over_budget":
+                continue
+            recovered_id = str(
+                sample.get("entry_id")
+                or sample.get("position_id")
+                or sample.get("artifact_id")
+                or ""
+            )
+            if recovered_id:
+                recovered_but_counted_entries.add(recovered_id)
+    if gate_currently_green():
+        active_stuck_count = 0
+    else:
+        active_stuck_count = max(
+            int(phase_duration_summary.get("hard_over_budget_count", 0) or 0)
+            - int(
+                phase_duration_summary.get("hard_terminalized_candidate_lease_count", 0)
+                or 0
+            )
+            - int(
+                phase_duration_summary.get("hard_terminalized_quote_rewarm_count", 0)
+                or 0
+            )
+            - len(recovered_but_counted_entries),
+            0,
+        )
     return {
         "pre_submit_blocked": pre_submit_blocked,
         "single_leg_created": single_leg_created,
@@ -5113,6 +5217,9 @@ def _build_business_progression_quality_summary(
         "candidate_takeover_count": candidate_takeover_count,
         "quote_rewarm_terminalized_count": quote_rewarm_terminalized_count,
         "recovered_but_counted_issue_count": len(recovered_but_counted_entries),
+        "historical_hard_over_budget_recovered_count": (
+            historical_hard_over_budget_recovered_count
+        ),
         "active_stuck_count": active_stuck_count,
         "ownerless_open_order_count": ownerless_open_order_count,
         "owned_pending_passive_close_count": owned_pending_passive_close_count,
@@ -5122,6 +5229,12 @@ def _build_business_progression_quality_summary(
         ),
         "deterministic_reject_after_submit_count": (
             deterministic_reject_after_submit_count
+        ),
+        "passive_close_resolved_without_terminal_truth_count": len(
+            passive_close_resolved_without_terminal_truth_entries
+        ),
+        "passive_close_truth_lag_resolved_count": len(
+            passive_close_truth_lag_resolved_entries
         ),
         "repeated_single_leg_guarded": {
             "violation_count": violation_count,
@@ -6408,19 +6521,6 @@ def run_diagnose(
     single_leg_exposure_recovery_summary = (
         _build_single_leg_exposure_recovery_summary(all_events)
     )
-    business_progression_quality_summary = (
-        _build_business_progression_quality_summary(all_events)
-    )
-    repeated_single_leg_guarded = business_progression_quality_summary.get(
-        "repeated_single_leg_guarded",
-        {},
-    )
-    if int(repeated_single_leg_guarded.get("violation_count", 0) or 0) > 0:
-        fingerprint = "repeated_single_leg_fee_drag_after_cooldown"
-        if fingerprint not in health.get("fingerprints", []):
-            health.setdefault("fingerprints", []).append(fingerprint)
-        health["critical_count"] = int(health.get("critical_count", 0) or 0) + 1
-        health["ok"] = False
     cleanup_blocker_summary = _build_cleanup_blocker_summary(all_events)
     order_errors = _build_order_error_evidence(
         all_events,
@@ -6441,6 +6541,22 @@ def run_diagnose(
     production_acceptance_gate = _build_production_acceptance_gate(
         all_events, local_state, exchange_truth, state_consistency,
     )
+    business_progression_quality_summary = (
+        _build_business_progression_quality_summary(
+            all_events,
+            production_acceptance_gate=production_acceptance_gate,
+        )
+    )
+    repeated_single_leg_guarded = business_progression_quality_summary.get(
+        "repeated_single_leg_guarded",
+        {},
+    )
+    if int(repeated_single_leg_guarded.get("violation_count", 0) or 0) > 0:
+        fingerprint = "repeated_single_leg_fee_drag_after_cooldown"
+        if fingerprint not in health.get("fingerprints", []):
+            health.setdefault("fingerprints", []).append(fingerprint)
+        health["critical_count"] = int(health.get("critical_count", 0) or 0) + 1
+        health["ok"] = False
     for fingerprint in production_acceptance_gate.get("fingerprints", []) or []:
         if fingerprint not in health.get("fingerprints", []):
             health.setdefault("fingerprints", []).append(fingerprint)

@@ -12,6 +12,8 @@ residuals, and live-flat cleanup.
 - `execution.close_deadline_breached`
 - `exit.passive_close_hedge_deadline_fail_closed`
 - `pending_passive_close_flat_probe`
+- `exit.passive_close_waiting_exchange_flat_truth`
+- `passive_close_resolved_without_terminal_truth_count`
 - `price_unavailable_for_min_notional`
 - `passive_close_maker_filled_under_chunk`
 - `entry.cleanup_leg_exposure`
@@ -21,7 +23,19 @@ residuals, and live-flat cleanup.
 
 ## Current Effective Rule
 
-Terminal reduce-only, already-flat, under-min, or price-unavailable close branches can clear only after live exchange truth proves both legs flat. If live truth shows residual exposure and the residual is tradeable, route through V1-style compensation/flattening. If truth is incomplete or cleanup cannot prove flat, retain/fail-closed with structured evidence.
+Terminal reduce-only, already-flat, under-min, price-unavailable, or
+maker+hedge-fill-complete close branches can clear only after live exchange
+truth proves both legs flat and both venues have no live open orders. If live
+truth shows residual exposure and the residual is tradeable, route through
+V1-style compensation/flattening. If truth is incomplete or cleanup cannot
+prove flat, retain/fail-closed with structured evidence.
+
+Local maker+hedge fill equality is not live terminal proof in production mode.
+If passive close execution is locally complete but exchange position/open-order
+truth has not jointly proven flat, retain `pending_passive_close`, keep the
+close owner, emit `exit.passive_close_waiting_exchange_flat_truth`, and let
+passive close maintenance probe again. Paper/backtest may keep local execution
+completion as terminal because no live exchange truth exists.
 
 Bybit reduce-only close `110017/orderQty will be truncated to zero` is terminal
 zero-qty evidence for that reduce-only request, not a confirmed close fill and
@@ -50,6 +64,13 @@ and then throw before `open_positions` / `pending_passive_closes` are removed
 or before the V1 recovery decision core sees the clear evidence.
 The same normalized queue boundary applies to pending-close reconciliation
 processing, supervisor venue coverage, and entry-conflict gating.
+
+Diagnostics must separate current risk from recovered process quality. An
+`exit.passive_close_resolved` payload without explicit exchange position-flat
+and open-order-flat proof counts as
+`passive_close_resolved_without_terminal_truth_count`. If a later production
+gate is green with exchange flat/no-open-orders and no V1 lifecycle blockers,
+the artifact is a recovered process issue, not current `active_stuck_count`.
 
 ## V1 / Exchange Semantics
 
@@ -85,6 +106,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-10 | MOVEUSDT ACK-only duplicate-client diagnose closure | fixed locally, deploy pending | CL-066 closes the deployed MOVEUSDT evidence-consumption gap where Bybit ACK-only accepted ids plus same-client-id `110072` stayed in active diagnose errors after reconciliation/terminal/current exchange truth proved flat. Diagnose now treats ACK-only `order.uncertain` as implicit truth-gap registration when accepted ids and no-fill evidence are present, binds nested request identities, and resolves matching duplicate-client artifacts only behind flat/no-open-orders truth. Close execution now records duplicate-client live-flat as `exit.close_duplicate_client_order_resolved_live_flat`, not zero-quantity `order.filled`. |
 | 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed, deployed/cloud verified | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. Cloud verification under `fd1579d` is flat/no-open-orders with no active order errors and no unmapped lifecycle events. |
 | 2026-06-19 | Existing reduce-only close order covers quantity | fixed locally, deploy pending | GENIUSUSDT-style close drift is not terminal-flat when Bybit still has nonzero position plus a matching reduce-only close order. CL-100 adopts the existing close order into pending passive close state, adds journal-based close-owner recovery, and keeps diagnose/gate red until exchange truth is flat/no-open-orders or owned close work is resolved. |
+| 2026-06-19 | Passive close resolved before terminal exchange truth | fixed locally, release pending | ESPORTSUSDT-style truth lag showed current production could recover flat/no-open-orders while diagnostics still counted old passive-close artifacts as active stuck. CL-101 keeps live pending passive close owner in `waiting_exchange_flat_truth` until position/open-order truth jointly proves flat, maps that owner as `owned_pending_passive_close`, and moves gate-green historical hard-over-budget artifacts into recovered process counters. |
 
 ## Recurrences
 

@@ -17,75 +17,15 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-Latest open/close lifecycle owner-truth closure, 2026-06-19:
-GENIUSUSDT-style review found that previous fixes could be locally safe yet
-business-stuck: a Bybit reduce-only close order may remain live after
-passive-close terminal/no-fill or `110017`, but local maker ids could be
-cleared before that order was adopted as owned close work. CL-100 extends the
-owner ledger so both local `pending_passive_closes` and passive-close journal
-events own matching reduce-only close open orders as
-`owned_pending_passive_close`; V1 lifecycle closure projects them as
-`PASSIVE_CLOSE` blockers that prevent new risk and route to passive close
-maintenance. Passive close now adopts existing matching reduce-only close
-orders before clearing ids, treats `110017` as terminal-flat only when
-position truth and open-order truth are both flat, blocks ownerless close-order
-ambiguity fail-closed, and emits Bybit `110007` opening cooldown evidence via
-`runtime.entry_admission_symbol_cooldown_armed`. Diagnose adds
-owner/adoption/duplicate-reduce-only/deterministic-reject business-quality
-counters and production gate row counts, so `health.ok` cannot hide
-`gate_passed=false`. Relation to prior closures: CL-083 covers the already-flat
-`110017` terminal-zero branch; CL-100 covers the non-flat
-existing-reduce-only-order branch; CL-099 covers opening admission and
-single-leg fee-drag. See
-[daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption)
-and [cards/passive-close-terminal-flatness.md](cards/passive-close-terminal-flatness.md).
+Index rows stay compact. Daily ledgers contain full evidence, root cause,
+fixes, and verification; cards contain reusable family rules.
 
-Latest Aster headroom, single-leg fee-drag, and phase handoff quality closure,
-2026-06-19:
-The next production-readiness review found that the issue was broader than
-visible order errors. Aster hedge-side `remaining_openable_notional=0` /
-max-notional truth must block before maker submit, because creating the maker
-leg first can manufacture avoidable single-leg exposure and repeated
-cleanup/reopen fee drag. CL-099 adds a two-leg admission check after selection
-and before maker submit, routes Aster headroom through the V3 signer path, keeps
-post-fill deterministic hedge admission blocks on the single-leg cleanup path,
-and arms hard route cooldown so the same maker/hedge path cannot immediately
-open again. Diagnostics now expose `business_progression_quality_summary`
-(`pre_submit_blocked`, `single_leg_created`, `single_leg_cleanup`,
-`cleanup_after_admission_block`, `repeated_single_leg_guarded`) and
-`phase_handoff_quality` for candidate and quote-rewarm stages. Candidate lease
-expiration emits `runtime.candidate_lease_expired` and
-`review.candidate_rejected rejected_stage=candidate_lease`; quote rewarm keeps
-terminal stale evidence. The follow-up business-quality closure also moves
-symbol-scope deterministic admission blocks such as
-`insufficient_balance_admission_blocked` into the candidate prefilter, keeps
-Aster `aster:*` cooldown as a route-level no-new-risk signal, adds
-`candidate_takeover_count`, `quote_rewarm_terminalized_count`,
-`recovered_but_counted_issue_count`, and `active_stuck_count` to
-`business_progression_quality_summary`. A follow-up diagnostic guard keeps
-soft-over-budget quote/candidate terminalization from offsetting unrelated
-hard-over-budget active stuck work. Passive close terminal/no-fill evidence now
-includes `exchange_code`, `exchange_msg`, and `raw_error`. See
-[daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality).
-
-Latest venue private auth admission and single-leg recovery closure,
-2026-06-19:
-After Aster 5018 and phase terminality fixes, the remaining production family
-was a module-level paired-entry closure gap: Bybit private auth failures such as
-`33004 api key expired` could be discovered only during order submit instead of
-venue private admission, and a maker-filled/hedge-auth-failed entry could fall
-toward generic unpaired recovery without owner-bound single-leg cleanup
-evidence. CL-098 adds a shared venue private health classifier, makes Bybit auth
-invalid a venue-wide new-risk cooldown (`runtime.entry_admission_blocked
-reason=venue_auth_invalid source=venue_private_health_precheck`), keeps
-reduce-only cleanup outside normal admission gates, and emits a critical
-`cleanup_blocked_by_venue_auth_invalid` blocker if credentials also prevent
-cleanup. Pending hedge auth-invalid now stays bound to the original pending
-entry, enters `single_leg_exposure_recovery`, flattens the maker venue
-reduce-only when high-confidence truth proves a single live leg/no open orders,
-and emits submitted/succeeded/failed/terminalized runtime evidence for
-diagnostics. See
-[daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure](daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure).
+| Date | Cluster | Failure Family | Status | Start Here |
+|---|---|---|---|---|
+| 2026-06-19 | CL-101 | passive-close terminal truth lag; gate-green historical active-stuck false positive | fixed locally, release pending | [daily](daily/2026-06-19.md#cluster-cl-101---passive-close-terminal-truth-lag-and-gate-green-active-stuck-diagnostic-closure), [card](cards/passive-close-terminal-flatness.md) |
+| 2026-06-19 | CL-100 | open/close owner ledger; Bybit reduce-only adoption; `110017` non-flat branch | deployed in `c35dd35`, terminal-truth follow-up local | [daily](daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption), [card](cards/passive-close-terminal-flatness.md) |
+| 2026-06-19 | CL-099 | Aster headroom; single-leg fee drag; candidate/quote active handoff | deployed in `c35dd35`, process-quality follow-up local | [daily](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality), [card](cards/pending-entry-hedge-admission.md) |
+| 2026-06-19 | CL-098 | venue private auth admission; owner-bound single-leg recovery | deployed in `c35dd35`, current cloud recovered | [daily](daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure), [card](cards/pending-entry-hedge-admission.md) |
 
 Latest Aster 5018 pre-submit headroom and phase terminality closure,
 2026-06-18:

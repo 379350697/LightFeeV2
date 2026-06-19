@@ -877,12 +877,29 @@ class PassiveCloseExecutor:
                 # Restore from open_positions if possible
                 position = state.open_positions.get(position_id)
                 if position is None:
+                    if self._runtime_mode == "live":
+                        now_ms = self._now_ms()
+                        next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                        pending.next_retry_at_ms = next_retry_at_ms
+                        self._journal.append(
+                            "exit.passive_close_waiting_exchange_flat_truth",
+                            {
+                                "position_id": position_id,
+                                "reason": pending.reason,
+                                "decision": "retain_pending",
+                                "next_action": "restore_position_snapshot_or_operator_reconcile",
+                                "next_retry_at_ms": next_retry_at_ms,
+                                "source": "passive_close_missing_position_snapshot",
+                            },
+                        )
+                        return False
                     state.pending_passive_closes.pop(position_id, None)
                     self._journal.append(
                         "exit.passive_close_orphaned",
                         {"position_id": position_id},
                     )
                     return True
+                pending.position_snapshot = position
 
             chunk_quantity = pending.current_chunk_quantity()
             if chunk_quantity <= 0.0:
@@ -3419,8 +3436,7 @@ class PassiveCloseExecutor:
         pending.active_chunk_index += 1
 
         if pending.completed():
-            await self._finalize_passive_close(state, pending)
-            return True
+            return await self._finalize_passive_close(state, pending)
 
         # Reset for next chunk
         position = pending.position_snapshot
@@ -3464,10 +3480,65 @@ class PassiveCloseExecutor:
         pending: PendingPassiveClose,
     ) -> bool:
         """Build CloseExecution from accumulated legs and clean up pending state."""
-        position = pending.position_snapshot
+        position = pending.position_snapshot or state.open_positions.get(pending.position_id)
         if position is None:
+            if self._runtime_mode == "live":
+                now_ms = self._now_ms()
+                next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+                pending.next_retry_at_ms = next_retry_at_ms
+                self._journal.append(
+                    "exit.passive_close_waiting_exchange_flat_truth",
+                    {
+                        "position_id": pending.position_id,
+                        "reason": pending.reason,
+                        "decision": "retain_pending",
+                        "next_action": "restore_position_snapshot_or_operator_reconcile",
+                        "next_retry_at_ms": next_retry_at_ms,
+                        "source": "passive_close_final_missing_position_snapshot",
+                    },
+                )
+                return False
             state.pending_passive_closes.pop(pending.position_id, None)
             return True
+        if pending.position_snapshot is None:
+            pending.position_snapshot = position
+
+        if self._runtime_mode == "live":
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_final_exchange_flat",
+                extra={
+                    "terminal_close_execution": True,
+                    "local_maker_fill_quantity": pending.maker_fill.quantity,
+                    "local_hedge_fill_quantity": pending.hedge_fill.quantity,
+                },
+            ):
+                return True
+
+            now_ms = self._now_ms()
+            next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            pending.next_retry_at_ms = next_retry_at_ms
+            self._journal.append(
+                "exit.passive_close_waiting_exchange_flat_truth",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "reason": pending.reason,
+                    "maker_quantity": pending.maker_fill.quantity,
+                    "hedge_quantity": pending.hedge_fill.quantity,
+                    "active_chunk_index": pending.active_chunk_index,
+                    "chunk_count": pending.chunk_count(),
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "decision": "retain_pending",
+                    "next_action": "retry_exchange_position_open_order_truth",
+                    "next_retry_at_ms": next_retry_at_ms,
+                    "source": "passive_close_final_exchange_truth_gate",
+                },
+            )
+            return False
 
         short_legs = []
         for leg in pending.short_legs:

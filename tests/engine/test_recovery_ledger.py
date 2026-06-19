@@ -162,6 +162,56 @@ def test_passive_close_journal_owns_live_reduce_only_close_order_without_local_p
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
+def test_waiting_exchange_flat_truth_passive_close_blocks_as_owned_close_work():
+    local = {
+        "open_positions": [
+            {
+                "position_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entries": [],
+        "pending_passive_closes": [
+            {
+                "position_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "position_snapshot": {
+                    "symbol": "ESPORTSUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                },
+                "chunk_quantities": [425.0],
+                "active_chunk_index": 1,
+                "maker_fill": {"quantity": 425.0},
+                "hedge_fill": {"quantity": 425.0},
+            }
+        ],
+    }
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local,
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+        },
+        owner_index=RecoveryOwnerIndex.from_state(local),
+    )
+
+    close_items = [
+        item for item in ledger.work_items
+        if item.kind == "owned_pending_passive_close"
+    ]
+    assert len(close_items) == 1
+    assert close_items[0].owner.owner_type == "pending_passive_close"
+    assert close_items[0].decision.outcome == "passive_close_order_maintenance_required"
+    assert close_items[0].decision.reason == "passive_close_waiting_exchange_flat_truth"
+    assert all(item.kind != "pending_passive_close" for item in ledger.work_items)
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+
+
 def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"open_positions": [], "pending_entries": []},

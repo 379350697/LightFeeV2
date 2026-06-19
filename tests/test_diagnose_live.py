@@ -5578,13 +5578,16 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "cleanup_after_admission_block": 0,
             "candidate_takeover_count": 0,
             "quote_rewarm_terminalized_count": 0,
-            "recovered_but_counted_issue_count": 0,
-            "active_stuck_count": 1,
+            "recovered_but_counted_issue_count": 1,
+            "historical_hard_over_budget_recovered_count": 1,
+            "active_stuck_count": 0,
             "ownerless_open_order_count": 0,
             "owned_pending_passive_close_count": 0,
             "adopted_reduce_only_order_count": 0,
             "duplicate_reduce_only_submit_blocked_count": 0,
             "deterministic_reject_after_submit_count": 0,
+            "passive_close_resolved_without_terminal_truth_count": 0,
+            "passive_close_truth_lag_resolved_count": 0,
             "repeated_single_leg_guarded": {
                 "violation_count": 0,
                 "severity": "ok",
@@ -5664,6 +5667,202 @@ def test_business_progression_quality_counts_recovered_zero_fill_without_active_
     assert phase_summary["hard_over_budget_count"] == 0
     assert business["recovered_but_counted_issue_count"] == 1
     assert business["active_stuck_count"] == 0
+
+
+def test_business_progression_quality_counts_passive_close_truth_lag_as_recovered():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "recovery.live_detected",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 5_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 8_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                },
+            },
+        },
+        {
+            "ts_ms": 901_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    phase_summary = dl._build_phase_duration_summary(events)
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert phase_summary["hard_over_budget_count"] == 1
+    assert business["passive_close_resolved_without_terminal_truth_count"] == 1
+    assert business["passive_close_truth_lag_resolved_count"] == 1
+    assert business["recovered_but_counted_issue_count"] == 1
+    assert business["active_stuck_count"] == 0
+
+
+def test_business_progression_quality_unresolved_passive_truth_lag_stays_active():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "recovery.live_detected",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 5_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-1781859127568-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 901_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert business["passive_close_resolved_without_terminal_truth_count"] == 1
+    assert business["passive_close_truth_lag_resolved_count"] == 0
+    assert business["recovered_but_counted_issue_count"] == 0
+    assert business["active_stuck_count"] == 1
+
+
+def test_business_progression_quality_gate_green_reclassifies_historical_hard_stuck():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "recovery.live_detected",
+            "payload": {
+                "position_id": "entry-cloud-recovered-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "recovery.blocked",
+            "payload": {
+                "position_id": "entry-cloud-recovered-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "reason": "unpaired_live_position",
+            },
+        },
+        {
+            "ts_ms": 901_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate={
+            "gate_passed": True,
+            "exchange_truth_flat": True,
+            "exchange_truth_no_open_orders": True,
+            "blocking_reasons": [],
+            "v1_lifecycle_summary": {"blocking_row_count": 0},
+        },
+    )
+
+    assert business["active_stuck_count"] == 0
+    assert business["recovered_but_counted_issue_count"] == 1
+    assert business["historical_hard_over_budget_recovered_count"] == 1
+
+
+def test_business_progression_quality_live_flat_flag_without_truth_stays_active():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "recovery.live_detected",
+            "payload": {
+                "position_id": "entry-legacy-live-flat-flag",
+                "symbol": "ESPORTSUSDT",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-legacy-live-flat-flag",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 5_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-legacy-live-flat-flag",
+                "symbol": "ESPORTSUSDT",
+                "reason": "funding_capture",
+                "live_flat_terminal": True,
+            },
+        },
+        {
+            "ts_ms": 901_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert business["passive_close_resolved_without_terminal_truth_count"] == 1
+    assert business["passive_close_truth_lag_resolved_count"] == 0
+    assert business["recovered_but_counted_issue_count"] == 0
+    assert business["active_stuck_count"] == 1
 
 
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():

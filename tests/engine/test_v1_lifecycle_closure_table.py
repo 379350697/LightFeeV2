@@ -454,6 +454,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "exit.passive_close_hedge_duplicate_client_order_reconciled",
         "exit.passive_close_hedge_confirmed_after_ack",
         "exit.passive_close_terminal_zero_qty_reduce_only_evidence",
+        "exit.passive_close_waiting_exchange_flat_truth",
         "execution.entry_residual_dust_tolerated",
         "execution.residual_repair_terminal",
         "recovery.flat",
@@ -551,6 +552,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.compensated") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.retry_wait") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.close_chunk_submitted") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("exit.passive_close_waiting_exchange_flat_truth") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.close_residual_detected") == "RESIDUAL_REPAIR"
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"

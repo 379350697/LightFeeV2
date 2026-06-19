@@ -10,6 +10,7 @@ decision path short.
 - `order.submit_result` rejected with `response_classification`.
 - `order.precheck_result` rejected before maker dispatch for venues with official non-mutating order pre-check support.
 - Bybit trading-terms family: `110126`, `110125`, `110123`, `must sign required agreement`.
+- Bybit opening balance family: `110007`, `ab not enough for new order`, `Available balance is insufficient`.
 - Aster max-notional family: `-5018`, `maximum notional value limit`, `max_notional_admission_blocked`.
 - Hyperliquid insufficient-margin family: `Insufficient margin to place order.`
 - Recurrence shape: maker leg has fill/exposure, hedge venue rejects deterministically, same pending keeps retrying until max lifetime or cleanup.
@@ -40,6 +41,15 @@ Deterministic hedge admission reject must:
     cleanup, the route must arm hard symbol/venue cooldown and diagnostics must
     flag any maker submit on the same guarded route as repeated single-leg
     fee-drag risk.
+12. Bybit `110007` is an opening admission block. It must arm
+    `bybit:SYMBOL` opening cooldown and be consumed by candidate/selection
+    filters before another maker submit. The cooldown does not block
+    reduce-only close, passive close maintenance, cancel, or recovery truth.
+13. Candidate and quote-rewarm quality is part of admission closure. A
+    deterministic admission/cooldown route should be pruned before selection;
+    a quote rewarm that reaches hard stale must emit
+    `runtime.entry_quote_rewarm_terminal_stale`, write cooldown, and stop
+    repeated same venue/symbol scheduling until TTL expires.
 
 ## V1 / Exchange Semantics
 
@@ -65,6 +75,9 @@ Deterministic hedge admission reject must:
   Binance-style private WS/listen-key health for Aster V3; passive progress and
   accepted-order uncertainty truth rely on REST V3 polling/probes.
 - Bybit trading-terms rejects: no matching V1 definition found. Treat as exchange-documented admission/permission block, not as V1 copy work. Use Bybit's official non-mutating order pre-check endpoint as the maker-before-hedge protection; keep the pending-hedge branch as defense-in-depth.
+- Bybit `110007` balance rejects are deterministic for non-reduce-only
+  opening risk and should be blocked at candidate/selection once observed.
+  They are not reduce-only close admission rejects.
 - Hyperliquid insufficient-margin rejects: no matching V1 exchange family found. Hyperliquid's official error response documents `Insufficient margin to place order.` under the perp margin family; V2 treats it as deterministic admission evidence with symbol cooldown, venue cooldown, shortlist/dispatch admission blocking, and pending hedge abort. Official doc: <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses>.
 - Transport-level classification alone is insufficient unless runtime consumes it in the pending hedge branch.
 
@@ -83,6 +96,7 @@ Deterministic hedge admission reject must:
 | 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure now uses `/v5/order/pre-check-order` before maker dispatch when the adapter supports it. `110125/110126/110123` records `runtime.entry_admission_blocked` with `source=pre_entry_bybit_precheck` and prevents maker submit; pending hedge admission handling remains the fallback. |
 | 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | local green, deploy pending | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
 | 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | local green, deploy pending | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
+| 2026-06-19 | Bybit 110007 and quote-rewarm process-quality closure | fixed locally, release pending | Bybit `110007` is treated as opening-only deterministic admission cooldown, while reduce-only close remains allowed. Diagnose now consumes production-gate truth so historical quote/admission hard-over-budget artifacts remain counted as process issues without becoming current active stuck when exchange truth and lifecycle blockers are clean. |
 
 ## Recurrences
 
@@ -128,4 +142,7 @@ Deterministic hedge admission reject must:
    `runtime.entry_admission_venue_degraded` prunes Hyperliquid candidates before
    shortlist/Local-L2 tracking while close/cancel/recovery truth still runs.
 9. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
-10. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+10. For quote stale recurrences, confirm terminal stale cooldown exists and
+    `quote_rewarm_terminalized_count` / `active_stuck_count` distinguish
+    terminalized stale work from active stuck work.
+11. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.

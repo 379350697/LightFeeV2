@@ -326,7 +326,11 @@ class TestMakerProgressTruthGate:
 class TestPassiveProgressAndHedge:
     def test_apply_maker_progress_updates_fill(self):
         journal = _open_journal()
-        executor = PassiveCloseExecutor({}, journal)
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
+        )
         pending = PendingPassiveClose(
             position_id="p001",
             reason="funding_capture",
@@ -353,7 +357,9 @@ class TestPassiveProgressAndHedge:
 
     def test_apply_maker_progress_accumulates(self):
         journal = _open_journal()
-        executor = PassiveCloseExecutor({}, journal)
+        executor = PassiveCloseExecutor(
+            {}, journal, config_overrides={"runtime_mode": "paper"},
+        )
         pending = PendingPassiveClose(
             position_id="p001",
             reason="funding_capture",
@@ -383,7 +389,9 @@ class TestPassiveProgressAndHedge:
 
     def test_terminal_filled_persists_full_maker_leg(self):
         journal = _open_journal()
-        executor = PassiveCloseExecutor({}, journal)
+        executor = PassiveCloseExecutor(
+            {}, journal, config_overrides={"runtime_mode": "paper"},
+        )
         pending = PendingPassiveClose(
             position_id="p001",
             reason="funding_capture",
@@ -1037,7 +1045,9 @@ class TestAdvanceChunkRootInvariant:
     def test_advance_succeeds_when_both_full(self):
         """maker_fill=0.01, hedge_fill=0.01, chunk=0.01 → _advance_chunk returns True."""
         journal = _open_journal()
-        executor = PassiveCloseExecutor({}, journal)
+        executor = PassiveCloseExecutor(
+            {}, journal, config_overrides={"runtime_mode": "paper"},
+        )
         state = EngineState()
         position = _make_position()
         pending = PendingPassiveClose(
@@ -1362,7 +1372,9 @@ class TestTerminalMakerFillHedgeFail:
         hedge_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(venue=Venue.OKX))
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
 
@@ -1419,7 +1431,9 @@ class TestTerminalMakerFillHedgeFail:
         hedge_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(venue=Venue.OKX))
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
 
@@ -1484,7 +1498,9 @@ class TestTerminalMakerFillHedgeFail:
         hedge_adapter.place_order = AsyncMock(side_effect=hedge_fill_side_effect)
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
 
@@ -1551,7 +1567,10 @@ class TestPartialMakerFillGradualCatchUp:
         ))
         executor = PassiveCloseExecutor(
             {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
-            config_overrides={"small_fill_buffer_notional_quote": 10.0},
+            config_overrides={
+                "runtime_mode": "paper",
+                "small_fill_buffer_notional_quote": 10.0,
+            },
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
 
@@ -1613,7 +1632,10 @@ class TestPartialMakerFillGradualCatchUp:
         ))
         executor = PassiveCloseExecutor(
             {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
-            config_overrides={"small_fill_buffer_notional_quote": 10.0},
+            config_overrides={
+                "runtime_mode": "paper",
+                "small_fill_buffer_notional_quote": 10.0,
+            },
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
 
@@ -1837,7 +1859,11 @@ class TestPartialMakerFillGradualCatchUp:
 
         for maker_qty, hedge_qty, should_advance, desc in progress_states:
             _j = _open_journal()
-            executor = PassiveCloseExecutor({}, _j)
+            executor = PassiveCloseExecutor(
+                {},
+                _j,
+                config_overrides={"runtime_mode": "paper"},
+            )
             state = EngineState()
             position = _make_position()
             pending = PendingPassiveClose(
@@ -1925,7 +1951,11 @@ class TestFallbackResidualReal:
         )
         _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
-        executor = PassiveCloseExecutor(adapters, journal)
+        executor = PassiveCloseExecutor(
+            adapters,
+            journal,
+            config_overrides={"runtime_mode": "paper"},
+        )
         executor.set_close_executor(CloseExecutor(adapters, journal))
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
 
@@ -2026,7 +2056,9 @@ class TestFallbackResidualReal:
         okx = LiveAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
         bybit = LiveAdapter(Venue.BYBIT, [(20.0, Side.SELL), (0.0, Side.SELL)])
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
-        executor = PassiveCloseExecutor(adapters, journal)
+        executor = PassiveCloseExecutor(
+            adapters, journal, config_overrides={"runtime_mode": "paper"},
+        )
         executor.set_close_executor(CloseExecutor(adapters, journal))
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
 
@@ -2136,7 +2168,9 @@ class TestFallbackResidualReal:
             first_order_raises=True,
         )
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
-        executor = PassiveCloseExecutor(adapters, journal)
+        executor = PassiveCloseExecutor(
+            adapters, journal, config_overrides={"runtime_mode": "paper"},
+        )
         executor.set_close_executor(CloseExecutor(adapters, journal))
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
 
@@ -2567,6 +2601,275 @@ class TestFallbackResidualReal:
         assert resolved[-1]["exchange_truth"]["positions_flat"] is True
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
+
+    def test_live_final_chunk_waits_for_exchange_flat_truth_before_terminal(self):
+        """Live finalization keeps the close owner until exchange truth is flat."""
+        journal = _open_journal()
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        okx.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="ESPORTSUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=3_000,
+            ),
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="ESPORTSUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_000,
+            ),
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="ESPORTSUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_100,
+            ),
+        ])
+        bybit.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=425.0,
+                entry_price=0.03731,
+                observed_at_ms=3_001,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_001,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_101,
+            ),
+        ])
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+
+        executor = PassiveCloseExecutor(
+            {Venue.OKX: okx, Venue.BYBIT: bybit},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1781859127568-ESPORTSUSDT",
+            symbol="ESPORTSUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=425.0,
+            short_quantity=425.0,
+            matched_quantity=425.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=425.0,
+            chunk_quantities=[425.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=425.0,
+                average_price=0.03733,
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+                last_fill_time_ms=3_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=425.0,
+                average_price=0.03731,
+                order_id="hedge-oid",
+                client_order_id="hedge-cid",
+                last_fill_time_ms=3_010,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        first_result = asyncio.run(executor._advance_chunk(state, pending))
+
+        assert first_result is False
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        assert pending.next_retry_at_ms > 0
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_waiting_exchange_flat_truth" in kinds
+        assert "exit.passive_close_resolved" not in kinds
+
+        pending.next_retry_at_ms = 0
+        second_result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state,
+                position.position_id,
+                wait_until_terminal=False,
+            )
+        )
+
+        assert second_result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        records = journal.read_all()
+        resolved = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.passive_close_resolved"
+        ]
+        assert resolved
+        assert resolved[-1]["resolution_source"] == "passive_close_final_exchange_flat"
+        assert resolved[-1]["exchange_truth"]["truth_available"] is True
+        assert all(
+            item["open_orders_empty"] is True
+            for item in resolved[-1]["exchange_truth"]["open_order_truth"]
+        )
+        okx.submit_passive_order.assert_not_called()
+        bybit.submit_passive_order.assert_not_called()
+
+    def test_live_recovered_final_chunk_without_snapshot_still_waits_for_exchange_truth(self):
+        """Recovered pending close records must not bypass live flat truth gating."""
+        journal = _open_journal()
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        okx.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="ESPORTSUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=3_000,
+            ),
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="ESPORTSUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_000,
+            ),
+        ])
+        bybit.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=425.0,
+                entry_price=0.03731,
+                observed_at_ms=3_001,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_001,
+            ),
+        ])
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+
+        executor = PassiveCloseExecutor(
+            {Venue.OKX: okx, Venue.BYBIT: bybit},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-recovered-nosnapshot-ESPORTSUSDT",
+            symbol="ESPORTSUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=425.0,
+            short_quantity=425.0,
+            matched_quantity=425.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=None,
+            target_quantity=425.0,
+            chunk_quantities=[425.0],
+            active_chunk_index=1,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=425.0,
+                average_price=0.03733,
+                order_id="maker-oid",
+                client_order_id="maker-cid",
+                last_fill_time_ms=3_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=425.0,
+                average_price=0.03731,
+                order_id="hedge-oid",
+                client_order_id="hedge-cid",
+                last_fill_time_ms=3_010,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        first_result = asyncio.run(executor._finalize_passive_close(state, pending))
+
+        assert first_result is False
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        assert pending.position_snapshot is position
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_waiting_exchange_flat_truth" in kinds
+        assert "exit.passive_close_resolved" not in kinds
+
+        pending.next_retry_at_ms = 0
+        second_result = asyncio.run(executor._finalize_passive_close(state, pending))
+
+        assert second_result is True
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        records = journal.read_all()
+        resolved = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.passive_close_resolved"
+        ]
+        assert resolved
+        assert all(
+            item["quantity"] == 0.0
+            for item in resolved[-1]["exchange_truth"]["positions"]
+        )
+        assert all(
+            item["open_orders_empty"] is True
+            for item in resolved[-1]["exchange_truth"]["open_order_truth"]
+        )
+        okx.submit_passive_order.assert_not_called()
+        bybit.submit_passive_order.assert_not_called()
 
     def test_live_flat_force_close_problem_keeps_close_reconciliation_work(self):
         """V1: lifecycle can clear flat while fill/PnL reconciliation continues."""
@@ -3799,7 +4102,9 @@ class TestFallbackResidualReal:
         binance = FilledMakerAdapter()
         bybit = PartialDuplicateBybitAdapter()
         adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
-        executor = PassiveCloseExecutor(adapters, journal)
+        executor = PassiveCloseExecutor(
+            adapters, journal, config_overrides={"runtime_mode": "paper"},
+        )
         executor.set_close_executor(CloseExecutor(adapters, journal))
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
 
@@ -5881,7 +6186,9 @@ class TestNonTerminalPartialFillHedgeGapClosure:
         hedge_adapter.place_order = AsyncMock(side_effect=hedge_fill_side_effect)
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
 
@@ -5981,7 +6288,9 @@ class TestNonTerminalPartialFillHedgeGapClosure:
         hedge_adapter.place_order = AsyncMock(side_effect=hedge_fill_side_effect)
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter}, journal,
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
 

@@ -431,20 +431,37 @@ class RecoveryLedger:
 
         for close in local_passive_closes:
             symbol = _symbol(close)
+            waiting_terminal_truth = _passive_close_waiting_terminal_truth(close)
+            kind = (
+                "owned_pending_passive_close"
+                if waiting_terminal_truth
+                else "pending_passive_close"
+            )
+            owner_type = "pending_passive_close" if waiting_terminal_truth else "passive_close"
+            outcome = (
+                "passive_close_order_maintenance_required"
+                if waiting_terminal_truth
+                else "pending_passive_close"
+            )
+            reason = (
+                "passive_close_waiting_exchange_flat_truth"
+                if waiting_terminal_truth
+                else "passive_close_requires_recovery"
+            )
             add_work(
                 RecoveryWorkItem(
-                    kind="pending_passive_close",
+                    kind=kind,
                     symbol=symbol,
                     venues=frozenset(filter(None, _venues_from_close(close))),
                     owner=RecoveryOwner(
-                        owner_type="passive_close",
+                        owner_type=owner_type,
                         owner_id=str(_get(close, "position_id", symbol)),
                         confidence="proven",
                         evidence={"source": "local_passive_close"},
                     ),
                     decision=RecoveryDecision(
-                        outcome="pending_passive_close",
-                        reason="passive_close_requires_recovery",
+                        outcome=outcome,
+                        reason=reason,
                     ),
                     blocking=True,
                 )
@@ -516,6 +533,34 @@ def _as_items(value: Any) -> list[Any]:
     if isinstance(value, (list, tuple, set)):
         return list(value)
     return [value]
+
+
+def _passive_close_waiting_terminal_truth(close: Any) -> bool:
+    completed = getattr(close, "completed", None)
+    if callable(completed):
+        try:
+            if bool(completed()):
+                return True
+        except Exception:
+            pass
+
+    chunk_quantities = _get(close, "chunk_quantities", [])
+    if isinstance(chunk_quantities, Iterable) and not isinstance(
+        chunk_quantities, (str, bytes, Mapping)
+    ):
+        chunks = list(chunk_quantities)
+        if chunks:
+            try:
+                active_chunk_index = int(_get(close, "active_chunk_index", 0) or 0)
+            except (TypeError, ValueError):
+                active_chunk_index = 0
+            if active_chunk_index >= len(chunks):
+                return True
+
+    return any(
+        str(_get(close, key, "") or "") == "waiting_exchange_flat_truth"
+        for key in ("short_stage", "long_stage")
+    )
 
 
 def _truth_available(exchange_truth: Any) -> bool:
