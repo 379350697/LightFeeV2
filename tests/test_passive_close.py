@@ -6803,6 +6803,10 @@ class TestReduceOnlyRejectedEscalation:
             if e.get("kind") == "exit.passive_close_maker_terminal_no_fill"
         ]
         assert len(terminal_events) == 1
+        terminal_payload = terminal_events[0]["payload"]
+        assert terminal_payload["exchange_code"] == ""
+        assert terminal_payload["exchange_msg"] == ""
+        assert terminal_payload["raw_error"] == ""
 
     def test_order_submit_error_rejected_escalates_to_dual_taker(self):
         """OrderSubmitError with is_rejected=True transitions to DUAL_TAKER."""

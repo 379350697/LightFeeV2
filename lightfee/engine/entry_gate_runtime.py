@@ -717,6 +717,14 @@ class EntryGateRuntime:
         stage: str,
     ) -> list:
         """V1-style pre-shortlist entry admission gate for venue-scope cooldowns."""
+        exchange_admission_reasons = {
+            "bybit_trading_terms_required",
+            "insufficient_balance_admission_blocked",
+            "insufficient_margin_admission_blocked",
+            "leverage_admission_blocked",
+            "max_notional_admission_blocked",
+            "venue_auth_invalid",
+        }
         self._last_entry_admission_filter_blockers = Counter()
         self._last_entry_admission_filter_samples = []
         if not candidates:
@@ -726,16 +734,24 @@ class EntryGateRuntime:
         blocked_samples: list[dict] = []
         blocked_until_ms = 0
         blocked_venues: set[str] = set()
+        blocked_scopes: set[str] = set()
         blocked_sources: set[str] = set()
         official_doc_urls: set[str] = set()
         evidence_gap_values: set[bool] = set()
         for candidate in candidates:
             block = self._candidate_admission_block(candidate, now_ms)
-            if not block or block.get("block_scope") != "venue":
+            reason = str(block.get("reason") or "venue_admission_blocked") if block else ""
+            block_scope = str(block.get("block_scope") or "symbol") if block else ""
+            if (
+                not block
+                or (
+                    block_scope != "venue"
+                    and reason not in exchange_admission_reasons
+                )
+            ):
                 allowed.append(candidate)
                 continue
 
-            reason = str(block.get("reason") or "venue_admission_blocked")
             venue = str(block.get("venue") or "")
             try:
                 candidate_blocked_until_ms = int(block.get("blocked_until_ms", 0) or 0)
@@ -744,6 +760,7 @@ class EntryGateRuntime:
             blocked_until_ms = max(blocked_until_ms, candidate_blocked_until_ms)
             if venue:
                 blocked_venues.add(venue)
+            blocked_scopes.add(block_scope or "symbol")
             source = str(block.get("source") or "entry_admission_cooldown")
             if source:
                 blocked_sources.add(source)
@@ -761,7 +778,7 @@ class EntryGateRuntime:
                     "short_venue": str(getattr(candidate, "short_venue", "") or ""),
                     "venue": venue,
                     "reason": reason,
-                    "block_scope": "venue",
+                    "block_scope": block_scope or "symbol",
                     "blocked_until_ms": candidate_blocked_until_ms,
                     "blocked_symbol": str(block.get("blocked_symbol") or ""),
                     "source": source,
@@ -779,6 +796,9 @@ class EntryGateRuntime:
         venue = next(iter(blocked_venues)) if len(blocked_venues) == 1 else "multiple"
         reason = sorted_reasons[0] if len(sorted_reasons) == 1 else "multiple_entry_admission_blocks"
         source = next(iter(blocked_sources)) if len(blocked_sources) == 1 else "multiple"
+        block_scope = (
+            next(iter(blocked_scopes)) if len(blocked_scopes) == 1 else "mixed"
+        )
         official_doc_url = (
             next(iter(official_doc_urls)) if len(official_doc_urls) == 1 else ""
         )
@@ -792,7 +812,7 @@ class EntryGateRuntime:
             {
                 "venue": venue,
                 "reason": reason,
-                "block_scope": "venue",
+                "block_scope": block_scope,
                 "blocked_until_ms": blocked_until_ms,
                 "source": source,
                 "official_doc_url": official_doc_url,

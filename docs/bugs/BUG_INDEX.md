@@ -33,7 +33,14 @@ open again. Diagnostics now expose `business_progression_quality_summary`
 `phase_handoff_quality` for candidate and quote-rewarm stages. Candidate lease
 expiration emits `runtime.candidate_lease_expired` and
 `review.candidate_rejected rejected_stage=candidate_lease`; quote rewarm keeps
-terminal stale evidence. See
+terminal stale evidence. The follow-up business-quality closure also moves
+symbol-scope deterministic admission blocks such as
+`insufficient_balance_admission_blocked` into the candidate prefilter, keeps
+Aster `aster:*` cooldown as a route-level no-new-risk signal, adds
+`candidate_takeover_count`, `quote_rewarm_terminalized_count`,
+`recovered_but_counted_issue_count`, and `active_stuck_count` to
+`business_progression_quality_summary`, and includes `exchange_code`,
+`exchange_msg`, and `raw_error` on passive close terminal/no-fill evidence. See
 [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality).
 
 Latest venue private auth admission and single-leg recovery closure,

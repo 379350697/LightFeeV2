@@ -5493,6 +5493,10 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "single_leg_created": 0,
             "single_leg_cleanup": 0,
             "cleanup_after_admission_block": 0,
+            "candidate_takeover_count": 0,
+            "quote_rewarm_terminalized_count": 0,
+            "recovered_but_counted_issue_count": 0,
+            "active_stuck_count": 1,
             "repeated_single_leg_guarded": {
                 "violation_count": 0,
                 "severity": "ok",
@@ -5519,6 +5523,59 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_business_progression_quality_counts_recovered_zero_fill_without_active_stuck():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-husdt", "symbol": "HUSDT"},
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {
+                "entry_id": "entry-husdt",
+                "symbol": "HUSDT",
+                "maker_order_id": "maker-husdt",
+                "outcome": "maker_resting",
+            },
+        },
+        {
+            "ts_ms": 5_400,
+            "kind": "passive_maintenance.cancel_issued",
+            "payload": {
+                "entry_id": "entry-husdt",
+                "symbol": "HUSDT",
+                "reason": "maker_try_window_fill_ratio_below_threshold",
+                "fill_ratio": 0.0,
+            },
+        },
+        {
+            "ts_ms": 8_000,
+            "kind": "entry.aborted",
+            "payload": {
+                "entry_id": "entry-husdt",
+                "symbol": "HUSDT",
+                "reason": "pending_entry_reconcile_abandoned_flat",
+            },
+        },
+        {
+            "ts_ms": 900_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    phase_summary = dl._build_phase_duration_summary(events)
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert phase_summary["hard_over_budget_count"] == 0
+    assert business["recovered_but_counted_issue_count"] == 1
+    assert business["active_stuck_count"] == 0
 
 
 def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnings():

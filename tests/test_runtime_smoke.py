@@ -379,6 +379,89 @@ class TestRuntimeLaneScheduling:
         assert tick_calls == [0]
 
     @pytest.mark.asyncio
+    async def test_active_position_tick_runs_normal_exit_before_next_full_tick(
+        self, tmp_path, monkeypatch
+    ):
+        """Open positions must let active fast ticks advance normal exits."""
+        from lightfee.config.schema import (
+            AppConfig, RuntimeConfig, StrategyConfig, PersistenceConfig,
+        )
+        import lightfee.engine.runtime as runtime_module
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.risk.modes import EngineLifecycle
+
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="paper",
+                poll_interval_ms=60_000,
+                sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+                sidecar_snapshot_max_age_ms=1000,
+            ),
+            strategy=StrategyConfig(
+                risk_monitor_enabled=False,
+                local_l2_enabled=False,
+                local_l2_ws_enabled=False,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "live-state.json"),
+            ),
+            venues=[],
+            symbols=["BTCUSDT"],
+        )
+        runtime = LiveRuntime(config)
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.open_positions["entry-fast-exit"] = SimpleNamespace(
+            position_id="entry-fast-exit",
+            symbol="BTCUSDT",
+        )
+
+        now = {"ms": 0}
+        full_tick_count = {"value": 0}
+        normal_exit_calls: list[tuple[int, int]] = []
+        real_sleep = asyncio.sleep
+
+        monkeypatch.setattr(runtime_module, "wall_clock_now_ms", lambda: now["ms"])
+
+        async def fake_sleep(_seconds: float):
+            now["ms"] = 300
+            await real_sleep(0)
+
+        async def quiet_heartbeat():
+            while runtime._running:
+                await real_sleep(0.01)
+
+        async def fake_full_tick():
+            full_tick_count["value"] += 1
+
+        async def fake_normal_exits(now_ms: int):
+            normal_exit_calls.append((now_ms, full_tick_count["value"]))
+            if len(normal_exit_calls) >= 2:
+                runtime._running = False
+
+        async def noop_lane(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(runtime, "_current_state_heartbeat_loop", quiet_heartbeat)
+        monkeypatch.setattr(runtime_module.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(runtime, "tick", fake_full_tick)
+        monkeypatch.setattr(runtime, "tick_active_positions", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_reload_rate_limits", noop_lane)
+        monkeypatch.setattr(runtime, "_sync_local_l2_data", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_tick_passive_close", noop_lane)
+        monkeypatch.setattr(runtime, "_maybe_process_normal_exits", fake_normal_exits)
+        monkeypatch.setattr(runtime, "_maybe_tick_maker_event", noop_lane)
+        monkeypatch.setattr(runtime, "_maintain_pending_entry_passive_orders", noop_lane)
+        monkeypatch.setattr(runtime, "_post_tick_housekeeping", noop_lane)
+        monkeypatch.setattr(runtime, "_snapshot_local_l2_state", lambda: None)
+        monkeypatch.setattr(runtime_module, "build_persistent_state_view", lambda state: {})
+        monkeypatch.setattr(runtime.snapshot_store, "write", lambda state: None)
+
+        await runtime.run_loop()
+
+        assert normal_exit_calls == [(0, 1), (300, 1)]
+
+    @pytest.mark.asyncio
     async def test_tick_exports_current_state_before_long_or_early_return_tick(self, tmp_path):
         """Runtime heartbeat: current-state refresh must not wait for full tick completion."""
         from lightfee.config.schema import (

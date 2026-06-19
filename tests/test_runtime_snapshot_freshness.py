@@ -1530,6 +1530,84 @@ def test_runtime_entry_quote_rewarm_hard_expiry_terminalizes_and_cools_down(tmp_
     assert runtime._entry_quote_rewarm_cooldown_until_ms[("aster", "CHZUSDT")] > 32_000
 
 
+def test_runtime_entry_quote_rewarm_cooldown_suppresses_revalidate_target(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            entry_quote_lease_ttl_ms=200,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal.open()
+    try:
+        runtime.market_data_runtime._schedule_entry_quote_rewarm_after_rest_stale(
+            {
+                "venue": "aster",
+                "symbol": "PRLUSDT",
+                "pair_id": "prl-binance-aster",
+                "candidate_rank": 1,
+            },
+            now_ms=1_000,
+        )
+        runtime.market_data_runtime._schedule_entry_quote_rewarm_after_rest_stale(
+            {
+                "venue": "aster",
+                "symbol": "PRLUSDT",
+                "pair_id": "prl-binance-aster",
+                "candidate_rank": 1,
+            },
+            now_ms=31_000,
+        )
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="aster",
+            symbol="PRLUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=10.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=10.0,
+            entry_notional_quote=50.0,
+            first_funding_timestamp_ms=400000,
+        )
+        snapshot = SidecarSnapshot(
+            published_at_ms=32_000,
+            market_observed_at_ms=32_000,
+            quotes={
+                "binance:PRLUSDT": _quote_with_liquidity(
+                    "binance",
+                    "PRLUSDT",
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    observed_at_ms=32_000,
+                ),
+                "aster:PRLUSDT": _quote_with_liquidity(
+                    "aster",
+                    "PRLUSDT",
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    observed_at_ms=31_000,
+                ),
+            },
+            candidates=[candidate],
+        )
+
+        targets = runtime.market_data_runtime._entry_quote_revalidate_targets(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=32_000,
+        )
+    finally:
+        runtime.journal.close()
+
+    assert [target for target in targets if target["venue"] == "aster"] == []
+
+
 @pytest.mark.asyncio
 async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     tmp_path,

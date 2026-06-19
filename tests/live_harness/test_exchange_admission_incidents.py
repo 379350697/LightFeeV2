@@ -1467,3 +1467,95 @@ async def test_recovered_admission_block_prevents_dispatch_until_ttl_expires():
         assert payload["evidence_gap"] is True
 
         runtime.journal.close()
+
+
+def test_symbol_scope_admission_block_filters_candidate_before_selection():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        try:
+            runtime.state.venue_entry_cooldowns["bybit:BALUSDT"] = {
+                "venue": "bybit",
+                "symbol": "BALUSDT",
+                "reason": "insufficient_balance_admission_blocked",
+                "raw_error": "bybit retCode=110007 retMsg=Available balance is insufficient",
+                "blocked_until_ms": 1778787600000,
+                "ttl_ms": 21_600_000,
+                "official_doc_url": "https://bybit-exchange.github.io/docs/v5/error",
+                "evidence_gap": False,
+                "block_scope": "symbol",
+            }
+            blocked = _candidate("BALUSDT", "binance", "bybit")
+            clean = _candidate("CLEANUSDT", "binance", "bybit")
+
+            filtered = runtime._filter_candidates_by_entry_admission(
+                [blocked, clean],
+                now_ms=1778787000000,
+                stage="candidate_prefilter",
+            )
+
+            assert [candidate.symbol for candidate in filtered] == ["CLEANUSDT"]
+            assert runtime._last_entry_admission_filter_blockers == {
+                "insufficient_balance_admission_blocked": 1
+            }
+            samples = runtime._last_entry_admission_filter_samples
+            assert samples == [
+                {
+                    "candidate_pair_id": "balusdt:binance->bybit",
+                    "pair_id": "balusdt:binance->bybit",
+                    "symbol": "BALUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "venue": "bybit",
+                    "reason": "insufficient_balance_admission_blocked",
+                    "block_scope": "symbol",
+                    "blocked_until_ms": 1778787600000,
+                    "blocked_symbol": "",
+                    "source": "entry_admission_cooldown",
+                    "official_doc_url": "https://bybit-exchange.github.io/docs/v5/error",
+                    "evidence_gap": False,
+                    "stage": "candidate_prefilter",
+                }
+            ]
+        finally:
+            runtime.journal.close()
+
+
+def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        try:
+            runtime.state.venue_entry_cooldowns["aster:*"] = {
+                "venue": "aster",
+                "symbol": "*",
+                "blocked_symbol": "ESPORTSUSDT",
+                "reason": "max_notional_admission_blocked",
+                "raw_error": (
+                    "max_notional_admission_blocked: requested_notional=23.9706 "
+                    "remaining_openable_notional=0.0"
+                ),
+                "blocked_until_ms": 1778787600000,
+                "ttl_ms": 21_600_000,
+                "official_doc_url": "https://www.asterdex.com/",
+                "evidence_gap": False,
+                "block_scope": "venue",
+                "source": "pre_entry_aster_precheck",
+            }
+            blocked = _candidate("LABUSDT", "binance", "aster")
+            clean = _candidate("CLEANUSDT", "binance", "bybit")
+
+            filtered = runtime._filter_candidates_by_entry_admission(
+                [blocked, clean],
+                now_ms=1778787000000,
+                stage="candidate_prefilter",
+            )
+
+            assert [candidate.symbol for candidate in filtered] == ["CLEANUSDT"]
+            assert runtime._last_entry_admission_filter_blockers == {
+                "max_notional_admission_blocked": 1
+            }
+            assert runtime._last_entry_admission_filter_samples[0]["block_scope"] == "venue"
+            assert runtime._last_entry_admission_filter_samples[0]["symbol"] == "LABUSDT"
+        finally:
+            runtime.journal.close()

@@ -4849,7 +4849,8 @@ def _build_single_leg_exposure_recovery_summary(
 def _build_business_progression_quality_summary(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    phase_handoff_quality = _build_phase_duration_summary(events).get(
+    phase_duration_summary = _build_phase_duration_summary(events)
+    phase_handoff_quality = phase_duration_summary.get(
         "phase_handoff_quality",
         {
             "severity": "ok",
@@ -4861,6 +4862,8 @@ def _build_business_progression_quality_summary(
     pre_submit_blocked = 0
     single_leg_created = 0
     single_leg_cleanup = 0
+    recovered_but_counted_entries: set[str] = set()
+    zero_fill_cancel_entries: set[str] = set()
     admission_blocked_entries: set[str] = set()
     cleanup_entries: set[str] = set()
     active_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4956,6 +4959,24 @@ def _build_business_progression_quality_summary(
             blocked_entry_id = entry_id(payload)
             if blocked_entry_id:
                 admission_blocked_entries.add(blocked_entry_id)
+        elif kind == "passive_maintenance.cancel_issued":
+            cancel_entry_id = entry_id(payload)
+            reason = str(payload.get("reason") or "")
+            fill_ratio = payload.get("fill_ratio")
+            try:
+                fill_ratio_value = float(fill_ratio)
+            except (TypeError, ValueError):
+                fill_ratio_value = 0.0
+            if (
+                cancel_entry_id
+                and reason == "maker_try_window_fill_ratio_below_threshold"
+                and fill_ratio_value <= 0.0
+            ):
+                zero_fill_cancel_entries.add(cancel_entry_id)
+        elif kind in {"entry.aborted", "entry.passive_unfilled"}:
+            terminal_entry_id = entry_id(payload)
+            if terminal_entry_id and terminal_entry_id in zero_fill_cancel_entries:
+                recovered_but_counted_entries.add(terminal_entry_id)
 
         if kind in {
             "runtime.entry_admission_blocked",
@@ -5025,11 +5046,31 @@ def _build_business_progression_quality_summary(
 
     cleanup_after_admission_block = len(cleanup_entries & admission_blocked_entries)
     violation_count = len(repeated_submit_samples)
+    phase_counts = phase_handoff_quality.get("phase_counts", {})
+    candidate_takeover_count = int(
+        (phase_counts.get("candidate_lease", {}) or {}).get("takeover_count", 0)
+        or 0
+    )
+    quote_rewarm_terminalized_count = int(
+        phase_duration_summary.get("terminalized_quote_rewarm_count", 0)
+        or 0
+    )
+    active_stuck_count = max(
+        int(phase_duration_summary.get("hard_over_budget_count", 0) or 0)
+        - int(phase_duration_summary.get("terminalized_candidate_lease_count", 0) or 0)
+        - int(phase_duration_summary.get("terminalized_quote_rewarm_count", 0) or 0)
+        - len(recovered_but_counted_entries),
+        0,
+    )
     return {
         "pre_submit_blocked": pre_submit_blocked,
         "single_leg_created": single_leg_created,
         "single_leg_cleanup": single_leg_cleanup,
         "cleanup_after_admission_block": cleanup_after_admission_block,
+        "candidate_takeover_count": candidate_takeover_count,
+        "quote_rewarm_terminalized_count": quote_rewarm_terminalized_count,
+        "recovered_but_counted_issue_count": len(recovered_but_counted_entries),
+        "active_stuck_count": active_stuck_count,
         "repeated_single_leg_guarded": {
             "violation_count": violation_count,
             "severity": "production_issue" if violation_count else "ok",
