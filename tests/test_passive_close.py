@@ -2714,9 +2714,27 @@ class TestFallbackResidualReal:
         assert position.position_id in state.pending_passive_closes
         assert position.position_id in state.open_positions
         assert pending.next_retry_at_ms > 0
-        kinds = [record["kind"] for record in journal.read_all()]
+        records = journal.read_all()
+        kinds = [record["kind"] for record in records]
         assert "exit.passive_close_waiting_exchange_flat_truth" in kinds
         assert "exit.passive_close_resolved" not in kinds
+        waiting_payload = next(
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.passive_close_waiting_exchange_flat_truth"
+        )
+        truth_attempt = waiting_payload["exchange_truth_attempt"]
+        assert truth_attempt["truth_available"] is True
+        assert truth_attempt["positions_flat"] is False
+        assert truth_attempt["open_orders_flat"] is True
+        assert [
+            item["quantity"]
+            for item in truth_attempt["positions"]
+        ] == [0.0, 425.0]
+        assert all(
+            item["open_orders_empty"] is True
+            for item in truth_attempt["open_order_truth"]
+        )
 
         pending.next_retry_at_ms = 0
         second_result = asyncio.run(
@@ -2870,6 +2888,51 @@ class TestFallbackResidualReal:
         )
         okx.submit_passive_order.assert_not_called()
         bybit.submit_passive_order.assert_not_called()
+
+    def test_live_missing_position_snapshot_waiting_event_carries_truth_attempt(self):
+        """Every waiting-exchange-truth event should explain missing proof locally."""
+        journal = _open_journal()
+        state = EngineState()
+        pending = PendingPassiveClose(
+            position_id="entry-missing-position-snapshot",
+            reason="funding_capture",
+            position_snapshot=None,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            active_chunk_index=1,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="maker-oid",
+                maker_client_order_id="maker-cid",
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=10.0),
+            hedge_fill=PendingPassiveLegFill(quantity=10.0),
+        )
+        state.pending_passive_closes[pending.position_id] = pending
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+
+        result = asyncio.run(executor._finalize_passive_close(state, pending))
+
+        assert result is False
+        assert pending.position_id in state.pending_passive_closes
+        waiting_payload = next(
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_waiting_exchange_flat_truth"
+        )
+        truth_attempt = waiting_payload["exchange_truth_attempt"]
+        assert truth_attempt["truth_available"] is False
+        assert truth_attempt["positions_flat"] is None
+        assert truth_attempt["open_orders_flat"] is None
+        assert truth_attempt["positions"] == []
+        assert truth_attempt["open_order_truth"] == []
+        assert truth_attempt["missing_evidence"] == ["position_snapshot"]
+        assert truth_attempt["source"] == "passive_close_final_missing_position_snapshot"
 
     def test_live_flat_force_close_problem_keeps_close_reconciliation_work(self):
         """V1: lifecycle can clear flat while fill/PnL reconciliation continues."""

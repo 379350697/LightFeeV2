@@ -22,9 +22,9 @@ fixes, and verification; cards contain reusable family rules.
 
 | Date | Cluster | Failure Family | Status | Start Here |
 |---|---|---|---|---|
-| 2026-06-19 | CL-101 | passive-close terminal truth lag; gate-green historical active-stuck false positive | fixed locally, release pending | [daily](daily/2026-06-19.md#cluster-cl-101---passive-close-terminal-truth-lag-and-gate-green-active-stuck-diagnostic-closure), [card](cards/passive-close-terminal-flatness.md) |
-| 2026-06-19 | CL-100 | open/close owner ledger; Bybit reduce-only adoption; `110017` non-flat branch | deployed in `c35dd35`, terminal-truth follow-up local | [daily](daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption), [card](cards/passive-close-terminal-flatness.md) |
-| 2026-06-19 | CL-099 | Aster headroom; single-leg fee drag; candidate/quote active handoff | deployed in `c35dd35`, process-quality follow-up local | [daily](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality), [card](cards/pending-entry-hedge-admission.md) |
+| 2026-06-19 | CL-101 | passive-close terminal truth lag; gate-green historical active-stuck false positive | deployed through `039d52c`; payload contract fixed in current release | [daily](daily/2026-06-19.md#cluster-cl-101---passive-close-terminal-truth-lag-and-gate-green-active-stuck-diagnostic-closure), [card](cards/passive-close-terminal-flatness.md) |
+| 2026-06-19 | CL-100 | open/close owner ledger; Bybit reduce-only adoption; `110017` non-flat branch | deployed through `039d52c`; waiting-event evidence contract fixed in current release | [daily](daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption), [card](cards/passive-close-terminal-flatness.md) |
+| 2026-06-19 | CL-099 | Aster headroom; single-leg fee drag; candidate/quote active handoff | deployed through `039d52c`, current cloud recovered | [daily](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality), [card](cards/pending-entry-hedge-admission.md) |
 | 2026-06-19 | CL-098 | venue private auth admission; owner-bound single-leg recovery | deployed in `c35dd35`, current cloud recovered | [daily](daily/2026-06-19.md#cluster-cl-098---venue-private-auth-admission-and-single-leg-recovery-closure), [card](cards/pending-entry-hedge-admission.md) |
 
 Latest Aster 5018 pre-submit headroom and phase terminality closure,

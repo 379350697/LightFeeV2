@@ -890,6 +890,10 @@ class PassiveCloseExecutor:
                                 "next_action": "restore_position_snapshot_or_operator_reconcile",
                                 "next_retry_at_ms": next_retry_at_ms,
                                 "source": "passive_close_missing_position_snapshot",
+                                "exchange_truth_attempt": self._missing_exchange_truth_attempt(
+                                    source="passive_close_missing_position_snapshot",
+                                    missing_evidence=["position_snapshot"],
+                                ),
                             },
                         )
                         return False
@@ -3495,6 +3499,10 @@ class PassiveCloseExecutor:
                         "next_action": "restore_position_snapshot_or_operator_reconcile",
                         "next_retry_at_ms": next_retry_at_ms,
                         "source": "passive_close_final_missing_position_snapshot",
+                        "exchange_truth_attempt": self._missing_exchange_truth_attempt(
+                            source="passive_close_final_missing_position_snapshot",
+                            missing_evidence=["position_snapshot"],
+                        ),
                     },
                 )
                 return False
@@ -3536,6 +3544,14 @@ class PassiveCloseExecutor:
                     "next_action": "retry_exchange_position_open_order_truth",
                     "next_retry_at_ms": next_retry_at_ms,
                     "source": "passive_close_final_exchange_truth_gate",
+                    "exchange_truth_attempt": getattr(
+                        pending,
+                        "_last_exchange_truth_attempt",
+                        self._missing_exchange_truth_attempt(
+                            source="passive_close_final_exchange_truth_gate",
+                            missing_evidence=["live_exchange_truth_attempt"],
+                        ),
+                    ),
                 },
             )
             return False
@@ -3786,6 +3802,27 @@ class PassiveCloseExecutor:
             position.short_venue, position.symbol
         )
         if long_err or short_err:
+            self._record_pending_exchange_truth_attempt(
+                pending,
+                position,
+                source=source,
+                long_probe={
+                    "quantity": (
+                        abs(float(getattr(long_snap, "quantity", 0.0) or 0.0))
+                        if long_snap is not None
+                        else None
+                    ),
+                    "error": long_err,
+                },
+                short_probe={
+                    "quantity": (
+                        abs(float(getattr(short_snap, "quantity", 0.0) or 0.0))
+                        if short_snap is not None
+                        else None
+                    ),
+                    "error": short_err,
+                },
+            )
             self._journal.append(
                 "exit.passive_close_clear_flat_untrusted",
                 {
@@ -3815,6 +3852,17 @@ class PassiveCloseExecutor:
             adapters or self._adapters,
         )
         if long_open_orders_flat is not True or short_open_orders_flat is not True:
+            self._record_pending_exchange_truth_attempt(
+                pending,
+                position,
+                source=source,
+                long_probe={"quantity": actual_long_size, "error": None},
+                short_probe={"quantity": actual_short_size, "error": None},
+                long_open_orders_flat=long_open_orders_flat,
+                short_open_orders_flat=short_open_orders_flat,
+                long_open_orders_evidence=long_open_orders_evidence,
+                short_open_orders_evidence=short_open_orders_evidence,
+            )
             self._journal.append(
                 "exit.passive_close_clear_flat_untrusted",
                 {
@@ -3884,6 +3932,130 @@ class PassiveCloseExecutor:
             "entry_price": float(getattr(snapshot, "entry_price", 0.0) or 0.0),
             "observed_at_ms": int(getattr(snapshot, "observed_at_ms", 0) or 0),
         }
+
+    @staticmethod
+    def _missing_exchange_truth_attempt(
+        *,
+        source: str,
+        missing_evidence: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "truth_available": False,
+            "positions_flat": None,
+            "open_orders_flat": None,
+            "positions": [],
+            "open_order_truth": [],
+            "source": source,
+            "missing_evidence": list(missing_evidence),
+        }
+
+    @staticmethod
+    def _exchange_truth_attempt_position_record(
+        venue: Venue,
+        symbol: str,
+        probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        quantity = probe.get("quantity")
+        try:
+            quantity_value = abs(float(quantity)) if quantity is not None else None
+        except (TypeError, ValueError):
+            quantity_value = None
+        return {
+            "venue": venue.value,
+            "symbol": symbol,
+            "quantity": quantity_value,
+            "error": probe.get("error"),
+        }
+
+    @staticmethod
+    def _open_order_truth_attempt_record(
+        venue: Venue,
+        symbol: str,
+        open_orders_flat: bool | None,
+        evidence: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "venue": venue.value,
+            "symbol": symbol,
+            "open_orders_empty": open_orders_flat,
+            "evidence": evidence,
+        }
+
+    def _record_pending_exchange_truth_attempt(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        long_probe: dict[str, Any],
+        short_probe: dict[str, Any],
+        long_open_orders_flat: bool | None = None,
+        short_open_orders_flat: bool | None = None,
+        long_open_orders_evidence: str | None = None,
+        short_open_orders_evidence: str | None = None,
+    ) -> dict[str, Any]:
+        position_errors = [
+            str(error)
+            for error in (long_probe.get("error"), short_probe.get("error"))
+            if error
+        ]
+        truth_available = not position_errors
+
+        def flat_quantity(probe: dict[str, Any]) -> bool:
+            quantity = probe.get("quantity")
+            try:
+                return quantity is not None and abs(float(quantity)) <= 1e-9
+            except (TypeError, ValueError):
+                return False
+
+        positions_flat = (
+            flat_quantity(long_probe) and flat_quantity(short_probe)
+            if truth_available
+            else None
+        )
+        open_orders_flat = (
+            long_open_orders_flat is True and short_open_orders_flat is True
+            if long_open_orders_flat is not None and short_open_orders_flat is not None
+            else None
+        )
+        truth_attempt = {
+            "truth_available": truth_available,
+            "positions_flat": positions_flat,
+            "open_orders_flat": open_orders_flat,
+            "positions": [
+                self._exchange_truth_attempt_position_record(
+                    position.long_venue,
+                    position.symbol,
+                    long_probe,
+                ),
+                self._exchange_truth_attempt_position_record(
+                    position.short_venue,
+                    position.symbol,
+                    short_probe,
+                ),
+            ],
+            "open_order_truth": [
+                self._open_order_truth_attempt_record(
+                    position.long_venue,
+                    position.symbol,
+                    long_open_orders_flat,
+                    long_open_orders_evidence,
+                ),
+                self._open_order_truth_attempt_record(
+                    position.short_venue,
+                    position.symbol,
+                    short_open_orders_flat,
+                    short_open_orders_evidence,
+                ),
+            ],
+            "source": source,
+        }
+        if position_errors:
+            truth_attempt["position_errors"] = position_errors
+        if open_orders_flat is None:
+            truth_attempt["missing_evidence"] = ["open_order_truth"]
+        setattr(pending, "_last_exchange_truth_attempt", truth_attempt)
+        return truth_attempt
 
     def _live_flat_exchange_truth(
         self,
@@ -5867,6 +6039,32 @@ class PassiveCloseExecutor:
         )
         long_flat = bool(long_probe.get("flat"))
         short_flat = bool(short_probe.get("flat"))
+        self._record_pending_exchange_truth_attempt(
+            pending,
+            snapshot,
+            source="pending_passive_close_live_flat_probe",
+            long_probe=long_probe,
+            short_probe=short_probe,
+        )
+
+        if (not (long_flat and short_flat)) and pending.completed():
+            long_oo_flat, long_oo_evidence = await self._probe_venue_open_orders_flat(
+                long_venue, symbol, adapters
+            )
+            short_oo_flat, short_oo_evidence = await self._probe_venue_open_orders_flat(
+                short_venue, symbol, adapters
+            )
+            self._record_pending_exchange_truth_attempt(
+                pending,
+                snapshot,
+                source="pending_passive_close_live_flat_probe",
+                long_probe=long_probe,
+                short_probe=short_probe,
+                long_open_orders_flat=long_oo_flat,
+                short_open_orders_flat=short_oo_flat,
+                long_open_orders_evidence=long_oo_evidence,
+                short_open_orders_evidence=short_oo_evidence,
+            )
 
         if long_flat and short_flat:
             # Position truth is flat. Verify open-order truth to prevent
@@ -5876,6 +6074,17 @@ class PassiveCloseExecutor:
             )
             short_oo_flat, short_oo_evidence = await self._probe_venue_open_orders_flat(
                 short_venue, symbol, adapters
+            )
+            self._record_pending_exchange_truth_attempt(
+                pending,
+                snapshot,
+                source="pending_passive_close_live_flat_probe",
+                long_probe=long_probe,
+                short_probe=short_probe,
+                long_open_orders_flat=long_oo_flat,
+                short_open_orders_flat=short_oo_flat,
+                long_open_orders_evidence=long_oo_evidence,
+                short_open_orders_evidence=short_oo_evidence,
             )
             if not long_oo_flat or not short_oo_flat:
                 self._journal.append(
