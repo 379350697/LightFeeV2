@@ -276,6 +276,18 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
                 and record["payload"].get("symbol") == symbol
             ][-1]
             assert event_payload["blocked_until_ms"] == state_payload["blocked_until_ms"]
+            if expected_reason == "insufficient_balance_admission_blocked":
+                cooldown_payload = [
+                    record["payload"]
+                    for record in records
+                    if record["kind"] == "runtime.entry_admission_symbol_cooldown_armed"
+                    and record["payload"].get("venue") == venue
+                    and record["payload"].get("symbol") == symbol
+                ][-1]
+                assert cooldown_payload["reason"] == expected_reason
+                assert cooldown_payload["reduce_only"] is False
+                assert cooldown_payload["block_scope"] == "symbol"
+                assert cooldown_payload["blocked_until_ms"] == state_payload["blocked_until_ms"]
 
         assert event_payload["reason"] == expected_reason
         assert event_payload["raw_error"] == raw_error[:500]

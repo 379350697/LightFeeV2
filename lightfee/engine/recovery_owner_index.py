@@ -123,6 +123,30 @@ class RecoveryOwnerIndex:
                 if venue and symbol:
                     self._positions_by_key[(venue, symbol)] = owner
 
+        for pending in _collection(state, "pending_passive_closes"):
+            owner = RecoveryOwner(
+                owner_type="pending_passive_close",
+                owner_id=_text(_get(pending, "position_id", _get(pending, "close_id", ""))),
+                confidence="proven",
+                evidence={"source": "local_pending_passive_close"},
+            )
+            phase_state = _get(pending, "phase_state", {})
+            self._index_order_ids(
+                owner,
+                order_ids=(
+                    _get(pending, "maker_order_id", ""),
+                    _get(phase_state, "maker_order_id", ""),
+                    _get(_get(pending, "maker_fill", {}), "order_id", ""),
+                    _get(_get(pending, "hedge_fill", {}), "order_id", ""),
+                ),
+                client_order_ids=(
+                    _get(pending, "maker_client_order_id", ""),
+                    _get(phase_state, "maker_client_order_id", ""),
+                    _get(_get(pending, "maker_fill", {}), "client_order_id", ""),
+                    _get(_get(pending, "hedge_fill", {}), "client_order_id", ""),
+                ),
+            )
+
         for residual in _collection(state, "pending_residual_repairs"):
             owner = RecoveryOwner(
                 owner_type="residual_repair",
@@ -145,19 +169,25 @@ class RecoveryOwnerIndex:
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
                 continue
+            kind = _text(_get(event, "kind", ""))
             order_id, client_order_id = _journal_order_identifiers(payload)
             position_specs = _journal_position_specs(event, payload)
             if not order_id and not client_order_id and not position_specs:
                 continue
             owner_id = _journal_owner_key(payload)
             symbol = _text(payload.get("symbol")).upper()
+            is_passive_close = kind.startswith("exit.passive_close")
             owner = RecoveryOwner(
-                owner_type="journal_pending_entry",
+                owner_type=(
+                    "journal_passive_close"
+                    if is_passive_close
+                    else "journal_pending_entry"
+                ),
                 owner_id=owner_id or symbol,
                 confidence="probable",
                 evidence={
-                    "source": "journal",
-                    "kind": _text(_get(event, "kind", "")),
+                    "source": "journal_passive_close" if is_passive_close else "journal",
+                    "kind": kind,
                     "symbol": symbol,
                 },
             )

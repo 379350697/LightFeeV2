@@ -29,6 +29,15 @@ not an ordinary maker retry. It must immediately route to live-truth closure:
 maker-flat plus other-leg-live goes to one-sided flatten, both-flat goes to
 flat cleanup, and untrusted truth retains pending close.
 
+If Bybit `110017` or a passive-close terminal/no-fill branch occurs while live
+position truth is still nonzero and open-order truth shows a matching
+reduce-only close order, the order is covered by existing exchange work rather
+than terminal-flat. Adopt the order by order id/client id when available, or by
+venue+symbol+side+reduce-only+quantity coverage when that evidence is
+consistent, then continue passive maintenance. Do not submit a duplicate
+reduce-only maker or taker-flatten while the owned close order is live. If the
+open order cannot be proven as a close owner, fail closed and block new risk.
+
 Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry
 backoff, enter fail-closed, compensate any unhedged gap when possible, and
@@ -75,6 +84,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-08 | Passive close terminality proof gate | fixed, deployed/cloud verified | Maker progress query timeout now keeps zero-fill cycle state; one-sided ACK-only flatten now registers `accepted_order_truth_gap` and waits for exchange truth before terminal lifecycle; clear path now passes full exchange positions/open-orders truth to recovery core. Merged as `74475c5` and included in the latest deployed main line. |
 | 2026-06-10 | MOVEUSDT ACK-only duplicate-client diagnose closure | fixed locally, deploy pending | CL-066 closes the deployed MOVEUSDT evidence-consumption gap where Bybit ACK-only accepted ids plus same-client-id `110072` stayed in active diagnose errors after reconciliation/terminal/current exchange truth proved flat. Diagnose now treats ACK-only `order.uncertain` as implicit truth-gap registration when accepted ids and no-fill evidence are present, binds nested request identities, and resolves matching duplicate-client artifacts only behind flat/no-open-orders truth. Close execution now records duplicate-client live-flat as `exit.close_duplicate_client_order_resolved_live_flat`, not zero-quantity `order.filled`. |
 | 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed, deployed/cloud verified | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. Cloud verification under `fd1579d` is flat/no-open-orders with no active order errors and no unmapped lifecycle events. |
+| 2026-06-19 | Existing reduce-only close order covers quantity | fixed locally, deploy pending | GENIUSUSDT-style close drift is not terminal-flat when Bybit still has nonzero position plus a matching reduce-only close order. CL-100 adopts the existing close order into pending passive close state, adds journal-based close-owner recovery, and keeps diagnose/gate red until exchange truth is flat/no-open-orders or owned close work is resolved. |
 
 ## Recurrences
 
@@ -90,6 +100,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-07 | `BABYUSDT` OKX/Bybit plus unowned Bybit `MORPHOUSDT`, `MONUSDT`, `SEIUSDT` live artifacts | working tree | local RED/GREEN coverage complete for `PC-06`/`PC-07`/`PC-08`; deploy and production verification pending | [daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry](../daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry) |
 | 2026-06-08 | ACK-only timeout/order-truth evidence for production issue 10 | `89e2b93` / `74475c5` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
+| 2026-06-19 | `GENIUSUSDT` Bybit reduce-only close owner | working tree | local semantic gates pass; deploy pending | [daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](../daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption) |
 
 ## Regression Harness
 
@@ -125,3 +136,5 @@ processing, supervisor venue coverage, and entry-conflict gating.
     silently retained, skipped by supervisor venue coverage, or skipped by entry
     conflict gating.
 11. Closure requires harness replay plus credentialed flat/no-open-orders probe.
+12. If a reduce-only close open order still exists, decide owner first: adopt
+    matching pending/journal passive-close owner, or fail closed as ownerless.

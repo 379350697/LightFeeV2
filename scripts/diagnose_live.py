@@ -4883,6 +4883,11 @@ def _build_business_progression_quality_summary(
     active_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
     entry_routes: dict[str, dict[str, str]] = {}
     repeated_submit_samples: list[dict[str, Any]] = []
+    ownerless_open_order_count = 0
+    owned_pending_passive_close_count = 0
+    adopted_reduce_only_order_count = 0
+    duplicate_reduce_only_submit_blocked_count = 0
+    deterministic_reject_after_submit_count = 0
 
     def event_ts(rec: dict[str, Any]) -> int:
         payload = rec.get("payload", {})
@@ -4991,9 +4996,27 @@ def _build_business_progression_quality_summary(
             terminal_entry_id = entry_id(payload)
             if terminal_entry_id and terminal_entry_id in zero_fill_cancel_entries:
                 recovered_but_counted_entries.add(terminal_entry_id)
+        elif kind == "exit.passive_close_open_order_ownerless_blocked":
+            ownerless_open_order_count += 1
+        elif kind == "exit.passive_close_existing_reduce_only_order_adopted":
+            adopted_reduce_only_order_count += 1
+            owned_pending_passive_close_count += 1
+        elif kind == "exit.passive_close_reduce_only_quantity_covered_by_open_order":
+            duplicate_reduce_only_submit_blocked_count += 1
+            owned_pending_passive_close_count += 1
+        elif kind == "order.rejected":
+            code = str(
+                payload.get("exchange_code")
+                or payload.get("code")
+                or ""
+            )
+            text = json.dumps(payload, sort_keys=True).lower()
+            if code == "110007" or "110007" in text or "ab not enough" in text:
+                deterministic_reject_after_submit_count += 1
 
         if kind in {
             "runtime.entry_admission_blocked",
+            "runtime.entry_admission_symbol_cooldown_armed",
             "runtime.venue_cooldown_started",
         }:
             venue = str(payload.get("venue") or "").lower()
@@ -5091,6 +5114,15 @@ def _build_business_progression_quality_summary(
         "quote_rewarm_terminalized_count": quote_rewarm_terminalized_count,
         "recovered_but_counted_issue_count": len(recovered_but_counted_entries),
         "active_stuck_count": active_stuck_count,
+        "ownerless_open_order_count": ownerless_open_order_count,
+        "owned_pending_passive_close_count": owned_pending_passive_close_count,
+        "adopted_reduce_only_order_count": adopted_reduce_only_order_count,
+        "duplicate_reduce_only_submit_blocked_count": (
+            duplicate_reduce_only_submit_blocked_count
+        ),
+        "deterministic_reject_after_submit_count": (
+            deterministic_reject_after_submit_count
+        ),
         "repeated_single_leg_guarded": {
             "violation_count": violation_count,
             "severity": "production_issue" if violation_count else "ok",
@@ -5414,6 +5446,22 @@ def _build_production_acceptance_gate(
         exchange_truth,
         events,
     )
+    v1_rows = [
+        row for row in v1_lifecycle_closure.get("rows", []) or []
+        if isinstance(row, dict)
+    ]
+    closure_owned_pending_passive_close_count = sum(
+        1
+        for row in v1_rows
+        if str(row.get("evidence_class") or "")
+        == "owned_pending_passive_close"
+    )
+    closure_ownerless_open_order_count = sum(
+        1
+        for row in v1_rows
+        if str(row.get("terminality") or "")
+        in {"orphan_maker_order", "orphan_reduce_only_order"}
+    )
     local_recovery_clean = (
         open_position_count == 0
         and pending_entry_count == 0
@@ -5692,6 +5740,10 @@ def _build_production_acceptance_gate(
         "pending_entry_live_conflicts": pending_live_conflicts,
         "recovery_decision": recovery_decision,
         "v1_lifecycle_closure": v1_lifecycle_closure,
+        "ownerless_open_order_count": closure_ownerless_open_order_count,
+        "owned_pending_passive_close_count": (
+            closure_owned_pending_passive_close_count
+        ),
         "runtime_progress": runtime_progress,
         "runtime_market_data_config": runtime_market_data_config,
         "fingerprints": fingerprints,

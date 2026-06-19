@@ -6744,6 +6744,180 @@ class TestProductionPathCoroutineSafety:
 class TestReduceOnlyRejectedEscalation:
     """Reduce-only rejected → immediate DUAL_TAKER escalation, no infinite retry."""
 
+    def test_terminal_no_fill_adopts_matching_live_reduce_only_order(self):
+        """A terminal/no-fill progress result cannot clear owner if the order is still live."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BYBIT,
+            side=Side.BUY,
+            order_id="bybit-close-live",
+            client_order_id="bybit-close-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.REJECTED,
+        ))
+        maker_adapter.fetch_open_orders = AsyncMock(return_value=[
+            {
+                "venue": "bybit",
+                "symbol": "GENIUSUSDT",
+                "side": "buy",
+                "quantity": 60.0,
+                "price": 0.3963,
+                "reduce_only": True,
+                "order_id": "bybit-close-live",
+                "client_order_id": "bybit-close-client",
+            }
+        ])
+        maker_adapter.submit_passive_order = AsyncMock()
+
+        executor = PassiveCloseExecutor(
+            {Venue.BYBIT: maker_adapter, Venue.BINANCE: _mock_adapter_passive_ok(Venue.BINANCE)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.3963)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-genius",
+            symbol="GENIUSUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            matched_quantity=60.0,
+            long_quantity=60.0,
+            short_quantity=60.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=60.0,
+            chunk_quantities=[60.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+                maker_order_id="bybit-close-live",
+                maker_client_order_id="bybit-close-client",
+                maker_resting_limit_price=0.3963,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False),
+            timeout=0.1,
+        ))
+
+        assert result is False
+        assert pending.phase_state.phase == PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
+        assert pending.phase_state.maker_order_id == "bybit-close-live"
+        assert pending.phase_state.maker_client_order_id == "bybit-close-client"
+        assert pending.phase_state.maker_resting_limit_price == pytest.approx(0.3963)
+        maker_adapter.submit_passive_order.assert_not_called()
+        kinds = [event["kind"] for event in journal.read_all()]
+        assert "exit.passive_close_existing_reduce_only_order_adopted" in kinds
+        assert "exit.passive_close_maker_terminal_no_fill" in kinds
+
+    def test_bybit_110017_with_existing_reduce_only_order_retains_pending(self):
+        """110017 with nonzero live exposure and a matching close order is covered, not flat."""
+        journal = _open_journal()
+
+        class BybitCoveredAdapter(VenueAdapter):
+            def __init__(self):
+                submit_error = OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "bybit passive order failed: bybit retCode=110017 retMsg=orderQty will be truncated to zero.",
+                )
+                submit_error.exchange_response_body = (
+                    '{"retCode":110017,"retMsg":"orderQty will be truncated to zero."}'
+                )
+                self.submit_passive_order = AsyncMock(side_effect=submit_error)
+                self.fetch_open_orders = AsyncMock(return_value=[
+                    {
+                        "venue": "bybit",
+                        "symbol": "GENIUSUSDT",
+                        "side": "buy",
+                        "quantity": 60.0,
+                        "price": 0.3963,
+                        "reduce_only": True,
+                        "order_id": "existing-close",
+                        "client_order_id": "existing-close-client",
+                    }
+                ])
+
+            @property
+            def venue(self):
+                return Venue.BYBIT
+
+            async def place_order(self, request):
+                raise AssertionError("one-sided IOC must not be submitted")
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=60.0,
+                    entry_price=0.396,
+                    observed_at_ms=1781856334226,
+                )
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            def price_tick_size(self, symbol=None):
+                return 0.0001
+
+        bybit = BybitCoveredAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BYBIT: bybit, Venue.BINANCE: _mock_adapter_passive_ok(Venue.BINANCE)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.3963)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.3962, 0.3964))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-genius",
+            symbol="GENIUSUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            matched_quantity=60.0,
+            long_quantity=60.0,
+            short_quantity=60.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=60.0,
+            chunk_quantities=[60.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+                maker_submit_attempt=0,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False),
+            timeout=0.1,
+        ))
+
+        assert result is False
+        assert position.position_id in state.pending_passive_closes
+        assert pending.phase_state.maker_order_id == "existing-close"
+        kinds = [event["kind"] for event in journal.read_all()]
+        assert "exit.passive_close_reduce_only_quantity_covered_by_open_order" in kinds
+        assert "exit.passive_close_existing_reduce_only_order_adopted" in kinds
+
     def test_recovered_terminal_rejected_maker_order_escalates_without_spin(self):
         """Recovered terminal rejected maker order must not be polled forever."""
         journal = _open_journal()

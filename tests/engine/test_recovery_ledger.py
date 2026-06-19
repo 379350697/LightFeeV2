@@ -39,6 +39,129 @@ def test_local_flat_plus_live_non_reduce_open_order_blocks_as_orphan_maker_order
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
+def test_pending_passive_close_owns_live_reduce_only_close_order():
+    local = {
+        "open_positions": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entries": [],
+        "pending_passive_closes": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "position_snapshot": {
+                    "symbol": "GENIUSUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                },
+                "phase_state": {
+                    "maker_order_id": "bybit-close-live",
+                    "maker_client_order_id": "bybit-close-client",
+                },
+            }
+        ],
+    }
+    owner_index = RecoveryOwnerIndex.from_state(local)
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local,
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "bybit",
+                    "symbol": "GENIUSUSDT",
+                    "side": "buy",
+                    "quantity": 60.0,
+                    "reduce_only": True,
+                    "order_id": "bybit-close-live",
+                    "client_order_id": "bybit-close-client",
+                }
+            ],
+        },
+        owner_index=owner_index,
+    )
+
+    close_items = [
+        item for item in ledger.work_items
+        if item.kind == "owned_pending_passive_close"
+    ]
+    assert len(close_items) == 1
+    assert close_items[0].owner.owner_type == "pending_passive_close"
+    assert close_items[0].decision.reason == "live_reduce_only_close_order_has_passive_close_owner"
+    assert all(item.kind != "owned_pending_entry" for item in ledger.work_items)
+    assert all(item.kind != "orphan_reduce_only_order" for item in ledger.work_items)
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+
+
+def test_passive_close_journal_owns_live_reduce_only_close_order_without_local_pending():
+    local = {
+        "open_positions": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entries": [],
+        "pending_passive_closes": [],
+    }
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(
+        local,
+        [
+            {
+                "kind": "exit.passive_close_maker_submitted",
+                "payload": {
+                    "position_id": "entry-genius",
+                    "symbol": "GENIUSUSDT",
+                    "venue": "bybit",
+                    "order_id": "bybit-close-live",
+                    "client_order_id": "bybit-close-client",
+                    "reduce_only": True,
+                },
+            }
+        ],
+    )
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local,
+        exchange_truth={
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [
+                {
+                    "venue": "bybit",
+                    "symbol": "GENIUSUSDT",
+                    "side": "buy",
+                    "quantity": 60.0,
+                    "reduce_only": True,
+                    "order_id": "bybit-close-live",
+                    "client_order_id": "bybit-close-client",
+                }
+            ],
+        },
+        owner_index=owner_index,
+    )
+
+    close_items = [
+        item for item in ledger.work_items
+        if item.kind == "owned_pending_passive_close"
+    ]
+    assert len(close_items) == 1
+    assert close_items[0].owner.owner_type == "journal_passive_close"
+    assert close_items[0].decision.outcome == "passive_close_order_maintenance_required"
+    assert all(item.kind != "owned_pending_entry" for item in ledger.work_items)
+    assert all(item.kind != "orphan_reduce_only_order" for item in ledger.work_items)
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
+
+
 def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"open_positions": [], "pending_entries": []},

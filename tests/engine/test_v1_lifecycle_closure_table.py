@@ -98,6 +98,86 @@ def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
     )
 
 
+def test_owned_pending_passive_close_projects_as_passive_close_blocker():
+    from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_positions": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "pending_passive_closes": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "position_snapshot": {
+                    "symbol": "GENIUSUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                },
+                "phase_state": {
+                    "maker_order_id": "bybit-close-live",
+                    "maker_client_order_id": "bybit-close-client",
+                },
+            }
+        ],
+    }
+
+    table = build_v1_lifecycle_closure_table(
+        local_state=local_state,
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {},
+            "open_orders": {
+                "bybit": {
+                    "GENIUSUSDT": {
+                        "symbol": "GENIUSUSDT",
+                        "venue": "bybit",
+                        "side": "buy",
+                        "quantity": 60.0,
+                        "reduce_only": True,
+                        "order_id": "bybit-close-live",
+                        "client_order_id": "bybit-close-client",
+                    }
+                }
+            },
+        },
+        owner_index=RecoveryOwnerIndex.from_state(local_state),
+        events=[
+            {
+                "kind": "runtime.entry_admission_venue_degraded",
+                "payload": {"reason": "multiple_entry_admission_blocks"},
+            }
+        ],
+        generated_at_ms=1781856334226,
+    )
+
+    payload = table.to_dict()
+    assert payload["summary"]["entry_allowed"] is False
+    assert "runtime.entry_admission_venue_degraded" not in payload["unmapped_event_kinds"]
+    close_rows = [
+        row for row in payload["rows"]
+        if row["evidence_class"] == "owned_pending_passive_close"
+    ]
+    assert len(close_rows) == 1
+    assert close_rows[0]["phase"] == "PASSIVE_CLOSE"
+    assert close_rows[0]["recovery_policy"] == "manage_owned_pending_passive_close"
+
+
 def test_owned_pending_entry_live_conflict_projects_as_live_artifact_row():
     from lightfee.engine.recovery_ledger import (
         ExchangeArtifact,

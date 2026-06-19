@@ -530,7 +530,7 @@ def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
 
 
 def _recovery_work_phase(kind: str) -> V1LifecycleClosurePhase:
-    if kind == "pending_passive_close":
+    if kind in {"pending_passive_close", "owned_pending_passive_close"}:
         return V1LifecycleClosurePhase.PASSIVE_CLOSE
     if kind == "pending_residual_repair":
         return V1LifecycleClosurePhase.RESIDUAL_REPAIR
@@ -1168,6 +1168,7 @@ _EVENT_KIND_PHASES = {
     "runtime.position_drift_skipped_passive_close_owner": (
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
     ),
+    "runtime.entry_admission_venue_degraded": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_reconcile_error": V1LifecycleClosurePhase.PENDING_ENTRY.value,
