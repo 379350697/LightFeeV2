@@ -17,6 +17,29 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest open/close lifecycle owner-truth closure, 2026-06-19:
+GENIUSUSDT-style review found that previous fixes could be locally safe yet
+business-stuck: a Bybit reduce-only close order may remain live after
+passive-close terminal/no-fill or `110017`, but local maker ids could be
+cleared before that order was adopted as owned close work. CL-100 extends the
+owner ledger so both local `pending_passive_closes` and passive-close journal
+events own matching reduce-only close open orders as
+`owned_pending_passive_close`; V1 lifecycle closure projects them as
+`PASSIVE_CLOSE` blockers that prevent new risk and route to passive close
+maintenance. Passive close now adopts existing matching reduce-only close
+orders before clearing ids, treats `110017` as terminal-flat only when
+position truth and open-order truth are both flat, blocks ownerless close-order
+ambiguity fail-closed, and emits Bybit `110007` opening cooldown evidence via
+`runtime.entry_admission_symbol_cooldown_armed`. Diagnose adds
+owner/adoption/duplicate-reduce-only/deterministic-reject business-quality
+counters and production gate row counts, so `health.ok` cannot hide
+`gate_passed=false`. Relation to prior closures: CL-083 covers the already-flat
+`110017` terminal-zero branch; CL-100 covers the non-flat
+existing-reduce-only-order branch; CL-099 covers opening admission and
+single-leg fee-drag. See
+[daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption)
+and [cards/passive-close-terminal-flatness.md](cards/passive-close-terminal-flatness.md).
+
 Latest Aster headroom, single-leg fee-drag, and phase handoff quality closure,
 2026-06-19:
 The next production-readiness review found that the issue was broader than

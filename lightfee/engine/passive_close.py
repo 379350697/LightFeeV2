@@ -1108,6 +1108,19 @@ class PassiveCloseExecutor:
                                 "zero_fill_cycles": pending.phase_state.zero_fill_cycles_in_phase,
                             },
                         )
+                        adopted = await self._adopt_matching_reduce_only_close_order(
+                            pending,
+                            position,
+                            venue=maker_venue,
+                            side=maker_side,
+                            target_quantity=chunk_quantity,
+                            order_id=progress.order_id or maker_order_id,
+                            client_order_id=progress.client_order_id or maker_client_id,
+                            source="terminal_no_fill_progress",
+                            now_ms=now_ms,
+                        )
+                        if adopted:
+                            return False
                         pending.phase_state.maker_order_id = ""
                         pending.phase_state.maker_client_order_id = ""
                         pending.phase_state.maker_resting_limit_price = None
@@ -1664,6 +1677,33 @@ class PassiveCloseExecutor:
                     evidence=evidence,
                     request_context=req_ctx,
                 ):
+                    adopted = await self._adopt_matching_reduce_only_close_order(
+                        pending,
+                        position,
+                        venue=maker_venue,
+                        side=maker_side,
+                        target_quantity=chunk_quantity,
+                        order_id="",
+                        client_order_id="",
+                        source="bybit_110017_reduce_only_submit_error",
+                        now_ms=self._now_ms(),
+                    )
+                    if adopted:
+                        self._journal.append(
+                            "exit.passive_close_reduce_only_quantity_covered_by_open_order",
+                            {
+                                "position_id": position.position_id,
+                                "symbol": position.symbol,
+                                "venue": maker_venue.value,
+                                "maker_leg": maker_leg_label,
+                                "error": str(e),
+                                "exchange_error": evidence.to_dict(),
+                                "request_context": req_ctx.to_dict(),
+                                "decision": "retain_pending",
+                                "reason": "existing_reduce_only_close_order_covers_quantity",
+                            },
+                        )
+                        return False
                     self._journal.append(
                         "exit.passive_close_terminal_zero_qty_reduce_only_evidence",
                         {
@@ -4706,12 +4746,35 @@ class PassiveCloseExecutor:
         if adapter is None:
             return False
 
-        open_orders_flat, open_orders_evidence = await self._probe_venue_open_orders_flat(
+        open_order_items, open_order_error = await self._fetch_venue_open_order_items(
             venue,
             position.symbol,
             self._adapters,
         )
+        if open_order_error:
+            open_orders_flat, open_orders_evidence = None, open_order_error
+        elif open_order_items:
+            open_orders_flat, open_orders_evidence = (
+                False,
+                f"open_orders_count={len(open_order_items)}",
+            )
+        else:
+            open_orders_flat, open_orders_evidence = True, None
         if open_orders_flat is not True:
+            adopted = await self._adopt_matching_reduce_only_close_order(
+                pending,
+                position,
+                venue=venue,
+                side=close_side,
+                target_quantity=live_qty,
+                order_id="",
+                client_order_id="",
+                source="one_sided_flatten_open_orders_not_flat",
+                now_ms=self._now_ms(),
+                open_orders=open_order_items,
+            )
+            if adopted:
+                return False
             self._journal.append(
                 "exit.passive_close_live_one_sided_truth_gap",
                 {
@@ -4725,6 +4788,21 @@ class PassiveCloseExecutor:
                     "open_orders_evidence": open_orders_evidence,
                     "decision": "retain_pending",
                     "reason": "one_sided_flatten_requires_open_order_flat_proof",
+                },
+            )
+            self._journal.append(
+                "exit.passive_close_open_order_ownerless_blocked",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "live_quantity": live_qty,
+                    "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
+                    "open_orders_flat": open_orders_flat,
+                    "open_orders_evidence": open_orders_evidence,
+                    "decision": "retain_pending_block_new_risk",
+                    "reason": "open_order_not_adoptable_for_one_sided_flatten",
                 },
             )
             pending.next_retry_at_ms = self._now_ms() + 5_000
@@ -5895,6 +5973,27 @@ class PassiveCloseExecutor:
         if adapter is None:
             return None, "adapter_missing"
 
+        items, error = await self._fetch_venue_open_order_items(
+            venue,
+            symbol,
+            adapters,
+        )
+        if error:
+            return None, error
+        if items:
+            return False, f"open_orders_count={len(items)}"
+        return True, None
+
+    async def _fetch_venue_open_order_items(
+        self,
+        venue: Venue,
+        symbol: str,
+        adapters: dict[Venue, VenueAdapter],
+    ) -> tuple[list[Any] | None, str | None]:
+        adapter = adapters.get(venue)
+        if adapter is None:
+            return None, "adapter_missing"
+
         # Try adapter.fetch_open_orders(symbol) duck-type first
         fetch_fn = getattr(adapter, "fetch_open_orders", None)
         if callable(fetch_fn):
@@ -5903,9 +6002,7 @@ class PassiveCloseExecutor:
                 if isinstance(orders, dict) and orders.get("error"):
                     return None, str(orders["error"])
                 items = orders if isinstance(orders, list) else []
-                if items:
-                    return False, f"open_orders_count={len(items)}"
-                return True, None
+                return items, None
             except Exception as exc:
                 return None, str(exc)
 
@@ -5941,11 +6038,171 @@ class PassiveCloseExecutor:
                     items = raw["data"]
                 elif isinstance(raw.get("list"), list):
                     items = raw["list"]
-            if items:
-                return False, f"open_orders_count={len(items)}"
-            return True, None
+            return items, None
         except Exception as exc:
             return None, str(exc)
+
+    async def _adopt_matching_reduce_only_close_order(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        venue: Venue,
+        side: Side,
+        target_quantity: float,
+        order_id: str = "",
+        client_order_id: str = "",
+        source: str,
+        now_ms: int,
+        open_orders: list[Any] | None = None,
+    ) -> bool:
+        """Recover ownership when exchange truth still has the reduce-only close order."""
+        if open_orders is None:
+            adapter = self._adapter(venue)
+            if adapter is None:
+                return False
+            fetch_fn = getattr(adapter, "fetch_open_orders", None)
+            if not callable(fetch_fn):
+                return False
+            try:
+                orders = await fetch_fn(position.symbol)
+            except Exception as exc:
+                self._journal.append(
+                    "exit.passive_close_existing_reduce_only_order_adopt_failed",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "venue": venue.value,
+                        "source": source,
+                        "error": str(exc),
+                        "reason": "open_orders_query_failed",
+                    },
+                )
+                return False
+            if isinstance(orders, dict) and orders.get("error"):
+                return False
+            items = orders if isinstance(orders, list) else []
+        else:
+            items = open_orders
+        match = self._find_matching_reduce_only_close_order(
+            items,
+            symbol=position.symbol,
+            side=side,
+            target_quantity=target_quantity,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        if match is None:
+            return False
+
+        matched_order_id = self._order_field(match, "order_id", "orderId", "id")
+        matched_client_id = self._order_field(
+            match, "client_order_id", "clientOrderId", "clientOid", "orderLinkId"
+        )
+        matched_price = self._positive_float(
+            self._order_field(match, "price", "limit_price", "order_price")
+        )
+        matched_quantity = self._positive_float(
+            self._order_field(match, "quantity", "qty", "size", "origQty")
+        )
+        pending.phase_state.maker_order_id = matched_order_id
+        pending.phase_state.maker_client_order_id = matched_client_id
+        if matched_price > 0.0:
+            pending.phase_state.maker_resting_limit_price = matched_price
+        pending.phase_state.maker_resting_since_ms = now_ms
+        pending.next_retry_at_ms = now_ms + self._config.progress_poll_interval_ms
+        self._journal.append(
+            "exit.passive_close_existing_reduce_only_order_adopted",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value,
+                "side": side.value,
+                "target_quantity": target_quantity,
+                "matched_quantity": matched_quantity,
+                "order_id": matched_order_id,
+                "client_order_id": matched_client_id,
+                "price": matched_price,
+                "source": source,
+                "decision": "retain_pending",
+                "reason": "exchange_open_order_matches_reduce_only_close_owner",
+            },
+        )
+        return True
+
+    def _find_matching_reduce_only_close_order(
+        self,
+        orders: list[Any],
+        *,
+        symbol: str,
+        side: Side,
+        target_quantity: float,
+        order_id: str = "",
+        client_order_id: str = "",
+    ) -> Any | None:
+        target_symbol_key = self._canonical_symbol_key(symbol)
+        target_side = side.value.lower()
+        expected_order_id = str(order_id or "")
+        expected_client_id = str(client_order_id or "")
+        for order in orders:
+            order_symbol = self._canonical_symbol_key(
+                self._order_field(order, "symbol", "instId", "s")
+            )
+            if order_symbol and target_symbol_key and order_symbol != target_symbol_key:
+                continue
+            if not self._order_bool(order, "reduce_only", "reduceOnly", "reduce-only"):
+                continue
+            order_side = self._order_side_text(order)
+            if order_side and order_side != target_side:
+                continue
+            current_order_id = self._order_field(order, "order_id", "orderId", "id")
+            current_client_id = self._order_field(
+                order, "client_order_id", "clientOrderId", "clientOid", "orderLinkId"
+            )
+            id_matches = (
+                (expected_order_id and current_order_id == expected_order_id)
+                or (expected_client_id and current_client_id == expected_client_id)
+            )
+            order_qty = self._positive_float(
+                self._order_field(order, "quantity", "qty", "size", "origQty")
+            )
+            quantity_matches = target_quantity <= 1e-9 or order_qty + 1e-9 >= target_quantity
+            if id_matches or (quantity_matches and order_qty > 0.0):
+                return order
+        return None
+
+    @staticmethod
+    def _order_field(order: Any, *names: str) -> str:
+        for name in names:
+            value = order.get(name) if isinstance(order, dict) else getattr(order, name, None)
+            if value is not None and value != "":
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _order_bool(order: Any, *names: str) -> bool:
+        for name in names:
+            value = order.get(name) if isinstance(order, dict) else getattr(order, name, None)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes"}:
+                    return True
+                if lowered in {"false", "0", "no"}:
+                    return False
+            if isinstance(value, (int, float)):
+                return bool(value)
+        return False
+
+    def _order_side_text(self, order: Any) -> str:
+        value = order.get("side") if isinstance(order, dict) else getattr(order, "side", None)
+        if isinstance(value, Side):
+            return value.value.lower()
+        text = str(value or "").lower()
+        if text.startswith("side."):
+            return text.split(".", 1)[1]
+        return text
 
     # ------------------------------------------------------------------
     # Price and tick helpers

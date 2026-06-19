@@ -3222,6 +3222,89 @@ def test_run_diagnose_conclusion_is_unhealthy_when_acceptance_gate_has_open_orde
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_production_gate_counts_journal_owned_pending_passive_close():
+    from scripts import diagnose_live as dl
+
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "open_positions": [
+            {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_passive_closes": [],
+        "pending_residual_repair_count": 0,
+    }
+    events = [
+        {
+            "kind": "exit.passive_close_maker_submitted",
+            "payload": {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "venue": "bybit",
+                "order_id": "bybit-close-live",
+                "client_order_id": "bybit-close-client",
+                "reduce_only": True,
+            },
+        }
+    ]
+    exchange_truth = {
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": True,
+        "has_open_order": True,
+        "positions": {
+            "bybit": {
+                "GENIUSUSDT": {
+                    "venue": "bybit",
+                    "symbol": "GENIUSUSDT",
+                    "side": "short",
+                    "quantity": 60.0,
+                }
+            }
+        },
+        "open_orders": {
+            "bybit": {
+                "GENIUSUSDT": [
+                    {
+                        "venue": "bybit",
+                        "symbol": "GENIUSUSDT",
+                        "side": "Buy",
+                        "quantity": 60.0,
+                        "reduce_only": True,
+                        "order_id": "bybit-close-live",
+                        "client_order_id": "bybit-close-client",
+                    }
+                ]
+            }
+        },
+    }
+
+    gate = dl._build_production_acceptance_gate(
+        events,
+        local_state,
+        exchange_truth,
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["owned_pending_passive_close_count"] == 1
+    assert gate["ownerless_open_order_count"] == 0
+    rows = gate["v1_lifecycle_closure"]["rows"]
+    assert any(
+        row["evidence_class"] == "owned_pending_passive_close"
+        and row["phase"] == "PASSIVE_CLOSE"
+        for row in rows
+    )
+
+
 def test_production_blocker_window_reports_closed_evidence_conclusions(tmp_path):
     from scripts.analyze_production_blockers import analyze_event_file
 
@@ -5497,6 +5580,11 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "quote_rewarm_terminalized_count": 0,
             "recovered_but_counted_issue_count": 0,
             "active_stuck_count": 1,
+            "ownerless_open_order_count": 0,
+            "owned_pending_passive_close_count": 0,
+            "adopted_reduce_only_order_count": 0,
+            "duplicate_reduce_only_submit_blocked_count": 0,
+            "deterministic_reject_after_submit_count": 0,
             "repeated_single_leg_guarded": {
                 "violation_count": 0,
                 "severity": "ok",
@@ -6481,6 +6569,71 @@ def test_business_progression_quality_summary_flags_route_cooldown_fee_drag():
     assert sample["venue_symbol"] == "aster:HUSDT"
     assert sample["submitted_venue_symbol"] == "binance:HUSDT"
     assert sample["cooldown_reason"] == "aster_max_notional_limit"
+
+
+def test_business_progression_quality_counts_reduce_only_adopt_and_deterministic_reject():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000000000,
+            "kind": "order.rejected",
+            "payload": {
+                "symbol": "OPGUSDT",
+                "venue": "bybit",
+                "exchange_code": "110007",
+                "raw_error": "bybit retCode=110007 retMsg=ab not enough for new order",
+            },
+        },
+        {
+            "ts_ms": 1700000000001,
+            "kind": "runtime.entry_admission_symbol_cooldown_armed",
+            "payload": {
+                "symbol": "OPGUSDT",
+                "venue": "bybit",
+                "reason": "insufficient_balance_admission_blocked",
+                "block_scope": "symbol",
+                "blocked_until_ms": 1700000300000,
+            },
+        },
+        {
+            "ts_ms": 1700000000100,
+            "kind": "exit.passive_close_existing_reduce_only_order_adopted",
+            "payload": {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "venue": "bybit",
+                "order_id": "bybit-close-live",
+            },
+        },
+        {
+            "ts_ms": 1700000000200,
+            "kind": "exit.passive_close_reduce_only_quantity_covered_by_open_order",
+            "payload": {
+                "position_id": "entry-genius",
+                "symbol": "GENIUSUSDT",
+                "venue": "bybit",
+                "exchange_code": "110017",
+            },
+        },
+        {
+            "ts_ms": 1700000000300,
+            "kind": "exit.passive_close_open_order_ownerless_blocked",
+            "payload": {
+                "position_id": "entry-ownerless",
+                "symbol": "BADUSDT",
+                "venue": "bybit",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+
+    assert summary["deterministic_reject_after_submit_count"] == 1
+    assert summary["adopted_reduce_only_order_count"] == 1
+    assert summary["duplicate_reduce_only_submit_blocked_count"] == 1
+    assert summary["owned_pending_passive_close_count"] == 2
+    assert summary["ownerless_open_order_count"] == 1
 
 
 def test_business_progression_quality_summary_reports_phase_takeover_gaps():

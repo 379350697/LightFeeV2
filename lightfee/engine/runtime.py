@@ -781,6 +781,16 @@ class LiveRuntime:
                 "ts_ms": now_ms,
             },
         )
+        self.journal.append(
+            "runtime.entry_admission_symbol_cooldown_armed",
+            {
+                **base_payload,
+                "block_scope": "venue" if is_venue_scope else "symbol",
+                "reduce_only": False,
+                "order_role": str(extra_payload.get("order_role") or "opening"),
+                "ts_ms": now_ms,
+            },
+        )
         if is_venue_scope:
             self.journal.append(
                 "runtime.venue_cooldown_started",

@@ -16,6 +16,7 @@ GLOBAL_BLOCKING_KINDS = frozenset(
         "orphan_maker_order",
         "unpaired_live_position",
         "owned_pending_entry_live_conflict",
+        "owned_pending_passive_close",
     }
 )
 
@@ -323,7 +324,7 @@ class RecoveryLedger:
                 side=str(_get(order, "side", "") or "").lower(),
                 quantity=quantity,
                 price=_float(_get(order, "price", 0.0)),
-                reduce_only=bool(_get(order, "reduce_only", False)),
+                reduce_only=bool(_get(order, "reduce_only", _get(order, "reduceOnly", False))),
                 order_id=str(_get(order, "order_id", "") or ""),
                 client_order_id=str(_get(order, "client_order_id", "") or ""),
                 raw=_raw_mapping(order),
@@ -331,6 +332,22 @@ class RecoveryLedger:
             live_symbols.add(artifact.symbol)
             owner = _owner_for_order(owner_index, artifact)
             if owner is not None and owner.confidence != "orphan":
+                if owner.owner_type in {"pending_passive_close", "journal_passive_close"}:
+                    add_work(
+                        RecoveryWorkItem(
+                            kind="owned_pending_passive_close",
+                            symbol=artifact.symbol,
+                            venues=frozenset(filter(None, [artifact.venue])),
+                            artifacts=(artifact,),
+                            owner=owner,
+                            decision=RecoveryDecision(
+                                outcome="passive_close_order_maintenance_required",
+                                reason="live_reduce_only_close_order_has_passive_close_owner",
+                            ),
+                            blocking=True,
+                        )
+                    )
+                    continue
                 add_work(
                     RecoveryWorkItem(
                         kind="owned_pending_entry",
