@@ -39,8 +39,10 @@ symbol-scope deterministic admission blocks such as
 Aster `aster:*` cooldown as a route-level no-new-risk signal, adds
 `candidate_takeover_count`, `quote_rewarm_terminalized_count`,
 `recovered_but_counted_issue_count`, and `active_stuck_count` to
-`business_progression_quality_summary`, and includes `exchange_code`,
-`exchange_msg`, and `raw_error` on passive close terminal/no-fill evidence. See
+`business_progression_quality_summary`. A follow-up diagnostic guard keeps
+soft-over-budget quote/candidate terminalization from offsetting unrelated
+hard-over-budget active stuck work. Passive close terminal/no-fill evidence now
+includes `exchange_code`, `exchange_msg`, and `raw_error`. See
 [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality).
 
 Latest venue private auth admission and single-leg recovery closure,

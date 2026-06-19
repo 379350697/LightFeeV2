@@ -5578,6 +5578,52 @@ def test_business_progression_quality_counts_recovered_zero_fill_without_active_
     assert business["active_stuck_count"] == 0
 
 
+def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {
+                "candidate_pair_id": "quote-soft",
+                "venue": "aster",
+                "symbol": "SOFTUSDT",
+            },
+        },
+        {
+            "ts_ms": 12_000,
+            "kind": "runtime.entry_quote_rewarm_terminal_stale",
+            "payload": {
+                "candidate_pair_id": "quote-soft",
+                "venue": "aster",
+                "symbol": "SOFTUSDT",
+            },
+        },
+        {
+            "ts_ms": 1_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "close-hard",
+                "symbol": "HARDUSDT",
+            },
+        },
+        {
+            "ts_ms": 401_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    phase_summary = dl._build_phase_duration_summary(events)
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert phase_summary["hard_over_budget_count"] == 1
+    assert phase_summary["terminalized_quote_rewarm_count"] == 1
+    assert business["quote_rewarm_terminalized_count"] == 1
+    assert business["active_stuck_count"] == 1
+
+
 def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnings():
     from scripts.diagnose_live import _build_entry_quantity_terminal_summary
 

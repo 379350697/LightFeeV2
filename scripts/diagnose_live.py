@@ -4498,6 +4498,18 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         if record.get("phase") == "quote_rewarm"
         and str(record.get("action_taken") or "")
     )
+    hard_terminalized_candidate_lease_count = sum(
+        1
+        for record in hard_over_budget_records
+        if record.get("phase") == "candidate_lease"
+        and str(record.get("action_taken") or "")
+    )
+    hard_terminalized_quote_rewarm_count = sum(
+        1
+        for record in hard_over_budget_records
+        if record.get("phase") == "quote_rewarm"
+        and str(record.get("action_taken") or "")
+    )
     max_age_by_phase: dict[str, int] = {}
     for record in records:
         phase = str(record["phase"])
@@ -4557,6 +4569,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "blank_action_count": blank_action_count,
         "terminalized_candidate_lease_count": terminalized_candidate_lease_count,
         "terminalized_quote_rewarm_count": terminalized_quote_rewarm_count,
+        "hard_terminalized_candidate_lease_count": hard_terminalized_candidate_lease_count,
+        "hard_terminalized_quote_rewarm_count": hard_terminalized_quote_rewarm_count,
         "phase_handoff_quality": {
             "severity": "production_issue" if missing_handoff_count else "ok",
             "missing_takeover_count": missing_handoff_count,
@@ -5057,8 +5071,14 @@ def _build_business_progression_quality_summary(
     )
     active_stuck_count = max(
         int(phase_duration_summary.get("hard_over_budget_count", 0) or 0)
-        - int(phase_duration_summary.get("terminalized_candidate_lease_count", 0) or 0)
-        - int(phase_duration_summary.get("terminalized_quote_rewarm_count", 0) or 0)
+        - int(
+            phase_duration_summary.get("hard_terminalized_candidate_lease_count", 0)
+            or 0
+        )
+        - int(
+            phase_duration_summary.get("hard_terminalized_quote_rewarm_count", 0)
+            or 0
+        )
         - len(recovered_but_counted_entries),
         0,
     )
