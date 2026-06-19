@@ -4197,13 +4197,13 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     }
     candidate_start_kinds = {
         "review.candidate_shortlisted",
-        "runtime.candidate_symbol_skipped",
     }
     candidate_terminal_kinds = {
         "execution.entry_selected",
         "review.candidate_rejected",
         "runtime.entry_blocked_gate",
         "runtime.candidate_lease_expired",
+        "runtime.candidate_symbol_skipped",
     }
     quote_rewarm_terminal_kinds = {
         "runtime.entry_quote_revalidate_resolved",
@@ -4310,6 +4310,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         if kind == "runtime.entry_selected_submit_deadline_exceeded":
             note_observed_action(artifact, "selected_pre_submit", kind)
         if kind == "runtime.candidate_lease_expired":
+            note_observed_action(artifact, "candidate_lease", kind)
+        if kind == "runtime.candidate_symbol_skipped":
             note_observed_action(artifact, "candidate_lease", kind)
         if kind in {
             "passive_maintenance.cancel_rest_timeout",

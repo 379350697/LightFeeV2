@@ -6490,6 +6490,84 @@ def test_business_progression_quality_summary_counts_candidate_quote_takeovers()
     assert handoff["samples"] == []
 
 
+def test_business_progression_quality_summary_treats_catalog_skip_as_candidate_takeover():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "runtime.candidate_symbol_skipped",
+            "payload": {
+                "candidate_pair_id": "highusdt:bybit->aster",
+                "pair_id": "highusdt:bybit->aster",
+                "symbol": "HIGHUSDT",
+                "long_venue": "bybit",
+                "short_venue": "aster",
+                "reason": "unsupported_symbol",
+            },
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+    handoff = summary["phase_handoff_quality"]
+
+    assert handoff["severity"] == "ok"
+    assert handoff["missing_takeover_count"] == 0
+    assert handoff["phase_counts"]["candidate_lease"] == {
+        "over_budget_count": 0,
+        "takeover_count": 0,
+        "missing_takeover_count": 0,
+    }
+    assert not any(
+        sample["artifact_id"] == "highusdt:bybit->aster"
+        for sample in handoff["samples"]
+    )
+
+
+def test_business_progression_quality_summary_counts_catalog_skip_after_shortlist():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "candidate_pair_id": "highusdt:bybit->aster",
+                "symbol": "HIGHUSDT",
+                "venue": "bybit",
+            },
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "runtime.candidate_symbol_skipped",
+            "payload": {
+                "candidate_pair_id": "highusdt:bybit->aster",
+                "pair_id": "highusdt:bybit->aster",
+                "symbol": "HIGHUSDT",
+                "long_venue": "bybit",
+                "short_venue": "aster",
+                "reason": "unsupported_symbol",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+    handoff = summary["phase_handoff_quality"]
+
+    assert handoff["severity"] == "ok"
+    assert handoff["missing_takeover_count"] == 0
+    assert handoff["phase_counts"]["candidate_lease"] == {
+        "over_budget_count": 1,
+        "takeover_count": 1,
+        "missing_takeover_count": 0,
+    }
+
+
 def test_venue_private_health_summary_deduplicates_block_and_cooldown_event():
     import scripts.diagnose_live as dl
 
