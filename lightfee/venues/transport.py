@@ -1981,9 +1981,51 @@ class VenueTransport(MarketDataClient):
         return payload
 
     async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
-        """Validate a Bybit order through the official non-mutating pre-check API."""
+        """Validate a new-risk order through a venue-supported non-mutating check."""
         spec = self._spec
         venue_sym = self._venue_symbol(request.symbol)
+        if spec.venue_id == Venue.ASTER:
+            if self.mode == "paper":
+                return {
+                    "venue": spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "status": "skipped",
+                    "reason": "paper_mode",
+                }
+            if request.reduce_only:
+                return {
+                    "venue": spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "status": "skipped",
+                    "reason": "reduce_only_exempt",
+                }
+            symbol_rule = await get_symbol_rules_cache().get(
+                self,
+                spec.venue_id,
+                venue_sym,
+            )
+            preflight = self.preflight_order_request(
+                request,
+                symbol_rule=symbol_rule,
+            )
+            fallback_price = (
+                request.price if request.price is not None else request.price_hint
+            )
+            headroom_price = preflight["quantized_price"]
+            if headroom_price is None:
+                headroom_price = fallback_price
+            headroom_payload = await self._aster_reject_new_risk_without_headroom(
+                request,
+                venue_sym,
+                float(preflight["quantized_qty"]),
+                headroom_price,
+                order_role="maker" if request.post_only else "hedge",
+                source="aster_headroom_pre_entry_precheck",
+            )
+            result = dict(preflight)
+            result.update(headroom_payload)
+            result["status"] = "ok"
+            return result
         if spec.venue_id != Venue.BYBIT:
             return {
                 "venue": spec.venue_id.value,

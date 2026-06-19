@@ -244,7 +244,7 @@ class EntryDispatchRuntime:
             )
         return ok
 
-    async def _precheck_bybit_entry_admission(
+    async def _precheck_entry_admission(
         self,
         *,
         candidate,
@@ -259,103 +259,149 @@ class EntryDispatchRuntime:
         maker_client_order_id: str,
         hedge_client_order_id: str,
     ) -> bool:
-        if Venue.BYBIT not in (long_venue, short_venue):
-            return True
-        adapter = self.ctx.venue_adapters.get(Venue.BYBIT)
-        precheck = getattr(adapter, "precheck_order_admission", None)
-        if adapter is None or not callable(precheck):
-            return True
-
         symbol = str(getattr(candidate, "symbol", "") or "")
         pair_id = self._candidate_pair_id(candidate)
         entry_type_value = str(getattr(entry_type, "value", entry_type) or "")
-        bybit_is_maker = maker_venue == Venue.BYBIT
-        passive = bybit_is_maker and "passive" in entry_type_value
-        side = Side.BUY if long_venue == Venue.BYBIT else Side.SELL
-        price_hint = (
-            long_order_price_hint if long_venue == Venue.BYBIT else short_order_price_hint
-        )
-        client_order_id = (
-            maker_client_order_id if bybit_is_maker else hedge_client_order_id
-        )
-        request = OrderRequest(
-            venue=Venue.BYBIT,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            price=price_hint if passive and price_hint > 0 else None,
-            reduce_only=False,
-            client_order_id=client_order_id,
-            post_only=passive,
-            time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
-            price_hint=price_hint if price_hint > 0 else None,
-            observed_at_ms=now_ms,
-        )
 
-        try:
-            await precheck(request)
-            return True
-        except OrderSubmitError as exc:
-            error_text = str(exc)
-            metadata = self._entry_admission_reject_metadata(Venue.BYBIT, error_text)
-            if metadata:
-                reason = str(metadata["reason"])
-                private_health_status = private_health_status_for_admission_reason(
-                    reason
-                )
-                source = "pre_entry_bybit_precheck"
-                extra_payload: dict[str, Any] = {}
-                if private_health_status:
-                    source = "venue_private_health_precheck"
-                    extra_payload.update(
-                        {
-                            "venue_private_health_status": private_health_status,
-                            "cooldown_scope": "venue",
-                            "reduce_only": False,
-                            "order_role": "maker" if bybit_is_maker else "hedge",
-                        }
+        leg_prechecks = [
+            {
+                "venue": long_venue,
+                "side": Side.BUY,
+                "price_hint": long_order_price_hint,
+                "order_role": "maker" if maker_venue == long_venue else "hedge",
+                "client_order_id": (
+                    maker_client_order_id
+                    if maker_venue == long_venue
+                    else hedge_client_order_id
+                ),
+            },
+            {
+                "venue": short_venue,
+                "side": Side.SELL,
+                "price_hint": short_order_price_hint,
+                "order_role": "maker" if maker_venue == short_venue else "hedge",
+                "client_order_id": (
+                    maker_client_order_id
+                    if maker_venue == short_venue
+                    else hedge_client_order_id
+                ),
+            },
+        ]
+
+        checked_venues: set[Venue] = set()
+        for leg in leg_prechecks:
+            venue = leg["venue"]
+            if venue in checked_venues:
+                continue
+            checked_venues.add(venue)
+            adapter = self.ctx.venue_adapters.get(venue)
+            precheck = getattr(adapter, "precheck_order_admission", None)
+            if adapter is None or not callable(precheck):
+                continue
+
+            is_maker = leg["order_role"] == "maker"
+            passive = is_maker and "passive" in entry_type_value
+            price_hint = float(leg["price_hint"] or 0.0)
+            request = OrderRequest(
+                venue=venue,
+                symbol=symbol,
+                side=leg["side"],
+                quantity=quantity,
+                price=price_hint if passive and price_hint > 0 else None,
+                reduce_only=False,
+                client_order_id=str(leg["client_order_id"] or ""),
+                post_only=passive,
+                time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
+                price_hint=price_hint if price_hint > 0 else None,
+                observed_at_ms=now_ms,
+            )
+
+            try:
+                await precheck(request)
+                continue
+            except OrderSubmitError as exc:
+                error_text = str(exc)
+                metadata = self._entry_admission_reject_metadata(venue, error_text)
+                if metadata:
+                    reason = str(metadata["reason"])
+                    private_health_status = private_health_status_for_admission_reason(
+                        reason
                     )
-                self._record_symbol_admission_block(
-                    venue=Venue.BYBIT,
-                    symbol=symbol,
-                    reason=reason,
-                    raw_error=error_text,
-                    now_ms=now_ms,
-                    evidence=metadata,
-                    source=source,
-                    candidate_pair_id=pair_id,
-                    extra_payload=extra_payload,
+                    source = f"pre_entry_{venue.value}_precheck"
+                    extra_payload: dict[str, Any] = {
+                        "order_role": str(leg["order_role"]),
+                    }
+                    if private_health_status:
+                        source = "venue_private_health_precheck"
+                        extra_payload.update(
+                            {
+                                "venue_private_health_status": private_health_status,
+                                "cooldown_scope": "venue",
+                                "reduce_only": False,
+                            }
+                        )
+                    self._record_symbol_admission_block(
+                        venue=venue,
+                        symbol=symbol,
+                        reason=reason,
+                        raw_error=error_text,
+                        now_ms=now_ms,
+                        evidence=metadata,
+                        source=source,
+                        candidate_pair_id=pair_id,
+                        extra_payload=extra_payload,
+                    )
+                    self.ctx.journal.append(
+                        "runtime.entry_blocked_admission_selection",
+                        {
+                            "symbol": symbol,
+                            "venue": venue.value,
+                            "long_venue": long_venue.value,
+                            "short_venue": short_venue.value,
+                            "pair_id": pair_id,
+                            "candidate_pair_id": pair_id,
+                            "reason": reason,
+                            "stage": "selected_pre_submit",
+                            "source": source,
+                            "order_role": str(leg["order_role"]),
+                            "blocked_count": 1,
+                            "ts_ms": now_ms,
+                        },
+                    )
+                    return False
+                self.ctx.journal.append(
+                    "runtime.entry_admission_precheck_rejected",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "raw_error": error_text[:500],
+                        "ts_ms": now_ms,
+                    },
                 )
                 return False
-            self.ctx.journal.append(
-                "runtime.entry_admission_precheck_rejected",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": error_text[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-        except Exception as exc:
-            self.ctx.journal.append(
-                "runtime.entry_admission_precheck_uncertain",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": str(exc)[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
+            except Exception as exc:
+                self.ctx.journal.append(
+                    "runtime.entry_admission_precheck_uncertain",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "raw_error": str(exc)[:500],
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+        return True
+
+    async def _precheck_bybit_entry_admission(self, **kwargs) -> bool:
+        return await self._precheck_entry_admission(**kwargs)
 
     async def _okx_entry_base_quantity_step(
         self, venue: Venue, symbol: str,
@@ -1895,7 +1941,7 @@ class EntryDispatchRuntime:
             )
             return False
 
-        if not await self._precheck_bybit_entry_admission(
+        if not await self._precheck_entry_admission(
             candidate=candidate,
             now_ms=now_ms,
             long_venue=long_venue,

@@ -32,6 +32,14 @@ Deterministic hedge admission reject must:
 9. Venue-scope admission cooldowns must prune new-entry candidates before
    shortlist tracking or maker submit. This is a new-entry admission downgrade
    only; exchange truth, close, cancel, and residual repair must remain usable.
+10. For paired entry, both legs must pass admission/headroom immediately before
+    maker submit. If the hedge leg deterministically cannot accept new risk,
+    runtime must block selection before any maker `order.passive_submitted`.
+11. If a maker fill already created a single leg before a deterministic hedge
+    admission block is discovered, cleanup is the final loss-control path. After
+    cleanup, the route must arm hard symbol/venue cooldown and diagnostics must
+    flag any maker submit on the same guarded route as repeated single-leg
+    fee-drag risk.
 
 ## V1 / Exchange Semantics
 
@@ -74,6 +82,7 @@ Deterministic hedge admission reject must:
 | 2026-06-08 | Production issues 3-7 admission evidence audit | fixed, deployed/cloud verified | Existing admission classifier and venue-scope downgrade coverage stayed authoritative. CL-052 did not add another admission branch; it records that deployment review should verify the already-covered `runtime.entry_admission_blocked`, `runtime.entry_admission_venue_degraded`, `pending_entry.hedge_admission_blocked`, and `entry.aborted` payload fields across the same source/scope/venue/symbol/pair/action/cooldown contract. |
 | 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure now uses `/v5/order/pre-check-order` before maker dispatch when the adapter supports it. `110125/110126/110123` records `runtime.entry_admission_blocked` with `source=pre_entry_bybit_precheck` and prevents maker submit; pending hedge admission handling remains the fallback. |
 | 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | local green, deploy pending | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
+| 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | local green, deploy pending | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
 
 ## Recurrences
 
@@ -85,6 +94,7 @@ Deterministic hedge admission reject must:
 | 2026-06-04 | `SEIUSDT` Bybit maker / Hyperliquid hedge | `1e082d9` | local RED/GREEN and cloud focused tests verify Hyperliquid insufficient margin now blocks initial entry and pending hedge retry; final cloud diagnose is flat/no-open-orders | [daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality](../daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) |
 | 2026-06-08 | issue 3-7 admission / pending hedge closure review | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-09 | `CLUSDT` OKX maker / Bybit hedge, Bybit `110125` crude-oil terms | working tree | local precheck regression added; deploy pending | Bybit endpoint/signature was healthy in the same window; failure is symbol trading-terms admission, now blocked before maker dispatch. |
+| 2026-06-19 | `HUSDT` Binance maker / Aster hedge, Aster headroom exhausted | working tree | local RED/GREEN covers pre-submit block and post-fill fee-drag guard | [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](../daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality) |
 
 ## Regression Harness
 
@@ -108,9 +118,14 @@ Deterministic hedge admission reject must:
    `cooldown_scope=symbol_and_venue`. If the exchange returned `-5018` first,
    check fallback source `exchange_5018_fallback`; it must not retry with a
    shrunken one-sided quantity.
-6. For Hyperliquid insufficient margin, check the symbol and venue cooldown events carry `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false`.
-7. If `hyperliquid:*` venue cooldown is active, confirm
+6. If a maker fill happened before a deterministic hedge admission block,
+   confirm cleanup emits single-leg recovery evidence and immediately arms hard
+   cooldown for the route. Then check `business_progression_quality_summary`
+   for `cleanup_after_admission_block` and
+   `repeated_single_leg_guarded`.
+7. For Hyperliquid insufficient margin, check the symbol and venue cooldown events carry `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false`.
+8. If `hyperliquid:*` venue cooldown is active, confirm
    `runtime.entry_admission_venue_degraded` prunes Hyperliquid candidates before
    shortlist/Local-L2 tracking while close/cancel/recovery truth still runs.
-8. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
-9. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+9. Run `scripts/diagnose_live.py --json --symbol <symbol> --venues <maker,hedge> --since-deploy`.
+10. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.

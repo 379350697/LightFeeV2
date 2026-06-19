@@ -48,6 +48,7 @@ from lightfee.engine.lifecycle import (
     set_lifecycle,
     transition_to_reconciling,
 )
+from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.loop_control import (
     ExportState,
     current_state_export_interval_ms,
@@ -318,6 +319,7 @@ class LiveRuntime:
         self._last_entry_admission_filter_samples: list[dict] = []
         self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
         self._last_snapshot_freshness_filter_samples: list[dict] = []
+        self._entry_candidate_lease_started_at_ms: dict[str, int] = {}
         self._snapshot_freshness_decision_last_emit_ms: dict[tuple[str, str, str, str], int] = {}
         self._snapshot_freshness_decision_suppressed: Counter[tuple[str, str, str, str]] = Counter()
         self._runtime_diagnostic_event_last_emit_ms: dict[tuple[str, ...], int] = {}
@@ -469,6 +471,8 @@ class LiveRuntime:
             "-5018" in text
             or "maximum notional value limit" in text
             or "max notional" in text
+            or "max_notional_admission_blocked" in text
+            or "remaining_openable_notional=0" in text
         ):
             return LiveRuntime._entry_admission_evidence("max_notional_admission_blocked")
         if venue == Venue.ASTER and "aster_headroom_unavailable" in text:
@@ -1024,7 +1028,7 @@ class LiveRuntime:
             now_ms,
         )
 
-    async def _precheck_bybit_entry_admission(
+    async def _precheck_entry_admission(
         self,
         *,
         candidate,
@@ -1039,7 +1043,7 @@ class LiveRuntime:
         maker_client_order_id: str,
         hedge_client_order_id: str,
     ) -> bool:
-        return await self.entry_dispatch_runtime._precheck_bybit_entry_admission(
+        return await self.entry_dispatch_runtime._precheck_entry_admission(
             candidate=candidate,
             now_ms=now_ms,
             long_venue=long_venue,
@@ -1052,6 +1056,10 @@ class LiveRuntime:
             maker_client_order_id=maker_client_order_id,
             hedge_client_order_id=hedge_client_order_id,
         )
+
+    async def _precheck_bybit_entry_admission(self, **kwargs) -> bool:
+        return await self._precheck_entry_admission(**kwargs)
+
     def get_venue_adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._venue_adapters.get(venue)
 
@@ -2491,6 +2499,79 @@ class LiveRuntime:
             candidates,
             skip_event_kind=skip_event_kind,
         )
+
+    def _filter_expired_entry_candidate_leases(
+        self,
+        candidates: list,
+        *,
+        now_ms: int,
+    ) -> list:
+        budget = phase_budgets_from_strategy(self.config.strategy)["candidate_lease"]
+        hard_ms = int(budget.hard_ms or 0)
+        if hard_ms <= 0:
+            return list(candidates)
+
+        active_keys: set[str] = set()
+        allowed: list = []
+        expired_count = 0
+        for candidate in candidates:
+            pair_id = self._candidate_pair_id(candidate)
+            if not pair_id:
+                allowed.append(candidate)
+                continue
+            active_keys.add(pair_id)
+            started_at_ms = int(
+                self._entry_candidate_lease_started_at_ms.get(pair_id, 0) or 0
+            )
+            if started_at_ms <= 0:
+                self._entry_candidate_lease_started_at_ms[pair_id] = now_ms
+                allowed.append(candidate)
+                continue
+            age_ms = max(now_ms - started_at_ms, 0)
+            if age_ms < hard_ms:
+                allowed.append(candidate)
+                continue
+
+            expired_count += 1
+            symbol = str(getattr(candidate, "symbol", "") or "").upper()
+            long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
+            short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
+            payload = {
+                "candidate_pair_id": pair_id,
+                "pair_id": pair_id,
+                "symbol": symbol,
+                "long_venue": long_venue,
+                "short_venue": short_venue,
+                "started_at_ms": started_at_ms,
+                "age_ms": age_ms,
+                "hard_ms": hard_ms,
+                "reason": "candidate_lease_hard_expired",
+                "action_taken": budget.action,
+                "source": "entry_candidate_lease",
+                "ts_ms": now_ms,
+            }
+            self.journal.append("runtime.candidate_lease_expired", payload)
+            self.journal.append(
+                "review.candidate_rejected",
+                {
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "symbol": symbol,
+                    "long_venue": long_venue,
+                    "short_venue": short_venue,
+                    "rejected_stage": "candidate_lease",
+                    "rejected_reason": "candidate_lease_hard_expired",
+                    "action_taken": budget.action,
+                    "ts_ms": now_ms,
+                },
+            )
+            self._entry_candidate_lease_started_at_ms.pop(pair_id, None)
+
+        for pair_id in list(self._entry_candidate_lease_started_at_ms):
+            if pair_id not in active_keys:
+                self._entry_candidate_lease_started_at_ms.pop(pair_id, None)
+        self.state.last_scan["candidate_lease_expired_count"] = expired_count
+        return allowed
 
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
@@ -4291,6 +4372,10 @@ class LiveRuntime:
                 budgets=snapshot_freshness_budgets,
                 publish_intervals=snapshot_freshness_publish_intervals,
                 entry_quote_truth_overlay=entry_quote_truth_overlay,
+            )
+            tradeable = self._filter_expired_entry_candidate_leases(
+                tradeable,
+                now_ms=now_ms,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0

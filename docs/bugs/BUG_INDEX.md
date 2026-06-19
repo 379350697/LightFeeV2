@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest Aster headroom, single-leg fee-drag, and phase handoff quality closure,
+2026-06-19:
+The next production-readiness review found that the issue was broader than
+visible order errors. Aster hedge-side `remaining_openable_notional=0` /
+max-notional truth must block before maker submit, because creating the maker
+leg first can manufacture avoidable single-leg exposure and repeated
+cleanup/reopen fee drag. CL-099 adds a two-leg admission check after selection
+and before maker submit, routes Aster headroom through the V3 signer path, keeps
+post-fill deterministic hedge admission blocks on the single-leg cleanup path,
+and arms hard route cooldown so the same maker/hedge path cannot immediately
+open again. Diagnostics now expose `business_progression_quality_summary`
+(`pre_submit_blocked`, `single_leg_created`, `single_leg_cleanup`,
+`cleanup_after_admission_block`, `repeated_single_leg_guarded`) and
+`phase_handoff_quality` for candidate and quote-rewarm stages. Candidate lease
+expiration emits `runtime.candidate_lease_expired` and
+`review.candidate_rejected rejected_stage=candidate_lease`; quote rewarm keeps
+terminal stale evidence. See
+[daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality).
+
 Latest venue private auth admission and single-leg recovery closure,
 2026-06-19:
 After Aster 5018 and phase terminality fixes, the remaining production family

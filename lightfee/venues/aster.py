@@ -117,6 +117,83 @@ class AsterAdapter(VenueAdapter):
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
+    async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
+        """Non-mutating Aster admission check used before paired entry submit."""
+        if request.reduce_only:
+            return {
+                "venue": Venue.ASTER.value,
+                "symbol": request.symbol,
+                "status": "skipped",
+                "reason": "reduce_only_exempt",
+            }
+        if self._private is None:
+            if self._mode == "live":
+                raise self._private_unavailable()
+            return await self._transport.precheck_order_admission(request)
+
+        venue_symbol = self._transport._venue_symbol(request.symbol)
+        symbol_rule = None
+        rule_source = "unavailable"
+        try:
+            symbol_rule = await transport_mod.get_symbol_rules_cache().get(
+                self._transport,
+                Venue.ASTER,
+                venue_symbol,
+            )
+            rule_source = str(getattr(symbol_rule, "rule_source", "") or "unknown")
+        except Exception:
+            symbol_rule = None
+        if rule_source.lower() not in _ASTER_TRUSTED_SYMBOL_RULE_SOURCES:
+            payload = {
+                "venue": Venue.ASTER.value,
+                "symbol": request.symbol,
+                "venue_symbol": venue_symbol,
+                "endpoint": self._transport._spec.order_path,
+                "product_type": self._transport._product_type(),
+                "client_order_id": request.client_order_id or "",
+                "order_id": request.order_id or "",
+                "raw_price": request.price,
+                "raw_qty": request.quantity,
+                "rule_source": rule_source,
+                "response_classification": "precision_rule_unavailable",
+                "reason": "aster_trusted_symbol_rule_unavailable",
+            }
+            self._transport._record_order_diagnostic(
+                "order_error.precision_rule_unavailable_before_submit",
+                payload,
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster_trusted_symbol_rule_unavailable",
+            )
+
+        preflight = self._transport.preflight_order_request(
+            request,
+            symbol_rule=symbol_rule,
+        )
+        fallback_price = request.price if request.price is not None else request.price_hint
+        headroom_price = preflight["quantized_price"]
+        if headroom_price is None:
+            headroom_price = fallback_price
+        headroom_payload = (
+            await self._transport._aster_reject_new_risk_without_headroom(
+                request,
+                venue_symbol,
+                float(preflight["quantized_qty"]),
+                headroom_price,
+                order_role="maker" if request.post_only else "hedge",
+                source="aster_headroom_pre_entry_precheck",
+                remaining_openable_provider=(
+                    self._private.fetch_remaining_openable_notional
+                ),
+            )
+        )
+        result = dict(preflight)
+        result.update(headroom_payload)
+        result["status"] = "ok"
+        result["private_api"] = "aster_v3"
+        return result
+
     async def _preflight_private_order_request(
         self,
         request: OrderRequest,

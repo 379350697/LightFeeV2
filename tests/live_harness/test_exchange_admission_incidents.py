@@ -13,6 +13,9 @@ from lightfee.engine.state import PendingEntry
 from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.risk.modes import EngineLifecycle
+from lightfee.venues.aster import AsterAdapter
+from lightfee.venues.symbol_rules import SymbolRule
+from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
 from tests.test_live_startup_preflight import make_test_config
 
 
@@ -90,6 +93,38 @@ class RejectingBybitPrecheckAdapter(TrustedVenueAdapter):
         raise OrderSubmitError(SubmitFailureClass.REJECTED, self.reject_reason)
 
 
+class RejectingAsterPrecheckAdapter(TrustedVenueAdapter):
+    def __init__(self, reject_reason: str):
+        self.reject_reason = reject_reason
+        self.precheck_calls = 0
+
+    async def precheck_order_admission(self, request):
+        self.precheck_calls += 1
+        raise OrderSubmitError(SubmitFailureClass.REJECTED, self.reject_reason)
+
+
+class FakeAsterPrivateHeadroom:
+    def __init__(self, remaining: float | None):
+        self.remaining = remaining
+        self.calls: list[tuple[str, int]] = []
+
+    async def fetch_remaining_openable_notional(self, symbol: str, leverage: int):
+        self.calls.append((symbol, leverage))
+        return self.remaining
+
+
+class FakeAsterRulesCache:
+    async def get(self, transport, venue, venue_symbol):
+        assert venue == Venue.ASTER
+        return SymbolRule(
+            tick_size=0.0001,
+            qty_step=0.001,
+            min_qty=0.001,
+            min_notional=0.0,
+            rule_source="exchangeInfo",
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
@@ -164,6 +199,17 @@ class RejectingBybitPrecheckAdapter(TrustedVenueAdapter):
             "aster",
             "MAXUSDT",
             'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
+            "max_notional_admission_blocked",
+            "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+            False,
+        ),
+        (
+            "aster",
+            "HUSDT",
+            (
+                "max_notional_admission_blocked: requested_notional=23.90043 "
+                "remaining_openable_notional=0.0"
+            ),
             "max_notional_admission_blocked",
             "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
             False,
@@ -304,6 +350,120 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
         assert payload["cooldown_scope"] == "venue"
         assert payload["reduce_only"] is False
         assert payload["raw_error"] == bybit.reject_reason[:500]
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingAsterPrecheckAdapter(
+            "max_notional_admission_blocked: requested_notional=23.90043 "
+            "remaining_openable_notional=0.0"
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={
+                Venue.BINANCE: TrustedVenueAdapter(),
+                Venue.ASTER: aster,
+            },
+        )
+        runtime.journal.open()
+
+        class CountingExecutor:
+            calls = 0
+
+            async def execute(self, ctx):
+                self.calls += 1
+                return EntryExecutionResult(route=ExecutionRoute.STANDARD_DUAL_TAKER)
+
+        executor = CountingExecutor()
+        runtime.entry_executor = executor
+        candidate = _candidate("HUSDT", "binance", "aster")
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            1778787000000,
+            price_hint=1.0,
+        )
+
+        assert dispatched is False
+        assert executor.calls == 0
+        assert aster.precheck_calls == 1
+        assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["reason"] == (
+            "max_notional_admission_blocked"
+        )
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == (
+            "venue"
+        )
+        records = runtime.journal.read_all()
+        assert not [
+            record for record in records
+            if record["kind"] == "order.passive_submitted"
+        ]
+        assert [
+            record
+            for record in records
+            if record["kind"] == "runtime.entry_blocked_admission_selection"
+        ][-1]["payload"]["reason"] == "max_notional_admission_blocked"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_real_aster_adapter_zero_headroom_blocks_before_maker_submit(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        import lightfee.venues.aster as aster_mod
+
+        aster = AsterAdapter(mode="paper")
+        private = FakeAsterPrivateHeadroom(remaining=0.0)
+        aster._private = private
+        monkeypatch.setattr(
+            aster_mod.transport_mod,
+            "get_symbol_rules_cache",
+            lambda: FakeAsterRulesCache(),
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={
+                Venue.BINANCE: TrustedVenueAdapter(),
+                Venue.ASTER: aster,
+            },
+        )
+        runtime.journal.open()
+
+        class CountingExecutor:
+            calls = 0
+
+            async def execute(self, ctx):
+                self.calls += 1
+                return EntryExecutionResult(route=ExecutionRoute.STANDARD_DUAL_TAKER)
+
+        executor = CountingExecutor()
+        runtime.entry_executor = executor
+
+        dispatched = await runtime._dispatch_entry(
+            _candidate("HUSDT", "binance", "aster"),
+            1778787000000,
+            price_hint=1.0,
+        )
+
+        assert dispatched is False
+        assert executor.calls == 0
+        assert private.calls == [
+            ("HUSDT", ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE)
+        ]
+        assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["reason"] == (
+            "max_notional_admission_blocked"
+        )
+        records = runtime.journal.read_all()
+        assert not [
+            record for record in records
+            if record["kind"] == "order.passive_submitted"
+        ]
+        assert [
+            record
+            for record in records
+            if record["kind"] == "runtime.entry_blocked_admission_selection"
+        ][-1]["payload"]["source"] == "pre_entry_aster_precheck"
         runtime.journal.close()
 
 
@@ -1097,6 +1257,72 @@ async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
         records = runtime.journal.read_all()
         assert [
             record for record in records
+            if record["kind"] == "runtime.venue_cooldown_started"
+        ][-1]["payload"]["reason"] == "aster_max_notional_limit"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_hedge_aster_max_notional_error_text_aborts_without_retry_and_hard_cools_down():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingHedgeAdapter(
+            "max_notional_admission_blocked: requested_notional=23.90043 "
+            "remaining_openable_notional=0.0"
+        )
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-husdt",
+            symbol="HUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert aster.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert (
+            pending.repair_state
+            == "hedge_admission_blocked:max_notional_admission_blocked"
+        )
+        assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["reason"] == (
+            "max_notional_admission_blocked"
+        )
+        assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["block_scope"] == (
+            "symbol"
+        )
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == (
+            "venue"
+        )
+        assert runtime._candidate_admission_block(
+            _candidate("HUSDT", "binance", "aster"),
+            1778787002000,
+        )["reason"] == "max_notional_admission_blocked"
+
+        records = runtime.journal.read_all()
+        assert not [
+            record
+            for record in records
+            if record["kind"] == "pending_entry.hedge_submit_result"
+            and record["payload"].get("outcome") == "error"
+        ]
+        assert [
+            record
+            for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]["reason"] == "max_notional_admission_blocked"
+        assert [
+            record
+            for record in records
             if record["kind"] == "runtime.venue_cooldown_started"
         ][-1]["payload"]["reason"] == "aster_max_notional_limit"
         runtime.journal.close()

@@ -462,6 +462,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "pending_entry.long_lived_pending_entry",
         "runtime.entry_selected_submit_deadline_exceeded",
         "runtime.entry_selected_submit_deadline_waiting_on_order_truth",
+        "runtime.candidate_lease_expired",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -493,6 +494,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("pending_entry.long_lived_pending_entry") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_exceeded") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_waiting_on_order_truth") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.candidate_lease_expired") == "DIAGNOSTIC_ONLY"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

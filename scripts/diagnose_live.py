@@ -4203,6 +4203,7 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "execution.entry_selected",
         "review.candidate_rejected",
         "runtime.entry_blocked_gate",
+        "runtime.candidate_lease_expired",
     }
     quote_rewarm_terminal_kinds = {
         "runtime.entry_quote_revalidate_resolved",
@@ -4308,6 +4309,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             note_observed_action(artifact, "maker_resting", kind)
         if kind == "runtime.entry_selected_submit_deadline_exceeded":
             note_observed_action(artifact, "selected_pre_submit", kind)
+        if kind == "runtime.candidate_lease_expired":
+            note_observed_action(artifact, "candidate_lease", kind)
         if kind in {
             "passive_maintenance.cancel_rest_timeout",
             "passive_maintenance.cancel_try_window",
@@ -4508,6 +4511,41 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             str(record["artifact_id"]),
         )
     )
+    handoff_phases = ("candidate_lease", "quote_rewarm")
+    phase_counts = {
+        phase: {
+            "over_budget_count": 0,
+            "takeover_count": 0,
+            "missing_takeover_count": 0,
+        }
+        for phase in handoff_phases
+    }
+    missing_handoff_samples: list[dict[str, Any]] = []
+    for record in over_budget_records:
+        phase = str(record.get("phase") or "")
+        if phase not in phase_counts:
+            continue
+        phase_counts[phase]["over_budget_count"] += 1
+        if str(record.get("action_taken") or ""):
+            phase_counts[phase]["takeover_count"] += 1
+            continue
+        phase_counts[phase]["missing_takeover_count"] += 1
+        if len(missing_handoff_samples) < 12:
+            missing_handoff_samples.append(
+                {
+                    "phase": phase,
+                    "artifact_id": str(record.get("artifact_id") or ""),
+                    "symbol": str(record.get("symbol") or ""),
+                    "venue": str(record.get("venue") or ""),
+                    "age_ms": int(record.get("age_ms") or 0),
+                    "hard_ms": int(record.get("hard_ms") or 0),
+                    "configured_action": str(record.get("configured_action") or ""),
+                    "truth_source": str(record.get("truth_source") or ""),
+                }
+            )
+    missing_handoff_count = sum(
+        counts["missing_takeover_count"] for counts in phase_counts.values()
+    )
     return {
         "budget_defaults_ms": _budget_defaults_payload(budgets),
         "artifact_count": len(artifacts),
@@ -4517,6 +4555,12 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "blank_action_count": blank_action_count,
         "terminalized_candidate_lease_count": terminalized_candidate_lease_count,
         "terminalized_quote_rewarm_count": terminalized_quote_rewarm_count,
+        "phase_handoff_quality": {
+            "severity": "production_issue" if missing_handoff_count else "ok",
+            "missing_takeover_count": missing_handoff_count,
+            "phase_counts": phase_counts,
+            "samples": missing_handoff_samples,
+        },
         "max_age_by_phase": dict(sorted(max_age_by_phase.items())),
         "samples": over_budget_records[:24],
     }
@@ -4797,6 +4841,199 @@ def _build_single_leg_exposure_recovery_summary(
         "venue_counts": dict(sorted(venue_counts.items())),
         "entry_ids": sorted(entry_ids)[:50],
         "samples": samples,
+    }
+
+
+def _build_business_progression_quality_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    phase_handoff_quality = _build_phase_duration_summary(events).get(
+        "phase_handoff_quality",
+        {
+            "severity": "ok",
+            "missing_takeover_count": 0,
+            "phase_counts": {},
+            "samples": [],
+        },
+    )
+    pre_submit_blocked = 0
+    single_leg_created = 0
+    single_leg_cleanup = 0
+    admission_blocked_entries: set[str] = set()
+    cleanup_entries: set[str] = set()
+    active_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
+    entry_routes: dict[str, dict[str, str]] = {}
+    repeated_submit_samples: list[dict[str, Any]] = []
+
+    def event_ts(rec: dict[str, Any]) -> int:
+        payload = rec.get("payload", {})
+        payload_ts = payload.get("ts_ms") if isinstance(payload, dict) else 0
+        return int(rec.get("ts_ms") or payload_ts or 0)
+
+    def entry_id(payload: dict[str, Any]) -> str:
+        return str(
+            payload.get("entry_id")
+            or payload.get("position_id")
+            or payload.get("internal_entry_id")
+            or ""
+        )
+
+    def cooldown_until(payload: dict[str, Any]) -> int:
+        return int(
+            payload.get("blocked_until_ms")
+            or payload.get("cooldown_until_ms")
+            or 0
+        )
+
+    def venue_value(payload: dict[str, Any], key: str) -> str:
+        return str(payload.get(key) or "").lower()
+
+    def route_venues(payload: dict[str, Any]) -> list[str]:
+        venues: list[str] = []
+        for key in (
+            "venue",
+            "long_venue",
+            "short_venue",
+            "maker_venue",
+            "hedge_venue",
+        ):
+            venue = venue_value(payload, key)
+            if venue and venue not in venues:
+                venues.append(venue)
+        route = entry_routes.get(entry_id(payload), {})
+        for key in ("long_venue", "short_venue", "maker_venue", "hedge_venue"):
+            venue = str(route.get(key) or "").lower()
+            if venue and venue not in venues:
+                venues.append(venue)
+        return venues
+
+    for rec in sorted(events, key=event_ts):
+        ts_ms = event_ts(rec)
+        active_cooldowns = {
+            key: value
+            for key, value in active_cooldowns.items()
+            if int(value.get("blocked_until_ms") or 0) > ts_ms
+        }
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+
+        if kind == "runtime.entry_blocked_admission_selection":
+            pre_submit_blocked += int(payload.get("blocked_count") or 1)
+        elif kind == "execution.entry_quantity_plan":
+            plan_entry_id = entry_id(payload)
+            if plan_entry_id:
+                long_venue = venue_value(payload, "long_venue")
+                short_venue = venue_value(payload, "short_venue")
+                maker_leg = str(payload.get("maker_leg") or "").lower()
+                route: dict[str, str] = {
+                    "long_venue": long_venue,
+                    "short_venue": short_venue,
+                }
+                if maker_leg == "long":
+                    route["maker_venue"] = long_venue
+                    route["hedge_venue"] = short_venue
+                elif maker_leg == "short":
+                    route["maker_venue"] = short_venue
+                    route["hedge_venue"] = long_venue
+                entry_routes[plan_entry_id] = route
+        elif kind == "pending_entry.missing_hedge_detected":
+            single_leg_created += 1
+        elif kind == "pending_entry.single_leg_exposure_recovery_started":
+            single_leg_created += 1
+        elif kind in {
+            "entry.cleanup_leg_exposure",
+            "pending_entry.single_leg_flatten_submitted",
+        }:
+            single_leg_cleanup += 1
+            cleanup_entry_id = entry_id(payload)
+            if cleanup_entry_id:
+                cleanup_entries.add(cleanup_entry_id)
+        elif kind == "pending_entry.hedge_admission_blocked":
+            blocked_entry_id = entry_id(payload)
+            if blocked_entry_id:
+                admission_blocked_entries.add(blocked_entry_id)
+
+        if kind in {
+            "runtime.entry_admission_blocked",
+            "runtime.venue_cooldown_started",
+        }:
+            venue = str(payload.get("venue") or "").lower()
+            symbol = str(
+                payload.get("symbol")
+                or payload.get("blocked_symbol")
+                or ""
+            ).upper()
+            until_ms = cooldown_until(payload)
+            if venue and until_ms > ts_ms:
+                if symbol:
+                    active_cooldowns[(venue, symbol)] = {
+                        "reason": str(payload.get("reason") or ""),
+                        "blocked_until_ms": until_ms,
+                        "ts_ms": ts_ms,
+                    }
+                scope = str(
+                    payload.get("cooldown_scope")
+                    or payload.get("block_scope")
+                    or ""
+                )
+                if scope == "venue":
+                    active_cooldowns[(venue, "*")] = {
+                        "reason": str(payload.get("reason") or ""),
+                        "blocked_until_ms": until_ms,
+                        "ts_ms": ts_ms,
+                    }
+
+        if kind == "order.passive_submitted":
+            submitted_venue = str(payload.get("venue") or "").lower()
+            symbol = str(payload.get("symbol") or "").upper()
+            if not submitted_venue or not symbol:
+                continue
+            cooldown = None
+            cooldown_venue = ""
+            cooldown_symbol = symbol
+            for route_venue in route_venues(payload):
+                cooldown = active_cooldowns.get(
+                    (route_venue, symbol)
+                ) or active_cooldowns.get((route_venue, "*"))
+                if cooldown is not None:
+                    cooldown_venue = route_venue
+                    if (route_venue, "*") in active_cooldowns and (
+                        route_venue,
+                        symbol,
+                    ) not in active_cooldowns:
+                        cooldown_symbol = "*"
+                    break
+            if cooldown is not None and len(repeated_submit_samples) < 12:
+                repeated_submit_samples.append(
+                    {
+                        "ts_ms": ts_ms,
+                        "venue_symbol": f"{cooldown_venue}:{cooldown_symbol}",
+                        "submitted_venue_symbol": f"{submitted_venue}:{symbol}",
+                        "position_id": entry_id(payload),
+                        "leg": str(payload.get("leg") or ""),
+                        "cooldown_reason": str(cooldown.get("reason") or ""),
+                        "cooldown_started_ts_ms": int(cooldown.get("ts_ms") or 0),
+                        "blocked_until_ms": int(
+                            cooldown.get("blocked_until_ms") or 0
+                        ),
+                    }
+                )
+
+    cleanup_after_admission_block = len(cleanup_entries & admission_blocked_entries)
+    violation_count = len(repeated_submit_samples)
+    return {
+        "pre_submit_blocked": pre_submit_blocked,
+        "single_leg_created": single_leg_created,
+        "single_leg_cleanup": single_leg_cleanup,
+        "cleanup_after_admission_block": cleanup_after_admission_block,
+        "repeated_single_leg_guarded": {
+            "violation_count": violation_count,
+            "severity": "production_issue" if violation_count else "ok",
+            "samples": repeated_submit_samples,
+        },
+        "phase_handoff_quality": phase_handoff_quality,
     }
 
 
@@ -6056,6 +6293,19 @@ def run_diagnose(
     single_leg_exposure_recovery_summary = (
         _build_single_leg_exposure_recovery_summary(all_events)
     )
+    business_progression_quality_summary = (
+        _build_business_progression_quality_summary(all_events)
+    )
+    repeated_single_leg_guarded = business_progression_quality_summary.get(
+        "repeated_single_leg_guarded",
+        {},
+    )
+    if int(repeated_single_leg_guarded.get("violation_count", 0) or 0) > 0:
+        fingerprint = "repeated_single_leg_fee_drag_after_cooldown"
+        if fingerprint not in health.get("fingerprints", []):
+            health.setdefault("fingerprints", []).append(fingerprint)
+        health["critical_count"] = int(health.get("critical_count", 0) or 0) + 1
+        health["ok"] = False
     cleanup_blocker_summary = _build_cleanup_blocker_summary(all_events)
     order_errors = _build_order_error_evidence(
         all_events,
@@ -6178,6 +6428,9 @@ def run_diagnose(
         "venue_private_health_summary": venue_private_health_summary,
         "single_leg_exposure_recovery_summary": (
             single_leg_exposure_recovery_summary
+        ),
+        "business_progression_quality_summary": (
+            business_progression_quality_summary
         ),
         "cleanup_blocker_summary": cleanup_blocker_summary,
         "duplicate_close_leg_suppressed_summary": duplicate_close_leg_suppressed_summary,

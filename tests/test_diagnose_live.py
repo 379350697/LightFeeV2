@@ -5488,6 +5488,34 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
         ]
         assert result["phase_duration_summary"] == nested
         assert result["phase_duration_summary"]["hard_over_budget_count"] >= 1
+        assert result["business_progression_quality_summary"] == {
+            "pre_submit_blocked": 0,
+            "single_leg_created": 0,
+            "single_leg_cleanup": 0,
+            "cleanup_after_admission_block": 0,
+            "repeated_single_leg_guarded": {
+                "violation_count": 0,
+                "severity": "ok",
+                "samples": [],
+            },
+            "phase_handoff_quality": {
+                "severity": "ok",
+                "missing_takeover_count": 0,
+                "phase_counts": {
+                    "candidate_lease": {
+                        "over_budget_count": 0,
+                        "takeover_count": 0,
+                        "missing_takeover_count": 0,
+                    },
+                    "quote_rewarm": {
+                        "over_budget_count": 0,
+                        "takeover_count": 0,
+                        "missing_takeover_count": 0,
+                    },
+                },
+                "samples": [],
+            },
+        }
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -6225,6 +6253,241 @@ def test_single_leg_recovery_summary_marks_started_without_terminal_unresolved()
     assert summary["terminalized_count"] == 0
     assert summary["unresolved_count"] == 1
     assert summary["unresolved_entry_ids"] == ["entry-auth-stuck"]
+
+
+def test_business_progression_quality_summary_flags_repeated_single_leg_fee_drag():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000000000,
+            "kind": "runtime.entry_blocked_admission_selection",
+            "payload": {
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "reason": "max_notional_admission_blocked",
+                "stage": "selected_pre_submit",
+            },
+        },
+        {
+            "ts_ms": 1700000000100,
+            "kind": "pending_entry.missing_hedge_detected",
+            "payload": {
+                "entry_id": "entry-husdt-1",
+                "symbol": "HUSDT",
+                "venue": "aster",
+            },
+        },
+        {
+            "ts_ms": 1700000000200,
+            "kind": "pending_entry.hedge_admission_blocked",
+            "payload": {
+                "entry_id": "entry-husdt-1",
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "reason": "max_notional_admission_blocked",
+                "blocked_until_ms": 1700000300000,
+            },
+        },
+        {
+            "ts_ms": 1700000000300,
+            "kind": "entry.cleanup_leg_exposure",
+            "payload": {
+                "entry_id": "entry-husdt-1",
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "stage": "abort",
+            },
+        },
+        {
+            "ts_ms": 1700000000400,
+            "kind": "runtime.venue_cooldown_started",
+            "payload": {
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "reason": "aster_max_notional_limit",
+                "blocked_until_ms": 1700000300000,
+            },
+        },
+        {
+            "ts_ms": 1700000000500,
+            "kind": "order.passive_submitted",
+            "payload": {
+                "position_id": "entry-husdt-2",
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "leg": "long",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+
+    assert summary["pre_submit_blocked"] == 1
+    assert summary["single_leg_created"] == 1
+    assert summary["single_leg_cleanup"] == 1
+    assert summary["cleanup_after_admission_block"] == 1
+    assert summary["repeated_single_leg_guarded"]["violation_count"] == 1
+    assert summary["repeated_single_leg_guarded"]["severity"] == "production_issue"
+    assert summary["repeated_single_leg_guarded"]["samples"][0]["venue_symbol"] == (
+        "aster:HUSDT"
+    )
+
+
+def test_business_progression_quality_summary_flags_route_cooldown_fee_drag():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000000300,
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-husdt-2",
+                "symbol": "HUSDT",
+                "long_venue": "binance",
+                "short_venue": "aster",
+                "maker_leg": "long",
+            },
+        },
+        {
+            "ts_ms": 1700000000400,
+            "kind": "runtime.venue_cooldown_started",
+            "payload": {
+                "symbol": "HUSDT",
+                "venue": "aster",
+                "reason": "aster_max_notional_limit",
+                "blocked_until_ms": 1700000300000,
+            },
+        },
+        {
+            "ts_ms": 1700000000500,
+            "kind": "order.passive_submitted",
+            "payload": {
+                "position_id": "entry-husdt-2",
+                "symbol": "HUSDT",
+                "venue": "binance",
+                "leg": "long",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+
+    assert summary["repeated_single_leg_guarded"]["violation_count"] == 1
+    sample = summary["repeated_single_leg_guarded"]["samples"][0]
+    assert sample["venue_symbol"] == "aster:HUSDT"
+    assert sample["submitted_venue_symbol"] == "binance:HUSDT"
+    assert sample["cooldown_reason"] == "aster_max_notional_limit"
+
+
+def test_business_progression_quality_summary_reports_phase_takeover_gaps():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "candidate_pair_id": "slow-candidate",
+                "symbol": "SLOWUSDT",
+                "venue": "aster",
+            },
+        },
+        {
+            "ts_ms": 10_000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {"venue": "aster", "symbol": "STALEUSDT"},
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+    handoff = summary["phase_handoff_quality"]
+
+    assert handoff["severity"] == "production_issue"
+    assert handoff["missing_takeover_count"] == 2
+    assert handoff["phase_counts"] == {
+        "candidate_lease": {
+            "over_budget_count": 1,
+            "takeover_count": 0,
+            "missing_takeover_count": 1,
+        },
+        "quote_rewarm": {
+            "over_budget_count": 1,
+            "takeover_count": 0,
+            "missing_takeover_count": 1,
+        },
+    }
+    assert {
+        sample["phase"]: sample["configured_action"]
+        for sample in handoff["samples"]
+    } == {
+        "candidate_lease": "expire_candidate_and_rescan",
+        "quote_rewarm": "skip_candidate_after_hard_rewarm",
+    }
+
+
+def test_business_progression_quality_summary_counts_candidate_quote_takeovers():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "candidate_pair_id": "expired-candidate",
+                "symbol": "EXPUSDT",
+                "venue": "aster",
+            },
+        },
+        {
+            "ts_ms": 62_000,
+            "kind": "runtime.candidate_lease_expired",
+            "payload": {
+                "candidate_pair_id": "expired-candidate",
+                "symbol": "EXPUSDT",
+                "venue": "aster",
+                "action_taken": "expire_candidate_and_rescan",
+            },
+        },
+        {
+            "ts_ms": 10_000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {"venue": "aster", "symbol": "STALEUSDT"},
+        },
+        {
+            "ts_ms": 42_000,
+            "kind": "runtime.entry_quote_rewarm_terminal_stale",
+            "payload": {
+                "venue": "aster",
+                "symbol": "STALEUSDT",
+                "action_taken": "skip_candidate_after_hard_rewarm",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+    handoff = summary["phase_handoff_quality"]
+
+    assert handoff["severity"] == "ok"
+    assert handoff["missing_takeover_count"] == 0
+    assert handoff["phase_counts"] == {
+        "candidate_lease": {
+            "over_budget_count": 1,
+            "takeover_count": 1,
+            "missing_takeover_count": 0,
+        },
+        "quote_rewarm": {
+            "over_budget_count": 1,
+            "takeover_count": 1,
+            "missing_takeover_count": 0,
+        },
+    }
+    assert handoff["samples"] == []
 
 
 def test_venue_private_health_summary_deduplicates_block_and_cooldown_event():

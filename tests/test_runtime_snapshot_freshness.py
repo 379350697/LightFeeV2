@@ -76,6 +76,30 @@ def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
     )
 
 
+def _candidate_lease_snapshot(candidate: CandidateInput, now_ms: int) -> SidecarSnapshot:
+    return SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        quotes={
+            f"{candidate.long_venue}:{candidate.symbol}": _quote_with_liquidity(
+                candidate.long_venue,
+                candidate.symbol,
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms,
+            ),
+            f"{candidate.short_venue}:{candidate.symbol}": _quote_with_liquidity(
+                candidate.short_venue,
+                candidate.symbol,
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+
 def _sidecar_liquidity_required_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
     return CandidateInput(
         long_venue="okx",
@@ -1504,6 +1528,68 @@ def test_runtime_entry_quote_rewarm_hard_expiry_terminalizes_and_cools_down(tmp_
     assert kinds.count("runtime.entry_quote_rewarm_scheduled_after_rest_stale") == 1
     assert kinds.count("runtime.entry_quote_rewarm_terminal_stale") == 1
     assert runtime._entry_quote_rewarm_cooldown_until_ms[("aster", "CHZUSDT")] > 32_000
+
+
+@pytest.mark.asyncio
+async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            candidate_lease_ms=1_000,
+            local_l2_enabled=False,
+            entry_readiness_provider="quote_lease",
+            min_scan_minutes_before_funding=0,
+            max_concurrent_positions=4,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    candidate = _freshness_candidate("LEASEUSDT")
+    candidate.pair_id = "leaseusdt:okx->bybit"
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime._live_scan_success_streak = 3
+    runtime.entry_executor = CapturingEntryExecutor()
+    runtime._entry_candidate_lease_started_at_ms[candidate.pair_id] = 1_000
+
+    now_ms = 2_500
+    snapshot = _candidate_lease_snapshot(candidate, now_ms)
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    kinds = [record["kind"] for record in records]
+    assert runtime.entry_executor.contexts == []
+    assert runtime.state.last_scan["tradeable_count"] == 0
+    assert runtime.state.last_scan["candidate_lease_expired_count"] == 1
+    assert "runtime.candidate_lease_expired" in kinds
+    assert "review.candidate_rejected" in kinds
+    assert "execution.entry_selected" not in kinds
+    expired = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.candidate_lease_expired"
+    )
+    assert expired["action_taken"] == "expire_candidate_and_rescan"
+    assert expired["reason"] == "candidate_lease_hard_expired"
 
 
 @pytest.mark.asyncio

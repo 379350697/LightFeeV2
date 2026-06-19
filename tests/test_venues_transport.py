@@ -9565,6 +9565,63 @@ class TestPassivePreflight:
         assert result["reason"] == "reduce_only_exempt"
         transport._request.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_aster_order_admission_precheck_blocks_zero_headroom(
+        self, monkeypatch
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.ASTER
+                assert venue_symbol == "HUSDT"
+                return SymbolRule(
+                    tick_size=0.0001,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=0.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            spec=aster_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="aster-key", api_secret="aster-secret"),
+        )
+
+        async def fake_request(method, path, *, params=None, **kwargs):
+            assert method == "GET"
+            assert path == "/fapi/v1/remainingOpenableNotionalValue"
+            assert params["symbol"] == "HUSDT"
+            return {"remainingOpenableNotionalValue": "0"}
+
+        transport._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="HUSDT",
+            side=Side.SELL,
+            quantity=23.0,
+            price=None,
+            price_hint=1.0,
+            reduce_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="entry-husdt-h-aster",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.precheck_order_admission(req)
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert "max_notional_admission_blocked" in str(exc.value)
+        block = transport.order_diagnostics[-1]
+        assert block["kind"] == "runtime.entry_admission_blocked"
+        assert block["payload"]["source"] == "aster_headroom_pre_entry_precheck"
+        assert block["payload"]["remaining_openable_notional"] == 0.0
+
 
 # ====================================================================# Root Fix: Journal Evidence Tests
 # ====================================================================
