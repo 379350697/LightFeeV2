@@ -12,6 +12,7 @@ from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
+from lightfee.engine.business_contract import quote_rewarm_handoff_contract
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
@@ -1341,6 +1342,12 @@ class MarketDataRuntime:
                     "_entry_quote_rewarm_scheduled_at_ms",
                     scheduled_at_ms,
                 )
+                handoff = quote_rewarm_handoff_contract(
+                    phase="quote_rewarm",
+                    status="hard_over_budget",
+                    configured_action=budgets["quote_rewarm"].action,
+                    terminal_kind="runtime.entry_quote_rewarm_terminal_stale",
+                )
                 payload = {
                     "venue": venue,
                     "symbol": symbol,
@@ -1353,7 +1360,14 @@ class MarketDataRuntime:
                     "hard_ms": hard_ms,
                     "blocked_until_ms": blocked_until_ms,
                     "cooldown_ttl_ms": cooldown_ttl_ms,
-                    "action_taken": budgets["quote_rewarm"].action,
+                    "action_taken": handoff.get(
+                        "action_taken",
+                        budgets["quote_rewarm"].action,
+                    ),
+                    "action_evidence_kind": handoff.get(
+                        "action_evidence_kind",
+                        "runtime.entry_quote_rewarm_terminal_stale",
+                    ),
                     "source": "entry_quote_truth",
                     "ts_ms": now_ms,
                 }

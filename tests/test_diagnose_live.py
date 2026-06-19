@@ -5465,6 +5465,37 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
     )
 
 
+def test_phase_duration_summary_terminalizes_hard_quote_rewarm_timeout():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 10_000,
+            "kind": "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+            "payload": {"venue": "binance", "symbol": "ALICEUSDT"},
+        },
+        {
+            "ts_ms": 70_001,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+    quote_sample = phase_summary["samples"][0]
+
+    assert quote_sample["phase"] == "quote_rewarm"
+    assert quote_sample["status"] == "hard_over_budget"
+    assert quote_sample["action_taken"] == "skip_candidate_after_hard_rewarm"
+    assert (
+        quote_sample["action_evidence_kind"]
+        == "business_contract.quote_rewarm_hard_timeout"
+    )
+    assert phase_summary["blank_action_count"] == 0
+    assert phase_summary["phase_handoff_quality"]["missing_takeover_count"] == 0
+
+
 def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
     from scripts.diagnose_live import _build_entry_outcome_summary
 
@@ -6914,7 +6945,7 @@ def test_business_progression_quality_summary_reports_phase_takeover_gaps():
     handoff = summary["phase_handoff_quality"]
 
     assert handoff["severity"] == "production_issue"
-    assert handoff["missing_takeover_count"] == 2
+    assert handoff["missing_takeover_count"] == 1
     assert handoff["phase_counts"] == {
         "candidate_lease": {
             "over_budget_count": 1,
@@ -6923,8 +6954,8 @@ def test_business_progression_quality_summary_reports_phase_takeover_gaps():
         },
         "quote_rewarm": {
             "over_budget_count": 1,
-            "takeover_count": 0,
-            "missing_takeover_count": 1,
+            "takeover_count": 1,
+            "missing_takeover_count": 0,
         },
     }
     assert {
@@ -6932,7 +6963,6 @@ def test_business_progression_quality_summary_reports_phase_takeover_gaps():
         for sample in handoff["samples"]
     } == {
         "candidate_lease": "expire_candidate_and_rescan",
-        "quote_rewarm": "skip_candidate_after_hard_rewarm",
     }
 
 

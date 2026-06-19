@@ -64,6 +64,9 @@ Deterministic hedge admission reject must:
     first. Admission block reasons, quantity hedgeability, and diagnostic
     process counters should be extended there before adding another local
     predicate in entry runtime or diagnose.
+16. `execution.dual_taker_armed` is a pending-entry terminal fallback signal.
+    It must map through `classify_business_event_kind` to V1 `PENDING_ENTRY`;
+    diagnose and lifecycle should not each carry a separate allowlist.
 
 ## V1 / Exchange Semantics
 
@@ -111,7 +114,7 @@ Deterministic hedge admission reject must:
 | 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | deployed through `039d52c` | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
 | 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | deployed through `039d52c` | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
 | 2026-06-19 | Bybit 110007 and quote-rewarm process-quality closure | deployed through `039d52c`; `106f47e` keeps diagnostics aligned | Bybit `110007` is treated as opening-only deterministic admission cooldown, while reduce-only close remains allowed. Diagnose consumes production-gate truth so historical quote/admission hard-over-budget artifacts remain counted as process issues without becoming current active stuck when exchange truth and lifecycle blockers are clean. `106f47e` keeps that distinction while adding passive-close waiting-event truth payloads, so admission/quote recovered artifacts do not hide live close blockers or create false active stuck. |
-| 2026-06-19 | Centralized business contract for entry sizing/admission diagnostics | local implementation in progress | CL-102 adds `lightfee/engine/business_contract.py` and wires entry quantity plans, admission degraded aggregation keys, and business-progression process counters through it. HOMEUSDT-style `1856 -> 1800` contract-size adjustment is now explicit evidence, not inferred from later residual repair or terminal state. |
+| 2026-06-19 | Centralized business contract for entry sizing/admission diagnostics | `8eadb8e` deployed as clean baseline; unified-contract follow-up local, deploy pending | CL-102 adds `lightfee/engine/business_contract.py` and wires entry quantity plans, admission degraded aggregation keys, business-progression process counters, quote-rewarm handoff evidence, and dual-taker lifecycle mapping through it. HOMEUSDT-style `1856 -> 1800` contract-size adjustment is now explicit evidence, not inferred from later residual repair or terminal state. Unhedgeable quantity must block before maker submit rather than relying on residual repair as the normal path. |
 
 ## Recurrences
 

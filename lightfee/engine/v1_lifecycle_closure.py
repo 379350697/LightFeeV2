@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
 
+from lightfee.engine.business_contract import classify_business_event_kind
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryLiveTruth,
     PendingEntryTerminalizer,
@@ -162,6 +163,9 @@ def map_lifecycle_event_kind(kind: str) -> str | None:
     text = str(kind or "")
     if text in _EVENT_KIND_PHASES:
         return _EVENT_KIND_PHASES[text]
+    contract_phase = classify_business_event_kind(text).get("phase")
+    if contract_phase:
+        return str(contract_phase)
     for prefix, phase in _EVENT_PREFIX_PHASES:
         if text.startswith(prefix):
             return phase

@@ -33,8 +33,9 @@ Quote rewarm must also have terminal evidence. A venue-symbol that stays stale
 past the hard `quote_rewarm` budget must emit
 `runtime.entry_quote_rewarm_terminal_stale`, enter a cooldown/stale terminal
 state, and stop being reselected until fresh quote truth arrives or the cooldown
-expires. Diagnose should read that runtime evidence instead of inventing a
-successful cleanup action from presentation-only fields.
+expires. Runtime and diagnose must get `action_taken` and
+`action_evidence_kind` from `quote_rewarm_handoff_contract` so a hard timeout
+cannot appear as an over-budget phase with a blank takeover action.
 
 Candidate lease has the same active-handoff contract. A tradeable candidate
 that exceeds the hard `candidate_lease` budget without being selected, rejected,
@@ -58,6 +59,7 @@ they count as terminal/takeover evidence rather than a missing-handoff issue.
 | 2026-06-16 | WS-BBO cold-start and full-universe OI cap/timeout could still block finalist evidence | local fixed; real public smoke verified; deployment pending | CL-087 adds a sticky WS-BBO warm set for recent V1 primary/shadow/current finalist targets and candidate-scoped Binance/Aster public OI refresh before the entry liquidity gate. It does not relax quote TTL, OI floor, liquidity/admission/sizing/order guards, or raise the global OI cap. Targeted OI success must still pass the original OI floor; timeout/unsupported remains fail-closed with explicit diagnostics. A real public smoke showed Binance/Aster BTC/ETH candidate-scoped OI resolves in about 354-368ms under the separate bounded entry budget, while the sidecar 100ms fast-path budget remains unchanged. Targeted OI runtime events are mapped as diagnostic-only lifecycle evidence to avoid unmapped drift. |
 | 2026-06-18 | Quote rewarm hard-budget terminal evidence | local green, deploy pending | CL-097 adds `runtime.entry_quote_rewarm_terminal_stale` and cooldown suppression when the same venue-symbol remains stale past the hard quote-rewarm budget. The event maps to V1 `ENTRY_QUOTE_LEASE` and keeps `phase_duration_summary` evidence-driven. |
 | 2026-06-19 | Candidate lease and quote rewarm active handoff quality | local green, deploy pending | CL-099 adds candidate-lease expiration/takeover evidence and `phase_handoff_quality` diagnostics for candidate and quote-rewarm stages. A stage that exceeds budget without terminal/takeover evidence is now a production issue, while explicit stale/expired evidence is counted as active business progression. Post-deploy diagnostic drift also closed the `runtime.candidate_symbol_skipped reason=unsupported_symbol` false positive so catalog skips do not manufacture missing lease takeover. |
+| 2026-06-19 | Unified quote-rewarm handoff contract | local green, deploy pending | CL-102 follow-up moves quote-rewarm hard timeout/takeover action evidence into `lightfee/engine/business_contract.py`. ALICEUSDT-style hard rewarm samples must now report `action_taken=skip_candidate_after_hard_rewarm` with contract evidence, not a blank action. This does not relax quote TTL, OI, liquidity, entry admission, or stale-cooldown rules. |
 
 ## Regression Harness
 

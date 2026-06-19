@@ -35,8 +35,10 @@ from lightfee.engine.exchange_truth import (
     request_venue_operation,
 )
 from lightfee.engine.business_contract import (
+    close_order_error_resolution_contract,
     diagnose_issue_counts,
     passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
+    quote_rewarm_handoff_contract,
 )
 from lightfee.engine.lifecycle_sla import (
     LifecyclePhaseBudget,
@@ -2292,29 +2294,20 @@ def _build_resolved_close_order_error_summary(
             if not value.startswith("position_id:")
         }
         order_terminal_match = bool(order_identities & terminal_identity_values)
-        is_post_only_close_reject = _payload_is_binance_close_post_only_boundary_reject(
-            payload
+        resolution = close_order_error_resolution_contract(
+            kind=kind,
+            payload=payload,
+            current_exchange_truth_clean=current_clean,
+            position_terminal_match=position_terminal_match,
+            order_terminal_match=order_terminal_match,
+            has_order_identity=bool(order_identities),
+            is_post_only_close_reject=(
+                _payload_is_binance_close_post_only_boundary_reject(payload)
+            ),
         )
-        is_reduce_only_terminal_reject = _payload_is_reduce_only_terminal_flat_reject(
-            payload
-        )
-        is_zero_fill_terminal = (
-            kind == "order.uncertain"
-            and _payload_is_zero_fill_terminal_flat(payload)
-        )
-        if not current_clean:
+        if not resolution.get("resolved"):
             continue
-        if is_post_only_close_reject:
-            if not position_terminal_match:
-                continue
-        elif is_reduce_only_terminal_reject or is_zero_fill_terminal:
-            if not (
-                order_terminal_match
-                or (not order_identities and position_terminal_match)
-            ):
-                continue
-        else:
-            continue
+        resolution_bucket = str(resolution.get("resolution_bucket") or "")
 
         exchange_error = _exchange_error_dict(payload)
         sample = {
@@ -2340,11 +2333,11 @@ def _build_resolved_close_order_error_summary(
             )[:300],
             "ts_ms": rec.get("ts_ms", 0),
         }
-        if is_post_only_close_reject:
+        if resolution_bucket == "post_only_boundary_reject":
             post_only_resolved.append(sample)
-        elif is_reduce_only_terminal_reject:
+        elif resolution_bucket == "reduce_only_terminal_flat":
             reduce_only_resolved.append(sample)
-        elif is_zero_fill_terminal:
+        elif resolution_bucket == "zero_fill_terminal_flat":
             zero_fill_resolved.append(sample)
         else:
             continue
@@ -4354,6 +4347,15 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         )
         action_taken = str(observed_action.get("action_taken") or "")
         action_evidence_kind = str(observed_action.get("action_evidence_kind") or "")
+        handoff = quote_rewarm_handoff_contract(
+            phase=phase,
+            status=status,
+            configured_action=budget.action,
+            terminal_kind=action_evidence_kind if action_taken else "",
+        )
+        if handoff and not action_taken:
+            action_taken = handoff["action_taken"]
+            action_evidence_kind = handoff["action_evidence_kind"]
         allow_configured_fallback = phase not in {"candidate_lease", "quote_rewarm"}
         if (
             not action_taken

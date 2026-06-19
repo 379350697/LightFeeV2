@@ -20,6 +20,112 @@ DETERMINISTIC_ENTRY_ADMISSION_REASONS = frozenset({
 })
 
 
+def classify_business_event_kind(
+    kind: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    text = str(kind or "")
+    payload = payload or {}
+    if text == "execution.dual_taker_armed":
+        return {
+            "phase": "PENDING_ENTRY",
+            "terminality": "terminal_fallback_armed",
+            "action_taken": "execute_terminal_taker_fallback",
+            "action_evidence_kind": text,
+            "diagnostic_severity": "info",
+            "owner_id": str(
+                payload.get("entry_id") or payload.get("position_id") or ""
+            ),
+        }
+    if text in {
+        "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+        "runtime.entry_quote_rewarm_terminal_stale",
+        "runtime.entry_quote_revalidate_resolved",
+        "runtime.entry_quote_revalidate_failed",
+    }:
+        return {
+            "phase": "ENTRY_QUOTE_LEASE",
+            "terminality": (
+                "terminal"
+                if text != "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
+                else "active"
+            ),
+            "action_taken": str(payload.get("action_taken") or ""),
+            "action_evidence_kind": text,
+            "diagnostic_severity": "info",
+            "owner_id": _venue_symbol_owner(payload),
+        }
+    return {}
+
+
+def quote_rewarm_handoff_contract(
+    *,
+    phase: str,
+    status: str,
+    configured_action: str,
+    terminal_kind: str = "",
+) -> dict[str, str]:
+    if str(phase or "") != "quote_rewarm":
+        return {}
+    action = str(configured_action or "")
+    if terminal_kind:
+        return {
+            "action_taken": action,
+            "action_evidence_kind": str(terminal_kind),
+            "diagnostic_severity": "info",
+        }
+    if str(status or "") == "hard_over_budget":
+        return {
+            "action_taken": action,
+            "action_evidence_kind": "business_contract.quote_rewarm_hard_timeout",
+            "diagnostic_severity": "production_issue",
+        }
+    return {}
+
+
+def close_order_error_resolution_contract(
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    current_exchange_truth_clean: bool,
+    position_terminal_match: bool,
+    order_terminal_match: bool,
+    has_order_identity: bool,
+    is_post_only_close_reject: bool | None = None,
+) -> dict[str, Any]:
+    if not current_exchange_truth_clean:
+        return {"resolved": False, "resolution_bucket": ""}
+    post_only = (
+        bool(is_post_only_close_reject)
+        if is_post_only_close_reject is not None
+        else _payload_is_post_only_close_reject(payload)
+    )
+    reduce_only = _payload_is_reduce_only_terminal_flat_reject(payload)
+    zero_fill = (
+        str(kind or "") == "order.uncertain"
+        and "zero fill" in _payload_reason_text(payload)
+    )
+    if post_only:
+        return {
+            "resolved": bool(position_terminal_match),
+            "resolution_bucket": "post_only_boundary_reject",
+        }
+    if reduce_only or zero_fill:
+        resolved = bool(
+            order_terminal_match
+            or (not has_order_identity and position_terminal_match)
+        )
+        return {
+            "resolved": resolved,
+            "resolution_bucket": (
+                "reduce_only_terminal_flat"
+                if reduce_only
+                else "zero_fill_terminal_flat"
+            ),
+        }
+    return {"resolved": False, "resolution_bucket": ""}
+
+
 def entry_admission_blocks_candidate(reason: str, block_scope: str) -> bool:
     if str(block_scope or "").lower() == "venue":
         return True
@@ -149,6 +255,80 @@ def diagnose_issue_counts(payload: dict[str, Any], kind: str) -> dict[str, int]:
             )
         }
     return {}
+
+
+def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> bool:
+    request_context = _payload_request_context(payload)
+    if not _boolish(request_context.get("reduce_only")):
+        return False
+    exchange_error = _exchange_error_dict(payload)
+    code = str(
+        payload.get("exchange_code")
+        or exchange_error.get("exchange_code")
+        or payload.get("code")
+        or exchange_error.get("code")
+        or ""
+    ).strip()
+    reason = _payload_reason_text(payload)
+    return (
+        code == "-2022"
+        or "reduceonly order is rejected" in reason
+        or "reduce only order is rejected" in reason
+        or "reduce-only order is rejected" in reason
+    )
+
+
+def _payload_is_post_only_close_reject(payload: dict[str, Any]) -> bool:
+    request_context = _payload_request_context(payload)
+    reason = _payload_reason_text(payload)
+    return (
+        ("post only" in reason or "post-only" in reason)
+        and _boolish(request_context.get("post_only"))
+        and _boolish(request_context.get("reduce_only"))
+    )
+
+
+def _payload_reason_text(payload: dict[str, Any]) -> str:
+    exchange_error = _exchange_error_dict(payload)
+    return str(
+        payload.get("reason")
+        or payload.get("error")
+        or payload.get("exchange_msg")
+        or payload.get("msg")
+        or exchange_error.get("exchange_msg")
+        or exchange_error.get("raw_body")
+        or exchange_error.get("msg")
+        or ""
+    ).lower()
+
+
+def _venue_symbol_owner(payload: dict[str, Any]) -> str:
+    venue = str(payload.get("venue") or "").lower()
+    symbol = str(payload.get("symbol") or "").upper()
+    return f"{venue}:{symbol}" if venue and symbol else ""
+
+
+def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    exchange_error = payload.get("exchange_error")
+    return exchange_error if isinstance(exchange_error, dict) else {}
+
+
+def _payload_request_context(payload: dict[str, Any]) -> dict[str, Any]:
+    request_context = payload.get("request_context")
+    if isinstance(request_context, dict):
+        return request_context
+    exchange_error = _exchange_error_dict(payload)
+    request_context = exchange_error.get("request_context")
+    return request_context if isinstance(request_context, dict) else {}
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
 
 
 def _safe_float(value: Any) -> float:
