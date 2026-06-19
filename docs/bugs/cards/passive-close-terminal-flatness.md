@@ -14,6 +14,9 @@ residuals, and live-flat cleanup.
 - `pending_passive_close_flat_probe`
 - `exit.passive_close_waiting_exchange_flat_truth`
 - `passive_close_resolved_without_terminal_truth_count`
+- `close_reconciliation_evidence_gap_count`
+- `exit.reconciled` with `evidence_gap_reason`,
+  `statement_probe_status`, and `trade_probe_status`
 - `price_unavailable_for_min_notional`
 - `passive_close_maker_filled_under_chunk`
 - `entry.cleanup_leg_exposure`
@@ -72,6 +75,17 @@ and open-order-flat proof counts as
 gate is green with exchange flat/no-open-orders and no V1 lifecycle blockers,
 the artifact is a recovered process issue, not current `active_stuck_count`.
 
+Close reconciliation evidence gaps are process-quality issues, not terminal
+truth. `exit.reconciled evidence_gap=true` must explain the missing proof via
+`evidence_gap_reason`, `statement_probe_status`, and per-side
+`trade_probe_status`. Gate green remains driven by exchange position truth plus
+open-order truth; missing statement/trade evidence is retained as historical
+process evidence so future reviews do not confuse "currently safe" with "the
+close path had perfect evidence".
+
+For new recurrences, start from `lightfee/engine/business_contract.py` before
+adding another passive-close or diagnose-local terminality predicate.
+
 ## V1 / Exchange Semantics
 
 - V1 lets live exchange truth dominate stale recovered local close state.
@@ -107,6 +121,7 @@ the artifact is a recovered process issue, not current `active_stuck_count`.
 | 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed, deployed/cloud verified | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. Cloud verification under `fd1579d` is flat/no-open-orders with no active order errors and no unmapped lifecycle events. |
 | 2026-06-19 | Existing reduce-only close order covers quantity | deployed in `106f47e`; waiting-event evidence payload is local to the event | GENIUSUSDT-style close drift is not terminal-flat when Bybit still has nonzero position plus a matching reduce-only close order. CL-100 adopts the existing close order into pending passive close state, adds journal-based close-owner recovery, and keeps diagnose/gate red until exchange truth is flat/no-open-orders or owned close work is resolved. Waiting passive-close evidence now carries local `exchange_truth_attempt` payload instead of requiring a join with sibling diagnostics. |
 | 2026-06-19 | Passive close resolved before terminal exchange truth | deployed in `106f47e`; cloud gate green; non-blocking diagnose mapping follow-up remains | ESPORTSUSDT-style truth lag showed current production could recover flat/no-open-orders while diagnostics still counted old passive-close artifacts as active stuck. CL-101 keeps live pending passive close owner in `waiting_exchange_flat_truth` until position/open-order truth jointly proves flat, maps that owner as `owned_pending_passive_close`, moves gate-green historical hard-over-budget artifacts into recovered process counters, and records `exchange_truth_attempt` directly on every waiting event, including missing-position-snapshot cases. Post-deploy `106f47e` cloud truth is flat/no-open-orders and gate green, while `diagnose_live.py --since-deploy` still exposes `runtime.passive_close_recovery_result` as a non-blocking V1 lifecycle mapping follow-up. |
+| 2026-06-19 | Reconciliation evidence gap classification | local implementation in progress | CL-102 centralizes terminal-truth and evidence-gap vocabulary in `lightfee/engine/business_contract.py`. `exit.reconciled` now classifies missing long/short trade-statement evidence with `evidence_gap_reason`, `statement_probe_status`, and `trade_probe_status`; diagnose counts it as `close_reconciliation_evidence_gap_count` without changing the exchange-truth gate. |
 
 ## Recurrences
 
@@ -160,3 +175,6 @@ the artifact is a recovered process issue, not current `active_stuck_count`.
 11. Closure requires harness replay plus credentialed flat/no-open-orders probe.
 12. If a reduce-only close open order still exists, decide owner first: adopt
     matching pending/journal passive-close owner, or fail closed as ownerless.
+13. If `exit.reconciled evidence_gap=true`, classify whether the missing proof
+    is long side, short side, both sides, or duplicate suppression before
+    treating it as a resolved process-quality artifact.

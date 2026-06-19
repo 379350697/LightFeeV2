@@ -186,6 +186,45 @@ def test_exit_reconciled_payload_does_not_dedupe_unidentified_close_fills():
     assert payload["duplicate_close_leg_suppressed_count"] == 0
 
 
+def test_exit_reconciled_payload_classifies_statement_evidence_gap():
+    runtime = CloseRuntime(ctx=None)
+    reconciliation = {
+        "position_id": "entry-esports",
+        "symbol": "ESPORTSUSDT",
+        "position_snapshot": {
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+        },
+    }
+    long_fill = OrderFill(
+        venue=Venue.BINANCE,
+        symbol="ESPORTSUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        price=1.1,
+        order_id="binance-close-1",
+        client_order_id="client-close-1",
+        fee_quote=0.01,
+        filled_at_ms=1781531700000,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation,
+        [long_fill],
+        [],
+        now_ms=1781531700200,
+    )
+
+    assert payload["venue_statement_reconciled"] is False
+    assert payload["evidence_gap"] is True
+    assert payload["evidence_gap_reason"] == "missing_short_close_trade_statement"
+    assert payload["statement_probe_status"] == "partial"
+    assert payload["trade_probe_status"] == {
+        "long": "found",
+        "short": "missing",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CloseBalance
 # ---------------------------------------------------------------------------

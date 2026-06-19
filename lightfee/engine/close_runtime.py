@@ -12,6 +12,7 @@ from typing import Any
 
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.business_contract import close_reconciliation_evidence_fields
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
@@ -575,6 +576,12 @@ class CloseRuntime:
         short = self._aggregate_close_reconciliation_fills(short_fills)
         long_qty = float(long["quantity"])
         short_qty = float(short["quantity"])
+        duplicate_count = len(long_duplicates) + len(short_duplicates)
+        evidence_gap_fields = close_reconciliation_evidence_fields(
+            long_quantity=long_qty,
+            short_quantity=short_qty,
+            duplicate_close_leg_suppressed_count=duplicate_count,
+        )
         long_entry = float(snapshot.get("long_entry_price") or 0.0)
         short_entry = float(snapshot.get("short_entry_price") or 0.0)
         funding_quote = float(snapshot.get("captured_funding_quote") or 0.0)
@@ -608,8 +615,8 @@ class CloseRuntime:
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
             "venue_statement_reconciled": complete,
             "evidence_gap": not complete,
-            "duplicate_close_leg_suppressed_count": len(long_duplicates)
-            + len(short_duplicates),
+            **evidence_gap_fields,
+            "duplicate_close_leg_suppressed_count": duplicate_count,
             "duplicate_close_leg_suppressed_samples": duplicate_samples[:12],
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }

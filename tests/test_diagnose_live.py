@@ -5586,6 +5586,9 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "adopted_reduce_only_order_count": 0,
             "duplicate_reduce_only_submit_blocked_count": 0,
             "deterministic_reject_after_submit_count": 0,
+            "entry_quantity_contract_blocked_count": 0,
+            "close_reconciliation_evidence_gap_count": 0,
+            "admission_degraded_suppressed_count": 0,
             "passive_close_resolved_without_terminal_truth_count": 0,
             "passive_close_truth_lag_resolved_count": 0,
             "repeated_single_leg_guarded": {
@@ -5863,6 +5866,53 @@ def test_business_progression_quality_live_flat_flag_without_truth_stays_active(
     assert business["passive_close_truth_lag_resolved_count"] == 0
     assert business["recovered_but_counted_issue_count"] == 0
     assert business["active_stuck_count"] == 1
+
+
+def test_business_progression_quality_counts_contract_and_process_issues():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-home",
+                "symbol": "HOMEUSDT",
+                "quantity_contract_status": "blocked_unhedgeable_quantity",
+                "unhedgeable_residual_quantity": 56.0,
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "evidence_gap": True,
+                "evidence_gap_reason": "missing_short_close_trade_statement",
+                "statement_probe_status": "partial",
+                "trade_probe_status": {"long": "found", "short": "missing"},
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "runtime.entry_admission_venue_degraded",
+            "payload": {
+                "venue": "bybit",
+                "symbol": "HUSDT",
+                "reason": "insufficient_balance_admission_blocked",
+                "block_scope": "symbol",
+                "suppressed_count": 37,
+                "aggregation_key": "shortlist:bybit:HUSDT:insufficient_balance_admission_blocked:symbol",
+            },
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert business["entry_quantity_contract_blocked_count"] == 1
+    assert business["close_reconciliation_evidence_gap_count"] == 1
+    assert business["admission_degraded_suppressed_count"] == 37
 
 
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():

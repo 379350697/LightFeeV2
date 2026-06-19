@@ -14,6 +14,7 @@ from typing import Any
 from lightfee.core.domain import OrderRequest, Side, TimeInForce, Venue
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
+from lightfee.engine.business_contract import classify_entry_quantity_contract
 from lightfee.engine.execution_planner import (
     ExecutionRoute,
     plan_incremental_entry_execution,
@@ -1877,6 +1878,11 @@ class EntryDispatchRuntime:
             full_target_quantity=plan.full_target_quantity,
             initial_maker_target_quantity=plan.initial_maker_target_quantity,
         )
+        quantity_contract = classify_entry_quantity_contract(
+            raw_quantity=raw_quantity,
+            common_quantity=quantity,
+            effective_quantity=effective_quantity,
+        )
         self.ctx.journal.append(
             "execution.entry_quantity_plan",
             {
@@ -1890,6 +1896,7 @@ class EntryDispatchRuntime:
                 "initial_maker_target_quantity": plan.initial_maker_target_quantity,
                 "effective_quantity": effective_quantity,
                 "quantity_plan_reason": quantity_plan_reason,
+                **quantity_contract,
                 "route": route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                 "min_hedgeable_chunk": min_hedgeable_chunk,

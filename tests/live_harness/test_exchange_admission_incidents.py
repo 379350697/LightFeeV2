@@ -1086,6 +1086,9 @@ def test_hyperliquid_venue_cooldown_prunes_new_entry_candidates_before_shortlist
         assert payload["venue"] == "hyperliquid"
         assert payload["reason"] == "insufficient_margin_admission_blocked"
         assert payload["block_scope"] == "venue"
+        assert payload["aggregation_key"] == (
+            "shortlist:hyperliquid:WLDUSDT:insufficient_margin_admission_blocked:venue"
+        )
         assert payload["source"] == "pending_hedge"
         assert payload["candidate_count"] == 2
         assert payload["blocked_count"] == 1

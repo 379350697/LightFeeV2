@@ -12,6 +12,10 @@ from typing import Any
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import AccountBalanceSnapshot, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.business_contract import (
+    entry_admission_aggregation_key,
+    entry_admission_blocks_candidate,
+)
 from lightfee.engine.runtime_context import EntryGateRuntimeContext
 from lightfee.risk.modes import EngineLifecycle
 
@@ -386,6 +390,13 @@ class EntryGateRuntime:
                 "venue": Venue.HYPERLIQUID.value,
                 "reason": reason,
                 "block_scope": "venue",
+                "aggregation_key": entry_admission_aggregation_key(
+                    stage=stage,
+                    venue=Venue.HYPERLIQUID.value,
+                    symbol="*",
+                    reason=reason,
+                    block_scope="venue",
+                ),
                 "source": source,
                 "official_doc_url": evidence["official_doc_url"],
                 "evidence_gap": True,
@@ -613,6 +624,13 @@ class EntryGateRuntime:
                 "venue": Venue.HYPERLIQUID.value,
                 "reason": reason,
                 "block_scope": "venue",
+                "aggregation_key": entry_admission_aggregation_key(
+                    stage=stage,
+                    venue=Venue.HYPERLIQUID.value,
+                    symbol="*",
+                    reason=reason,
+                    block_scope="venue",
+                ),
                 "source": source,
                 "official_doc_url": evidence.get("official_doc_url", ""),
                 "evidence_gap": bool(evidence.get("evidence_gap", True)),
@@ -717,14 +735,6 @@ class EntryGateRuntime:
         stage: str,
     ) -> list:
         """V1-style pre-shortlist entry admission gate for venue-scope cooldowns."""
-        exchange_admission_reasons = {
-            "bybit_trading_terms_required",
-            "insufficient_balance_admission_blocked",
-            "insufficient_margin_admission_blocked",
-            "leverage_admission_blocked",
-            "max_notional_admission_blocked",
-            "venue_auth_invalid",
-        }
         self._last_entry_admission_filter_blockers = Counter()
         self._last_entry_admission_filter_samples = []
         if not candidates:
@@ -742,13 +752,7 @@ class EntryGateRuntime:
             block = self._candidate_admission_block(candidate, now_ms)
             reason = str(block.get("reason") or "venue_admission_blocked") if block else ""
             block_scope = str(block.get("block_scope") or "symbol") if block else ""
-            if (
-                not block
-                or (
-                    block_scope != "venue"
-                    and reason not in exchange_admission_reasons
-                )
-            ):
+            if not block or not entry_admission_blocks_candidate(reason, block_scope):
                 allowed.append(candidate)
                 continue
 
@@ -807,12 +811,28 @@ class EntryGateRuntime:
             if len(evidence_gap_values) == 1
             else True
         )
+        sample_symbols = {
+            str(sample.get("symbol") or "").upper()
+            for sample in blocked_samples
+            if str(sample.get("symbol") or "")
+        }
+        aggregation_symbol = (
+            next(iter(sample_symbols)) if len(sample_symbols) == 1 else "*"
+        )
+        aggregation_key = entry_admission_aggregation_key(
+            stage=stage,
+            venue=venue,
+            symbol=aggregation_symbol,
+            reason=reason,
+            block_scope=block_scope,
+        )
         self._append_runtime_diagnostic_event(
             "runtime.entry_admission_venue_degraded",
             {
                 "venue": venue,
                 "reason": reason,
                 "block_scope": block_scope,
+                "aggregation_key": aggregation_key,
                 "blocked_until_ms": blocked_until_ms,
                 "source": source,
                 "official_doc_url": official_doc_url,
@@ -825,7 +845,7 @@ class EntryGateRuntime:
                     sorted(self._last_entry_admission_filter_blockers.items())
                 ),
                 "samples": blocked_samples[:10],
-                "suppressed_count": 0,
+                "suppressed_count": max(blocked_count - len(blocked_samples), 0),
                 "ts_ms": now_ms,
             },
             now_ms=now_ms,

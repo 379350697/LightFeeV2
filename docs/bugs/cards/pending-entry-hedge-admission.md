@@ -13,6 +13,10 @@ decision path short.
 - Bybit opening balance family: `110007`, `ab not enough for new order`, `Available balance is insufficient`.
 - Aster max-notional family: `-5018`, `maximum notional value limit`, `max_notional_admission_blocked`.
 - Hyperliquid insufficient-margin family: `Insufficient margin to place order.`
+- `execution.entry_quantity_plan` with `quantity_contract_status` and
+  `unhedgeable_residual_quantity`.
+- `runtime.entry_admission_venue_degraded` with `aggregation_key` and
+  `suppressed_count`.
 - Recurrence shape: maker leg has fill/exposure, hedge venue rejects deterministically, same pending keeps retrying until max lifetime or cleanup.
 
 ## Current Effective Rule
@@ -50,6 +54,16 @@ Deterministic hedge admission reject must:
     a quote rewarm that reaches hard stale must emit
     `runtime.entry_quote_rewarm_terminal_stale`, write cooldown, and stop
     repeated same venue/symbol scheduling until TTL expires.
+14. Entry sizing must be hedgeable before maker submit. If venue step/contract
+    size converts raw size into a smaller common quantity, journal it as
+    `quantity_contract_status=hedgeable_adjusted` with the
+    `unhedgeable_residual_quantity`. If the route cannot produce a hedgeable
+    quantity, block before maker submit; residual repair remains a fallback,
+    not the normal sizing path.
+15. For new recurrence fixes, check `lightfee/engine/business_contract.py`
+    first. Admission block reasons, quantity hedgeability, and diagnostic
+    process counters should be extended there before adding another local
+    predicate in entry runtime or diagnose.
 
 ## V1 / Exchange Semantics
 
@@ -97,6 +111,7 @@ Deterministic hedge admission reject must:
 | 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | deployed through `039d52c` | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
 | 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | deployed through `039d52c` | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
 | 2026-06-19 | Bybit 110007 and quote-rewarm process-quality closure | deployed through `039d52c`; `106f47e` keeps diagnostics aligned | Bybit `110007` is treated as opening-only deterministic admission cooldown, while reduce-only close remains allowed. Diagnose consumes production-gate truth so historical quote/admission hard-over-budget artifacts remain counted as process issues without becoming current active stuck when exchange truth and lifecycle blockers are clean. `106f47e` keeps that distinction while adding passive-close waiting-event truth payloads, so admission/quote recovered artifacts do not hide live close blockers or create false active stuck. |
+| 2026-06-19 | Centralized business contract for entry sizing/admission diagnostics | local implementation in progress | CL-102 adds `lightfee/engine/business_contract.py` and wires entry quantity plans, admission degraded aggregation keys, and business-progression process counters through it. HOMEUSDT-style `1856 -> 1800` contract-size adjustment is now explicit evidence, not inferred from later residual repair or terminal state. |
 
 ## Recurrences
 
@@ -145,4 +160,8 @@ Deterministic hedge admission reject must:
 10. For quote stale recurrences, confirm terminal stale cooldown exists and
     `quote_rewarm_terminalized_count` / `active_stuck_count` distinguish
     terminalized stale work from active stuck work.
-11. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+11. For sizing recurrences, inspect `execution.entry_quantity_plan` before
+    pending-entry residual evidence. `quantity_contract_status` should explain
+    whether the maker quantity was already hedgeable, adjusted to a hedgeable
+    quantity, or blocked.
+12. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.

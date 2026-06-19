@@ -2544,11 +2544,81 @@ class TestPlannerDispatchIntegration:
         assert payload["common_quantity"] == pytest.approx(700.0)
         assert payload["full_target_quantity"] == pytest.approx(700.0)
         assert payload["initial_maker_target_quantity"] == pytest.approx(700.0)
+        assert payload["effective_quantity"] == pytest.approx(700.0)
         assert payload["quantity_plan_reason"] == "exchange_step_rounding"
+        assert payload["quantity_contract_status"] == "hedgeable_adjusted"
+        assert payload["unhedgeable_residual_quantity"] == pytest.approx(
+            20.5692497072687
+        )
         assert payload["venue_quantity_steps"]["okx"] == pytest.approx(100.0)
         assert payload["venue_quantity_steps"]["bybit"] == pytest.approx(0.001)
         assert payload["venue_quantity_metadata"]["okx"]["quantity_step"] == pytest.approx(100.0)
         assert payload["venue_quantity_metadata"]["bybit"]["quantity_step"] == pytest.approx(0.001)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_contract_adjusts_home_1856_to_hedgeable_1800(
+        self, config, tmp_journal,
+    ):
+        config.strategy.maker_initial_slice_ratio = 1.0
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=1856.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(1800.0)
+        assert executor.ctx.short_quantity == pytest.approx(1800.0)
+        records = runtime.journal.read_all()
+        assert "order.passive_submitted" not in [r["kind"] for r in records]
+        payload = [
+            r["payload"]
+            for r in records
+            if r["kind"] == "execution.entry_quantity_plan"
+        ][-1]
+        assert payload["raw_quantity"] == pytest.approx(1856.0)
+        assert payload["common_quantity"] == pytest.approx(1800.0)
+        assert payload["full_target_quantity"] == pytest.approx(1800.0)
+        assert payload["effective_quantity"] == pytest.approx(1800.0)
+        assert payload["quantity_contract_status"] == "hedgeable_adjusted"
+        assert payload["unhedgeable_residual_quantity"] == pytest.approx(56.0)
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_skips_when_non_okx_quantity_metadata_missing(

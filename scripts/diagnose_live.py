@@ -34,6 +34,10 @@ from lightfee.engine.exchange_truth import (
     normalize_exchange_truth_payload,
     request_venue_operation,
 )
+from lightfee.engine.business_contract import (
+    diagnose_issue_counts,
+    passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
+)
 from lightfee.engine.lifecycle_sla import (
     LifecyclePhaseBudget,
     classify_phase_age,
@@ -4889,6 +4893,9 @@ def _build_business_progression_quality_summary(
     adopted_reduce_only_order_count = 0
     duplicate_reduce_only_submit_blocked_count = 0
     deterministic_reject_after_submit_count = 0
+    entry_quantity_contract_blocked_count = 0
+    close_reconciliation_evidence_gap_count = 0
+    admission_degraded_suppressed_count = 0
     passive_close_resolved_without_terminal_truth_entries: set[str] = set()
     passive_close_terminal_truth_entries: set[str] = set()
 
@@ -4936,42 +4943,7 @@ def _build_business_progression_quality_summary(
         return str(payload.get(key) or "").lower()
 
     def passive_close_has_terminal_truth(payload: dict[str, Any]) -> bool:
-        truth = payload.get("exchange_truth")
-        if not isinstance(truth, dict):
-            return False
-        if truth.get("truth_available") is False:
-            return False
-        positions_flat = (
-            truth.get("positions_flat")
-            if isinstance(truth.get("positions_flat"), bool)
-            else None
-        )
-        if positions_flat is None:
-            positions = truth.get("positions")
-            if isinstance(positions, list):
-                position_items = [
-                    item for item in positions if isinstance(item, dict)
-                ]
-                positions_flat = bool(position_items) and all(
-                    abs(float((item or {}).get("quantity") or 0.0)) <= 1e-9
-                    for item in position_items
-                )
-        open_orders_flat = (
-            truth.get("open_orders_flat")
-            if isinstance(truth.get("open_orders_flat"), bool)
-            else None
-        )
-        if open_orders_flat is None:
-            open_order_truth = truth.get("open_order_truth")
-            if isinstance(open_order_truth, list):
-                open_order_items = [
-                    item for item in open_order_truth if isinstance(item, dict)
-                ]
-                open_orders_flat = bool(open_order_items) and all(
-                    bool((item or {}).get("open_orders_empty"))
-                    for item in open_order_items
-                )
-        return bool(positions_flat) and bool(open_orders_flat)
+        return contract_passive_close_has_terminal_truth(payload)
 
     def route_venues(payload: dict[str, Any]) -> list[str]:
         venues: list[str] = []
@@ -5003,6 +4975,16 @@ def _build_business_progression_quality_summary(
         payload = rec.get("payload", {})
         if not isinstance(payload, dict):
             continue
+        issue_counts = diagnose_issue_counts(payload, kind)
+        entry_quantity_contract_blocked_count += int(
+            issue_counts.get("entry_quantity_contract_blocked_count", 0) or 0
+        )
+        close_reconciliation_evidence_gap_count += int(
+            issue_counts.get("close_reconciliation_evidence_gap_count", 0) or 0
+        )
+        admission_degraded_suppressed_count += int(
+            issue_counts.get("admission_degraded_suppressed_count", 0) or 0
+        )
 
         if kind == "runtime.entry_blocked_admission_selection":
             pre_submit_blocked += int(payload.get("blocked_count") or 1)
@@ -5230,6 +5212,13 @@ def _build_business_progression_quality_summary(
         "deterministic_reject_after_submit_count": (
             deterministic_reject_after_submit_count
         ),
+        "entry_quantity_contract_blocked_count": (
+            entry_quantity_contract_blocked_count
+        ),
+        "close_reconciliation_evidence_gap_count": (
+            close_reconciliation_evidence_gap_count
+        ),
+        "admission_degraded_suppressed_count": admission_degraded_suppressed_count,
         "passive_close_resolved_without_terminal_truth_count": len(
             passive_close_resolved_without_terminal_truth_entries
         ),
