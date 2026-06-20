@@ -26,6 +26,31 @@ def classify_business_event_kind(
 ) -> dict[str, Any]:
     text = str(kind or "")
     payload = payload or {}
+    market_evidence = entry_market_evidence_contract(text, payload)
+    if market_evidence:
+        return {
+            "phase": market_evidence["phase"],
+            "terminality": market_evidence["terminality"],
+            "action_taken": market_evidence["action_taken"],
+            "action_evidence_kind": text,
+            "diagnostic_severity": market_evidence["diagnostic_severity"],
+            "owner_id": market_evidence["owner_id"],
+            "evidence_class": market_evidence["evidence_class"],
+            "blocks_entry": market_evidence["blocks_entry"],
+        }
+    close_reconciliation = close_reconciliation_evidence_contract(
+        payload,
+        current_exchange_truth_clean=passive_close_has_terminal_truth(payload),
+    )
+    if text == "exit.reconciled" and close_reconciliation:
+        return {
+            "phase": close_reconciliation["phase"],
+            "terminality": close_reconciliation["terminality"],
+            "action_taken": close_reconciliation["action"],
+            "action_evidence_kind": text,
+            "diagnostic_severity": close_reconciliation["diagnostic_severity"],
+            "owner_id": close_reconciliation["owner_id"],
+        }
     if text == "execution.dual_taker_armed":
         return {
             "phase": "PENDING_ENTRY",
@@ -36,24 +61,6 @@ def classify_business_event_kind(
             "owner_id": str(
                 payload.get("entry_id") or payload.get("position_id") or ""
             ),
-        }
-    if text in {
-        "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
-        "runtime.entry_quote_rewarm_terminal_stale",
-        "runtime.entry_quote_revalidate_resolved",
-        "runtime.entry_quote_revalidate_failed",
-    }:
-        return {
-            "phase": "ENTRY_QUOTE_LEASE",
-            "terminality": (
-                "terminal"
-                if text != "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
-                else "active"
-            ),
-            "action_taken": str(payload.get("action_taken") or ""),
-            "action_evidence_kind": text,
-            "diagnostic_severity": "info",
-            "owner_id": _venue_symbol_owner(payload),
         }
     if text in {
         "exit.passive_close_waiting_exchange_flat_truth",
@@ -100,6 +107,166 @@ def classify_business_event_kind(
             "owner_id": str(payload.get("position_id") or ""),
         }
     return {}
+
+
+def entry_market_evidence_contract(
+    kind: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    text = str(kind or "")
+    owner_id = _venue_symbol_owner(payload)
+    reason = str(
+        payload.get("reason_bucket")
+        or payload.get("reason")
+        or payload.get("outcome")
+        or payload.get("open_interest_evidence_reason")
+        or ""
+    )
+    base = {
+        "phase": "ENTRY_MARKET_EVIDENCE",
+        "owner_id": owner_id,
+        "reason": reason,
+        "blocks_entry": False,
+        "diagnostic_severity": "info",
+        "terminality": "active",
+        "action": "",
+        "action_taken": "",
+        "evidence_class": "",
+    }
+    if text in {
+        "runtime.entry_quote_revalidate_failed",
+        "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+        "runtime.quote_stale",
+        "runtime.order_quote_stale_skipped",
+    }:
+        return {
+            **base,
+            "evidence_class": "quote",
+            "action": "block_stale_quote",
+            "action_taken": "block_stale_quote",
+            "blocks_entry": True,
+            "terminality": "terminal_candidate_block",
+            "diagnostic_severity": "production_issue",
+        }
+    if text in {
+        "runtime.entry_quote_revalidate_resolved",
+        "runtime.entry_quote_evidence_resolved_by_ws_bbo",
+        "runtime.last_good_revalidated_by_entry_quote_truth",
+    }:
+        action = (
+            "diagnostic_recovered_overbudget"
+            if _payload_over_budget(payload)
+            else "allow_entry_evidence"
+        )
+        return {
+            **base,
+            "evidence_class": "quote",
+            "action": action,
+            "action_taken": action,
+            "terminality": "terminal_evidence_resolved",
+        }
+    if text == "runtime.entry_quote_rewarm_scheduled_after_rest_stale":
+        return {
+            **base,
+            "evidence_class": "quote",
+            "action": "refresh_evidence",
+            "action_taken": "schedule_quote_rewarm",
+            "terminality": "active",
+        }
+    if text == "runtime.entry_quote_rewarm_terminal_stale":
+        action_taken = str(
+            payload.get("action_taken") or "skip_candidate_after_hard_rewarm"
+        )
+        return {
+            **base,
+            "evidence_class": "quote",
+            "action": "terminal_candidate_rewarm",
+            "action_taken": action_taken,
+            "blocks_entry": True,
+            "terminality": "terminal_candidate_block",
+            "diagnostic_severity": "production_issue",
+        }
+    if text in {
+        "execution.entry_liquidity_blocked",
+        "runtime.perp_liquidity_stale_advisory",
+    }:
+        if text == "runtime.perp_liquidity_stale_advisory":
+            return {
+                **base,
+                "evidence_class": "oi",
+                "action": "refresh_evidence",
+                "action_taken": "record_oi_liquidity_advisory",
+                "terminality": "active",
+            }
+        return {
+            **base,
+            "evidence_class": "oi",
+            "action": "block_oi_unavailable",
+            "action_taken": "block_oi_unavailable",
+            "blocks_entry": True,
+            "terminality": "terminal_candidate_block",
+            "diagnostic_severity": "production_issue",
+        }
+    if text == "runtime.entry_oi_targeted_refresh_started":
+        return {
+            **base,
+            "evidence_class": "oi",
+            "action": "refresh_evidence",
+            "action_taken": "targeted_oi_refresh",
+            "terminality": "active",
+        }
+    if text == "runtime.entry_oi_targeted_refresh_resolved":
+        action = (
+            "diagnostic_recovered_overbudget"
+            if _payload_over_budget(payload)
+            else "allow_entry_evidence"
+        )
+        return {
+            **base,
+            "evidence_class": "oi",
+            "action": action,
+            "action_taken": action,
+            "terminality": "terminal_evidence_resolved",
+        }
+    if text == "runtime.entry_oi_targeted_refresh_failed":
+        return {
+            **base,
+            "evidence_class": "oi",
+            "action": "block_oi_unavailable",
+            "action_taken": "block_oi_unavailable",
+            "blocks_entry": True,
+            "terminality": "terminal_candidate_block",
+            "diagnostic_severity": "production_issue",
+        }
+    return {}
+
+
+def close_reconciliation_evidence_contract(
+    payload: dict[str, Any] | None,
+    current_exchange_truth_clean: bool,
+) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    if payload.get("evidence_gap") is not True:
+        return {}
+    clean = bool(current_exchange_truth_clean)
+    action = (
+        "terminal_flat_accounting_gap"
+        if clean
+        else "unresolved_close_accounting_gap"
+    )
+    return {
+        "phase": "CLOSE_RECONCILIATION",
+        "terminality": action,
+        "action": action,
+        "action_taken": action,
+        "blocks_business_terminal": not clean,
+        "diagnostic_severity": "info" if clean else "critical",
+        "owner_id": str(payload.get("position_id") or payload.get("entry_id") or ""),
+        "symbol": str(payload.get("symbol") or ""),
+        "reason": str(payload.get("evidence_gap_reason") or "unknown"),
+        "statement_probe_status": str(payload.get("statement_probe_status") or ""),
+    }
 
 
 def quote_rewarm_handoff_contract(
@@ -522,6 +689,19 @@ def _boolish(value: Any) -> bool:
         return value != 0
     text = str(value or "").strip().lower()
     return text in {"1", "true", "yes", "y", "on"}
+
+
+def _payload_over_budget(payload: dict[str, Any]) -> bool:
+    for key in ("over_budget", "recovered_overbudget", "recovered_over_budget"):
+        if _boolish(payload.get(key)):
+            return True
+    elapsed = _safe_float(payload.get("elapsed_ms"))
+    budget = _safe_float(
+        payload.get("budget_ms")
+        or payload.get("hard_ms")
+        or payload.get("hard_budget_ms")
+    )
+    return bool(elapsed and budget and elapsed > budget)
 
 
 def _safe_float(value: Any) -> float:

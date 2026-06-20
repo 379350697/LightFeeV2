@@ -5178,6 +5178,68 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "timeout": 1,
         },
     }
+    assert summary["entry_market_evidence_summary"] == {
+        "action_counts": {
+            "allow_entry_evidence": 1,
+            "block_oi_unavailable": 3,
+            "block_stale_quote": 2,
+        },
+        "blocked_candidate_count": 5,
+        "diagnostic_recovered_overbudget_count": 0,
+        "evidence_class_counts": {
+            "oi": 4,
+            "quote": 2,
+        },
+        "oi": {
+            "blocked_candidate_count": 3,
+            "failed_count": 1,
+            "resolved_count": 1,
+        },
+        "quote": {
+            "blocked_candidate_count": 2,
+            "terminal_candidate_rewarm_count": 0,
+        },
+        "samples": [
+            {
+                "action": "block_stale_quote",
+                "blocks_entry": True,
+                "evidence_class": "quote",
+                "owner_id": "aster:HOMEUSDT",
+                "reason": "rest_resolved_but_stale",
+            },
+            {
+                "action": "block_stale_quote",
+                "blocks_entry": True,
+                "evidence_class": "quote",
+                "owner_id": "binance:HOMEUSDT",
+                "reason": "rest_throttled",
+            },
+            {
+                "action": "block_oi_unavailable",
+                "blocks_entry": True,
+                "evidence_class": "oi",
+                "owner_id": "aster:HOMEUSDT",
+                "reason": "oi_evidence_unavailable",
+            },
+            {
+                "action": "block_oi_unavailable",
+                "blocks_entry": True,
+                "evidence_class": "oi",
+                "owner_id": "binance:BSBUSDT",
+                "reason": "oi_evidence_unavailable",
+            },
+            {
+                "action": "allow_entry_evidence",
+                "blocks_entry": False,
+                "evidence_class": "oi",
+                "owner_id": "binance:HOMEUSDT",
+                "reason": "targeted_refresh",
+            },
+        ],
+        "terminal_candidate_rewarm_count": 0,
+        "total_count": 6,
+        "unresolved_blocker_count": 1,
+    }
 
 
 def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
@@ -5652,6 +5714,13 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "deterministic_reject_after_submit_count": 0,
             "entry_quantity_contract_blocked_count": 0,
             "close_reconciliation_evidence_gap_count": 0,
+            "close_reconciliation_evidence_gap_summary": {
+                "count": 0,
+                "terminal_flat_accounting_gap_count": 0,
+                "unresolved_close_accounting_gap_count": 0,
+                "blocking_count": 0,
+                "samples": [],
+            },
             "admission_degraded_suppressed_count": 0,
             "passive_close_resolved_without_terminal_truth_count": 0,
             "passive_close_truth_lag_resolved_count": 0,
@@ -6025,6 +6094,71 @@ def test_business_progression_quality_counts_contract_and_process_issues():
     assert business["entry_quantity_contract_blocked_count"] == 1
     assert business["close_reconciliation_evidence_gap_count"] == 1
     assert business["admission_degraded_suppressed_count"] == 37
+    assert business["close_reconciliation_evidence_gap_summary"] == {
+        "count": 1,
+        "terminal_flat_accounting_gap_count": 0,
+        "unresolved_close_accounting_gap_count": 1,
+        "blocking_count": 1,
+        "samples": [
+            {
+                "action": "unresolved_close_accounting_gap",
+                "blocks_business_terminal": True,
+                "owner_id": "entry-esports",
+                "reason": "missing_short_close_trade_statement",
+                "statement_probe_status": "partial",
+                "symbol": "ESPORTSUSDT",
+            },
+        ],
+    }
+
+
+def test_business_progression_quality_marks_flat_accounting_gap_non_blocking():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "entry-husdt",
+                "symbol": "HUSDT",
+                "evidence_gap": True,
+                "evidence_gap_reason": "missing_short_close_trade_statement",
+                "statement_probe_status": "partial",
+                "trade_probe_status": {"long": "found", "short": "missing"},
+            },
+        },
+    ]
+    production_acceptance_gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "v1_lifecycle_summary": {"blocking_row_count": 0},
+    }
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate=production_acceptance_gate,
+    )
+
+    assert business["close_reconciliation_evidence_gap_count"] == 1
+    assert business["close_reconciliation_evidence_gap_summary"] == {
+        "count": 1,
+        "terminal_flat_accounting_gap_count": 1,
+        "unresolved_close_accounting_gap_count": 0,
+        "blocking_count": 0,
+        "samples": [
+            {
+                "action": "terminal_flat_accounting_gap",
+                "blocks_business_terminal": False,
+                "owner_id": "entry-husdt",
+                "reason": "missing_short_close_trade_statement",
+                "statement_probe_status": "partial",
+                "symbol": "HUSDT",
+            },
+        ],
+    }
 
 
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():

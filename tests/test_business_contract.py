@@ -5,7 +5,9 @@ import pytest
 from lightfee.engine.business_contract import (
     classify_business_event_kind,
     classify_entry_quantity_contract,
+    close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
+    entry_market_evidence_contract,
     passive_close_final_truth_contract,
     quote_rewarm_handoff_contract,
 )
@@ -57,6 +59,103 @@ def test_quote_rewarm_handoff_contract_terminalizes_hard_timeout():
         "action_evidence_kind": "business_contract.quote_rewarm_hard_timeout",
         "diagnostic_severity": "production_issue",
     }
+
+
+def test_entry_market_evidence_contract_blocks_stale_quote():
+    result = entry_market_evidence_contract(
+        "runtime.entry_quote_revalidate_failed",
+        {
+            "venue": "aster",
+            "symbol": "ALICEUSDT",
+            "reason_bucket": "rest_resolved_but_stale",
+            "reason_family": "rest_invalid_quote",
+        },
+    )
+
+    assert result["phase"] == "ENTRY_MARKET_EVIDENCE"
+    assert result["evidence_class"] == "quote"
+    assert result["action"] == "block_stale_quote"
+    assert result["blocks_entry"] is True
+    assert result["diagnostic_severity"] == "production_issue"
+
+
+def test_entry_market_evidence_contract_maps_oi_resolution_and_failure():
+    resolved = entry_market_evidence_contract(
+        "runtime.entry_oi_targeted_refresh_resolved",
+        {
+            "venue": "binance",
+            "symbol": "HOMEUSDT",
+            "previous_open_interest_evidence_status": "deferred_by_cap",
+            "open_interest_evidence_status": "available",
+        },
+    )
+    failed = entry_market_evidence_contract(
+        "runtime.entry_oi_targeted_refresh_failed",
+        {
+            "venue": "aster",
+            "symbol": "BSBUSDT",
+            "open_interest_evidence_status": "timeout",
+        },
+    )
+
+    assert resolved["action"] == "allow_entry_evidence"
+    assert resolved["blocks_entry"] is False
+    assert resolved["terminality"] == "terminal_evidence_resolved"
+    assert failed["action"] == "block_oi_unavailable"
+    assert failed["blocks_entry"] is True
+    assert failed["terminality"] == "terminal_candidate_block"
+
+
+def test_entry_market_evidence_contract_terminalizes_quote_rewarm():
+    result = entry_market_evidence_contract(
+        "runtime.entry_quote_rewarm_terminal_stale",
+        {
+            "venue": "aster",
+            "symbol": "TRUSTUSDT",
+            "action_taken": "skip_candidate_after_hard_rewarm",
+        },
+    )
+
+    assert result["action"] == "terminal_candidate_rewarm"
+    assert result["action_taken"] == "skip_candidate_after_hard_rewarm"
+    assert result["blocks_entry"] is True
+    assert result["terminality"] == "terminal_candidate_block"
+
+
+def test_close_reconciliation_evidence_contract_keeps_flat_gap_non_blocking():
+    result = close_reconciliation_evidence_contract(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "evidence_gap": True,
+            "evidence_gap_reason": "missing_short_close_trade_statement",
+            "statement_probe_status": "partial",
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["phase"] == "CLOSE_RECONCILIATION"
+    assert result["action"] == "terminal_flat_accounting_gap"
+    assert result["terminality"] == "terminal_flat_accounting_gap"
+    assert result["blocks_business_terminal"] is False
+    assert result["diagnostic_severity"] == "info"
+
+
+def test_close_reconciliation_evidence_contract_blocks_unclean_gap():
+    result = close_reconciliation_evidence_contract(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "evidence_gap": True,
+            "evidence_gap_reason": "missing_short_close_trade_statement",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["action"] == "unresolved_close_accounting_gap"
+    assert result["terminality"] == "unresolved_close_accounting_gap"
+    assert result["blocks_business_terminal"] is True
+    assert result["diagnostic_severity"] == "critical"
 
 
 def test_business_event_kind_maps_dual_taker_to_pending_entry():

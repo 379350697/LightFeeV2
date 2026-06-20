@@ -35,8 +35,10 @@ from lightfee.engine.exchange_truth import (
     request_venue_operation,
 )
 from lightfee.engine.business_contract import (
+    close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     diagnose_issue_counts,
+    entry_market_evidence_contract,
     passive_close_final_truth_contract,
     passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
     quote_rewarm_handoff_contract,
@@ -3625,6 +3627,7 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     quote_rewarm_after_rest_stale_summary = (
         _build_quote_rewarm_after_rest_stale_summary(events)
     )
+    entry_market_evidence_summary = _build_entry_market_evidence_summary(events)
     artifact_duration_summary = _build_artifact_duration_summary(events)
     phase_duration_summary = _build_phase_duration_summary(events)
     return {
@@ -3661,10 +3664,95 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
                 sorted(oi_targeted_refresh_summary["previous_status_counts"].items())
             ),
         },
+        "entry_market_evidence_summary": entry_market_evidence_summary,
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "artifact_duration_summary": artifact_duration_summary,
         "phase_duration_summary": phase_duration_summary,
         "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _build_entry_market_evidence_summary(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    action_counts: dict[str, int] = {}
+    evidence_class_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    total_count = 0
+    blocked_candidate_count = 0
+    terminal_candidate_rewarm_count = 0
+    diagnostic_recovered_overbudget_count = 0
+    unresolved_blocker_count = 0
+    oi_resolved_count = 0
+    oi_failed_count = 0
+    oi_blocked_candidate_count = 0
+    quote_blocked_candidate_count = 0
+
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        contract = entry_market_evidence_contract(kind, payload)
+        if not contract:
+            continue
+        total_count += 1
+        action = str(contract.get("action") or "unknown")
+        evidence_class = str(contract.get("evidence_class") or "unknown")
+        action_counts[action] = action_counts.get(action, 0) + 1
+        evidence_class_counts[evidence_class] = (
+            evidence_class_counts.get(evidence_class, 0) + 1
+        )
+        blocks_entry = contract.get("blocks_entry") is True
+        if blocks_entry:
+            blocked_candidate_count += 1
+            if evidence_class == "oi":
+                oi_blocked_candidate_count += 1
+            elif evidence_class == "quote":
+                quote_blocked_candidate_count += 1
+        if action == "terminal_candidate_rewarm":
+            terminal_candidate_rewarm_count += 1
+            unresolved_blocker_count += 1
+        elif action == "diagnostic_recovered_overbudget":
+            diagnostic_recovered_overbudget_count += 1
+        elif kind == "runtime.entry_oi_targeted_refresh_failed":
+            unresolved_blocker_count += 1
+        if evidence_class == "oi" and action in {
+            "allow_entry_evidence",
+            "diagnostic_recovered_overbudget",
+        }:
+            oi_resolved_count += 1
+        elif kind == "runtime.entry_oi_targeted_refresh_failed":
+            oi_failed_count += 1
+        if len(samples) < 5 and action != "refresh_evidence":
+            samples.append({
+                "action": action,
+                "blocks_entry": blocks_entry,
+                "evidence_class": evidence_class,
+                "owner_id": str(contract.get("owner_id") or ""),
+                "reason": str(contract.get("reason") or ""),
+            })
+
+    return {
+        "action_counts": dict(sorted(action_counts.items())),
+        "blocked_candidate_count": blocked_candidate_count,
+        "diagnostic_recovered_overbudget_count": (
+            diagnostic_recovered_overbudget_count
+        ),
+        "evidence_class_counts": dict(sorted(evidence_class_counts.items())),
+        "oi": {
+            "blocked_candidate_count": oi_blocked_candidate_count,
+            "failed_count": oi_failed_count,
+            "resolved_count": oi_resolved_count,
+        },
+        "quote": {
+            "blocked_candidate_count": quote_blocked_candidate_count,
+            "terminal_candidate_rewarm_count": terminal_candidate_rewarm_count,
+        },
+        "samples": samples,
+        "terminal_candidate_rewarm_count": terminal_candidate_rewarm_count,
+        "total_count": total_count,
+        "unresolved_blocker_count": unresolved_blocker_count,
     }
 
 
@@ -4912,6 +5000,13 @@ def _build_business_progression_quality_summary(
     deterministic_reject_after_submit_count = 0
     entry_quantity_contract_blocked_count = 0
     close_reconciliation_evidence_gap_count = 0
+    close_reconciliation_evidence_gap_summary = {
+        "count": 0,
+        "terminal_flat_accounting_gap_count": 0,
+        "unresolved_close_accounting_gap_count": 0,
+        "blocking_count": 0,
+        "samples": [],
+    }
     admission_degraded_suppressed_count = 0
     passive_close_resolved_without_terminal_truth_entries: set[str] = set()
     passive_close_terminal_truth_entries: set[str] = set()
@@ -5011,6 +5106,45 @@ def _build_business_progression_quality_summary(
         close_reconciliation_evidence_gap_count += int(
             issue_counts.get("close_reconciliation_evidence_gap_count", 0) or 0
         )
+        if kind == "exit.reconciled" and payload.get("evidence_gap") is True:
+            reconciliation_contract = close_reconciliation_evidence_contract(
+                payload,
+                current_exchange_truth_clean=gate_currently_green(),
+            )
+            if reconciliation_contract:
+                action = str(reconciliation_contract.get("action") or "")
+                close_reconciliation_evidence_gap_summary["count"] += 1
+                if action == "terminal_flat_accounting_gap":
+                    close_reconciliation_evidence_gap_summary[
+                        "terminal_flat_accounting_gap_count"
+                    ] += 1
+                elif action == "unresolved_close_accounting_gap":
+                    close_reconciliation_evidence_gap_summary[
+                        "unresolved_close_accounting_gap_count"
+                    ] += 1
+                if reconciliation_contract.get("blocks_business_terminal") is True:
+                    close_reconciliation_evidence_gap_summary[
+                        "blocking_count"
+                    ] += 1
+                samples = close_reconciliation_evidence_gap_summary["samples"]
+                if isinstance(samples, list) and len(samples) < 12:
+                    samples.append({
+                        "action": action,
+                        "blocks_business_terminal": bool(
+                            reconciliation_contract.get(
+                                "blocks_business_terminal"
+                            )
+                        ),
+                        "owner_id": str(
+                            reconciliation_contract.get("owner_id") or ""
+                        ),
+                        "reason": str(reconciliation_contract.get("reason") or ""),
+                        "statement_probe_status": str(
+                            reconciliation_contract.get("statement_probe_status")
+                            or ""
+                        ),
+                        "symbol": str(reconciliation_contract.get("symbol") or ""),
+                    })
         admission_degraded_suppressed_count += int(
             issue_counts.get("admission_degraded_suppressed_count", 0) or 0
         )
@@ -5259,6 +5393,9 @@ def _build_business_progression_quality_summary(
         ),
         "close_reconciliation_evidence_gap_count": (
             close_reconciliation_evidence_gap_count
+        ),
+        "close_reconciliation_evidence_gap_summary": (
+            close_reconciliation_evidence_gap_summary
         ),
         "admission_degraded_suppressed_count": admission_degraded_suppressed_count,
         "passive_close_resolved_without_terminal_truth_count": len(
@@ -6655,6 +6792,18 @@ def run_diagnose(
             {},
         )
     )
+    entry_market_evidence_summary = (
+        production_acceptance_gate.get("entry_outcome_summary", {}).get(
+            "entry_market_evidence_summary",
+            {},
+        )
+    )
+    close_reconciliation_evidence_gap_summary = (
+        business_progression_quality_summary.get(
+            "close_reconciliation_evidence_gap_summary",
+            {},
+        )
+    )
     if code_side_blockers or exclude_strategy or exclude_liquidity:
         from scripts.analyze_production_blockers import build_code_side_blocker_view
 
@@ -6730,6 +6879,10 @@ def run_diagnose(
             unpaired_live_position_recovery_summary
         ),
         "resolved_quantity_adjustment_summary": resolved_quantity_adjustment_summary,
+        "entry_market_evidence_summary": entry_market_evidence_summary,
+        "close_reconciliation_evidence_gap_summary": (
+            close_reconciliation_evidence_gap_summary
+        ),
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "phase_duration_summary": phase_duration_summary,
         "code_side_blocker_view": code_side_blocker_view,

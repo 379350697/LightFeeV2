@@ -29,6 +29,15 @@ top-book quote lease. Slow OI/liquidity evidence can be cached, capped, deferred
 or marked unavailable for sidecar publication, but entry gates remain fail-closed
 when required evidence is not available.
 
+Quote/OI admission evidence is now classified by
+`entry_market_evidence_contract(...)` before runtime diagnostics interpret it.
+The contract distinguishes `allow_entry_evidence`, `block_stale_quote`,
+`block_oi_unavailable`, `terminal_candidate_rewarm`, `refresh_evidence`, and
+`diagnostic_recovered_overbudget`. Advisory or recovered evidence can explain a
+past no-entry window, but only blocking contract actions are current entry
+blockers. This keeps the business rule unified: quote/OI evidence decides
+whether a candidate may open; it never changes close terminal truth.
+
 Quote rewarm must also have terminal evidence. A venue-symbol that stays stale
 past the hard `quote_rewarm` budget must emit
 `runtime.entry_quote_rewarm_terminal_stale`, enter a cooldown/stale terminal
@@ -60,6 +69,7 @@ they count as terminal/takeover evidence rather than a missing-handoff issue.
 | 2026-06-18 | Quote rewarm hard-budget terminal evidence | local green, deploy pending | CL-097 adds `runtime.entry_quote_rewarm_terminal_stale` and cooldown suppression when the same venue-symbol remains stale past the hard quote-rewarm budget. The event maps to V1 `ENTRY_QUOTE_LEASE` and keeps `phase_duration_summary` evidence-driven. |
 | 2026-06-19 | Candidate lease and quote rewarm active handoff quality | local green, deploy pending | CL-099 adds candidate-lease expiration/takeover evidence and `phase_handoff_quality` diagnostics for candidate and quote-rewarm stages. A stage that exceeds budget without terminal/takeover evidence is now a production issue, while explicit stale/expired evidence is counted as active business progression. Post-deploy diagnostic drift also closed the `runtime.candidate_symbol_skipped reason=unsupported_symbol` false positive so catalog skips do not manufacture missing lease takeover. |
 | 2026-06-19 | Unified quote-rewarm handoff contract | local green, deploy pending | CL-102 follow-up moves quote-rewarm hard timeout/takeover action evidence into `lightfee/engine/business_contract.py`. ALICEUSDT-style hard rewarm samples must now report `action_taken=skip_candidate_after_hard_rewarm` with contract evidence, not a blank action. This does not relax quote TTL, OI, liquidity, entry admission, or stale-cooldown rules. |
+| 2026-06-20 | Unified quote/OI entry admission evidence contract | local green, deploy pending | CL-104 adds `entry_market_evidence_contract(...)` and root `entry_market_evidence_summary`. Quote stale and OI unavailable remain fail-closed candidate blockers; resolved OI/quote evidence, advisory evidence, and over-budget recovery are diagnostic/accounting facts rather than threshold changes. Binance `bookTicker` / `openInterest` stay evidence sources; no quote TTL, OI floor, liquidity floor, or entry admission guard is loosened. |
 
 ## Regression Harness
 

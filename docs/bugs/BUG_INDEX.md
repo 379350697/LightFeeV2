@@ -14,6 +14,7 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 | [local-l2-sequence-continuity](cards/local-l2-sequence-continuity.md) | Local-L2 rebuilds and official sequence evidence | `runtime.local_l2_sequence_gap_rebuild`, `runtime.local_l2_snapshot_error`, or Local-L2 insufficient evidence recurs. |
 | [passive-close-terminal-flatness](cards/passive-close-terminal-flatness.md) | passive close terminal flatness / under-min / price unavailable | Pending passive close loops, terminal flat, under-min, or price-unavailable close branches recur. |
 | [pending-entry-terminality-live-truth](cards/pending-entry-terminality-live-truth.md) | pending entry false flat / live truth mismatch | Local state is flat but exchange truth has nonzero positions, or pending entries clear on stale/uncertain evidence. |
+| [market-data-snapshot-freshness](cards/market-data-snapshot-freshness.md) | quote/OI entry admission evidence and sidecar snapshot freshness | Quote stale, quote rewarm, OI targeted refresh, sidecar OI cap, or entry liquidity evidence recurs. |
 
 ## Recent Closures
 
@@ -22,6 +23,7 @@ fixes, and verification; cards contain reusable family rules.
 
 | Date | Cluster | Failure Family | Status | Start Here |
 |---|---|---|---|---|
+| 2026-06-20 | CL-104 | quote/OI entry admission evidence; close reconciliation accounting gap after terminal flat truth | unified business-contract fix local; deploy verification pending | [daily](daily/2026-06-20.md#cluster-cl-104---quoteoi-entry-admission-evidence-and-reconciliation-accounting-gap-contract), [market-data card](cards/market-data-snapshot-freshness.md), [passive close card](cards/passive-close-terminal-flatness.md) |
 | 2026-06-20 | CL-103 | passive-close final truth single-leg cleanup; risk-only/fail-closed non-terminal exposure | runtime fix `fb1c3a0` deployed; cloud gate green with exchange flat/no-open-orders, `risk_mode=running`, no unmapped events | [daily](daily/2026-06-20.md#cluster-cl-103---passive-close-final-truth-single-leg-cleanup-contract), [card](cards/passive-close-terminal-flatness.md) |
 | 2026-06-19 | CL-102 | centralized business contract; entry sizing residual evidence; quote rewarm handoff; dual-taker lifecycle mapping; close-error terminal truth | `8eadb8e` deployed as clean baseline; unified-contract follow-up local on `codex/business-contract-unification`, deploy pending | [daily](daily/2026-06-19.md#cluster-cl-102---business-contract-centralization-and-process-issue-counters), [market-data card](cards/market-data-snapshot-freshness.md), [passive close card](cards/passive-close-terminal-flatness.md), [admission card](cards/pending-entry-hedge-admission.md) |
 | 2026-06-19 | CL-101 | passive-close terminal truth lag; gate-green historical active-stuck false positive | deployed in `106f47e`; cloud gate green; non-blocking diagnose mapping follow-up remains for `runtime.passive_close_recovery_result` | [daily](daily/2026-06-19.md#cluster-cl-101---passive-close-terminal-truth-lag-and-gate-green-active-stuck-diagnostic-closure), [card](cards/passive-close-terminal-flatness.md) |
