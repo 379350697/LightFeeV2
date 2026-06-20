@@ -2537,6 +2537,8 @@ class TestFallbackResidualReal:
 
     def test_live_flat_cleanup_resolves_passive_close_terminal(self):
         """V1 parity: live-flat passive cleanup is still a close resolution."""
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
         journal = _open_journal()
         executor = PassiveCloseExecutor(
             {},
@@ -2567,6 +2569,8 @@ class TestFallbackResidualReal:
         )
         state.open_positions[position.position_id] = position
         state.pending_passive_closes[position.position_id] = pending
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
 
         executor._clear_live_flat_state(
             state,
@@ -2601,6 +2605,11 @@ class TestFallbackResidualReal:
         assert resolved[-1]["exchange_truth"]["positions_flat"] is True
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
+        assert state.lifecycle == EngineLifecycle.RUNNING
+        assert state.risk_mode == GlobalRiskMode.RUNNING
+        assert "runtime.stale_fail_closed_cleared" in [
+            record["kind"] for record in records
+        ]
 
     def test_live_final_chunk_flattens_trusted_single_leg_exchange_truth(self):
         """Trusted one-sided final truth is actionable close work, not a wait loop."""

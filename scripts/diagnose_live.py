@@ -6630,6 +6630,15 @@ def run_diagnose(
     unpaired_live_position_recovery_summary = (
         _build_unpaired_live_position_recovery_summary(state, all_events)
     )
+    business_progression_quality_summary[
+        "risk_only_live_single_leg_exposure_count"
+    ] = int(
+        unpaired_live_position_recovery_summary.get(
+            "current_risk_exposure_count",
+            0,
+        )
+        or 0
+    )
     resolved_quantity_adjustment_summary = entry_quantity_terminal_summary.get(
         "resolved_quantity_adjustment_summary",
         {},

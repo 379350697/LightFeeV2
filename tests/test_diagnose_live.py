@@ -606,6 +606,18 @@ def test_run_diagnose_counts_only_active_unpaired_recovery_as_current_work(monke
         })
         _write_jsonl(os.path.join(d, "events.jsonl"), [
             {
+                "ts_ms": 1770000000500,
+                "kind": "recovery.unpaired_live_position_cleanup_skipped",
+                "payload": {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "side": "sell",
+                    "reason": "auto_disabled",
+                    "current_risk_exposure": True,
+                    "business_terminal": False,
+                },
+            },
+            {
                 "ts_ms": 1770000001000,
                 "kind": "recovery.unpaired_live_position_terminal_flat",
                 "payload": {
@@ -642,6 +654,12 @@ def test_run_diagnose_counts_only_active_unpaired_recovery_as_current_work(monke
         assert summary["current_work_count"] == 0
         assert summary["active_work_count"] == 0
         assert summary["terminal_flat_count"] == 1
+        assert (
+            result["business_progression_quality_summary"][
+                "risk_only_live_single_leg_exposure_count"
+            ]
+            == 0
+        )
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

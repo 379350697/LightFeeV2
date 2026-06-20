@@ -70,6 +70,18 @@ def test_business_event_kind_maps_dual_taker_to_pending_entry():
     assert result["diagnostic_severity"] == "info"
 
 
+def test_business_event_kind_maps_passive_close_recovery_result():
+    result = classify_business_event_kind(
+        "runtime.passive_close_recovery_result",
+        {"position_id": "entry-1", "decision": "RUNNING_CLEAN"},
+    )
+
+    assert result["phase"] == "PASSIVE_CLOSE"
+    assert result["terminality"] == "terminal_truth_recorded"
+    assert result["action_taken"] == "record_passive_close_recovery_result"
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_close_order_error_resolution_requires_clean_exchange_truth():
     payload = {
         "position_id": "entry-1",

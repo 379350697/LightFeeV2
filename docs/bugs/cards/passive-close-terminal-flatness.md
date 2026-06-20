@@ -17,6 +17,8 @@ residuals, and live-flat cleanup.
 - `passive_close_final_truth_actions.flatten_remaining_live_leg`
 - `passive_close_actionable_single_leg_wait_count`
 - `risk_only_live_single_leg_exposure_count`
+- `runtime.passive_close_recovery_result`
+- `runtime.stale_fail_closed_cleared`
 - `passive_close_resolved_without_terminal_truth_count`
 - `close_reconciliation_evidence_gap_count`
 - `exit.reconciled` with `evidence_gap_reason`,
@@ -47,6 +49,14 @@ leg remains, `passive_close_final_truth_contract` must return
 reduce-only IOC flatten path and then prove fresh exchange flat/no-open-orders
 before clearing local state. Errors stay as historical evidence after cleanup;
 they do not replace cleanup.
+
+After the last owned passive-close/open-position record is removed behind
+fresh exchange flat/no-open-orders truth, stale automatic `fail_closed` must be
+cleared through `clear_stale_fail_closed_if_recovery_clean(...)`. Operator
+fail-closed remains authoritative, and any remaining open/pending/unpaired
+recovery work still blocks the clear. Current risk-only exposure counters must
+come from current unpaired recovery records, not from historical since-deploy
+events that have already reached terminal flat.
 
 Local maker+hedge fill equality is not live terminal proof in production mode.
 If passive close execution is locally complete but exchange position/open-order
@@ -137,7 +147,7 @@ adding another passive-close or diagnose-local terminality predicate.
 | 2026-06-19 | Existing reduce-only close order covers quantity | deployed in `106f47e`; waiting-event evidence payload is local to the event | GENIUSUSDT-style close drift is not terminal-flat when Bybit still has nonzero position plus a matching reduce-only close order. CL-100 adopts the existing close order into pending passive close state, adds journal-based close-owner recovery, and keeps diagnose/gate red until exchange truth is flat/no-open-orders or owned close work is resolved. Waiting passive-close evidence now carries local `exchange_truth_attempt` payload instead of requiring a join with sibling diagnostics. |
 | 2026-06-19 | Passive close resolved before terminal exchange truth | deployed in `106f47e`; cloud gate green; non-blocking diagnose mapping follow-up remains | ESPORTSUSDT-style truth lag showed current production could recover flat/no-open-orders while diagnostics still counted old passive-close artifacts as active stuck. CL-101 keeps live pending passive close owner in `waiting_exchange_flat_truth` until position/open-order truth jointly proves flat, maps that owner as `owned_pending_passive_close`, moves gate-green historical hard-over-budget artifacts into recovered process counters, and records `exchange_truth_attempt` directly on every waiting event, including missing-position-snapshot cases. Post-deploy `106f47e` cloud truth is flat/no-open-orders and gate green, while `diagnose_live.py --since-deploy` still exposes `runtime.passive_close_recovery_result` as a non-blocking V1 lifecycle mapping follow-up. |
 | 2026-06-19 | Reconciliation evidence gap and close-error terminal truth classification | `8eadb8e` deployed as clean baseline; unified-contract follow-up local, deploy pending | CL-102 centralizes terminal-truth and evidence-gap vocabulary in `lightfee/engine/business_contract.py`. `exit.reconciled` now classifies missing long/short trade-statement evidence with `evidence_gap_reason`, `statement_probe_status`, and `trade_probe_status`; diagnose counts it as `close_reconciliation_evidence_gap_count` without changing the exchange-truth gate. SAHARAUSDT-style `-2022` reduce-only close errors resolve only through `close_order_error_resolution_contract` when current exchange truth is flat and has no open orders, with matching terminal position/order evidence. The contract must read nested `exchange_error`/`request_context` journal payloads and must not treat a bare `-2022` as resolved without reduce-only close context. |
-| 2026-06-20 | Owned passive-close single-leg final truth cleanup | local green; deploy pending | CL-103 makes `passive_close_final_truth_contract` the final truth action source. Trusted one-sided residual plus no open orders now routes to owned `exit.passive_close_live_one_sided_flatten` instead of repeating `retry_exchange_position_open_order_truth`; untrusted truth and unknown/open orders still retain/fail closed. Diagnose exposes actionable passive-close waits and `risk_only_live_single_leg_exposure_count`, making it explicit that risk-only/fail-closed is a current high-risk blocker, not a terminal cleanup state. |
+| 2026-06-20 | Owned passive-close single-leg final truth cleanup | local green after stale fail-closed/lifecycle follow-up; redeploy pending | CL-103 makes `passive_close_final_truth_contract` the final truth action source. Trusted one-sided residual plus no open orders now routes to owned `exit.passive_close_live_one_sided_flatten` instead of repeating `retry_exchange_position_open_order_truth`; untrusted truth and unknown/open orders still retain/fail closed. Follow-up after first deploy showed actual exchange truth/local owners cleared, but stale `risk_mode=fail_closed`, unmapped `runtime.passive_close_recovery_result`, and historical risk-only event counting still made diagnose non-green. The same contract now clears stale automatic fail-closed after terminal owner cleanup, maps the passive-close recovery result through `classify_business_event_kind`, and reports `risk_only_live_single_leg_exposure_count` from current recovery records only. |
 
 ## Recurrences
 
@@ -200,3 +210,10 @@ adding another passive-close or diagnose-local terminality predicate.
     `retry_exchange_position_open_order_truth` in that shape is a recurrence.
 15. Treat `risk_only`/`fail_closed` as temporary containment only. Closure still
     requires exchange flat, no open orders, and local owner cleanup.
+16. If current truth is flat/no-open-orders but diagnose still shows
+    `risk_mode_fail_closed`, verify whether terminal owner cleanup emitted
+    `runtime.stale_fail_closed_cleared` or whether a real operator/requested
+    fail-closed or remaining recovery record is blocking the clear.
+17. If `risk_only_live_single_leg_exposure_count` is nonzero, verify it against
+    current `unpaired_live_position_recoveries`, not only since-deploy event
+    history.

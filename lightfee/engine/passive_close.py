@@ -78,7 +78,10 @@ from lightfee.venues.common import (
 from lightfee.venues.capabilities import get_capability_flags
 from lightfee.venues.specs import VenueOperation, get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
-from lightfee.engine.recovery import clear_legacy_recovery_block_via_core
+from lightfee.engine.recovery import (
+    clear_legacy_recovery_block_via_core,
+    clear_stale_fail_closed_if_recovery_clean,
+)
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
@@ -4702,6 +4705,7 @@ class PassiveCloseExecutor:
                 core_decision,
                 journal=self._journal,
             )
+            clear_stale_fail_closed_if_recovery_clean(state, self._journal)
             failure_reason = "terminal_close_resolution_failed"
             terminal_extra = dict(extra or {})
             terminal_extra["closure_fields"] = closure_fields

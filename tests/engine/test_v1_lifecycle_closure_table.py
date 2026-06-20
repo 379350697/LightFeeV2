@@ -511,6 +511,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.position_drift_correction_verified",
         "runtime.position_drift_detected",
         "runtime.position_drift_flatten_leg",
+        "runtime.passive_close_recovery_result",
         "exit.accepted_order_truth_gap_registered",
         "exit.pending_close_reconciliation_registered",
         "exit.reconciled",
@@ -556,6 +557,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.close_chunk_submitted") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.passive_close_waiting_exchange_flat_truth") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.passive_close_live_one_sided_flatten") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("runtime.passive_close_recovery_result") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.close_residual_detected") == "RESIDUAL_REPAIR"
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"

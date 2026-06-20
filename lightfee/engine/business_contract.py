@@ -90,6 +90,15 @@ def classify_business_event_kind(
             ),
             "owner_id": str(payload.get("position_id") or ""),
         }
+    if text == "runtime.passive_close_recovery_result":
+        return {
+            "phase": "PASSIVE_CLOSE",
+            "terminality": "terminal_truth_recorded",
+            "action_taken": "record_passive_close_recovery_result",
+            "action_evidence_kind": text,
+            "diagnostic_severity": "info",
+            "owner_id": str(payload.get("position_id") or ""),
+        }
     return {}
 
 
