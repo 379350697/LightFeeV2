@@ -2602,72 +2602,73 @@ class TestFallbackResidualReal:
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
 
-    def test_live_final_chunk_waits_for_exchange_flat_truth_before_terminal(self):
-        """Live finalization keeps the close owner until exchange truth is flat."""
+    def test_live_final_chunk_flattens_trusted_single_leg_exchange_truth(self):
+        """Trusted one-sided final truth is actionable close work, not a wait loop."""
         journal = _open_journal()
 
-        okx = _mock_adapter_with_tick(Venue.OKX)
-        bybit = _mock_adapter_with_tick(Venue.BYBIT)
-        okx.fetch_position = AsyncMock(side_effect=[
-            PositionSnapshot(
-                venue=Venue.OKX,
-                symbol="ESPORTSUSDT",
-                side=Side.BUY,
-                quantity=0.0,
-                entry_price=0.0,
-                observed_at_ms=3_000,
-            ),
-            PositionSnapshot(
-                venue=Venue.OKX,
-                symbol="ESPORTSUSDT",
-                side=Side.BUY,
-                quantity=0.0,
-                entry_price=0.0,
-                observed_at_ms=4_000,
-            ),
-            PositionSnapshot(
-                venue=Venue.OKX,
-                symbol="ESPORTSUSDT",
-                side=Side.BUY,
-                quantity=0.0,
-                entry_price=0.0,
-                observed_at_ms=4_100,
-            ),
-        ])
-        bybit.fetch_position = AsyncMock(side_effect=[
-            PositionSnapshot(
-                venue=Venue.BYBIT,
-                symbol="ESPORTSUSDT",
-                side=Side.SELL,
-                quantity=425.0,
-                entry_price=0.03731,
-                observed_at_ms=3_001,
-            ),
-            PositionSnapshot(
-                venue=Venue.BYBIT,
-                symbol="ESPORTSUSDT",
-                side=Side.SELL,
-                quantity=0.0,
-                entry_price=0.0,
-                observed_at_ms=4_001,
-            ),
-            PositionSnapshot(
-                venue=Venue.BYBIT,
-                symbol="ESPORTSUSDT",
-                side=Side.SELL,
-                quantity=0.0,
-                entry_price=0.0,
-                observed_at_ms=4_101,
-            ),
-        ])
-        okx.fetch_open_orders = AsyncMock(return_value=[])
-        bybit.fetch_open_orders = AsyncMock(return_value=[])
+        class FinalTruthAdapter(VenueAdapter):
+            def __init__(self, venue: Venue, snapshots: list[tuple[float, Side]]):
+                self._venue = venue
+                self._snapshots = list(snapshots)
+                self.place_order_calls: list[OrderRequest] = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            def price_tick_size(self, symbol=None):
+                return 0.0001
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def fetch_open_orders(self, symbol):
+                return []
+
+            async def fetch_position(self, symbol):
+                if self._snapshots:
+                    quantity, side = self._snapshots.pop(0)
+                else:
+                    quantity, side = 0.0, Side.SELL
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    entry_price=0.03731 if quantity else 0.0,
+                    observed_at_ms=4_000,
+                )
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                self._snapshots = [(0.0, Side.SELL), (0.0, Side.SELL)]
+                return OrderFill(
+                    venue=self._venue,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=request.price or 0.03731,
+                    order_id=f"{self._venue.value}-flatten",
+                    client_order_id=request.client_order_id,
+                    fee_quote=0.0,
+                    filled_at_ms=4_050,
+                )
+
+        okx = FinalTruthAdapter(
+            Venue.OKX,
+            [(0.0, Side.BUY), (0.0, Side.BUY), (0.0, Side.BUY)],
+        )
+        bybit = FinalTruthAdapter(
+            Venue.BYBIT,
+            [(425.0, Side.SELL), (425.0, Side.SELL), (0.0, Side.SELL)],
+        )
 
         executor = PassiveCloseExecutor(
             {Venue.OKX: okx, Venue.BYBIT: bybit},
             journal,
             config_overrides={"runtime_mode": "live"},
         )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.03731)
         state = EngineState()
         position = _make_position(
             position_id="entry-1781859127568-ESPORTSUSDT",
@@ -2710,62 +2711,35 @@ class TestFallbackResidualReal:
 
         first_result = asyncio.run(executor._advance_chunk(state, pending))
 
-        assert first_result is False
-        assert position.position_id in state.pending_passive_closes
-        assert position.position_id in state.open_positions
-        assert pending.next_retry_at_ms > 0
-        records = journal.read_all()
-        kinds = [record["kind"] for record in records]
-        assert "exit.passive_close_waiting_exchange_flat_truth" in kinds
-        assert "exit.passive_close_resolved" not in kinds
-        waiting_payload = next(
-            record["payload"]
-            for record in records
-            if record["kind"] == "exit.passive_close_waiting_exchange_flat_truth"
-        )
-        truth_attempt = waiting_payload["exchange_truth_attempt"]
-        assert truth_attempt["truth_available"] is True
-        assert truth_attempt["positions_flat"] is False
-        assert truth_attempt["open_orders_flat"] is True
-        assert [
-            item["quantity"]
-            for item in truth_attempt["positions"]
-        ] == [0.0, 425.0]
-        assert all(
-            item["open_orders_empty"] is True
-            for item in truth_attempt["open_order_truth"]
-        )
-
-        pending.next_retry_at_ms = 0
-        second_result = asyncio.run(
-            executor.drive_pending_passive_close(
-                state,
-                position.position_id,
-                wait_until_terminal=False,
-            )
-        )
-
-        assert second_result is True
+        assert first_result is True
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
+        assert okx.place_order_calls == []
+        assert len(bybit.place_order_calls) == 1
+        request = bybit.place_order_calls[0]
+        assert request.side is Side.BUY
+        assert request.quantity == pytest.approx(425.0)
+        assert request.reduce_only is True
+        assert request.time_in_force is TimeInForce.IOC
         records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        assert "exit.passive_close_waiting_exchange_flat_truth" not in kinds
         resolved = [
             record["payload"]
             for record in records
             if record["kind"] == "exit.passive_close_resolved"
         ]
         assert resolved
-        assert resolved[-1]["resolution_source"] == "passive_close_final_exchange_flat"
+        assert resolved[-1]["resolution_source"] == "passive_close_live_one_sided_flattened"
         assert resolved[-1]["exchange_truth"]["truth_available"] is True
         assert all(
             item["open_orders_empty"] is True
             for item in resolved[-1]["exchange_truth"]["open_order_truth"]
         )
-        okx.submit_passive_order.assert_not_called()
-        bybit.submit_passive_order.assert_not_called()
 
-    def test_live_recovered_final_chunk_without_snapshot_still_waits_for_exchange_truth(self):
-        """Recovered pending close records must not bypass live flat truth gating."""
+    def test_live_recovered_final_chunk_without_snapshot_clears_on_trusted_flat_truth(self):
+        """Recovered pending close records clear only after live flat truth proof."""
         journal = _open_journal()
 
         okx = _mock_adapter_with_tick(Venue.OKX)
@@ -2804,6 +2778,14 @@ class TestFallbackResidualReal:
                 quantity=0.0,
                 entry_price=0.0,
                 observed_at_ms=4_001,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="ESPORTSUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=4_101,
             ),
         ])
         okx.fetch_open_orders = AsyncMock(return_value=[])
@@ -2857,21 +2839,13 @@ class TestFallbackResidualReal:
 
         first_result = asyncio.run(executor._finalize_passive_close(state, pending))
 
-        assert first_result is False
-        assert position.position_id in state.pending_passive_closes
-        assert position.position_id in state.open_positions
-        assert pending.position_snapshot is position
-        kinds = [record["kind"] for record in journal.read_all()]
-        assert "exit.passive_close_waiting_exchange_flat_truth" in kinds
-        assert "exit.passive_close_resolved" not in kinds
-
-        pending.next_retry_at_ms = 0
-        second_result = asyncio.run(executor._finalize_passive_close(state, pending))
-
-        assert second_result is True
+        assert first_result is True
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
+        assert pending.position_snapshot is position
         records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.passive_close_waiting_exchange_flat_truth" not in kinds
         resolved = [
             record["payload"]
             for record in records

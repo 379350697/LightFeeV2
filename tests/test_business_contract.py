@@ -6,6 +6,7 @@ from lightfee.engine.business_contract import (
     classify_business_event_kind,
     classify_entry_quantity_contract,
     close_order_error_resolution_contract,
+    passive_close_final_truth_contract,
     quote_rewarm_handoff_contract,
 )
 
@@ -149,3 +150,101 @@ def test_close_order_error_resolution_requires_reduce_only_context():
     )
 
     assert result["resolved"] is False
+
+
+def test_passive_close_final_truth_contract_clears_flat_truth():
+    result = passive_close_final_truth_contract(
+        {
+            "truth_available": True,
+            "positions_flat": True,
+            "open_orders_flat": True,
+            "positions": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "quantity": 0.0},
+                {"venue": "binance", "symbol": "ESPORTSUSDT", "quantity": 0.0},
+            ],
+            "open_order_truth": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "open_orders_empty": True},
+                {"venue": "binance", "symbol": "ESPORTSUSDT", "open_orders_empty": True},
+            ],
+        },
+        long_venue="bybit",
+        short_venue="binance",
+    )
+
+    assert result["action"] == "clear_flat"
+    assert result["terminal"] is True
+
+
+def test_passive_close_final_truth_contract_routes_trusted_single_leg_to_flatten():
+    result = passive_close_final_truth_contract(
+        {
+            "truth_available": True,
+            "positions_flat": False,
+            "open_orders_flat": True,
+            "positions": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "quantity": 0.0},
+                {"venue": "binance", "symbol": "ESPORTSUSDT", "quantity": 470.0},
+            ],
+            "open_order_truth": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "open_orders_empty": True},
+                {"venue": "binance", "symbol": "ESPORTSUSDT", "open_orders_empty": True},
+            ],
+        },
+        long_venue="bybit",
+        short_venue="binance",
+    )
+
+    assert result["action"] == "flatten_remaining_live_leg"
+    assert result["terminal"] is False
+    assert result["leg_label"] == "short"
+    assert result["venue"] == "binance"
+    assert result["quantity"] == pytest.approx(470.0)
+    assert result["next_action"] == "flatten_remaining_live_leg"
+
+
+def test_passive_close_final_truth_contract_retains_untrusted_truth():
+    result = passive_close_final_truth_contract(
+        {
+            "truth_available": False,
+            "positions_flat": None,
+            "open_orders_flat": None,
+            "positions": [],
+            "open_order_truth": [],
+            "missing_evidence": ["position_snapshot"],
+        },
+        long_venue="bybit",
+        short_venue="binance",
+    )
+
+    assert result["action"] == "retain_untrusted_truth"
+    assert result["next_action"] == "retain_untrusted_truth"
+    assert result["terminal"] is False
+
+
+def test_passive_close_final_truth_contract_blocks_ownerless_open_order():
+    result = passive_close_final_truth_contract(
+        {
+            "truth_available": True,
+            "positions_flat": False,
+            "open_orders_flat": False,
+            "positions": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "quantity": 0.0},
+                {"venue": "binance", "symbol": "ESPORTSUSDT", "quantity": 470.0},
+            ],
+            "open_order_truth": [
+                {"venue": "bybit", "symbol": "ESPORTSUSDT", "open_orders_empty": True},
+                {
+                    "venue": "binance",
+                    "symbol": "ESPORTSUSDT",
+                    "open_orders_empty": False,
+                    "evidence": "open_orders_count=1",
+                },
+            ],
+        },
+        long_venue="bybit",
+        short_venue="binance",
+    )
+
+    assert result["action"] == "adopt_or_block_existing_close_order"
+    assert result["next_action"] == "adopt_existing_reduce_only_close_order"
+    assert result["terminal"] is False

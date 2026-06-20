@@ -55,6 +55,41 @@ def classify_business_event_kind(
             "diagnostic_severity": "info",
             "owner_id": _venue_symbol_owner(payload),
         }
+    if text in {
+        "exit.passive_close_waiting_exchange_flat_truth",
+        "exit.passive_close_live_one_sided_flatten",
+        "exit.passive_close_live_one_sided_truth_gap",
+        "exit.passive_close_open_order_ownerless_blocked",
+        "exit.passive_close_live_one_sided_normalize_failed",
+        "exit.passive_close_live_one_sided_error",
+        "exit.passive_close_live_one_sided_force_close_problem",
+    }:
+        action = str(payload.get("passive_close_final_truth_action") or "")
+        if not action and text == "exit.passive_close_waiting_exchange_flat_truth":
+            contract = passive_close_final_truth_contract(
+                payload.get("exchange_truth_attempt", {}),
+                long_venue=payload.get("long_venue", ""),
+                short_venue=payload.get("short_venue", ""),
+            )
+            action = str(contract.get("action") or "")
+        if not action and text == "exit.passive_close_live_one_sided_flatten":
+            action = "flatten_remaining_live_leg"
+        return {
+            "phase": "PASSIVE_CLOSE",
+            "terminality": "active",
+            "action_taken": action,
+            "action_evidence_kind": text,
+            "diagnostic_severity": (
+                "critical"
+                if action in {
+                    "flatten_remaining_live_leg",
+                    "adopt_or_block_existing_close_order",
+                    "fail_closed_manual_block",
+                }
+                else "info"
+            ),
+            "owner_id": str(payload.get("position_id") or ""),
+        }
     return {}
 
 
@@ -169,6 +204,108 @@ def classify_entry_quantity_contract(
     return {
         "quantity_contract_status": status,
         "unhedgeable_residual_quantity": residual,
+    }
+
+
+def passive_close_final_truth_contract(
+    exchange_truth_attempt: dict[str, Any] | None,
+    *,
+    long_venue: Any,
+    short_venue: Any,
+    epsilon: float = 1e-9,
+) -> dict[str, Any]:
+    """Classify the final passive-close exchange truth into one business action."""
+    truth = exchange_truth_attempt if isinstance(exchange_truth_attempt, dict) else {}
+    long_key = _normalize_venue_text(long_venue)
+    short_key = _normalize_venue_text(short_venue)
+    base = {
+        "terminal": False,
+        "phase": "PASSIVE_CLOSE",
+        "diagnostic_severity": "critical",
+    }
+
+    if truth.get("truth_available") is False or truth.get("position_errors"):
+        return {
+            **base,
+            "action": "retain_untrusted_truth",
+            "next_action": "retain_untrusted_truth",
+            "reason": "position_truth_untrusted",
+        }
+
+    positions = _position_truth_by_venue(truth.get("positions"))
+    long_qty = _quantity_for_venue(positions, long_key)
+    short_qty = _quantity_for_venue(positions, short_key)
+    positions_flat = truth.get("positions_flat")
+    if not isinstance(positions_flat, bool):
+        if long_qty is None or short_qty is None:
+            positions_flat = None
+        else:
+            positions_flat = abs(long_qty) <= epsilon and abs(short_qty) <= epsilon
+
+    open_orders_flat = truth.get("open_orders_flat")
+    if not isinstance(open_orders_flat, bool):
+        open_orders_flat = _open_orders_flat_from_truth(truth.get("open_order_truth"))
+
+    if open_orders_flat is None:
+        return {
+            **base,
+            "action": "retain_untrusted_truth",
+            "next_action": "retain_untrusted_truth",
+            "reason": "open_order_truth_untrusted",
+        }
+
+    if positions_flat is True and open_orders_flat is True:
+        return {
+            **base,
+            "action": "clear_flat",
+            "next_action": "clear_flat",
+            "terminal": True,
+            "diagnostic_severity": "info",
+            "reason": "exchange_flat_no_open_orders",
+        }
+
+    if long_qty is None or short_qty is None:
+        return {
+            **base,
+            "action": "retain_untrusted_truth",
+            "next_action": "retain_untrusted_truth",
+            "reason": "position_truth_incomplete",
+        }
+
+    long_nonzero = abs(long_qty) > epsilon
+    short_nonzero = abs(short_qty) > epsilon
+    if long_nonzero == short_nonzero:
+        return {
+            **base,
+            "action": "fail_closed_manual_block",
+            "next_action": "manual_reconcile_multi_leg_exposure",
+            "reason": "not_single_live_leg",
+            "long_quantity": abs(long_qty),
+            "short_quantity": abs(short_qty),
+        }
+
+    leg_label = "long" if long_nonzero else "short"
+    venue = long_key if long_nonzero else short_key
+    quantity = abs(long_qty if long_nonzero else short_qty)
+    if open_orders_flat is True:
+        return {
+            **base,
+            "action": "flatten_remaining_live_leg",
+            "next_action": "flatten_remaining_live_leg",
+            "reason": "trusted_one_sided_live_residual",
+            "leg_label": leg_label,
+            "venue": venue,
+            "quantity": quantity,
+        }
+
+    return {
+        **base,
+        "action": "adopt_or_block_existing_close_order",
+        "next_action": "adopt_existing_reduce_only_close_order",
+        "reason": "open_orders_present_for_one_sided_residual",
+        "leg_label": leg_label,
+        "venue": venue,
+        "quantity": quantity,
     }
 
 
@@ -306,6 +443,53 @@ def _venue_symbol_owner(payload: dict[str, Any]) -> str:
     venue = str(payload.get("venue") or "").lower()
     symbol = str(payload.get("symbol") or "").upper()
     return f"{venue}:{symbol}" if venue and symbol else ""
+
+
+def _normalize_venue_text(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").lower()
+
+
+def _position_truth_by_venue(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        venue = _normalize_venue_text(item.get("venue"))
+        if venue:
+            result[venue] = item
+    return result
+
+
+def _quantity_for_venue(
+    positions: dict[str, dict[str, Any]],
+    venue: str,
+) -> float | None:
+    item = positions.get(venue)
+    if not isinstance(item, dict):
+        return None
+    if item.get("error"):
+        return None
+    quantity = item.get("quantity")
+    try:
+        return float(quantity)
+    except (TypeError, ValueError):
+        return None
+
+
+def _open_orders_flat_from_truth(value: Any) -> bool | None:
+    if not isinstance(value, list):
+        return None
+    items = [item for item in value if isinstance(item, dict)]
+    if not items:
+        return None
+    for item in items:
+        if item.get("error"):
+            return None
+        if item.get("open_orders_empty") is not True:
+            return False
+    return True
 
 
 def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:

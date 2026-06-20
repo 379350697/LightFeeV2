@@ -42,6 +42,7 @@ from lightfee.engine.bybit_duplicate_reconcile import (
     build_order_reconcile_result_payload,
     reconcile_bybit_duplicate_client_order,
 )
+from lightfee.engine.business_contract import passive_close_final_truth_contract
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
     _is_bybit_duplicate_order_link_id,
@@ -3525,6 +3526,71 @@ class PassiveCloseExecutor:
             ):
                 return True
 
+            truth_attempt = getattr(
+                pending,
+                "_last_exchange_truth_attempt",
+                self._missing_exchange_truth_attempt(
+                    source="passive_close_final_exchange_truth_gate",
+                    missing_evidence=["live_exchange_truth_attempt"],
+                ),
+            )
+            final_truth_contract = passive_close_final_truth_contract(
+                truth_attempt,
+                long_venue=position.long_venue.value,
+                short_venue=position.short_venue.value,
+            )
+            contract_action = str(final_truth_contract.get("action") or "")
+            if contract_action in {
+                "flatten_remaining_live_leg",
+                "adopt_or_block_existing_close_order",
+            }:
+                try:
+                    contract_venue = Venue.from_str(
+                        str(final_truth_contract.get("venue") or "")
+                    )
+                except ValueError:
+                    contract_venue = None
+                leg_label = str(final_truth_contract.get("leg_label") or "")
+                if contract_venue is not None and leg_label in {"long", "short"}:
+                    live_snapshot, live_error = await self._fetch_live_position_snapshot(
+                        contract_venue,
+                        position.symbol,
+                    )
+                    if live_error:
+                        final_truth_contract = {
+                            **final_truth_contract,
+                            "action": "retain_untrusted_truth",
+                            "next_action": "retain_untrusted_truth",
+                            "reason": "final_truth_live_snapshot_untrusted",
+                            "live_snapshot_error": live_error,
+                        }
+                    elif self._live_position_quantity(live_snapshot) <= 1e-9:
+                        if await self._clear_if_live_flat(
+                            state,
+                            pending,
+                            position,
+                            source="passive_close_final_contract_live_flat",
+                            extra={
+                                "terminal_close_execution": True,
+                                "passive_close_final_truth_action": contract_action,
+                                "flattened_venue": contract_venue.value,
+                                "flattened_quantity": 0.0,
+                                "contract_reason": str(
+                                    final_truth_contract.get("reason") or ""
+                                ),
+                            },
+                        ):
+                            return True
+                    elif await self._flatten_live_one_sided_position(
+                        state,
+                        pending,
+                        position,
+                        venue=contract_venue,
+                        live_snapshot=live_snapshot,
+                        leg_label=leg_label,
+                    ):
+                        return True
+
             now_ms = self._now_ms()
             next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
             pending.next_retry_at_ms = next_retry_at_ms
@@ -3541,17 +3607,23 @@ class PassiveCloseExecutor:
                     "long_venue": position.long_venue.value,
                     "short_venue": position.short_venue.value,
                     "decision": "retain_pending",
-                    "next_action": "retry_exchange_position_open_order_truth",
+                    "next_action": str(
+                        final_truth_contract.get("next_action")
+                        or "retry_exchange_position_open_order_truth"
+                    ),
+                    "passive_close_final_truth_action": str(
+                        final_truth_contract.get("action") or ""
+                    ),
+                    "business_contract_action": str(
+                        final_truth_contract.get("action") or ""
+                    ),
+                    "diagnostic_severity": str(
+                        final_truth_contract.get("diagnostic_severity") or ""
+                    ),
+                    "contract_reason": str(final_truth_contract.get("reason") or ""),
                     "next_retry_at_ms": next_retry_at_ms,
                     "source": "passive_close_final_exchange_truth_gate",
-                    "exchange_truth_attempt": getattr(
-                        pending,
-                        "_last_exchange_truth_attempt",
-                        self._missing_exchange_truth_attempt(
-                            source="passive_close_final_exchange_truth_gate",
-                            missing_evidence=["live_exchange_truth_attempt"],
-                        ),
-                    ),
+                    "exchange_truth_attempt": truth_attempt,
                 },
             )
             return False

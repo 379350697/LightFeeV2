@@ -168,7 +168,17 @@ async def test_auto_disabled_keeps_work_diagnostic_only(tmp_path: Path) -> None:
 
     assert adapter.place_order_call_count == 0
     assert ctx.state.unpaired_live_position_recoveries[0]["terminal_status"] == ""
-    assert "recovery.unpaired_live_position_cleanup_skipped" in _kinds(ctx)
+    events = _events(ctx)
+    skipped = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "recovery.unpaired_live_position_cleanup_skipped"
+    ]
+    assert skipped
+    assert skipped[-1]["current_risk_exposure"] is True
+    assert skipped[-1]["business_terminal"] is False
+    assert skipped[-1]["diagnostic_severity"] == "critical"
+    assert skipped[-1]["next_action"] == "operator_or_config_enable_required"
 
 
 @pytest.mark.asyncio

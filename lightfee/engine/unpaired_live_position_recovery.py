@@ -302,7 +302,12 @@ class UnpairedLivePositionRecoveryRuntime:
     ) -> None:
         record["last_error"] = reason
         record["next_attempt_ms"] = int(now_ms) + BACKOFF_MS
-        payload = {**record, "reason": reason, "auto_enabled": self._auto_enabled()}
+        payload = {
+            **record,
+            "reason": reason,
+            "auto_enabled": self._auto_enabled(),
+            **self._risk_exposure_payload(record, reason),
+        }
         if detail:
             payload["detail"] = detail[:240]
         self._append(
@@ -321,7 +326,11 @@ class UnpairedLivePositionRecoveryRuntime:
     ) -> None:
         record["last_error"] = reason
         record["next_attempt_ms"] = int(now_ms) + BACKOFF_MS
-        payload = {**record, "reason": reason}
+        payload = {
+            **record,
+            "reason": reason,
+            **self._risk_exposure_payload(record, reason),
+        }
         if detail:
             payload["detail"] = detail[:240]
         self._append(
@@ -358,7 +367,11 @@ class UnpairedLivePositionRecoveryRuntime:
         record["next_attempt_ms"] = int(now_ms)
         self._append(
             "recovery.unpaired_live_position_cleanup_failed",
-            {**record, "reason": reason},
+            {
+                **record,
+                "reason": reason,
+                **self._risk_exposure_payload(record, reason),
+            },
             now_ms=now_ms,
         )
 
@@ -423,6 +436,22 @@ class UnpairedLivePositionRecoveryRuntime:
         return bool(configured) and venue.value in configured
 
     @staticmethod
+    def _risk_exposure_payload(
+        record: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        current_exposure = (
+            str(record.get("terminal_status") or "").lower() != "flat"
+            and abs(float(record.get("quantity") or 0.0)) > EPSILON
+        )
+        return {
+            "current_risk_exposure": current_exposure,
+            "business_terminal": False,
+            "diagnostic_severity": "critical" if current_exposure else "warning",
+            "next_action": _unpaired_next_action(reason),
+        }
+
+    @staticmethod
     def _has_non_reduce_open_order(open_orders: list[Any], symbol: str) -> bool:
         for order in open_orders:
             order_symbol = str(_get(order, "symbol", "") or "")
@@ -462,6 +491,21 @@ class UnpairedLivePositionRecoveryRuntime:
                 "notional_quote": quantity * entry_price,
             }
         )
+
+
+def _unpaired_next_action(reason: str) -> str:
+    return {
+        "auto_disabled": "operator_or_config_enable_required",
+        "cap_exceeded": "operator_flatten_or_raise_cap_required",
+        "notional_unknown": "operator_truth_or_manual_flatten_required",
+        "position_truth_stale": "retry_fresh_position_truth",
+        "position_truth_unavailable": "retry_fresh_position_truth",
+        "open_order_truth_unavailable": "retry_open_order_truth",
+        "non_reduce_open_order_conflict": "operator_reconcile_open_order_conflict",
+        "quantity_normalized_to_zero": "operator_manual_flatten_required",
+        "max_attempts_exceeded": "operator_manual_flatten_required",
+        "submit_failed": "operator_manual_flatten_required",
+    }.get(str(reason or ""), "retry_or_operator_reconcile")
 
 
 def _get(item: Any, key: str, default: Any = None) -> Any:

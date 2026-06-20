@@ -511,6 +511,10 @@ def test_run_diagnose_reports_unpaired_live_position_recovery_route(monkeypatch)
                     "side": "sell",
                     "auto_enabled": False,
                     "reason": "auto_disabled",
+                    "current_risk_exposure": True,
+                    "business_terminal": False,
+                    "diagnostic_severity": "critical",
+                    "next_action": "operator_or_config_enable_required",
                 },
             },
         ])
@@ -540,6 +544,7 @@ def test_run_diagnose_reports_unpaired_live_position_recovery_route(monkeypatch)
         assert summary["current_work_count"] == 1
         assert summary["active_work_count"] == 1
         assert summary["terminal_flat_count"] == 0
+        assert summary["current_risk_exposure_count"] == 1
         assert summary["auto_enabled"] is False
         assert summary["event_counts"][
             "recovery.unpaired_live_position_cleanup_skipped"
@@ -550,7 +555,17 @@ def test_run_diagnose_reports_unpaired_live_position_recovery_route(monkeypatch)
         assert detail["owner_excluded"] is True
         assert detail["open_order_truth_available"] is True
         assert detail["cap_ok"] is True
+        assert detail["current_risk_exposure"] is True
+        assert detail["business_terminal"] is False
         assert detail["latest_event"]["reason"] == "auto_disabled"
+        assert detail["latest_event"]["current_risk_exposure"] is True
+        assert detail["latest_event"]["business_terminal"] is False
+        assert detail["latest_event"]["diagnostic_severity"] == "critical"
+        assert detail["latest_event"]["next_action"] == (
+            "operator_or_config_enable_required"
+        )
+        business = result["business_progression_quality_summary"]
+        assert business["risk_only_live_single_leg_exposure_count"] == 1
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -5622,6 +5637,9 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "admission_degraded_suppressed_count": 0,
             "passive_close_resolved_without_terminal_truth_count": 0,
             "passive_close_truth_lag_resolved_count": 0,
+            "passive_close_actionable_single_leg_wait_count": 0,
+            "risk_only_live_single_leg_exposure_count": 0,
+            "passive_close_final_truth_actions": {},
             "repeated_single_leg_guarded": {
                 "violation_count": 0,
                 "severity": "ok",
@@ -5762,6 +5780,51 @@ def test_business_progression_quality_counts_passive_close_truth_lag_as_recovere
     assert business["passive_close_truth_lag_resolved_count"] == 1
     assert business["recovered_but_counted_issue_count"] == 1
     assert business["active_stuck_count"] == 0
+
+
+def test_business_progression_quality_flags_actionable_passive_close_single_leg_wait():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 5_000,
+            "kind": "exit.passive_close_waiting_exchange_flat_truth",
+            "payload": {
+                "position_id": "entry-1781902330536-ESPORTSUSDT",
+                "symbol": "ESPORTSUSDT",
+                "long_venue": "bybit",
+                "short_venue": "binance",
+                "decision": "retain_pending",
+                "next_action": "retry_exchange_position_open_order_truth",
+                "exchange_truth_attempt": {
+                    "truth_available": True,
+                    "positions_flat": False,
+                    "open_orders_flat": True,
+                    "positions": [
+                        {"venue": "bybit", "symbol": "ESPORTSUSDT", "quantity": 0.0},
+                        {"venue": "binance", "symbol": "ESPORTSUSDT", "quantity": 470.0},
+                    ],
+                    "open_order_truth": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "ESPORTSUSDT",
+                            "open_orders_empty": True,
+                        },
+                        {
+                            "venue": "binance",
+                            "symbol": "ESPORTSUSDT",
+                            "open_orders_empty": True,
+                        },
+                    ],
+                },
+            },
+        }
+    ]
+
+    business = dl._build_business_progression_quality_summary(events)
+
+    assert business["passive_close_actionable_single_leg_wait_count"] == 1
+    assert business["passive_close_final_truth_actions"]["flatten_remaining_live_leg"] == 1
 
 
 def test_business_progression_quality_unresolved_passive_truth_lag_stays_active():

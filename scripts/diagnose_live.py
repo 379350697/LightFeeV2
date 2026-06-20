@@ -37,6 +37,7 @@ from lightfee.engine.exchange_truth import (
 from lightfee.engine.business_contract import (
     close_order_error_resolution_contract,
     diagnose_issue_counts,
+    passive_close_final_truth_contract,
     passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
     quote_rewarm_handoff_contract,
 )
@@ -3801,18 +3802,29 @@ def _build_unpaired_live_position_recovery_summary(
             "kind": kind,
             "ts_ms": int(event.get("ts_ms") or 0),
             "reason": str(payload.get("reason") or payload.get("last_error") or ""),
+            "current_risk_exposure": payload.get("current_risk_exposure"),
+            "business_terminal": payload.get("business_terminal"),
+            "diagnostic_severity": str(payload.get("diagnostic_severity") or ""),
+            "next_action": str(payload.get("next_action") or ""),
         }
 
     details: list[dict[str, Any]] = []
     terminal_count = 0
     active_count = 0
     manual_required_count = 0
+    current_risk_exposure_count = 0
     for record in records:
         terminal_status = str(record.get("terminal_status") or "")
         if terminal_status == "flat":
             terminal_count += 1
         else:
             active_count += 1
+        current_risk_exposure = (
+            terminal_status != "flat"
+            and _diagnose_float(record.get("quantity")) > 1e-9
+        )
+        if current_risk_exposure:
+            current_risk_exposure_count += 1
         if terminal_status == "manual_required":
             manual_required_count += 1
         key = (
@@ -3839,6 +3851,8 @@ def _build_unpaired_live_position_recovery_summary(
                 ),
                 "cap_quote": _diagnose_float(record.get("cap_quote")),
                 "cap_ok": bool(record.get("cap_ok")),
+                "current_risk_exposure": current_risk_exposure,
+                "business_terminal": terminal_status == "flat",
                 "latest_event": latest_event,
             }
         )
@@ -3848,6 +3862,7 @@ def _build_unpaired_live_position_recovery_summary(
         "active_work_count": active_count,
         "terminal_flat_count": terminal_count,
         "manual_required_count": manual_required_count,
+        "current_risk_exposure_count": current_risk_exposure_count,
         "auto_enabled": last_auto_enabled,
         "event_counts": dict(sorted(event_counts.items())),
         "details": details,
@@ -4900,6 +4915,9 @@ def _build_business_progression_quality_summary(
     admission_degraded_suppressed_count = 0
     passive_close_resolved_without_terminal_truth_entries: set[str] = set()
     passive_close_terminal_truth_entries: set[str] = set()
+    passive_close_actionable_single_leg_wait_count = 0
+    passive_close_final_truth_actions: dict[str, int] = {}
+    risk_only_live_single_leg_exposure_count = 0
 
     def gate_currently_green() -> bool:
         if not isinstance(production_acceptance_gate, dict):
@@ -4978,6 +4996,15 @@ def _build_business_progression_quality_summary(
         if not isinstance(payload, dict):
             continue
         issue_counts = diagnose_issue_counts(payload, kind)
+        if (
+            kind
+            in {
+                "recovery.unpaired_live_position_cleanup_skipped",
+                "recovery.unpaired_live_position_cleanup_failed",
+            }
+            and payload.get("current_risk_exposure") is True
+        ):
+            risk_only_live_single_leg_exposure_count += 1
         entry_quantity_contract_blocked_count += int(
             issue_counts.get("entry_quantity_contract_blocked_count", 0) or 0
         )
@@ -5075,6 +5102,19 @@ def _build_business_progression_quality_summary(
             terminal_position_id = entry_id(payload)
             if terminal_position_id and passive_close_has_terminal_truth(payload):
                 passive_close_terminal_truth_entries.add(terminal_position_id)
+        elif kind == "exit.passive_close_waiting_exchange_flat_truth":
+            final_truth_contract = passive_close_final_truth_contract(
+                payload.get("exchange_truth_attempt", {}),
+                long_venue=payload.get("long_venue", ""),
+                short_venue=payload.get("short_venue", ""),
+            )
+            final_truth_action = str(final_truth_contract.get("action") or "")
+            if final_truth_action:
+                passive_close_final_truth_actions[final_truth_action] = (
+                    passive_close_final_truth_actions.get(final_truth_action, 0) + 1
+                )
+            if final_truth_action == "flatten_remaining_live_leg":
+                passive_close_actionable_single_leg_wait_count += 1
 
         if kind in {
             "runtime.entry_admission_blocked",
@@ -5226,6 +5266,15 @@ def _build_business_progression_quality_summary(
         ),
         "passive_close_truth_lag_resolved_count": len(
             passive_close_truth_lag_resolved_entries
+        ),
+        "passive_close_actionable_single_leg_wait_count": (
+            passive_close_actionable_single_leg_wait_count
+        ),
+        "risk_only_live_single_leg_exposure_count": (
+            risk_only_live_single_leg_exposure_count
+        ),
+        "passive_close_final_truth_actions": dict(
+            sorted(passive_close_final_truth_actions.items())
         ),
         "repeated_single_leg_guarded": {
             "violation_count": violation_count,
