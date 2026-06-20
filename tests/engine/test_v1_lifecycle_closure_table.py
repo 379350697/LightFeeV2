@@ -161,6 +161,22 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
             {
                 "kind": "runtime.entry_admission_venue_degraded",
                 "payload": {"reason": "multiple_entry_admission_blocks"},
+            },
+            {
+                "kind": "runtime.entry_admission_symbol_cooldown_armed",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "ESPORTSUSDT",
+                    "reason": "max_notional_admission_blocked",
+                },
+            },
+            {
+                "kind": "runtime.venue_cooldown_started",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "ESPORTSUSDT",
+                    "reason": "max_notional_admission_blocked",
+                },
             }
         ],
         generated_at_ms=1781856334226,
@@ -169,6 +185,8 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
     payload = table.to_dict()
     assert payload["summary"]["entry_allowed"] is False
     assert "runtime.entry_admission_venue_degraded" not in payload["unmapped_event_kinds"]
+    assert "runtime.entry_admission_symbol_cooldown_armed" not in payload["unmapped_event_kinds"]
+    assert "runtime.venue_cooldown_started" not in payload["unmapped_event_kinds"]
     close_rows = [
         row for row in payload["rows"]
         if row["evidence_class"] == "owned_pending_passive_close"
@@ -396,7 +414,10 @@ def test_ws_bbo_scope_flags_full_universe_hot_path_regression():
 
 
 def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
-    from lightfee.engine.v1_lifecycle_closure import map_lifecycle_event_kind
+    from lightfee.engine.v1_lifecycle_closure import (
+        map_lifecycle_event,
+        map_lifecycle_event_kind,
+    )
 
     recent_event_kinds = [
         "runtime.booting",
@@ -577,6 +598,17 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         == "ENTRY_QUOTE_LEASE"
     )
     assert map_lifecycle_event_kind("execution.dual_taker_armed") == "PENDING_ENTRY"
+    assert (
+        map_lifecycle_event(
+            "execution.dual_taker_armed",
+            {
+                "position_id": "p001",
+                "execution_kind": "exit",
+                "symbol": "BTCUSDT",
+            },
+        )
+        == "PASSIVE_CLOSE"
+    )
     assert map_lifecycle_event_kind("entry.hedge_drive_cancel_replace") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.maker_event_reprice") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.maker_event_reprice_error") == "PENDING_ENTRY"

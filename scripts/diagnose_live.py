@@ -5039,6 +5039,14 @@ def _build_business_progression_quality_summary(
                 return False
         return True
 
+    def current_exchange_truth_clean() -> bool:
+        if not isinstance(production_acceptance_gate, dict):
+            return False
+        return (
+            production_acceptance_gate.get("exchange_truth_flat") is True
+            and production_acceptance_gate.get("exchange_truth_no_open_orders") is True
+        )
+
     def event_ts(rec: dict[str, Any]) -> int:
         payload = rec.get("payload", {})
         payload_ts = payload.get("ts_ms") if isinstance(payload, dict) else 0
@@ -5114,7 +5122,7 @@ def _build_business_progression_quality_summary(
         if kind == "exit.reconciled" and payload.get("evidence_gap") is True:
             reconciliation_contract = close_reconciliation_evidence_contract(
                 payload,
-                current_exchange_truth_clean=gate_currently_green(),
+                current_exchange_truth_clean=current_exchange_truth_clean(),
             )
             if reconciliation_contract:
                 action = str(reconciliation_contract.get("action") or "")
@@ -7079,6 +7087,7 @@ def _build_entry_quantity_terminal_summary(
     terminal_flat_entries: set[str] = set()
     residual_repair_completed_entries: set[str] = set()
     residual_repair_completed_symbols: set[str] = set()
+    unopened_terminal_entries: set[str] = set()
     resolved_quantity_adjustment_entries: set[str] = set()
     resolved_quantity_adjustment_samples: list[dict[str, Any]] = []
     resolved_planner_quantity_adjustment_count = 0
@@ -7126,6 +7135,13 @@ def _build_entry_quantity_terminal_summary(
             reason = str(payload.get("reason") or "").lower()
             if "flat" in terminal_state or "flat" in reason:
                 terminal_flat_entries.add(entry_id)
+        elif kind in {
+            "entry.aborted",
+            "entry.passive_unfilled",
+            "runtime.entry_admission_blocked",
+            "pending_entry.hedge_admission_blocked",
+        }:
+            unopened_terminal_entries.add(entry_id)
 
     def add_warning_reason(kind_name: str, payload: dict[str, Any]) -> None:
         reason_family = str(
@@ -7252,6 +7268,11 @@ def _build_entry_quantity_terminal_summary(
                         and entry_id in balanced_opened_entries
                         and entry_id in terminal_flat_entries
                     )
+                    unopened_terminal_adjustment = (
+                        reason_family == "planner_quantity_adjustment"
+                        and entry_id in unopened_terminal_entries
+                        and entry_id not in balanced_opened_entries
+                    )
                     if resolved_planner_adjustment:
                         resolved_planner_quantity_adjustment_count += 1
                         resolved_quantity_adjustment_entries.add(entry_id)
@@ -7261,6 +7282,16 @@ def _build_entry_quantity_terminal_summary(
                                 "kind": "common_quantity_mismatch",
                                 "reason_family": reason_family,
                                 "symbol": str(payload.get("symbol") or ""),
+                            })
+                    elif unopened_terminal_adjustment:
+                        resolved_quantity_adjustment_entries.add(entry_id)
+                        if len(resolved_quantity_adjustment_samples) < 12:
+                            resolved_quantity_adjustment_samples.append({
+                                "entry_id": entry_id,
+                                "kind": "common_quantity_mismatch",
+                                "reason_family": reason_family,
+                                "symbol": str(payload.get("symbol") or ""),
+                                "terminality": "unopened_candidate_terminal",
                             })
                     elif entry_id not in tolerated_dust_entry_ids:
                         quantity_mismatch_warning_entries.add(entry_id)

@@ -159,17 +159,24 @@ def build_v1_lifecycle_closure_table(
     )
 
 
-def map_lifecycle_event_kind(kind: str) -> str | None:
+def map_lifecycle_event(
+    kind: str,
+    payload: Mapping[str, Any] | None = None,
+) -> str | None:
     text = str(kind or "")
     if text in _EVENT_KIND_PHASES:
         return _EVENT_KIND_PHASES[text]
-    contract_phase = classify_business_event_kind(text).get("phase")
+    contract_phase = classify_business_event_kind(text, dict(payload or {})).get("phase")
     if contract_phase:
         return str(contract_phase)
     for prefix, phase in _EVENT_PREFIX_PHASES:
         if text.startswith(prefix):
             return phase
     return None
+
+
+def map_lifecycle_event_kind(kind: str) -> str | None:
+    return map_lifecycle_event(kind)
 
 
 def entry_gate_from_closure(closure: Mapping[str, Any] | V1LifecycleClosureTable | None) -> tuple[bool, str]:
@@ -838,7 +845,8 @@ def _unmapped_event_kinds(events: Any) -> set[str]:
     unmapped: set[str] = set()
     for event in _as_items(events):
         kind = str(_get(event, "kind", "") or "")
-        if kind and map_lifecycle_event_kind(kind) is None:
+        payload = _mapping(_get(event, "payload", {}))
+        if kind and map_lifecycle_event(kind, payload) is None:
             unmapped.add(kind)
     return unmapped
 
@@ -1172,6 +1180,10 @@ _EVENT_KIND_PHASES = {
     "runtime.position_drift_skipped_passive_close_owner": (
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
     ),
+    "runtime.entry_admission_symbol_cooldown_armed": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.venue_cooldown_started": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.entry_admission_venue_degraded": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
