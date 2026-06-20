@@ -337,6 +337,108 @@ def close_order_error_resolution_contract(
     return {"resolved": False, "resolution_bucket": ""}
 
 
+def classify_noise_visibility(
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    current_exchange_truth_clean: bool,
+) -> dict[str, Any]:
+    """Classify diagnostic evidence by whether it is current risk or history."""
+    payload = payload if isinstance(payload, dict) else {}
+    text = str(kind or "")
+    base = {
+        "visibility": "aggregated_diagnostic",
+        "blocks_gate": False,
+        "requires_operator_action": False,
+        "reason": "",
+        "kind": text,
+        "owner_id": str(payload.get("position_id") or payload.get("entry_id") or ""),
+        "symbol": str(payload.get("symbol") or "").upper(),
+    }
+
+    if (
+        text
+        in {
+            "recovery.unpaired_live_position_cleanup_skipped",
+            "recovery.unpaired_live_position_cleanup_failed",
+        }
+        and payload.get("current_risk_exposure") is True
+    ):
+        return {
+            **base,
+            "visibility": "current_blocker",
+            "blocks_gate": True,
+            "requires_operator_action": True,
+            "reason": "current_single_leg_or_risk_only_exposure",
+        }
+
+    market_evidence = entry_market_evidence_contract(text, payload)
+    if market_evidence and market_evidence.get("blocks_entry") is True:
+        return {
+            **base,
+            "visibility": "current_admission_blocker",
+            "blocks_gate": False,
+            "requires_operator_action": False,
+            "reason": "entry_market_evidence_block",
+        }
+
+    reconciliation = close_reconciliation_evidence_contract(
+        payload,
+        current_exchange_truth_clean=current_exchange_truth_clean,
+    )
+    if text == "exit.reconciled" and reconciliation:
+        if reconciliation.get("blocks_business_terminal") is True:
+            return {
+                **base,
+                "visibility": "current_blocker",
+                "blocks_gate": True,
+                "requires_operator_action": True,
+                "reason": "unresolved_close_accounting_gap",
+            }
+        return {
+            **base,
+            "visibility": "historical_terminal_evidence",
+            "reason": "terminal_flat_accounting_gap",
+        }
+
+    is_close_artifact = (
+        text in {"order.rejected", "order.uncertain"}
+        or text.startswith("exit.passive_close_")
+    )
+    code = str(
+        payload.get("exchange_code")
+        or _exchange_error_dict(payload).get("exchange_code")
+        or payload.get("code")
+        or ""
+    )
+    reason_text = _payload_reason_text(payload)
+    known_close_noise = (
+        _payload_is_post_only_close_reject(payload)
+        or _payload_is_reduce_only_terminal_flat_reject(payload)
+        or ("zero fill" in reason_text)
+        or code == "110072"
+        or "duplicate" in reason_text
+        or "ack-only" in reason_text
+        or "ack only" in reason_text
+    )
+    if is_close_artifact and known_close_noise:
+        if current_exchange_truth_clean:
+            return {
+                **base,
+                "visibility": "historical_terminal_evidence",
+                "reason": "resolved_close_artifact_after_terminal_truth",
+            }
+        return {
+            **base,
+            "visibility": "current_blocker",
+            "blocks_gate": True,
+            "requires_operator_action": True,
+            "reason": "unresolved_close_artifact",
+        }
+
+    return base
+
+
 def entry_admission_blocks_candidate(reason: str, block_scope: str) -> bool:
     if str(block_scope or "").lower() == "venue":
         return True

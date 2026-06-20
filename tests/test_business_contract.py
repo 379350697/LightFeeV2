@@ -5,6 +5,7 @@ import pytest
 from lightfee.engine.business_contract import (
     classify_business_event_kind,
     classify_entry_quantity_contract,
+    classify_noise_visibility,
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     entry_market_evidence_contract,
@@ -156,6 +157,65 @@ def test_close_reconciliation_evidence_contract_blocks_unclean_gap():
     assert result["terminality"] == "unresolved_close_accounting_gap"
     assert result["blocks_business_terminal"] is True
     assert result["diagnostic_severity"] == "critical"
+
+
+def test_noise_visibility_classifies_resolved_close_artifact_as_historical():
+    payload = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "venue": "binance",
+        "exchange_code": "-2022",
+        "reason": "HTTP 400: ReduceOnly Order is rejected.",
+        "request_context": {"reduce_only": True},
+    }
+
+    clean = classify_noise_visibility(
+        "order.rejected",
+        payload,
+        current_exchange_truth_clean=True,
+    )
+    dirty = classify_noise_visibility(
+        "order.rejected",
+        payload,
+        current_exchange_truth_clean=False,
+    )
+
+    assert clean["visibility"] == "historical_terminal_evidence"
+    assert clean["blocks_gate"] is False
+    assert clean["requires_operator_action"] is False
+    assert clean["reason"] == "resolved_close_artifact_after_terminal_truth"
+    assert dirty["visibility"] == "current_blocker"
+    assert dirty["blocks_gate"] is True
+
+
+def test_noise_visibility_keeps_entry_market_blocks_as_admission_evidence():
+    result = classify_noise_visibility(
+        "runtime.entry_quote_revalidate_failed",
+        {"venue": "binance", "symbol": "STABLEUSDT", "reason": "quote_stale"},
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["visibility"] == "current_admission_blocker"
+    assert result["blocks_gate"] is False
+    assert result["requires_operator_action"] is False
+    assert result["reason"] == "entry_market_evidence_block"
+
+
+def test_noise_visibility_never_hides_current_single_leg_exposure():
+    result = classify_noise_visibility(
+        "recovery.unpaired_live_position_cleanup_skipped",
+        {
+            "position_id": "entry-risk",
+            "symbol": "ESPORTSUSDT",
+            "current_risk_exposure": True,
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["visibility"] == "current_blocker"
+    assert result["blocks_gate"] is True
+    assert result["requires_operator_action"] is True
+    assert result["reason"] == "current_single_leg_or_risk_only_exposure"
 
 
 def test_business_event_kind_maps_dual_taker_to_pending_entry():

@@ -2443,8 +2443,11 @@ def test_run_diagnose_resolves_moveusdt_ack_only_duplicate_after_terminal_flat(m
         assert gate["gate_passed"] is True
         assert gate["blocking_reasons"] == []
         assert gate["resolved_order_truth_gap_count"] == 1
+        assert gate["short_window_warning_details"]["passive_close_truth_gap"] == 0
+        assert "passive_close_truth_gap" not in gate["short_window_warning_families"]
         assert result["order_error_evidence"] == []
         assert result["top_exchange_errors"] == []
+        assert result["diagnostic_noise_summary"]["resolved_close_artifact_count"] == 1
         assert result["conclusion"]["status"] == "healthy"
     finally:
         import shutil
@@ -5697,6 +5700,25 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
         ]
         assert result["phase_duration_summary"] == nested
         assert result["phase_duration_summary"]["hard_over_budget_count"] >= 1
+        assert result["diagnostic_noise_summary"] == {
+            "visibility_counts": {
+                "historical_terminal_evidence": 1,
+            },
+            "historical_terminalized_over_budget_count": 1,
+            "resolved_close_artifact_count": 0,
+            "current_admission_blocker_count": 0,
+            "current_blocker_count": 0,
+            "samples": [
+                {
+                    "kind": "phase_duration.hard_over_budget",
+                    "visibility": "historical_terminal_evidence",
+                    "reason": "terminalized_over_budget_after_clean_truth",
+                    "artifact_id": "entry-no-submit",
+                    "symbol": "NOSUBUSDT",
+                    "phase": "selected_pre_submit",
+                },
+            ],
+        }
         assert result["business_progression_quality_summary"] == {
             "pre_submit_blocked": 0,
             "single_leg_created": 0,
@@ -6159,6 +6181,160 @@ def test_business_progression_quality_marks_flat_accounting_gap_non_blocking():
             },
         ],
     }
+
+
+def test_diagnostic_noise_summary_separates_admission_and_current_blockers():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "binance",
+                "symbol": "STABLEUSDT",
+                "reason": "quote_stale",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "recovery.unpaired_live_position_cleanup_skipped",
+            "payload": {
+                "position_id": "entry-risk",
+                "symbol": "ESPORTSUSDT",
+                "current_risk_exposure": True,
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": False,
+        "exchange_truth_flat": False,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": ["exchange_truth_nonzero_position"],
+        "entry_outcome_summary": {
+            "entry_market_evidence_summary": dl._build_entry_market_evidence_summary(
+                events
+            ),
+            "phase_duration_summary": dl._build_phase_duration_summary(events),
+        },
+        "resolved_order_truth_gap_count": 0,
+        "unresolved_order_truth_gap_count": 0,
+    }
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate=gate,
+    )
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary=business,
+    )
+
+    assert summary["visibility_counts"] == {
+        "current_admission_blocker": 1,
+        "current_blocker": 1,
+    }
+    assert summary["current_admission_blocker_count"] == 1
+    assert summary["current_blocker_count"] == 1
+    assert summary["historical_terminalized_over_budget_count"] == 0
+
+
+def test_diagnostic_noise_summary_does_not_double_count_resolved_close_artifact():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-close",
+                "symbol": "CLOSEUSDT",
+                "exchange_code": "-2022",
+                "request_context": {"reduce_only": True},
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 0,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={},
+        resolved_close_order_error_summary={
+            "reduce_only_terminal_flat_count": 1,
+        },
+    )
+
+    assert summary["resolved_close_artifact_count"] == 1
+    assert summary["visibility_counts"] == {"historical_terminal_evidence": 1}
+
+
+def test_diagnostic_noise_summary_treats_flat_accounting_gap_as_historical_even_if_gate_blocked():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "entry-gap",
+                "symbol": "GAPUSDT",
+                "evidence_gap": True,
+                "evidence_gap_reason": "missing_short_close_trade_statement",
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": False,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": ["quick_flat_events_present"],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 0,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={},
+    )
+
+    assert summary["visibility_counts"] == {"historical_terminal_evidence": 1}
+    assert summary["current_blocker_count"] == 0
+    assert summary["samples"][0]["reason"] == "terminal_flat_accounting_gap"
+
+
+def test_diagnostic_noise_summary_counts_current_risk_only_exposure_without_raw_event():
+    import scripts.diagnose_live as dl
+
+    gate = {
+        "gate_passed": False,
+        "exchange_truth_flat": False,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": ["exchange_truth_nonzero_position"],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 0,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        [],
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={
+            "risk_only_live_single_leg_exposure_count": 1,
+        },
+    )
+
+    assert summary["visibility_counts"] == {"current_blocker": 1}
+    assert summary["current_blocker_count"] == 1
+    assert summary["samples"][0]["reason"] == "current_risk_only_live_single_leg_exposure"
 
 
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():
@@ -7621,6 +7797,8 @@ def test_run_diagnose_resolves_home_passive_close_order_errors_by_terminal_truth
         gate = result["production_acceptance_gate"]
         assert gate["v1_lifecycle_closure"]["unmapped_event_kinds"] == []
         assert gate["gate_passed"] is True
+        assert result["diagnostic_noise_summary"]["resolved_close_artifact_count"] == 4
+        assert result["diagnostic_noise_summary"]["current_blocker_count"] == 0
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

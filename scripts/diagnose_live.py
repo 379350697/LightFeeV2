@@ -35,6 +35,7 @@ from lightfee.engine.exchange_truth import (
     request_venue_operation,
 )
 from lightfee.engine.business_contract import (
+    classify_noise_visibility,
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     diagnose_issue_counts,
@@ -5422,6 +5423,156 @@ def _build_business_progression_quality_summary(
     }
 
 
+def _build_diagnostic_noise_summary(
+    events: list[dict[str, Any]],
+    *,
+    production_acceptance_gate: dict[str, Any] | None,
+    business_progression_quality_summary: dict[str, Any],
+    resolved_close_order_error_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    gate = production_acceptance_gate if isinstance(production_acceptance_gate, dict) else {}
+    business = (
+        business_progression_quality_summary
+        if isinstance(business_progression_quality_summary, dict)
+        else {}
+    )
+    resolved_close_errors = (
+        resolved_close_order_error_summary
+        if isinstance(resolved_close_order_error_summary, dict)
+        else {}
+    )
+    resolved_close_artifact_count = int(
+        gate.get("resolved_order_truth_gap_count") or 0
+    )
+    resolved_close_artifact_count += int(
+        resolved_close_errors.get("post_only_boundary_reject_count") or 0
+    )
+    resolved_close_artifact_count += int(
+        resolved_close_errors.get("reduce_only_terminal_flat_count") or 0
+    )
+    resolved_close_artifact_count += int(
+        resolved_close_errors.get("zero_fill_terminal_flat_count") or 0
+    )
+    current_exchange_truth_clean = (
+        gate.get("exchange_truth_flat") is True
+        and gate.get("exchange_truth_no_open_orders") is True
+    )
+    visibility_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    raw_current_risk_only_count = 0
+
+    def note(item: dict[str, Any], sample: dict[str, Any] | None = None) -> None:
+        visibility = str(item.get("visibility") or "")
+        if not visibility or visibility == "aggregated_diagnostic":
+            return
+        visibility_counts[visibility] = visibility_counts.get(visibility, 0) + 1
+        if sample is not None and len(samples) < 12:
+            samples.append(sample)
+
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        contract = classify_noise_visibility(
+            kind,
+            payload,
+            current_exchange_truth_clean=current_exchange_truth_clean,
+        )
+        visibility = str(contract.get("visibility") or "")
+        if visibility == "aggregated_diagnostic":
+            continue
+        sample = {
+            "kind": kind,
+            "visibility": visibility,
+            "reason": str(contract.get("reason") or ""),
+            "position_id": str(payload.get("position_id") or ""),
+            "entry_id": str(payload.get("entry_id") or ""),
+            "symbol": str(payload.get("symbol") or "").upper(),
+        }
+        if sample["reason"] == "current_single_leg_or_risk_only_exposure":
+            raw_current_risk_only_count += 1
+        if (
+            resolved_close_artifact_count > 0
+            and visibility == "historical_terminal_evidence"
+            and sample["reason"] == "resolved_close_artifact_after_terminal_truth"
+        ):
+            if len(samples) < 12:
+                samples.append(sample)
+            continue
+        note(contract, sample)
+
+    risk_only_live_single_leg_exposure_count = int(
+        business.get("risk_only_live_single_leg_exposure_count") or 0
+    )
+    risk_only_summary_delta_count = max(
+        0,
+        risk_only_live_single_leg_exposure_count - raw_current_risk_only_count,
+    )
+    if risk_only_summary_delta_count > 0:
+        visibility_counts["current_blocker"] = (
+            visibility_counts.get("current_blocker", 0)
+            + risk_only_summary_delta_count
+        )
+        if len(samples) < 12:
+            samples.append(
+                {
+                    "kind": "business_progression.risk_only_live_single_leg_exposure",
+                    "visibility": "current_blocker",
+                    "reason": "current_risk_only_live_single_leg_exposure",
+                    "count": risk_only_summary_delta_count,
+                }
+            )
+
+    historical_over_budget_count = int(
+        business.get("historical_hard_over_budget_recovered_count") or 0
+    )
+    phase_summary = (
+        gate.get("entry_outcome_summary", {}).get("phase_duration_summary", {})
+        if isinstance(gate.get("entry_outcome_summary", {}), dict)
+        else {}
+    )
+    if historical_over_budget_count > 0:
+        visibility_counts["historical_terminal_evidence"] = (
+            visibility_counts.get("historical_terminal_evidence", 0)
+            + historical_over_budget_count
+        )
+        for sample in phase_summary.get("samples", []) or []:
+            if not isinstance(sample, dict):
+                continue
+            if str(sample.get("status") or "") != "hard_over_budget":
+                continue
+            if len(samples) >= 12:
+                break
+            samples.append(
+                {
+                    "kind": "phase_duration.hard_over_budget",
+                    "visibility": "historical_terminal_evidence",
+                    "reason": "terminalized_over_budget_after_clean_truth",
+                    "artifact_id": str(sample.get("artifact_id") or ""),
+                    "symbol": str(sample.get("symbol") or "").upper(),
+                    "phase": str(sample.get("phase") or ""),
+                }
+            )
+
+    if resolved_close_artifact_count > 0:
+        visibility_counts["historical_terminal_evidence"] = (
+            visibility_counts.get("historical_terminal_evidence", 0)
+            + resolved_close_artifact_count
+        )
+
+    return {
+        "visibility_counts": dict(sorted(visibility_counts.items())),
+        "historical_terminalized_over_budget_count": historical_over_budget_count,
+        "resolved_close_artifact_count": resolved_close_artifact_count,
+        "current_admission_blocker_count": int(
+            visibility_counts.get("current_admission_blocker", 0)
+        ),
+        "current_blocker_count": int(visibility_counts.get("current_blocker", 0)),
+        "samples": samples,
+    }
+
+
 def _build_cleanup_blocker_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     reason_counts: dict[str, int] = {}
     venue_counts: dict[str, int] = {}
@@ -5955,7 +6106,7 @@ def _build_production_acceptance_gate(
             )
             or 0
         ),
-        "passive_close_truth_gap": resolved_order_truth_gap_count,
+        "passive_close_truth_gap": unresolved_order_truth_gap_count,
         "passive_zero_fill_exhausted_then_recovered": (
             passive_zero_fill_exhausted_then_recovered_count
         ),
@@ -6804,6 +6955,12 @@ def run_diagnose(
             {},
         )
     )
+    diagnostic_noise_summary = _build_diagnostic_noise_summary(
+        all_events,
+        production_acceptance_gate=production_acceptance_gate,
+        business_progression_quality_summary=business_progression_quality_summary,
+        resolved_close_order_error_summary=resolved_close_order_error_summary,
+    )
     if code_side_blockers or exclude_strategy or exclude_liquidity:
         from scripts.analyze_production_blockers import build_code_side_blocker_view
 
@@ -6883,6 +7040,7 @@ def run_diagnose(
         "close_reconciliation_evidence_gap_summary": (
             close_reconciliation_evidence_gap_summary
         ),
+        "diagnostic_noise_summary": diagnostic_noise_summary,
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "phase_duration_summary": phase_duration_summary,
         "code_side_blocker_view": code_side_blocker_view,
