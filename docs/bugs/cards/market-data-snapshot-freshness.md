@@ -46,6 +46,11 @@ for that candidate, but they are not current exchange exposure, not passive-clos
 terminal truth, and not permission to loosen quote TTL, OI floors, liquidity
 floors, or entry admission.
 
+This scope must remain true even when another current blocker exists in the
+same diagnose window. Candidate quote/OI blockers are admission evidence; they
+do not make terminal close accounting gaps current close blockers and they do
+not create live exposure without exchange position/open-order truth.
+
 Quote rewarm must also have terminal evidence. A venue-symbol that stays stale
 past the hard `quote_rewarm` budget must emit
 `runtime.entry_quote_rewarm_terminal_stale`, enter a cooldown/stale terminal
@@ -80,6 +85,7 @@ they count as terminal/takeover evidence rather than a missing-handoff issue.
 | 2026-06-20 | Unified quote/OI entry admission evidence contract | fixed in `447218a`, deployed/cloud verified | CL-104 adds `entry_market_evidence_contract(...)` and root `entry_market_evidence_summary`. Quote stale and OI unavailable remain fail-closed candidate blockers; resolved OI/quote evidence, advisory evidence, and over-budget recovery are diagnostic/accounting facts rather than threshold changes. Binance `bookTicker` / `openInterest` stay evidence sources; no quote TTL, OI floor, liquidity floor, or entry admission guard is loosened. Cloud `447218a` showed `entry_market_evidence_summary.unresolved_blocker_count=0`. |
 | 2026-06-20 | Quote/OI diagnostic noise visibility | fixed in `091ce2c`, deployed/cloud verified | `classify_noise_visibility(...)` keeps quote stale and OI unavailable as `current_admission_blocker` evidence instead of health-critical current exposure. `diagnostic_noise_summary` aggregates candidate blockers by visibility while preserving the raw journal evidence, and terminal-flat historical unpaired cleanup is no longer counted as current quote/OI or risk exposure noise. No quote TTL, OI floor, liquidity floor, or entry admission guard is loosened. Cloud `091ce2c` showed `entry_market_evidence_summary.unresolved_blocker_count=0` and `diagnostic_noise_summary.current_blocker_count=0`; quote/OI samples remained admission evidence only. |
 | 2026-06-20 | Admission blocker scope and non-handoff phase action evidence | local green, deploy pending | Post-deploy strict review found unresolved quote/OI blocker samples could be correct but under-scoped in diagnostics, and over-budget non-handoff phases could still be counted as blank-action noise. The follow-up keeps raw evidence visible, labels unresolved quote/OI blockers as `entry_candidate_admission`, and fills action/evidence for action-required phases without terminalizing `candidate_lease` handoff samples. |
+| 2026-06-21 | Quote/OI admission scope preserved during 2-7 close/accounting diagnostics | local green, merge/deploy pending | CL-105 keeps quote/OI and quote-rewarm evidence as candidate admission blockers only. Close accounting gaps now use current exchange flat/no-open-orders truth for terminal downgrade rather than the whole production gate, so an unrelated admission blocker cannot make a terminal-flat accounting gap look like current close risk. |
 
 ## Regression Harness
 

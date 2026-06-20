@@ -7383,6 +7383,232 @@ class TestReduceOnlyRejectedEscalation:
             f"Expected DUAL_TAKER after reduce-only rejection, got {pending.phase_state.phase}"
         )
 
+    def test_crossing_post_only_close_rotates_to_opposite_maker_leg_without_submit(self):
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        other_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: other_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50000.01, 50000.02))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                preferred_maker_leg=ActiveMakerLeg.LONG,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+            )
+        )
+
+        assert result is False
+        maker_adapter.submit_passive_order.assert_not_called()
+        assert pending.phase_state.phase == PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.SHORT
+        events = journal.read_all()
+        assert "exit.passive_close_post_only_maker_rotated" in [
+            event.get("kind") for event in events
+        ]
+
+    def test_binance_5022_post_only_reject_rotates_to_opposite_maker_leg(self):
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.submit_passive_order = AsyncMock(
+            side_effect=OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                (
+                    "Binance API error: code=-5022 GTX_ORDER_REJECT: "
+                    "Due to the order could not be executed as maker"
+                ),
+            )
+        )
+        other_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: other_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                preferred_maker_leg=ActiveMakerLeg.LONG,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+            )
+        )
+
+        assert result is False
+        assert pending.phase_state.phase == PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.SHORT
+        events = journal.read_all()
+        assert "exit.passive_close_post_only_maker_rotated" in [
+            event.get("kind") for event in events
+        ]
+
+    def test_partial_fill_binance_5022_arms_dual_taker_without_switching_maker_leg(self):
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.cancel_passive_order = AsyncMock(
+            return_value=_make_passive_ack(order_id="old-oid")
+        )
+        maker_adapter.submit_passive_order = AsyncMock(
+            side_effect=OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                (
+                    "Binance API error: code=-5022 GTX_ORDER_REJECT: "
+                    "Due to the order could not be executed as maker"
+                ),
+            )
+        )
+        other_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: other_adapter},
+            journal,
+        )
+        executor._probe_order_dead = AsyncMock(return_value=True)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                preferred_maker_leg=ActiveMakerLeg.LONG,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.4, average_price=50000.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.4, average_price=50000.0),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50000.0, 0.6, 0.01, 50000.0,
+            )
+        )
+
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG
+        assert pending.maker_fill.quantity == 0.4
+        assert pending.hedge_fill.quantity == 0.4
+        events = journal.read_all()
+        assert "exit.passive_close_post_only_maker_rotated" not in [
+            event.get("kind") for event in events
+        ]
+        dual_taker = [
+            event for event in events
+            if event.get("kind") == "execution.dual_taker_armed"
+        ][-1]
+        assert dual_taker["payload"]["execution_kind"] == "exit"
+        assert dual_taker["payload"]["symbol"] == position.symbol
+        assert abs(dual_taker["payload"]["remaining_quantity"] - 0.6) < 1e-9
+
+    def test_binance_2022_reduce_only_reject_adopts_existing_close_order(self):
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.submit_passive_order = AsyncMock(
+            side_effect=OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "Binance API error: code=-2022, msg=ReduceOnly Order is rejected.",
+            )
+        )
+        maker_adapter.fetch_open_orders = AsyncMock(return_value=[
+            {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "quantity": 1.0,
+                "reduceOnly": True,
+                "orderId": "existing-close-1",
+                "clientOrderId": "existing-close-cid",
+                "price": 50000.0,
+            }
+        ])
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 1.0,
+            )
+        )
+
+        assert result is False
+        assert pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+        assert pending.phase_state.maker_order_id == "existing-close-1"
+        assert pending.phase_state.maker_client_order_id == "existing-close-cid"
+        events = journal.read_all()
+        assert "exit.passive_close_reduce_only_quantity_covered_by_open_order" in [
+            event.get("kind") for event in events
+        ]
+
     def test_order_submit_error_uncertain_backs_off_with_escalation(self):
         """OrderSubmitError with is_rejected=False counts failures, backs off,
         escalates to DUAL_TAKER after PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES."""

@@ -21,6 +21,10 @@ residuals, and live-flat cleanup.
 - `runtime.stale_fail_closed_cleared`
 - `passive_close_resolved_without_terminal_truth_count`
 - `close_reconciliation_evidence_gap_count`
+- `execution.dual_taker_armed` with `execution_kind=exit`
+- `exit.passive_close_post_only_maker_rotated`
+- Binance close `-5022 GTX_ORDER_REJECT` post-only maker reject
+- Binance close `-2022 ReduceOnly Order is rejected`
 - `exit.reconciled` with `evidence_gap_reason`,
   `statement_probe_status`, and `trade_probe_status`
 - `price_unavailable_for_min_notional`
@@ -119,6 +123,18 @@ gaps must not re-open a cleared business owner or create `risk_only` /
 For new recurrences, start from `lightfee/engine/business_contract.py` before
 adding another passive-close or diagnose-local terminality predicate.
 
+For Binance post-only close maker `-5022`, run the BBO guard before submit.
+If the high-slippage chunk has zero maker/hedge fill progress, V2 may rotate to
+the opposite maker leg and reset the zero-fill containers. If the chunk already
+has any maker or hedge fill progress, do not rotate maker legs; preserve the
+fill ledger and arm `DUAL_TAKER` for the remaining quantity.
+
+For Binance reduce-only close `-2022`, first check current open orders. A
+matching reduce-only close order that covers the quantity should be adopted as
+the passive-close owner. If the position is already flat, terminal-flat handling
+still requires exchange position truth and no-open-order truth; the error code
+alone is not success evidence.
+
 ## V1 / Exchange Semantics
 
 - V1 lets live exchange truth dominate stale recovered local close state.
@@ -159,6 +175,7 @@ adding another passive-close or diagnose-local terminality predicate.
 | 2026-06-20 | Reconciliation statement gap cannot override terminal flat truth | fixed in `447218a`, deployed/cloud verified | CL-104 adds `close_reconciliation_evidence_contract(...)` and root `close_reconciliation_evidence_gap_summary`. HUSDT-style `missing_short_close_trade_statement` is `terminal_flat_accounting_gap` when current exchange truth is flat/no-open-orders; it stays visible as accounting evidence but cannot create current exposure, `risk_only`, or `fail_closed`. If exchange truth is not clean, the same gap is `unresolved_close_accounting_gap` and remains a blocker. Cloud `447218a` showed `close_reconciliation_evidence_gap_summary.blocking_count=0`, exchange flat/no-open-orders, no pending close, and `risk_mode=running`. |
 | 2026-06-20 | Resolved close artifacts and terminal unpaired cleanup become historical diagnostic evidence | fixed in `091ce2c`, deployed/cloud verified | `classify_noise_visibility(...)` and root `diagnostic_noise_summary` separate resolved ACK-only / duplicate-client / reduce-only / post-only close artifacts from current blockers after exchange flat + no open orders. Final review also fixed historical `recovery.unpaired_live_position_cleanup_skipped` events so they become `historical_terminal_evidence` when current exchange truth is flat/no-open-orders and current recovery exposure count is zero. `short_window_warning_details.passive_close_truth_gap` now counts only unresolved/current truth gaps. Current single-leg exposure, ownerless open orders, untrusted truth, and unresolved reconciliation gaps remain blocking and are not downgraded. Cloud `091ce2c` showed `diagnostic_noise_summary.current_blocker_count=0`, exchange flat/no-open-orders, and no local open/pending work. |
 | 2026-06-20 | Compensation already-flat lifecycle mapping | local green, deploy pending | Post-deploy strict review found `exit.compensation_already_flat` could remain a V1 lifecycle unmapped tail even though it means the passive-close compensation branch already has flat truth. The follow-up maps it through `classify_business_event_kind(...)` to V1 `PASSIVE_CLOSE`, `terminal_flat_already_proven`, action `record_compensation_terminal_flat`, so terminal-flat evidence is preserved without creating current risk or suppressing true non-flat blockers. |
+| 2026-06-21 | Binance close 5022/2022 and exit dual-taker semantic split | local green, merge/deploy pending | CL-105 adds BBO guard + post-submit 5022 classification for passive close. Zero-progress high-slippage chunks may rotate to the opposite maker leg; partial-progress chunks preserve fill accounting and arm `DUAL_TAKER`. Binance `-2022` close rejects now adopt an existing matching reduce-only close order before retry/fail-closed. Passive-close `execution.dual_taker_armed` carries `execution_kind=exit` and maps to V1 `PASSIVE_CLOSE`, while entry fallback remains `PENDING_ENTRY`. |
 
 ## Recurrences
 
@@ -175,6 +192,7 @@ adding another passive-close or diagnose-local terminality predicate.
 | 2026-06-08 | ACK-only timeout/order-truth evidence for production issue 10 | `89e2b93` / `74475c5` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 | 2026-06-19 | `GENIUSUSDT` Bybit reduce-only close owner | `106f47e` | deployed terminal-truth gates pass; waiting-event evidence payload now local to the event | [daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](../daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption) |
+| 2026-06-21 | `HOMEUSDT`, `ESPORTSUSDT`, Binance close `-5022`/`-2022` families | `cfd0644` | local RED/GREEN; deploy pending | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 
 ## Regression Harness
 
@@ -228,3 +246,8 @@ adding another passive-close or diagnose-local terminality predicate.
 17. If `risk_only_live_single_leg_exposure_count` is nonzero, verify it against
     current `unpaired_live_position_recoveries`, not only since-deploy event
     history.
+18. If Binance close returns `-5022`, check BBO and chunk fill progress before
+    maker-leg rotation. Rotation is zero-progress only; partial-progress close
+    chunks must preserve fill accounting and fall back to terminal taker close.
+19. If Binance close returns `-2022`, inspect existing reduce-only close orders
+    and position truth before deciding retry, adopt, or terminal-flat.

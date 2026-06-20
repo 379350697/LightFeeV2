@@ -246,6 +246,22 @@ def test_business_event_kind_maps_dual_taker_to_pending_entry():
     assert result["diagnostic_severity"] == "info"
 
 
+def test_business_event_kind_maps_exit_dual_taker_to_passive_close():
+    result = classify_business_event_kind(
+        "execution.dual_taker_armed",
+        {
+            "position_id": "p001",
+            "symbol": "BTCUSDT",
+            "execution_kind": "exit",
+        },
+    )
+
+    assert result["phase"] == "PASSIVE_CLOSE"
+    assert result["terminality"] == "terminal_fallback_armed"
+    assert result["action_taken"] == "execute_terminal_taker_fallback"
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_business_event_kind_maps_passive_close_recovery_result():
     result = classify_business_event_kind(
         "runtime.passive_close_recovery_result",

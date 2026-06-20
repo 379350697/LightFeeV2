@@ -15,8 +15,12 @@ decision path short.
 - Hyperliquid insufficient-margin family: `Insufficient margin to place order.`
 - `execution.entry_quantity_plan` with `quantity_contract_status` and
   `unhedgeable_residual_quantity`.
+- `execution.entry_quantity_plan` with `quantity_plan_reason=planner_quantity_adjustment`
+  followed by unopened terminal evidence such as `runtime.entry_admission_blocked`.
 - `runtime.entry_admission_venue_degraded` with `aggregation_key` and
   `suppressed_count`.
+- `runtime.entry_admission_symbol_cooldown_armed`
+- `runtime.venue_cooldown_started`
 - Recurrence shape: maker leg has fill/exposure, hedge venue rejects deterministically, same pending keeps retrying until max lifetime or cleanup.
 
 ## Current Effective Rule
@@ -65,8 +69,15 @@ Deterministic hedge admission reject must:
     process counters should be extended there before adding another local
     predicate in entry runtime or diagnose.
 16. `execution.dual_taker_armed` is a pending-entry terminal fallback signal.
-    It must map through `classify_business_event_kind` to V1 `PENDING_ENTRY`;
-    diagnose and lifecycle should not each carry a separate allowlist.
+    It must map through `classify_business_event_kind` to V1 `PENDING_ENTRY`
+    unless the payload explicitly says `execution_kind=exit`; diagnose and
+    lifecycle should not each carry a separate allowlist.
+17. Candidate quantity plans that never reached actual opened exposure must not
+    become current entry quantity warnings. If a planner adjustment is followed
+    by `entry.aborted`, `entry.passive_unfilled`,
+    `runtime.entry_admission_blocked`, or
+    `pending_entry.hedge_admission_blocked` without balanced opened evidence,
+    classify it as unopened terminal candidate evidence.
 
 ## V1 / Exchange Semantics
 
@@ -115,6 +126,7 @@ Deterministic hedge admission reject must:
 | 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | deployed through `039d52c` | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
 | 2026-06-19 | Bybit 110007 and quote-rewarm process-quality closure | deployed through `039d52c`; `106f47e` keeps diagnostics aligned | Bybit `110007` is treated as opening-only deterministic admission cooldown, while reduce-only close remains allowed. Diagnose consumes production-gate truth so historical quote/admission hard-over-budget artifacts remain counted as process issues without becoming current active stuck when exchange truth and lifecycle blockers are clean. `106f47e` keeps that distinction while adding passive-close waiting-event truth payloads, so admission/quote recovered artifacts do not hide live close blockers or create false active stuck. |
 | 2026-06-19 | Centralized business contract for entry sizing/admission diagnostics | `8eadb8e` deployed as clean baseline; unified-contract follow-up local, deploy pending | CL-102 adds `lightfee/engine/business_contract.py` and wires entry quantity plans, admission degraded aggregation keys, business-progression process counters, quote-rewarm handoff evidence, and dual-taker lifecycle mapping through it. HOMEUSDT-style `1856 -> 1800` contract-size adjustment is now explicit evidence, not inferred from later residual repair or terminal state. Unhedgeable quantity must block before maker submit rather than relying on residual repair as the normal path. |
+| 2026-06-21 | Unopened admission-blocked quantity plans and cooldown lifecycle mapping | local green, merge/deploy pending | CL-105 keeps actual opened-entry quantity warnings strict, but moves planner adjustments for unopened admission-blocked candidates into resolved terminal evidence. `runtime.entry_admission_symbol_cooldown_armed` and `runtime.venue_cooldown_started` now map as diagnostic admission containment so they do not pollute V1 lifecycle acceptance. Entry `execution.dual_taker_armed` remains `PENDING_ENTRY`; exit payloads map separately to `PASSIVE_CLOSE`. |
 
 ## Recurrences
 
@@ -127,6 +139,7 @@ Deterministic hedge admission reject must:
 | 2026-06-08 | issue 3-7 admission / pending hedge closure review | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-09 | `CLUSDT` OKX maker / Bybit hedge, Bybit `110125` crude-oil terms | working tree | local precheck regression added; deploy pending | Bybit endpoint/signature was healthy in the same window; failure is symbol trading-terms admission, now blocked before maker dispatch. |
 | 2026-06-19 | `HUSDT` Binance maker / Aster hedge, Aster headroom exhausted | `039d52c` | deployed RED/GREEN covers pre-submit block and post-fill fee-drag guard; current cloud recovered | [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](../daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality) |
+| 2026-06-21 | `ESPORTSUSDT` unopened Aster admission-blocked quantity plan | `cfd0644` | local RED/GREEN; deploy pending | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 
 ## Regression Harness
 
@@ -168,3 +181,6 @@ Deterministic hedge admission reject must:
     whether the maker quantity was already hedgeable, adjusted to a hedgeable
     quantity, or blocked.
 12. Closure requires cloud harness plus high-confidence exchange truth flat/no-open-orders.
+13. If a quantity mismatch appears for an entry that never opened, inspect
+    admission-block/abort evidence before treating it as a current quantity
+    warning.

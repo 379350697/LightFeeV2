@@ -2737,6 +2737,112 @@ def test_run_diagnose_blocks_home_recovery_flat_quick_flat_chain(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_keeps_flat_close_accounting_gap_non_blocking_with_quick_flat(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1781293950000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781293920000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                },
+            },
+            {
+                "ts_ms": 1781293940000,
+                "kind": "runtime.position_drift_corrected",
+                "payload": {
+                    "position_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "reason": "exchange_truth_flat",
+                },
+            },
+            {
+                "ts_ms": 1781293940100,
+                "kind": "exit.reconciled",
+                "payload": {
+                    "position_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "evidence_gap": True,
+                    "evidence_gap_reason": (
+                        "missing_long_close_trade_statement_after_duplicate_leg_suppression"
+                    ),
+                    "statement_probe_status": "partial",
+                    "long_closed_qty": 0.0,
+                    "short_closed_qty": 1000.0,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["binance", "bybit"],
+            now_ms=1781293950000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert "quick_flat_events_present" in gate["blocking_reasons"]
+        gap_summary = result["business_progression_quality_summary"][
+            "close_reconciliation_evidence_gap_summary"
+        ]
+        assert gap_summary["terminal_flat_accounting_gap_count"] == 1
+        assert gap_summary["unresolved_close_accounting_gap_count"] == 0
+        assert gap_summary["blocking_count"] == 0
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_entry_quantity_plan_for_unopened_admission_block_is_not_current_warning():
+    from scripts.diagnose_live import _build_entry_quantity_terminal_summary
+
+    summary = _build_entry_quantity_terminal_summary([
+        {
+            "ts_ms": 1781967374446,
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "common_quantity": 1532.097441397273,
+                "full_target_quantity": 1470.813543741382,
+                "quantity_plan_reason": "planner_quantity_adjustment",
+            },
+        },
+        {
+            "ts_ms": 1781967374999,
+            "kind": "runtime.entry_admission_blocked",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "venue": "aster",
+                "reason": "max_notional_admission_blocked",
+            },
+        },
+    ])
+
+    assert summary["common_quantity_mismatch_count"] == 1
+    assert summary["common_quantity_mismatch_warning_count"] == 0
+    assert summary["common_quantity_mismatch_warning_entry_ids"] == []
+
+
 def test_run_diagnose_does_not_count_okx_global_recovery_for_non_okx_venues(monkeypatch):
     from scripts import diagnose_live as dl
 

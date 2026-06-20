@@ -52,8 +52,13 @@ def classify_business_event_kind(
             "owner_id": close_reconciliation["owner_id"],
         }
     if text == "execution.dual_taker_armed":
+        phase = (
+            "PASSIVE_CLOSE"
+            if str(payload.get("execution_kind") or "").lower() == "exit"
+            else "PENDING_ENTRY"
+        )
         return {
-            "phase": "PENDING_ENTRY",
+            "phase": phase,
             "terminality": "terminal_fallback_armed",
             "action_taken": "execute_terminal_taker_fallback",
             "action_evidence_kind": text,

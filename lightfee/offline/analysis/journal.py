@@ -154,7 +154,7 @@ def summarize_quick_flat_events(
     records: list[dict],
     *,
     quick_flat_window_ms: int = 60_000,
-) -> dict[str, int | str]:
+) -> dict[str, int | str | list[dict[str, int | str]]]:
     """Summarize quick-flat terminal observations without double-counting exits."""
     entry_opened_at: dict[str, int] = {}
     for record in records:
@@ -208,9 +208,13 @@ def summarize_quick_flat_events(
                 int(previous["ts_ms"]),
             ):
                 quick_flat_positions[position_id] = {
+                    "entry_opened_ts_ms": opened_at_ms,
                     "kind": kind,
                     "priority": priority,
+                    "position_id": position_id,
+                    "symbol": str(payload.get("symbol", "") or ""),
                     "ts_ms": closed_at_ms,
+                    "elapsed_ms": elapsed_ms,
                 }
 
     terminal_kind_counts: dict[str, int] = {}
@@ -226,6 +230,23 @@ def summarize_quick_flat_events(
         "low_confidence_event_count": low_confidence_event_count,
         "close_identity_confidence": close_identity_confidence,
         "quick_flat_terminal_kind_counts": terminal_kind_counts,
+        "samples": [
+            {
+                "position_id": str(terminal.get("position_id") or ""),
+                "symbol": str(terminal.get("symbol") or ""),
+                "entry_opened_ts_ms": int(terminal.get("entry_opened_ts_ms") or 0),
+                "terminal_ts_ms": int(terminal.get("ts_ms") or 0),
+                "terminal_kind": str(terminal.get("kind") or ""),
+                "elapsed_ms": int(terminal.get("elapsed_ms") or 0),
+            }
+            for terminal in sorted(
+                quick_flat_positions.values(),
+                key=lambda item: (
+                    int(item.get("ts_ms") or 0),
+                    str(item.get("position_id") or ""),
+                ),
+            )[:12]
+        ],
     }
 
 

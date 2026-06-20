@@ -1549,7 +1549,10 @@ class PassiveCloseExecutor:
                     "execution.dual_taker_armed",
                     {
                         "position_id": position_id,
+                        "symbol": position.symbol,
+                        "execution_kind": "exit",
                         "reason": "passive_phases_exhausted",
+                        "maker_leg": pending.phase_state.active_maker_leg.value,
                         "remaining_quantity": pending.remaining_chunk_quantity(),
                     },
                 )
@@ -1643,6 +1646,18 @@ class PassiveCloseExecutor:
             pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
             return False
 
+        quote = self._resolve_local_l2_quote(maker_venue, position.symbol)
+        if self._post_only_price_would_take(maker_side, aligned_price, quote):
+            self._rotate_post_only_maker_leg(
+                pending,
+                position,
+                maker_venue=maker_venue,
+                maker_leg_label=maker_leg_label,
+                aligned_price=aligned_price,
+                reason="post_only_bbo_would_take_pre_submit",
+            )
+            return False
+
         adapter = self._adapter(maker_venue)
         if adapter is None:
             return False
@@ -1696,6 +1711,44 @@ class PassiveCloseExecutor:
                 request_context=req_ctx,
             )
             if e.is_rejected:
+                if self._is_post_only_would_take_error(e, evidence):
+                    self._rotate_post_only_maker_leg(
+                        pending,
+                        position,
+                        maker_venue=maker_venue,
+                        maker_leg_label=maker_leg_label,
+                        aligned_price=aligned_price,
+                        reason="post_only_submit_rejected_would_take",
+                    )
+                    return False
+                if self._is_reduce_only_reject_error(e, evidence):
+                    adopted = await self._adopt_matching_reduce_only_close_order(
+                        pending,
+                        position,
+                        venue=maker_venue,
+                        side=maker_side,
+                        target_quantity=chunk_quantity,
+                        order_id="",
+                        client_order_id="",
+                        source="reduce_only_submit_error",
+                        now_ms=self._now_ms(),
+                    )
+                    if adopted:
+                        self._journal.append(
+                            "exit.passive_close_reduce_only_quantity_covered_by_open_order",
+                            {
+                                "position_id": position.position_id,
+                                "symbol": position.symbol,
+                                "venue": maker_venue.value,
+                                "maker_leg": maker_leg_label,
+                                "error": str(e),
+                                "exchange_error": evidence.to_dict(),
+                                "request_context": req_ctx.to_dict(),
+                                "decision": "retain_pending",
+                                "reason": "existing_reduce_only_close_order_covers_quantity",
+                            },
+                        )
+                        return False
                 if _is_bybit_terminal_zero_qty_reduce_only_error(
                     e,
                     venue=maker_venue,
@@ -1884,6 +1937,144 @@ class PassiveCloseExecutor:
             },
         )
         return True
+
+    def _post_only_price_would_take(
+        self,
+        side: Side,
+        price: float,
+        quote: tuple[float, float] | None,
+    ) -> bool:
+        if quote is None:
+            return False
+        best_bid, best_ask = quote
+        if side == Side.SELL:
+            return price <= best_bid + 1e-12
+        if side == Side.BUY:
+            return price >= best_ask - 1e-12
+        return False
+
+    def _rotate_post_only_maker_leg(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        maker_venue: Venue,
+        maker_leg_label: str,
+        aligned_price: float,
+        reason: str,
+    ) -> bool:
+        has_chunk_progress = (
+            pending.maker_fill.quantity > 1e-9
+            or pending.hedge_fill.quantity > 1e-9
+        )
+        if has_chunk_progress:
+            pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+            pending.phase_state.maker_order_id = ""
+            pending.phase_state.maker_client_order_id = ""
+            pending.phase_state.maker_resting_limit_price = None
+            pending.phase_state.maker_resting_since_ms = 0
+            pending.next_retry_at_ms = 0
+            self._journal.append(
+                "execution.dual_taker_armed",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "execution_kind": "exit",
+                    "reason": reason,
+                    "maker_venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "remaining_quantity": pending.remaining_chunk_quantity(),
+                    "decision": "preserve_partial_fill_and_fallback",
+                },
+            )
+            return False
+
+        if pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER:
+            previous_leg = pending.phase_state.active_maker_leg
+            pending.phase_state.phase = PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
+            pending.phase_state.active_maker_leg = (
+                ActiveMakerLeg.SHORT
+                if previous_leg == ActiveMakerLeg.LONG
+                else ActiveMakerLeg.LONG
+            )
+            now_ms = self._now_ms()
+            pending.phase_state.zero_fill_cycles_in_phase = 0
+            pending.phase_state.cycle_attempt = 1
+            pending.phase_state.phase_started_at_ms = now_ms
+            pending.phase_state.cycle_started_at_ms = now_ms
+            pending.phase_state.maker_submit_consecutive_failures = 0
+            pending.phase_state.maker_order_id = ""
+            pending.phase_state.maker_client_order_id = ""
+            pending.phase_state.maker_resting_limit_price = None
+            pending.phase_state.maker_resting_since_ms = 0
+            pending.maker_fill = PendingPassiveLegFill()
+            pending.hedge_fill = PendingPassiveLegFill()
+            pending.next_retry_at_ms = 0
+            self._journal.append(
+                "exit.passive_close_post_only_maker_rotated",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "maker_venue": maker_venue.value,
+                    "from_maker_leg": maker_leg_label,
+                    "to_maker_leg": pending.phase_state.active_maker_leg.value,
+                    "from_phase": PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER.value,
+                    "to_phase": PassiveExecutionPhase.LOW_SLIPPAGE_MAKER.value,
+                    "aligned_price": aligned_price,
+                    "reason": reason,
+                    "decision": "try_opposite_maker_leg",
+                },
+            )
+            return True
+
+        pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+        self._journal.append(
+            "execution.dual_taker_armed",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "execution_kind": "exit",
+                "reason": reason,
+                "maker_venue": maker_venue.value,
+                "maker_leg": maker_leg_label,
+                "remaining_quantity": pending.remaining_chunk_quantity(),
+            },
+        )
+        return False
+
+    def _is_post_only_would_take_error(
+        self,
+        error: BaseException,
+        evidence: Any,
+    ) -> bool:
+        code = str(getattr(evidence, "exchange_code", "") or "")
+        text = " ".join(
+            [
+                str(error),
+                str(getattr(evidence, "exchange_msg", "") or ""),
+                str(getattr(evidence, "raw_body", "") or ""),
+            ]
+        ).lower()
+        return code == "-5022" or "gtx_order_reject" in text or (
+            "post only" in text and "maker" in text and "reject" in text
+        )
+
+    def _is_reduce_only_reject_error(
+        self,
+        error: BaseException,
+        evidence: Any,
+    ) -> bool:
+        code = str(getattr(evidence, "exchange_code", "") or "")
+        text = " ".join(
+            [
+                str(error),
+                str(getattr(evidence, "exchange_msg", "") or ""),
+                str(getattr(evidence, "raw_body", "") or ""),
+            ]
+        ).lower()
+        return code == "-2022" or "reduceonly order is rejected" in text or (
+            "reduce only order is rejected" in text
+        )
 
     # ------------------------------------------------------------------
     # Poll maker progress

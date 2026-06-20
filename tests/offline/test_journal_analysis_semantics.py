@@ -164,6 +164,44 @@ class TestQuickFlatObservability:
         assert summary["quick_flat_count"] == 1
         assert summary["duplicate_event_count"] == 1
 
+    def test_quick_flat_summary_exposes_terminal_samples(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-esports",
+                    "symbol": "ESPORTSUSDT",
+                },
+            },
+            {
+                "ts_ms": 18_500,
+                "kind": "runtime.position_drift_corrected",
+                "payload": {
+                    "position_id": "entry-esports",
+                    "symbol": "ESPORTSUSDT",
+                    "reason": "duplicated_hedge_progress_repaired",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 1
+        assert summary["samples"] == [
+            {
+                "position_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "entry_opened_ts_ms": 1000,
+                "terminal_ts_ms": 18_500,
+                "terminal_kind": "runtime.position_drift_corrected",
+                "elapsed_ms": 17_500,
+            }
+        ]
+
     def test_journal_report_exposes_deduplicated_quick_flat_counts(self):
         records = [
             {
