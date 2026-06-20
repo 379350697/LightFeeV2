@@ -6337,6 +6337,50 @@ def test_diagnostic_noise_summary_counts_current_risk_only_exposure_without_raw_
     assert summary["samples"][0]["reason"] == "current_risk_only_live_single_leg_exposure"
 
 
+def test_diagnostic_noise_summary_downgrades_terminal_flat_unpaired_cleanup_history():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "recovery.unpaired_live_position_cleanup_skipped",
+            "payload": {
+                "position_id": "entry-risk",
+                "symbol": "SAHARAUSDT",
+                "current_risk_exposure": True,
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "recovery.unpaired_live_position_terminal_flat",
+            "payload": {
+                "position_id": "entry-risk",
+                "symbol": "SAHARAUSDT",
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 0,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={
+            "risk_only_live_single_leg_exposure_count": 0,
+        },
+    )
+
+    assert summary["visibility_counts"] == {"historical_terminal_evidence": 1}
+    assert summary["current_blocker_count"] == 0
+    assert summary["samples"][0]["reason"] == "terminal_flat_recovered_unpaired_cleanup"
+
+
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():
     import scripts.diagnose_live as dl
 

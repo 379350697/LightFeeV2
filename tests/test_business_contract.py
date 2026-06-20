@@ -209,13 +209,30 @@ def test_noise_visibility_never_hides_current_single_leg_exposure():
             "symbol": "ESPORTSUSDT",
             "current_risk_exposure": True,
         },
-        current_exchange_truth_clean=True,
+        current_exchange_truth_clean=False,
     )
 
     assert result["visibility"] == "current_blocker"
     assert result["blocks_gate"] is True
     assert result["requires_operator_action"] is True
     assert result["reason"] == "current_single_leg_or_risk_only_exposure"
+
+
+def test_noise_visibility_terminal_flat_downgrades_historical_unpaired_cleanup():
+    result = classify_noise_visibility(
+        "recovery.unpaired_live_position_cleanup_skipped",
+        {
+            "position_id": "entry-risk",
+            "symbol": "ESPORTSUSDT",
+            "current_risk_exposure": True,
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["visibility"] == "historical_terminal_evidence"
+    assert result["blocks_gate"] is False
+    assert result["requires_operator_action"] is False
+    assert result["reason"] == "terminal_flat_recovered_unpaired_cleanup"
 
 
 def test_business_event_kind_maps_dual_taker_to_pending_entry():

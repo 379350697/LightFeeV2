@@ -364,6 +364,14 @@ def classify_noise_visibility(
         }
         and payload.get("current_risk_exposure") is True
     ):
+        if current_exchange_truth_clean:
+            return {
+                **base,
+                "visibility": "historical_terminal_evidence",
+                "blocks_gate": False,
+                "requires_operator_action": False,
+                "reason": "terminal_flat_recovered_unpaired_cleanup",
+            }
         return {
             **base,
             "visibility": "current_blocker",
