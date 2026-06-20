@@ -139,7 +139,7 @@ Deterministic hedge admission reject must:
 | 2026-06-08 | issue 3-7 admission / pending hedge closure review | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-09 | `CLUSDT` OKX maker / Bybit hedge, Bybit `110125` crude-oil terms | working tree | local precheck regression added; deploy pending | Bybit endpoint/signature was healthy in the same window; failure is symbol trading-terms admission, now blocked before maker dispatch. |
 | 2026-06-19 | `HUSDT` Binance maker / Aster hedge, Aster headroom exhausted | `039d52c` | deployed RED/GREEN covers pre-submit block and post-fill fee-drag guard; current cloud recovered | [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](../daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality) |
-| 2026-06-21 | `ESPORTSUSDT` unopened Aster admission-blocked quantity plan | `TBD_LOCAL_COMMIT` | local RED/GREEN; deploy pending | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
+| 2026-06-21 | `ESPORTSUSDT` unopened Aster admission-blocked quantity plan | `cfd0644` | local RED/GREEN; deploy pending | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 
 ## Regression Harness
 
