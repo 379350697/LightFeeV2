@@ -3732,6 +3732,11 @@ def _build_entry_market_evidence_summary(
                 "evidence_class": evidence_class,
                 "owner_id": str(contract.get("owner_id") or ""),
                 "reason": str(contract.get("reason") or ""),
+                "scope": (
+                    "entry_candidate_admission"
+                    if blocks_entry
+                    else "entry_market_evidence"
+                ),
             })
 
     return {
@@ -3750,10 +3755,12 @@ def _build_entry_market_evidence_summary(
             "blocked_candidate_count": quote_blocked_candidate_count,
             "terminal_candidate_rewarm_count": terminal_candidate_rewarm_count,
         },
+        "blocker_scope": "entry_candidate_admission",
         "samples": samples,
         "terminal_candidate_rewarm_count": terminal_candidate_rewarm_count,
         "total_count": total_count,
         "unresolved_blocker_count": unresolved_blocker_count,
+        "unresolved_blocker_scope": "entry_candidate_admission",
     }
 
 
@@ -4464,17 +4471,13 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         if (
             not action_taken
             and allow_configured_fallback
-            and (
-                status == "hard_over_budget"
-                or (phase == "entry_selected_terminal" and status == "soft_over_budget")
-            )
+            and status in {"hard_over_budget", "soft_over_budget"}
         ):
             action_taken = budget.action
-            action_evidence_kind = (
-                "runtime.entry_selected_terminal_soft_budget_exceeded"
-                if phase == "entry_selected_terminal" and status == "soft_over_budget"
-                else default_action_evidence_kind(phase)
-            )
+            if status == "soft_over_budget":
+                action_evidence_kind = f"runtime.{phase}_soft_budget_exceeded"
+            else:
+                action_evidence_kind = default_action_evidence_kind(phase)
         records.append({
             "phase": phase,
             "artifact_id": str(artifact["artifact_id"]),
@@ -4594,7 +4597,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     blank_action_count = sum(
         1
         for record in over_budget_records
-        if not str(record.get("action_taken") or "")
+        if record.get("phase") != "candidate_lease"
+        and not str(record.get("action_taken") or "")
     )
     terminalized_candidate_lease_count = sum(
         1
@@ -5489,6 +5493,7 @@ def _build_diagnostic_noise_summary(
             "position_id": str(payload.get("position_id") or ""),
             "entry_id": str(payload.get("entry_id") or ""),
             "symbol": str(payload.get("symbol") or "").upper(),
+            "scope": str(contract.get("scope") or ""),
         }
         if sample["reason"] == "current_single_leg_or_risk_only_exposure":
             raw_current_risk_only_count += 1
@@ -5520,6 +5525,7 @@ def _build_diagnostic_noise_summary(
                     "kind": "business_progression.risk_only_live_single_leg_exposure",
                     "visibility": "current_blocker",
                     "reason": "current_risk_only_live_single_leg_exposure",
+                    "scope": "current_live_exposure",
                     "count": risk_only_summary_delta_count,
                 }
             )
@@ -5552,6 +5558,7 @@ def _build_diagnostic_noise_summary(
                     "artifact_id": str(sample.get("artifact_id") or ""),
                     "symbol": str(sample.get("symbol") or "").upper(),
                     "phase": str(sample.get("phase") or ""),
+                    "scope": "",
                 }
             )
 

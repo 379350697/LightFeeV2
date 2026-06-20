@@ -258,6 +258,23 @@ def test_business_event_kind_maps_passive_close_recovery_result():
     assert result["diagnostic_severity"] == "info"
 
 
+def test_business_event_kind_maps_compensation_already_flat_to_passive_close():
+    result = classify_business_event_kind(
+        "exit.compensation_already_flat",
+        {
+            "position_id": "entry-1",
+            "symbol": "ALICEUSDT",
+            "venue": "bybit",
+            "reason": "funding_capture",
+        },
+    )
+
+    assert result["phase"] == "PASSIVE_CLOSE"
+    assert result["terminality"] == "terminal_flat_already_proven"
+    assert result["action_taken"] == "record_compensation_terminal_flat"
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_close_order_error_resolution_requires_clean_exchange_truth():
     payload = {
         "position_id": "entry-1",

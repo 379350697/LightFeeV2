@@ -5202,6 +5202,7 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "blocked_candidate_count": 2,
             "terminal_candidate_rewarm_count": 0,
         },
+        "blocker_scope": "entry_candidate_admission",
         "samples": [
             {
                 "action": "block_stale_quote",
@@ -5209,6 +5210,7 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "evidence_class": "quote",
                 "owner_id": "aster:HOMEUSDT",
                 "reason": "rest_resolved_but_stale",
+                "scope": "entry_candidate_admission",
             },
             {
                 "action": "block_stale_quote",
@@ -5216,6 +5218,7 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "evidence_class": "quote",
                 "owner_id": "binance:HOMEUSDT",
                 "reason": "rest_throttled",
+                "scope": "entry_candidate_admission",
             },
             {
                 "action": "block_oi_unavailable",
@@ -5223,6 +5226,7 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "evidence_class": "oi",
                 "owner_id": "aster:HOMEUSDT",
                 "reason": "oi_evidence_unavailable",
+                "scope": "entry_candidate_admission",
             },
             {
                 "action": "block_oi_unavailable",
@@ -5230,6 +5234,7 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "evidence_class": "oi",
                 "owner_id": "binance:BSBUSDT",
                 "reason": "oi_evidence_unavailable",
+                "scope": "entry_candidate_admission",
             },
             {
                 "action": "allow_entry_evidence",
@@ -5237,11 +5242,13 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
                 "evidence_class": "oi",
                 "owner_id": "binance:HOMEUSDT",
                 "reason": "targeted_refresh",
+                "scope": "entry_market_evidence",
             },
         ],
         "terminal_candidate_rewarm_count": 0,
         "total_count": 6,
         "unresolved_blocker_count": 1,
+        "unresolved_blocker_scope": "entry_candidate_admission",
     }
 
 
@@ -5502,7 +5509,7 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
 
     assert phase_summary["over_budget_count"] >= 5
     assert phase_summary["hard_over_budget_count"] >= 5
-    assert phase_summary["blank_action_count"] == 1
+    assert phase_summary["blank_action_count"] == 0
     assert phase_summary["terminalized_candidate_lease_count"] == 0
     assert phase_summary["terminalized_quote_rewarm_count"] == 1
     assert phase_summary["budget_defaults_ms"]["selected_pre_submit"]["hard_ms"] == 15000
@@ -5550,6 +5557,12 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
     )
     assert samples_by_phase["pending_entry"]["truth_source"] == (
         "pending_entry_terminality_from_order_fill_position_truth"
+    )
+    assert samples_by_phase["pending_entry"]["action_taken"] == (
+        "v1_force_terminal_cancel_reconcile_finalize_abort"
+    )
+    assert samples_by_phase["pending_entry"]["action_evidence_kind"] == (
+        "pending_entry.long_lived_pending_entry"
     )
     assert samples_by_phase["maker_resting"]["action_taken"] == (
         "cancel_then_reconcile_open_orders_trades_positions"
@@ -5716,6 +5729,7 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
                     "artifact_id": "entry-no-submit",
                     "symbol": "NOSUBUSDT",
                     "phase": "selected_pre_submit",
+                    "scope": "",
                 },
             ],
         }
@@ -6238,6 +6252,7 @@ def test_diagnostic_noise_summary_separates_admission_and_current_blockers():
     assert summary["current_admission_blocker_count"] == 1
     assert summary["current_blocker_count"] == 1
     assert summary["historical_terminalized_over_budget_count"] == 0
+    assert summary["samples"][0]["scope"] == "entry_candidate_admission"
 
 
 def test_diagnostic_noise_summary_does_not_double_count_resolved_close_artifact():
@@ -6335,6 +6350,7 @@ def test_diagnostic_noise_summary_counts_current_risk_only_exposure_without_raw_
     assert summary["visibility_counts"] == {"current_blocker": 1}
     assert summary["current_blocker_count"] == 1
     assert summary["samples"][0]["reason"] == "current_risk_only_live_single_leg_exposure"
+    assert summary["samples"][0]["scope"] == "current_live_exposure"
 
 
 def test_diagnostic_noise_summary_downgrades_terminal_flat_unpaired_cleanup_history():

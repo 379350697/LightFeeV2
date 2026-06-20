@@ -106,6 +106,15 @@ def classify_business_event_kind(
             "diagnostic_severity": "info",
             "owner_id": str(payload.get("position_id") or ""),
         }
+    if text == "exit.compensation_already_flat":
+        return {
+            "phase": "PASSIVE_CLOSE",
+            "terminality": "terminal_flat_already_proven",
+            "action_taken": "record_compensation_terminal_flat",
+            "action_evidence_kind": text,
+            "diagnostic_severity": "info",
+            "owner_id": str(payload.get("position_id") or ""),
+        }
     return {}
 
 
@@ -388,6 +397,7 @@ def classify_noise_visibility(
             "blocks_gate": False,
             "requires_operator_action": False,
             "reason": "entry_market_evidence_block",
+            "scope": "entry_candidate_admission",
         }
 
     reconciliation = close_reconciliation_evidence_contract(
