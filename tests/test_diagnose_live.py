@@ -5157,6 +5157,166 @@ def test_run_diagnose_filters_resolved_bybit_terminal_zero_qty_from_order_errors
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_splits_terminal_zero_qty_truth_probe_from_submit_errors(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1782036325000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1782036319000,
+                "kind": "exit.passive_close_terminal_zero_qty_reduce_only_evidence",
+                "payload": {
+                    "position_id": "entry-1782035523315-ESPORTSUSDT",
+                    "symbol": "ESPORTSUSDT",
+                    "venue": "bybit",
+                    "decision": "probe_live_truth",
+                },
+            },
+            {
+                "ts_ms": 1782036320121,
+                "kind": "exit.passive_close_maker_submit_error",
+                "payload": {
+                    "position_id": "entry-1782035523315-ESPORTSUSDT",
+                    "symbol": "ESPORTSUSDT",
+                    "venue": "bybit",
+                    "decision": "retain_pending",
+                    "reason": "terminal_zero_qty_live_truth_not_flat",
+                },
+            },
+            {
+                "ts_ms": 1782036322000,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1782035523315-ESPORTSUSDT",
+                    "symbol": "ESPORTSUSDT",
+                    "resolution_source": "passive_close_terminal_truth_probe",
+                    "live_flat_terminal": True,
+                    "problem": False,
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1782036330000,
+        )
+
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        summary = result["resolved_terminal_zero_qty_reduce_only_summary"]
+        assert summary["truth_probe_retain_pending_count"] == 1
+        assert summary["truth_probe_retain_pending_resolved_count"] == 1
+        assert summary["truth_probe_retain_pending_position_ids"] == [
+            "entry-1782035523315-ESPORTSUSDT"
+        ]
+        assert result["diagnostic_noise_summary"][
+            "terminal_zero_qty_truth_probe_count"
+        ] == 1
+        assert result["diagnostic_noise_summary"]["visibility_counts"] == {
+            "historical_terminal_evidence": 1
+        }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_resolves_truth_probe_submit_error_with_terminal_close_only(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1782036325000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1782036320121,
+                "kind": "exit.passive_close_maker_submit_error",
+                "payload": {
+                    "position_id": "entry-1782035523315-ESPORTSUSDT",
+                    "symbol": "ESPORTSUSDT",
+                    "venue": "bybit",
+                    "decision": "retain_pending",
+                    "reason": "terminal_zero_qty_live_truth_not_flat",
+                },
+            },
+            {
+                "ts_ms": 1782036322000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1782035523315-ESPORTSUSDT",
+                    "symbol": "ESPORTSUSDT",
+                    "terminal_state": "flat",
+                },
+            },
+        ])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "positions": {},
+            "open_orders": {},
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "errors": [],
+            "missing_evidence": [],
+        })
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1782036330000,
+        )
+
+        assert result["order_error_evidence"] == []
+        summary = result["resolved_terminal_zero_qty_reduce_only_summary"]
+        assert summary["truth_probe_retain_pending_resolved_count"] == 1
+        assert summary["truth_probe_retain_pending_unresolved_count"] == 0
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_reports_passive_zero_fill_recovered_short_window(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -5455,6 +5615,50 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "terminal_candidate_rewarm_count": 0,
         },
         "blocker_scope": "entry_candidate_admission",
+        "candidate_admission_noise_summary": {
+            "blocks_production_gate": False,
+            "current_scope": "entry_candidate_admission",
+            "next_action": "targeted_refresh_or_data_source_backfill",
+            "top_blocked_owner_ids": [
+                {
+                    "owner_id": "aster:HOMEUSDT",
+                    "count": 2,
+                    "actions": {
+                        "block_oi_unavailable": 1,
+                        "block_stale_quote": 1,
+                    },
+                    "evidence_classes": {
+                        "oi": 1,
+                        "quote": 1,
+                    },
+                    "reasons": {
+                        "oi_evidence_unavailable": 1,
+                        "rest_resolved_but_stale": 1,
+                    },
+                },
+                {
+                    "owner_id": "aster:BSBUSDT",
+                    "count": 1,
+                    "actions": {"block_oi_unavailable": 1},
+                    "evidence_classes": {"oi": 1},
+                    "reasons": {"timeout_waiting_for_oi": 1},
+                },
+                {
+                    "owner_id": "binance:BSBUSDT",
+                    "count": 1,
+                    "actions": {"block_oi_unavailable": 1},
+                    "evidence_classes": {"oi": 1},
+                    "reasons": {"oi_evidence_unavailable": 1},
+                },
+                {
+                    "owner_id": "binance:HOMEUSDT",
+                    "count": 1,
+                    "actions": {"block_stale_quote": 1},
+                    "evidence_classes": {"quote": 1},
+                    "reasons": {"rest_throttled": 1},
+                },
+            ],
+        },
         "samples": [
             {
                 "action": "block_stale_quote",
@@ -6400,11 +6604,14 @@ def test_business_progression_quality_counts_contract_and_process_issues():
         "samples": [
             {
                 "action": "unresolved_close_accounting_gap",
+                "audit_status": "blocking_reconciliation_required",
                 "blocks_business_terminal": True,
+                "next_action": "reconcile_missing_trade_statement_before_terminal",
                 "owner_id": "entry-esports",
                 "reason": "missing_short_close_trade_statement",
                 "statement_probe_status": "partial",
                 "symbol": "ESPORTSUSDT",
+                "truth_source": "local_reconciliation_incomplete",
             },
         ],
     }
@@ -6449,11 +6656,14 @@ def test_business_progression_quality_marks_flat_accounting_gap_non_blocking():
         "samples": [
             {
                 "action": "terminal_flat_accounting_gap",
+                "audit_status": "terminal_flat_backfill_required",
                 "blocks_business_terminal": False,
+                "next_action": "backfill_trade_statement_or_archive_gap",
                 "owner_id": "entry-husdt",
                 "reason": "missing_short_close_trade_statement",
                 "statement_probe_status": "partial",
                 "symbol": "HUSDT",
+                "truth_source": "exchange_flat_no_open_orders",
             },
         ],
     }

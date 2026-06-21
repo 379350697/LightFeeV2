@@ -1950,6 +1950,17 @@ def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> 
     )
 
 
+def _payload_is_terminal_zero_qty_truth_probe_retained(
+    payload: dict[str, Any],
+) -> bool:
+    reason = str(payload.get("reason") or payload.get("error") or "").lower()
+    decision = str(payload.get("decision") or "").lower()
+    return (
+        reason == "terminal_zero_qty_live_truth_not_flat"
+        and decision == "retain_pending"
+    )
+
+
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
     if kind in {
         "exit.passive_close_hedge_confirmed_after_ack",
@@ -2080,8 +2091,10 @@ def _build_resolved_terminal_zero_qty_reduce_only_summary(
     symbol: str = "",
 ) -> dict[str, Any]:
     terminal_positions: set[str] = set()
+    truth_probe_retain_pending_positions: set[str] = set()
     resolved_positions: set[str] = set()
     terminal_event_count = 0
+    truth_probe_retain_pending_count = 0
     for rec in events:
         kind = str(rec.get("kind", "") or "")
         payload = rec.get("payload", {})
@@ -2096,6 +2109,12 @@ def _build_resolved_terminal_zero_qty_reduce_only_summary(
         if kind == "exit.passive_close_terminal_zero_qty_reduce_only_evidence":
             terminal_event_count += 1
             terminal_positions.add(position_id)
+        elif (
+            kind == "exit.passive_close_maker_submit_error"
+            and _payload_is_terminal_zero_qty_truth_probe_retained(payload)
+        ):
+            truth_probe_retain_pending_count += 1
+            truth_probe_retain_pending_positions.add(position_id)
         elif kind == "exit.passive_close_resolved":
             if payload.get("live_flat_terminal") is not False:
                 resolved_positions.add(position_id)
@@ -2109,6 +2128,13 @@ def _build_resolved_terminal_zero_qty_reduce_only_summary(
     )
     resolved_terminal_positions = terminal_positions & resolved_positions
     unresolved_positions = terminal_positions - resolved_terminal_positions
+    resolved_truth_probe_retain_pending_positions = (
+        truth_probe_retain_pending_positions & resolved_positions
+    )
+    unresolved_truth_probe_retain_pending_positions = (
+        truth_probe_retain_pending_positions
+        - resolved_truth_probe_retain_pending_positions
+    )
     return {
         "count": terminal_event_count,
         "position_ids": sorted(terminal_positions),
@@ -2116,6 +2142,22 @@ def _build_resolved_terminal_zero_qty_reduce_only_summary(
         "resolved_position_ids": sorted(resolved_terminal_positions),
         "unresolved_count": len(unresolved_positions),
         "unresolved_position_ids": sorted(unresolved_positions),
+        "truth_probe_retain_pending_count": truth_probe_retain_pending_count,
+        "truth_probe_retain_pending_position_ids": (
+            sorted(truth_probe_retain_pending_positions)
+        ),
+        "truth_probe_retain_pending_resolved_count": len(
+            resolved_truth_probe_retain_pending_positions
+        ),
+        "truth_probe_retain_pending_resolved_position_ids": (
+            sorted(resolved_truth_probe_retain_pending_positions)
+        ),
+        "truth_probe_retain_pending_unresolved_count": len(
+            unresolved_truth_probe_retain_pending_positions
+        ),
+        "truth_probe_retain_pending_unresolved_position_ids": (
+            sorted(unresolved_truth_probe_retain_pending_positions)
+        ),
         "current_exchange_truth_clean": current_clean,
     }
 
@@ -2126,13 +2168,21 @@ def _order_error_resolved_by_terminal_zero_qty(
 ) -> bool:
     if not resolved_terminal_zero_qty_summary:
         return False
-    if int(resolved_terminal_zero_qty_summary.get("resolved_count", 0) or 0) <= 0:
-        return False
-    if not _payload_is_bybit_terminal_zero_qty_reduce_only(payload):
+    if not (
+        _payload_is_bybit_terminal_zero_qty_reduce_only(payload)
+        or _payload_is_terminal_zero_qty_truth_probe_retained(payload)
+    ):
         return False
     position_id = str(payload.get("position_id") or "")
     resolved = set(
         resolved_terminal_zero_qty_summary.get("resolved_position_ids", []) or []
+    )
+    resolved.update(
+        resolved_terminal_zero_qty_summary.get(
+            "truth_probe_retain_pending_resolved_position_ids",
+            [],
+        )
+        or []
     )
     return bool(position_id and position_id in resolved)
 
@@ -3692,6 +3742,7 @@ def _build_entry_market_evidence_summary(
     oi_failed_count = 0
     oi_blocked_candidate_count = 0
     quote_blocked_candidate_count = 0
+    blocked_owner_stats: dict[str, dict[str, Any]] = {}
 
     for rec in events:
         kind = str(rec.get("kind") or "")
@@ -3715,6 +3766,31 @@ def _build_entry_market_evidence_summary(
                 oi_blocked_candidate_count += 1
             elif evidence_class == "quote":
                 quote_blocked_candidate_count += 1
+            owner_id = str(contract.get("owner_id") or "")
+            if owner_id:
+                stat = blocked_owner_stats.setdefault(
+                    owner_id,
+                    {
+                        "owner_id": owner_id,
+                        "count": 0,
+                        "actions": {},
+                        "evidence_classes": {},
+                        "reasons": {},
+                    },
+                )
+                stat["count"] = int(stat.get("count") or 0) + 1
+                actions = stat["actions"]
+                if isinstance(actions, dict):
+                    actions[action] = int(actions.get(action) or 0) + 1
+                classes = stat["evidence_classes"]
+                if isinstance(classes, dict):
+                    classes[evidence_class] = int(
+                        classes.get(evidence_class) or 0
+                    ) + 1
+                reasons = stat["reasons"]
+                if isinstance(reasons, dict):
+                    reason = str(contract.get("reason") or "unknown")
+                    reasons[reason] = int(reasons.get(reason) or 0) + 1
         if action == "terminal_candidate_rewarm":
             terminal_candidate_rewarm_count += 1
             unresolved_blocker_count += 1
@@ -3743,9 +3819,33 @@ def _build_entry_market_evidence_summary(
                 ),
             })
 
+    top_blocked_owner_ids: list[dict[str, Any]] = []
+    for stat in sorted(
+        blocked_owner_stats.values(),
+        key=lambda item: (
+            -int(item.get("count") or 0),
+            str(item.get("owner_id") or ""),
+        ),
+    )[:12]:
+        top_blocked_owner_ids.append({
+            "owner_id": str(stat.get("owner_id") or ""),
+            "count": int(stat.get("count") or 0),
+            "actions": dict(sorted((stat.get("actions") or {}).items())),
+            "evidence_classes": dict(
+                sorted((stat.get("evidence_classes") or {}).items())
+            ),
+            "reasons": dict(sorted((stat.get("reasons") or {}).items())),
+        })
+
     return {
         "action_counts": dict(sorted(action_counts.items())),
         "blocked_candidate_count": blocked_candidate_count,
+        "candidate_admission_noise_summary": {
+            "blocks_production_gate": False,
+            "current_scope": "entry_candidate_admission",
+            "next_action": "targeted_refresh_or_data_source_backfill",
+            "top_blocked_owner_ids": top_blocked_owner_ids,
+        },
         "diagnostic_recovered_overbudget_count": (
             diagnostic_recovered_overbudget_count
         ),
@@ -5205,12 +5305,23 @@ def _build_business_progression_quality_summary(
                     ] += 1
                 samples = close_reconciliation_evidence_gap_summary["samples"]
                 if isinstance(samples, list) and len(samples) < 12:
+                    terminal_flat_gap = action == "terminal_flat_accounting_gap"
                     samples.append({
                         "action": action,
+                        "audit_status": (
+                            "terminal_flat_backfill_required"
+                            if terminal_flat_gap
+                            else "blocking_reconciliation_required"
+                        ),
                         "blocks_business_terminal": bool(
                             reconciliation_contract.get(
                                 "blocks_business_terminal"
                             )
+                        ),
+                        "next_action": (
+                            "backfill_trade_statement_or_archive_gap"
+                            if terminal_flat_gap
+                            else "reconcile_missing_trade_statement_before_terminal"
                         ),
                         "owner_id": str(
                             reconciliation_contract.get("owner_id") or ""
@@ -5221,6 +5332,11 @@ def _build_business_progression_quality_summary(
                             or ""
                         ),
                         "symbol": str(reconciliation_contract.get("symbol") or ""),
+                        "truth_source": (
+                            "exchange_flat_no_open_orders"
+                            if terminal_flat_gap
+                            else "local_reconciliation_incomplete"
+                        ),
                     })
         admission_degraded_suppressed_count += int(
             issue_counts.get("admission_degraded_suppressed_count", 0) or 0
@@ -5505,6 +5621,7 @@ def _build_diagnostic_noise_summary(
     production_acceptance_gate: dict[str, Any] | None,
     business_progression_quality_summary: dict[str, Any],
     resolved_close_order_error_summary: dict[str, Any] | None = None,
+    resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gate = production_acceptance_gate if isinstance(production_acceptance_gate, dict) else {}
     business = (
@@ -5515,6 +5632,11 @@ def _build_diagnostic_noise_summary(
     resolved_close_errors = (
         resolved_close_order_error_summary
         if isinstance(resolved_close_order_error_summary, dict)
+        else {}
+    )
+    resolved_terminal_zero_qty = (
+        resolved_terminal_zero_qty_summary
+        if isinstance(resolved_terminal_zero_qty_summary, dict)
         else {}
     )
     resolved_close_artifact_count = int(
@@ -5640,7 +5762,7 @@ def _build_diagnostic_noise_summary(
             + resolved_close_artifact_count
         )
 
-    return {
+    result = {
         "visibility_counts": dict(sorted(visibility_counts.items())),
         "historical_terminalized_over_budget_count": historical_over_budget_count,
         "resolved_close_artifact_count": resolved_close_artifact_count,
@@ -5650,6 +5772,39 @@ def _build_diagnostic_noise_summary(
         "current_blocker_count": int(visibility_counts.get("current_blocker", 0)),
         "samples": samples,
     }
+    truth_probe_count = int(
+        resolved_terminal_zero_qty.get("truth_probe_retain_pending_count") or 0
+    )
+    truth_probe_resolved_count = int(
+        resolved_terminal_zero_qty.get(
+            "truth_probe_retain_pending_resolved_count"
+        )
+        or 0
+    )
+    if truth_probe_count > 0:
+        visibility_counts["historical_terminal_evidence"] = (
+            visibility_counts.get("historical_terminal_evidence", 0)
+            + truth_probe_resolved_count
+        )
+        result["visibility_counts"] = dict(sorted(visibility_counts.items()))
+        result["terminal_zero_qty_truth_probe_count"] = truth_probe_count
+        result["terminal_zero_qty_truth_probe_resolved_count"] = (
+            truth_probe_resolved_count
+        )
+        result["terminal_zero_qty_truth_probe_position_ids"] = list(
+            resolved_terminal_zero_qty.get(
+                "truth_probe_retain_pending_position_ids",
+                [],
+            )
+            or []
+        )
+        result["current_blocker_count"] = int(
+            visibility_counts.get("current_blocker", 0)
+        )
+        result["current_admission_blocker_count"] = int(
+            visibility_counts.get("current_admission_blocker", 0)
+        )
+    return result
 
 
 def _build_cleanup_blocker_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -7046,6 +7201,7 @@ def run_diagnose(
         production_acceptance_gate=production_acceptance_gate,
         business_progression_quality_summary=business_progression_quality_summary,
         resolved_close_order_error_summary=resolved_close_order_error_summary,
+        resolved_terminal_zero_qty_summary=resolved_terminal_zero_qty_summary,
     )
     if code_side_blockers or exclude_strategy or exclude_liquidity:
         from scripts.analyze_production_blockers import build_code_side_blocker_view
