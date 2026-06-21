@@ -1273,6 +1273,13 @@ _EVENT_KIND_PHASES = {
     "execution.passive_small_fill_buffer_expired": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
     ),
+    "execution.min_notional_accumulating": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "execution.min_notional_abort_and_flatten": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
+    "execution.pending_entry_hedge_chunk_buffering": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "execution.passive_cycle_zero_fill": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "execution.passive_phase_switched": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "entry.abort_maker_cancel_requested": V1LifecycleClosurePhase.PENDING_ENTRY.value,

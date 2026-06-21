@@ -6666,6 +6666,103 @@ def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnin
     }
 
 
+def test_quantity_terminal_summary_resolves_planner_warning_with_flat_accounting_gap():
+    from scripts.diagnose_live import _build_entry_quantity_terminal_summary
+
+    events = [
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-terminal-gap",
+                "symbol": "HUSDT",
+                "common_quantity": 259.591,
+                "full_target_quantity": 249.208,
+                "quantity_plan_reason": "planner_quantity_adjustment",
+            },
+        },
+        {
+            "kind": "entry.opened",
+            "payload": {
+                "entry_id": "entry-terminal-gap",
+                "position_id": "entry-terminal-gap",
+                "symbol": "HUSDT",
+                "long_quantity": 259.591,
+                "short_quantity": 259.591,
+                "matched_quantity": 259.591,
+            },
+        },
+        {
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "entry-terminal-gap",
+                "symbol": "HUSDT",
+                "evidence_gap": True,
+                "evidence_gap_reason": "missing_short_close_trade_statement",
+                "statement_probe_status": "partial",
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                },
+            },
+        },
+    ]
+
+    summary = _build_entry_quantity_terminal_summary(events)
+
+    assert summary["common_quantity_mismatch_count"] == 1
+    assert summary["common_quantity_mismatch_warning_count"] == 0
+    assert summary["common_quantity_mismatch_warning_entry_ids"] == []
+    assert summary["resolved_quantity_adjustment_summary"] == {
+        "planner_quantity_adjustment_count": 1,
+        "hedge_exchange_step_rounding_count": 0,
+        "entry_ids": ["entry-terminal-gap"],
+        "samples": [
+            {
+                "entry_id": "entry-terminal-gap",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "planner_quantity_adjustment",
+                "symbol": "HUSDT",
+                "terminality": "terminal_flat_accounting_gap",
+            },
+        ],
+    }
+
+
+def test_quantity_terminal_summary_keeps_unproven_planner_mismatch_as_warning():
+    from scripts.diagnose_live import _build_entry_quantity_terminal_summary
+
+    summary = _build_entry_quantity_terminal_summary([
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-active-warning",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 2300.0,
+                "full_target_quantity": 2272.727,
+                "quantity_plan_reason": "planner_quantity_adjustment",
+            },
+        },
+        {
+            "kind": "entry.opened",
+            "payload": {
+                "entry_id": "entry-active-warning",
+                "position_id": "entry-active-warning",
+                "symbol": "HOMEUSDT",
+                "long_quantity": 2300.0,
+                "short_quantity": 2300.0,
+                "matched_quantity": 2300.0,
+            },
+        },
+    ])
+
+    assert summary["common_quantity_mismatch_count"] == 1
+    assert summary["common_quantity_mismatch_warning_count"] == 1
+    assert summary["common_quantity_mismatch_warning_entry_ids"] == [
+        "entry-active-warning"
+    ]
+
+
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):
     from scripts import diagnose_live as dl
 

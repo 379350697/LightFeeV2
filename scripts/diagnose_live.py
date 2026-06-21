@@ -6103,7 +6103,13 @@ def _build_production_acceptance_gate(
             else 0
         ),
     }
-    entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(events)
+    entry_quantity_terminal_summary = _build_entry_quantity_terminal_summary(
+        events,
+        {
+            "exchange_truth_flat": exchange_truth_flat,
+            "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        },
+    )
     entry_outcome_summary = _build_entry_outcome_summary(events)
     passive_zero_fill_exhausted_then_recovered_count = _count_passive_zero_fill_exhausted_then_recovered(
         events
@@ -7085,6 +7091,7 @@ def _build_entry_quantity_terminal_summary(
     quantity_warning_samples: list[dict[str, Any]] = []
     balanced_opened_entries: set[str] = set()
     terminal_flat_entries: set[str] = set()
+    terminal_flat_accounting_gap_entries: set[str] = set()
     residual_repair_completed_entries: set[str] = set()
     residual_repair_completed_symbols: set[str] = set()
     unopened_terminal_entries: set[str] = set()
@@ -7092,6 +7099,11 @@ def _build_entry_quantity_terminal_summary(
     resolved_quantity_adjustment_samples: list[dict[str, Any]] = []
     resolved_planner_quantity_adjustment_count = 0
     resolved_hedge_exchange_step_rounding_count = 0
+    current_exchange_truth_clean = bool(
+        production_acceptance_gate
+        and production_acceptance_gate.get("exchange_truth_flat") is True
+        and production_acceptance_gate.get("exchange_truth_no_open_orders") is True
+    )
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -7130,6 +7142,10 @@ def _build_entry_quantity_terminal_summary(
                 and abs(long_closed - short_closed) <= 1e-9
             ):
                 terminal_flat_entries.add(entry_id)
+            elif contract_passive_close_has_terminal_truth(payload):
+                terminal_flat_entries.add(entry_id)
+                if payload.get("evidence_gap") is True:
+                    terminal_flat_accounting_gap_entries.add(entry_id)
         elif kind == "runtime.position_lifecycle_terminal":
             terminal_state = str(payload.get("terminal_state") or "").lower()
             reason = str(payload.get("reason") or "").lower()
@@ -7266,7 +7282,10 @@ def _build_entry_quantity_terminal_summary(
                     resolved_planner_adjustment = (
                         reason_family == "planner_quantity_adjustment"
                         and entry_id in balanced_opened_entries
-                        and entry_id in terminal_flat_entries
+                        and (
+                            entry_id in terminal_flat_entries
+                            or current_exchange_truth_clean
+                        )
                     )
                     unopened_terminal_adjustment = (
                         reason_family == "planner_quantity_adjustment"
@@ -7277,12 +7296,17 @@ def _build_entry_quantity_terminal_summary(
                         resolved_planner_quantity_adjustment_count += 1
                         resolved_quantity_adjustment_entries.add(entry_id)
                         if len(resolved_quantity_adjustment_samples) < 12:
-                            resolved_quantity_adjustment_samples.append({
+                            sample = {
                                 "entry_id": entry_id,
                                 "kind": "common_quantity_mismatch",
                                 "reason_family": reason_family,
                                 "symbol": str(payload.get("symbol") or ""),
-                            })
+                            }
+                            if entry_id in terminal_flat_accounting_gap_entries:
+                                sample["terminality"] = "terminal_flat_accounting_gap"
+                            elif current_exchange_truth_clean:
+                                sample["terminality"] = "current_exchange_truth_clean"
+                            resolved_quantity_adjustment_samples.append(sample)
                     elif unopened_terminal_adjustment:
                         resolved_quantity_adjustment_entries.add(entry_id)
                         if len(resolved_quantity_adjustment_samples) < 12:
