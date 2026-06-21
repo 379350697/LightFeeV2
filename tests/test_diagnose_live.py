@@ -6637,6 +6637,7 @@ def test_quantity_terminal_summary_resolves_terminal_planner_and_rounding_warnin
     ]
     assert summary["resolved_quantity_adjustment_summary"] == {
         "planner_quantity_adjustment_count": 1,
+        "entry_quantity_exchange_step_rounding_count": 0,
         "hedge_exchange_step_rounding_count": 2,
         "entry_ids": [
             "entry-balanced-flat",
@@ -6715,6 +6716,7 @@ def test_quantity_terminal_summary_resolves_planner_warning_with_flat_accounting
     assert summary["common_quantity_mismatch_warning_entry_ids"] == []
     assert summary["resolved_quantity_adjustment_summary"] == {
         "planner_quantity_adjustment_count": 1,
+        "entry_quantity_exchange_step_rounding_count": 0,
         "hedge_exchange_step_rounding_count": 0,
         "entry_ids": ["entry-terminal-gap"],
         "samples": [
@@ -6754,13 +6756,146 @@ def test_quantity_terminal_summary_keeps_unproven_planner_mismatch_as_warning():
                 "matched_quantity": 2300.0,
             },
         },
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-active-rounding-warning",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 2400.0,
+                "full_target_quantity": 2389.8432,
+                "quantity_plan_reason": "exchange_step_rounding",
+            },
+        },
     ])
 
-    assert summary["common_quantity_mismatch_count"] == 1
-    assert summary["common_quantity_mismatch_warning_count"] == 1
+    assert summary["common_quantity_mismatch_count"] == 2
+    assert summary["common_quantity_mismatch_warning_count"] == 2
     assert summary["common_quantity_mismatch_warning_entry_ids"] == [
-        "entry-active-warning"
+        "entry-active-rounding-warning",
+        "entry-active-warning",
     ]
+
+
+def test_quantity_terminal_summary_resolves_cloud_terminal_quantity_adjustments():
+    from scripts.diagnose_live import _build_entry_quantity_terminal_summary
+
+    clean_truth_gate = {
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+    }
+    events = [
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-abandoned-planner",
+                "symbol": "HUSDT",
+                "common_quantity": 252.4806,
+                "full_target_quantity": 242.3814,
+                "quantity_plan_reason": "planner_quantity_adjustment",
+            },
+        },
+        {
+            "kind": "reconciliation.entry_abandoned_flat",
+            "payload": {
+                "entry_id": "entry-abandoned-planner",
+                "symbol": "HUSDT",
+                "reason": "both_venues_zero",
+            },
+        },
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-unfilled-rounding",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 2400.0,
+                "full_target_quantity": 2399.4001,
+                "quantity_plan_reason": "exchange_step_rounding",
+            },
+        },
+        {
+            "kind": "entry.passive_unfilled",
+            "payload": {
+                "entry_id": "entry-unfilled-rounding",
+                "symbol": "HOMEUSDT",
+                "reason": "zero_fill_unfilled_removal",
+            },
+        },
+        {
+            "kind": "execution.entry_quantity_plan",
+            "payload": {
+                "entry_id": "entry-repaired-rounding",
+                "symbol": "HOMEUSDT",
+                "common_quantity": 2400.0,
+                "full_target_quantity": 2389.8432,
+                "quantity_plan_reason": "exchange_step_rounding",
+            },
+        },
+        {
+            "kind": "entry.opened",
+            "payload": {
+                "entry_id": "entry-repaired-rounding",
+                "position_id": "entry-repaired-rounding",
+                "symbol": "HOMEUSDT",
+                "long_quantity": 2300.0,
+                "short_quantity": 2300.0,
+                "matched_quantity": 2300.0,
+            },
+        },
+        {
+            "kind": "execution.residual_repair_completed",
+            "payload": {
+                "entry_id": "entry-repaired-rounding",
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-repaired-rounding",
+                "symbol": "HOMEUSDT",
+            },
+        },
+    ]
+
+    summary = _build_entry_quantity_terminal_summary(events, clean_truth_gate)
+
+    assert summary["common_quantity_mismatch_count"] == 3
+    assert summary["common_quantity_mismatch_warning_count"] == 0
+    assert summary["common_quantity_mismatch_warning_entry_ids"] == []
+    assert summary["quantity_warning_reason_counts"] == {}
+    assert summary["resolved_quantity_adjustment_summary"] == {
+        "planner_quantity_adjustment_count": 1,
+        "entry_quantity_exchange_step_rounding_count": 2,
+        "hedge_exchange_step_rounding_count": 0,
+        "entry_ids": [
+            "entry-abandoned-planner",
+            "entry-repaired-rounding",
+            "entry-unfilled-rounding",
+        ],
+        "samples": [
+            {
+                "entry_id": "entry-abandoned-planner",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "planner_quantity_adjustment",
+                "symbol": "HUSDT",
+                "terminality": "unopened_candidate_terminal",
+            },
+            {
+                "entry_id": "entry-repaired-rounding",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "exchange_step_rounding",
+                "symbol": "HOMEUSDT",
+                "terminality": "residual_repair_completed",
+            },
+            {
+                "entry_id": "entry-unfilled-rounding",
+                "kind": "common_quantity_mismatch",
+                "reason_family": "exchange_step_rounding",
+                "symbol": "HOMEUSDT",
+                "terminality": "unopened_candidate_terminal",
+            },
+        ],
+    }
 
 
 def test_run_diagnose_current_exchange_truth_closes_legacy_opened_positions(monkeypatch):

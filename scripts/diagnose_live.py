@@ -7098,6 +7098,7 @@ def _build_entry_quantity_terminal_summary(
     resolved_quantity_adjustment_entries: set[str] = set()
     resolved_quantity_adjustment_samples: list[dict[str, Any]] = []
     resolved_planner_quantity_adjustment_count = 0
+    resolved_entry_quantity_exchange_step_rounding_count = 0
     resolved_hedge_exchange_step_rounding_count = 0
     current_exchange_truth_clean = bool(
         production_acceptance_gate
@@ -7152,8 +7153,15 @@ def _build_entry_quantity_terminal_summary(
             if "flat" in terminal_state or "flat" in reason:
                 terminal_flat_entries.add(entry_id)
         elif kind in {
+            "exit.passive_close_resolved",
+            "exit.passive_close_fallback_terminal_flat",
+            "exit.passive_close_recovery_probe_flat",
+        }:
+            terminal_flat_entries.add(entry_id)
+        elif kind in {
             "entry.aborted",
             "entry.passive_unfilled",
+            "reconciliation.entry_abandoned_flat",
             "runtime.entry_admission_blocked",
             "pending_entry.hedge_admission_blocked",
         }:
@@ -7279,21 +7287,33 @@ def _build_entry_quantity_terminal_summary(
                         or payload.get("reason_family")
                         or "unknown"
                     )
-                    resolved_planner_adjustment = (
-                        reason_family == "planner_quantity_adjustment"
-                        and entry_id in balanced_opened_entries
+                    resolvable_common_adjustment = reason_family in {
+                        "planner_quantity_adjustment",
+                        "exchange_step_rounding",
+                    }
+                    opened_terminal_adjustment = (
+                        entry_id in balanced_opened_entries
                         and (
                             entry_id in terminal_flat_entries
+                            or entry_id in terminal_flat_accounting_gap_entries
+                            or entry_id in residual_repair_completed_entries
                             or current_exchange_truth_clean
                         )
                     )
                     unopened_terminal_adjustment = (
-                        reason_family == "planner_quantity_adjustment"
+                        resolvable_common_adjustment
                         and entry_id in unopened_terminal_entries
                         and entry_id not in balanced_opened_entries
                     )
-                    if resolved_planner_adjustment:
-                        resolved_planner_quantity_adjustment_count += 1
+                    if resolvable_common_adjustment and (
+                        opened_terminal_adjustment
+                        or unopened_terminal_adjustment
+                        or current_exchange_truth_clean
+                    ):
+                        if reason_family == "planner_quantity_adjustment":
+                            resolved_planner_quantity_adjustment_count += 1
+                        elif reason_family == "exchange_step_rounding":
+                            resolved_entry_quantity_exchange_step_rounding_count += 1
                         resolved_quantity_adjustment_entries.add(entry_id)
                         if len(resolved_quantity_adjustment_samples) < 12:
                             sample = {
@@ -7304,19 +7324,13 @@ def _build_entry_quantity_terminal_summary(
                             }
                             if entry_id in terminal_flat_accounting_gap_entries:
                                 sample["terminality"] = "terminal_flat_accounting_gap"
+                            elif unopened_terminal_adjustment:
+                                sample["terminality"] = "unopened_candidate_terminal"
+                            elif entry_id in residual_repair_completed_entries:
+                                sample["terminality"] = "residual_repair_completed"
                             elif current_exchange_truth_clean:
                                 sample["terminality"] = "current_exchange_truth_clean"
                             resolved_quantity_adjustment_samples.append(sample)
-                    elif unopened_terminal_adjustment:
-                        resolved_quantity_adjustment_entries.add(entry_id)
-                        if len(resolved_quantity_adjustment_samples) < 12:
-                            resolved_quantity_adjustment_samples.append({
-                                "entry_id": entry_id,
-                                "kind": "common_quantity_mismatch",
-                                "reason_family": reason_family,
-                                "symbol": str(payload.get("symbol") or ""),
-                                "terminality": "unopened_candidate_terminal",
-                            })
                     elif entry_id not in tolerated_dust_entry_ids:
                         quantity_mismatch_warning_entries.add(entry_id)
                         add_warning_reason("common_quantity_mismatch", payload)
@@ -7357,6 +7371,9 @@ def _build_entry_quantity_terminal_summary(
         "resolved_quantity_adjustment_summary": {
             "planner_quantity_adjustment_count": (
                 resolved_planner_quantity_adjustment_count
+            ),
+            "entry_quantity_exchange_step_rounding_count": (
+                resolved_entry_quantity_exchange_step_rounding_count
             ),
             "hedge_exchange_step_rounding_count": (
                 resolved_hedge_exchange_step_rounding_count
