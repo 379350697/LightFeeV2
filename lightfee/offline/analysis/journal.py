@@ -150,26 +150,180 @@ def quick_flat_event_key(event: dict) -> tuple:
     return (str(event.get("kind", "") or ""), position_id, reason, ts_ms)
 
 
+_ENTRY_START_KIND_PRIORITY = {
+    "review.candidate_shortlisted": 10,
+    "execution.entry_selected": 20,
+    "order.submitted": 30,
+    "runtime.entry_dispatched": 40,
+    "runtime.pending_entry_registered": 50,
+}
+
+
+def _entry_position_id(payload: dict) -> str:
+    return str(
+        payload.get("position_id")
+        or payload.get("entry_id")
+        or payload.get("internal_entry_id")
+        or payload.get("pending_id")
+        or ""
+    )
+
+
+def _positive_payload_ts(payload: dict, key: str) -> int:
+    try:
+        value = int(payload.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _entry_time_info(records: list[dict]) -> dict[str, dict]:
+    info_by_position: dict[str, dict] = {}
+
+    def info_for(position_id: str) -> dict:
+        return info_by_position.setdefault(
+            position_id,
+            {
+                "position_id": position_id,
+                "symbol": "",
+                "entered_at_ms": 0,
+                "opened_at_ms": 0,
+                "opened_payload_at_ms": 0,
+                "opened_event_ts_ms": 0,
+                "opened_quality": "",
+                "started_at_ms": 0,
+                "started_kind": "",
+                "started_priority": 0,
+            },
+        )
+
+    for record in records:
+        kind = str(record.get("kind", "") or "")
+        payload = _event_payload(record)
+        position_id = _entry_position_id(payload)
+        if not position_id:
+            continue
+        ts_ms = _event_ts_ms(record)
+        info = info_for(position_id)
+        symbol = str(payload.get("symbol", "") or "")
+        if symbol and not info["symbol"]:
+            info["symbol"] = symbol
+
+        if kind == "entry.opened":
+            entered_at_ms = _positive_payload_ts(payload, "entered_at_ms")
+            opened_payload_at_ms = _positive_payload_ts(payload, "opened_at_ms")
+            opened_at_ms = opened_payload_at_ms or ts_ms
+            if entered_at_ms and (
+                not info["entered_at_ms"] or entered_at_ms < info["entered_at_ms"]
+            ):
+                info["entered_at_ms"] = entered_at_ms
+            if opened_payload_at_ms and (
+                not info["opened_payload_at_ms"]
+                or opened_payload_at_ms < info["opened_payload_at_ms"]
+            ):
+                info["opened_payload_at_ms"] = opened_payload_at_ms
+            if opened_at_ms and (
+                not info["opened_at_ms"] or opened_at_ms < info["opened_at_ms"]
+            ):
+                info["opened_at_ms"] = opened_at_ms
+            if ts_ms and (
+                not info["opened_event_ts_ms"] or ts_ms < info["opened_event_ts_ms"]
+            ):
+                info["opened_event_ts_ms"] = ts_ms
+            quality = str(payload.get("entry_timestamp_quality", "") or "")
+            if quality and not info["opened_quality"]:
+                info["opened_quality"] = quality
+            continue
+
+        priority = _ENTRY_START_KIND_PRIORITY.get(kind)
+        if priority is None or ts_ms <= 0:
+            continue
+        current_started = int(info["started_at_ms"] or 0)
+        current_priority = int(info["started_priority"] or 0)
+        if (
+            current_started <= 0
+            or ts_ms < current_started
+            or (ts_ms == current_started and priority < current_priority)
+        ):
+            info["started_at_ms"] = ts_ms
+            info["started_kind"] = kind
+            info["started_priority"] = priority
+
+    return info_by_position
+
+
+def _select_quick_flat_entry_time(info: dict, terminal_ts_ms: int) -> tuple[int, str, str]:
+    entered_at_ms = int(info.get("entered_at_ms") or 0)
+    entered_quality = str(info.get("opened_quality") or "exchange_fill_exact")
+    if entered_at_ms > 0 and entered_quality != "finalization_fallback":
+        return (
+            entered_at_ms,
+            "entry.opened.entered_at_ms",
+            entered_quality,
+        )
+
+    started_at_ms = int(info.get("started_at_ms") or 0)
+    opened_at_ms = int(info.get("opened_at_ms") or 0)
+    opened_event_ts_ms = int(info.get("opened_event_ts_ms") or 0)
+    if started_at_ms > 0:
+        opened_reference = entered_at_ms or opened_at_ms or opened_event_ts_ms
+        if (
+            terminal_ts_ms > 0
+            and opened_reference > 0
+            and started_at_ms < opened_reference
+        ):
+            return (
+                started_at_ms,
+                str(info.get("started_kind") or "entry_lifecycle_start"),
+                "lifecycle_start",
+            )
+
+    if entered_at_ms > 0:
+        return (
+            entered_at_ms,
+            "entry.opened.entered_at_ms",
+            entered_quality,
+        )
+
+    opened_payload_at_ms = int(info.get("opened_payload_at_ms") or 0)
+    if opened_at_ms > 0:
+        if opened_payload_at_ms > 0:
+            return (
+                opened_at_ms,
+                "entry.opened.opened_at_ms",
+                str(info.get("opened_quality") or "opened_at_ms"),
+            )
+        return (
+            opened_at_ms,
+            "entry.opened.event_ts_ms",
+            "legacy_event_time",
+        )
+    if opened_event_ts_ms > 0:
+        return (
+            opened_event_ts_ms,
+            "entry.opened.event_ts_ms",
+            "legacy_event_time",
+        )
+    if started_at_ms > 0:
+        return (
+            started_at_ms,
+            str(info.get("started_kind") or "entry_lifecycle_start"),
+            "lifecycle_start",
+        )
+    return (0, "", "")
+
+
 def summarize_quick_flat_events(
     records: list[dict],
     *,
     quick_flat_window_ms: int = 60_000,
 ) -> dict[str, int | str | list[dict[str, int | str]]]:
     """Summarize quick-flat terminal observations without double-counting exits."""
-    entry_opened_at: dict[str, int] = {}
-    for record in records:
-        if record.get("kind") != "entry.opened":
-            continue
-        payload = _event_payload(record)
-        position_id = str(payload.get("position_id", "") or "")
-        if not position_id:
-            continue
-        ts_ms = _event_ts_ms(record)
-        if position_id not in entry_opened_at or ts_ms < entry_opened_at[position_id]:
-            entry_opened_at[position_id] = ts_ms
+    entry_times = _entry_time_info(records)
 
     seen_exit_keys: set[tuple] = set()
     quick_flat_positions: dict[str, dict] = {}
+    resolved_positions: dict[str, dict] = {}
     duplicate_event_count = 0
     low_confidence_event_count = 0
     window_ms = int(quick_flat_window_ms or 0)
@@ -192,11 +346,32 @@ def summarize_quick_flat_events(
             continue
         seen_exit_keys.add(key)
 
-        opened_at_ms = entry_opened_at.get(position_id)
-        if opened_at_ms is None:
+        entry_info = entry_times.get(position_id)
+        if not entry_info:
             continue
         closed_at_ms = _event_ts_ms(record)
+        opened_at_ms, time_source, timestamp_quality = _select_quick_flat_entry_time(
+            entry_info,
+            closed_at_ms,
+        )
+        if opened_at_ms <= 0:
+            continue
         elapsed_ms = closed_at_ms - opened_at_ms
+        terminal = {
+            "entry_started_ts_ms": int(entry_info.get("started_at_ms") or opened_at_ms),
+            "entry_entered_ts_ms": int(entry_info.get("entered_at_ms") or 0),
+            "entry_opened_ts_ms": int(entry_info.get("opened_at_ms") or opened_at_ms),
+            "entry_opened_event_ts_ms": int(
+                entry_info.get("opened_event_ts_ms") or entry_info.get("opened_at_ms") or opened_at_ms
+            ),
+            "kind": kind,
+            "position_id": position_id,
+            "symbol": str(payload.get("symbol") or entry_info.get("symbol") or ""),
+            "ts_ms": closed_at_ms,
+            "elapsed_ms": elapsed_ms,
+            "time_source": time_source,
+            "timestamp_quality": timestamp_quality,
+        }
         if 0 <= elapsed_ms <= window_ms:
             previous = quick_flat_positions.get(position_id)
             priority = _QUICK_FLAT_TERMINAL_KIND_PRIORITY[kind]
@@ -207,15 +382,29 @@ def summarize_quick_flat_events(
                 int(previous["priority"]),
                 int(previous["ts_ms"]),
             ):
-                quick_flat_positions[position_id] = {
-                    "entry_opened_ts_ms": opened_at_ms,
-                    "kind": kind,
-                    "priority": priority,
-                    "position_id": position_id,
-                    "symbol": str(payload.get("symbol", "") or ""),
-                    "ts_ms": closed_at_ms,
-                    "elapsed_ms": elapsed_ms,
-                }
+                terminal["priority"] = priority
+                quick_flat_positions[position_id] = terminal
+            continue
+        opened_reference = int(
+            entry_info.get("opened_at_ms")
+            or entry_info.get("opened_event_ts_ms")
+            or 0
+        )
+        if (
+            opened_reference > 0
+            and 0 <= closed_at_ms - opened_reference <= window_ms
+        ):
+            previous = resolved_positions.get(position_id)
+            priority = _QUICK_FLAT_TERMINAL_KIND_PRIORITY[kind]
+            if previous is None or (
+                priority,
+                closed_at_ms,
+            ) >= (
+                int(previous["priority"]),
+                int(previous["ts_ms"]),
+            ):
+                terminal["priority"] = priority
+                resolved_positions[position_id] = terminal
 
     terminal_kind_counts: dict[str, int] = {}
     for terminal in quick_flat_positions.values():
@@ -227,6 +416,7 @@ def summarize_quick_flat_events(
         "quick_flat_count": len(quick_flat_positions),
         "duplicate_event_count": duplicate_event_count,
         "quick_flat_duplicate_event_count": duplicate_event_count,
+        "resolved_long_pending_fast_close_count": len(resolved_positions),
         "low_confidence_event_count": low_confidence_event_count,
         "close_identity_confidence": close_identity_confidence,
         "quick_flat_terminal_kind_counts": terminal_kind_counts,
@@ -235,12 +425,43 @@ def summarize_quick_flat_events(
                 "position_id": str(terminal.get("position_id") or ""),
                 "symbol": str(terminal.get("symbol") or ""),
                 "entry_opened_ts_ms": int(terminal.get("entry_opened_ts_ms") or 0),
+                "entry_started_ts_ms": int(terminal.get("entry_started_ts_ms") or 0),
+                "entry_entered_ts_ms": int(terminal.get("entry_entered_ts_ms") or 0),
+                "entry_opened_event_ts_ms": int(
+                    terminal.get("entry_opened_event_ts_ms") or 0
+                ),
                 "terminal_ts_ms": int(terminal.get("ts_ms") or 0),
                 "terminal_kind": str(terminal.get("kind") or ""),
                 "elapsed_ms": int(terminal.get("elapsed_ms") or 0),
+                "time_source": str(terminal.get("time_source") or ""),
+                "timestamp_quality": str(terminal.get("timestamp_quality") or ""),
             }
             for terminal in sorted(
                 quick_flat_positions.values(),
+                key=lambda item: (
+                    int(item.get("ts_ms") or 0),
+                    str(item.get("position_id") or ""),
+                ),
+            )[:12]
+        ],
+        "resolved_samples": [
+            {
+                "position_id": str(terminal.get("position_id") or ""),
+                "symbol": str(terminal.get("symbol") or ""),
+                "entry_started_ts_ms": int(terminal.get("entry_started_ts_ms") or 0),
+                "entry_entered_ts_ms": int(terminal.get("entry_entered_ts_ms") or 0),
+                "entry_opened_ts_ms": int(terminal.get("entry_opened_ts_ms") or 0),
+                "entry_opened_event_ts_ms": int(
+                    terminal.get("entry_opened_event_ts_ms") or 0
+                ),
+                "terminal_ts_ms": int(terminal.get("ts_ms") or 0),
+                "terminal_kind": str(terminal.get("kind") or ""),
+                "elapsed_ms": int(terminal.get("elapsed_ms") or 0),
+                "time_source": str(terminal.get("time_source") or ""),
+                "timestamp_quality": str(terminal.get("timestamp_quality") or ""),
+            }
+            for terminal in sorted(
+                resolved_positions.values(),
                 key=lambda item: (
                     int(item.get("ts_ms") or 0),
                     str(item.get("position_id") or ""),

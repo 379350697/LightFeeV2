@@ -487,6 +487,13 @@ class PendingEntry:
     # V1: PendingEntryHedge.next_progress_poll_ms — when to next query
     # passive order progress and run maintain_pending_entry_passive_order.
     next_progress_poll_ms: int = 0
+    # --- V1 entry timestamp contract ---
+    # V1 OpenPosition.entered_at_ms = max(maker_fill.filled_at_ms, hedge_fill.filled_at_ms).
+    # These are leg fill completion observations; opened_at_ms remains local finalization time.
+    maker_leg_filled_at_ms: int = 0
+    hedge_leg_filled_at_ms: int = 0
+    maker_fill_timestamp_quality: str = ""
+    hedge_fill_timestamp_quality: str = ""
 
     def __post_init__(self) -> None:
         """Migrate legacy string hedge_inflight to HedgeInflight | None."""
@@ -515,6 +522,75 @@ class PendingEntry:
             else PendingEntryRemainderSlice.from_dict(item)
             for item in (self.maker_remainder_slices or [])
         ]
+
+    @staticmethod
+    def _fill_timestamp_quality_rank(quality: str) -> int:
+        quality = str(quality or "")
+        if quality == "exchange_fill_exact":
+            return 3
+        if quality == "live_truth_observed":
+            return 2
+        if quality == "observed":
+            return 2
+        if quality:
+            return 1
+        return 0
+
+    def _note_leg_fill_timestamp(
+        self,
+        *,
+        leg: str,
+        filled_at_ms: int,
+        quality: str,
+    ) -> None:
+        ts_ms = int(filled_at_ms or 0)
+        if ts_ms <= 0:
+            return
+        quality = str(quality or "observed")
+        if leg == "maker":
+            current_ts = int(self.maker_leg_filled_at_ms or 0)
+            current_quality = str(self.maker_fill_timestamp_quality or "")
+            current_rank = self._fill_timestamp_quality_rank(current_quality)
+            new_rank = self._fill_timestamp_quality_rank(quality)
+            if current_ts <= 0 or new_rank > current_rank or (
+                new_rank == current_rank and ts_ms > current_ts
+            ):
+                self.maker_leg_filled_at_ms = ts_ms
+                self.maker_fill_timestamp_quality = quality
+            return
+        current_ts = int(self.hedge_leg_filled_at_ms or 0)
+        current_quality = str(self.hedge_fill_timestamp_quality or "")
+        current_rank = self._fill_timestamp_quality_rank(current_quality)
+        new_rank = self._fill_timestamp_quality_rank(quality)
+        if current_ts <= 0 or new_rank > current_rank or (
+            new_rank == current_rank and ts_ms > current_ts
+        ):
+            self.hedge_leg_filled_at_ms = ts_ms
+            self.hedge_fill_timestamp_quality = quality
+
+    def note_maker_fill_observed(
+        self,
+        filled_at_ms: int,
+        *,
+        quality: str = "observed",
+    ) -> None:
+        self._note_leg_fill_timestamp(
+            leg="maker",
+            filled_at_ms=filled_at_ms,
+            quality=quality,
+        )
+
+    def note_hedge_fill_observed(
+        self,
+        filled_at_ms: int,
+        *,
+        quality: str = "observed",
+    ) -> None:
+        self._note_leg_fill_timestamp(
+            leg="hedge",
+            filled_at_ms=filled_at_ms,
+            quality=quality,
+        )
 
     # --- V1 recovery helpers (CONTRACT RECOVERY-002/003) ---
 
@@ -1205,6 +1281,10 @@ class EngineState:
                     "hedge_client_order_id": p.hedge_client_order_id,
                     "maker_leg_filled": p.maker_leg_filled,
                     "hedge_leg_filled": p.hedge_leg_filled,
+                    "maker_leg_filled_at_ms": p.maker_leg_filled_at_ms,
+                    "hedge_leg_filled_at_ms": p.hedge_leg_filled_at_ms,
+                    "maker_fill_timestamp_quality": p.maker_fill_timestamp_quality,
+                    "hedge_fill_timestamp_quality": p.hedge_fill_timestamp_quality,
                     "deadline_ms": p.deadline_ms,
                     "uncertain_outcome": p.uncertain_outcome,
                     "reconcile_attempt": p.reconcile_attempt,

@@ -59,7 +59,11 @@ from lightfee.engine.venue_private_health import (
     private_health_status_for_admission_reason,
 )
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
-from lightfee.offline.analysis.journal import summarize_quick_flat_events
+from lightfee.offline.analysis.journal import (
+    _entry_time_info,
+    _select_quick_flat_entry_time,
+    summarize_quick_flat_events,
+)
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
@@ -4064,6 +4068,7 @@ def _entry_artifact_id(payload: dict[str, Any]) -> str:
 
 def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     artifacts: dict[str, dict[str, Any]] = {}
+    entry_times = _entry_time_info(events)
 
     def artifact_for(entry_id: str) -> dict[str, Any]:
         return artifacts.setdefault(
@@ -4073,7 +4078,12 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
                 "symbol": "",
                 "selected_at_ms": 0,
                 "pending_created_at_ms": 0,
+                "entry_started_at_ms": 0,
+                "entered_at_ms": 0,
                 "opened_at_ms": 0,
+                "semantic_entry_at_ms": 0,
+                "entry_time_source": "",
+                "entry_timestamp_quality": "",
                 "close_created_at_ms": 0,
                 "terminal_at_ms": 0,
                 "terminal_kind": "",
@@ -4108,7 +4118,11 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
         elif kind == "runtime.pending_entry_registered":
             artifact["pending_created_at_ms"] = ts_ms
         elif kind == "entry.opened":
-            artifact["opened_at_ms"] = ts_ms
+            artifact["opened_at_ms"] = int(payload.get("opened_at_ms") or ts_ms or 0)
+            artifact["entered_at_ms"] = int(payload.get("entered_at_ms") or 0)
+            artifact["entry_timestamp_quality"] = str(
+                payload.get("entry_timestamp_quality") or ""
+            )
         elif kind == "exit.passive_close_created":
             artifact["close_created_at_ms"] = ts_ms
         elif kind == "pending_entry.long_lived_pending_entry":
@@ -4124,6 +4138,8 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
     samples: list[dict[str, Any]] = []
     max_selected_to_terminal_ms = 0
     max_pending_created_to_terminal_ms = 0
+    max_entered_to_terminal_ms = 0
+    max_semantic_entry_to_terminal_ms = 0
     max_close_created_to_terminal_ms = 0
     long_lived_pending_entry_count = 0
     close_data_quality_warning_count = 0
@@ -4131,6 +4147,24 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
         terminal_at_ms = int(artifact["terminal_at_ms"] or 0)
         selected_at_ms = int(artifact["selected_at_ms"] or 0)
         pending_created_at_ms = int(artifact["pending_created_at_ms"] or 0)
+        entry_info = entry_times.get(str(artifact["entry_id"] or ""), {})
+        semantic_entry_ms, entry_time_source, timestamp_quality = (
+            _select_quick_flat_entry_time(entry_info, terminal_at_ms)
+            if entry_info
+            else (0, "", "")
+        )
+        entry_started_at_ms = int(
+            entry_info.get("started_at_ms")
+            or semantic_entry_ms
+            or artifact["entered_at_ms"]
+            or artifact["opened_at_ms"]
+            or 0
+        )
+        if semantic_entry_ms > 0:
+            artifact["semantic_entry_at_ms"] = semantic_entry_ms
+            artifact["entry_time_source"] = entry_time_source
+            artifact["entry_timestamp_quality"] = timestamp_quality
+            artifact["entry_started_at_ms"] = entry_started_at_ms
         close_created_at_ms = int(artifact["close_created_at_ms"] or 0)
         selected_to_terminal_ms = (
             max(0, terminal_at_ms - selected_at_ms)
@@ -4140,6 +4174,18 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
         pending_created_to_terminal_ms = (
             max(0, terminal_at_ms - pending_created_at_ms)
             if pending_created_at_ms > 0 and terminal_at_ms > 0
+            else 0
+        )
+        entered_at_ms = int(artifact["entered_at_ms"] or 0)
+        entered_to_terminal_ms = (
+            max(0, terminal_at_ms - entered_at_ms)
+            if entered_at_ms > 0 and terminal_at_ms > 0
+            else 0
+        )
+        semantic_entry_at_ms = int(artifact["semantic_entry_at_ms"] or 0)
+        semantic_entry_to_terminal_ms = (
+            max(0, terminal_at_ms - semantic_entry_at_ms)
+            if semantic_entry_at_ms > 0 and terminal_at_ms > 0
             else 0
         )
         close_created_to_terminal_ms = (
@@ -4153,6 +4199,12 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
         max_pending_created_to_terminal_ms = max(
             max_pending_created_to_terminal_ms, pending_created_to_terminal_ms
         )
+        max_entered_to_terminal_ms = max(
+            max_entered_to_terminal_ms, entered_to_terminal_ms
+        )
+        max_semantic_entry_to_terminal_ms = max(
+            max_semantic_entry_to_terminal_ms, semantic_entry_to_terminal_ms
+        )
         max_close_created_to_terminal_ms = max(
             max_close_created_to_terminal_ms, close_created_to_terminal_ms
         )
@@ -4162,7 +4214,7 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
             long_lived_pending_entry_count += 1
         if close_warning:
             close_data_quality_warning_count += 1
-        if selected_to_terminal_ms or pending_created_to_terminal_ms or close_created_to_terminal_ms or long_lived or close_warning:
+        if selected_to_terminal_ms or pending_created_to_terminal_ms or semantic_entry_to_terminal_ms or entered_to_terminal_ms or close_created_to_terminal_ms or long_lived or close_warning:
             status = "terminal"
             if artifact["terminal_kind"] == "entry.aborted":
                 status = "aborted"
@@ -4176,8 +4228,18 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
                 "entry_id": artifact["entry_id"],
                 "symbol": artifact["symbol"],
                 "status": status,
+                "entry_started_at_ms": int(artifact["entry_started_at_ms"] or 0),
+                "entered_at_ms": entered_at_ms,
+                "opened_at_ms": int(artifact["opened_at_ms"] or 0),
+                "semantic_entry_at_ms": semantic_entry_at_ms,
+                "entry_time_source": str(artifact["entry_time_source"] or ""),
+                "entry_timestamp_quality": str(
+                    artifact["entry_timestamp_quality"] or ""
+                ),
                 "selected_to_terminal_ms": selected_to_terminal_ms,
                 "pending_created_to_terminal_ms": pending_created_to_terminal_ms,
+                "entered_to_terminal_ms": entered_to_terminal_ms,
+                "semantic_entry_to_terminal_ms": semantic_entry_to_terminal_ms,
                 "close_created_to_terminal_ms": close_created_to_terminal_ms,
                 "long_lived": long_lived,
                 "close_data_quality_warning": close_warning,
@@ -4199,6 +4261,8 @@ def _build_artifact_duration_summary(events: list[dict[str, Any]]) -> dict[str, 
         "close_data_quality_warning_count": close_data_quality_warning_count,
         "max_selected_to_terminal_ms": max_selected_to_terminal_ms,
         "max_pending_created_to_terminal_ms": max_pending_created_to_terminal_ms,
+        "max_entered_to_terminal_ms": max_entered_to_terminal_ms,
+        "max_semantic_entry_to_terminal_ms": max_semantic_entry_to_terminal_ms,
         "max_close_created_to_terminal_ms": max_close_created_to_terminal_ms,
         "samples": samples[:12],
     }
@@ -6192,6 +6256,7 @@ def _build_production_acceptance_gate(
         "quick_flat_duplicate_event_count": int(
             quick_flat_summary.get("duplicate_event_count", 0) or 0
         ),
+        "quick_flat_summary": quick_flat_summary,
         "closed_trade_lifecycle_count": recovery_lifecycle["closed_trade_lifecycle_count"],
         "unclosed_trade_lifecycle_count": recovery_lifecycle["unclosed_trade_lifecycle_count"],
         "closed_residual_lifecycle_count": recovery_lifecycle["closed_residual_lifecycle_count"],

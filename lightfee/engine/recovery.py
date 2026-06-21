@@ -566,6 +566,14 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     hedge_client_order_id=str(pdata.get("hedge_client_order_id", "")),
                     maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
                     hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
+                    maker_leg_filled_at_ms=int(pdata.get("maker_leg_filled_at_ms", 0) or 0),
+                    hedge_leg_filled_at_ms=int(pdata.get("hedge_leg_filled_at_ms", 0) or 0),
+                    maker_fill_timestamp_quality=str(
+                        pdata.get("maker_fill_timestamp_quality", "") or ""
+                    ),
+                    hedge_fill_timestamp_quality=str(
+                        pdata.get("hedge_fill_timestamp_quality", "") or ""
+                    ),
                     deadline_ms=int(pdata.get("deadline_ms", 0)),
                     fallback_route=str(pdata.get("fallback_route", "")),
                     uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
@@ -1188,6 +1196,10 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "hedge_client_order_id": p.hedge_client_order_id,
             "maker_leg_filled": p.maker_leg_filled,
             "hedge_leg_filled": p.hedge_leg_filled,
+            "maker_leg_filled_at_ms": p.maker_leg_filled_at_ms,
+            "hedge_leg_filled_at_ms": p.hedge_leg_filled_at_ms,
+            "maker_fill_timestamp_quality": p.maker_fill_timestamp_quality,
+            "hedge_fill_timestamp_quality": p.hedge_fill_timestamp_quality,
             "deadline_ms": p.deadline_ms,
             "fallback_route": p.fallback_route,
             "uncertain_outcome": p.uncertain_outcome,

@@ -1423,6 +1423,152 @@ def test_acceptance_gate_accepts_passive_close_resolved_lifecycle_when_flat():
     assert gate["recovery_lifecycle"]["closed_open_keys"] == ["entry-1781416483009-HOMEUSDT"]
 
 
+def test_acceptance_gate_accepts_long_pending_fast_close_when_exchange_truth_flat():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-1782039187428-OPNUSDT"
+    events = [
+        {
+            "ts_ms": 1782039187428,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "entry_id": position_id,
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782039187429,
+            "kind": "order.submitted",
+            "payload": {
+                "entry_id": position_id,
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782039187622,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {
+                "entry_id": position_id,
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782039636236,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "internal_entry_id": position_id,
+                "symbol": "OPNUSDT",
+                "opened_at_ms": 1782039636236,
+            },
+        },
+        {
+            "ts_ms": 1782039650843,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+                "reason": "first_stage_capture",
+            },
+        },
+        {
+            "ts_ms": 1782039661609,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+                "reason": "first_stage_capture",
+            },
+        },
+        {
+            "ts_ms": 1782039661609,
+            "kind": "recovery.flat",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {"okx": {}, "bybit": {}},
+        "open_orders": {"okx": {"OPNUSDT": []}, "bybit": {"OPNUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+    duration = dl._build_artifact_duration_summary(events)
+
+    assert gate["gate_passed"] is True
+    assert "quick_flat_events_present" not in gate["blocking_reasons"]
+    assert gate["quick_flat_count"] == 0
+    assert gate["quick_flat_summary"]["resolved_long_pending_fast_close_count"] == 1
+    assert duration["samples"][0]["entry_started_at_ms"] == 1782039187428
+    assert duration["samples"][0]["entered_at_ms"] == 0
+    assert duration["samples"][0]["semantic_entry_at_ms"] == 1782039187428
+    assert duration["samples"][0]["entered_to_terminal_ms"] == 0
+    assert duration["samples"][0]["semantic_entry_to_terminal_ms"] == 474181
+    assert duration["samples"][0]["entry_time_source"] == "review.candidate_shortlisted"
+
+
+def test_acceptance_gate_still_blocks_true_legacy_quick_flat_when_flat():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-1781294076754-HOMEUSDT"
+    events = [
+        {
+            "ts_ms": 1781294076000,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HOMEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781294095000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HOMEUSDT",
+                "reason": "quick_flat_recovery",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {"okx": {}, "bybit": {}},
+        "open_orders": {"okx": {"HOMEUSDT": []}, "bybit": {"HOMEUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["gate_passed"] is False
+    assert gate["quick_flat_count"] == 1
+    assert "quick_flat_events_present" in gate["blocking_reasons"]
+
+
 def test_acceptance_gate_does_not_accept_passive_close_resolved_when_live_state_not_flat():
     from scripts import diagnose_live as dl
 
@@ -5502,13 +5648,23 @@ def test_entry_outcome_summary_exposes_long_lived_artifact_durations():
     assert durations["long_lived_pending_entry_count"] == 1
     assert durations["close_data_quality_warning_count"] == 1
     assert durations["max_selected_to_terminal_ms"] == 760_200
+    assert durations["max_entered_to_terminal_ms"] == 0
+    assert durations["max_semantic_entry_to_terminal_ms"] == 760_200
     assert durations["max_close_created_to_terminal_ms"] == 47_000
     assert durations["samples"][0] == {
         "entry_id": "entry-long-br",
         "symbol": "BRUSDT",
         "status": "aborted",
+        "entry_started_at_ms": 1_000,
+        "entered_at_ms": 0,
+        "opened_at_ms": 0,
+        "semantic_entry_at_ms": 1_000,
+        "entry_time_source": "execution.entry_selected",
+        "entry_timestamp_quality": "lifecycle_start",
         "selected_to_terminal_ms": 760_200,
         "pending_created_to_terminal_ms": 750_200,
+        "entered_to_terminal_ms": 0,
+        "semantic_entry_to_terminal_ms": 760_200,
         "close_created_to_terminal_ms": 0,
         "long_lived": True,
         "close_data_quality_warning": False,

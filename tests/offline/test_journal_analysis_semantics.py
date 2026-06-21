@@ -196,11 +196,167 @@ class TestQuickFlatObservability:
                 "position_id": "entry-esports",
                 "symbol": "ESPORTSUSDT",
                 "entry_opened_ts_ms": 1000,
+                "entry_started_ts_ms": 1000,
+                "entry_entered_ts_ms": 0,
+                "entry_opened_event_ts_ms": 1000,
                 "terminal_ts_ms": 18_500,
                 "terminal_kind": "runtime.position_drift_corrected",
                 "elapsed_ms": 17_500,
+                "time_source": "entry.opened.event_ts_ms",
+                "timestamp_quality": "legacy_event_time",
             }
         ]
+
+    def test_long_pending_fast_close_uses_semantic_entry_start_not_finalizer_time(self):
+        position_id = "entry-1782039187428-OPNUSDT"
+        records = [
+            {
+                "ts_ms": 1782039187428,
+                "kind": "review.candidate_shortlisted",
+                "payload": {
+                    "position_id": position_id,
+                    "entry_id": position_id,
+                    "symbol": "OPNUSDT",
+                },
+            },
+            {
+                "ts_ms": 1782039187429,
+                "kind": "order.submitted",
+                "payload": {
+                    "position_id": position_id,
+                    "entry_id": position_id,
+                    "symbol": "OPNUSDT",
+                },
+            },
+            {
+                "ts_ms": 1782039187622,
+                "kind": "runtime.pending_entry_registered",
+                "payload": {
+                    "position_id": position_id,
+                    "entry_id": position_id,
+                    "symbol": "OPNUSDT",
+                },
+            },
+            {
+                "ts_ms": 1782039636236,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": position_id,
+                    "internal_entry_id": position_id,
+                    "symbol": "OPNUSDT",
+                    "opened_at_ms": 1782039636236,
+                },
+            },
+            {
+                "ts_ms": 1782039661609,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "OPNUSDT",
+                    "reason": "first_stage_capture",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 0
+        assert summary["resolved_long_pending_fast_close_count"] == 1
+        assert summary["resolved_samples"] == [
+            {
+                "position_id": position_id,
+                "symbol": "OPNUSDT",
+                "entry_started_ts_ms": 1782039187428,
+                "entry_entered_ts_ms": 0,
+                "entry_opened_ts_ms": 1782039636236,
+                "entry_opened_event_ts_ms": 1782039636236,
+                "terminal_ts_ms": 1782039661609,
+                "terminal_kind": "runtime.position_lifecycle_terminal",
+                "elapsed_ms": 474181,
+                "time_source": "review.candidate_shortlisted",
+                "timestamp_quality": "lifecycle_start",
+            }
+        ]
+
+    def test_quick_flat_prefers_entered_at_ms_when_available(self):
+        position_id = "entry-with-v1-time"
+        records = [
+            {
+                "ts_ms": 9_000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "BTCUSDT",
+                    "entered_at_ms": 1_000,
+                    "opened_at_ms": 9_000,
+                    "entry_timestamp_quality": "exchange_fill_exact",
+                },
+            },
+            {
+                "ts_ms": 15_000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "BTCUSDT",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=10_000,
+        )
+
+        assert summary["quick_flat_count"] == 0
+        assert summary["resolved_long_pending_fast_close_count"] == 1
+        assert summary["resolved_samples"][0]["elapsed_ms"] == 14_000
+        assert summary["resolved_samples"][0]["time_source"] == "entry.opened.entered_at_ms"
+
+    def test_quick_flat_does_not_trust_finalization_fallback_entered_at(self):
+        position_id = "entry-finalizer-fallback"
+        records = [
+            {
+                "ts_ms": 1_000,
+                "kind": "execution.entry_selected",
+                "payload": {
+                    "entry_id": position_id,
+                    "symbol": "OPNUSDT",
+                },
+            },
+            {
+                "ts_ms": 180_000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "OPNUSDT",
+                    "entered_at_ms": 180_000,
+                    "opened_at_ms": 180_000,
+                    "entry_timestamp_quality": "finalization_fallback",
+                },
+            },
+            {
+                "ts_ms": 205_000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "OPNUSDT",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(
+            records,
+            quick_flat_window_ms=60_000,
+        )
+
+        assert summary["quick_flat_count"] == 0
+        assert summary["resolved_long_pending_fast_close_count"] == 1
+        assert summary["resolved_samples"][0]["elapsed_ms"] == 204_000
+        assert summary["resolved_samples"][0]["time_source"] == "execution.entry_selected"
+        assert summary["resolved_samples"][0]["timestamp_quality"] == "lifecycle_start"
 
     def test_journal_report_exposes_deduplicated_quick_flat_counts(self):
         records = [

@@ -126,6 +126,18 @@ def apply_pending_entry_passive_progress(pending: Any, progress: Any) -> bool:
         average_price = float(getattr(progress, "average_price", 0.0) or 0.0)
         if average_price > 0.0:
             pending.maker_fill_price = average_price
+        filled_at_ms = int(
+            getattr(progress, "last_fill_time_ms", 0)
+            or getattr(progress, "observed_at_ms", 0)
+            or 0
+        )
+        quality = (
+            "exchange_fill_exact"
+            if int(getattr(progress, "last_fill_time_ms", 0) or 0) > 0
+            else "observed"
+        )
+        if hasattr(pending, "note_maker_fill_observed"):
+            pending.note_maker_fill_observed(filled_at_ms, quality=quality)
         pending.push_maker_remainder_slice(
             delta_quantity,
             average_price if average_price > 0.0 else None,

@@ -147,12 +147,28 @@ class PendingEntryRuntime:
                     if result.long_fill.quantity > pending.maker_leg_filled:
                         pending.maker_leg_filled = result.long_fill.quantity
                         pending.maker_fill_price = _recon_fill_price(result.long_fill)
+                        pending.note_maker_fill_observed(
+                            getattr(result.long_fill, "filled_at_ms", 0) or now_ms,
+                            quality=(
+                                "exchange_fill_exact"
+                                if getattr(result.long_fill, "filled_at_ms", 0)
+                                else "observed"
+                            ),
+                        )
                         maker_filled_updated = True
                 else:
                     if result.long_fill.quantity > pending.hedge_leg_filled:
                         pending.hedge_leg_filled = result.long_fill.quantity
                         pending.hedge_fill_price = _recon_fill_price(result.long_fill)
                         pending.hedge_order_id = result.long_fill.order_id
+                        pending.note_hedge_fill_observed(
+                            getattr(result.long_fill, "filled_at_ms", 0) or now_ms,
+                            quality=(
+                                "exchange_fill_exact"
+                                if getattr(result.long_fill, "filled_at_ms", 0)
+                                else "observed"
+                            ),
+                        )
                         hedge_filled_updated = True
 
             if result.short_fill is not None and result.short_fill.quantity > 0:
@@ -160,12 +176,28 @@ class PendingEntryRuntime:
                     if result.short_fill.quantity > pending.maker_leg_filled:
                         pending.maker_leg_filled = result.short_fill.quantity
                         pending.maker_fill_price = _recon_fill_price(result.short_fill)
+                        pending.note_maker_fill_observed(
+                            getattr(result.short_fill, "filled_at_ms", 0) or now_ms,
+                            quality=(
+                                "exchange_fill_exact"
+                                if getattr(result.short_fill, "filled_at_ms", 0)
+                                else "observed"
+                            ),
+                        )
                         maker_filled_updated = True
                 else:
                     if result.short_fill.quantity > pending.hedge_leg_filled:
                         pending.hedge_leg_filled = result.short_fill.quantity
                         pending.hedge_fill_price = _recon_fill_price(result.short_fill)
                         pending.hedge_order_id = result.short_fill.order_id
+                        pending.note_hedge_fill_observed(
+                            getattr(result.short_fill, "filled_at_ms", 0) or now_ms,
+                            quality=(
+                                "exchange_fill_exact"
+                                if getattr(result.short_fill, "filled_at_ms", 0)
+                                else "observed"
+                            ),
+                        )
                         hedge_filled_updated = True
 
             def _defer_live_position_progress(
@@ -209,6 +241,10 @@ class PendingEntryRuntime:
                     if result.long_status == "filled":
                         if pos_qty > pending.maker_leg_filled:
                             pending.maker_leg_filled = pos_qty
+                            pending.note_maker_fill_observed(
+                                getattr(result.long_position, "observed_at_ms", 0) or now_ms,
+                                quality="live_truth_observed",
+                            )
                             maker_filled_updated = True
                         if pos_price > 0 and pending.maker_fill_price <= 0:
                             pending.maker_fill_price = pos_price
@@ -224,6 +260,10 @@ class PendingEntryRuntime:
                         )
                 elif pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
+                    pending.note_hedge_fill_observed(
+                        getattr(result.long_position, "observed_at_ms", 0) or now_ms,
+                        quality="live_truth_observed",
+                    )
                     hedge_filled_updated = True
                 if pending.maker_leg != "long":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
@@ -240,6 +280,10 @@ class PendingEntryRuntime:
                     if result.short_status == "filled":
                         if pos_qty > pending.maker_leg_filled:
                             pending.maker_leg_filled = pos_qty
+                            pending.note_maker_fill_observed(
+                                getattr(result.short_position, "observed_at_ms", 0) or now_ms,
+                                quality="live_truth_observed",
+                            )
                             maker_filled_updated = True
                         if pos_price > 0 and pending.maker_fill_price <= 0:
                             pending.maker_fill_price = pos_price
@@ -255,6 +299,10 @@ class PendingEntryRuntime:
                         )
                 elif pos_qty > pending.hedge_leg_filled:
                     pending.hedge_leg_filled = pos_qty
+                    pending.note_hedge_fill_observed(
+                        getattr(result.short_position, "observed_at_ms", 0) or now_ms,
+                        quality="live_truth_observed",
+                    )
                     hedge_filled_updated = True
                 if pending.maker_leg != "short":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
@@ -1389,6 +1437,42 @@ class PendingEntryRuntime:
         maker_order_id_for_fill, maker_client_order_id_for_fill = (
             self.ctx._pending_entry_maker_order_identifiers(pending)
         )
+        maker_filled_at_ms = int(getattr(pending, "maker_leg_filled_at_ms", 0) or 0)
+        hedge_filled_at_ms = int(getattr(pending, "hedge_leg_filled_at_ms", 0) or 0)
+        maker_timestamp_quality = str(
+            getattr(pending, "maker_fill_timestamp_quality", "") or ""
+        )
+        hedge_timestamp_quality = str(
+            getattr(pending, "hedge_fill_timestamp_quality", "") or ""
+        )
+        if maker_filled_at_ms <= 0 and raw_maker_leg_filled > 0.0:
+            maker_filled_at_ms = now_ms
+            maker_timestamp_quality = "finalization_fallback"
+        if hedge_filled_at_ms <= 0 and raw_hedge_leg_filled > 0.0:
+            hedge_filled_at_ms = now_ms
+            hedge_timestamp_quality = "finalization_fallback"
+        entry_timestamp_quality = (
+            "exchange_fill_exact"
+            if (
+                maker_timestamp_quality == "exchange_fill_exact"
+                and hedge_timestamp_quality == "exchange_fill_exact"
+            )
+            else (
+                "live_truth_observed"
+                if "live_truth_observed" in {
+                    maker_timestamp_quality,
+                    hedge_timestamp_quality,
+                }
+                else (
+                    "observed"
+                    if "observed" in {
+                        maker_timestamp_quality,
+                        hedge_timestamp_quality,
+                    }
+                    else "finalization_fallback"
+                )
+            )
+        )
 
         # V1: build_residual_task is computed before branching, but only after
         # order/fill reconciliation has made pending quantities authoritative.
@@ -1399,7 +1483,7 @@ class PendingEntryRuntime:
             quantity=pending.maker_leg_filled,
             price=pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price,
             order_id=maker_order_id_for_fill,
-            filled_at_ms=now_ms,
+            filled_at_ms=maker_filled_at_ms,
         )
         hedge_fill = OrderFill(
             venue=pending.hedge_venue(),
@@ -1408,7 +1492,7 @@ class PendingEntryRuntime:
             quantity=pending.hedge_leg_filled,
             price=pending.hedge_fill_price if pending.hedge_fill_price > 0 else pending.maker_fill_price,
             order_id=pending.hedge_order_id,
-            filled_at_ms=now_ms,
+            filled_at_ms=hedge_filled_at_ms,
         )
 
         pair_id = getattr(pending, "pair_id", "") or residual_pair_id(
@@ -1670,7 +1754,7 @@ class PendingEntryRuntime:
             quantity=open_maker_fill_quantity,
             price=pending.maker_fill_price,
             order_id=maker_order_id_for_fill,
-            filled_at_ms=now_ms,
+            filled_at_ms=maker_filled_at_ms,
         )
         hedge_fill = OrderFill(
             venue=pending.hedge_venue(),
@@ -1679,7 +1763,7 @@ class PendingEntryRuntime:
             quantity=open_hedge_fill_quantity,
             price=pending.hedge_fill_price,
             order_id=pending.hedge_order_id,
-            filled_at_ms=now_ms,
+            filled_at_ms=hedge_filled_at_ms,
         )
 
         ctx = EntryContext(
@@ -1750,6 +1834,12 @@ class PendingEntryRuntime:
                 "long_entry_price": position.long_entry_price,
                 "short_entry_price": position.short_entry_price,
                 "opened_at_ms": position.opened_at_ms,
+                "entered_at_ms": position.entered_at_ms,
+                "maker_filled_at_ms": maker_filled_at_ms,
+                "hedge_filled_at_ms": hedge_filled_at_ms,
+                "maker_fill_timestamp_quality": maker_timestamp_quality,
+                "hedge_fill_timestamp_quality": hedge_timestamp_quality,
+                "entry_timestamp_quality": entry_timestamp_quality,
                 "matched_quantity": position.matched_quantity,
                 "balanced_quantity": balanced_quantity,
                 "raw_maker_leg_filled": raw_maker_leg_filled,

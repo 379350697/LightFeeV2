@@ -319,9 +319,15 @@ side is an evidence gap/fail-closed condition, not default buy.
    work before any production-health conclusion or entry-risk decision. An
    unavailable/partial truth probe with no local work and no live artifact is an
    evidence gap, not a global recovery block.
-17. For quick-flat reports, join `execution.entry_selected`, `entry.opened`,
+17. For quick-flat reports, join `execution.entry_selected`, `order.submitted`,
+    `runtime.pending_entry_registered`, `entry.opened`,
     `runtime.funding_capture_state_updated`, `runtime.normal_close_routing_*`,
     and `exit.closed` by `position_id`.
+    Treat `entry.opened.entered_at_ms` as the V1 business entry timestamp when
+    present. Treat `entry.opened.opened_at_ms` or the event timestamp as local
+    finalizer evidence; if earlier lifecycle evidence proves a long pending
+    entry, classify the fast close as resolved diagnostic evidence rather than
+    true open-to-flat quick-flat.
 18. Deduplicate duplicate `exit.closed` projections before judging frequency.
 19. Classify each quick flat as bug, avoidable timing, unavoidable recovery, or
     duplicate observation.

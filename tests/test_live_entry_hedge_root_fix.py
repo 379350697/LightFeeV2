@@ -829,9 +829,13 @@ class TestPendingEntryPersistenceRoundtrip:
             created_at_ms=1000,
             maker_leg="long",
             maker_leg_filled=10.0,
+            maker_leg_filled_at_ms=123456,
             maker_fill_price=15.0,
             hedge_leg_filled=0.0,
+            hedge_leg_filled_at_ms=0,
             hedge_fill_price=0.0,
+            maker_fill_timestamp_quality="exchange_fill_exact",
+            hedge_fill_timestamp_quality="",
             uncertain_outcome=True,
             hedge_inflight="link-hedge-inflight-cid",
             maker_client_order_id="maker-orig",
@@ -848,6 +852,10 @@ class TestPendingEntryPersistenceRoundtrip:
         assert pe["hedge_inflight"]["client_order_id"] == "link-hedge-inflight-cid"
         assert pe["maker_fill_price"] == 15.0
         assert pe["hedge_fill_price"] == 0.0
+        assert pe["maker_leg_filled_at_ms"] == 123456
+        assert pe["hedge_leg_filled_at_ms"] == 0
+        assert pe["maker_fill_timestamp_quality"] == "exchange_fill_exact"
+        assert pe["hedge_fill_timestamp_quality"] == ""
         assert pe["maker_client_order_id"] == "maker-orig"
         assert pe["hedge_client_order_id"] == "hedge-orig"
         assert pe["maker_leg"] == "long"
@@ -875,6 +883,10 @@ class TestPendingEntryPersistenceRoundtrip:
                     "uncertain_outcome": True,
                     "maker_fill_price": 0.85,
                     "hedge_fill_price": 0.84,
+                    "maker_leg_filled_at_ms": 3000,
+                    "hedge_leg_filled_at_ms": 0,
+                    "maker_fill_timestamp_quality": "exchange_fill_exact",
+                    "hedge_fill_timestamp_quality": "",
                     "hedge_inflight": "matic-inflight-cid",
                     "maker_client_order_id": "matic-maker-cid",
                     "hedge_client_order_id": "matic-hedge-cid",
@@ -895,6 +907,10 @@ class TestPendingEntryPersistenceRoundtrip:
         assert restored.hedge_inflight.submitted_at_ms == 0  # legacy
         assert restored.maker_fill_price == 0.85
         assert restored.hedge_fill_price == 0.84
+        assert restored.maker_leg_filled_at_ms == 3000
+        assert restored.hedge_leg_filled_at_ms == 0
+        assert restored.maker_fill_timestamp_quality == "exchange_fill_exact"
+        assert restored.hedge_fill_timestamp_quality == ""
         assert restored.maker_client_order_id == "matic-maker-cid"
         assert restored.hedge_client_order_id == "matic-hedge-cid"
         assert restored.outcome == "hedge_uncertain"
@@ -918,9 +934,13 @@ class TestPendingEntryPersistenceRoundtrip:
             created_at_ms=4000,
             maker_leg="long",
             maker_leg_filled=1000.0,
+            maker_leg_filled_at_ms=4500,
             maker_fill_price=0.50,
             hedge_leg_filled=0.0,
+            hedge_leg_filled_at_ms=0,
             hedge_fill_price=0.0,
+            maker_fill_timestamp_quality="exchange_fill_exact",
+            hedge_fill_timestamp_quality="",
             uncertain_outcome=True,
             hedge_inflight="crv-inflight-cid",
             maker_client_order_id="crv-maker-cid",
@@ -932,6 +952,10 @@ class TestPendingEntryPersistenceRoundtrip:
         pe = view["pending_entries"]["test-view"]
         assert pe["maker_fill_price"] == 0.50
         assert pe["hedge_fill_price"] == 0.0
+        assert pe["maker_leg_filled_at_ms"] == 4500
+        assert pe["hedge_leg_filled_at_ms"] == 0
+        assert pe["maker_fill_timestamp_quality"] == "exchange_fill_exact"
+        assert pe["hedge_fill_timestamp_quality"] == ""
         assert isinstance(pe["hedge_inflight"], dict)
         assert pe["hedge_inflight"]["client_order_id"] == "crv-inflight-cid"
         assert pe["maker_leg"] == "long"
@@ -6653,6 +6677,57 @@ class TestPartiallyMatchedResidualV1Parity:
         queued = [e for e in runtime.journal.read_all()
                   if e.get("kind") == "execution.residual_repair_queued"]
         assert len(queued) == 0, "Balanced fill must NOT emit residual_repair_queued"
+
+    @pytest.mark.asyncio
+    async def test_finalize_pending_entry_uses_leg_fill_times_for_entered_at(self, tmp_path):
+        """V1: entered_at_ms is max(maker_fill.filled_at_ms, hedge_fill.filled_at_ms),
+        while opened_at_ms remains the local finalization timestamp."""
+        runtime = _make_open_runtime(tmp_path)
+
+        now_ms = 1779422875621
+        maker_filled_at_ms = now_ms - 420_000
+        hedge_filled_at_ms = now_ms - 120_000
+        pending = PendingEntry(
+            pending_id="entry-fill-time-contract",
+            symbol="ETHUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=maker_filled_at_ms - 5_000,
+            maker_leg="long",
+            maker_leg_filled=10.0,
+            hedge_leg_filled=10.0,
+            maker_leg_filled_at_ms=maker_filled_at_ms,
+            hedge_leg_filled_at_ms=hedge_filled_at_ms,
+            maker_fill_timestamp_quality="exchange_fill_exact",
+            hedge_fill_timestamp_quality="exchange_fill_exact",
+            maker_fill_price=3000.0,
+            hedge_fill_price=3001.0,
+            maker_order_id="maker-oid-fill-time",
+            hedge_order_id="hedge-oid-fill-time",
+            maker_client_order_id="maker-cid-fill-time",
+            hedge_client_order_id="hedge-cid-fill-time",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._finalize_pending_entry(pending, pending.pending_id, now_ms)
+
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.opened_at_ms == now_ms
+        assert position.entered_at_ms == hedge_filled_at_ms
+        assert position.long_fill.filled_at_ms == maker_filled_at_ms
+        assert position.short_fill.filled_at_ms == hedge_filled_at_ms
+        opened = [
+            e for e in runtime.journal.read_all()
+            if e.get("kind") == "entry.opened"
+        ][-1]["payload"]
+        assert opened["opened_at_ms"] == now_ms
+        assert opened["entered_at_ms"] == hedge_filled_at_ms
+        assert opened["maker_filled_at_ms"] == maker_filled_at_ms
+        assert opened["hedge_filled_at_ms"] == hedge_filled_at_ms
+        assert opened["entry_timestamp_quality"] == "exchange_fill_exact"
 
 
 class TestUnmatchedResidualV1Parity:
