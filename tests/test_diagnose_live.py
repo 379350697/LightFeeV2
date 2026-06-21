@@ -5617,8 +5617,12 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
         "blocker_scope": "entry_candidate_admission",
         "candidate_admission_noise_summary": {
             "blocks_production_gate": False,
+            "current_abnormal_position_count": 0,
+            "current_close_blocker_count": 0,
+            "current_warning_count": 0,
             "current_scope": "entry_candidate_admission",
             "next_action": "targeted_refresh_or_data_source_backfill",
+            "raw_candidate_block_count": 5,
             "top_blocked_owner_ids": [
                 {
                     "owner_id": "aster:HOMEUSDT",
@@ -6071,6 +6075,68 @@ def test_phase_duration_summary_terminalizes_hard_quote_rewarm_timeout():
     )
     assert phase_summary["blank_action_count"] == 0
     assert phase_summary["phase_handoff_quality"]["missing_takeover_count"] == 0
+
+
+def test_phase_duration_summary_splits_historical_terminalized_from_current_overbudget():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {"entry_id": "entry-historical", "symbol": "HOMEUSDT"},
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {
+                "entry_id": "entry-historical",
+                "symbol": "HOMEUSDT",
+                "maker_order_id": "maker-home",
+                "outcome": "maker_resting",
+            },
+        },
+        {
+            "ts_ms": 420_000,
+            "kind": "pending_entry.long_lived_pending_entry",
+            "payload": {"entry_id": "entry-historical", "symbol": "HOMEUSDT"},
+        },
+        {
+            "ts_ms": 430_000,
+            "kind": "entry.opened",
+            "payload": {"entry_id": "entry-historical", "symbol": "HOMEUSDT"},
+        },
+        {
+            "ts_ms": 950_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+    for idx in range(13):
+        events.append(
+            {
+                "ts_ms": 1_000 + idx,
+                "kind": "execution.entry_selected",
+                "payload": {
+                    "entry_id": f"entry-current-{idx}",
+                    "symbol": f"CUR{idx}USDT",
+                },
+            }
+        )
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+
+    assert phase_summary["hard_over_budget_count"] >= 1
+    assert phase_summary["historical_terminalized_hard_over_budget_count"] >= 1
+    assert phase_summary["current_hard_over_budget_count"] == 13
+    current_samples = phase_summary["current_hard_over_budget_samples"]
+    assert len(current_samples) == 12
+    assert current_samples[0]["artifact_id"] == "entry-current-0"
+    historical_samples = phase_summary["historical_terminalized_hard_over_budget_samples"]
+    assert {
+        sample["artifact_id"] for sample in historical_samples
+    } == {"entry-historical"}
 
 
 def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():

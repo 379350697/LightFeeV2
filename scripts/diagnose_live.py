@@ -3842,8 +3842,12 @@ def _build_entry_market_evidence_summary(
         "blocked_candidate_count": blocked_candidate_count,
         "candidate_admission_noise_summary": {
             "blocks_production_gate": False,
+            "current_abnormal_position_count": 0,
+            "current_close_blocker_count": 0,
+            "current_warning_count": 0,
             "current_scope": "entry_candidate_admission",
             "next_action": "targeted_refresh_or_data_source_backfill",
+            "raw_candidate_block_count": blocked_candidate_count,
             "top_blocked_owner_ids": top_blocked_owner_ids,
         },
         "diagnostic_recovered_overbudget_count": (
@@ -4603,6 +4607,7 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             note_observed_action(artifact, "recovery_terminal", kind)
 
     records: list[dict[str, Any]] = []
+    terminalized_record_ids: set[int] = set()
 
     def add_record(
         artifact: dict[str, Any],
@@ -4642,7 +4647,7 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
                 action_evidence_kind = f"runtime.{phase}_soft_budget_exceeded"
             else:
                 action_evidence_kind = default_action_evidence_kind(phase)
-        records.append({
+        record = {
             "phase": phase,
             "artifact_id": str(artifact["artifact_id"]),
             "symbol": str(artifact["symbol"]),
@@ -4655,7 +4660,10 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             "action_taken": action_taken,
             "action_evidence_kind": action_evidence_kind,
             "truth_source": budget.truth_source,
-        })
+        }
+        records.append(record)
+        if end_ms > 0:
+            terminalized_record_ids.add(id(record))
 
     for artifact in artifacts.values():
         selected_at_ms = int(artifact["selected_at_ms"] or 0)
@@ -4758,6 +4766,54 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     hard_over_budget_records = [
         record for record in records if record["status"] == "hard_over_budget"
     ]
+
+    def is_terminalized_record(record: dict[str, Any]) -> bool:
+        return id(record) in terminalized_record_ids
+
+    def unique_artifact_ids(items: list[dict[str, Any]]) -> set[str]:
+        seen: set[str] = set()
+        for item in items:
+            artifact_id = str(item.get("artifact_id") or "")
+            if artifact_id:
+                seen.add(artifact_id)
+        return seen
+
+    def unique_artifact_samples(
+        items: list[dict[str, Any]],
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for item in items:
+            artifact_id = str(item.get("artifact_id") or "")
+            if not artifact_id or artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            result.append(item)
+            if len(result) >= limit:
+                break
+        return result
+
+    current_hard_over_budget_records = [
+        record for record in hard_over_budget_records
+        if not is_terminalized_record(record)
+    ]
+    historical_terminalized_hard_over_budget_records = [
+        record for record in hard_over_budget_records
+        if is_terminalized_record(record)
+    ]
+    current_hard_over_budget_samples = unique_artifact_samples(
+        current_hard_over_budget_records
+    )
+    historical_terminalized_hard_over_budget_samples = unique_artifact_samples(
+        historical_terminalized_hard_over_budget_records
+    )
+    current_hard_over_budget_count = len(
+        unique_artifact_ids(current_hard_over_budget_records)
+    )
+    historical_terminalized_hard_over_budget_count = len(
+        unique_artifact_ids(historical_terminalized_hard_over_budget_records)
+    )
     blank_action_count = sum(
         1
         for record in over_budget_records
@@ -4844,6 +4900,14 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "phase_record_count": len(records),
         "over_budget_count": len(over_budget_records),
         "hard_over_budget_count": len(hard_over_budget_records),
+        "current_hard_over_budget_count": current_hard_over_budget_count,
+        "historical_terminalized_hard_over_budget_count": (
+            historical_terminalized_hard_over_budget_count
+        ),
+        "current_hard_over_budget_samples": current_hard_over_budget_samples,
+        "historical_terminalized_hard_over_budget_samples": (
+            historical_terminalized_hard_over_budget_samples
+        ),
         "blank_action_count": blank_action_count,
         "terminalized_candidate_lease_count": terminalized_candidate_lease_count,
         "terminalized_quote_rewarm_count": terminalized_quote_rewarm_count,
