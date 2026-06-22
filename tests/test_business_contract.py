@@ -189,16 +189,88 @@ def test_noise_visibility_classifies_resolved_close_artifact_as_historical():
 
 
 def test_noise_visibility_keeps_entry_market_blocks_as_admission_evidence():
-    result = classify_noise_visibility(
+    for kind in (
         "runtime.entry_quote_revalidate_failed",
-        {"venue": "binance", "symbol": "STABLEUSDT", "reason": "quote_stale"},
+        "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+        "runtime.entry_quote_rewarm_terminal_stale",
+    ):
+        result = classify_noise_visibility(
+            kind,
+            {"venue": "binance", "symbol": "STABLEUSDT", "reason": "quote_stale"},
+            current_exchange_truth_clean=True,
+        )
+
+        assert result["visibility"] == "current_admission_blocker"
+        assert result["blocks_gate"] is False
+        assert result["requires_operator_action"] is False
+        assert result["reason"] == "entry_market_evidence_block"
+        assert result["scope"] == "entry_candidate_admission"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "venue": "bybit",
+            "exchange_code": "110072",
+            "exchange_msg": "OrderLinkedID is duplicate",
+        },
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "venue": "binance",
+            "exchange_code": "-5022",
+            "exchange_msg": "Post Only order will be rejected.",
+            "request_context": {"post_only": True, "reduce_only": True},
+        },
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "venue": "binance",
+            "reason": "zero fill order uncertain",
+        },
+    ],
+)
+def test_noise_visibility_classifies_known_close_artifacts_by_truth(payload):
+    clean = classify_noise_visibility(
+        "order.rejected",
+        payload,
+        current_exchange_truth_clean=True,
+    )
+    dirty = classify_noise_visibility(
+        "order.rejected",
+        payload,
+        current_exchange_truth_clean=False,
+    )
+
+    assert clean["visibility"] == "historical_terminal_evidence"
+    assert clean["blocks_gate"] is False
+    assert clean["requires_operator_action"] is False
+    assert clean["reason"] == "resolved_close_artifact_after_terminal_truth"
+    assert dirty["visibility"] == "current_blocker"
+    assert dirty["blocks_gate"] is True
+    assert dirty["requires_operator_action"] is True
+    assert dirty["reason"] == "unresolved_close_artifact"
+
+
+def test_noise_visibility_classifies_unsupported_symbol_probe_as_catalog_diagnostic():
+    result = classify_noise_visibility(
+        "recovery.live_position_probe_unsupported_symbols",
+        {
+            "venue": "okx",
+            "unsupported_symbols": ["HOMEUSDT", "GUNUSDT"],
+            "classification": "unsupported_symbol_flat",
+        },
         current_exchange_truth_clean=True,
     )
 
-    assert result["visibility"] == "current_admission_blocker"
+    assert result["visibility"] == "catalog_diagnostic"
     assert result["blocks_gate"] is False
     assert result["requires_operator_action"] is False
-    assert result["reason"] == "entry_market_evidence_block"
+    assert result["reason"] == "unsupported_symbol_probe_filtered"
+    assert result["scope"] == "exchange_truth_catalog_filter"
 
 
 def test_noise_visibility_never_hides_current_single_leg_exposure():

@@ -6251,8 +6251,13 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             },
             "historical_terminalized_over_budget_count": 1,
             "resolved_close_artifact_count": 0,
+            "catalog_filtered_probe_count": 0,
             "current_admission_blocker_count": 0,
             "current_blocker_count": 0,
+            "admission_blocker_reason_counts": {},
+            "historical_terminal_reason_counts": {
+                "terminalized_over_budget_after_clean_truth": 1,
+            },
             "samples": [
                 {
                     "kind": "phase_duration.hard_over_budget",
@@ -6830,6 +6835,35 @@ def test_diagnostic_noise_summary_does_not_double_count_resolved_close_artifact(
     assert summary["visibility_counts"] == {"historical_terminal_evidence": 1}
 
 
+def test_diagnostic_noise_summary_does_not_historicalize_close_artifacts_when_truth_dirty():
+    import scripts.diagnose_live as dl
+
+    gate = {
+        "gate_passed": False,
+        "exchange_truth_flat": False,
+        "exchange_truth_no_open_orders": False,
+        "blocking_reasons": ["exchange_truth_nonzero_position"],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 1,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        [],
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={},
+        resolved_close_order_error_summary={
+            "reduce_only_terminal_flat_count": 1,
+            "current_exchange_truth_clean": False,
+        },
+    )
+
+    assert summary["resolved_close_artifact_count"] == 0
+    assert summary["visibility_counts"] == {"current_blocker": 2}
+    assert summary["current_blocker_count"] == 2
+    assert summary["historical_terminal_reason_counts"] == {}
+    assert summary["samples"][0]["reason"] == "unresolved_close_artifact"
+
+
 def test_diagnostic_noise_summary_treats_flat_accounting_gap_as_historical_even_if_gate_blocked():
     import scripts.diagnose_live as dl
 
@@ -6933,6 +6967,129 @@ def test_diagnostic_noise_summary_downgrades_terminal_flat_unpaired_cleanup_hist
     assert summary["visibility_counts"] == {"historical_terminal_evidence": 1}
     assert summary["current_blocker_count"] == 0
     assert summary["samples"][0]["reason"] == "terminal_flat_recovered_unpaired_cleanup"
+
+
+def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog_noise():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-h",
+                "symbol": "HUSDT",
+                "venue": "binance",
+                "exchange_code": "-2022",
+                "reason": "ReduceOnly Order is rejected.",
+                "request_context": {"reduce_only": True},
+            },
+        },
+        {
+            "ts_ms": 1_100,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-h",
+                "symbol": "HUSDT",
+                "venue": "binance",
+                "exchange_code": "-5022",
+                "reason": "Post Only order will be rejected.",
+                "request_context": {"post_only": True, "reduce_only": True},
+            },
+        },
+        {
+            "ts_ms": 1_200,
+            "kind": "order.uncertain",
+            "payload": {
+                "position_id": "entry-h",
+                "symbol": "HUSDT",
+                "venue": "bybit",
+                "reason": "zero fill order uncertain",
+            },
+        },
+        {
+            "ts_ms": 1_300,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-h",
+                "symbol": "HUSDT",
+                "venue": "bybit",
+                "exchange_code": "110072",
+                "exchange_msg": "OrderLinkedID is duplicate",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "binance",
+                "symbol": "AKEUSDT",
+                "reason": "quote_stale",
+            },
+        },
+        {
+            "ts_ms": 2_100,
+            "kind": "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+            "payload": {
+                "venue": "binance",
+                "symbol": "AERGOUSDT",
+                "reason": "quote_stale",
+            },
+        },
+        {
+            "ts_ms": 2_200,
+            "kind": "runtime.entry_quote_rewarm_terminal_stale",
+            "payload": {
+                "venue": "binance",
+                "symbol": "POWERUSDT",
+                "reason": "quote_stale",
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "recovery.live_position_probe_unsupported_symbols",
+            "payload": {
+                "venue": "okx",
+                "unsupported_symbols": ["HOMEUSDT", "GUNUSDT"],
+                "classification": "unsupported_symbol_flat",
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 1,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={},
+        resolved_close_order_error_summary={
+            "post_only_boundary_reject_count": 1,
+            "reduce_only_terminal_flat_count": 1,
+            "zero_fill_terminal_flat_count": 1,
+        },
+    )
+
+    assert summary["current_blocker_count"] == 0
+    assert summary["current_admission_blocker_count"] == 3
+    assert summary["catalog_filtered_probe_count"] == 1
+    assert summary["resolved_close_artifact_count"] == 4
+    assert summary["visibility_counts"] == {
+        "catalog_diagnostic": 1,
+        "current_admission_blocker": 3,
+        "historical_terminal_evidence": 4,
+    }
+    assert summary["admission_blocker_reason_counts"] == {
+        "entry_market_evidence_block": 3,
+    }
+    assert summary["historical_terminal_reason_counts"] == {
+        "resolved_close_artifact_after_terminal_truth": 4,
+    }
 
 
 def test_business_progression_quality_soft_terminal_does_not_hide_hard_stuck():

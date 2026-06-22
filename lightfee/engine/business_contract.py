@@ -394,6 +394,16 @@ def classify_noise_visibility(
             "reason": "current_single_leg_or_risk_only_exposure",
         }
 
+    if text == "recovery.live_position_probe_unsupported_symbols":
+        return {
+            **base,
+            "visibility": "catalog_diagnostic",
+            "blocks_gate": False,
+            "requires_operator_action": False,
+            "reason": "unsupported_symbol_probe_filtered",
+            "scope": "exchange_truth_catalog_filter",
+        }
+
     market_evidence = entry_market_evidence_contract(text, payload)
     if market_evidence and market_evidence.get("blocks_entry") is True:
         return {

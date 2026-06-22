@@ -5703,33 +5703,78 @@ def _build_diagnostic_noise_summary(
         if isinstance(resolved_terminal_zero_qty_summary, dict)
         else {}
     )
-    resolved_close_artifact_count = int(
+    raw_resolved_close_artifact_count = int(
         gate.get("resolved_order_truth_gap_count") or 0
     )
-    resolved_close_artifact_count += int(
+    raw_resolved_close_artifact_count += int(
         resolved_close_errors.get("post_only_boundary_reject_count") or 0
     )
-    resolved_close_artifact_count += int(
+    raw_resolved_close_artifact_count += int(
         resolved_close_errors.get("reduce_only_terminal_flat_count") or 0
     )
-    resolved_close_artifact_count += int(
+    raw_resolved_close_artifact_count += int(
         resolved_close_errors.get("zero_fill_terminal_flat_count") or 0
     )
     current_exchange_truth_clean = (
         gate.get("exchange_truth_flat") is True
         and gate.get("exchange_truth_no_open_orders") is True
     )
+    resolved_close_summary_truth_clean = (
+        resolved_close_errors.get("current_exchange_truth_clean") is not False
+    )
+    resolved_close_artifact_count = (
+        raw_resolved_close_artifact_count
+        if current_exchange_truth_clean and resolved_close_summary_truth_clean
+        else 0
+    )
+    untrusted_close_artifact_count = (
+        raw_resolved_close_artifact_count - resolved_close_artifact_count
+    )
     visibility_counts: dict[str, int] = {}
+    visibility_reason_counts: dict[str, dict[str, int]] = {}
     samples: list[dict[str, Any]] = []
     raw_current_risk_only_count = 0
+
+    def bump_reason(visibility: str, reason: str, count: int = 1) -> None:
+        if not visibility or not reason or count <= 0:
+            return
+        reason_counts = visibility_reason_counts.setdefault(visibility, {})
+        reason_counts[reason] = reason_counts.get(reason, 0) + count
 
     def note(item: dict[str, Any], sample: dict[str, Any] | None = None) -> None:
         visibility = str(item.get("visibility") or "")
         if not visibility or visibility == "aggregated_diagnostic":
             return
         visibility_counts[visibility] = visibility_counts.get(visibility, 0) + 1
+        bump_reason(visibility, str(item.get("reason") or ""))
         if sample is not None and len(samples) < 12:
             samples.append(sample)
+
+    def apply_derived_fields(result: dict[str, Any]) -> None:
+        result["visibility_counts"] = dict(sorted(visibility_counts.items()))
+        result["catalog_filtered_probe_count"] = int(
+            visibility_counts.get("catalog_diagnostic", 0)
+        )
+        result["admission_blocker_reason_counts"] = dict(
+            sorted(
+                visibility_reason_counts.get(
+                    "current_admission_blocker", {}
+                ).items()
+            )
+        )
+        result["historical_terminal_reason_counts"] = dict(
+            sorted(
+                visibility_reason_counts.get(
+                    "historical_terminal_evidence", {}
+                ).items()
+            )
+        )
+        result["current_admission_blocker_count"] = int(
+            visibility_counts.get("current_admission_blocker", 0)
+        )
+        result["current_blocker_count"] = int(
+            visibility_counts.get("current_blocker", 0)
+        )
 
     for rec in events:
         kind = str(rec.get("kind") or "")
@@ -5777,6 +5822,11 @@ def _build_diagnostic_noise_summary(
             visibility_counts.get("current_blocker", 0)
             + risk_only_summary_delta_count
         )
+        bump_reason(
+            "current_blocker",
+            "current_risk_only_live_single_leg_exposure",
+            risk_only_summary_delta_count,
+        )
         if len(samples) < 12:
             samples.append(
                 {
@@ -5800,6 +5850,11 @@ def _build_diagnostic_noise_summary(
         visibility_counts["historical_terminal_evidence"] = (
             visibility_counts.get("historical_terminal_evidence", 0)
             + historical_over_budget_count
+        )
+        bump_reason(
+            "historical_terminal_evidence",
+            "terminalized_over_budget_after_clean_truth",
+            historical_over_budget_count,
         )
         for sample in phase_summary.get("samples", []) or []:
             if not isinstance(sample, dict):
@@ -5825,17 +5880,44 @@ def _build_diagnostic_noise_summary(
             visibility_counts.get("historical_terminal_evidence", 0)
             + resolved_close_artifact_count
         )
+        bump_reason(
+            "historical_terminal_evidence",
+            "resolved_close_artifact_after_terminal_truth",
+            resolved_close_artifact_count,
+        )
+    if untrusted_close_artifact_count > 0:
+        visibility_counts["current_blocker"] = (
+            visibility_counts.get("current_blocker", 0)
+            + untrusted_close_artifact_count
+        )
+        bump_reason(
+            "current_blocker",
+            "unresolved_close_artifact",
+            untrusted_close_artifact_count,
+        )
+        if len(samples) < 12:
+            samples.append(
+                {
+                    "kind": "resolved_close_order_error_summary.untrusted",
+                    "visibility": "current_blocker",
+                    "reason": "unresolved_close_artifact",
+                    "scope": "current_exchange_truth",
+                    "count": untrusted_close_artifact_count,
+                }
+            )
 
     result = {
-        "visibility_counts": dict(sorted(visibility_counts.items())),
+        "visibility_counts": {},
         "historical_terminalized_over_budget_count": historical_over_budget_count,
         "resolved_close_artifact_count": resolved_close_artifact_count,
-        "current_admission_blocker_count": int(
-            visibility_counts.get("current_admission_blocker", 0)
-        ),
-        "current_blocker_count": int(visibility_counts.get("current_blocker", 0)),
+        "catalog_filtered_probe_count": 0,
+        "current_admission_blocker_count": 0,
+        "current_blocker_count": 0,
+        "admission_blocker_reason_counts": {},
+        "historical_terminal_reason_counts": {},
         "samples": samples,
     }
+    apply_derived_fields(result)
     truth_probe_count = int(
         resolved_terminal_zero_qty.get("truth_probe_retain_pending_count") or 0
     )
@@ -5850,7 +5932,11 @@ def _build_diagnostic_noise_summary(
             visibility_counts.get("historical_terminal_evidence", 0)
             + truth_probe_resolved_count
         )
-        result["visibility_counts"] = dict(sorted(visibility_counts.items()))
+        bump_reason(
+            "historical_terminal_evidence",
+            "terminal_zero_qty_truth_probe_resolved",
+            truth_probe_resolved_count,
+        )
         result["terminal_zero_qty_truth_probe_count"] = truth_probe_count
         result["terminal_zero_qty_truth_probe_resolved_count"] = (
             truth_probe_resolved_count
@@ -5862,12 +5948,7 @@ def _build_diagnostic_noise_summary(
             )
             or []
         )
-        result["current_blocker_count"] = int(
-            visibility_counts.get("current_blocker", 0)
-        )
-        result["current_admission_blocker_count"] = int(
-            visibility_counts.get("current_admission_blocker", 0)
-        )
+        apply_derived_fields(result)
     return result
 
 

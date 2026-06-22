@@ -123,6 +123,16 @@ gaps must not re-open a cleared business owner or create `risk_only` /
 For new recurrences, start from `lightfee/engine/business_contract.py` before
 adding another passive-close or diagnose-local terminality predicate.
 
+Diagnostic visibility is part of the same terminal-truth contract. Resolved
+close/order artifacts such as Binance close `-2022`, Binance close post-only
+`-5022`, Bybit duplicate `110072`, ACK-only, and zero-fill may be
+`historical_terminal_evidence` only after current exchange truth proves
+flat/no-open-orders. If that truth is unavailable or dirty, the artifact stays
+a current blocker. Quote stale and quote rewarm terminal stale are
+`current_admission_blocker` records, not current exposure. Unsupported-symbol
+position/open-order probe records from venue catalog scope are
+`catalog_diagnostic`; they stay visible for audit but do not block the gate.
+
 For Binance post-only close maker `-5022`, run the BBO guard before submit.
 If the high-slippage chunk has zero maker/hedge fill progress, V2 may rotate to
 the opposite maker leg and reset the zero-fill containers. If the chunk already
