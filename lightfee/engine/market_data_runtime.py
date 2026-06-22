@@ -70,55 +70,93 @@ class EntryOpenInterestRefresher:
         *,
         now_ms: int,
     ) -> dict[str, Any] | None:
-        venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
-        if venue_key not in self.SUPPORTED_VENUES or not symbol_key:
+        if not symbol_key:
             return {
                 "open_interest_quote": 0.0,
                 "open_interest_evidence_status": "unsupported",
                 "open_interest_evidence_reason": "unsupported_targeted_refresh",
             }
+        batch = await self.refresh_open_interest_batch(
+            venue,
+            [symbol_key],
+            now_ms=now_ms,
+        )
+        return batch.get(symbol_key)
+
+    async def refresh_open_interest_batch(
+        self,
+        venue: str,
+        symbols: list[str],
+        *,
+        now_ms: int,
+    ) -> dict[str, dict[str, Any]]:
+        venue_key = str(venue or "").strip().lower()
+        symbol_keys = [
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ]
+        symbol_keys = list(dict.fromkeys(symbol_keys))
+        if venue_key not in self.SUPPORTED_VENUES:
+            return {
+                symbol: {
+                    "open_interest_quote": 0.0,
+                    "open_interest_evidence_status": "unsupported",
+                    "open_interest_evidence_reason": "unsupported_targeted_refresh",
+                }
+                for symbol in symbol_keys
+            }
+        if not symbol_keys:
+            return {}
         try:
             result = await self._client_for_venue(
                 venue_key
-            ).fetch_entry_open_interest_evidence([symbol_key])
+            ).fetch_entry_open_interest_evidence(symbol_keys)
         except Exception as exc:
             return {
-                "open_interest_quote": 0.0,
-                "open_interest_evidence_status": "timeout",
-                "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                symbol: {
+                    "open_interest_quote": 0.0,
+                    "open_interest_evidence_status": "timeout",
+                    "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                }
+                for symbol in symbol_keys
             }
-        ticker = result.get(f"{venue_key}:{symbol_key}")
-        if ticker is None:
-            return {
-                "open_interest_quote": 0.0,
-                "open_interest_evidence_status": "parse_error",
-                "open_interest_evidence_reason": "missing_targeted_ticker",
+        payloads: dict[str, dict[str, Any]] = {}
+        for symbol_key in symbol_keys:
+            ticker = result.get(f"{venue_key}:{symbol_key}")
+            if ticker is None:
+                payloads[symbol_key] = {
+                    "open_interest_quote": 0.0,
+                    "open_interest_evidence_status": "parse_error",
+                    "open_interest_evidence_reason": "missing_targeted_ticker",
+                }
+                continue
+            payloads[symbol_key] = {
+                "open_interest_quote": float(
+                    getattr(ticker, "open_interest_quote", 0.0) or 0.0
+                ),
+                "open_interest_evidence_status": str(
+                    getattr(ticker, "open_interest_evidence_status", "") or "unavailable"
+                ),
+                "open_interest_evidence_reason": str(
+                    getattr(ticker, "open_interest_evidence_reason", "")
+                    or "targeted_refresh"
+                ),
+                "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
+                "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
+                "oi_cache_miss_count": int(getattr(ticker, "oi_cache_miss_count", 0) or 0),
+                "oi_refresh_attempt_count": int(
+                    getattr(ticker, "oi_refresh_attempt_count", 0) or 0
+                ),
+                "oi_refresh_cap": int(getattr(ticker, "oi_refresh_cap", 0) or 0),
+                "oi_deferred_count": int(getattr(ticker, "oi_deferred_count", 0) or 0),
+                "oi_timeout_count": int(getattr(ticker, "oi_timeout_count", 0) or 0),
+                "oi_refresh_elapsed_ms": int(
+                    getattr(ticker, "oi_refresh_elapsed_ms", 0) or 0
+                ),
             }
-        return {
-            "open_interest_quote": float(
-                getattr(ticker, "open_interest_quote", 0.0) or 0.0
-            ),
-            "open_interest_evidence_status": str(
-                getattr(ticker, "open_interest_evidence_status", "") or "unavailable"
-            ),
-            "open_interest_evidence_reason": str(
-                getattr(ticker, "open_interest_evidence_reason", "")
-                or "targeted_refresh"
-            ),
-            "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
-            "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
-            "oi_cache_miss_count": int(getattr(ticker, "oi_cache_miss_count", 0) or 0),
-            "oi_refresh_attempt_count": int(
-                getattr(ticker, "oi_refresh_attempt_count", 0) or 0
-            ),
-            "oi_refresh_cap": int(getattr(ticker, "oi_refresh_cap", 0) or 0),
-            "oi_deferred_count": int(getattr(ticker, "oi_deferred_count", 0) or 0),
-            "oi_timeout_count": int(getattr(ticker, "oi_timeout_count", 0) or 0),
-            "oi_refresh_elapsed_ms": int(
-                getattr(ticker, "oi_refresh_elapsed_ms", 0) or 0
-            ),
-        }
+        return payloads
 
 
 class MarketDataRuntime:
@@ -2447,7 +2485,8 @@ class MarketDataRuntime:
 
         refresher = self._entry_open_interest_refresher()
         refresh = getattr(refresher, "refresh_open_interest", None)
-        if not callable(refresh):
+        batch_refresh = getattr(refresher, "refresh_open_interest_batch", None)
+        if not callable(refresh) and not callable(batch_refresh):
             return stats
 
         self.ctx.journal.append(
@@ -2458,21 +2497,20 @@ class MarketDataRuntime:
                 "ts_ms": now_ms,
             },
         )
-        for venue, symbol, quote, previous_status in targets:
+        def _apply_refresh_result(
+            *,
+            venue: str,
+            symbol: str,
+            quote,
+            previous_status: str,
+            result: dict[str, Any] | None,
+            default_elapsed_ms: int,
+        ) -> None:
             stats["attempt_count"] += 1
-            started_ms = wall_clock_now_ms()
-            try:
-                result = await refresh(venue, symbol, now_ms=now_ms)
-            except Exception as exc:  # pragma: no cover - defensive telemetry
-                result = {
-                    "open_interest_quote": 0.0,
-                    "open_interest_evidence_status": "timeout",
-                    "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
-                }
             elapsed_ms = int(
                 (result or {}).get(
                     "oi_targeted_refresh_elapsed_ms",
-                    max(wall_clock_now_ms() - started_ms, 0),
+                    (result or {}).get("oi_refresh_elapsed_ms", default_elapsed_ms),
                 )
                 or 0
             )
@@ -2530,6 +2568,61 @@ class MarketDataRuntime:
                 self.ctx.journal.append(
                     "runtime.entry_oi_targeted_refresh_failed",
                     payload,
+                )
+
+        if callable(batch_refresh):
+            grouped: dict[str, list[tuple[str, Any, str]]] = {}
+            for venue, symbol, quote, previous_status in targets:
+                grouped.setdefault(venue, []).append((symbol, quote, previous_status))
+            for venue, entries in grouped.items():
+                symbols = [symbol for symbol, _quote, _status in entries]
+                started_ms = wall_clock_now_ms()
+                try:
+                    batch_results = await batch_refresh(venue, symbols, now_ms=now_ms)
+                except Exception as exc:  # pragma: no cover - defensive telemetry
+                    batch_results = {
+                        symbol: {
+                            "open_interest_quote": 0.0,
+                            "open_interest_evidence_status": "timeout",
+                            "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                        }
+                        for symbol in symbols
+                    }
+                elapsed_ms = max(wall_clock_now_ms() - started_ms, 0)
+                for symbol, quote, previous_status in entries:
+                    result = (batch_results or {}).get(symbol)
+                    if result is None:
+                        result = {
+                            "open_interest_quote": 0.0,
+                            "open_interest_evidence_status": "parse_error",
+                            "open_interest_evidence_reason": "missing_targeted_ticker",
+                        }
+                    _apply_refresh_result(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        previous_status=previous_status,
+                        result=result,
+                        default_elapsed_ms=elapsed_ms,
+                    )
+        else:
+            for venue, symbol, quote, previous_status in targets:
+                started_ms = wall_clock_now_ms()
+                try:
+                    result = await refresh(venue, symbol, now_ms=now_ms)
+                except Exception as exc:  # pragma: no cover - defensive telemetry
+                    result = {
+                        "open_interest_quote": 0.0,
+                        "open_interest_evidence_status": "timeout",
+                        "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                    }
+                _apply_refresh_result(
+                    venue=venue,
+                    symbol=symbol,
+                    quote=quote,
+                    previous_status=previous_status,
+                    result=result,
+                    default_elapsed_ms=max(wall_clock_now_ms() - started_ms, 0),
                 )
 
         self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[

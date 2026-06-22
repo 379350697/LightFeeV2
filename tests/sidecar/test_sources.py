@@ -181,7 +181,7 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.bid == 100.0
         assert quote.ask == 101.0
         assert quote.open_interest == 0.0
-        assert quote.open_interest_evidence_status == "timeout"
-        assert quote.open_interest_evidence_reason == "timeout_waiting_for_oi"
+        assert quote.open_interest_evidence_status == "refresh_inflight"
+        assert quote.open_interest_evidence_reason == "background_refresh_inflight"
         assert quote.oi_refresh_attempt_count == 1
-        assert quote.oi_timeout_count == 1
+        assert quote.oi_timeout_count == 0

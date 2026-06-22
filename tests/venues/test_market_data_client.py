@@ -295,12 +295,69 @@ class TestProductionSidecarParserRegressions:
             assert ticker.bid > 0.0
             assert ticker.ask > 0.0
             assert ticker.open_interest_quote == 0.0
-            assert ticker.open_interest_evidence_status == "timeout"
-            assert ticker.open_interest_evidence_reason == "timeout_waiting_for_oi"
+            assert ticker.open_interest_evidence_status == "refresh_inflight"
+            assert ticker.open_interest_evidence_reason == "background_refresh_inflight"
             assert ticker.oi_refresh_cap == 128
             assert ticker.oi_refresh_attempt_count == 2
-            assert ticker.oi_timeout_count == 2
+            assert ticker.oi_timeout_count == 0
             assert ticker.oi_refresh_elapsed_ms >= 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [(binance_spec, "binance"), (aster_spec, "aster")],
+    )
+    async def test_binance_style_entry_open_interest_uses_single_symbol_endpoints(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class FakeBinanceStyleClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.calls: list[tuple[str, dict]] = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                if path == spec.funding_ticker_path:
+                    raise AssertionError("entry OI must not call full bookTicker")
+                if path == spec.volume_24h_path:
+                    raise AssertionError("entry OI must not call full 24hr ticker")
+                if path == spec.premium_index_path:
+                    assert params == {"symbol": "BTCUSDT"}
+                    return {
+                        "symbol": "BTCUSDT",
+                        "lastFundingRate": "0.0001",
+                        "markPrice": "100.5",
+                        "indexPrice": "100.4",
+                        "nextFundingTime": "1700000000000",
+                    }
+                if path == spec.open_interest_path:
+                    assert params == {"symbol": "BTCUSDT"}
+                    await asyncio.sleep(0.05)
+                    return {"symbol": "BTCUSDT", "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceStyleClient()
+        client.binance_style_open_interest_enrichment_budget_s = (
+            BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S
+        )
+
+        result = await asyncio.wait_for(
+            client.fetch_entry_open_interest_evidence(["BTCUSDT"]),
+            timeout=1.0,
+        )
+
+        ticker = result[f"{venue_key}:BTCUSDT"]
+        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_reason == "fresh_refresh"
+        assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert [call[0] for call in client.calls] == [
+            spec.premium_index_path,
+            spec.open_interest_path,
+        ]
 
     @pytest.mark.asyncio
     async def test_binance_entry_open_interest_budget_can_resolve_realistic_latency(self):
@@ -332,6 +389,40 @@ class TestProductionSidecarParserRegressions:
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.oi_timeout_count == 0
         assert ticker.oi_refresh_attempt_count == 1
+
+    @pytest.mark.asyncio
+    async def test_binance_slow_open_interest_populates_background_cache(self):
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls = 0
+                self.binance_style_open_interest_enrichment_budget_s = 0.01
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls += 1
+                    await asyncio.sleep(0.05)
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+
+        first = await client._fetch_binance_style(["BTCUSDT"])
+        assert first["binance:BTCUSDT"].open_interest_evidence_status == "refresh_inflight"
+
+        await asyncio.sleep(0.08)
+        second = await client._fetch_binance_style(["BTCUSDT"])
+
+        assert client.oi_calls == 1
+        ticker = second["binance:BTCUSDT"]
+        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):
@@ -549,6 +640,44 @@ class TestProductionSidecarParserRegressions:
             ticker.open_interest_evidence_reason == "refresh_cap_exceeded"
             for ticker in deferred
         )
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_refresh_cap_rotates_across_cycles(self):
+        symbols = [f"S{i}USDT" for i in range(5)]
+
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls: list[str] = []
+                self.binance_style_open_interest_refresh_cap = 2
+                self.binance_style_open_interest_enrichment_budget_s = 0.001
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": symbol, "bidPrice": "100", "askPrice": "101"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {"symbol": symbol, "lastFundingRate": "0.0001", "markPrice": "100.5"}
+                        for symbol in symbols
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": symbol, "quoteVolume": "12345"} for symbol in symbols]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls.append(params["symbol"])
+                    await asyncio.sleep(0.02)
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+
+        await client._fetch_binance_style(symbols)
+        await asyncio.sleep(0.04)
+        await client._fetch_binance_style(symbols)
+
+        assert client.oi_calls[:4] == ["S0USDT", "S1USDT", "S2USDT", "S3USDT"]
 
     @pytest.mark.asyncio
     async def test_binance_entry_open_interest_refresh_scopes_single_deferred_candidate(self):
@@ -828,6 +957,9 @@ class TestProductionSidecarParserRegressions:
         assert ticker.bid == 65000.0
         assert ticker.ask == 65000.0
         assert ticker.funding_rate_bps == 1.0
+        assert ticker.open_interest_quote == pytest.approx(20.0 * 65000.0)
+        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_reason == "openInterest_times_mark"
 
     @pytest.mark.asyncio
     async def test_hyperliquid_asset_contexts_match_universe_by_index(self):

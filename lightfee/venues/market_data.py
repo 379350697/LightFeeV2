@@ -181,6 +181,13 @@ class MarketDataClient:
         self._binance_style_open_interest_cache: dict[
             str, tuple[float, float, int, str, str]
         ] = {}
+        self._binance_style_open_interest_inflight: dict[
+            str, asyncio.Task[tuple[str, float, float, int, str, str]]
+        ] = {}
+        self._binance_style_open_interest_refresh_cursor: int = 0
+        self._binance_style_open_interest_semaphore = asyncio.Semaphore(
+            _BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY
+        )
 
     @property
     def venue(self) -> Venue:
@@ -204,6 +211,13 @@ class MarketDataClient:
         return self._client
 
     async def close(self) -> None:
+        inflight = list(self._binance_style_open_interest_inflight.values())
+        self._binance_style_open_interest_inflight.clear()
+        for task in inflight:
+            if not task.done():
+                task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -357,7 +371,10 @@ class MarketDataClient:
         ]
         if not scoped_symbols:
             return {}
-        return await self.fetch_funding_tickers(list(dict.fromkeys(scoped_symbols)))
+        deduped = list(dict.fromkeys(scoped_symbols))
+        if self._spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+            return await self._fetch_binance_style_entry_open_interest(deduped)
+        return await self.fetch_funding_tickers(deduped)
 
     # ------------------------------------------------------------------
     # Per-symbol L2 snapshot
@@ -457,6 +474,8 @@ class MarketDataClient:
     def _binance_style_oi_status_from_error(exc: Exception) -> str:
         status_code = int(getattr(exc, "status_code", 0) or 0)
         message = str(exc).lower()
+        if "timeout" in message:
+            return "timeout"
         if status_code in (429, 418) or "429" in message or "too many" in message:
             return "rate_limited"
         if status_code in (400, 404) and (
@@ -475,7 +494,7 @@ class MarketDataClient:
         self,
         venue_sym: str,
         *,
-        mark_price: float,
+        mark_price: float | None,
         now_ms: int,
     ) -> tuple[float, str, str] | None:
         entry = self._binance_style_open_interest_cache.get(
@@ -486,7 +505,9 @@ class MarketDataClient:
         open_interest_quote, cached_mark_price, observed_at_ms, status, reason = entry
         if now_ms - int(observed_at_ms or 0) > BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS:
             return None
-        if mark_price <= 0.0 or cached_mark_price <= 0.0:
+        if cached_mark_price <= 0.0:
+            return None
+        if mark_price is not None and mark_price <= 0.0:
             return None
         return open_interest_quote, status, reason
 
@@ -505,6 +526,332 @@ class MarketDataClient:
         self._binance_style_open_interest_cache[
             self._binance_style_oi_cache_key(venue_sym)
         ] = (open_interest_quote, mark_price, observed_at_ms, status, reason)
+
+    @staticmethod
+    def _binance_style_first_symbol_item(
+        raw: Any,
+        venue_sym: str,
+    ) -> dict[str, Any] | None:
+        if isinstance(raw, dict):
+            data = raw.get("data")
+            if isinstance(data, list):
+                items = data
+            else:
+                items = [raw]
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            return None
+        fallback: dict[str, Any] | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if fallback is None:
+                fallback = item
+            symbol = str(item.get("symbol", "") or item.get("s", "") or "")
+            if symbol == venue_sym:
+                return item
+        return fallback
+
+    @staticmethod
+    def _binance_style_parse_required_float(
+        item: dict[str, Any],
+        *keys: str,
+    ) -> tuple[float, bool, str]:
+        for key in keys:
+            if not _has_nonempty_field(item, key):
+                continue
+            try:
+                return float(item.get(key)), True, key
+            except (TypeError, ValueError):
+                return 0.0, False, key
+        return 0.0, False, ""
+
+    async def _fetch_binance_style_open_interest_probe(
+        self,
+        venue_sym: str,
+        *,
+        mark_price: float | None,
+        observed_at_ms: int,
+    ) -> tuple[str, float, float, int, str, str]:
+        spec = self._spec
+        async with self._binance_style_open_interest_semaphore:
+            if not spec.open_interest_path:
+                return venue_sym, 0.0, 0.0, observed_at_ms, "unsupported", "unsupported"
+
+            resolved_mark = float(mark_price or 0.0)
+            if resolved_mark <= 0.0 and spec.premium_index_path:
+                try:
+                    raw_pi = await self._public_get(
+                        spec.premium_index_path,
+                        params={"symbol": venue_sym},
+                    )
+                except Exception as exc:
+                    return (
+                        venue_sym,
+                        0.0,
+                        0.0,
+                        observed_at_ms,
+                        self._binance_style_oi_status_from_error(exc),
+                        _http_error_reason(exc),
+                    )
+                pi_item = self._binance_style_first_symbol_item(raw_pi, venue_sym)
+                if pi_item is None:
+                    return (
+                        venue_sym,
+                        0.0,
+                        0.0,
+                        observed_at_ms,
+                        "missing_mark_price",
+                        "missing_mark_price",
+                    )
+                resolved_mark, mark_ok, _mark_key = self._binance_style_parse_required_float(
+                    pi_item,
+                    "markPrice",
+                    "mark_price",
+                    "markPx",
+                )
+                if not mark_ok or resolved_mark <= 0.0:
+                    return (
+                        venue_sym,
+                        0.0,
+                        0.0,
+                        observed_at_ms,
+                        "missing_mark_price",
+                        "missing_mark_price",
+                    )
+
+            if resolved_mark <= 0.0:
+                return (
+                    venue_sym,
+                    0.0,
+                    0.0,
+                    observed_at_ms,
+                    "missing_mark_price",
+                    "missing_mark_price",
+                )
+
+            try:
+                raw_oi = await self._public_get(
+                    spec.open_interest_path,
+                    params={"symbol": venue_sym},
+                )
+            except Exception as exc:
+                return (
+                    venue_sym,
+                    0.0,
+                    resolved_mark,
+                    observed_at_ms,
+                    self._binance_style_oi_status_from_error(exc),
+                    _http_error_reason(exc),
+                )
+            oi_item = self._binance_style_first_symbol_item(raw_oi, venue_sym)
+            if oi_item is None:
+                return (
+                    venue_sym,
+                    0.0,
+                    resolved_mark,
+                    observed_at_ms,
+                    "parse_error",
+                    "missing_open_interest",
+                )
+            open_interest, oi_ok, oi_key = self._binance_style_parse_required_float(
+                oi_item,
+                "openInterest",
+                "open_interest",
+                "oi",
+                "size",
+            )
+            if not oi_ok:
+                return (
+                    venue_sym,
+                    0.0,
+                    resolved_mark,
+                    observed_at_ms,
+                    "parse_error",
+                    f"invalid_{oi_key or 'open_interest'}",
+                )
+            return (
+                venue_sym,
+                open_interest * resolved_mark,
+                resolved_mark,
+                observed_at_ms,
+                "available",
+                "fresh_refresh",
+            )
+
+    def _binance_style_record_open_interest_task(
+        self,
+        cache_key: str,
+        task: asyncio.Task[tuple[str, float, float, int, str, str]],
+    ) -> None:
+        if self._binance_style_open_interest_inflight.get(cache_key) is task:
+            self._binance_style_open_interest_inflight.pop(cache_key, None)
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        venue_sym, open_interest_quote, mark_price, observed_at_ms, status, reason = result
+        self._binance_style_store_open_interest(
+            venue_sym,
+            open_interest_quote=open_interest_quote,
+            mark_price=mark_price,
+            observed_at_ms=observed_at_ms,
+            status=status,
+            reason=reason,
+        )
+
+    def _binance_style_open_interest_task(
+        self,
+        venue_sym: str,
+        *,
+        mark_price: float | None,
+        observed_at_ms: int,
+    ) -> asyncio.Task[tuple[str, float, float, int, str, str]]:
+        cache_key = self._binance_style_oi_cache_key(venue_sym)
+        task = self._binance_style_open_interest_inflight.get(cache_key)
+        if task is not None and not task.done():
+            return task
+        self._binance_style_open_interest_inflight.pop(cache_key, None)
+        task = asyncio.create_task(
+            self._fetch_binance_style_open_interest_probe(
+                venue_sym,
+                mark_price=mark_price,
+                observed_at_ms=observed_at_ms,
+            ),
+            name=venue_sym,
+        )
+        self._binance_style_open_interest_inflight[cache_key] = task
+        task.add_done_callback(
+            lambda completed, key=cache_key: self._binance_style_record_open_interest_task(
+                key,
+                completed,
+            )
+        )
+        return task
+
+    async def _fetch_binance_style_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        spec = self._spec
+        venue_str = spec.venue_id.value
+        now_ms = _now_ms()
+        venue_sym_to_canon = {
+            self._to_venue_symbol(symbol): symbol.upper()
+            for symbol in list(dict.fromkeys(symbols))
+        }
+        result: dict[str, FundingTicker] = {}
+        if not spec.open_interest_path:
+            for venue_sym, canon in venue_sym_to_canon.items():
+                result[f"{venue_str}:{canon}"] = FundingTicker(
+                    venue=venue_str,
+                    symbol=canon,
+                    bid=0.0,
+                    ask=0.0,
+                    open_interest_evidence_status="unsupported",
+                    open_interest_evidence_reason="unsupported",
+                )
+            return result
+
+        oi_map: dict[str, tuple[float, float, str, str]] = {}
+        pending_status: dict[str, tuple[str, str]] = {}
+        tasks: list[asyncio.Task[tuple[str, float, float, int, str, str]]] = []
+        for venue_sym in venue_sym_to_canon:
+            cached = self._binance_style_cached_open_interest(
+                venue_sym,
+                mark_price=None,
+                now_ms=now_ms,
+            )
+            if cached is not None:
+                open_interest_quote, status, reason = cached
+                cached_mark = self._binance_style_open_interest_cache[
+                    self._binance_style_oi_cache_key(venue_sym)
+                ][1]
+                oi_map[venue_sym] = (
+                    open_interest_quote,
+                    cached_mark,
+                    status,
+                    reason or "cache_hit",
+                )
+                continue
+            tasks.append(
+                self._binance_style_open_interest_task(
+                    venue_sym,
+                    mark_price=None,
+                    observed_at_ms=now_ms,
+                )
+            )
+
+        refresh_started_ms = _now_ms()
+        if tasks:
+            budget_s = float(
+                getattr(
+                    self,
+                    "binance_style_open_interest_enrichment_budget_s",
+                    BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
+                )
+                or 0.0
+            )
+            done, pending = await asyncio.wait(tasks, timeout=max(budget_s, 0.0))
+            for task in done:
+                try:
+                    venue_sym, open_interest_quote, mark_price, _observed, status, reason = (
+                        task.result()
+                    )
+                except Exception:
+                    continue
+                if status == "available":
+                    oi_map[venue_sym] = (
+                        open_interest_quote,
+                        mark_price,
+                        status,
+                        reason or "fresh_refresh",
+                    )
+                else:
+                    pending_status[venue_sym] = (status, reason or status)
+            for task in pending:
+                venue_sym = task.get_name()
+                pending_status[venue_sym] = ("timeout", "timeout_waiting_for_oi")
+        elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
+
+        candidate_count = len(venue_sym_to_canon)
+        cache_hit_count = candidate_count - len(tasks)
+        for venue_sym, canon in venue_sym_to_canon.items():
+            open_interest_quote, mark_price, status, reason = oi_map.get(
+                venue_sym,
+                (0.0, 0.0, *pending_status.get(venue_sym, ("unavailable", "not_refreshed"))),
+            )
+            result[f"{venue_str}:{canon}"] = FundingTicker(
+                venue=venue_str,
+                symbol=canon,
+                bid=0.0,
+                ask=0.0,
+                mark_price=mark_price,
+                open_interest_quote=open_interest_quote,
+                open_interest_evidence_status=status,
+                open_interest_evidence_reason=reason,
+                oi_candidate_count=candidate_count,
+                oi_cache_hit_count=cache_hit_count,
+                oi_cache_miss_count=len(tasks),
+                oi_refresh_attempt_count=len(tasks),
+                oi_refresh_cap=int(
+                    getattr(
+                        self,
+                        "binance_style_open_interest_refresh_cap",
+                        BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP,
+                    )
+                    or BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP
+                ),
+                oi_deferred_count=0,
+                oi_timeout_count=sum(
+                    1 for status_reason in pending_status.values() if status_reason[0] == "timeout"
+                ),
+                oi_refresh_elapsed_ms=elapsed_ms,
+            )
+        return result
 
     async def _fetch_binance_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
         spec = self._spec
@@ -561,7 +908,6 @@ class MarketDataClient:
             for venue_sym in venue_sym_to_canon
         }
         if spec.open_interest_path:
-            sem = asyncio.Semaphore(_BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY)
             oi_candidate_count = 0
             oi_cache_hit_count = 0
             oi_cache_miss_count = 0
@@ -569,26 +915,6 @@ class MarketDataClient:
             oi_deferred_count = 0
             oi_timeout_count = 0
             oi_refresh_elapsed_ms = 0
-
-            async def _fetch_oi(venue_sym: str) -> tuple[str, float, str]:
-                async with sem:
-                    try:
-                        raw_oi = await self._public_get(
-                            spec.open_interest_path,
-                            params={"symbol": venue_sym},
-                        )
-                    except Exception as exc:
-                        return venue_sym, 0.0, self._binance_style_oi_status_from_error(exc)
-                    item = raw_oi[0] if isinstance(raw_oi, list) and raw_oi else raw_oi
-                    if isinstance(item, dict):
-                        open_interest = _safe_float(item.get("openInterest", 0))
-                        mark_price = _safe_float(
-                            pi_map.get(venue_sym, {}).get("markPrice", 0)
-                        )
-                        if mark_price > 0.0:
-                            return venue_sym, open_interest * mark_price, "available"
-                        return venue_sym, 0.0, "missing_mark_price"
-                    return venue_sym, 0.0, "parse_error"
 
             oi_symbols: list[str] = []
             for sym in venue_sym_to_canon:
@@ -618,14 +944,40 @@ class MarketDataClient:
                 )
                 or BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP
             )
-            refresh_symbols = oi_symbols[:max(refresh_cap, 0)]
+            refresh_limit = max(refresh_cap, 0)
+            if refresh_limit > 0 and len(oi_symbols) > refresh_limit:
+                start = (
+                    0
+                    if oi_cache_hit_count > 0
+                    else self._binance_style_open_interest_refresh_cursor % len(oi_symbols)
+                )
+                ordered = oi_symbols[start:] + oi_symbols[:start]
+                refresh_symbols = ordered[:refresh_limit]
+                refresh_set = set(refresh_symbols)
+                deferred_symbols = [sym for sym in oi_symbols if sym not in refresh_set]
+                self._binance_style_open_interest_refresh_cursor = (
+                    start + len(refresh_symbols)
+                ) % len(oi_symbols)
+            else:
+                refresh_symbols = oi_symbols[:refresh_limit] if refresh_limit > 0 else []
+                refresh_set = set(refresh_symbols)
+                deferred_symbols = [sym for sym in oi_symbols if sym not in refresh_set]
+                if oi_symbols:
+                    self._binance_style_open_interest_refresh_cursor = (
+                        self._binance_style_open_interest_refresh_cursor
+                        + len(refresh_symbols)
+                    ) % len(oi_symbols)
             oi_refresh_attempt_count = len(refresh_symbols)
-            for deferred_sym in oi_symbols[len(refresh_symbols):]:
+            for deferred_sym in deferred_symbols:
                 oi_evidence_status[deferred_sym] = "deferred_by_cap"
                 oi_evidence_reason[deferred_sym] = "refresh_cap_exceeded"
-            oi_deferred_count = max(len(oi_symbols) - len(refresh_symbols), 0)
+            oi_deferred_count = len(deferred_symbols)
             tasks = [
-                asyncio.create_task(_fetch_oi(sym), name=sym)
+                self._binance_style_open_interest_task(
+                    sym,
+                    mark_price=_safe_float(pi_map.get(sym, {}).get("markPrice", 0)),
+                    observed_at_ms=now_ms,
+                )
                 for sym in refresh_symbols
             ]
             if tasks:
@@ -645,37 +997,33 @@ class MarketDataClient:
                 oi_refresh_elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
                 for task in done:
                     try:
-                        venue_sym, open_interest_quote, status = task.result()
+                        venue_sym, open_interest_quote, mark_price, observed_at_ms, status, reason = (
+                            task.result()
+                        )
                     except Exception:
                         continue
                     oi_evidence_status[venue_sym] = status
-                    oi_evidence_reason[venue_sym] = status
+                    oi_evidence_reason[venue_sym] = reason or status
+                    if status == "timeout":
+                        oi_timeout_count += 1
                     if status == "available":
                         oi_map[venue_sym] = open_interest_quote
-                        mark_price = _safe_float(
-                            pi_map.get(venue_sym, {}).get("markPrice", 0)
-                        )
                         self._binance_style_store_open_interest(
                             venue_sym,
                             open_interest_quote=open_interest_quote,
                             mark_price=mark_price,
-                            observed_at_ms=now_ms,
+                            observed_at_ms=observed_at_ms,
                             status=status,
-                            reason="fresh_refresh",
+                            reason=reason or "fresh_refresh",
                         )
-                for task in pending:
-                    task.cancel()
                 for task in pending:
                     try:
                         venue_sym = task.get_name()
                     except Exception:
                         venue_sym = ""
                     if venue_sym:
-                        oi_evidence_status[venue_sym] = "timeout"
-                        oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
-                oi_timeout_count = len(pending)
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
+                        oi_evidence_status[venue_sym] = "refresh_inflight"
+                        oi_evidence_reason[venue_sym] = "background_refresh_inflight"
         else:
             oi_candidate_count = 0
             oi_cache_hit_count = 0
@@ -1154,10 +1502,16 @@ class MarketDataClient:
                 ctx,
                 "openInterest",
             )
-            if has_open_interest:
+            if has_open_interest and mark > 0.0:
+                open_interest_quote = open_interest * mark
                 oi_status = "available"
-                oi_reason = oi_key
+                oi_reason = f"{oi_key}_times_mark"
+            elif has_open_interest:
+                open_interest_quote = 0.0
+                oi_status = "unavailable"
+                oi_reason = "missing_mark_price"
             else:
+                open_interest_quote = 0.0
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
 
@@ -1173,7 +1527,7 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
                 funding_timestamp_ms=funding_ts,
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
-                open_interest_quote=open_interest,
+                open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,
             )
