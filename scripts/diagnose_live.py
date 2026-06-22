@@ -3741,6 +3741,9 @@ def _build_entry_market_evidence_summary(
     oi_resolved_count = 0
     oi_failed_count = 0
     oi_blocked_candidate_count = 0
+    oi_unavailable_count = 0
+    oi_below_floor_count = 0
+    oi_structural_count = 0
     quote_blocked_candidate_count = 0
     blocked_owner_stats: dict[str, dict[str, Any]] = {}
 
@@ -3764,6 +3767,12 @@ def _build_entry_market_evidence_summary(
             blocked_candidate_count += 1
             if evidence_class == "oi":
                 oi_blocked_candidate_count += 1
+                if action == "block_oi_unavailable":
+                    oi_unavailable_count += 1
+                elif action == "block_oi_below_floor":
+                    oi_below_floor_count += 1
+                elif action == "block_oi_structural":
+                    oi_structural_count += 1
             elif evidence_class == "quote":
                 quote_blocked_candidate_count += 1
             owner_id = str(contract.get("owner_id") or "")
@@ -3837,6 +3846,13 @@ def _build_entry_market_evidence_summary(
             "reasons": dict(sorted((stat.get("reasons") or {}).items())),
         })
 
+    if oi_unavailable_count > 0 or quote_blocked_candidate_count > 0:
+        next_action = "targeted_refresh_or_data_source_backfill"
+    elif oi_below_floor_count > 0 or oi_structural_count > 0:
+        next_action = "confirmed_oi_below_floor_no_data_backfill"
+    else:
+        next_action = "no_entry_market_evidence_action_required"
+
     return {
         "action_counts": dict(sorted(action_counts.items())),
         "blocked_candidate_count": blocked_candidate_count,
@@ -3846,7 +3862,7 @@ def _build_entry_market_evidence_summary(
             "current_close_blocker_count": 0,
             "current_warning_count": 0,
             "current_scope": "entry_candidate_admission",
-            "next_action": "targeted_refresh_or_data_source_backfill",
+            "next_action": next_action,
             "raw_candidate_block_count": blocked_candidate_count,
             "top_blocked_owner_ids": top_blocked_owner_ids,
         },
@@ -3855,9 +3871,12 @@ def _build_entry_market_evidence_summary(
         ),
         "evidence_class_counts": dict(sorted(evidence_class_counts.items())),
         "oi": {
+            "below_floor_count": oi_below_floor_count,
             "blocked_candidate_count": oi_blocked_candidate_count,
             "failed_count": oi_failed_count,
             "resolved_count": oi_resolved_count,
+            "structural_count": oi_structural_count,
+            "unavailable_count": oi_unavailable_count,
         },
         "quote": {
             "blocked_candidate_count": quote_blocked_candidate_count,

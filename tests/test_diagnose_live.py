@@ -5669,9 +5669,12 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "quote": 2,
         },
         "oi": {
+            "below_floor_count": 0,
             "blocked_candidate_count": 3,
             "failed_count": 1,
             "resolved_count": 1,
+            "structural_count": 0,
+            "unavailable_count": 3,
         },
         "quote": {
             "blocked_candidate_count": 2,
@@ -5773,6 +5776,108 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
         "unresolved_blocker_count": 1,
         "unresolved_blocker_scope": "entry_candidate_admission",
     }
+
+
+def test_entry_market_evidence_summary_distinguishes_low_oi_from_unavailable():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "HUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 432_987.0,
+                "min_open_interest_quote": 1_000_000.0,
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "hyperliquid",
+                "symbol": "DYMUSDT",
+                "reason": "perp_open_interest_below_floor",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 209_347.0,
+                "min_open_interest_quote": 1_000_000.0,
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "binance",
+                "symbol": "BSBUSDT",
+                "reason": "oi_evidence_unavailable",
+                "open_interest_evidence_status": "timeout",
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["action_counts"] == {
+        "block_oi_below_floor": 1,
+        "block_oi_structural": 1,
+        "block_oi_unavailable": 1,
+    }
+    assert summary["oi"]["blocked_candidate_count"] == 3
+    assert summary["oi"]["below_floor_count"] == 1
+    assert summary["oi"]["structural_count"] == 1
+    assert summary["oi"]["unavailable_count"] == 1
+    assert summary["candidate_admission_noise_summary"]["next_action"] == (
+        "targeted_refresh_or_data_source_backfill"
+    )
+    assert summary["candidate_admission_noise_summary"]["top_blocked_owner_ids"] == [
+        {
+            "owner_id": "aster:HUSDT",
+            "count": 1,
+            "actions": {"block_oi_structural": 1},
+            "evidence_classes": {"oi": 1},
+            "reasons": {"perp_open_interest_structural": 1},
+        },
+        {
+            "owner_id": "binance:BSBUSDT",
+            "count": 1,
+            "actions": {"block_oi_unavailable": 1},
+            "evidence_classes": {"oi": 1},
+            "reasons": {"oi_evidence_unavailable": 1},
+        },
+        {
+            "owner_id": "hyperliquid:DYMUSDT",
+            "count": 1,
+            "actions": {"block_oi_below_floor": 1},
+            "evidence_classes": {"oi": 1},
+            "reasons": {"perp_open_interest_below_floor": 1},
+        },
+    ]
+
+
+def test_entry_market_evidence_summary_low_oi_only_needs_no_data_backfill():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "POWERUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 19_037.0,
+                "min_open_interest_quote": 1_000_000.0,
+            },
+        }
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["action_counts"] == {"block_oi_structural": 1}
+    assert summary["oi"]["unavailable_count"] == 0
+    assert summary["candidate_admission_noise_summary"]["next_action"] == (
+        "confirmed_oi_below_floor_no_data_backfill"
+    )
 
 
 def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():

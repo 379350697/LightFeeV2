@@ -107,6 +107,47 @@ def test_entry_market_evidence_contract_maps_oi_resolution_and_failure():
     assert failed["terminality"] == "terminal_candidate_block"
 
 
+def test_entry_market_evidence_contract_distinguishes_low_oi_from_unavailable():
+    structural = entry_market_evidence_contract(
+        "execution.entry_liquidity_blocked",
+        {
+            "venue": "aster",
+            "symbol": "HUSDT",
+            "reason": "perp_open_interest_structural",
+            "open_interest_evidence_status": "available",
+            "observed_open_interest_quote": 432_987.0,
+            "min_open_interest_quote": 1_000_000.0,
+        },
+    )
+    below_floor = entry_market_evidence_contract(
+        "execution.entry_liquidity_blocked",
+        {
+            "venue": "hyperliquid",
+            "symbol": "DYMUSDT",
+            "reason": "perp_open_interest_below_floor",
+            "open_interest_evidence_status": "available",
+            "observed_open_interest_quote": 209_347.0,
+            "min_open_interest_quote": 1_000_000.0,
+        },
+    )
+    unavailable = entry_market_evidence_contract(
+        "execution.entry_liquidity_blocked",
+        {
+            "venue": "binance",
+            "symbol": "BSBUSDT",
+            "reason": "oi_evidence_unavailable",
+            "open_interest_evidence_status": "timeout",
+        },
+    )
+
+    assert structural["action"] == "block_oi_structural"
+    assert structural["blocks_entry"] is True
+    assert below_floor["action"] == "block_oi_below_floor"
+    assert below_floor["blocks_entry"] is True
+    assert unavailable["action"] == "block_oi_unavailable"
+    assert unavailable["blocks_entry"] is True
+
+
 def test_entry_market_evidence_contract_terminalizes_quote_rewarm():
     result = entry_market_evidence_contract(
         "runtime.entry_quote_rewarm_terminal_stale",

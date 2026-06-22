@@ -224,11 +224,12 @@ def entry_market_evidence_contract(
                 "action_taken": "record_oi_liquidity_advisory",
                 "terminality": "active",
             }
+        action = _entry_oi_block_action(payload, reason)
         return {
             **base,
             "evidence_class": "oi",
-            "action": "block_oi_unavailable",
-            "action_taken": "block_oi_unavailable",
+            "action": action,
+            "action_taken": action,
             "blocks_entry": True,
             "terminality": "terminal_candidate_block",
             "diagnostic_severity": "production_issue",
@@ -265,6 +266,34 @@ def entry_market_evidence_contract(
             "diagnostic_severity": "production_issue",
         }
     return {}
+
+
+def _entry_oi_block_action(payload: dict[str, Any], reason: str) -> str:
+    evidence_status = str(
+        payload.get("open_interest_evidence_status") or ""
+    ).strip().lower()
+    normalized_reason = str(reason or "").strip()
+    if normalized_reason == "perp_open_interest_structural":
+        return "block_oi_structural"
+    if normalized_reason == "perp_open_interest_below_floor":
+        return "block_oi_below_floor"
+    try:
+        current_value = float(
+            payload.get("observed_open_interest_quote")
+            if payload.get("observed_open_interest_quote") is not None
+            else payload.get("current_value")
+        )
+        floor = float(
+            payload.get("min_open_interest_quote")
+            if payload.get("min_open_interest_quote") is not None
+            else payload.get("floor")
+        )
+    except (TypeError, ValueError):
+        current_value = 0.0
+        floor = 0.0
+    if evidence_status == "available" and floor > 0.0 and current_value < floor:
+        return "block_oi_below_floor"
+    return "block_oi_unavailable"
 
 
 def close_reconciliation_evidence_contract(
