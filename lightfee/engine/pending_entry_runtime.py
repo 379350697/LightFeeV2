@@ -806,18 +806,16 @@ class PendingEntryRuntime:
             adapter,
             maker_venue,
         )
-        if matches is not None:
-            if matches:
-                self.ctx.journal.append(
-                    "entry.abort_retained_maker_open_order",
-                    {
-                        **evidence,
-                        "open_order_count": len(matches),
-                        "open_order_truth": "present",
-                    },
-                )
-                return False
-            return True
+        if matches:
+            self.ctx.journal.append(
+                "entry.abort_retained_maker_open_order",
+                {
+                    **evidence,
+                    "open_order_count": len(matches),
+                    "open_order_truth": "present",
+                },
+            )
+            return False
 
         try:
             progress = await adapter.query_passive_order_progress(
@@ -827,6 +825,8 @@ class PendingEntryRuntime:
                 side=pending.maker_side(),
             )
         except Exception as exc:
+            if matches is not None:
+                return True
             self.ctx.journal.append(
                 "entry.abort_maker_order_truth_unavailable",
                 {**evidence, "error": str(exc), "open_order_error": open_order_error},
@@ -837,6 +837,22 @@ class PendingEntryRuntime:
         cumulative_quantity = float(
             getattr(progress, "cumulative_quantity", 0.0) or 0.0
         ) if progress is not None else 0.0
+        if cumulative_quantity > maker_filled + 1e-9:
+            self.ctx.journal.append(
+                "entry.abort_maker_positive_fill_truth_retained",
+                {
+                    **evidence,
+                    "open_order_error": open_order_error,
+                    "progress_state": getattr(state, "value", str(state or "")),
+                    "cumulative_quantity": cumulative_quantity,
+                    "local_maker_quantity": maker_filled,
+                    "target_quantity": target_quantity,
+                    "decision": "retain_pending_for_recovery_truth",
+                },
+            )
+            return False
+        if matches is not None:
+            return True
         if state is not None and hasattr(state, "is_terminal") and state.is_terminal():
             return True
         self.ctx.journal.append(

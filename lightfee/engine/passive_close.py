@@ -5642,12 +5642,30 @@ class PassiveCloseExecutor:
         if close_result is None:
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
+        close_anchor_extra = {
+            "terminal_close_execution": True,
+            "fallback_live_close_source": source,
+            "fallback_live_close_long_quantity": close_result.long_close_qty,
+            "fallback_live_close_short_quantity": close_result.short_close_qty,
+            "fallback_live_close_long_price": close_result.long_close_price,
+            "fallback_live_close_short_price": close_result.short_close_price,
+            "fallback_live_close_long_fee_quote": close_result.long_fee_quote,
+            "fallback_live_close_short_fee_quote": close_result.short_fee_quote,
+            "fallback_live_close_realized_price_pnl_quote": (
+                close_result.realized_price_pnl_quote
+            ),
+            "fallback_live_close_funding_pnl_quote": close_result.funding_pnl_quote,
+            "fallback_live_close_net_quote": close_result.net_quote,
+        }
         if await self._clear_if_live_flat(
             state,
             pending,
             position,
             source=f"{source}_matched_close_flat_probe",
-            extra={"live_matched_quantity": live_quantity},
+            extra={
+                "live_matched_quantity": live_quantity,
+                **close_anchor_extra,
+            },
         ):
             return True
         pending.next_retry_at_ms = self._now_ms() + 5_000

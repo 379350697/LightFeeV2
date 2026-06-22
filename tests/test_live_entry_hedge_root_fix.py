@@ -4696,6 +4696,79 @@ class TestRealPathAbortCleanupDeadline:
         assert "entry.abort_retained_maker_open_order" in kinds
 
     @pytest.mark.asyncio
+    async def test_abort_pending_entry_retains_when_maker_progress_has_unabsorbed_fill(self, tmp_path):
+        """Positive exchange fill truth must not be downgraded to entry.aborted."""
+        from lightfee.risk.modes import GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.BYBIT)
+        hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
+        maker.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="USTCUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1_000_000,
+        )
+        hedge.position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="USTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1_000_000,
+        )
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol="USTCUSDT",
+            side=Side.BUY,
+            order_id="maker-progress-positive",
+            client_order_id="maker-progress-positive-cid",
+            cumulative_quantity=25.0,
+            average_price=0.10,
+            state=PassiveOrderState.FILLED,
+        )
+        runtime._venue_adapters[Venue.BYBIT] = maker
+        runtime._venue_adapters[Venue.HYPERLIQUID] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-maker-progress-positive",
+            symbol="USTCUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.HYPERLIQUID,
+            target_quantity=100.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000_000,
+            maker_leg="long",
+            maker_order_id="maker-progress-positive",
+            maker_client_order_id="maker-progress-positive-cid",
+            maker_leg_filled=0.0,
+            hedge_leg_filled=0.0,
+            passive_order=PendingPassiveOrder(
+                order_id="maker-progress-positive",
+                client_order_id="maker-progress-positive-cid",
+                target_quantity=100.0,
+                last_progress_state=PassiveOrderState.OPEN,
+            ),
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        removed = await runtime._abort_pending_entry(
+            pending,
+            pending.pending_id,
+            "pending_entry_max_lifetime_exhausted",
+        )
+
+        assert removed is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "entry.abort_maker_positive_fill_truth_retained" in kinds
+        assert "entry.aborted" not in kinds
+
+    @pytest.mark.asyncio
     async def test_long_lived_selected_pending_entry_forces_abort_even_before_pending_hard_ceiling(self, tmp_path):
         """Entry-selected lifetime is a separate SLA from PendingEntry.created_at_ms."""
         runtime = _make_open_runtime(

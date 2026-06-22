@@ -706,6 +706,118 @@ class TestFallbackToAggressive:
         kinds = [record["kind"] for record in journal.read_all()]
         assert "recovery.flat" in kinds
 
+    def test_fallback_matched_close_terminal_payload_carries_execution_anchors(self):
+        """Fallback matched close terminal evidence must carry attribution anchors."""
+        journal = _open_journal()
+        from lightfee.engine.close_executor import CloseExecutor
+
+        class FlatAdapter(VenueAdapter):
+            def __init__(self, venue):
+                self._venue = venue
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def place_order(self, request):
+                raise AssertionError("matched close path must use close executor")
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1000,
+                )
+
+            async def fetch_open_orders(self, symbol):
+                return []
+
+        class AnchoredCloseExecutor(CloseExecutor):
+            async def execute_close(
+                self,
+                position,
+                reason,
+                now_ms,
+                long_price_hint=0.0,
+                short_price_hint=0.0,
+                total_quantity=None,
+                state=None,
+                short_stage="exit_short",
+                long_stage="exit_long",
+            ):
+                return CloseExecution(
+                    position_id=position.position_id,
+                    reason=reason,
+                    long_close_price=1.25,
+                    short_close_price=1.27,
+                    long_close_qty=total_quantity or 0.0,
+                    short_close_qty=total_quantity or 0.0,
+                    long_fee_quote=0.11,
+                    short_fee_quote=0.13,
+                    realized_price_pnl_quote=0.42,
+                    funding_pnl_quote=0.0,
+                    net_quote=0.18,
+                )
+
+        long_adapter = FlatAdapter(Venue.BINANCE)
+        short_adapter = FlatAdapter(Venue.BYBIT)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: long_adapter, Venue.BYBIT: short_adapter},
+            journal,
+        )
+        executor.set_close_executor(AnchoredCloseExecutor({}, journal))
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.26)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="fallback-anchor-001",
+            symbol="ANCHORUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=0.75,
+            short_quantity=0.75,
+            matched_quantity=0.75,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.75,
+            chunk_quantities=[0.75],
+            phase_state=PassivePhaseState(phase=PassiveExecutionPhase.DUAL_TAKER),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor._handle_live_balanced_close_target(
+                state,
+                pending,
+                position,
+                live_quantity=0.75,
+                source="fallback_live_balanced",
+            )
+        )
+
+        assert result is True
+        terminal = next(
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.position_lifecycle_terminal"
+        )
+        assert terminal["terminal_reason"] == "fallback_live_balanced_matched_close_flat_probe"
+        assert terminal["terminal_close_execution"] is True
+        assert terminal["fallback_live_close_source"] == "fallback_live_balanced"
+        assert terminal["fallback_live_close_long_quantity"] == 0.75
+        assert terminal["fallback_live_close_short_quantity"] == 0.75
+        assert terminal["fallback_live_close_long_fee_quote"] == 0.11
+        assert terminal["fallback_live_close_short_fee_quote"] == 0.13
+        assert terminal["fallback_live_close_realized_price_pnl_quote"] == 0.42
+        assert terminal["fallback_live_close_net_quote"] == 0.18
+
 
 # ---------------------------------------------------------------------------
 # Recovery probe
