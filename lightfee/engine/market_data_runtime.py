@@ -22,7 +22,15 @@ from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKe
 class EntryOpenInterestRefresher:
     """Candidate-scoped public OI refresher for entry liquidity evidence."""
 
-    SUPPORTED_VENUES = {"binance", "aster"}
+    SUPPORTED_VENUES = {
+        "aster",
+        "binance",
+        "bitget",
+        "bybit",
+        "gate",
+        "hyperliquid",
+        "okx",
+    }
 
     def __init__(self, *, targeted_budget_s: float | None = None) -> None:
         self._clients: dict[str, Any] = {}

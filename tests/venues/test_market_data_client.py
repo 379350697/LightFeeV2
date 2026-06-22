@@ -678,6 +678,141 @@ class TestProductionSidecarParserRegressions:
         assert client.max_active_funding > 1
 
     @pytest.mark.asyncio
+    async def test_okx_open_interest_uses_usd_value_and_missing_data_is_unavailable(self):
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "bidPx": "100",
+                                "askPx": "101",
+                                "markPx": "100.5",
+                                "last": "100.5",
+                            },
+                            {
+                                "instId": "ETH-USDT-SWAP",
+                                "bidPx": "200",
+                                "askPx": "201",
+                                "markPx": "200.5",
+                                "last": "200.5",
+                            },
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    return {"data": []}
+                if path == "/api/v5/public/open-interest":
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "oi": "12",
+                                "oiUsd": "1500000",
+                            }
+                        ]
+                    }
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(
+            ["BTCUSDT", "ETHUSDT"]
+        )
+
+        btc = result["okx:BTCUSDT"]
+        eth = result["okx:ETHUSDT"]
+        assert btc.open_interest_quote == pytest.approx(1_500_000.0)
+        assert btc.open_interest_evidence_status == "available"
+        assert eth.open_interest_quote == 0.0
+        assert eth.open_interest_evidence_status == "unavailable"
+        assert eth.open_interest_evidence_reason == "missing_open_interest"
+
+    @pytest.mark.asyncio
+    async def test_okx_open_interest_http_error_is_not_available_zero(self):
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "bidPx": "100",
+                                "askPx": "101",
+                                "markPx": "100.5",
+                                "last": "100.5",
+                            }
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    return {"data": []}
+                if path == "/api/v5/public/open-interest":
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "timeout",
+                    )
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(["BTCUSDT"])
+
+        ticker = result["okx:BTCUSDT"]
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "http_error"
+        assert ticker.open_interest_evidence_reason == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_bybit_missing_open_interest_value_is_unavailable_not_zero_available(self):
+        class FakeBybitClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "bid1Price": "100",
+                                "ask1Price": "101",
+                                "markPrice": "100.5",
+                                "turnover24h": "1000000",
+                            }
+                        ]
+                    }
+                }
+
+        result = await FakeBybitClient(bybit_spec())._fetch_bybit_style(["BTCUSDT"])
+
+        ticker = result["bybit:BTCUSDT"]
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_evidence_reason == "missing_open_interest_value"
+
+    @pytest.mark.asyncio
+    async def test_bitget_holding_amount_is_quote_normalized_open_interest(self):
+        class FakeBitgetClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return {
+                    "data": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "bidPr": "100",
+                            "askPr": "101",
+                            "bidSz": "1",
+                            "askSz": "2",
+                            "markPrice": "100.5",
+                            "indexPrice": "100.4",
+                            "fundingRate": "0.0001",
+                            "usdtVolume": "1000000",
+                            "holdingAmount": "2500",
+                        }
+                    ]
+                }
+
+        result = await FakeBitgetClient(bitget_spec())._fetch_bitget_style(["BTCUSDT"])
+
+        ticker = result["bitget:BTCUSDT"]
+        assert ticker.bid == 100.0
+        assert ticker.ask == 101.0
+        assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
+        assert ticker.open_interest_evidence_status == "available"
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_meta_dict_universe_is_parsed(self):
         class FakeHyperliquidClient(MarketDataClient):
             async def _public_post(self, path, body=None):

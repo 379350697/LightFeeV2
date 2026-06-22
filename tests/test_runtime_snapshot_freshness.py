@@ -3272,6 +3272,115 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
     )
 
 
+@pytest.mark.asyncio
+async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.long_venue = "okx"
+    candidate.short_venue = "bybit"
+
+    class FakeOiRefresher:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
+            self.calls.append((venue, symbol))
+            return {
+                "open_interest_quote": 2_500_000.0,
+                "open_interest_evidence_status": "available",
+                "open_interest_evidence_reason": "targeted_refresh",
+            }
+
+    refresher = FakeOiRefresher()
+    runtime.entry_open_interest_refresher = refresher
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="unavailable",
+                open_interest_evidence_reason="not_refreshed",
+            ),
+            "bybit:BTCUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="unavailable",
+                open_interest_evidence_reason="not_refreshed",
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="bybit",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+        )
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert refresher.calls == [("okx", "BTCUSDT"), ("bybit", "BTCUSDT")]
+    assert stats["attempt_count"] == 2
+    assert stats["resolved_count"] == 2
+    assert filtered == [candidate]
+    assert snapshot.quotes["okx:BTCUSDT"].open_interest_evidence_status == "available"
+    assert snapshot.quotes["bybit:BTCUSDT"].open_interest_evidence_status == "available"
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert not any(
+        record["payload"].get("reason") == "oi_evidence_unavailable"
+        for record in records
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    )
+
+
 def test_entry_open_interest_refresher_uses_targeted_public_budget():
     refresher = EntryOpenInterestRefresher(targeted_budget_s=1.25)
     client = refresher._client_for_venue("binance")

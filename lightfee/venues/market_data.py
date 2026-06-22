@@ -78,6 +78,35 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
+def _has_nonempty_field(item: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        if key not in item:
+            continue
+        value = item.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        return True
+    return False
+
+
+def _first_present_float(
+    item: dict[str, Any],
+    *keys: str,
+    default: float = 0.0,
+) -> tuple[float, bool, str]:
+    for key in keys:
+        if _has_nonempty_field(item, key):
+            return _safe_float(item.get(key), default=default), True, key
+    return default, False, ""
+
+
+def _http_error_reason(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message[:200] if message else type(exc).__name__
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -801,16 +830,55 @@ class MarketDataClient:
 
         # 3. open-interest?instType=SWAP
         oi_map: dict[str, float] = {}
+        oi_evidence_status: dict[str, str] = {
+            venue_sym: "unavailable" if spec.open_interest_path else "unsupported"
+            for venue_sym in venue_sym_to_canon
+        }
+        oi_evidence_reason: dict[str, str] = {
+            venue_sym: "not_refreshed" if spec.open_interest_path else "unsupported"
+            for venue_sym in venue_sym_to_canon
+        }
         if spec.open_interest_path:
             try:
                 oi_raw = await self._public_get(spec.open_interest_path, params={"instType": "SWAP"})
                 oi_data = oi_raw.get("data", [])
-                for item in (oi_data if isinstance(oi_data, list) else [oi_data]):
+                items_oi = oi_data if isinstance(oi_data, list) else [oi_data]
+                for item in items_oi:
+                    if not isinstance(item, dict):
+                        continue
                     sym = str(item.get("instId", ""))
                     if sym in venue_sym_to_canon:
-                        oi_map[sym] = _safe_float(item.get("oi", 0))
-            except PublicTransportError:
-                pass
+                        quote_oi, has_quote_oi, quote_key = _first_present_float(item, "oiUsd")
+                        if has_quote_oi:
+                            oi_map[sym] = quote_oi
+                            oi_evidence_status[sym] = "available"
+                            oi_evidence_reason[sym] = quote_key
+                            continue
+                        raw_oi, has_raw_oi, raw_key = _first_present_float(
+                            item,
+                            "oiCcy",
+                            "oi",
+                        )
+                        mark = _safe_float(
+                            ticker_map.get(sym, {}).get(
+                                "markPx",
+                                ticker_map.get(sym, {}).get("last", 0),
+                            )
+                        )
+                        if has_raw_oi and mark > 0.0:
+                            oi_map[sym] = raw_oi * mark
+                            oi_evidence_status[sym] = "available"
+                            oi_evidence_reason[sym] = f"{raw_key}_times_mark"
+                        elif has_raw_oi:
+                            oi_evidence_status[sym] = "unavailable"
+                            oi_evidence_reason[sym] = "missing_mark_price"
+                for venue_sym in venue_sym_to_canon:
+                    if venue_sym not in oi_map and oi_evidence_status.get(venue_sym) == "unavailable":
+                        oi_evidence_reason[venue_sym] = "missing_open_interest"
+            except PublicTransportError as exc:
+                for venue_sym in venue_sym_to_canon:
+                    oi_evidence_status[venue_sym] = "http_error"
+                    oi_evidence_reason[venue_sym] = _http_error_reason(exc)
 
         result: dict[str, FundingTicker] = {}
         seen_canon: set[str] = set()  # dedup: 1000-prefix stripping may produce duplicate entries
@@ -838,6 +906,11 @@ class MarketDataClient:
                 funding_timestamp_ms=_funding_timestamp_ms(fr),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
+                open_interest_evidence_status=oi_evidence_status.get(
+                    venue_sym,
+                    "unavailable" if spec.open_interest_path else "unsupported",
+                ),
+                open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
             )
         return result
 
@@ -860,6 +933,17 @@ class MarketDataClient:
             canon = venue_sym_to_canon.get(sym)
             if canon is None:
                 continue
+            open_interest_quote, has_open_interest_quote, oi_key = _first_present_float(
+                item,
+                "openInterestValue",
+                "singleOpenInterestValue",
+            )
+            if has_open_interest_quote:
+                oi_status = "available"
+                oi_reason = oi_key
+            else:
+                oi_status = "unavailable"
+                oi_reason = "missing_open_interest_value"
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
@@ -872,7 +956,9 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
                 funding_timestamp_ms=_funding_timestamp_ms(item, fallback_ms=_now_ms()),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
-                open_interest_quote=_safe_float(item.get("openInterestValue", 0)),
+                open_interest_quote=open_interest_quote,
+                open_interest_evidence_status=oi_status,
+                open_interest_evidence_reason=oi_reason,
             )
         return result
 
@@ -895,19 +981,43 @@ class MarketDataClient:
             canon = venue_sym_to_canon.get(sym)
             if canon is None:
                 continue
+            mark = _safe_float(
+                item.get("markPrice", item.get("lastPr", item.get("last", 0)))
+            )
+            holding_amount, has_holding_amount, oi_key = _first_present_float(
+                item,
+                "holdingAmount",
+                "openInterest",
+            )
+            if has_holding_amount and mark > 0.0:
+                open_interest_quote = holding_amount * mark
+                oi_status = "available"
+                oi_reason = f"{oi_key}_times_mark"
+            elif has_holding_amount:
+                open_interest_quote = 0.0
+                oi_status = "unavailable"
+                oi_reason = "missing_mark_price"
+            else:
+                open_interest_quote = 0.0
+                oi_status = "unavailable"
+                oi_reason = "missing_open_interest"
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
-                bid=_safe_float(item.get("bestBid", 0)),
-                ask=_safe_float(item.get("bestAsk", 0)),
+                bid=_safe_float(item.get("bidPr", item.get("bestBid", 0))),
+                ask=_safe_float(item.get("askPr", item.get("bestAsk", 0))),
                 bid_size=_safe_float(item.get("bidSz", 0)),
                 ask_size=_safe_float(item.get("askSz", 0)),
-                mark_price=_safe_float(item.get("markPrice", 0)),
+                mark_price=mark,
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
                 funding_timestamp_ms=_now_ms(),  # Bitget REST ticker does not include funding time
-                volume_24h_quote=_safe_float(item.get("usdtVolume", 0)),
-                open_interest_quote=_safe_float(item.get("openInterest", 0)),
+                volume_24h_quote=_safe_float(
+                    item.get("usdtVolume", item.get("quoteVolume", 0))
+                ),
+                open_interest_quote=open_interest_quote,
+                open_interest_evidence_status=oi_status,
+                open_interest_evidence_reason=oi_reason,
             )
         return result
 
@@ -931,7 +1041,22 @@ class MarketDataClient:
                 continue
             mark = _safe_float(item.get("mark_price", 0))
             quanto = _safe_float(item.get("quanto_multiplier", 1.0))
-            oi_contracts = _safe_float(item.get("total_size", 0))
+            oi_contracts, has_oi_contracts, oi_key = _first_present_float(
+                item,
+                "total_size",
+            )
+            if has_oi_contracts and quanto > 0 and mark > 0:
+                open_interest_quote = oi_contracts * quanto * mark
+                oi_status = "available"
+                oi_reason = f"{oi_key}_times_quanto_mark"
+            elif has_oi_contracts:
+                open_interest_quote = oi_contracts
+                oi_status = "available"
+                oi_reason = oi_key
+            else:
+                open_interest_quote = 0.0
+                oi_status = "unavailable"
+                oi_reason = "missing_open_interest"
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
@@ -944,7 +1069,9 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(item.get("funding_rate", 0)) * 10000.0,
                 funding_timestamp_ms=_now_ms(),  # Gate REST ticker does not include funding next apply time
                 volume_24h_quote=_safe_float(item.get("volume_24h_quote", item.get("volume_24h", 0))),
-                open_interest_quote=oi_contracts * quanto * mark if quanto > 0 and mark > 0 else oi_contracts,
+                open_interest_quote=open_interest_quote,
+                open_interest_evidence_status=oi_status,
+                open_interest_evidence_reason=oi_reason,
             )
         return result
 
@@ -1023,6 +1150,17 @@ class MarketDataClient:
             bid_size = impact_notional / best_bid if best_bid > 0 else 0.0
             ask_size = impact_notional / best_ask if best_ask > 0 else 0.0
 
+            open_interest, has_open_interest, oi_key = _first_present_float(
+                ctx,
+                "openInterest",
+            )
+            if has_open_interest:
+                oi_status = "available"
+                oi_reason = oi_key
+            else:
+                oi_status = "unavailable"
+                oi_reason = "missing_open_interest"
+
             result[f"{venue_str}:{canon.upper()}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon.upper(),
@@ -1035,7 +1173,9 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
                 funding_timestamp_ms=funding_ts,
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
-                open_interest_quote=_safe_float(ctx.get("openInterest", 0)),
+                open_interest_quote=open_interest,
+                open_interest_evidence_status=oi_status,
+                open_interest_evidence_reason=oi_reason,
             )
         return result
 
