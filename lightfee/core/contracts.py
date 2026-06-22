@@ -15,6 +15,8 @@ from lightfee.core.domain import (
     AssetTransferStatus,
     ExecutionLiquiditySnapshot,
     OrderFill,
+    OrderFillProbeResult,
+    OrderFillProbeStatus,
     OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
@@ -91,6 +93,65 @@ class VenueAdapter(ABC):
         client_order_id: Optional[str] = None,
     ) -> Optional[OrderFillReconciliation]:
         return None
+
+    async def fetch_order_fill_probe(
+        self,
+        symbol: str,
+        order_id: str = "",
+        client_order_id: Optional[str] = None,
+    ) -> OrderFillProbeResult:
+        """Return explicit fill truth instead of overloading None/[] semantics."""
+        try:
+            reconciliation = await self.fetch_order_fill_reconciliation(
+                symbol,
+                order_id,
+                client_order_id,
+            )
+        except Exception as exc:
+            return OrderFillProbeResult(
+                status=OrderFillProbeStatus.ERROR,
+                venue=self.venue,
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                error=str(exc),
+            )
+        if reconciliation is None:
+            return OrderFillProbeResult(
+                status=OrderFillProbeStatus.UNAVAILABLE,
+                venue=self.venue,
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+            )
+        try:
+            quantity = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            return OrderFillProbeResult(
+                status=OrderFillProbeStatus.ERROR,
+                venue=self.venue,
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                reconciliation=reconciliation,
+                error=f"invalid_reconciliation_quantity:{exc}",
+            )
+        metadata = getattr(reconciliation, "metadata", None)
+        return OrderFillProbeResult(
+            status=(
+                OrderFillProbeStatus.CONFIRMED_FILL
+                if quantity > 1e-12
+                else OrderFillProbeStatus.CONFIRMED_NO_FILL
+            ),
+            venue=self.venue,
+            symbol=symbol,
+            order_id=str(getattr(reconciliation, "order_id", "") or order_id),
+            client_order_id=str(
+                getattr(reconciliation, "client_order_id", "") or client_order_id or ""
+            ),
+            reconciliation=reconciliation,
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
 
     async def fetch_order_status(
         self,

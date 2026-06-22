@@ -7,6 +7,8 @@ import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import (
+    OrderFillProbeResult,
+    OrderFillProbeStatus,
     OrderFillReconciliation,
     PositionSnapshot,
     Side,
@@ -97,6 +99,61 @@ class _NoFillReconciliationAdapter:
 
     def drain_order_diagnostics(self):
         return []
+
+
+class _UnavailableOrderProbeAdapter(_NoFillReconciliationAdapter):
+    def __init__(self, venue: Venue):
+        self.venue = venue
+
+    async def fetch_order_fill_probe(self, symbol, order_id="", client_order_id=""):
+        return OrderFillProbeResult(
+            status=OrderFillProbeStatus.UNAVAILABLE,
+            venue=self.venue,
+            symbol=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            error="statement endpoint timeout",
+        )
+
+
+class _UnavailableProbeLiveFlatAdapter(_UnavailableOrderProbeAdapter):
+    async def fetch_open_orders(self, symbol):
+        return []
+
+    async def fetch_position(self, symbol):
+        return PositionSnapshot(
+            venue=self.venue,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1234,
+        )
+
+    async def cancel_passive_order(self, **kwargs):
+        return None
+
+
+class _ConfirmedFillProbeAdapter(_UnavailableOrderProbeAdapter):
+    async def fetch_order_fill_probe(self, symbol, order_id="", client_order_id=""):
+        return OrderFillProbeResult(
+            status=OrderFillProbeStatus.CONFIRMED_FILL,
+            venue=self.venue,
+            symbol=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            reconciliation=OrderFillReconciliation(
+                venue=self.venue,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=1.0,
+                average_price=1.0,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                fee_quote=0.001,
+                filled_at_ms=1234,
+            ),
+        )
 
 
 class _LivePositionAdapter(_NoFillReconciliationAdapter):
@@ -328,6 +385,16 @@ class _CloseLegFillAdapter(_NoFillReconciliationAdapter):
         )
 
 
+class _CloseLegMissingStatementAdapter(_CloseLegFillAdapter):
+    async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
+        self.fill_reconciliation_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
+        return []
+
+
 class _UnavailableCloseLegAdapter(_CloseLegFillAdapter):
     def __init__(self, venue: Venue, *, live_quantity: float):
         super().__init__(venue, {})
@@ -473,6 +540,237 @@ def _pending_entry(**overrides):
     )
     values.update(overrides)
     return PendingEntry(**values)
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_entry_retains_accepted_order_when_probe_unavailable(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    maker = _UnavailableOrderProbeAdapter(Venue.BYBIT)
+    hedge = _UnavailableOrderProbeAdapter(Venue.HYPERLIQUID)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-abort-truth-gate",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="accepted-maker-order",
+        maker_client_order_id="accepted-maker-cid",
+        hedge_order_id="",
+        hedge_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    removed = await runtime._abort_pending_entry(
+        pending,
+        pending.pending_id,
+        "pending_entry_max_lifetime_exhausted",
+    )
+
+    assert removed is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.uncertain_outcome is True
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "pending_entry.abort_truth_gate_retained" in kinds
+    assert "entry.aborted" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_entry_allows_unavailable_probe_when_live_flat_no_open(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    maker = _UnavailableProbeLiveFlatAdapter(Venue.BYBIT)
+    hedge = _UnavailableProbeLiveFlatAdapter(Venue.HYPERLIQUID)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-live-flat-abort",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="accepted-maker-order",
+        maker_client_order_id="accepted-maker-cid",
+        hedge_order_id="",
+        hedge_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    removed = await runtime._abort_pending_entry(
+        pending,
+        pending.pending_id,
+        "pending_entry_max_lifetime_exhausted",
+    )
+
+    assert removed is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    records = tmp_journal.read_all()
+    assert [
+        record["kind"]
+        for record in records
+        if record["kind"] == "pending_entry.abort_truth_gate_retained"
+    ] == []
+    aborted = [record for record in records if record["kind"] == "entry.aborted"]
+    assert len(aborted) == 1
+    assert aborted[0]["payload"]["truth_gate_decision"] == (
+        "allow_abort_live_flat_no_open_orders"
+    )
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_entry_retains_when_hedge_probe_unavailable_without_live_truth(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    maker = _UnavailableProbeLiveFlatAdapter(Venue.BYBIT)
+    hedge = _UnavailableOrderProbeAdapter(Venue.HYPERLIQUID)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-hedge-truth-required",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="accepted-maker-order",
+        maker_client_order_id="accepted-maker-cid",
+        hedge_order_id="accepted-hedge-order",
+        hedge_client_order_id="accepted-hedge-cid",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    removed = await runtime._abort_pending_entry(
+        pending,
+        pending.pending_id,
+        "pending_entry_max_lifetime_exhausted",
+    )
+
+    assert removed is False
+    assert pending.pending_id in runtime.state.pending_entries
+    records = tmp_journal.read_all()
+    retained = [
+        record for record in records
+        if record["kind"] == "pending_entry.abort_truth_gate_retained"
+    ]
+    assert len(retained) == 1
+    assert retained[0]["payload"]["truth_gate_decision"] == (
+        "retain_pending_order_truth_unavailable"
+    )
+    assert any(
+        ref["source"] == "hedge_open_orders" and ref["available"] is False
+        for ref in retained[0]["payload"]["live_position_truth_refs"]
+    )
+    assert [record for record in records if record["kind"] == "entry.aborted"] == []
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_entry_allows_hedge_unavailable_probe_when_all_live_truth_flat(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    maker = _UnavailableProbeLiveFlatAdapter(Venue.BYBIT)
+    hedge = _UnavailableProbeLiveFlatAdapter(Venue.HYPERLIQUID)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-all-live-flat-abort",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="accepted-maker-order",
+        maker_client_order_id="accepted-maker-cid",
+        hedge_order_id="accepted-hedge-order",
+        hedge_client_order_id="accepted-hedge-cid",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    removed = await runtime._abort_pending_entry(
+        pending,
+        pending.pending_id,
+        "pending_entry_max_lifetime_exhausted",
+    )
+
+    assert removed is True
+    aborted = [
+        record for record in tmp_journal.read_all()
+        if record["kind"] == "entry.aborted"
+    ]
+    assert len(aborted) == 1
+    assert aborted[0]["payload"]["truth_gate_decision"] == (
+        "allow_abort_live_flat_no_open_orders"
+    )
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_entry_confirmed_fill_retains_for_recovery(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    maker = _ConfirmedFillProbeAdapter(Venue.BYBIT)
+    hedge = _UnavailableOrderProbeAdapter(Venue.HYPERLIQUID)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: maker, Venue.HYPERLIQUID: hedge},
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-confirmed-fill-retain",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        maker_order_id="accepted-maker-order",
+        maker_client_order_id="accepted-maker-cid",
+        hedge_order_id="",
+        hedge_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    removed = await runtime._abort_pending_entry(
+        pending,
+        pending.pending_id,
+        "pending_entry_max_lifetime_exhausted",
+    )
+
+    assert removed is False
+    assert pending.pending_id in runtime.state.pending_entries
+    records = tmp_journal.read_all()
+    retained = [
+        record for record in records
+        if record["kind"] == "pending_entry.abort_truth_gate_retained"
+    ]
+    assert len(retained) == 1
+    assert retained[0]["payload"]["truth_gate_decision"] == (
+        "retain_pending_order_truth_confirmed_fill"
+    )
+    assert [record for record in records if record["kind"] == "entry.aborted"] == []
 
 
 @pytest.mark.asyncio
@@ -720,6 +1018,129 @@ async def test_pending_close_reconciliation_uses_snapshot_after_lifecycle_flat(
     kinds = [record["kind"] for record in records]
     assert "exit.reconciled" in kinds
     assert "reconciliation.pending_close_orphaned" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_partial_statement_retains_backfill(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=1.0100,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+            fee_quote=0.02,
+            filled_at_ms=2000,
+        ),
+    })
+    short_adapter = _CloseLegMissingStatementAdapter(Venue.BYBIT, {})
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-partial-reconcile", symbol="BEATUSDT")
+    )
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(position_id="entry-partial-reconcile")
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert retained["position_id"] == "entry-partial-reconcile"
+    assert retained["pending_backfill"] is True
+    assert retained["attempt_count"] == 1
+    assert retained["next_attempt_ms"] > 3000
+
+    records = tmp_journal.read_all()
+    reconciled = [record for record in records if record["kind"] == "exit.reconciled"]
+    assert len(reconciled) == 1
+    assert reconciled[0]["payload"]["evidence_gap"] is True
+    assert reconciled[0]["payload"]["missing_leg"] == "short"
+    assert reconciled[0]["payload"]["pending_backfill"] is True
+    assert [
+        record["kind"]
+        for record in records
+        if record["kind"] == "order.filled"
+    ] == ["order.filled"]
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_backfill_emits_only_delta_across_retries(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=10.0,
+            average_price=1.0100,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+            fee_quote=0.01,
+            filled_at_ms=2000,
+        ),
+    })
+    short_adapter = _CloseLegMissingStatementAdapter(Venue.BYBIT, {})
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-backfill-delta", symbol="BEATUSDT")
+    )
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(position_id="entry-backfill-delta")
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert retained["emitted_fill_event_quantities"]
+
+    long_adapter.fills[("okx-close-order", "okx-close-cid")] = OrderFillReconciliation(
+        venue=Venue.OKX,
+        symbol="BEATUSDT",
+        side=Side.SELL,
+        quantity=15.0,
+        average_price=1.0100,
+        order_id="okx-close-order",
+        client_order_id="okx-close-cid",
+        fee_quote=0.015,
+        filled_at_ms=4000,
+    )
+    retained["next_attempt_ms"] = 0
+
+    await runtime._reconcile_pending_state(now_ms=5000)
+
+    filled = [
+        record["payload"]
+        for record in tmp_journal.read_all()
+        if record["kind"] == "order.filled"
+    ]
+    assert [payload["quantity"] for payload in filled] == [10.0, 5.0]
+    assert [payload["fee_quote"] for payload in filled] == [
+        pytest.approx(0.01),
+        pytest.approx(0.005),
+    ]
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert list(retained["emitted_fill_event_quantities"].values()) == [
+        pytest.approx(15.0)
+    ]
 
 
 @pytest.mark.asyncio

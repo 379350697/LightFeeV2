@@ -16,6 +16,7 @@ DETERMINISTIC_ENTRY_ADMISSION_REASONS = frozenset({
     "insufficient_margin_admission_blocked",
     "leverage_admission_blocked",
     "max_notional_admission_blocked",
+    "route_abnormal_terminal_cooldown",
     "venue_auth_invalid",
 })
 
@@ -197,6 +198,16 @@ def entry_market_evidence_contract(
             "evidence_class": "quote",
             "action": "terminal_candidate_rewarm",
             "action_taken": action_taken,
+            "blocks_entry": True,
+            "terminality": "terminal_candidate_block",
+            "diagnostic_severity": "production_issue",
+        }
+    if text == "runtime.route_abnormal_cooldown_armed":
+        return {
+            **base,
+            "evidence_class": "route",
+            "action": "block_abnormal_route",
+            "action_taken": "arm_route_abnormal_cooldown",
             "blocks_entry": True,
             "terminality": "terminal_candidate_block",
             "diagnostic_severity": "production_issue",
@@ -492,6 +503,14 @@ def entry_admission_aggregation_key(
         str(symbol or "*").upper(),
         str(reason or "unknown"),
         str(block_scope or "symbol").lower(),
+    ])
+
+
+def entry_route_key(symbol: str, long_venue: str, short_venue: str) -> str:
+    return ":".join([
+        "route",
+        str(symbol or "").upper(),
+        f"{str(long_venue or '').lower()}->{str(short_venue or '').lower()}",
     ])
 
 

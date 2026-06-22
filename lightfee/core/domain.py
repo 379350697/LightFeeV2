@@ -170,6 +170,27 @@ class OrderFillReconciliation:
     metadata: Optional[dict] = field(default=None)
 
 
+class OrderFillProbeStatus(Enum):
+    """Explicit exchange-truth status for order fill probes."""
+
+    CONFIRMED_FILL = "confirmed_fill"
+    CONFIRMED_NO_FILL = "confirmed_no_fill"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class OrderFillProbeResult:
+    status: OrderFillProbeStatus
+    venue: Venue
+    symbol: str
+    order_id: str = ""
+    client_order_id: str = ""
+    reconciliation: Optional[OrderFillReconciliation] = None
+    metadata: Optional[dict] = field(default=None)
+    error: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class VenueMarketQuote:
     symbol: str

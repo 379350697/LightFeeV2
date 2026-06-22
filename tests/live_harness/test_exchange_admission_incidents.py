@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from lightfee.engine.entry import EntryState
+from lightfee.engine.business_contract import entry_route_key
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
@@ -1532,6 +1533,59 @@ def test_symbol_scope_admission_block_filters_candidate_before_selection():
                     "stage": "candidate_prefilter",
                 }
             ]
+        finally:
+            runtime.journal.close()
+
+
+def test_route_abnormal_cooldown_filters_only_same_directed_route():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        try:
+            route_key = entry_route_key("HOMEUSDT", "binance", "bybit")
+            runtime.state.venue_entry_cooldowns[route_key] = {
+                "venue": "route",
+                "symbol": "HOMEUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "reason": "route_abnormal_terminal_cooldown",
+                "raw_error": "fallback_live_balanced",
+                "blocked_until_ms": 1778787600000,
+                "ttl_ms": 1_800_000,
+                "official_doc_url": "",
+                "evidence_gap": False,
+                "block_scope": "route",
+                "route_key": route_key,
+                "source": "passive_close_abnormal_terminal",
+            }
+            blocked = _candidate("HOMEUSDT", "binance", "bybit")
+            reversed_route = _candidate("HOMEUSDT", "bybit", "binance")
+            clean = _candidate("CLEANUSDT", "binance", "bybit")
+
+            filtered = runtime._filter_candidates_by_entry_admission(
+                [blocked, reversed_route, clean],
+                now_ms=1778787000000,
+                stage="candidate_prefilter",
+            )
+
+            assert [candidate.symbol for candidate in filtered] == [
+                "HOMEUSDT",
+                "CLEANUSDT",
+            ]
+            assert filtered[0].long_venue == "bybit"
+            assert runtime._last_entry_admission_filter_blockers == {
+                "route_abnormal_terminal_cooldown": 1
+            }
+            sample = runtime._last_entry_admission_filter_samples[0]
+            assert sample["block_scope"] == "route"
+            assert sample["source"] == "passive_close_abnormal_terminal"
+            payload = [
+                record["payload"]
+                for record in runtime.journal.read_all()
+                if record["kind"] == "runtime.entry_admission_venue_degraded"
+            ][-1]
+            assert payload["reason"] == "route_abnormal_terminal_cooldown"
+            assert payload["block_scope"] == "route"
         finally:
             runtime.journal.close()
 

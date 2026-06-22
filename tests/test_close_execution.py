@@ -19,6 +19,8 @@ from pathlib import Path
 
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillProbeResult,
+    OrderFillProbeStatus,
     OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
@@ -26,6 +28,7 @@ from lightfee.core.domain import (
     TimeInForce,
     Venue,
 )
+from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.close_executor import (
     CloseBalance,
@@ -223,6 +226,290 @@ def test_exit_reconciled_payload_classifies_statement_evidence_gap():
         "long": "found",
         "short": "missing",
     }
+    assert payload["candidate_owner_id"] == "entry-esports"
+    assert payload["missing_leg"] == "short"
+    assert payload["pending_backfill"] is True
+    assert payload["accounting_status"] == "pending_backfill"
+    assert payload["clean_accounting_ready"] is False
+
+
+def test_close_reconciliation_order_filled_events_anchor_each_confirmed_leg():
+    payload = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "long_legs": [
+            {
+                "venue": Venue.BINANCE.value,
+                "order_id": "binance-close-1",
+                "client_order_id": "client-close-1",
+                "quantity": 10.0,
+                "average_price": 1.1,
+                "fee_quote": 0.01,
+                "filled_at_ms": 1781531700000,
+            }
+        ],
+        "short_legs": [
+            {
+                "venue": Venue.BYBIT.value,
+                "order_id": "bybit-close-1",
+                "client_order_id": "client-close-2",
+                "trade_id": "bybit-trade-1",
+                "quantity": 10.0,
+                "average_price": 1.0,
+                "fee_quote": 0.02,
+                "filled_at_ms": 1781531700100,
+            }
+        ],
+    }
+
+    events = CloseRuntime._order_filled_events_from_close_reconciliation_payload(
+        payload,
+        source="pending_close_reconciliation",
+    )
+
+    assert events == [
+        {
+            "fill_event_anchor_id": CloseRuntime._deterministic_fill_event_anchor_id(
+                position_id="entry-home",
+                leg="long",
+                venue=Venue.BINANCE.value,
+                order_id="binance-close-1",
+                client_order_id="client-close-1",
+                trade_id="",
+                exec_id="",
+            ),
+            "position_id": "entry-home",
+            "leg": "long",
+            "venue": Venue.BINANCE.value,
+            "symbol": "HOMEUSDT",
+            "side": Side.SELL.value,
+            "order_id": "binance-close-1",
+            "client_order_id": "client-close-1",
+            "trade_id": "",
+            "exec_id": "",
+            "quantity": 10.0,
+            "cumulative_quantity": 10.0,
+            "price": 1.1,
+            "fee_quote": 0.01,
+            "filled_at_ms": 1781531700000,
+            "source": "pending_close_reconciliation",
+        },
+        {
+            "fill_event_anchor_id": CloseRuntime._deterministic_fill_event_anchor_id(
+                position_id="entry-home",
+                leg="short",
+                venue=Venue.BYBIT.value,
+                order_id="bybit-close-1",
+                client_order_id="client-close-2",
+                trade_id="bybit-trade-1",
+                exec_id="",
+            ),
+            "position_id": "entry-home",
+            "leg": "short",
+            "venue": Venue.BYBIT.value,
+            "symbol": "HOMEUSDT",
+            "side": Side.BUY.value,
+            "order_id": "bybit-close-1",
+            "client_order_id": "client-close-2",
+            "trade_id": "bybit-trade-1",
+            "exec_id": "",
+            "quantity": 10.0,
+            "cumulative_quantity": 10.0,
+            "price": 1.0,
+            "fee_quote": 0.02,
+            "filled_at_ms": 1781531700100,
+            "source": "pending_close_reconciliation",
+        },
+    ]
+
+
+def test_close_reconciliation_order_filled_events_are_idempotent(tmp_path):
+    journal = Journal(tmp_path / "journal.jsonl")
+    journal.open()
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.journal = journal
+    runtime = CloseRuntime(ctx=ctx)
+    payload = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "long_legs": [
+            {
+                "venue": Venue.BINANCE.value,
+                "order_id": "binance-close-1",
+                "client_order_id": "client-close-1",
+                "quantity": 10.0,
+                "average_price": 1.1,
+                "fee_quote": 0.01,
+                "filled_at_ms": 1781531700000,
+            }
+        ],
+        "short_legs": [],
+        "emitted_fill_event_ids": [],
+    }
+
+    runtime._append_close_reconciliation_order_filled_events(
+        payload,
+        now_ms=1781531700200,
+    )
+    runtime._append_close_reconciliation_order_filled_events(
+        payload,
+        now_ms=1781531700300,
+    )
+
+    filled = [event for event in journal.read_all() if event["kind"] == "order.filled"]
+    assert len(filled) == 1
+    assert filled[0]["payload"]["fill_event_id"]
+    assert payload["emitted_fill_event_ids"] == [filled[0]["payload"]["fill_event_id"]]
+    journal.close()
+
+
+def test_close_reconciliation_order_filled_events_emit_only_cumulative_delta(tmp_path):
+    journal = Journal(tmp_path / "journal.jsonl")
+    journal.open()
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.journal = journal
+    runtime = CloseRuntime(ctx=ctx)
+    payload = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "long_legs": [
+            {
+                "venue": Venue.BINANCE.value,
+                "order_id": "binance-close-1",
+                "client_order_id": "client-close-1",
+                "quantity": 10.0,
+                "average_price": 1.1,
+                "fee_quote": 0.01,
+                "filled_at_ms": 1781531700000,
+            }
+        ],
+        "short_legs": [],
+        "emitted_fill_event_ids": [],
+        "emitted_fill_event_quantities": {},
+    }
+
+    runtime._append_close_reconciliation_order_filled_events(
+        payload,
+        now_ms=1781531700200,
+    )
+    payload["long_legs"][0]["quantity"] = 15.0
+    payload["long_legs"][0]["fee_quote"] = 0.015
+    runtime._append_close_reconciliation_order_filled_events(
+        payload,
+        now_ms=1781531700300,
+    )
+    runtime._append_close_reconciliation_order_filled_events(
+        payload,
+        now_ms=1781531700400,
+    )
+
+    filled = [event for event in journal.read_all() if event["kind"] == "order.filled"]
+    assert [event["payload"]["quantity"] for event in filled] == [10.0, 5.0]
+    assert [event["payload"]["fee_quote"] for event in filled] == [
+        pytest.approx(0.01),
+        pytest.approx(0.005),
+    ]
+    assert len(payload["emitted_fill_event_ids"]) == 2
+    assert list(payload["emitted_fill_event_quantities"].values()) == [pytest.approx(15.0)]
+    journal.close()
+
+
+@pytest.mark.asyncio
+async def test_close_leg_probe_contract_uses_confirmed_no_fill_not_adapter_empty_list():
+    class _ProbeAdapter:
+        async def fetch_order_fill_probe(self, symbol, order_id="", client_order_id=None):
+            return OrderFillProbeResult(
+                status=OrderFillProbeStatus.CONFIRMED_NO_FILL,
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                metadata={"response_classification": "confirmed_no_fill"},
+            )
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.venue_adapters = {Venue.BYBIT: _ProbeAdapter()}
+    runtime = CloseRuntime(ctx=ctx)
+
+    fills = await runtime._fetch_close_leg_reconciliations(
+        symbol="HOMEUSDT",
+        venue=Venue.BYBIT,
+        legs=[{"order_id": "close-order-1", "client_order_id": "close-cid-1"}],
+    )
+
+    assert fills == []
+
+
+@pytest.mark.asyncio
+async def test_venue_adapter_probe_contract_distinguishes_no_fill_and_errors():
+    class _ZeroFillAdapter(VenueAdapter):
+        @property
+        def venue(self):
+            return Venue.BINANCE
+
+        async def place_order(self, request):
+            raise NotImplementedError
+
+        async def fetch_position(self, symbol):
+            raise NotImplementedError
+
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol,
+            order_id="",
+            client_order_id=None,
+        ):
+            return OrderFillReconciliation(
+                venue=Venue.BINANCE,
+                symbol=symbol,
+                side=Side.SELL,
+                quantity=0.0,
+                average_price=0.0,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                fee_quote=0.0,
+                filled_at_ms=0,
+            )
+
+    class _ErrorAdapter(_ZeroFillAdapter):
+        @property
+        def venue(self):
+            return Venue.BYBIT
+
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol,
+            order_id="",
+            client_order_id=None,
+        ):
+            raise TimeoutError("statement endpoint timeout")
+
+    no_fill = await _ZeroFillAdapter().fetch_order_fill_probe(
+        "HOMEUSDT",
+        "order-1",
+        "cid-1",
+    )
+    error = await _ErrorAdapter().fetch_order_fill_probe(
+        "HOMEUSDT",
+        "order-2",
+        "cid-2",
+    )
+
+    assert no_fill.status == OrderFillProbeStatus.CONFIRMED_NO_FILL
+    assert no_fill.reconciliation is not None
+    assert error.status == OrderFillProbeStatus.ERROR
+    assert "statement endpoint timeout" in error.error
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
     OrderFill,
+    OrderFillProbeStatus,
     PassiveOrderState,
     PositionSnapshot,
     Side,
@@ -7410,6 +7411,23 @@ class LiveRuntime:
         hedge_venue = pending.hedge_venue()
         symbol = pending.symbol
 
+        abort_gate = await self._pending_entry_abort_truth_gate(
+            pending,
+            entry_id,
+            reason,
+        )
+        if abort_gate.get("decision") == "retain_pending":
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                wall_clock_now_ms() + 1_000,
+            )
+            self.journal.append(
+                "pending_entry.abort_truth_gate_retained",
+                abort_gate,
+            )
+            return False
+
         if not await self._ensure_pending_entry_maker_not_open_before_abort(
             pending,
             entry_id,
@@ -7471,9 +7489,399 @@ class LiveRuntime:
                 "reason": reason,
                 "maker_quantity": pending.maker_leg_filled,
                 "hedge_quantity": pending.hedge_leg_filled,
+                "truth_gate_decision": abort_gate.get(
+                    "truth_gate_decision",
+                    "allow_terminal_abort",
+                ),
+                "order_truth_refs": abort_gate.get("order_truth_refs", []),
+                "trade_truth_refs": abort_gate.get("trade_truth_refs", []),
+                "live_position_truth_refs": abort_gate.get(
+                    "live_position_truth_refs",
+                    [],
+                ),
             },
         )
         return True
+
+    async def _pending_entry_abort_truth_gate(
+        self,
+        pending,
+        entry_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Retain pending entries when accepted exchange truth is not terminal."""
+        maker_venue = pending.maker_venue()
+        hedge_venue = pending.hedge_venue()
+        maker_order_id, maker_client_order_id = self._pending_entry_maker_order_identifiers(
+            pending
+        )
+        order_refs = [
+            {
+                "leg": "maker",
+                "venue": maker_venue,
+                "order_id": maker_order_id,
+                "client_order_id": maker_client_order_id,
+            },
+            {
+                "leg": "hedge",
+                "venue": hedge_venue,
+                "order_id": str(getattr(pending, "hedge_order_id", "") or ""),
+                "client_order_id": str(
+                    getattr(pending, "hedge_client_order_id", "") or ""
+                ),
+            },
+        ]
+        durable_refs = [
+            ref for ref in order_refs if ref["order_id"] or ref["client_order_id"]
+        ]
+        base_payload = {
+            "entry_id": entry_id,
+            "owner_id": entry_id,
+            "symbol": pending.symbol,
+            "reason": reason,
+            "truth_gate_decision": "allow_terminal_abort",
+            "decision": "allow_abort",
+            "order_truth_refs": [
+                {
+                    "leg": ref["leg"],
+                    "venue": ref["venue"].value,
+                    "order_id": ref["order_id"],
+                    "client_order_id": ref["client_order_id"],
+                }
+                for ref in durable_refs
+            ],
+            "trade_truth_refs": [],
+            "live_position_truth_refs": [],
+        }
+        if not durable_refs:
+            return base_payload
+
+        probe_statuses: list[dict[str, Any]] = []
+        for ref in durable_refs:
+            probe_payload = await self._probe_pending_entry_abort_order_truth(
+                pending,
+                ref["venue"],
+                ref["leg"],
+                ref["order_id"],
+                ref["client_order_id"],
+            )
+            probe_statuses.append(probe_payload)
+
+        now_ms = wall_clock_now_ms()
+        live_truths: list[dict[str, Any]] = []
+        for ref in durable_refs:
+            live_truth = await self._pending_entry_abort_live_truth_for_order_ref(
+                pending,
+                entry_id,
+                ref,
+                now_ms,
+            )
+            live_truths.append(live_truth)
+            base_payload["live_position_truth_refs"].extend(
+                live_truth.get("refs", [])
+            )
+
+        local_fill_evidence = bool(
+            getattr(pending, "has_any_fill", lambda: False)()
+        )
+        statuses = {
+            str(probe_payload.get("status") or "")
+            for probe_payload in probe_statuses
+        }
+        if (
+            OrderFillProbeStatus.CONFIRMED_FILL.value in statuses
+            and not local_fill_evidence
+        ):
+            return {
+                **base_payload,
+                "truth_gate_decision": "retain_pending_order_truth_confirmed_fill",
+                "decision": "retain_pending",
+                "order_truth_refs": probe_statuses,
+            }
+        if local_fill_evidence:
+            return {
+                **base_payload,
+                "truth_gate_decision": "allow_abort_local_fill_cleanup_required",
+                "order_truth_refs": probe_statuses,
+            }
+
+        live_has_open_order = any(
+            bool(item.get("has_live_open_order")) for item in live_truths
+        )
+        live_has_position = any(
+            bool(item.get("has_live_position")) for item in live_truths
+        )
+        if live_has_open_order:
+            return {
+                **base_payload,
+                "truth_gate_decision": "retain_pending_live_open_order_truth",
+                "decision": "retain_pending",
+                "order_truth_refs": probe_statuses,
+            }
+        if live_has_position:
+            return {
+                **base_payload,
+                "truth_gate_decision": "retain_pending_live_position_truth",
+                "decision": "retain_pending",
+                "order_truth_refs": probe_statuses,
+            }
+
+        live_truth_available = bool(live_truths) and all(
+            bool(item.get("open_available"))
+            and bool(item.get("position_available"))
+            for item in live_truths
+        )
+        has_probe_uncertainty = bool(
+            statuses
+            & {
+                OrderFillProbeStatus.UNAVAILABLE.value,
+                OrderFillProbeStatus.ERROR.value,
+            }
+        )
+        live_flat_no_open = live_truth_available and not (
+            live_has_open_order or live_has_position
+        )
+        if has_probe_uncertainty:
+            if live_flat_no_open:
+                return {
+                    **base_payload,
+                    "truth_gate_decision": "allow_abort_live_flat_no_open_orders",
+                    "order_truth_refs": probe_statuses,
+                }
+            return {
+                **base_payload,
+                "truth_gate_decision": "retain_pending_order_truth_unavailable",
+                "decision": "retain_pending",
+                "order_truth_refs": probe_statuses,
+            }
+
+        unknown_statuses = statuses - {
+            OrderFillProbeStatus.CONFIRMED_NO_FILL.value,
+            OrderFillProbeStatus.CONFIRMED_FILL.value,
+        }
+        if unknown_statuses:
+            return {
+                **base_payload,
+                "truth_gate_decision": "retain_pending_order_truth_unknown",
+                "decision": "retain_pending",
+                "order_truth_refs": probe_statuses,
+            }
+        return {**base_payload, "order_truth_refs": probe_statuses}
+
+    async def _pending_entry_abort_live_truth_for_order_ref(
+        self,
+        pending,
+        entry_id: str,
+        ref: dict[str, Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        leg = str(ref.get("leg") or "")
+        venue = ref.get("venue")
+        if not isinstance(venue, Venue):
+            return {
+                "refs": [{
+                    "source": f"{leg}_open_orders",
+                    "available": False,
+                    "has_live_open_order": False,
+                    "error": "venue_unavailable",
+                }],
+                "open_available": False,
+                "position_available": False,
+                "has_live_open_order": False,
+                "has_live_position": False,
+            }
+        order_id = str(ref.get("order_id") or "")
+        client_order_id = str(ref.get("client_order_id") or "")
+        adapter = self.get_venue_adapter(venue)
+        runtime_mode = str(getattr(self.config.runtime, "mode", "") or "").lower()
+        if adapter is None:
+            available = runtime_mode != "live"
+            error = "" if available else f"{leg}_adapter_unavailable"
+            return {
+                "refs": [
+                    {
+                        "source": f"{leg}_open_orders",
+                        "venue": venue.value,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "available": available,
+                        "has_live_open_order": False,
+                        "error": error,
+                    },
+                    {
+                        "source": f"{leg}_position",
+                        "venue": venue.value,
+                        "available": available,
+                        "has_live_position": False,
+                        "error": error,
+                    },
+                ],
+                "open_available": available,
+                "position_available": available,
+                "has_live_open_order": False,
+                "has_live_position": False,
+            }
+
+        open_available = True
+        has_live_open_order = False
+        open_error = ""
+        try:
+            open_orders = await self._fetch_residual_repair_open_orders(
+                adapter,
+                venue,
+                pending.symbol,
+            )
+            has_live_open_order = any(
+                self._pending_entry_open_order_matches(
+                    row,
+                    symbol=pending.symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                )
+                for row in open_orders
+            )
+        except Exception as exc:
+            open_available = runtime_mode != "live"
+            open_error = str(exc) or exc.__class__.__name__
+
+        position_available = True
+        has_live_position = False
+        position_error = ""
+        fetch_position = getattr(adapter, "fetch_position", None)
+        if not callable(fetch_position):
+            position_available = runtime_mode != "live"
+            position_error = "" if position_available else "fetch_position_unavailable"
+        else:
+            try:
+                position = await fetch_position(pending.symbol)
+                live_qty = (
+                    abs(float(getattr(position, "quantity", 0.0) or 0.0))
+                    if position is not None
+                    else 0.0
+                )
+                position_side = getattr(position, "side", None)
+                expected_leg = self._pending_entry_abort_ref_position_leg(pending, leg)
+                expected_side = Side.BUY if expected_leg == "long" else Side.SELL
+                has_live_position = bool(
+                    live_qty > 1e-9
+                    and position_side == expected_side
+                )
+            except Exception as exc:
+                position_available = runtime_mode != "live"
+                position_error = str(exc) or exc.__class__.__name__
+
+        if runtime_mode == "live" and (
+            not open_available
+            or not position_available
+            or has_live_open_order
+            or has_live_position
+        ):
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(
+                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                now_ms + 1_000,
+            )
+
+        return {
+            "refs": [
+                {
+                    "source": f"{leg}_open_orders",
+                    "venue": venue.value,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "available": open_available,
+                    "has_live_open_order": has_live_open_order,
+                    "error": open_error,
+                },
+                {
+                    "source": f"{leg}_position",
+                    "venue": venue.value,
+                    "available": position_available,
+                    "has_live_position": has_live_position,
+                    "error": position_error,
+                },
+            ],
+            "open_available": open_available,
+            "position_available": position_available,
+            "has_live_open_order": has_live_open_order,
+            "has_live_position": has_live_position,
+        }
+
+    @staticmethod
+    def _pending_entry_abort_ref_position_leg(pending, leg: str) -> str:
+        maker_leg = str(getattr(pending, "maker_leg", "") or "").lower()
+        if leg == "maker":
+            return maker_leg if maker_leg in {"long", "short"} else "long"
+        if maker_leg == "long":
+            return "short"
+        if maker_leg == "short":
+            return "long"
+        return "short"
+
+    async def _probe_pending_entry_abort_order_truth(
+        self,
+        pending,
+        venue: Venue,
+        leg: str,
+        order_id: str,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        adapter = self.get_venue_adapter(venue)
+        payload = {
+            "leg": leg,
+            "venue": venue.value,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "status": OrderFillProbeStatus.UNAVAILABLE.value,
+            "error": "",
+        }
+        if adapter is None:
+            return {**payload, "error": "adapter_unavailable"}
+        fetch_probe = getattr(adapter, "fetch_order_fill_probe", None)
+        if callable(fetch_probe):
+            try:
+                probe = await fetch_probe(pending.symbol, order_id, client_order_id or None)
+            except Exception as exc:
+                return {
+                    **payload,
+                    "status": OrderFillProbeStatus.ERROR.value,
+                    "error": str(exc),
+                }
+            status = getattr(probe, "status", OrderFillProbeStatus.UNAVAILABLE)
+            if isinstance(status, OrderFillProbeStatus):
+                status_value = status.value
+            else:
+                status_value = str(status or OrderFillProbeStatus.UNAVAILABLE.value)
+            return {**payload, "status": status_value}
+        fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
+        if not callable(fetch_reconciliation):
+            return {**payload, "error": "fetch_order_fill_probe_unavailable"}
+        try:
+            reconciliation = await fetch_reconciliation(
+                pending.symbol,
+                order_id,
+                client_order_id or None,
+            )
+        except Exception as exc:
+            return {
+                **payload,
+                "status": OrderFillProbeStatus.ERROR.value,
+                "error": str(exc),
+            }
+        if reconciliation is None:
+            return payload
+        try:
+            quantity = float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            quantity = 0.0
+        return {
+            **payload,
+            "status": (
+                OrderFillProbeStatus.CONFIRMED_FILL.value
+                if quantity > 1e-12
+                else OrderFillProbeStatus.CONFIRMED_NO_FILL.value
+            ),
+        }
 
     async def _cleanup_failed_leg_exposure(
         self, venue, symbol: str, entry_id: str, stage: str

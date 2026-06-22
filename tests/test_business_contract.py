@@ -290,6 +290,34 @@ def test_noise_visibility_never_hides_current_single_leg_exposure():
     assert result["reason"] == "current_single_leg_or_risk_only_exposure"
 
 
+def test_noise_visibility_classifies_route_cooldown_as_admission_blocker():
+    event = classify_business_event_kind(
+        "runtime.route_abnormal_cooldown_armed",
+        {
+            "symbol": "HOMEUSDT",
+            "route_key": "route:HOMEUSDT:binance->bybit",
+            "reason": "route_abnormal_terminal_cooldown",
+        },
+    )
+    visibility = classify_noise_visibility(
+        "runtime.route_abnormal_cooldown_armed",
+        {
+            "symbol": "HOMEUSDT",
+            "route_key": "route:HOMEUSDT:binance->bybit",
+            "reason": "route_abnormal_terminal_cooldown",
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert event["phase"] == "ENTRY_MARKET_EVIDENCE"
+    assert event["blocks_entry"] is True
+    assert event["evidence_class"] == "route"
+    assert visibility["visibility"] == "current_admission_blocker"
+    assert visibility["blocks_gate"] is False
+    assert visibility["requires_operator_action"] is False
+    assert visibility["scope"] == "entry_candidate_admission"
+
+
 def test_noise_visibility_terminal_flat_downgrades_historical_unpaired_cleanup():
     result = classify_noise_visibility(
         "recovery.unpaired_live_position_cleanup_skipped",

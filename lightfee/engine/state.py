@@ -1085,6 +1085,8 @@ class EngineState:
     unpaired_live_position_recoveries: list = field(default_factory=list)
     # --- Venue entry cooldowns (V1 venue_entry_cooldowns) ---
     venue_entry_cooldowns: dict = field(default_factory=dict)
+    # --- Route abnormal terminal incidents for rolling admission cooldowns ---
+    route_abnormal_terminal_incidents: dict = field(default_factory=dict)
     # --- Venue market data degradations (V1 venue_market_data_degradations) ---
     venue_market_data_degradations: dict = field(default_factory=dict)
     # --- Transfer truth outage state (V1 transfer_truth) ---
@@ -1166,6 +1168,7 @@ class EngineState:
             "live_recovery_reduce_only_pairs": self.live_recovery_reduce_only_pairs,
             "unpaired_live_position_recoveries": self.unpaired_live_position_recoveries,
             "venue_entry_cooldowns": self.venue_entry_cooldowns,
+            "route_abnormal_terminal_incidents": self.route_abnormal_terminal_incidents,
             "venue_market_data_degradations": self.venue_market_data_degradations,
             "transfer_truth": self.transfer_truth,
             "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,

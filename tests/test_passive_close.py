@@ -48,6 +48,9 @@ from lightfee.engine.passive_close import (
     PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES,
     PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES,
     PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES,
+    PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATED_TTL_MS,
+    PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_TTL_MS,
+    PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_WINDOW_MS,
     PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS,
     PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS,
     HedgeDeltaResult,
@@ -56,6 +59,7 @@ from lightfee.engine.passive_close import (
     PassiveCloseManagerProfile,
     PassiveManagerDecisionKind,
 )
+from lightfee.engine.business_contract import entry_route_key
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.state import (
     ActiveMakerLeg,
@@ -321,6 +325,424 @@ class TestMakerProgressTruthGate:
         assert truth_gap
         assert truth_gap[-1]["source"] == "poll_maker_progress"
         assert truth_gap[-1]["next_action"] == "retry_progress_poll"
+
+
+class TestPassiveCloseRouteAbnormalCooldown:
+    def test_abnormal_terminal_arms_route_only_admission_cooldown(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+        )
+        executor = PassiveCloseExecutor({}, journal)
+
+        payload = executor._arm_route_abnormal_cooldown_if_needed(
+            state,
+            pending,
+            position,
+            source="fallback_live_balanced",
+            now_ms=1781531700000,
+        )
+
+        route_key = entry_route_key("HOMEUSDT", "binance", "bybit")
+        assert payload is not None
+        assert state.venue_entry_cooldowns[route_key]["block_scope"] == "route"
+        assert state.venue_entry_cooldowns[route_key]["reason"] == (
+            "route_abnormal_terminal_cooldown"
+        )
+        assert state.venue_entry_cooldowns[route_key]["blocked_until_ms"] == (
+            1781531700000 + PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_TTL_MS
+        )
+        assert state.venue_entry_cooldowns[route_key]["route_key"] == route_key
+        assert state.venue_entry_cooldowns[route_key]["abnormal_terminal_family"] == "fallback"
+        assert [
+            record["kind"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.route_abnormal_cooldown_armed"
+        ] == ["runtime.route_abnormal_cooldown_armed"]
+
+    def test_route_abnormal_cooldown_escalates_on_third_abnormal_terminal(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+        )
+        route_key = entry_route_key("HOMEUSDT", "binance", "bybit")
+        state.route_abnormal_terminal_incidents[route_key] = [
+            {
+                "ts_ms": 1781531600000,
+                "position_id": "old-1",
+                "source": "fallback_live_balanced_close",
+                "abnormal_terminal_family": "fallback",
+            },
+            {
+                "ts_ms": 1781531650000,
+                "position_id": "old-2",
+                "source": "fallback_live_imbalanced_close",
+                "abnormal_terminal_family": "fallback",
+            },
+        ]
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+        )
+        executor = PassiveCloseExecutor({}, journal)
+
+        payload = executor._arm_route_abnormal_cooldown_if_needed(
+            state,
+            pending,
+            position,
+            source="passive_close_hedge_deadline_compensated_flat",
+            now_ms=1781531700000,
+        )
+
+        assert payload is not None
+        assert state.venue_entry_cooldowns[route_key]["route_abnormal_count"] == 3
+        assert state.venue_entry_cooldowns[route_key]["ttl_ms"] == (
+            PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATED_TTL_MS
+        )
+        assert state.venue_entry_cooldowns[route_key]["blocked_until_ms"] == (
+            1781531700000 + PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATED_TTL_MS
+        )
+        assert len(state.route_abnormal_terminal_incidents[route_key]) == 3
+
+    def test_route_abnormal_cooldown_prunes_incidents_outside_48h_window(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+        )
+        route_key = entry_route_key("HOMEUSDT", "binance", "bybit")
+        now_ms = 1781531700000
+        state.route_abnormal_terminal_incidents[route_key] = [
+            {
+                "ts_ms": now_ms - PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_WINDOW_MS - 1,
+                "position_id": "expired",
+                "source": "fallback_live_balanced_close",
+                "abnormal_terminal_family": "fallback",
+            },
+            {
+                "ts_ms": now_ms - 1000,
+                "position_id": "recent",
+                "source": "fallback_live_imbalanced_close",
+                "abnormal_terminal_family": "fallback",
+            },
+        ]
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+        )
+        executor = PassiveCloseExecutor({}, journal)
+
+        payload = executor._arm_route_abnormal_cooldown_if_needed(
+            state,
+            pending,
+            position,
+            source="fallback_live_imbalanced_close",
+            now_ms=now_ms,
+        )
+
+        assert payload is not None
+        assert payload["route_abnormal_count"] == 2
+        assert payload["ttl_ms"] == PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_TTL_MS
+        assert [
+            item["position_id"]
+            for item in state.route_abnormal_terminal_incidents[route_key]
+        ] == ["recent", position.position_id]
+
+    def test_clean_terminal_does_not_arm_route_cooldown(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+        )
+        executor = PassiveCloseExecutor({}, journal)
+
+        payload = executor._arm_route_abnormal_cooldown_if_needed(
+            state,
+            pending,
+            position,
+            source="normal_passive_close_finalized",
+            now_ms=1781531700000,
+        )
+
+        assert payload is None
+        assert state.venue_entry_cooldowns == {}
+
+    def test_route_cooldown_uses_abnormal_terminal_allowlist_not_substrings(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+        )
+        executor = PassiveCloseExecutor({}, journal)
+
+        for source in (
+            "statement_gap_pending_backfill",
+            "quote_stale_entry_admission",
+            "catalog_diagnostic_probe",
+            "clean_not_compensated_terminal",
+        ):
+            payload = executor._arm_route_abnormal_cooldown_if_needed(
+                state,
+                pending,
+                position,
+                source=source,
+                now_ms=1781531700000,
+            )
+            assert payload is None
+
+        assert state.venue_entry_cooldowns == {}
+        assert state.route_abnormal_terminal_incidents == {}
+
+
+class TestPassiveCloseFinalTruthGate:
+    def test_final_truth_refresh_reconciles_accepted_hedge_before_compensation(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        pending.maker_fill = PendingPassiveLegFill(
+            quantity=10.0,
+            average_price=1.1,
+            order_id="maker-order",
+            client_order_id="maker-cid",
+        )
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "hedge-order",
+            "client_order_id": "hedge-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "hedge-order",
+                "client_order_id": "hedge-cid",
+            }],
+        })
+        adapter = MagicMock()
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="HOMEUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.0,
+                order_id="hedge-order",
+                client_order_id="hedge-cid",
+                fee_quote=0.02,
+                filled_at_ms=1781531700000,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "confirmed_fill",
+                },
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+
+        result = asyncio.run(
+            executor._refresh_passive_close_final_hedge_truth_before_terminal(
+                state,
+                pending,
+                position,
+                {
+                    "hedge_venue": Venue.BYBIT,
+                    "hedge_leg": "short",
+                    "hedge_side": Side.BUY,
+                    "unhedged_gap": 10.0,
+                },
+                source="drive_unhedged_gap",
+                now_ms=1781531700100,
+            )
+        )
+
+        assert result["decision"] == "reconciled_continue_pending"
+        assert pending.hedge_fill.quantity == pytest.approx(10.0)
+        assert pending.hedge_fill.order_id == "hedge-order"
+        assert state.pending_close_reconciliations == []
+        assert [
+            record["kind"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_final_truth_reconciled"
+        ] == ["exit.passive_close_final_truth_reconciled"]
+        filled = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "order.filled"
+        ]
+        assert filled == [
+            {
+                "fill_event_id": PassiveCloseExecutor._passive_close_fill_event_id(
+                    position_id=position.position_id,
+                    leg="short",
+                    venue=Venue.BYBIT.value,
+                    order_id="hedge-order",
+                    client_order_id="hedge-cid",
+                    trade_id="",
+                    exec_id="",
+                    quantity=10.0,
+                ),
+                "position_id": position.position_id,
+                "leg": "short",
+                "venue": Venue.BYBIT.value,
+                "symbol": "HOMEUSDT",
+                "side": Side.BUY.value,
+                "order_id": "hedge-order",
+                "client_order_id": "hedge-cid",
+                "trade_id": "",
+                "exec_id": "",
+                "quantity": 10.0,
+                "price": 1.0,
+                "fee_quote": 0.02,
+                "filled_at_ms": 1781531700000,
+                "source": "passive_close_final_truth_reconciliation",
+            }
+        ]
+
+    def test_final_truth_refresh_is_idempotent_for_already_recorded_hedge(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            symbol="HOMEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            matched_quantity=10.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+        )
+        pending.hedge_fill = PendingPassiveLegFill(
+            quantity=10.0,
+            average_price=1.0,
+            order_id="hedge-order",
+            client_order_id="hedge-cid",
+        )
+        pending.short_legs.append(
+            PersistedCloseExecutionLeg(
+                fill=OrderFill(
+                    venue=Venue.BYBIT,
+                    symbol="HOMEUSDT",
+                    side=Side.BUY,
+                    quantity=10.0,
+                    price=1.0,
+                    order_id="hedge-order",
+                    client_order_id="hedge-cid",
+                    fee_quote=0.02,
+                    filled_at_ms=1781531700000,
+                ),
+                client_order_id="hedge-cid",
+                submit_started_at_ms=1781531699000,
+            )
+        )
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "hedge-order",
+            "client_order_id": "hedge-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "hedge-order",
+                "client_order_id": "hedge-cid",
+            }],
+        })
+        adapter = MagicMock()
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="HOMEUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.0,
+                order_id="hedge-order",
+                client_order_id="hedge-cid",
+                fee_quote=0.02,
+                filled_at_ms=1781531700000,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "confirmed_fill",
+                },
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+
+        result = asyncio.run(
+            executor._refresh_passive_close_final_hedge_truth_before_terminal(
+                state,
+                pending,
+                position,
+                {
+                    "hedge_venue": Venue.BYBIT,
+                    "hedge_leg": "short",
+                    "hedge_side": Side.BUY,
+                    "unhedged_gap": 10.0,
+                },
+                source="drive_unhedged_gap",
+                now_ms=1781531700100,
+            )
+        )
+
+        assert result["decision"] == "reconciled_continue_pending"
+        assert result["idempotent_replay"] is True
+        assert pending.hedge_fill.quantity == pytest.approx(10.0)
+        assert state.pending_close_reconciliations == []
+        assert [
+            record for record in journal.read_all() if record["kind"] == "order.filled"
+        ] == []
 
 
 class TestPassiveProgressAndHedge:

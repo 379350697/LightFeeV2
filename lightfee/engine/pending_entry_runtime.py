@@ -2333,5 +2333,18 @@ class PendingEntryRuntime:
             "contains_positive_fill_evidence": (
                 decision.contains_positive_fill_evidence
             ),
+            "truth_gate_decision": getattr(
+                decision,
+                "truth_gate_decision",
+                "",
+            ),
+            "order_truth_refs": getattr(decision, "order_truth_refs", []),
+            "trade_truth_refs": getattr(decision, "trade_truth_refs", []),
+            "live_position_truth_refs": getattr(
+                decision,
+                "live_position_truth_refs",
+                [],
+            ),
+            "owner_id": entry_id,
             "ts_ms": now_ms,
         }

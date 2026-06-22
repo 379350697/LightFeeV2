@@ -498,6 +498,10 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
         [],
     )
     state.venue_entry_cooldowns = snap.get("venue_entry_cooldowns", {})
+    state.route_abnormal_terminal_incidents = snap.get(
+        "route_abnormal_terminal_incidents",
+        {},
+    )
     state.venue_market_data_degradations = snap.get("venue_market_data_degradations", {})
     state.transfer_truth = snap.get("transfer_truth", {})
     state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
@@ -1165,6 +1169,7 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
         state.unpaired_live_position_recoveries
     )
     view["venue_entry_cooldowns"] = state.venue_entry_cooldowns
+    view["route_abnormal_terminal_incidents"] = state.route_abnormal_terminal_incidents
     view["venue_market_data_degradations"] = state.venue_market_data_degradations
     view["transfer_truth"] = state.transfer_truth
     view["entry_liquidity_qualification_records"] = state.entry_liquidity_qualification_records

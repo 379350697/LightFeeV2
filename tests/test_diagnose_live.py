@@ -7046,6 +7046,18 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
             },
         },
         {
+            "ts_ms": 2_300,
+            "kind": "runtime.route_abnormal_cooldown_armed",
+            "payload": {
+                "symbol": "HOMEUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "route_key": "route:HOMEUSDT:binance->bybit",
+                "reason": "route_abnormal_terminal_cooldown",
+                "block_scope": "route",
+            },
+        },
+        {
             "ts_ms": 3_000,
             "kind": "recovery.live_position_probe_unsupported_symbols",
             "payload": {
@@ -7076,16 +7088,16 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
     )
 
     assert summary["current_blocker_count"] == 0
-    assert summary["current_admission_blocker_count"] == 3
+    assert summary["current_admission_blocker_count"] == 4
     assert summary["catalog_filtered_probe_count"] == 1
     assert summary["resolved_close_artifact_count"] == 4
     assert summary["visibility_counts"] == {
         "catalog_diagnostic": 1,
-        "current_admission_blocker": 3,
+        "current_admission_blocker": 4,
         "historical_terminal_evidence": 4,
     }
     assert summary["admission_blocker_reason_counts"] == {
-        "entry_market_evidence_block": 3,
+        "entry_market_evidence_block": 4,
     }
     assert summary["historical_terminal_reason_counts"] == {
         "resolved_close_artifact_after_terminal_truth": 4,

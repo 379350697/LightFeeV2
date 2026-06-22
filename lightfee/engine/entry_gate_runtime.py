@@ -15,6 +15,7 @@ from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import (
     entry_admission_aggregation_key,
     entry_admission_blocks_candidate,
+    entry_route_key,
 )
 from lightfee.engine.runtime_context import EntryGateRuntimeContext
 from lightfee.risk.modes import EngineLifecycle
@@ -652,6 +653,32 @@ class EntryGateRuntime:
     def _candidate_admission_block(self, candidate, now_ms: int) -> dict | None:
         symbol = str(getattr(candidate, "symbol", "") or "")
         candidate_pair_id = self._candidate_pair_id(candidate)
+        long_venue_text = str(getattr(candidate, "long_venue", "") or "")
+        short_venue_text = str(getattr(candidate, "short_venue", "") or "")
+        route_key = entry_route_key(symbol, long_venue_text, short_venue_text)
+        route_payload = dict(
+            self.ctx.state.venue_entry_cooldowns.get(route_key, {}) or {}
+        )
+        try:
+            route_until_ms = int(route_payload.get("blocked_until_ms", 0) or 0)
+        except (TypeError, ValueError):
+            route_until_ms = 0
+        if route_until_ms > now_ms:
+            route_payload.setdefault("venue", "route")
+            route_payload.setdefault("symbol", symbol)
+            route_payload.setdefault("long_venue", long_venue_text.lower())
+            route_payload.setdefault("short_venue", short_venue_text.lower())
+            route_payload.setdefault("route_key", route_key)
+            route_payload.setdefault("block_scope", "route")
+            route_payload.setdefault("reason", "route_abnormal_terminal_cooldown")
+            route_payload["blocked_until_ms"] = route_until_ms
+            route_payload.setdefault("ttl_ms", self._SYMBOL_ADMISSION_BLOCK_TTL_MS)
+            route_payload.setdefault("raw_error", "")
+            route_payload.setdefault("official_doc_url", "")
+            route_payload.setdefault("evidence_gap", False)
+            route_payload.setdefault("candidate_pair_id", candidate_pair_id)
+            route_payload.setdefault("pair_id", candidate_pair_id)
+            return route_payload
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),

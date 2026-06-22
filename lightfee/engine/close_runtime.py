@@ -7,10 +7,11 @@ from LiveRuntime. Keep journal events, payload keys, and close semantics stable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 from typing import Any
 
-from lightfee.core.domain import Venue
+from lightfee.core.domain import OrderFillProbeStatus, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import close_reconciliation_evidence_fields
 from lightfee.engine.lifecycle import set_lifecycle
@@ -29,7 +30,10 @@ class CloseRuntime:
         self.ctx = ctx
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
-        return self.ctx._flush_adapter_order_diagnostics(adapter)
+        flush = getattr(self.ctx, "_flush_adapter_order_diagnostics", None)
+        if callable(flush):
+            return flush(adapter)
+        return None
 
     def _entry_readiness_provider_uses_local_l2(self) -> bool:
         return self.ctx._entry_readiness_provider_uses_local_l2()
@@ -309,8 +313,9 @@ class CloseRuntime:
         adapter = self.ctx.venue_adapters.get(venue)
         if adapter is None:
             return None
-        fetch = getattr(adapter, "fetch_order_fill_reconciliation", None)
-        if not callable(fetch):
+        fetch_probe = getattr(adapter, "fetch_order_fill_probe", None)
+        fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
+        if not callable(fetch_probe) and not callable(fetch_reconciliation):
             return None
 
         fills: list[Any] = []
@@ -318,8 +323,27 @@ class CloseRuntime:
             order_id, client_order_id = self._close_reconciliation_leg_identity(leg)
             if not order_id and not client_order_id:
                 return None
-            fill = await fetch(symbol, order_id, client_order_id)
-            self._flush_adapter_order_diagnostics(adapter)
+            if callable(fetch_probe):
+                probe = await fetch_probe(symbol, order_id, client_order_id)
+                self._flush_adapter_order_diagnostics(adapter)
+                status = getattr(probe, "status", None)
+                if status == OrderFillProbeStatus.CONFIRMED_NO_FILL:
+                    continue
+                if status in {
+                    OrderFillProbeStatus.UNAVAILABLE,
+                    OrderFillProbeStatus.ERROR,
+                }:
+                    return None
+                if status != OrderFillProbeStatus.CONFIRMED_FILL:
+                    return None
+                fill = getattr(probe, "reconciliation", None)
+            else:
+                fill = await fetch_reconciliation(symbol, order_id, client_order_id)
+                self._flush_adapter_order_diagnostics(adapter)
+                if fill is None:
+                    return None
+                if self._close_reconciliation_fill_qty(fill) <= 1e-12:
+                    continue
             if fill is None:
                 return None
             fills.append(fill)
@@ -591,6 +615,17 @@ class CloseRuntime:
         )
         exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
         complete = long_qty > 1e-12 and short_qty > 1e-12
+        missing_legs = [
+            leg
+            for leg, qty in (("long", long_qty), ("short", short_qty))
+            if qty <= 1e-12
+        ]
+        if not missing_legs:
+            missing_leg = "none"
+        elif len(missing_legs) == 2:
+            missing_leg = "both"
+        else:
+            missing_leg = missing_legs[0]
         return {
             "position_id": reconciliation.get("position_id", ""),
             "symbol": reconciliation.get("symbol", snapshot.get("symbol", "")),
@@ -615,11 +650,192 @@ class CloseRuntime:
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
             "venue_statement_reconciled": complete,
             "evidence_gap": not complete,
+            "candidate_owner_id": position_id,
+            "missing_leg": missing_leg,
+            "pending_backfill": not complete,
+            "accounting_status": "complete" if complete else "pending_backfill",
+            "clean_accounting_ready": complete,
             **evidence_gap_fields,
             "duplicate_close_leg_suppressed_count": duplicate_count,
             "duplicate_close_leg_suppressed_samples": duplicate_samples[:12],
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }
+
+    @staticmethod
+    def _order_filled_events_from_close_reconciliation_payload(
+        payload: dict[str, Any],
+        *,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        position_id = str(payload.get("position_id") or "")
+        symbol = str(payload.get("symbol") or "")
+        events: list[dict[str, Any]] = []
+        for leg, side in (("long", Side.SELL), ("short", Side.BUY)):
+            raw_legs = payload.get(f"{leg}_legs") or []
+            if not isinstance(raw_legs, list):
+                continue
+            for leg_payload in raw_legs:
+                if not isinstance(leg_payload, dict):
+                    continue
+                try:
+                    quantity = float(leg_payload.get("quantity") or 0.0)
+                except (TypeError, ValueError):
+                    quantity = 0.0
+                if quantity <= 1e-12:
+                    continue
+                try:
+                    price = float(
+                        leg_payload.get("average_price")
+                        or leg_payload.get("price")
+                        or 0.0
+                    )
+                except (TypeError, ValueError):
+                    price = 0.0
+                try:
+                    fee_quote = float(leg_payload.get("fee_quote") or 0.0)
+                except (TypeError, ValueError):
+                    fee_quote = 0.0
+                try:
+                    filled_at_ms = int(leg_payload.get("filled_at_ms") or 0)
+                except (TypeError, ValueError):
+                    filled_at_ms = 0
+                fill_event_anchor_id = CloseRuntime._deterministic_fill_event_anchor_id(
+                    position_id=position_id,
+                    leg=leg,
+                    venue=str(leg_payload.get("venue") or "").lower(),
+                    order_id=str(leg_payload.get("order_id") or ""),
+                    client_order_id=str(leg_payload.get("client_order_id") or ""),
+                    trade_id=str(leg_payload.get("trade_id") or ""),
+                    exec_id=str(leg_payload.get("exec_id") or ""),
+                )
+                events.append({
+                    "fill_event_anchor_id": fill_event_anchor_id,
+                    "position_id": position_id,
+                    "leg": leg,
+                    "venue": str(leg_payload.get("venue") or "").lower(),
+                    "symbol": symbol,
+                    "side": side.value,
+                    "order_id": str(leg_payload.get("order_id") or ""),
+                    "client_order_id": str(leg_payload.get("client_order_id") or ""),
+                    "trade_id": str(leg_payload.get("trade_id") or ""),
+                    "exec_id": str(leg_payload.get("exec_id") or ""),
+                    "quantity": quantity,
+                    "cumulative_quantity": quantity,
+                    "price": price,
+                    "fee_quote": fee_quote,
+                    "filled_at_ms": filled_at_ms,
+                    "source": source,
+                })
+        return events
+
+    @staticmethod
+    def _deterministic_fill_event_anchor_id(
+        *,
+        position_id: str,
+        leg: str,
+        venue: str,
+        order_id: str,
+        client_order_id: str,
+        trade_id: str,
+        exec_id: str,
+    ) -> str:
+        raw = "|".join(
+            [
+                position_id,
+                leg,
+                venue,
+                order_id,
+                client_order_id,
+                trade_id,
+                exec_id,
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _deterministic_fill_event_id(
+        *,
+        fill_event_anchor_id: str | None = None,
+        position_id: str = "",
+        leg: str = "",
+        venue: str = "",
+        order_id: str = "",
+        client_order_id: str = "",
+        trade_id: str = "",
+        exec_id: str = "",
+        quantity: float = 0.0,
+        cumulative_quantity: float | None = None,
+    ) -> str:
+        anchor = fill_event_anchor_id or CloseRuntime._deterministic_fill_event_anchor_id(
+            position_id=position_id,
+            leg=leg,
+            venue=venue,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            trade_id=trade_id,
+            exec_id=exec_id,
+        )
+        cumulative = quantity if cumulative_quantity is None else cumulative_quantity
+        raw = "|".join([anchor, f"{quantity:.12g}", f"{cumulative:.12g}"])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _append_close_reconciliation_order_filled_events(
+        self,
+        payload: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> None:
+        source = str(payload.get("source") or "pending_close_reconciliation")
+        emitted = payload.setdefault("emitted_fill_event_ids", [])
+        emitted_set = {
+            str(item)
+            for item in emitted
+            if isinstance(item, (str, int, float))
+        }
+        emitted_quantities = payload.setdefault("emitted_fill_event_quantities", {})
+        if not isinstance(emitted_quantities, dict):
+            emitted_quantities = {}
+            payload["emitted_fill_event_quantities"] = emitted_quantities
+        for event in self._order_filled_events_from_close_reconciliation_payload(
+            payload,
+            source=source,
+        ):
+            anchor_id = str(event.get("fill_event_anchor_id") or "")
+            try:
+                cumulative_quantity = float(
+                    event.get("cumulative_quantity")
+                    or event.get("quantity")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                cumulative_quantity = 0.0
+            try:
+                emitted_quantity = float(emitted_quantities.get(anchor_id) or 0.0)
+            except (TypeError, ValueError):
+                emitted_quantity = 0.0
+            delta_quantity = max(0.0, cumulative_quantity - emitted_quantity)
+            if delta_quantity <= 1e-12:
+                continue
+            original_fee_quote = float(event.get("fee_quote") or 0.0)
+            if cumulative_quantity > 1e-12 and delta_quantity < cumulative_quantity:
+                event["fee_quote"] = original_fee_quote * delta_quantity / cumulative_quantity
+            event["quantity"] = delta_quantity
+            event["emitted_cumulative_quantity"] = cumulative_quantity
+            fill_event_id = self._deterministic_fill_event_id(
+                fill_event_anchor_id=anchor_id,
+                quantity=delta_quantity,
+                cumulative_quantity=cumulative_quantity,
+            )
+            event["fill_event_id"] = fill_event_id
+            if fill_event_id and fill_event_id in emitted_set:
+                continue
+            self.ctx.journal.append_critical(now_ms, "order.filled", event)
+            if fill_event_id:
+                emitted.append(fill_event_id)
+                emitted_set.add(fill_event_id)
+            if anchor_id:
+                emitted_quantities[anchor_id] = cumulative_quantity
+
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
         self.ctx.state.set_pending_close_reconciliations(
             getattr(self.ctx.state, "pending_close_reconciliations", [])
@@ -707,16 +923,66 @@ class CloseRuntime:
                 legs=reconciliation.get("short_legs"),
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
+                payload = self._exit_reconciled_payload_from_leg_fills(
+                    reconciliation,
+                    long_fills,
+                    short_fills,
+                    now_ms,
+                )
+                emitted_fill_event_ids = reconciliation.get("emitted_fill_event_ids")
+                if isinstance(emitted_fill_event_ids, list):
+                    payload["emitted_fill_event_ids"] = list(emitted_fill_event_ids)
+                emitted_fill_event_quantities = reconciliation.get(
+                    "emitted_fill_event_quantities"
+                )
+                if isinstance(emitted_fill_event_quantities, dict):
+                    payload["emitted_fill_event_quantities"] = dict(
+                        emitted_fill_event_quantities
+                    )
                 self.ctx.journal.append_critical(
                     now_ms,
                     "exit.reconciled",
-                    self._exit_reconciled_payload_from_leg_fills(
-                        reconciliation,
-                        long_fills,
-                        short_fills,
-                        now_ms,
-                    ),
+                    payload,
                 )
+                self._append_close_reconciliation_order_filled_events(payload, now_ms=now_ms)
+                reconciliation["emitted_fill_event_ids"] = list(
+                    payload.get("emitted_fill_event_ids") or []
+                )
+                reconciliation["emitted_fill_event_quantities"] = dict(
+                    payload.get("emitted_fill_event_quantities") or {}
+                )
+                if bool(payload.get("pending_backfill")):
+                    reconciliation["pending_backfill"] = True
+                    reconciliation["missing_leg"] = payload.get("missing_leg", "")
+                    reconciliation["candidate_owner_id"] = payload.get("candidate_owner_id", "")
+                    reconciliation["last_evidence_gap_reason"] = payload.get(
+                        "evidence_gap_reason",
+                        "",
+                    )
+                    reconciliation["last_partial_reconciled_at_ms"] = now_ms
+                    self._call_apply_pending_close_reconciliation_backoff(
+                        reconciliation,
+                        now_ms,
+                    )
+                    retained.append(reconciliation)
+                    self.ctx.journal.append(
+                        "reconciliation.pending_close_backfill_retained",
+                        {
+                            "position_id": reconciliation.get("position_id", ""),
+                            "symbol": symbol,
+                            "candidate_owner_id": payload.get("candidate_owner_id", ""),
+                            "missing_leg": payload.get("missing_leg", ""),
+                            "evidence_gap_reason": payload.get(
+                                "evidence_gap_reason",
+                                "",
+                            ),
+                            "next_attempt_ms": reconciliation.get("next_attempt_ms", 0),
+                            "source": payload.get(
+                                "source",
+                                "pending_close_reconciliation",
+                            ),
+                        },
+                    )
                 changed = True
                 continue
             if long_fills == [] and short_fills == []:
@@ -725,7 +991,7 @@ class CloseRuntime:
                     {
                         "position_id": reconciliation.get("position_id", ""),
                         "symbol": symbol,
-                        "reason": "missing_order_identity",
+                        "reason": "confirmed_no_close_fill",
                     },
                 )
                 self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)

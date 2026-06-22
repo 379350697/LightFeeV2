@@ -12,6 +12,7 @@ Rust references:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import sys
 import time
@@ -42,7 +43,10 @@ from lightfee.engine.bybit_duplicate_reconcile import (
     build_order_reconcile_result_payload,
     reconcile_bybit_duplicate_client_order,
 )
-from lightfee.engine.business_contract import passive_close_final_truth_contract
+from lightfee.engine.business_contract import (
+    entry_route_key,
+    passive_close_final_truth_contract,
+)
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
     _is_bybit_duplicate_order_link_id,
@@ -101,6 +105,19 @@ PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS = 3_000
 PASSIVE_CLOSE_SMALL_FILL_BUFFER_MS = 2_000
 PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE = 10.0
 PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS = 5_000
+PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_TTL_MS = 30 * 60 * 1000
+PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATED_TTL_MS = 2 * 60 * 60 * 1000
+PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATE_AFTER = 3
+PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_WINDOW_MS = 48 * 60 * 60 * 1000
+PASSIVE_CLOSE_ABNORMAL_TERMINAL_SOURCE_FAMILIES = {
+    "fallback_live_balanced": "fallback",
+    "fallback_live_balanced_close": "fallback",
+    "fallback_live_imbalanced": "fallback",
+    "fallback_live_imbalanced_close": "fallback",
+    "passive_close_hedge_deadline_compensated_flat": "compensated",
+    "terminal_maker_filled_unhedged_retry": "residual",
+    "drive_unhedged_gap": "residual",
+}
 PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES = 3
 PASSIVE_CLOSE_MAX_MANAGER_FAILURES = 3
 PASSIVE_CLOSE_MAX_MAKER_SUBMIT_FAILURES = 3
@@ -520,6 +537,20 @@ class PassiveCloseExecutor:
         *,
         source: str,
     ) -> bool:
+        final_truth = await self._refresh_passive_close_final_hedge_truth_before_terminal(
+            state,
+            pending,
+            position,
+            decision,
+            source=source,
+            now_ms=self._now_ms(),
+        )
+        if final_truth.get("decision") in {
+            "reconciled_continue_pending",
+            "defer_terminal_truth_unavailable",
+        }:
+            return False
+
         enter_fail_closed(state)
         state.last_error = f"passive close hedge deadline breached for {pending.position_id}"
         pending.next_retry_at_ms = 0
@@ -671,8 +702,18 @@ class PassiveCloseExecutor:
         payload = reconciliation.get("original_payload")
         if not isinstance(payload, dict):
             payload = {}
-        order_id = str(payload.get("accepted_order_id") or "")
-        client_order_id = str(payload.get("accepted_client_order_id") or "")
+        order_id = str(
+            payload.get("accepted_order_id")
+            or reconciliation.get("accepted_order_id")
+            or reconciliation.get("order_id")
+            or ""
+        )
+        client_order_id = str(
+            payload.get("accepted_client_order_id")
+            or reconciliation.get("accepted_client_order_id")
+            or reconciliation.get("client_order_id")
+            or ""
+        )
         leg_records = (
             reconciliation.get("long_legs", [])
             if hedge_leg == "long"
@@ -686,6 +727,345 @@ class PassiveCloseExecutor:
             order_id = order_id or str(record.get("order_id") or "")
             client_order_id = client_order_id or str(record.get("client_order_id") or "")
         return order_id, client_order_id
+
+    async def _refresh_passive_close_final_hedge_truth_before_terminal(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        decision: dict[str, Any],
+        *,
+        source: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        raw_venue = decision.get("hedge_venue")
+        hedge_venue = raw_venue if isinstance(raw_venue, Venue) else None
+        if hedge_venue is None:
+            try:
+                hedge_venue = Venue.from_str(str(raw_venue or ""))
+            except ValueError:
+                return {"decision": "missing_hedge_venue"}
+        hedge_leg = str(decision.get("hedge_leg") or "")
+        if hedge_leg not in {"long", "short"}:
+            return {"decision": "missing_hedge_leg"}
+
+        active_truth_gap = self._active_hedge_truth_gap_reconciliation(
+            state,
+            pending,
+            hedge_venue=hedge_venue,
+            hedge_leg=hedge_leg,
+        )
+        if active_truth_gap is None:
+            return {"decision": "no_active_truth_gap"}
+
+        order_id, client_order_id = self._accepted_order_truth_gap_identity(
+            active_truth_gap,
+            hedge_venue=hedge_venue,
+            hedge_leg=hedge_leg,
+        )
+        if not order_id and not client_order_id:
+            return {"decision": "missing_order_identity"}
+
+        adapter = self._adapters.get(hedge_venue)
+        fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
+        if not callable(fetch_reconciliation):
+            return self._defer_final_hedge_truth_gap(
+                pending,
+                active_truth_gap,
+                source=source,
+                now_ms=now_ms,
+                reason="fetch_order_fill_reconciliation_unavailable",
+            )
+
+        reconciliation = None
+        reconcile_error = ""
+        try:
+            reconciliation = await fetch_reconciliation(
+                position.symbol,
+                order_id,
+                client_order_id or None,
+            )
+        except Exception as error:
+            reconcile_error = str(error)
+
+        if reconciliation is None:
+            return self._defer_final_hedge_truth_gap(
+                pending,
+                active_truth_gap,
+                source=source,
+                now_ms=now_ms,
+                reason="hedge_trade_truth_unavailable",
+                error=reconcile_error,
+            )
+
+        target_qty = float(decision.get("unhedged_gap") or 0.0)
+        truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+            venue=hedge_venue,
+            symbol=position.symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            target_qty=target_qty,
+            reconciliation=reconciliation,
+            metadata=getattr(reconciliation, "metadata", None),
+        )
+        if truth_decision.fill_status != OrderTruthFillStatus.CONFIRMED_FILL:
+            return {
+                "decision": "not_reconciled",
+                "order_truth_fill_status": truth_decision.fill_status.value,
+                "order_truth_decision": truth_decision.decision,
+            }
+
+        recorded_qty = self._recorded_passive_close_leg_fill_qty(
+            pending,
+            hedge_leg=hedge_leg,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        delta_qty = max(0.0, float(truth_decision.reconciled_qty or 0.0) - recorded_qty)
+        if delta_qty <= 1e-12:
+            state.remove_pending_close_reconciliation(active_truth_gap)
+            pending.next_retry_at_ms = now_ms
+            self._journal.append(
+                "exit.passive_close_final_truth_reconciled",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_leg": hedge_leg,
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "filled": 0.0,
+                    "recorded_quantity": recorded_qty,
+                    "cumulative_hedge": pending.hedge_fill.quantity,
+                    "cumulative_maker": pending.maker_fill.quantity,
+                    "source": source,
+                    "order_truth_fill_status": truth_decision.fill_status.value,
+                    "order_truth_decision": truth_decision.decision,
+                    "idempotent_replay": True,
+                },
+            )
+            return {
+                "decision": "reconciled_continue_pending",
+                "filled": 0.0,
+                "recorded_quantity": recorded_qty,
+                "idempotent_replay": True,
+            }
+
+        side = getattr(reconciliation, "side", None)
+        if not isinstance(side, Side):
+            raw_side = decision.get("hedge_side")
+            side = raw_side if isinstance(raw_side, Side) else (
+                Side.SELL if hedge_leg == "long" else Side.BUY
+            )
+        price_raw = getattr(reconciliation, "average_price", 0.0)
+        try:
+            price = float(price_raw or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        fill = OrderFill(
+            venue=hedge_venue,
+            symbol=position.symbol,
+            side=side,
+            quantity=delta_qty,
+            price=price,
+            order_id=str(getattr(reconciliation, "order_id", "") or order_id),
+            client_order_id=str(
+                getattr(reconciliation, "client_order_id", "")
+                or client_order_id
+            ),
+            fee_quote=self._delta_fill_fee_quote(
+                getattr(reconciliation, "fee_quote", None),
+                delta_qty=delta_qty,
+                total_qty=float(truth_decision.reconciled_qty or 0.0),
+            ),
+            filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+        )
+        previous_qty = pending.hedge_fill.quantity
+        new_qty = previous_qty + fill.quantity
+        previous_notional = previous_qty * pending.hedge_fill.average_price
+        pending.hedge_fill.quantity = new_qty
+        pending.hedge_fill.average_price = (
+            (previous_notional + fill.quantity * fill.price) / new_qty
+            if new_qty > 1e-12
+            else fill.price
+        )
+        pending.hedge_fill.fee_quote += fill.fee_quote or 0.0
+        pending.hedge_fill.last_fill_time_ms = fill.filled_at_ms
+        pending.hedge_fill.order_id = fill.order_id
+        pending.hedge_fill.client_order_id = fill.client_order_id or client_order_id
+
+        leg = PersistedCloseExecutionLeg(
+            fill=fill,
+            client_order_id=fill.client_order_id,
+            submit_started_at_ms=now_ms,
+        )
+        if hedge_leg == "long":
+            pending.long_legs.append(leg)
+        else:
+            pending.short_legs.append(leg)
+        state.remove_pending_close_reconciliation(active_truth_gap)
+        pending.next_retry_at_ms = now_ms
+        self._journal.append(
+            "exit.passive_close_final_truth_reconciled",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "hedge_venue": hedge_venue.value,
+                "hedge_leg": hedge_leg,
+                "accepted_order_id": order_id,
+                "accepted_client_order_id": client_order_id,
+                "filled": fill.quantity,
+                "cumulative_hedge": pending.hedge_fill.quantity,
+                "cumulative_maker": pending.maker_fill.quantity,
+                "source": source,
+                "order_truth_fill_status": truth_decision.fill_status.value,
+                "order_truth_decision": truth_decision.decision,
+            },
+        )
+        self._journal.append(
+            "order.filled",
+            {
+                "fill_event_id": self._passive_close_fill_event_id(
+                    position_id=pending.position_id,
+                    leg=hedge_leg,
+                    venue=hedge_venue.value,
+                    order_id=fill.order_id,
+                    client_order_id=fill.client_order_id or "",
+                    trade_id=str(getattr(reconciliation, "trade_id", "") or ""),
+                    exec_id=str(getattr(reconciliation, "exec_id", "") or ""),
+                    quantity=fill.quantity,
+                ),
+                "position_id": pending.position_id,
+                "leg": hedge_leg,
+                "venue": hedge_venue.value,
+                "symbol": position.symbol,
+                "side": fill.side.value,
+                "order_id": fill.order_id,
+                "client_order_id": fill.client_order_id or "",
+                "trade_id": str(getattr(reconciliation, "trade_id", "") or ""),
+                "exec_id": str(getattr(reconciliation, "exec_id", "") or ""),
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "fee_quote": fill.fee_quote or 0.0,
+                "filled_at_ms": fill.filled_at_ms,
+                "source": "passive_close_final_truth_reconciliation",
+            },
+        )
+        return {"decision": "reconciled_continue_pending", "filled": fill.quantity}
+
+    @staticmethod
+    def _delta_fill_fee_quote(
+        fee_quote: Any,
+        *,
+        delta_qty: float,
+        total_qty: float,
+    ) -> float | None:
+        try:
+            fee = float(fee_quote)
+        except (TypeError, ValueError):
+            return None
+        if total_qty <= 1e-12:
+            return fee
+        return fee * max(0.0, delta_qty) / total_qty
+
+    @staticmethod
+    def _passive_close_fill_event_id(
+        *,
+        position_id: str,
+        leg: str,
+        venue: str,
+        order_id: str,
+        client_order_id: str,
+        trade_id: str,
+        exec_id: str,
+        quantity: float,
+    ) -> str:
+        raw = "|".join(
+            [
+                position_id,
+                leg,
+                venue,
+                order_id,
+                client_order_id,
+                trade_id,
+                exec_id,
+                f"{quantity:.12g}",
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _recorded_passive_close_leg_fill_qty(
+        pending: PendingPassiveClose,
+        *,
+        hedge_leg: str,
+        order_id: str,
+        client_order_id: str,
+    ) -> float:
+        def matches(fill: Any, leg_client_order_id: Any = "") -> bool:
+            fill_order_id = str(getattr(fill, "order_id", "") or "")
+            fill_client_order_id = str(
+                getattr(fill, "client_order_id", "") or leg_client_order_id or ""
+            )
+            return bool(order_id and fill_order_id == order_id) or bool(
+                client_order_id and fill_client_order_id == client_order_id
+            )
+
+        legs = pending.long_legs if hedge_leg == "long" else pending.short_legs
+        recorded = 0.0
+        for leg in legs:
+            fill = getattr(leg, "fill", None)
+            if fill is None or not matches(fill, getattr(leg, "client_order_id", "")):
+                continue
+            try:
+                recorded += float(getattr(fill, "quantity", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+        hedge_fill = getattr(pending, "hedge_fill", None)
+        if hedge_fill is not None and matches(hedge_fill):
+            try:
+                recorded = max(
+                    recorded,
+                    float(getattr(hedge_fill, "quantity", 0.0) or 0.0),
+                )
+            except (TypeError, ValueError):
+                pass
+        return recorded
+
+    def _defer_final_hedge_truth_gap(
+        self,
+        pending: PendingPassiveClose,
+        reconciliation: dict[str, Any],
+        *,
+        source: str,
+        now_ms: int,
+        reason: str,
+        error: str = "",
+    ) -> dict[str, Any]:
+        attempt_count = int(reconciliation.get("final_truth_attempt_count") or 0) + 1
+        reconciliation["final_truth_attempt_count"] = attempt_count
+        reconciliation["next_attempt_ms"] = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+        pending.next_retry_at_ms = reconciliation["next_attempt_ms"]
+        bounded_defer = attempt_count <= 2
+        self._journal.append(
+            "exit.passive_close_final_truth_deferred",
+            {
+                "position_id": pending.position_id,
+                "source": source,
+                "reason": reason,
+                "error": error,
+                "attempt_count": attempt_count,
+                "bounded_defer": bounded_defer,
+                "next_retry_at_ms": pending.next_retry_at_ms,
+            },
+        )
+        return {
+            "decision": "defer_terminal_truth_unavailable"
+            if bounded_defer
+            else "terminal_truth_still_unavailable",
+            "bounded_defer": bounded_defer,
+            "attempt_count": attempt_count,
+        }
 
     async def _handle_hedge_truth_gap_result(
         self,
@@ -4763,11 +5143,103 @@ class PassiveCloseExecutor:
                 ),
                 "single_leg_fast_flatten_threshold_ms": 2_000,
                 "first_progress_ms": first_progress_ms,
+                "route_key": str(extra_payload.get("route_key") or ""),
+                "abnormal_terminal_family": str(
+                    extra_payload.get("abnormal_terminal_family") or ""
+                ),
+                "abnormal_terminal_source": str(
+                    extra_payload.get("abnormal_terminal_source") or ""
+                ),
                 "resolved_at_ms": now_ms,
                 "exchange_truth": truth_payload,
                 **closure_fields,
             },
         )
+
+    @staticmethod
+    def _abnormal_terminal_family(source: str) -> str:
+        return PASSIVE_CLOSE_ABNORMAL_TERMINAL_SOURCE_FAMILIES.get(
+            str(source or "").lower(),
+            "",
+        )
+
+    def _arm_route_abnormal_cooldown_if_needed(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        family = self._abnormal_terminal_family(source)
+        if not family:
+            return None
+
+        route_key = entry_route_key(
+            position.symbol,
+            position.long_venue.value,
+            position.short_venue.value,
+        )
+        incident_store = getattr(state, "route_abnormal_terminal_incidents", None)
+        if not isinstance(incident_store, dict):
+            incident_store = {}
+            state.route_abnormal_terminal_incidents = incident_store
+        raw_incidents = incident_store.get(route_key, [])
+        if not isinstance(raw_incidents, list):
+            raw_incidents = []
+        window_start_ms = now_ms - PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_WINDOW_MS
+        incidents = [
+            dict(item)
+            for item in raw_incidents
+            if isinstance(item, dict)
+            and int(item.get("ts_ms") or 0) >= window_start_ms
+        ]
+        incidents.append({
+            "ts_ms": now_ms,
+            "position_id": pending.position_id,
+            "source": source,
+            "abnormal_terminal_family": family,
+        })
+        incident_store[route_key] = incidents
+        abnormal_count = len(incidents)
+        ttl_ms = (
+            PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATED_TTL_MS
+            if abnormal_count >= PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_ESCALATE_AFTER
+            else PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_TTL_MS
+        )
+        blocked_until_ms = now_ms + ttl_ms
+        payload = {
+            "venue": "route",
+            "symbol": position.symbol,
+            "long_venue": position.long_venue.value,
+            "short_venue": position.short_venue.value,
+            "reason": "route_abnormal_terminal_cooldown",
+            "raw_error": source,
+            "blocked_until_ms": blocked_until_ms,
+            "ttl_ms": ttl_ms,
+            "official_doc_url": "",
+            "evidence_gap": False,
+            "block_scope": "route",
+            "cooldown_scope": "route",
+            "source": "passive_close_abnormal_terminal",
+            "route_key": route_key,
+            "route_abnormal_count": abnormal_count,
+            "route_abnormal_window_ms": PASSIVE_CLOSE_ABNORMAL_ROUTE_COOLDOWN_WINDOW_MS,
+            "abnormal_terminal_family": family,
+            "abnormal_terminal_source": source,
+            "position_id": pending.position_id,
+            "owner_id": pending.position_id,
+        }
+        state.venue_entry_cooldowns[route_key] = payload
+        self._journal.append(
+            "runtime.route_abnormal_cooldown_armed",
+            {
+                **payload,
+                "ts_ms": now_ms,
+            },
+        )
+        return payload
 
     def _clear_live_flat_state(
         self,
@@ -4900,6 +5372,24 @@ class PassiveCloseExecutor:
             failure_reason = "terminal_close_resolution_failed"
             terminal_extra = dict(extra or {})
             terminal_extra["closure_fields"] = closure_fields
+            abnormal_family = self._abnormal_terminal_family(source)
+            if abnormal_family:
+                terminal_extra.setdefault(
+                    "route_key",
+                    entry_route_key(
+                        position.symbol,
+                        position.long_venue.value,
+                        position.short_venue.value,
+                    ),
+                )
+                terminal_extra.setdefault(
+                    "abnormal_terminal_family",
+                    abnormal_family,
+                )
+                terminal_extra.setdefault(
+                    "abnormal_terminal_source",
+                    source,
+                )
             self._emit_passive_close_terminal_resolution(
                 pending,
                 position,
@@ -4908,6 +5398,13 @@ class PassiveCloseExecutor:
                 actual_short_size=actual_short_size,
                 extra=terminal_extra,
                 exchange_truth=exchange_truth,
+            )
+            self._arm_route_abnormal_cooldown_if_needed(
+                state,
+                pending,
+                position,
+                source=source,
+                now_ms=self._now_ms(),
             )
         except Exception as error:
             state.pending_close_reconciliations = original_reconciliations
