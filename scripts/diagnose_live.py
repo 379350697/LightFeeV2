@@ -6298,6 +6298,14 @@ def _build_production_acceptance_gate(
         and recovery_decision.get("kind")
         in {"RUNNING_CLEAN", "RUNNING_WITH_EVIDENCE_GAP"}
     )
+    current_terminal_truth_clean = (
+        local_recovery_clean
+        and exchange_recovery_clean
+        and recovery_decision.get("entry_allowed") is True
+        and not recovery_decision.get("block_reason")
+        and recovery_decision.get("kind")
+        in {"RUNNING_CLEAN", "RUNNING_WITH_EVIDENCE_GAP"}
+    )
     fingerprints: list[str] = []
     if (
         current_core_clean
@@ -6326,7 +6334,7 @@ def _build_production_acceptance_gate(
     unresolved_order_truth_gap_count = int(
         resolved_order_truth_gap_summary.get("unresolved_count", 0) or 0
     )
-    if resolved_order_truth_gap_count and current_core_clean:
+    if resolved_order_truth_gap_count and current_terminal_truth_clean:
         exception_conclusions["resolved_order_truth_gap"] = (
             "closed_by_current_exchange_truth"
         )

@@ -2360,6 +2360,69 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_acceptance_gate_resolved_order_truth_gap_is_green_when_fail_closed_but_flat():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "entry-prod-flat-HUSDT",
+                    "symbol": "HUSDT",
+                    "venue": "bybit",
+                    "accepted_order_id": "close-order-1",
+                    "accepted_client_order_id": "lf-close-1",
+                },
+            },
+            {
+                "kind": "exit.passive_close_hedge_confirmed_after_ack",
+                "payload": {
+                    "position_id": "entry-prod-flat-HUSDT",
+                    "symbol": "HUSDT",
+                    "hedge_venue": "bybit",
+                    "order_id": "close-order-1",
+                    "client_order_id": "lf-close-1",
+                    "filled": 100.0,
+                    "residual": 0.0,
+                },
+            },
+            {
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-prod-flat-HUSDT",
+                    "symbol": "HUSDT",
+                    "terminal_state": "flat",
+                },
+            },
+        ],
+        local_state={
+            "lifecycle": "risk_only",
+            "risk_mode": "fail_closed",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["resolved_order_truth_gap_count"] == 1
+    assert gate["unresolved_order_truth_gap_count"] == 0
+    assert gate["exception_conclusions"]["resolved_order_truth_gap"] == (
+        "closed_by_current_exchange_truth"
+    )
+    assert gate["unclassified_exceptions"] == []
+    assert gate["gate_passed"] is True
+
+
 def test_run_diagnose_weak_order_truth_resolution_does_not_green(monkeypatch):
     from scripts import diagnose_live as dl
 
