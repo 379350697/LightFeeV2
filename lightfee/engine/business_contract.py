@@ -591,8 +591,6 @@ def _recovery_ledger_flat_truth_covers_scope(
         return False
 
     symbol_u = str(symbol or "").upper()
-    unfiltered_position_venues: set[str] = set()
-    unfiltered_order_venues: set[str] = set()
     for venue in venues:
         if not _truth_probe_evidence_succeeded(
             truth,
@@ -616,22 +614,6 @@ def _recovery_ledger_flat_truth_covers_scope(
             },
         ):
             return False
-        if _truth_probe_evidence_succeeded(
-            truth,
-            venue=venue,
-            symbol=symbol_u,
-            endpoint="fetch_all_positions",
-            success_classifications={"position_probe_unfiltered_succeeded"},
-        ):
-            unfiltered_position_venues.add(venue)
-        if _truth_probe_evidence_succeeded(
-            truth,
-            venue=venue,
-            symbol=symbol_u,
-            endpoint="fetch_open_orders",
-            success_classifications={"open_order_probe_unfiltered_succeeded"},
-        ):
-            unfiltered_order_venues.add(venue)
 
     for raw in positions:
         if not isinstance(raw, dict):
@@ -639,8 +621,7 @@ def _recovery_ledger_flat_truth_covers_scope(
         record_symbol = str(raw.get("symbol") or "").upper()
         record_venue = str(raw.get("venue") or "").lower()
         if symbol_u and record_symbol and record_symbol != symbol_u:
-            if record_venue not in unfiltered_position_venues:
-                continue
+            continue
         if venues and record_venue and record_venue not in venues:
             continue
         if abs(_safe_float(raw.get("quantity"))) > 1e-9:
@@ -652,8 +633,7 @@ def _recovery_ledger_flat_truth_covers_scope(
         record_symbol = str(raw.get("symbol") or "").upper()
         record_venue = str(raw.get("venue") or "").lower()
         if symbol_u and record_symbol and record_symbol != symbol_u:
-            if record_venue not in unfiltered_order_venues:
-                continue
+            continue
         if venues and record_venue and record_venue not in venues:
             continue
         return False

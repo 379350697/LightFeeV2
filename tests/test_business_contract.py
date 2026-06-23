@@ -533,7 +533,31 @@ def test_close_reconciliation_exchange_truth_rejects_target_account_truth_error(
     ) is None
 
 
-def test_close_reconciliation_exchange_truth_rejects_unfiltered_target_open_order():
+def test_close_reconciliation_exchange_truth_accepts_unfiltered_unrelated_position():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+    }
+    truth = _recovery_ledger_account_flat_truth("bybit", "okx")
+    truth["positions"] = [{
+        "venue": "bybit",
+        "symbol": "DEXEUSDT",
+        "quantity": 1.0,
+    }]
+
+    assert (
+        close_reconciliation_exchange_truth(
+            reconciliation,
+            current_exchange_truth=truth,
+        )
+        is truth
+    )
+
+
+def test_close_reconciliation_exchange_truth_rejects_unfiltered_target_symbol_order():
     reconciliation = {
         "position_id": "entry-h",
         "symbol": "HUSDT",
@@ -544,7 +568,7 @@ def test_close_reconciliation_exchange_truth_rejects_unfiltered_target_open_orde
     truth = _recovery_ledger_account_flat_truth("bybit", "okx")
     truth["open_orders"] = [{
         "venue": "bybit",
-        "symbol": "OTHERUSDT",
+        "symbol": "HUSDT",
         "quantity": 1.0,
     }]
 
