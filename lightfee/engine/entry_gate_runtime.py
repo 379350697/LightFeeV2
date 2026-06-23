@@ -23,6 +23,34 @@ from lightfee.engine.runtime_context import EntryGateRuntimeContext
 from lightfee.risk.modes import EngineLifecycle
 
 
+_ENTRY_ADMISSION_EVIDENCE_FIELDS = (
+    "requested_notional",
+    "remaining_openable_notional",
+    "notional_gap",
+    "leverage",
+    "headroom_source",
+    "headroom_error",
+    "order_role",
+)
+
+
+def _copy_entry_admission_evidence_fields(
+    target: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    for field in _ENTRY_ADMISSION_EVIDENCE_FIELDS:
+        if field in source:
+            target[field] = source.get(field)
+
+
+def _first_sample_value(samples: list[dict[str, Any]], key: str) -> Any:
+    for sample in samples:
+        value = sample.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 class EntryGateRuntime:
     def __init__(self, ctx: EntryGateRuntimeContext) -> None:
         self.ctx = ctx
@@ -803,7 +831,11 @@ class EntryGateRuntime:
             evidence_gap_values.add(bool(block.get("evidence_gap", True)))
             self._last_entry_admission_filter_blockers[reason] += 1
             if len(blocked_samples) < 24:
-                blocked_samples.append({
+                blocked_symbol = str(
+                    block.get("blocked_symbol")
+                    or ""
+                )
+                sample = {
                     "candidate_pair_id": self._candidate_pair_id(candidate),
                     "pair_id": self._candidate_pair_id(candidate),
                     "symbol": str(getattr(candidate, "symbol", "") or ""),
@@ -813,12 +845,14 @@ class EntryGateRuntime:
                     "reason": reason,
                     "block_scope": block_scope or "symbol",
                     "blocked_until_ms": candidate_blocked_until_ms,
-                    "blocked_symbol": str(block.get("blocked_symbol") or ""),
+                    "blocked_symbol": blocked_symbol,
                     "source": source,
                     "official_doc_url": doc_url,
                     "evidence_gap": bool(block.get("evidence_gap", True)),
                     "stage": stage,
-                })
+                }
+                _copy_entry_admission_evidence_fields(sample, block)
+                blocked_samples.append(sample)
 
         self._last_entry_admission_filter_samples = blocked_samples
         blocked_count = sum(self._last_entry_admission_filter_blockers.values())
@@ -848,35 +882,62 @@ class EntryGateRuntime:
         aggregation_symbol = (
             next(iter(sample_symbols)) if len(sample_symbols) == 1 else "*"
         )
+        blocked_root_symbols = {
+            str(sample.get("blocked_symbol") or sample.get("symbol") or "").upper()
+            for sample in blocked_samples
+            if str(sample.get("blocked_symbol") or sample.get("symbol") or "")
+        }
+        blocked_root_symbol = (
+            next(iter(blocked_root_symbols))
+            if len(blocked_root_symbols) == 1
+            else ""
+        )
+        use_blocked_root_symbol = (
+            venue == Venue.ASTER.value
+            and reason == "max_notional_admission_blocked"
+            and blocked_root_symbol
+        )
+        event_symbol = (
+            blocked_root_symbol
+            if use_blocked_root_symbol
+            else aggregation_symbol
+        )
         aggregation_key = entry_admission_aggregation_key(
             stage=stage,
             venue=venue,
-            symbol=aggregation_symbol,
+            symbol=event_symbol,
             reason=reason,
             block_scope=block_scope,
         )
+        event_payload: dict[str, Any] = {
+            "venue": venue,
+            "symbol": event_symbol,
+            "blocked_symbol": blocked_root_symbol,
+            "reason": reason,
+            "block_scope": block_scope,
+            "aggregation_key": aggregation_key,
+            "blocked_until_ms": blocked_until_ms,
+            "source": source,
+            "official_doc_url": official_doc_url,
+            "evidence_gap": evidence_gap,
+            "stage": stage,
+            "candidate_count": len(candidates),
+            "blocked_count": blocked_count,
+            "allowed_count": len(allowed),
+            "blocked_reason_counts": dict(
+                sorted(self._last_entry_admission_filter_blockers.items())
+            ),
+            "samples": blocked_samples[:10],
+            "suppressed_count": max(blocked_count - len(blocked_samples), 0),
+            "ts_ms": now_ms,
+        }
+        for field in _ENTRY_ADMISSION_EVIDENCE_FIELDS:
+            value = _first_sample_value(blocked_samples, field)
+            if value is not None:
+                event_payload[field] = value
         self._append_runtime_diagnostic_event(
             "runtime.entry_admission_venue_degraded",
-            {
-                "venue": venue,
-                "reason": reason,
-                "block_scope": block_scope,
-                "aggregation_key": aggregation_key,
-                "blocked_until_ms": blocked_until_ms,
-                "source": source,
-                "official_doc_url": official_doc_url,
-                "evidence_gap": evidence_gap,
-                "stage": stage,
-                "candidate_count": len(candidates),
-                "blocked_count": blocked_count,
-                "allowed_count": len(allowed),
-                "blocked_reason_counts": dict(
-                    sorted(self._last_entry_admission_filter_blockers.items())
-                ),
-                "samples": blocked_samples[:10],
-                "suppressed_count": max(blocked_count - len(blocked_samples), 0),
-                "ts_ms": now_ms,
-            },
+            event_payload,
             now_ms=now_ms,
             key_parts=(stage, venue, reason, source),
             interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
@@ -1336,28 +1397,34 @@ class EntryGateRuntime:
                         ),
                         None,
                     )
-                    decisions.append(
-                        self._entry_liquidity_decision_payload(
-                            venue=venue,
-                            symbol=symbol,
-                            quote=quote,
-                            snapshot=snapshot,
-                            now_ms=now_ms,
-                            fallback_source=fallback_source,
-                            reason="perp_open_interest_structural",
-                            decision="skip_entry",
-                            event_kind="execution.entry_liquidity_blocked",
-                            eligibility_class=(
-                                EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY.value
-                            ),
-                            observed_volume_24h_quote=volume_24h_quote,
-                            min_volume_24h_quote=volume_floor,
-                            observed_open_interest_quote=open_interest_quote,
-                            min_open_interest_quote=open_interest_floor,
-                            state_record=state_record,
-                            open_interest_evidence_status=open_interest_evidence_status,
-                        )
+                    decision_payload = self._entry_liquidity_decision_payload(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        fallback_source=fallback_source,
+                        reason="perp_open_interest_structural",
+                        decision="skip_entry",
+                        event_kind="execution.entry_liquidity_blocked",
+                        eligibility_class=(
+                            EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY.value
+                        ),
+                        observed_volume_24h_quote=volume_24h_quote,
+                        min_volume_24h_quote=volume_floor,
+                        observed_open_interest_quote=open_interest_quote,
+                        min_open_interest_quote=open_interest_floor,
+                        state_record=state_record,
+                        open_interest_evidence_status=open_interest_evidence_status,
                     )
+                    decision_payload["structural_suppressed"] = True
+                    decision_payload["structural_suppression_reason"] = (
+                        "structural_backoff_active"
+                    )
+                    decision_payload["next_structural_recheck_ms"] = (
+                        (state_record or {}).get("suppress_until_ms")
+                    )
+                    decisions.append(decision_payload)
                     continue
 
             if volume_floor > 0.0 and volume_24h_quote < volume_floor:

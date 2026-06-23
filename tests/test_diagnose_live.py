@@ -1371,12 +1371,100 @@ def test_run_diagnose_resolves_aster_5018_when_headroom_admission_blocked(monkey
                 "requested_notional": 30.0,
                 "remaining_openable_notional": 10.0,
                 "notional_gap": 20.0,
+                "leverage": 4,
                 "reasons": {"max_notional_admission_blocked": 1},
             }
         ]
         assert cooldown_summary["advice_counts"] == {
             "check_aster_account_leverage_position_limit_or_capital": 1
         }
+        assert result["production_acceptance_gate"]["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_diagnose_rolls_up_aster_venue_degraded_sample_headroom(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "normal",
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+            "pending_residual_repairs": [],
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781665905362,
+                "kind": "runtime.entry_admission_venue_degraded",
+                "payload": {
+                    "venue": "aster",
+                    "reason": "max_notional_admission_blocked",
+                    "source": "pre_entry_aster_precheck",
+                    "block_scope": "venue",
+                    "evidence_gap": False,
+                    "blocked_count": 2,
+                    "samples": [
+                        {
+                            "candidate_pair_id": "lab:binance->aster",
+                            "symbol": "LABUSDT",
+                            "blocked_symbol": "ESPORTSUSDT",
+                            "venue": "aster",
+                            "reason": "max_notional_admission_blocked",
+                            "requested_notional": 23.9706,
+                            "remaining_openable_notional": 0.0,
+                            "notional_gap": 23.9706,
+                            "leverage": 4,
+                            "headroom_source": "exchange_error_text",
+                        },
+                        {
+                            "candidate_pair_id": "h:binance->aster",
+                            "symbol": "HUSDT",
+                            "blocked_symbol": "ESPORTSUSDT",
+                            "venue": "aster",
+                            "reason": "max_notional_admission_blocked",
+                            "requested_notional": 23.9706,
+                            "remaining_openable_notional": 0.0,
+                            "notional_gap": 23.9706,
+                            "leverage": 4,
+                            "headroom_source": "exchange_error_text",
+                        },
+                    ],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LABUSDT",
+            venues=["aster", "binance"],
+            now_ms=1781665910000,
+        )
+
+        summary = result["entry_admission_cooldown_summary"]
+        assert summary["reason_counts"] == {"max_notional_admission_blocked": 1}
+        assert summary["scope_counts"] == {"venue": 1}
+        assert summary["top_blocked_symbols"] == [
+            {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "count": 1,
+                "requested_notional": 23.9706,
+                "remaining_openable_notional": 0.0,
+                "notional_gap": 23.9706,
+                "leverage": 4,
+                "headroom_source": "exchange_error_text",
+                "affected_candidates": ["HUSDT", "LABUSDT"],
+                "reasons": {"max_notional_admission_blocked": 1},
+            }
+        ]
         assert result["production_acceptance_gate"]["gate_passed"] is True
     finally:
         import shutil
@@ -2172,6 +2260,76 @@ def test_run_diagnose_acceptance_gate_classifies_scoped_snapshot_fallback_as_v1_
         assert gate["snapshot_fallback_blocking_count"] == 1
         assert gate["exception_conclusions"]["snapshot_fallback_blocking"] == "v1_parity"
         assert gate["insufficient_evidence_exceptions"] == []
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_acceptance_gate_downgrades_snapshot_fallback_resolved_by_quote_truth(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "candidate_pair_id": "bulla:bybit->aster",
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "BULLAUSDT",
+                            "candidate_pair_id": "bulla:bybit->aster",
+                            "domain": "market_observed",
+                            "venue": "global",
+                            "source_age_ms": 60000,
+                            "fallback_duration_ms": 55000,
+                            "blocked": True,
+                            "block_reason": "market_observed_stale",
+                        }
+                    ],
+                },
+            },
+            {
+                "ts_ms": 1779816049500,
+                "kind": "runtime.snapshot_freshness_decision",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "candidate_pair_id": "bulla:bybit->aster",
+                    "reason": "quote_stale_resolved_by_entry_quote_truth",
+                    "decision": "continue",
+                    "action": "continue",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["bybit", "aster"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 0
+        assert gate["snapshot_fallback_unresolved_current_blocker_count"] == 0
+        assert gate["snapshot_fallback_resolved_by_entry_quote_truth_count"] == 1
+        assert "snapshot_fallback_blocking" not in gate["exception_conclusions"]
         assert gate["blocking_reasons"] == []
         assert gate["gate_passed"] is True
     finally:
@@ -5754,8 +5912,10 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "below_floor_count": 0,
             "blocked_candidate_count": 3,
             "failed_count": 1,
+            "next_structural_recheck_ms": None,
             "resolved_count": 1,
             "structural_count": 0,
+            "structural_suppressed_count": 0,
             "unavailable_count": 3,
         },
         "quote": {
@@ -5770,7 +5930,9 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "current_warning_count": 0,
             "current_scope": "entry_candidate_admission",
             "next_action": "targeted_refresh_or_data_source_backfill",
+            "next_structural_recheck_ms": None,
             "raw_candidate_block_count": 5,
+            "structural_suppressed_count": 0,
             "top_blocked_owner_ids": [
                 {
                     "owner_id": "aster:HOMEUSDT",
@@ -5933,6 +6095,118 @@ def test_entry_market_evidence_summary_distinguishes_low_oi_from_unavailable():
             "evidence_classes": {"oi": 1},
             "reasons": {"perp_open_interest_below_floor": 1},
         },
+    ]
+
+
+def test_entry_market_evidence_summary_reports_structural_suppression_backoff():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "consecutive_failures": 3,
+                "suppress_until_ms": 1779817850000,
+                "last_structural_probe_at_ms": 1779816049000,
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "consecutive_failures": 4,
+                "suppress_until_ms": 1779817850000,
+                "last_structural_probe_at_ms": 1779816049000,
+            },
+        },
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "consecutive_failures": 5,
+                "suppress_until_ms": 1779817850000,
+                "last_structural_probe_at_ms": 1779816049000,
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["oi"]["structural_count"] == 3
+    assert summary["oi"]["structural_suppressed_count"] == 2
+    assert summary["oi"]["next_structural_recheck_ms"] == 1779817850000
+    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 2
+    assert summary["candidate_admission_noise_summary"]["top_blocked_owner_ids"] == [
+        {
+            "owner_id": "aster:ESPORTSUSDT",
+            "count": 3,
+            "actions": {"block_oi_structural": 3},
+            "evidence_classes": {"oi": 3},
+            "reasons": {"perp_open_interest_structural": 3},
+            "structural_suppressed_count": 2,
+            "next_structural_recheck_ms": 1779817850000,
+        }
+    ]
+    assert summary["candidate_admission_noise_summary"]["next_action"] == (
+        "confirmed_oi_below_floor_no_data_backfill"
+    )
+
+
+def test_entry_market_evidence_summary_does_not_count_suppressed_structural_as_current_blocker():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "structural_suppressed": True,
+                "next_structural_recheck_ms": 1779817850000,
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["blocked_candidate_count"] == 0
+    assert summary["unresolved_blocker_count"] == 0
+    assert summary["action_counts"] == {"suppress_oi_structural": 1}
+    assert summary["oi"]["structural_count"] == 1
+    assert summary["oi"]["structural_suppressed_count"] == 1
+    assert summary["oi"]["next_structural_recheck_ms"] == 1779817850000
+    assert summary["candidate_admission_noise_summary"]["raw_candidate_block_count"] == 0
+    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 1
+    assert summary["candidate_admission_noise_summary"]["top_blocked_owner_ids"] == [
+        {
+            "owner_id": "aster:ESPORTSUSDT",
+            "count": 1,
+            "actions": {"suppress_oi_structural": 1},
+            "evidence_classes": {"oi": 1},
+            "reasons": {"perp_open_interest_structural": 1},
+            "structural_suppressed_count": 1,
+            "next_structural_recheck_ms": 1779817850000,
+        }
     ]
 
 

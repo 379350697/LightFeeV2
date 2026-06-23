@@ -3274,6 +3274,58 @@ def _snapshot_fallback_has_scoped_blocking_evidence(payload: dict[str, Any]) -> 
     return False
 
 
+def _snapshot_fallback_identity_keys(payload: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+
+    def add_from(raw: dict[str, Any]) -> None:
+        for field in ("candidate_pair_id", "pair_id"):
+            value = str(raw.get(field) or "").strip()
+            if value:
+                keys.add(f"pair:{value}")
+        for field in ("candidate_symbol", "symbol"):
+            value = str(raw.get(field) or "").strip().upper()
+            if value:
+                keys.add(f"symbol:{value}")
+
+    add_from(payload)
+    for item in payload.get("candidate_freshness_scope", []) or []:
+        if isinstance(item, dict):
+            add_from(item)
+    return keys
+
+
+def _snapshot_fallback_resolution_keys(events: list[dict[str, Any]]) -> set[str]:
+    keys: set[str] = set()
+    resolved_kinds = {
+        "runtime.entry_quote_revalidate_resolved",
+        "runtime.entry_quote_evidence_resolved_by_ws_bbo",
+    }
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = _payload_dict(rec)
+        if kind == "runtime.snapshot_freshness_decision":
+            reason = str(payload.get("reason") or "")
+            action = str(payload.get("action") or payload.get("decision") or "")
+            if (
+                reason != "quote_stale_resolved_by_entry_quote_truth"
+                or action not in {"allow", "continue", "resolved"}
+            ):
+                continue
+        elif kind not in resolved_kinds:
+            continue
+        keys.update(_snapshot_fallback_identity_keys(payload))
+    return keys
+
+
+def _snapshot_fallback_resolved_by_entry_quote_truth(
+    payload: dict[str, Any],
+    resolution_keys: set[str],
+) -> bool:
+    if not resolution_keys:
+        return False
+    return bool(_snapshot_fallback_identity_keys(payload) & resolution_keys)
+
+
 def _snapshot_fallback_exception_conclusion(payload: dict[str, Any]) -> str:
     if payload.get("v1_parity_evidence"):
         return "v1_parity"
@@ -3727,6 +3779,14 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
 def _build_entry_market_evidence_summary(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    def optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     action_counts: dict[str, int] = {}
     evidence_class_counts: dict[str, int] = {}
     samples: list[dict[str, Any]] = []
@@ -3741,6 +3801,8 @@ def _build_entry_market_evidence_summary(
     oi_unavailable_count = 0
     oi_below_floor_count = 0
     oi_structural_count = 0
+    oi_structural_suppressed_count = 0
+    oi_structural_next_recheck_ms = 0
     quote_blocked_candidate_count = 0
     blocked_owner_stats: dict[str, dict[str, Any]] = {}
 
@@ -3797,6 +3859,62 @@ def _build_entry_market_evidence_summary(
                 if isinstance(reasons, dict):
                     reason = str(contract.get("reason") or "unknown")
                     reasons[reason] = int(reasons.get(reason) or 0) + 1
+                if action == "block_oi_structural":
+                    suppress_until_ms = optional_int(payload.get("suppress_until_ms"))
+                    if suppress_until_ms:
+                        stat["next_structural_recheck_ms"] = max(
+                            int(stat.get("next_structural_recheck_ms") or 0),
+                            suppress_until_ms,
+                        )
+                        oi_structural_next_recheck_ms = max(
+                            oi_structural_next_recheck_ms,
+                            suppress_until_ms,
+                        )
+        elif action == "suppress_oi_structural":
+            oi_structural_count += 1
+            oi_structural_suppressed_count += 1
+            suppress_until_ms = optional_int(
+                payload.get("next_structural_recheck_ms")
+                or payload.get("suppress_until_ms")
+            )
+            if suppress_until_ms:
+                oi_structural_next_recheck_ms = max(
+                    oi_structural_next_recheck_ms,
+                    suppress_until_ms,
+                )
+            owner_id = str(contract.get("owner_id") or "")
+            if owner_id:
+                stat = blocked_owner_stats.setdefault(
+                    owner_id,
+                    {
+                        "owner_id": owner_id,
+                        "count": 0,
+                        "actions": {},
+                        "evidence_classes": {},
+                        "reasons": {},
+                    },
+                )
+                stat["count"] = int(stat.get("count") or 0) + 1
+                actions = stat["actions"]
+                if isinstance(actions, dict):
+                    actions[action] = int(actions.get(action) or 0) + 1
+                classes = stat["evidence_classes"]
+                if isinstance(classes, dict):
+                    classes[evidence_class] = int(
+                        classes.get(evidence_class) or 0
+                    ) + 1
+                reasons = stat["reasons"]
+                if isinstance(reasons, dict):
+                    reason = str(contract.get("reason") or "unknown")
+                    reasons[reason] = int(reasons.get(reason) or 0) + 1
+                stat["structural_suppressed_count"] = int(
+                    stat.get("structural_suppressed_count") or 0
+                ) + 1
+                if suppress_until_ms:
+                    stat["next_structural_recheck_ms"] = max(
+                        int(stat.get("next_structural_recheck_ms") or 0),
+                        suppress_until_ms,
+                    )
         if action == "terminal_candidate_rewarm":
             terminal_candidate_rewarm_count += 1
             unresolved_blocker_count += 1
@@ -3825,6 +3943,20 @@ def _build_entry_market_evidence_summary(
                 ),
             })
 
+    for stat in blocked_owner_stats.values():
+        reasons = stat.get("reasons") if isinstance(stat.get("reasons"), dict) else {}
+        structural_count = int(
+            (reasons or {}).get("perp_open_interest_structural") or 0
+        )
+        next_recheck = int(stat.get("next_structural_recheck_ms") or 0)
+        existing_suppressed = int(stat.get("structural_suppressed_count") or 0)
+        if structural_count > 1 and next_recheck:
+            suppressed_count = structural_count - 1
+            stat["structural_suppressed_count"] = (
+                existing_suppressed + suppressed_count
+            )
+            oi_structural_suppressed_count += suppressed_count
+
     top_blocked_owner_ids: list[dict[str, Any]] = []
     for stat in sorted(
         blocked_owner_stats.values(),
@@ -3842,6 +3974,14 @@ def _build_entry_market_evidence_summary(
             ),
             "reasons": dict(sorted((stat.get("reasons") or {}).items())),
         })
+        if stat.get("structural_suppressed_count"):
+            top_blocked_owner_ids[-1]["structural_suppressed_count"] = int(
+                stat.get("structural_suppressed_count") or 0
+            )
+        if stat.get("next_structural_recheck_ms"):
+            top_blocked_owner_ids[-1]["next_structural_recheck_ms"] = int(
+                stat.get("next_structural_recheck_ms") or 0
+            )
 
     if oi_unavailable_count > 0 or quote_blocked_candidate_count > 0:
         next_action = "targeted_refresh_or_data_source_backfill"
@@ -3861,6 +4001,8 @@ def _build_entry_market_evidence_summary(
             "current_scope": "entry_candidate_admission",
             "next_action": next_action,
             "raw_candidate_block_count": blocked_candidate_count,
+            "structural_suppressed_count": oi_structural_suppressed_count,
+            "next_structural_recheck_ms": oi_structural_next_recheck_ms or None,
             "top_blocked_owner_ids": top_blocked_owner_ids,
         },
         "diagnostic_recovered_overbudget_count": (
@@ -3873,6 +4015,8 @@ def _build_entry_market_evidence_summary(
             "failed_count": oi_failed_count,
             "resolved_count": oi_resolved_count,
             "structural_count": oi_structural_count,
+            "structural_suppressed_count": oi_structural_suppressed_count,
+            "next_structural_recheck_ms": oi_structural_next_recheck_ms or None,
             "unavailable_count": oi_unavailable_count,
         },
         "quote": {
@@ -5004,6 +5148,66 @@ def _build_entry_admission_cooldown_summary(
             return None
         return parsed if math.isfinite(parsed) else None
 
+    def first_value(rows: list[dict[str, Any]], key: str) -> Any:
+        for row in rows:
+            value = row.get(key)
+            if value is not None and value != "":
+                return value
+        return None
+
+    def normalized_rollup_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        samples_raw = payload.get("samples") or []
+        sample_rows = [
+            item for item in samples_raw
+            if isinstance(item, dict)
+        ]
+        normalized = dict(payload)
+        venue = str(normalized.get("venue") or first_value(sample_rows, "venue") or "").lower()
+        block_scope = str(
+            normalized.get("cooldown_scope")
+            or normalized.get("block_scope")
+            or ""
+        ).lower()
+        root_symbol = str(
+            normalized.get("blocked_symbol")
+            or (
+                first_value(sample_rows, "blocked_symbol")
+                if block_scope == "venue"
+                else None
+            )
+            or normalized.get("symbol")
+            or first_value(sample_rows, "symbol")
+            or ""
+        ).upper()
+        normalized["venue"] = venue
+        normalized["symbol"] = root_symbol
+        normalized["blocked_symbol"] = root_symbol
+        affected_candidates = sorted({
+            str(item.get("symbol") or "").upper()
+            for item in sample_rows
+            if str(item.get("symbol") or "").upper()
+            and str(item.get("symbol") or "").upper() != root_symbol
+        })
+        if affected_candidates:
+            normalized["affected_candidates"] = affected_candidates
+        for key in (
+            "requested_notional",
+            "remaining_openable_notional",
+            "notional_gap",
+            "leverage",
+            "headroom_source",
+            "headroom_error",
+        ):
+            if normalized.get(key) is None:
+                value = first_value(sample_rows, key)
+                if value is not None:
+                    normalized[key] = value
+        requested = optional_float(normalized.get("requested_notional"))
+        remaining = optional_float(normalized.get("remaining_openable_notional"))
+        if normalized.get("notional_gap") is None and requested is not None and remaining is not None:
+            normalized["notional_gap"] = max(requested - remaining, 0.0)
+        return normalized
+
     reason_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
     scope_counts: dict[str, int] = {}
@@ -5023,6 +5227,7 @@ def _build_entry_admission_cooldown_summary(
         payload = rec.get("payload", {})
         if not isinstance(payload, dict):
             continue
+        rollup_payload = normalized_rollup_payload(payload)
         total += 1
         reason = str(payload.get("reason") or "unknown")
         source = str(payload.get("source") or "unknown")
@@ -5031,8 +5236,12 @@ def _build_entry_admission_cooldown_summary(
             or payload.get("block_scope")
             or "unknown"
         )
-        venue = str(payload.get("venue") or "").lower()
-        symbol = str(payload.get("symbol") or payload.get("blocked_symbol") or "").upper()
+        venue = str(rollup_payload.get("venue") or "").lower()
+        symbol = str(
+            rollup_payload.get("symbol")
+            or rollup_payload.get("blocked_symbol")
+            or ""
+        ).upper()
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         source_counts[source] = source_counts.get(source, 0) + 1
         scope_counts[scope] = scope_counts.get(scope, 0) + 1
@@ -5053,9 +5262,11 @@ def _build_entry_admission_cooldown_summary(
             )
             rollup["count"] += 1
             rollup["reasons"][reason] = rollup["reasons"].get(reason, 0) + 1
-            requested_notional = optional_float(payload.get("requested_notional"))
-            remaining_notional = optional_float(payload.get("remaining_openable_notional"))
-            notional_gap = optional_float(payload.get("notional_gap"))
+            requested_notional = optional_float(rollup_payload.get("requested_notional"))
+            remaining_notional = optional_float(
+                rollup_payload.get("remaining_openable_notional")
+            )
+            notional_gap = optional_float(rollup_payload.get("notional_gap"))
             if requested_notional is not None:
                 rollup["requested_notional"] += requested_notional
             if remaining_notional is not None:
@@ -5069,6 +5280,20 @@ def _build_entry_admission_cooldown_summary(
                 notional_gap = max(requested_notional - remaining_notional, 0.0)
             if notional_gap is not None:
                 rollup["notional_gap"] += notional_gap
+            leverage = rollup_payload.get("leverage")
+            if leverage is not None and rollup.get("leverage") is None:
+                rollup["leverage"] = leverage
+            headroom_source = str(rollup_payload.get("headroom_source") or "")
+            if headroom_source and not rollup.get("headroom_source"):
+                rollup["headroom_source"] = headroom_source
+            headroom_error = str(rollup_payload.get("headroom_error") or "")
+            if headroom_error and not rollup.get("headroom_error"):
+                rollup["headroom_error"] = headroom_error
+            affected_candidates = rollup_payload.get("affected_candidates") or []
+            if affected_candidates:
+                existing = set(rollup.get("affected_candidates") or [])
+                existing.update(str(item) for item in affected_candidates if str(item))
+                rollup["affected_candidates"] = sorted(existing)
         if venue == "aster" and reason == "max_notional_admission_blocked":
             advice = "check_aster_account_leverage_position_limit_or_capital"
             advice_counts[advice] = advice_counts.get(advice, 0) + 1
@@ -5083,10 +5308,10 @@ def _build_entry_admission_cooldown_summary(
                 "cooldown_scope": scope,
                 "blocked_until_ms": int(payload.get("blocked_until_ms") or 0),
                 "evidence_gap": payload.get("evidence_gap"),
-                "requested_notional": payload.get("requested_notional"),
-                "remaining_openable_notional": payload.get("remaining_openable_notional"),
-                "notional_gap": payload.get("notional_gap"),
-                "leverage": payload.get("leverage"),
+                "requested_notional": rollup_payload.get("requested_notional"),
+                "remaining_openable_notional": rollup_payload.get("remaining_openable_notional"),
+                "notional_gap": rollup_payload.get("notional_gap"),
+                "leverage": rollup_payload.get("leverage"),
             })
     top_blocked_symbols = sorted(
         symbol_rollups.values(),
@@ -6130,6 +6355,8 @@ def _build_production_acceptance_gate(
     okx_instrument_missing_skipped_count = 0
     local_l2_official_rebuild_count = 0
     snapshot_fallback_blocking_count = 0
+    snapshot_fallback_unresolved_current_blocker_count = 0
+    snapshot_fallback_resolved_by_entry_quote_truth_count = 0
     bulk_health_diagnostic_count = 0
     contained_admission_count = 0
     hyperliquid_margin_view_zero_count = 0
@@ -6152,6 +6379,7 @@ def _build_production_acceptance_gate(
         and runtime_market_data_config.get("local_l2_effective_enabled") is False
     )
     local_l2_residual_runtime_enabled_count = 0
+    snapshot_fallback_quote_resolution_keys = _snapshot_fallback_resolution_keys(events)
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -6329,10 +6557,17 @@ def _build_production_acceptance_gate(
             local_l2_residual_runtime_enabled_count += 1
 
         if kind == "runtime.snapshot_fallback_last_good" and _is_snapshot_fallback_blocking(payload):
-            snapshot_fallback_blocking_count += 1
-            exception_conclusions["snapshot_fallback_blocking"] = (
-                _snapshot_fallback_exception_conclusion(payload)
-            )
+            if _snapshot_fallback_resolved_by_entry_quote_truth(
+                payload,
+                snapshot_fallback_quote_resolution_keys,
+            ):
+                snapshot_fallback_resolved_by_entry_quote_truth_count += 1
+            else:
+                snapshot_fallback_blocking_count += 1
+                snapshot_fallback_unresolved_current_blocker_count += 1
+                exception_conclusions["snapshot_fallback_blocking"] = (
+                    _snapshot_fallback_exception_conclusion(payload)
+                )
 
         if kind == "entry.opened":
             entry_opened_count += 1
@@ -6698,6 +6933,12 @@ def _build_production_acceptance_gate(
             local_l2_residual_runtime_enabled_count
         ),
         "snapshot_fallback_blocking_count": snapshot_fallback_blocking_count,
+        "snapshot_fallback_unresolved_current_blocker_count": (
+            snapshot_fallback_unresolved_current_blocker_count
+        ),
+        "snapshot_fallback_resolved_by_entry_quote_truth_count": (
+            snapshot_fallback_resolved_by_entry_quote_truth_count
+        ),
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,
         "hyperliquid_margin_view_zero_count": hyperliquid_margin_view_zero_count,

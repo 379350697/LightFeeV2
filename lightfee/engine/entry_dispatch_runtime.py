@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from contextlib import suppress
 from typing import Any
 
@@ -29,6 +30,62 @@ from lightfee.engine.venue_private_health import (
 )
 from lightfee.engine.v1_lifecycle import V1TradingLifecycle
 from lightfee.venues.cid import generate_exchange_cid
+from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+
+
+_ASTER_HEADROOM_NUMBER_RE = re.compile(
+    r"\b(?P<key>requested_notional|remaining_openable_notional)="
+    r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+)
+
+
+def _aster_headroom_payload_from_error(
+    *,
+    venue: Venue,
+    reason: str,
+    error_text: str,
+    order_role: str,
+) -> dict[str, Any]:
+    if venue is not Venue.ASTER or reason not in {
+        "max_notional_admission_blocked",
+        "aster_headroom_unavailable",
+    }:
+        return {}
+
+    payload: dict[str, Any] = {
+        "order_role": order_role,
+        "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+    }
+    parsed: dict[str, float] = {}
+    for match in _ASTER_HEADROOM_NUMBER_RE.finditer(str(error_text or "")):
+        try:
+            parsed[match.group("key")] = float(match.group("value"))
+        except (TypeError, ValueError):
+            continue
+
+    requested_notional = parsed.get("requested_notional")
+    remaining_openable_notional = parsed.get("remaining_openable_notional")
+    if requested_notional is not None:
+        payload["requested_notional"] = requested_notional
+    if remaining_openable_notional is not None:
+        payload["remaining_openable_notional"] = remaining_openable_notional
+    if requested_notional is not None and remaining_openable_notional is not None:
+        payload["notional_gap"] = max(
+            requested_notional - remaining_openable_notional,
+            0.0,
+        )
+        payload["headroom_source"] = "exchange_error_text"
+        payload["evidence_gap"] = False
+        return payload
+
+    payload["evidence_gap"] = True
+    payload["headroom_error"] = str(error_text or "")[:500]
+    payload["headroom_source"] = (
+        "headroom_unavailable"
+        if reason == "aster_headroom_unavailable"
+        else "exchange_error_without_headroom"
+    )
+    return payload
 
 
 class EntryDispatchRuntime:
@@ -118,6 +175,12 @@ class EntryDispatchRuntime:
             metadata = self._entry_admission_reject_metadata(venue, reject_reason)
             if metadata:
                 reason = str(metadata["reason"])
+                extra_payload = _aster_headroom_payload_from_error(
+                    venue=venue,
+                    reason=reason,
+                    error_text=reject_reason,
+                    order_role="entry_result",
+                )
                 self._record_symbol_admission_block(
                     venue=venue,
                     symbol=symbol,
@@ -127,6 +190,7 @@ class EntryDispatchRuntime:
                     evidence=metadata,
                     source="initial_entry",
                     candidate_pair_id=candidate_pair_id,
+                    extra_payload=extra_payload,
                 )
 
     async def _prepare_live_entry_leverage_for_candidate(
@@ -332,6 +396,14 @@ class EntryDispatchRuntime:
                     extra_payload: dict[str, Any] = {
                         "order_role": str(leg["order_role"]),
                     }
+                    extra_payload.update(
+                        _aster_headroom_payload_from_error(
+                            venue=venue,
+                            reason=reason,
+                            error_text=error_text,
+                            order_role=str(leg["order_role"]),
+                        )
+                    )
                     if private_health_status:
                         source = "venue_private_health_precheck"
                         extra_payload.update(

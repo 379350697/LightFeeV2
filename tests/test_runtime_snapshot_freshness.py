@@ -3730,6 +3730,9 @@ def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tm
         and record["payload"]["reason"] == "perp_open_interest_structural"
     )
     assert structural["eligibility_class"] == "structural_ineligibility"
+    assert structural["structural_suppressed"] is True
+    assert structural["structural_suppression_reason"] == "structural_backoff_active"
+    assert structural["next_structural_recheck_ms"] == 1_810_000
     assert structural["last_structural_probe_at_ms"] == 69500
     assert structural["endpoint"] == "sidecar_perp_liquidity"
     assert structural["source"] == "sidecar_perp_liquidity"

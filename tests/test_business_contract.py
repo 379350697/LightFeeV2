@@ -151,6 +151,25 @@ def test_entry_market_evidence_contract_distinguishes_low_oi_from_unavailable():
     assert unavailable["blocks_entry"] is True
 
 
+def test_entry_market_evidence_contract_treats_structural_suppression_as_backoff():
+    result = entry_market_evidence_contract(
+        "execution.entry_liquidity_blocked",
+        {
+            "venue": "aster",
+            "symbol": "ESPORTSUSDT",
+            "reason": "perp_open_interest_structural",
+            "open_interest_evidence_status": "available",
+            "structural_suppressed": True,
+            "next_structural_recheck_ms": 1779817850000,
+        },
+    )
+
+    assert result["action"] == "suppress_oi_structural"
+    assert result["blocks_entry"] is False
+    assert result["terminality"] == "structural_backoff_suppressed"
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_entry_market_evidence_contract_terminalizes_quote_rewarm():
     result = entry_market_evidence_contract(
         "runtime.entry_quote_rewarm_terminal_stale",

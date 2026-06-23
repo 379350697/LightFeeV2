@@ -202,7 +202,7 @@ class FakeAsterRulesCache:
             'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
             "max_notional_admission_blocked",
             "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
-            False,
+            True,
         ),
         (
             "aster",
@@ -405,8 +405,50 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
         assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["reason"] == (
             "max_notional_admission_blocked"
         )
+        symbol_cooldown = runtime.state.venue_entry_cooldowns["aster:HUSDT"]
+        venue_cooldown = runtime.state.venue_entry_cooldowns["aster:*"]
+        assert symbol_cooldown["requested_notional"] == pytest.approx(23.90043)
+        assert symbol_cooldown["remaining_openable_notional"] == pytest.approx(0.0)
+        assert symbol_cooldown["notional_gap"] == pytest.approx(23.90043)
+        assert symbol_cooldown["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+        assert symbol_cooldown["headroom_source"] == "exchange_error_text"
+        assert symbol_cooldown["order_role"] == "hedge"
         assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == (
             "venue"
+        )
+        assert venue_cooldown["requested_notional"] == pytest.approx(23.90043)
+        assert venue_cooldown["remaining_openable_notional"] == pytest.approx(0.0)
+        assert venue_cooldown["notional_gap"] == pytest.approx(23.90043)
+        assert venue_cooldown["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+        assert venue_cooldown["headroom_source"] == "exchange_error_text"
+
+        clean_candidate = _candidate("CLEANUSDT", "binance", "bybit")
+        filtered = runtime._filter_candidates_by_entry_admission(
+            [candidate, clean_candidate],
+            now_ms=1778787001000,
+            stage="shortlist",
+        )
+        assert [item.symbol for item in filtered] == ["CLEANUSDT"]
+        degraded_payload = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_degraded"
+        ][-1]
+        assert degraded_payload["symbol"] == "HUSDT"
+        assert degraded_payload["blocked_symbol"] == "HUSDT"
+        assert degraded_payload["requested_notional"] == pytest.approx(23.90043)
+        assert degraded_payload["remaining_openable_notional"] == pytest.approx(0.0)
+        assert degraded_payload["notional_gap"] == pytest.approx(23.90043)
+        assert degraded_payload["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+        assert degraded_payload["headroom_source"] == "exchange_error_text"
+        assert degraded_payload["samples"][0]["requested_notional"] == pytest.approx(
+            23.90043
+        )
+        assert degraded_payload["samples"][0]["remaining_openable_notional"] == (
+            pytest.approx(0.0)
+        )
+        assert degraded_payload["samples"][0]["notional_gap"] == pytest.approx(
+            23.90043
         )
         records = runtime.journal.read_all()
         assert not [
@@ -1610,6 +1652,12 @@ def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
                 "evidence_gap": False,
                 "block_scope": "venue",
                 "source": "pre_entry_aster_precheck",
+                "requested_notional": 23.9706,
+                "remaining_openable_notional": 0.0,
+                "notional_gap": 23.9706,
+                "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+                "headroom_source": "exchange_error_text",
+                "order_role": "hedge",
             }
             blocked = _candidate("LABUSDT", "binance", "aster")
             clean = _candidate("CLEANUSDT", "binance", "bybit")
@@ -1624,7 +1672,25 @@ def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
             assert runtime._last_entry_admission_filter_blockers == {
                 "max_notional_admission_blocked": 1
             }
-            assert runtime._last_entry_admission_filter_samples[0]["block_scope"] == "venue"
-            assert runtime._last_entry_admission_filter_samples[0]["symbol"] == "LABUSDT"
+            sample = runtime._last_entry_admission_filter_samples[0]
+            assert sample["block_scope"] == "venue"
+            assert sample["symbol"] == "LABUSDT"
+            assert sample["blocked_symbol"] == "ESPORTSUSDT"
+            assert sample["requested_notional"] == pytest.approx(23.9706)
+            assert sample["remaining_openable_notional"] == pytest.approx(0.0)
+            assert sample["notional_gap"] == pytest.approx(23.9706)
+            assert sample["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+            assert sample["headroom_source"] == "exchange_error_text"
+            degraded_payload = [
+                record["payload"]
+                for record in runtime.journal.read_all()
+                if record["kind"] == "runtime.entry_admission_venue_degraded"
+            ][-1]
+            assert degraded_payload["symbol"] == "ESPORTSUSDT"
+            assert degraded_payload["blocked_symbol"] == "ESPORTSUSDT"
+            assert degraded_payload["requested_notional"] == pytest.approx(23.9706)
+            assert degraded_payload["remaining_openable_notional"] == pytest.approx(0.0)
+            assert degraded_payload["notional_gap"] == pytest.approx(23.9706)
+            assert degraded_payload["samples"][0]["symbol"] == "LABUSDT"
         finally:
             runtime.journal.close()

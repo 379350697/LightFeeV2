@@ -225,14 +225,19 @@ def entry_market_evidence_contract(
                 "terminality": "active",
             }
         action = _entry_oi_block_action(payload, reason)
+        suppressed = action == "suppress_oi_structural"
         return {
             **base,
             "evidence_class": "oi",
             "action": action,
             "action_taken": action,
-            "blocks_entry": True,
-            "terminality": "terminal_candidate_block",
-            "diagnostic_severity": "production_issue",
+            "blocks_entry": not suppressed,
+            "terminality": (
+                "structural_backoff_suppressed"
+                if suppressed
+                else "terminal_candidate_block"
+            ),
+            "diagnostic_severity": "info" if suppressed else "production_issue",
         }
     if text == "runtime.entry_oi_targeted_refresh_started":
         return {
@@ -274,6 +279,8 @@ def _entry_oi_block_action(payload: dict[str, Any], reason: str) -> str:
     ).strip().lower()
     normalized_reason = str(reason or "").strip()
     if normalized_reason == "perp_open_interest_structural":
+        if payload.get("structural_suppressed") is True:
+            return "suppress_oi_structural"
         return "block_oi_structural"
     if normalized_reason == "perp_open_interest_below_floor":
         return "block_oi_below_floor"
